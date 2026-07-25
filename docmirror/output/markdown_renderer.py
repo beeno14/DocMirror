@@ -458,6 +458,56 @@ def validate_markdown(markdown: str) -> list[str]:
     return list(dict.fromkeys(issues))
 
 
+def _source_ids_are_contiguous(ordered: list[str], source_ids: list[str]) -> bool:
+    return bool(source_ids) and any(
+        ordered[index : index + len(source_ids)] == source_ids
+        for index in range(0, len(ordered) - len(source_ids) + 1)
+    )
+
+
+def _materialize_slice_reflow(
+    transform: Any,
+    node_by_id: dict[str, Any],
+) -> tuple[str, set[str]] | None:
+    """Materialize one exact source-slice reflow after conservation checks."""
+    source_ids = list(transform.source_node_ids)
+    if not source_ids or transform.anchor_node_id != source_ids[0]:
+        return None
+    source_nodes = {node_id: node_by_id.get(node_id) for node_id in source_ids}
+    if any(node is None for node in source_nodes.values()):
+        return None
+
+    ranges_by_node: dict[str, list[tuple[int, int]]] = {node_id: [] for node_id in source_ids}
+    rendered_slices: list[str] = []
+    for item in transform.output_slices:
+        node_id = str(item.node_id)
+        node = source_nodes.get(node_id)
+        if node is None:
+            return None
+        text = str(getattr(node, "text", "") or "")
+        start = int(item.start)
+        end = int(item.end)
+        if start < 0 or end <= start or end > len(text):
+            return None
+        fragment = text[start:end]
+        if not fragment.strip():
+            return None
+        ranges_by_node[node_id].append((start, end))
+        rendered_slices.append(fragment.strip())
+
+    for node_id, node in source_nodes.items():
+        text = str(getattr(node, "text", "") or "")
+        cursor = 0
+        for start, end in sorted(ranges_by_node[node_id]):
+            if start < cursor or text[cursor:start].strip():
+                return None
+            cursor = end
+        if text[cursor:].strip():
+            return None
+
+    return "\n\n".join(rendered_slices), set(source_ids[1:])
+
+
 def _enhanced_reading_state(
     node_ids: list[Any],
     node_by_id: dict[str, Any],
@@ -479,11 +529,16 @@ def _enhanced_reading_state(
         source_ids = list(transform.source_node_ids)
         if not source_ids:
             continue
-        contiguous = any(
-            ordered[index : index + len(source_ids)] == source_ids
-            for index in range(0, len(ordered) - len(source_ids) + 1)
-        )
-        if not contiguous:
+        if not _source_ids_are_contiguous(ordered, source_ids):
+            continue
+        if transform.kind == "reflow_slices":
+            materialized = _materialize_slice_reflow(transform, node_by_id)
+            if materialized is None:
+                continue
+            reflowed_text, suppressed = materialized
+            text_overrides[transform.anchor_node_id] = reflowed_text
+            suppressed_node_ids.update(suppressed)
+            applied += 1
             continue
         anchor = node_by_id.get(transform.anchor_node_id)
         fragments = [node_by_id.get(node_id) for node_id in transform.fragment_node_ids]
