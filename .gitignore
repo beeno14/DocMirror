@@ -47,6 +47,7 @@ coverage.xml
 
 ## Parse output
 /output/
+/outputs/
 
 ## Distribution
 *.whl

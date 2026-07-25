@@ -140,7 +140,7 @@ def _extract_personal_brief(parse_result: Any, full_text: str) -> dict[str, Any]
     text = _linear(full_text)
     page_texts = _page_texts(parse_result)
     accounts = _personal_accounts(text, page_texts)
-    inquiries = _personal_inquiries(text, page_texts)
+    inquiries = _personal_inquiries(parse_result, text, page_texts)
     overdue = _overdue_from_personal_accounts(accounts)
     credit_lines = _personal_credit_lines(accounts)
     return {
@@ -323,15 +323,23 @@ def _personal_account_from_chunk(
     return account
 
 
-def _personal_inquiries(text: str, page_texts: list[tuple[int, str, str]]) -> list[dict[str, Any]]:
+def _personal_inquiries(
+    parse_result: Any,
+    text: str,
+    page_texts: list[tuple[int, str, str]],
+) -> list[dict[str, Any]]:
     if "机构查询记录明细" not in text:
         return []
     institution_start = text.index("机构查询记录明细")
     personal_start = text.find("个人查询记录明细", institution_start)
     institution_text = text[institution_start : personal_start if personal_start >= 0 else len(text)]
     personal_text = text[personal_start:] if personal_start >= 0 else ""
+    institution_records = _merge_reconstructed_institution_inquiries(
+        _inquiry_rows(institution_text, "institution", page_texts),
+        _reconstructed_institution_inquiries(parse_result),
+    )
     records = [
-        *_inquiry_rows(institution_text, "institution", page_texts),
+        *institution_records,
         *_inquiry_rows(personal_text, "personal", page_texts),
     ]
     seen: set[str] = set()
@@ -343,6 +351,63 @@ def _personal_inquiries(text: str, page_texts: list[tuple[int, str, str]]) -> li
         seen.add(record_id)
         out.append(record)
     return out
+
+
+def _reconstructed_institution_inquiries(parse_result: Any) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.inquiry_reading_order import (
+        reconstruct_institution_inquiry_rows,
+    )
+
+    records: list[dict[str, Any]] = []
+    for row in reconstruct_institution_inquiry_rows(parse_result):
+        query_date = _iso_date(str(row.get("query_date_text") or ""))
+        institution = _compact(str(row.get("institution") or ""))
+        reason = str(row.get("reason") or "").replace("(", "（").replace(")", "）")
+        if not query_date or not institution or not reason:
+            continue
+        source_ref: dict[str, Any] = {"source": "native_dfg_inquiry_ledger"}
+        if page := int(row.get("page") or 0):
+            source_ref["page"] = page
+        if node_ids := [str(value) for value in row.get("source_node_ids") or [] if value]:
+            source_ref["node_ids"] = node_ids
+        if evidence_ids := [str(value) for value in row.get("evidence_ids") or [] if value]:
+            source_ref["evidence_ids"] = evidence_ids
+        sequence = int(row.get("sequence") or 0)
+        records.append(
+            {
+                "inquiry_id": _stable_id(
+                    "credit_inquiry",
+                    "institution",
+                    query_date,
+                    institution,
+                    reason,
+                ),
+                "sequence": sequence,
+                "inquiry_type": "institution",
+                "inquiry_date": query_date,
+                "institution": institution,
+                "reason": reason,
+                "source": "personal_brief_inquiry_ledger",
+                "source_refs": [source_ref],
+                "confidence": float(row.get("confidence") or 0.98),
+            }
+        )
+    return records
+
+
+def _merge_reconstructed_institution_inquiries(
+    fallback: list[dict[str, Any]],
+    reconstructed: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Prefer DFG rows while retaining text-only rows as compatibility fallback."""
+
+    def key(record: dict[str, Any]) -> tuple[int, str]:
+        return int(record.get("sequence") or 0), str(record.get("inquiry_date") or "")
+
+    reconstructed_by_key = {key(record): record for record in reconstructed}
+    merged = [reconstructed_by_key.pop(key(record), record) for record in fallback]
+    merged.extend(reconstructed_by_key.values())
+    return merged
 
 
 def _inquiry_rows(
