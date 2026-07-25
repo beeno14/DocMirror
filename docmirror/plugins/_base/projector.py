@@ -45,6 +45,10 @@ class CommunityProjector:
     def derive(self, parse_result: Any, text: str = "") -> ProjectionData:
         raise NotImplementedError
 
+    def reading_projection(self, parse_result: Any) -> Any | None:
+        """Return an optional declarative projection for enhanced Markdown."""
+        return None
+
     def supports(self, sealed: Any) -> bool:
         from docmirror.models.sealed import SealedParseResult
 

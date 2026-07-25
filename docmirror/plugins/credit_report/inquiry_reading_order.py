@@ -59,11 +59,19 @@ def _row_match(value: Any) -> re.Match[str] | None:
     return _ROW_START_RE.match(str(getattr(value, "text", "") or ""))
 
 
-def _reason(value: Any) -> str:
-    compact = _compact(getattr(value, "text", ""))
-    if compact not in _COMPACT_INQUIRY_REASONS:
-        return ""
-    return compact.replace("(", "（").replace(")", "）")
+def _reason_sequence(values: list[Any]) -> tuple[str, list[Any]]:
+    """Find one known reason even when unrelated column fragments interleave it."""
+    for reason in sorted(_COMPACT_INQUIRY_REASONS, key=len, reverse=True):
+        assembled = ""
+        selected: list[Any] = []
+        for value in values:
+            fragment = _compact(getattr(value, "text", ""))
+            if fragment and reason.startswith(assembled + fragment):
+                assembled += fragment
+                selected.append(value)
+                if assembled == reason:
+                    return reason.replace("(", "（").replace(")", "）"), selected
+    return "", []
 
 
 def _is_section_end(value: Any) -> bool:
@@ -167,26 +175,21 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
             ),
             section_end,
         )
-        reason_index = next(
-            (
-                candidate_index
-                for candidate_index in range(index + 1, next_row)
-                if _reason(ordered[candidate_index])
-            ),
-            -1,
-        )
-        if reason_index < 0 or _bbox(anchor) is None:
+        row_tail = ordered[index + 1 : next_row]
+        reason, reason_nodes = _reason_sequence(row_tail)
+        if not reason_nodes or _bbox(anchor) is None:
             index = next_row
             continue
 
-        reason_node = ordered[reason_index]
+        reason_node = reason_nodes[0]
         if _bbox(reason_node) is None:
             index = next_row
             continue
+        reason_node_keys = {id(node) for node in reason_nodes}
         fragments = [
             node
-            for node in ordered[index + 1 : next_row]
-            if node is not reason_node and _is_institution_fragment(anchor, reason_node, node)
+            for node in row_tail
+            if id(node) not in reason_node_keys and _is_institution_fragment(anchor, reason_node, node)
         ]
         institution = _compact(anchor_match.group("institution")) + "".join(
             _compact(getattr(fragment, "text", "")) for fragment in fragments
@@ -195,14 +198,23 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
             index = next_row
             continue
 
-        source_nodes = [anchor, reason_node, *fragments]
+        relevant_node_keys = {id(node) for node in (*reason_nodes, *fragments)}
+        source_nodes = [anchor, *(node for node in row_tail if id(node) in relevant_node_keys)]
         rows.append(
             {
                 "sequence": int(anchor_match.group("sequence")),
                 "query_date_text": anchor_match.group("date"),
                 "institution": institution,
-                "reason": _reason(reason_node),
+                "reason": reason,
                 "page": int(getattr(anchor, "page", 0) or 0),
+                "anchor_node_id": str(getattr(anchor, "node_id", "") or ""),
+                "reason_node_id": str(getattr(reason_node, "node_id", "") or ""),
+                "reason_node_ids": [
+                    str(getattr(node, "node_id", "") or "") for node in reason_nodes
+                ],
+                "fragment_node_ids": [
+                    str(getattr(node, "node_id", "") or "") for node in fragments
+                ],
                 "source_node_ids": [
                     str(getattr(node, "node_id", "") or "") for node in source_nodes
                 ],
@@ -221,4 +233,45 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
     return rows
 
 
-__all__ = ["reconstruct_institution_inquiry_rows"]
+def build_institution_inquiry_reading_projection(parse_result: Any) -> Any | None:
+    """Build validated joins for wrapped institution fragments only."""
+    from docmirror.output.reading_projection import FragmentJoin, ReadingProjection
+
+    transforms = []
+    for row in reconstruct_institution_inquiry_rows(parse_result):
+        fragment_node_ids = tuple(str(value) for value in row.get("fragment_node_ids") or ())
+        if not fragment_node_ids:
+            continue
+        transforms.append(
+            FragmentJoin(
+                scope="credit_report.personal_brief.institution_inquiries",
+                source_node_ids=tuple(str(value) for value in row.get("source_node_ids") or ()),
+                anchor_node_id=str(row.get("anchor_node_id") or ""),
+                fragment_node_ids=fragment_node_ids,
+                reason="wrapped institution fragments follow the inquiry-reason column",
+                confidence=float(row.get("confidence") or 0.99),
+                evidence_ids=tuple(str(value) for value in row.get("evidence_ids") or ()),
+            )
+        )
+        reason_node_ids = tuple(str(value) for value in row.get("reason_node_ids") or ())
+        if len(reason_node_ids) > 1:
+            transforms.append(
+                FragmentJoin(
+                    scope="credit_report.personal_brief.institution_inquiries.reason",
+                    source_node_ids=tuple(str(value) for value in row.get("source_node_ids") or ()),
+                    anchor_node_id=reason_node_ids[0],
+                    fragment_node_ids=reason_node_ids[1:],
+                    reason="wrapped inquiry-reason fragments form one recognized reason",
+                    confidence=float(row.get("confidence") or 0.99),
+                    evidence_ids=tuple(str(value) for value in row.get("evidence_ids") or ()),
+                )
+            )
+    if not transforms:
+        return None
+    return ReadingProjection(plugin_id="credit_report", transforms=tuple(transforms))
+
+
+__all__ = [
+    "build_institution_inquiry_reading_projection",
+    "reconstruct_institution_inquiry_rows",
+]

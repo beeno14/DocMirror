@@ -62,9 +62,11 @@ def _write_community_bundle_files(
     targets = {
         "community": task_dir / f"{file_id}_community.json",
         "content": task_dir / f"{file_id}_content.md",
+        "enhanced_reading": task_dir / f"{file_id}_enhanced_reading.md",
         "datasets": task_dir / f"{file_id}_datasets",
     }
     content = bundle.render_markdown()
+    enhanced_reading = bundle.render_enhanced_markdown()
     community_payload = bundle.json_payload()
     dataset_csvs = bundle.render_dataset_csvs()
     schema_validation = validate_projection_payload("community", community_payload)
@@ -76,6 +78,7 @@ def _write_community_bundle_files(
     writer = ArtifactWriter(task_dir)
     writer.write_text(targets["community"].name, dumps_json(community_payload, ensure_ascii=False, indent=2))
     writer.write_text(targets["content"].name, content)
+    writer.write_text(targets["enhanced_reading"].name, enhanced_reading)
     for relative_path, csv_content in dataset_csvs.items():
         writer.write_text(relative_path, csv_content)
     writer.write_text(f"{file_id}_datasets/_audit_cells.csv", bundle.render_audit_csv())

@@ -40,9 +40,15 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     task_id, written = write_outputs(result, tmp_path, file_id="001", task_id="test_task_001")
 
     assert task_id == "test_task_001"
-    assert {"mirror", "community", "content", "datasets"} <= set(written)
+    assert {"mirror", "community", "content", "enhanced_reading", "datasets"} <= set(written)
     assert written["community"].is_file()
     assert written["content"].name == "001_content.md"
+    assert written["enhanced_reading"].name == "001_enhanced_reading.md"
+    assert written["enhanced_reading"].is_file()
+    enhanced = written["enhanced_reading"].read_text(encoding="utf-8")
+    assert 'mode="enhanced"' in enhanced
+    assert 'plugin="business_license"' in enhanced
+    assert 'transforms="0"' in enhanced
     assert written["datasets"].name == "001_datasets"
     assert written["datasets"].is_dir()
     assert (written["datasets"] / "_audit_cells.csv").is_file()
@@ -85,7 +91,7 @@ def test_write_outputs_can_omit_cli_support_files(tmp_path: Path):
     )
 
     task_dir = tmp_path / task_id
-    assert {"community", "content", "datasets"} <= set(written)
+    assert {"community", "content", "enhanced_reading", "datasets"} <= set(written)
     assert "mirror" not in written
     assert not (task_dir / "001_mirror.json").exists()
     assert not (task_dir / "manifest.json").exists()
@@ -113,6 +119,7 @@ def test_content_markdown_is_identical_between_default_and_all_modes(tmp_path: P
     )
 
     assert default_written["content"].read_bytes() == all_written["content"].read_bytes()
+    assert default_written["enhanced_reading"].read_bytes() == all_written["enhanced_reading"].read_bytes()
 
 
 def test_community_json_records_markdown_image_omission(tmp_path: Path):

@@ -22,6 +22,7 @@ from docmirror.tables.cell_normalizer import normalize_cell_line_breaks
 
 MARKDOWN_PROFILE_VERSION = "1.0"
 MARKDOWN_PROFILE_MARKER = f'<!-- docmirror:markdown-profile version="{MARKDOWN_PROFILE_VERSION}" -->'
+ENHANCED_READING_PROFILE_VERSION = "1.0"
 
 _IMAGE_MARKDOWN_RE = re.compile(r"(?<!\\)!\[[^\]]*\]\([^\n)]*\)")
 _IMAGE_REFERENCE_RE = re.compile(r"(?<!\\)!\[[^\]]*\]\s*\[[^\]]*\]")
@@ -457,6 +458,62 @@ def validate_markdown(markdown: str) -> list[str]:
     return list(dict.fromkeys(issues))
 
 
+def _enhanced_reading_state(
+    node_ids: list[Any],
+    node_by_id: dict[str, Any],
+    reading_projection: Any,
+) -> tuple[dict[str, str], set[str], int, str]:
+    """Validate and materialize source-conserving fragment joins."""
+    from docmirror.output.reading_projection import ReadingProjection
+
+    try:
+        projection = ReadingProjection.model_validate(reading_projection)
+    except Exception:
+        return {}, set(), 0, ""
+
+    ordered = [str(node_id) for node_id in node_ids]
+    text_overrides: dict[str, str] = {}
+    suppressed_node_ids: set[str] = set()
+    applied = 0
+    for transform in projection.transforms:
+        source_ids = list(transform.source_node_ids)
+        if not source_ids:
+            continue
+        contiguous = any(
+            ordered[index : index + len(source_ids)] == source_ids
+            for index in range(0, len(ordered) - len(source_ids) + 1)
+        )
+        if not contiguous:
+            continue
+        anchor = node_by_id.get(transform.anchor_node_id)
+        fragments = [node_by_id.get(node_id) for node_id in transform.fragment_node_ids]
+        if anchor is None or any(fragment is None for fragment in fragments):
+            continue
+        anchor_text = str(getattr(anchor, "text", "") or "")
+        fragment_texts = [str(getattr(fragment, "text", "") or "") for fragment in fragments]
+        if not anchor_text or any(not text for text in fragment_texts):
+            continue
+        text_overrides[transform.anchor_node_id] = anchor_text + "".join(fragment_texts)
+        suppressed_node_ids.update(transform.fragment_node_ids)
+        applied += 1
+    return text_overrides, suppressed_node_ids, applied, projection.plugin_id
+
+
+def _enhanced_profile_marker(plugin_id: str, transforms: int) -> str:
+    plugin = html.escape(str(plugin_id or "generic"), quote=True)
+    return (
+        f'<!-- docmirror:reading-profile version="{ENHANCED_READING_PROFILE_VERSION}" '
+        f'mode="enhanced" plugin="{plugin}" transforms="{transforms}" -->'
+    )
+
+
+def _mark_canonical_as_enhanced(markdown: str, plugin_id: str) -> str:
+    marker = _enhanced_profile_marker(plugin_id, 0)
+    if markdown.startswith(MARKDOWN_PROFILE_MARKER):
+        return markdown.replace(MARKDOWN_PROFILE_MARKER, f"{MARKDOWN_PROFILE_MARKER}\n\n{marker}", 1)
+    return f"{MARKDOWN_PROFILE_MARKER}\n\n{marker}\n\n{markdown.lstrip()}"
+
+
 class MarkdownRenderer:
     """Render all DocMirror Markdown through one DMP implementation."""
 
@@ -477,6 +534,52 @@ class MarkdownRenderer:
             self._render_parse_fallback(parts, result, page_sources)
         return self._finish(parts)
 
+    def render_enhanced_parse_result(
+        self,
+        result: Any,
+        reading_projection: Any = None,
+        *,
+        fallback_plugin_id: str = "generic",
+    ) -> str:
+        """Render an audited plugin reading projection without changing source nodes."""
+        page_sources = {
+            int(getattr(page, "page_number", index) or index): int(
+                getattr(page, "source_page_number", None) or getattr(page, "page_number", index) or index
+            )
+            for index, page in enumerate(getattr(result, "pages", None) or [], start=1)
+        }
+        flow = getattr(result, "document_flow", None)
+        nodes = list(getattr(flow, "nodes", None) or [])
+        reading_flows = list(getattr(flow, "reading_flow", None) or [])
+        if not nodes or not reading_flows:
+            return _mark_canonical_as_enhanced(self.render_parse_result(result), fallback_plugin_id)
+        node_ids = list(getattr(reading_flows[0], "node_ids", None) or [])
+        if not node_ids:
+            return _mark_canonical_as_enhanced(self.render_parse_result(result), fallback_plugin_id)
+        node_by_id = {str(getattr(node, "node_id", "") or ""): node for node in nodes}
+        text_overrides, suppressed_node_ids, applied, plugin_id = _enhanced_reading_state(
+            node_ids,
+            node_by_id,
+            reading_projection,
+        )
+        if applied == 0:
+            return _mark_canonical_as_enhanced(
+                self.render_parse_result(result),
+                plugin_id or fallback_plugin_id,
+            )
+        profile_marker = _enhanced_profile_marker(plugin_id or fallback_plugin_id, applied)
+        parts = [MARKDOWN_PROFILE_MARKER, profile_marker]
+        self._render_parse_flow(
+            parts,
+            result,
+            nodes,
+            reading_flows[0],
+            page_sources,
+            text_overrides=text_overrides,
+            suppressed_node_ids=suppressed_node_ids,
+        )
+        return self._finish(parts)
+
     def _render_parse_flow(
         self,
         parts: list[str],
@@ -484,7 +587,12 @@ class MarkdownRenderer:
         nodes: list[Any],
         reading_flow: Any,
         page_sources: dict[int, int],
+        *,
+        text_overrides: dict[str, str] | None = None,
+        suppressed_node_ids: set[str] | None = None,
     ) -> None:
+        text_overrides = text_overrides or {}
+        suppressed_node_ids = suppressed_node_ids or set()
         node_by_id = {str(getattr(node, "node_id", "") or ""): node for node in nodes}
         table_by_id = {
             str(getattr(table, "table_id", "") or ""): table
@@ -509,6 +617,8 @@ class MarkdownRenderer:
         current_page: int | None = None
         for node_id in list(getattr(reading_flow, "node_ids", None) or []):
             node_key = str(node_id)
+            if node_key in suppressed_node_ids:
+                continue
             if node_key in consumed_nodes:
                 continue
             consumed_nodes.add(node_key)
@@ -535,6 +645,7 @@ class MarkdownRenderer:
                 tables_by_page,
                 consumed_tables,
                 pages_with_text,
+                text_override=text_overrides.get(node_key),
             )
             parts.extend(rendered)
         for page in ordered_pages[page_cursor:]:
@@ -549,6 +660,8 @@ class MarkdownRenderer:
         tables_by_page: dict[int, list[Any]],
         consumed_tables: set[int],
         pages_with_text: set[int],
+        *,
+        text_override: str | None = None,
     ) -> list[str]:
         node_type = str(getattr(node, "type", "") or "")
         role = str(getattr(node, "role", "") or "")
@@ -580,7 +693,7 @@ class MarkdownRenderer:
             return [_image_marker()]
         if role == "key_value":
             return self._render_key_value(metadata.get("key", ""), metadata.get("value", ""))
-        text = getattr(node, "text", "")
+        text = text_override if text_override is not None else getattr(node, "text", "")
         if node_type == "heading":
             return self._render_heading(text, metadata.get("level", ""))
         if node_type == "list_item":
@@ -750,6 +863,20 @@ def render_markdown(result: Any) -> str:
     return DEFAULT_MARKDOWN_RENDERER.render_parse_result(result)
 
 
+def render_enhanced_markdown(
+    result: Any,
+    reading_projection: Any = None,
+    *,
+    fallback_plugin_id: str = "generic",
+) -> str:
+    """Render enhanced reading Markdown from validated plugin transformations."""
+    return DEFAULT_MARKDOWN_RENDERER.render_enhanced_parse_result(
+        result,
+        reading_projection,
+        fallback_plugin_id=fallback_plugin_id,
+    )
+
+
 def render_markdown_from_vnext(mirror: dict[str, Any]) -> str:
     """Render a Mirror vNext mapping using DMP 1.0."""
     return DEFAULT_MARKDOWN_RENDERER.render_mirror_vnext(mirror)
@@ -757,10 +884,12 @@ def render_markdown_from_vnext(mirror: dict[str, Any]) -> str:
 
 __all__ = [
     "DEFAULT_MARKDOWN_RENDERER",
+    "ENHANCED_READING_PROFILE_VERSION",
     "MARKDOWN_PROFILE_MARKER",
     "MARKDOWN_PROFILE_VERSION",
     "MarkdownContractError",
     "MarkdownRenderer",
+    "render_enhanced_markdown",
     "render_markdown",
     "render_markdown_from_vnext",
     "validate_markdown",

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from docmirror.output.markdown_renderer import render_markdown
+from docmirror.output.markdown_renderer import render_enhanced_markdown, render_markdown
 
 _SYSTEM_COLUMNS = ("record_id", "_page_start", "_page_end")
 _AUDIT_COLUMNS = (
@@ -541,6 +541,7 @@ class CommunityBundle:
     files: dict[str, str]
     warnings: list[dict[str, Any]]
     result: Any
+    reading_projection: Any | None = None
 
     def json_payload(self) -> dict[str, Any]:
         sections_by_id = {str(section["id"]): section for section in self.sections}
@@ -578,6 +579,16 @@ class CommunityBundle:
                 }
             )
         return markdown
+
+    def render_enhanced_markdown(self) -> str:
+        """Render the fixed enhanced view, using canonical content as fallback."""
+        entities = getattr(self.result, "entities", None)
+        plugin_id = str(getattr(entities, "document_type", "") or self.schema.get("domain") or "generic")
+        return render_enhanced_markdown(
+            self.result,
+            self.reading_projection,
+            fallback_plugin_id=plugin_id,
+        )
 
     def render_dataset_csvs(self) -> dict[str, str]:
         """Render one intuitive wide CSV per logical dataset."""
