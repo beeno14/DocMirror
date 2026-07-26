@@ -3,7 +3,9 @@
 
 from types import SimpleNamespace
 
-from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow
+import pytest
+
+from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow, TextBlock
 from docmirror.plugins.credit_report.report_profile import (
     detect_credit_report_content_mode,
     detect_credit_report_subtype,
@@ -32,9 +34,46 @@ def test_personal_brief_native_header_recovery_stops_at_adjacent_labels() -> Non
     assert fields["subject_name"] == "张三"
     assert fields["id_type"] == "身份证"
     assert fields["id_number"] == "11010519491231002X"
+    assert fields["marital_status"] == "married"
     assert fields["report_time"] == "2026-07-19T09:08:07"
     assert fields["report_subtype"] == "personal_brief"
     assert fields["content_mode"] == "native_text"
+
+
+@pytest.mark.parametrize(
+    ("source_value", "normalized"),
+    [
+        ("未婚", "unmarried"),
+        ("已婚", "married"),
+        ("离婚", "divorced"),
+    ],
+)
+def test_personal_marital_status_normalizes_three_supported_values(
+    source_value: str,
+    normalized: str,
+) -> None:
+    result = _result(
+        PageContent(
+            page_number=1,
+            texts=[
+                TextBlock(
+                    content=(
+                        "报告编号：2026071900012345678901\n"
+                        "姓名：张三\n证件类型：身份证\n证件号码：11010519491231002X\n"
+                        f"{source_value}"
+                    )
+                )
+            ],
+        )
+    )
+
+    fields = recover_credit_report_header_fields(
+        result,
+        "个人信用报告 信贷记录",
+        report_subtype="personal_brief",
+    )
+
+    assert fields["marital_status"] == normalized
 
 
 def test_personal_brief_does_not_treat_inquiry_ledger_as_header_institution() -> None:

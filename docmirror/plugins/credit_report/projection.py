@@ -9,7 +9,14 @@ from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
 
-_DEFAULT_RECORD_ID_KEYS = ("record_id", "account_id", "liability_id", "inquiry_id", "public_record_id")
+_DEFAULT_RECORD_ID_KEYS = (
+    "record_id",
+    "account_id",
+    "liability_id",
+    "inquiry_id",
+    "public_record_id",
+    "note_id",
+)
 _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 
 
@@ -59,6 +66,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     )
     from docmirror.plugins._base.kv_projection import extract_kv_projection
     from docmirror.plugins.credit_report.business_assembly import assemble_credit_report_business
+    from docmirror.plugins.credit_report.business_records import extract_personal_brief_section_content
     from docmirror.plugins.credit_report.report_profile import (
         detect_credit_report_content_mode,
         detect_credit_report_subtype,
@@ -67,6 +75,11 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     from docmirror.plugins.credit_report.scanned_business import (
         extract_scanned_credit_business,
         link_repayment_records_to_accounts,
+    )
+    from docmirror.plugins.credit_report.semantic_enrichment import (
+        credit_report_data_dictionary,
+        credit_report_semantic_extensions,
+        enrich_credit_report_record_evidence,
     )
 
     base = extract_kv_projection(
@@ -155,36 +168,66 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         },
         existing_summary=dict(scanned_business.get("credit_summary") or {}),
     )
-    dataset_names = (
+    dataset_names = [
         "credit_accounts",
-        "credit_lines",
         "repayment_liability_records",
         "repayment_records",
         "overdue_records",
         "inquiry_records",
         "public_records",
-    )
+    ]
+    if report_subtype != "personal_brief":
+        dataset_names.insert(1, "credit_lines")
     datasets = {name: rows for name in dataset_names if (rows := _records(name, assembled.get(name)))}
     if assembled.get("credit_summary"):
         domain_facts["credit_summary"] = dict(assembled["credit_summary"])
     if assembled.get("credit_extraction_audit"):
         domain_facts["credit_extraction_audit"] = dict(assembled["credit_extraction_audit"])
+    section_content: dict[str, Any] = {}
+    if report_subtype == "personal_brief":
+        section_content = extract_personal_brief_section_content(parse_result, full_text)
+        for fact_name in ("non_credit_transaction_summary", "public_record_summary"):
+            value = section_content.get(fact_name)
+            if isinstance(value, dict) and value.get("source_statement"):
+                domain_facts[fact_name] = value
+        report_notes = list(section_content.get("report_notes") or [])
+        if report_notes:
+            enrich_credit_report_record_evidence(parse_result, {"report_notes": report_notes})
+            datasets["report_notes"] = _records("report_notes", report_notes)
+    domain_facts["data_dictionary"] = credit_report_data_dictionary()
+    evidence_ids = tuple(
+        dict.fromkeys(
+            [
+                *base.evidence_ids,
+                *[
+                    str(evidence_id)
+                    for rows in datasets.values()
+                    for row in rows
+                    for evidence_id in (row.get("evidence_ids") or [])
+                    if evidence_id
+                ],
+            ]
+        )
+    )
 
     entity_fields = dict(base.entity_fields)
     if domain_facts.get("subject_name"):
         entity_fields["subject_name"] = domain_facts["subject_name"]
     if domain_facts.get("id_number"):
         entity_fields["subject_id"] = domain_facts["id_number"]
+    if domain_facts.get("marital_status"):
+        entity_fields["marital_status"] = domain_facts["marital_status"]
     warnings = tuple(dict.fromkeys((*base.warnings, *_account_structure_warnings(credit_accounts))))
     return ProjectionData(
         projector_id=base.projector_id,
         document_type=base.document_type,
         entity_fields=entity_fields,
         domain_facts=domain_facts,
+        semantic=credit_report_semantic_extensions(report_subtype=report_subtype),
         datasets=datasets,
         sections=tuple(build_credit_sections_light(parse_result, full_text)),
         warnings=warnings,
-        evidence_ids=base.evidence_ids,
+        evidence_ids=evidence_ids,
         confidence=base.confidence,
         reason="post-seal credit-report projection",
     )

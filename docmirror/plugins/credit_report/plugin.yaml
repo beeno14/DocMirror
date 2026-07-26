@@ -24,11 +24,23 @@ projection:
     overdue_records: 逾期记录
     inquiry_records: 查询记录
     public_records: 公共记录
+    report_notes: 说明
     residence_records: 居住信息
     employment_records: 职业信息
     repayment_liability_records: 相关还款责任信息
-  summary_facts: {credit_summary: credit_summary}
+  summary_facts:
+    credit_summary: credit_summary
+    non_credit_transaction_summary: non_credit_transactions
+    public_record_summary: public_records
   internal_facts: [credit_extraction_audit]
+  internal_fields:
+    - classification_source
+    - doc_type_hint_source
+    - user_doc_type_hint
+    - user_doc_type_hint_strength
+    - document_scene_refined
+    - layout_profile_id_refined
+    - layout_profile_refine_confidence
   section_markers:
     credit_accounts: [credit_details]
     credit_lines: [credit_details]
@@ -37,14 +49,72 @@ projection:
     overdue_records: [credit_details, repayment_history]
     public_records: [public_records]
     inquiry_records: [inquiries]
+    report_notes: [notes]
   section_type_markers:
     信息概要: credit_summary
     基本信息: basic_information
     身份: identity
+    非信贷: non_credit_transactions
     信贷: credit_details
     还款: repayment_history
     公共: public_records
     查询: inquiries
+    说明: notes
+  reading_columns:
+    credit_accounts:
+      - sequence
+      - account_type
+      - institution
+      - business_type
+      - account_identifier
+      - card_tail
+      - open_date
+      - snapshot_date
+      - due_date
+      - close_date
+      - currency
+      - credit_limit
+      - credit_limit_status
+      - used_amount
+      - used_amount_status
+      - loan_amount
+      - loan_amount_status
+      - balance
+      - balance_status
+      - account_state
+      - activation_state
+      - payoff_state
+    credit_lines:
+      - credit_line_id
+      - account_id
+      - account_identifier
+      - facility_type
+      - institution
+      - total_limit
+      - total_limit_status
+      - used_limit
+      - used_limit_status
+      - currency
+      - account_state
+      - payoff_state
+    repayment_liability_records:
+      - sequence
+      - liability_date
+      - related_party_name
+      - institution
+      - business_type
+      - responsibility_amount
+      - balance
+      - currency
+    inquiry_records:
+      - sequence
+      - inquiry_date
+      - institution
+      - reason
+      - inquiry_type
+    report_notes:
+      - sequence
+      - content
 
 resources:
   field_schema: resources/field_schema.yaml

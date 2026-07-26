@@ -170,10 +170,10 @@ def test_community_enhanced_markdown_uses_projected_rows_without_changing_canoni
     assert 'docmirror:reading-profile version="2.0"' in enhanced
     assert 'source="community-semantic"' in enhanced
     assert "平安融易（江苏）融资担保有限公\n\n担保资格审查\n\n司" in canonical
-    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | institution |" in enhanced
+    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | 机构查询 |" in enhanced
     assert (
         "| 103 | 2023-04-28 | 福建漳州农村商业银行股份有限公司 | "
-        "法人代表、负责人、高管等资信审查 | institution |"
+        "法人代表、负责人、高管等资信审查 | 机构查询 |"
     ) in enhanced
     assert "不应调整有限公" not in enhanced
     assert sealed.integrity_fingerprint == fingerprint
@@ -204,7 +204,7 @@ def test_write_outputs_persists_enhanced_reading_without_private_reading_project
     enhanced = enhanced_path.read_text(encoding="utf-8")
     assert enhanced_path.name == "001_enhanced_reading.md"
     assert "平安融易（江苏）融资担保有限公\n\n担保资格审查\n\n司" in canonical
-    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | institution |" in enhanced
+    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | 机构查询 |" in enhanced
     assert 'source="community-semantic"' in enhanced
     assert result.model_dump(mode="python") == before
 

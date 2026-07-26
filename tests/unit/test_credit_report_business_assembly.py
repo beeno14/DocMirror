@@ -195,6 +195,7 @@ def test_assembly_reports_collection_evidence_coverage() -> None:
                     "public_record_id": "public-1",
                     "record_type": "judgment",
                     "authority": "示例法院",
+                    "source_refs": [{"source": "native_text", "page": 1}],
                     "confidence": 0.9,
                 }
             ]

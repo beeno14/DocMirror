@@ -122,6 +122,7 @@ _TYPE_MAP = {
     "identifier": "string",
     "id_number": "string",
     "account_number": "string",
+    "long_id": "string",
     "email": "string",
     "array": "text",
     "object": "text",
@@ -373,6 +374,8 @@ def _public_record(
     for key in ("source_refs", "source_cell_refs", "source_fact_ids", "evidence_ids"):
         if key not in source and row_mapping.get(key) not in (None, "", []):
             source[key] = _json_safe(row_mapping[key])
+    if "confidence" not in source and row_mapping.get("confidence") not in (None, ""):
+        source["confidence"] = _json_safe(row_mapping["confidence"])
     page_range = _page_range(source_value, _page_range(row_mapping, fallback_page_range))
     if page_range:
         source["page_range"] = page_range
@@ -428,6 +431,11 @@ def _dataset_columns(rows: list[Any], dictionary: dict[str, Any], dataset_id: st
         }
         if info.get("unit") not in (None, ""):
             column["unit"] = str(info["unit"])
+        if str(info.get("format") or info.get("type") or "").lower() == "long_id":
+            column["format"] = "long_id"
+        for metadata_key in ("definition", "sensitive", "display", "aggregation"):
+            if info.get(metadata_key) not in (None, ""):
+                column[metadata_key] = _json_safe(info[metadata_key])
         columns.append(column)
     return columns
 
@@ -551,7 +559,9 @@ def _warning_code(raw: str) -> str:
 
 def _reading_column_keys(dataset: dict[str, Any]) -> list[str]:
     available = [str(column.get("key") or "") for column in dataset.get("columns") or [] if column.get("key")]
-    preferred = _READING_COLUMN_PREFERENCES.get(str(dataset.get("name") or ""), ())
+    preferred = tuple(dataset.get("reading_columns") or ()) or _READING_COLUMN_PREFERENCES.get(
+        str(dataset.get("name") or ""), ()
+    )
     selected = [key for key in preferred if key in available]
     return selected or available
 
@@ -625,8 +635,51 @@ def _markdown_text(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
 
 
+def _masked_display(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= 4:
+        return "*" * len(text)
+    if len(text) <= 8:
+        return f"{text[:1]}{'*' * (len(text) - 3)}{text[-2:]}"
+    return f"{text[:4]}{'*' * max(4, len(text) - 8)}{text[-4:]}"
+
+
+def _markdown_display(
+    value: Any,
+    *,
+    key: str,
+    descriptor: dict[str, Any],
+    dictionary: dict[str, Any],
+    privacy_mode: str = "masked",
+) -> str:
+    if privacy_mode != "full" and (
+        descriptor.get("sensitive") is True or descriptor.get("display") == "masked"
+    ):
+        return _markdown_text(_masked_display(value))
+    enums = dictionary.get("enums") if isinstance(dictionary.get("enums"), dict) else {}
+    enum_values = enums.get(key) if isinstance(enums.get(key), dict) else {}
+    if not enum_values and key.endswith("_status"):
+        enum_values = enums.get("reporting_status") if isinstance(enums.get("reporting_status"), dict) else {}
+    if isinstance(value, (str, int, float, bool)) and value in enum_values:
+        return _markdown_text(enum_values[value])
+    return _markdown_text(value)
+
+
 def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     """Transcribe a public Community semantic result without accessing ParseResult."""
+    semantic_domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
+    dictionary = (
+        semantic_domain.get("data_dictionary")
+        if isinstance(semantic_domain.get("data_dictionary"), dict)
+        else {}
+    )
+    extensions = semantic_domain.get("extensions") if isinstance(semantic_domain.get("extensions"), dict) else {}
+    presentation = (
+        extensions.get("enhanced_markdown")
+        if isinstance(extensions.get("enhanced_markdown"), dict)
+        else {}
+    )
+    privacy_mode = str(presentation.get("privacy_mode") or "masked")
     if (payload.get("schema") or {}).get("name") == "docmirror.community.semantic":
         payload = _community_view_from_semantic(payload)
     document = payload.get("document") or {}
@@ -643,11 +696,76 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         ("Document type", document.get("type")),
         ("Pages", document.get("page_count")),
     ]
-    for label, value in metadata:
-        if value not in (None, ""):
-            parts.append(f"**{label}:** {_markdown_text(value)}")
+    if presentation.get("show_top_document_metadata", True):
+        for label, value in metadata:
+            if value not in (None, ""):
+                parts.append(f"**{label}:** {_markdown_text(value)}")
+
+    dictionary_fields = dictionary.get("fields") if isinstance(dictionary.get("fields"), dict) else {}
+
+    def document_value(path: str) -> Any:
+        value: Any = document
+        for part in path.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
+
+    def item_line(item: dict[str, Any], *, label: str = "") -> str:
+        key = str(item.get("key") or "")
+        return (
+            f"**{_markdown_text(label or item.get('label') or key)}:** "
+            f"{_markdown_display(item.get('value'), key=key, descriptor=item, dictionary=dictionary, privacy_mode=privacy_mode)}"
+        )
+
+    def document_item(spec: dict[str, Any]) -> dict[str, Any] | None:
+        path = str(spec.get("path") or "")
+        key = str(spec.get("key") or path.replace(".", "_"))
+        value = document_value(path)
+        if not path or value in (None, "", [], {}):
+            return None
+        descriptor = dictionary_fields.get(key) if isinstance(dictionary_fields.get(key), dict) else {}
+        return {
+            "key": key,
+            "label": str(spec.get("label") or descriptor.get("label") or key.replace("_", " ")),
+            "value": value,
+            **{
+                metadata_key: descriptor[metadata_key]
+                for metadata_key in ("sensitive", "display")
+                if descriptor.get(metadata_key) not in (None, "")
+            },
+        }
+
+    def section_pools(section: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        items = {
+            str(item.get("key") or ""): item
+            for item in section.get("items") or []
+            if isinstance(item, dict) and item.get("key")
+        }
+        groups = {
+            str(group.get("key") or ""): group
+            for group in section.get("groups") or []
+            if isinstance(group, dict) and group.get("key")
+        }
+        return items, groups
+
+    def configured_item(
+        reference: Any,
+        items: dict[str, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        spec = reference if isinstance(reference, dict) else {"key": str(reference)}
+        key = str(spec.get("key") or "")
+        item = items.get(key)
+        if item is None and spec.get("fallback"):
+            item = items.get(str(spec["fallback"]))
+        return item
 
     rendered_sections: set[str] = set()
+    section_layouts = (
+        presentation.get("section_layouts")
+        if isinstance(presentation.get("section_layouts"), dict)
+        else {}
+    )
     for entry in reading.get("document_flow") or []:
         kind = str(entry.get("kind") or "")
         ref_id = str(entry.get("ref_id") or "")
@@ -657,15 +775,56 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                 continue
             rendered_sections.add(ref_id)
             parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or ref_id)}")
-            for item in section.get("items") or []:
-                parts.append(f"**{_markdown_text(item.get('label') or item.get('key'))}:** {_markdown_text(item.get('value'))}")
-            for group in section.get("groups") or []:
-                parts.append(f"### {_markdown_text(group.get('label') or group.get('key'))}")
-                for item in group.get("items") or []:
-                    parts.append(
-                        f"**{_markdown_text(item.get('label') or item.get('key'))}:** "
-                        f"{_markdown_text(item.get('value'))}"
+            layout = section_layouts.get(str(section.get("type") or ""))
+            if isinstance(layout, dict):
+                items, groups = section_pools(section)
+                rendered_item_keys: set[str] = set()
+                rendered_group_keys: set[str] = set()
+                for group_spec in layout.get("groups") or []:
+                    if not isinstance(group_spec, dict):
+                        continue
+                    group_parts: list[str] = []
+                    for reference in group_spec.get("fields") or []:
+                        item = configured_item(reference, items)
+                        if item is None:
+                            continue
+                        rendered_item_keys.add(str(item.get("key") or ""))
+                        group_parts.append(item_line(item))
+                    for spec in group_spec.get("document_fields") or []:
+                        item = document_item(spec) if isinstance(spec, dict) else None
+                        if item is not None:
+                            group_parts.append(item_line(item))
+                    for group_key in group_spec.get("nested_groups") or []:
+                        group = groups.get(str(group_key))
+                        if group is None or not group.get("items"):
+                            continue
+                        rendered_group_keys.add(str(group_key))
+                        group_parts.append(f"#### {_markdown_text(group.get('label') or group.get('key'))}")
+                        group_parts.extend(
+                            item_line(item) for item in group.get("items") or [] if isinstance(item, dict)
+                        )
+                    if group_parts:
+                        parts.append(f"### {_markdown_text(group_spec.get('title') or '概要')}")
+                        parts.extend(group_parts)
+                if not layout.get("omit_unlisted", False):
+                    parts.extend(
+                        item_line(item)
+                        for key, item in items.items()
+                        if key not in rendered_item_keys
                     )
+                    for key, group in groups.items():
+                        if key in rendered_group_keys:
+                            continue
+                        parts.append(f"### {_markdown_text(group.get('label') or group.get('key'))}")
+                        parts.extend(
+                            item_line(item) for item in group.get("items") or [] if isinstance(item, dict)
+                        )
+            else:
+                for item in section.get("items") or []:
+                    parts.append(item_line(item))
+                for group in section.get("groups") or []:
+                    parts.append(f"### {_markdown_text(group.get('label') or group.get('key'))}")
+                    parts.extend(item_line(item) for item in group.get("items") or [] if isinstance(item, dict))
             continue
         if kind != "dataset":
             continue
@@ -682,25 +841,76 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             parts.append("_No displayable columns._")
             continue
         labels = [_markdown_text(column_by_key[key].get("label") or key) for key in keys]
-        lines = [
-            "| " + " | ".join(labels) + " |",
-            "| " + " | ".join("---" for _ in keys) + " |",
-        ]
-        for row in dataset.get("rows") or []:
-            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
-            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
-            values = [_markdown_text(normalized.get(key, canonical_raw.get(key))) for key in keys]
-            lines.append("| " + " | ".join(values) + " |")
-        parts.append("\n".join(lines))
+        def render_rows(rows: list[dict[str, Any]]) -> str:
+            lines = [
+                "| " + " | ".join(labels) + " |",
+                "| " + " | ".join("---" for _ in keys) + " |",
+            ]
+            for row in rows:
+                normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+                canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+                values = [
+                    _markdown_display(
+                        normalized.get(key, canonical_raw.get(key)),
+                        key=key,
+                        descriptor=column_by_key[key],
+                        dictionary=dictionary,
+                        privacy_mode=privacy_mode,
+                    )
+                    for key in keys
+                ]
+                lines.append("| " + " | ".join(values) + " |")
+            return "\n".join(lines)
+
+        dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
+        if dataset.get("name") == "inquiry_records" and "inquiry_type" in keys:
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in dataset_rows:
+                normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+                canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+                group_key = str(normalized.get("inquiry_type", canonical_raw.get("inquiry_type")) or "unknown")
+                grouped.setdefault(group_key, []).append(row)
+            enum_labels = ((dictionary.get("enums") or {}).get("inquiry_type") or {})
+            for group_key in ("institution", "personal", *sorted(set(grouped) - {"institution", "personal"})):
+                rows = grouped.get(group_key)
+                if not rows:
+                    continue
+                parts.append(f"#### {_markdown_text(enum_labels.get(group_key) or group_key)}")
+                parts.append(render_rows(rows))
+        else:
+            parts.append(render_rows(dataset_rows))
 
     for section_id, section in sections.items():
         if section_id not in rendered_sections:
             parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or section_id)}")
+
+    appendix = presentation.get("appendix") if isinstance(presentation.get("appendix"), dict) else {}
+    if appendix:
+        all_items: dict[str, dict[str, Any]] = {}
+        for section in sections.values():
+            section_items, _section_groups = section_pools(section)
+            all_items.update(section_items)
+        appendix_parts: list[str] = []
+        for reference in appendix.get("fields") or []:
+            item = configured_item(reference, all_items)
+            if item is not None:
+                appendix_parts.append(item_line(item))
+        for spec in appendix.get("document_fields") or []:
+            item = document_item(spec) if isinstance(spec, dict) else None
+            if item is not None:
+                appendix_parts.append(item_line(item))
+        if appendix_parts:
+            parts.append(f"## {_markdown_text(appendix.get('title') or '附录')}")
+            parts.extend(appendix_parts)
     return "\n\n".join(part for part in parts if part).rstrip() + "\n"
 
 
-def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> dict[str, Any]:
-    """Publish source-order blocks and physical tables without mutating ParseResult."""
+def _semantic_source_structure(
+    result: Any,
+    sections: list[dict[str, Any]],
+    datasets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Publish source-order blocks plus auditable logical reconstructions."""
     graph = getattr(result, "document_flow", None)
 
     def graph_values(name: str) -> list[Any]:
@@ -735,11 +945,25 @@ def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> d
     )
 
     blocks: list[dict[str, Any]] = []
+    section_titles = {
+        re.sub(r"\s+", "", str(section.get("title") or "")): str(section.get("id") or "")
+        for section in sections
+        if section.get("title")
+    }
     for order, node in enumerate(ordered_nodes, start=1):
+        node_text = str(getattr(node, "text", "") or "")
+        compact_node_text = re.sub(r"\s+", "", node_text)
+        role = str(getattr(node, "role", "") or "body")
+        if compact_node_text in section_titles:
+            role = "heading"
+        elif order == 1 and any(marker in compact_node_text for marker in ("信用报告", "征信报告")):
+            role = "title"
+        elif re.fullmatch(r"\d+[.、]?", compact_node_text):
+            role = "list_marker"
         block: dict[str, Any] = {
             "id": str(getattr(node, "node_id", "") or f"source:block:{order:06d}"),
             "kind": str(getattr(node, "type", "") or "paragraph"),
-            "role": str(getattr(node, "role", "") or "body"),
+            "role": role,
             "order": order,
             "page": max(1, int(getattr(node, "page", 1) or 1)),
             "text": str(getattr(node, "text", "") or ""),
@@ -755,6 +979,8 @@ def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> d
         metadata = getattr(node, "metadata", None)
         if isinstance(metadata, dict) and metadata:
             block["extensions"] = _json_safe(metadata)
+            if metadata.get("table_id"):
+                block["source_table_ref"] = str(metadata["table_id"])
         blocks.append(block)
 
     if not blocks:
@@ -855,11 +1081,179 @@ def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> d
                 source_table["extraction_layer"] = str(extraction_layer)
             source_tables.append(source_table)
 
+    synthesized_flows: list[dict[str, Any]] = []
+    for dataset in datasets:
+        if str(dataset.get("name") or "") != "inquiry_records":
+            continue
+        column_keys = [
+            key
+            for key in ("sequence", "inquiry_date", "institution", "reason", "inquiry_type")
+            if any(str(column.get("key") or "") == key for column in dataset.get("columns") or [])
+        ]
+        logical_rows: list[list[str]] = []
+        row_models: list[dict[str, Any]] = []
+        pages: list[int] = []
+        evidence_ids: list[str] = []
+        for row in dataset.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            page_range = [int(value) for value in (source.get("page_range") or []) if int(value or 0) > 0]
+            pages.extend(page_range)
+            row_evidence = [str(value) for value in (source.get("evidence_ids") or []) if value]
+            evidence_ids.extend(row_evidence)
+            logical_rows.append([str(normalized.get(key, raw.get(key)) or "") for key in column_keys])
+            row_models.append(
+                {
+                    "record_id": str(row.get("record_id") or ""),
+                    "page_range": page_range,
+                    "source_refs": _json_safe(source.get("source_refs") or []),
+                    "evidence_ids": row_evidence,
+                }
+            )
+        if not logical_rows:
+            continue
+        logical_id = f"logical:{dataset['id']}"
+        page_start = min(pages) if pages else 1
+        page_end = max(pages) if pages else page_start
+        segments = [
+            {
+                "id": f"{logical_id}:p{page}",
+                "page": page,
+                "record_ids": [
+                    model["record_id"]
+                    for model in row_models
+                    if page in (model.get("page_range") or [])
+                ],
+                "repeated_header": page != page_start,
+            }
+            for page in sorted(set(pages))
+        ]
+        source_tables.append(
+            {
+                "id": logical_id,
+                "kind": "logical_reconstruction",
+                "dataset_id": str(dataset.get("id") or ""),
+                "section_id": str(dataset.get("section_id") or ""),
+                "page": page_start,
+                "page_start": page_start,
+                "page_end": page_end,
+                "order": len(source_tables) + 1,
+                "headers": column_keys,
+                "rows": logical_rows,
+                "row_models": row_models,
+                "record_ids": [model["record_id"] for model in row_models],
+                "segments": segments,
+                "evidence_ids": list(dict.fromkeys(evidence_ids)),
+                "provenance": "plugin_reconstruction_from_source_blocks",
+            }
+        )
+        if page_end > page_start:
+            synthesized_flows.append(
+                {
+                    "id": f"flow:{logical_id}",
+                    "type": "table_continuation",
+                    "source_table_ref": logical_id,
+                    "page_start": page_start,
+                    "page_end": page_end,
+                    "segment_refs": [segment["id"] for segment in segments],
+                    "repeated_headers": [segment["id"] for segment in segments if segment["repeated_header"]],
+                    "evidence_refs": list(dict.fromkeys(evidence_ids)),
+                }
+            )
+
+    heading_indexes: dict[str, int] = {}
+    for section in sections:
+        section_id = str(section.get("id") or "")
+        title = re.sub(r"\s+", "", str(section.get("title") or ""))
+        matched = next(
+            (
+                index
+                for index in range(len(blocks))
+                if re.sub(r"\s+", "", str(blocks[index].get("text") or "")) == title
+            ),
+            None,
+        )
+        if matched is not None:
+            heading_indexes[section_id] = matched
+            blocks[matched]["role"] = "heading"
+
+    ordered_heading_indexes = sorted(set(heading_indexes.values()))
+
+    def next_heading(index: int) -> int:
+        return next((value for value in ordered_heading_indexes if value > index), len(blocks))
+
+    dataset_indexes_by_section: dict[str, list[int]] = {}
+    for dataset in datasets:
+        section_id = str(dataset.get("section_id") or "")
+        for row in dataset.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            for ref in source.get("source_refs") or []:
+                if not isinstance(ref, dict):
+                    continue
+                for node_id in [ref.get("node_id"), *(ref.get("node_ids") or [])]:
+                    node_id = str(node_id or "")
+                    if node_id:
+                        index = next(
+                            (position for position, block in enumerate(blocks) if str(block.get("id") or "") == node_id),
+                            None,
+                        )
+                        if index is not None:
+                            dataset_indexes_by_section.setdefault(section_id, []).append(index)
+
+    claimed_by_dataset_sections: dict[str, set[int]] = {}
+    for section_id, indexes in dataset_indexes_by_section.items():
+        if not indexes:
+            continue
+        first_index = min(indexes)
+        data_start = first_index
+        while data_start > 0:
+            previous = blocks[data_start - 1]
+            if previous.get("role") == "heading" or previous.get("kind") == "physical_table":
+                break
+            data_start -= 1
+        data_end = next_heading(max(indexes))
+        claimed_by_dataset_sections[section_id] = set(range(data_start, data_end))
+    all_dataset_claims = {
+        index for claimed in claimed_by_dataset_sections.values() for index in claimed
+    }
+
     semantic_sections: list[dict[str, Any]] = []
     for section in sections:
         public = {key: _json_safe(value) for key, value in section.items() if not key.startswith("_")}
-        page_range = list(public.get("page_range") or [])
-        if len(page_range) == 2:
+        section_id = str(public.get("id") or "")
+        if section_id in heading_indexes:
+            start_index = heading_indexes[section_id]
+            section_indexes = set(range(start_index, next_heading(start_index)))
+            if section_id in claimed_by_dataset_sections:
+                section_indexes.update(claimed_by_dataset_sections[section_id])
+            else:
+                section_indexes.difference_update(all_dataset_claims)
+            section_blocks = [blocks[index] for index in sorted(section_indexes)]
+            public["block_refs"] = [str(block["id"]) for block in section_blocks]
+            public["source_table_refs"] = list(
+                dict.fromkeys(
+                    [
+                        str(block.get("source_table_ref") or "")
+                        for block in section_blocks
+                        if block.get("source_table_ref")
+                    ]
+                    + [
+                        str(table.get("id") or "")
+                        for table in source_tables
+                        if str(table.get("section_id") or "") == section_id
+                    ]
+                )
+            )
+        else:
+            page_range = list(public.get("page_range") or [])
+            if len(page_range) != 2:
+                semantic_sections.append(public)
+                continue
             start, end = int(page_range[0]), int(page_range[1])
             public["block_refs"] = [
                 str(block["id"]) for block in blocks if start <= int(block.get("page") or 1) <= end
@@ -868,15 +1262,31 @@ def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> d
                 str(table["id"]) for table in source_tables if start <= int(table.get("page") or 1) <= end
             ]
         semantic_sections.append(public)
+    outline = graph_values("outline")
+    if not outline:
+        outline = [
+            {
+                "id": f"outline:{section.get('id')}",
+                "level": 1,
+                "title": str(section.get("title") or ""),
+                "section_id": str(section.get("id") or ""),
+                "block_ref": (
+                    str(blocks[heading_indexes[str(section.get("id") or "")]]["id"])
+                    if str(section.get("id") or "") in heading_indexes
+                    else ""
+                ),
+            }
+            for section in semantic_sections
+        ]
     return {
         "sections": semantic_sections,
         "blocks": blocks,
         "source_tables": source_tables,
         "reading_flows": graph_values("reading_flow"),
-        "outline": graph_values("outline"),
+        "outline": outline,
         "edges": graph_values("edges"),
         "relations": graph_values("relations"),
-        "cross_page_flows": graph_values("cross_page_flows"),
+        "cross_page_flows": [*graph_values("cross_page_flows"), *synthesized_flows],
         "suppressed_noise": graph_values("suppressed_noise"),
     }
 
@@ -890,6 +1300,13 @@ def _semantic_bindings(
     table_ids = {
         str(table.get("id") or "") for table in structure.get("source_tables") or [] if isinstance(table, dict)
     }
+    logical_tables_by_record: dict[str, list[str]] = {}
+    for table in structure.get("source_tables") or []:
+        if not isinstance(table, dict) or table.get("kind") != "logical_reconstruction":
+            continue
+        table_id = str(table.get("id") or "")
+        for record_id in table.get("record_ids") or []:
+            logical_tables_by_record.setdefault(str(record_id), []).append(table_id)
     bindings: list[dict[str, Any]] = []
     for dataset in datasets:
         dataset_id = str(dataset.get("id") or "")
@@ -924,6 +1341,9 @@ def _semantic_bindings(
                 evidence = str(evidence or "")
                 if evidence and evidence not in evidence_refs:
                     evidence_refs.append(evidence)
+            for table_id in logical_tables_by_record.get(record_id, []):
+                if table_id not in source_table_refs:
+                    source_table_refs.append(table_id)
             binding: dict[str, Any] = {
                 "id": f"binding:{dataset_id}:{record_id}",
                 "dataset_id": dataset_id,
@@ -1055,7 +1475,7 @@ class CommunityBundle:
                 if key not in {"document_type", "projector_id", "support_level"}
             },
         }
-        structure = _semantic_source_structure(self.result, public_sections)
+        structure = _semantic_source_structure(self.result, public_sections, public_datasets)
         payload = {
             "schema": {
                 "name": "docmirror.community.semantic",
@@ -1131,9 +1551,14 @@ class CommunityBundle:
                 for column in columns:
                     key = str(column["key"])
                     value = normalized.get(key, raw.get(key))
+                    csv_type = (
+                        "long_id"
+                        if str(column.get("format") or "").lower() == "long_id"
+                        else str(column.get("type") or "string")
+                    )
                     output_row[key] = _csv_safe(
-                        _json_value(value, str(column.get("type") or "string")),
-                        str(column.get("type") or "string"),
+                        _json_value(value, csv_type),
+                        csv_type,
                     )
                 writer.writerow(output_row)
             rendered[relative_path] = "\ufeff" + output.getvalue()
@@ -1215,7 +1640,11 @@ class CommunityBundle:
                     if value in (None, "") and raw_value in (None, ""):
                         continue
                     column = columns.get(key) or {"key": key, "label": key, "type": _type_of(value)}
-                    value_type = str(column.get("type") or "string")
+                    value_type = (
+                        "long_id"
+                        if str(column.get("format") or "").lower() == "long_id"
+                        else str(column.get("type") or "string")
+                    )
                     safe_value, value_escaped = _csv_safe_with_flag(_json_value(value, value_type), value_type)
                     safe_raw, raw_escaped = _csv_safe_with_flag(_scalar(raw_value), value_type)
                     field_evidence = _field_evidence(value, source, page_range)
@@ -1246,6 +1675,8 @@ def _csv_safe_with_flag(value: Any, value_type: str = "string") -> tuple[Any, bo
         return value, False
     # Prevent spreadsheet formula execution for textual cells without changing
     # legitimate signed numbers such as -10.25. JSON remains untouched.
+    if value_type == "long_id" and value:
+        return ("'" + value if not value.startswith("'") else value), not value.startswith("'")
     textual_types = {"string", "text", "enum", "date", "datetime"}
     escaped = value_type in textual_types and value.startswith(("=", "+", "-", "@"))
     return ("'" + value if escaped else value), escaped
@@ -1325,8 +1756,13 @@ def project_community_bundle(
         value = getattr(entities, key, None)
         if value not in (None, ""):
             fields[key] = value
+    internal_fields = {str(key) for key in (projection_policy or {}).get("internal_fields") or ()}
     for key, value in extension.items():
-        if key.startswith("_") or key in {"field_details", "data_dictionary", "community_support_level"}:
+        if (
+            key.startswith("_")
+            or key in {"field_details", "data_dictionary", "community_support_level"}
+            or key in internal_fields
+        ):
             continue
         if not isinstance(value, (dict, list)):
             fields[key] = value
@@ -1461,6 +1897,11 @@ def project_community_bundle(
         }
         if unit:
             item["unit"] = unit
+        field_descriptors = dictionary.get("fields") if isinstance(dictionary.get("fields"), dict) else {}
+        descriptor = field_descriptors.get(str(key)) if isinstance(field_descriptors.get(str(key)), dict) else {}
+        for metadata_key in ("definition", "sensitive", "display"):
+            if descriptor.get(metadata_key) not in (None, ""):
+                item[metadata_key] = _json_safe(descriptor[metadata_key])
         field_section["items"].append(item)
 
     for fact_key, section_type in (projection.get("summary_facts") or {}).items():
@@ -1472,7 +1913,7 @@ def project_community_bundle(
             if value in (None, "", [], {}):
                 continue
             if isinstance(value, dict):
-                group = {"key": str(key), "label": str(key).replace("_", " "), "items": []}
+                group = {"key": str(key), "label": _field_label(str(key), dictionary), "items": []}
                 for child_key, child_value in value.items():
                     if child_value in (None, "", [], {}):
                         continue
@@ -1480,7 +1921,7 @@ def project_community_bundle(
                     group["items"].append(
                         {
                             "key": str(child_key),
-                            "label": str(child_key).replace("_", " "),
+                            "label": _field_label(str(child_key), dictionary),
                             "value": _json_value(child_value, child_type),
                             "raw": str(_scalar(child_value)),
                             "type": child_type,
@@ -1493,7 +1934,7 @@ def project_community_bundle(
                 summary_section["items"].append(
                     {
                         "key": str(key),
-                        "label": str(key).replace("_", " "),
+                        "label": _field_label(str(key), dictionary),
                         "value": _json_value(value, value_type),
                         "raw": str(_scalar(value)),
                         "type": value_type,
@@ -1542,6 +1983,9 @@ def project_community_bundle(
             "columns": _dataset_columns(rows, dictionary, key),
             "completeness": _dataset_completeness(result, key, rows, projection),
         }
+        configured_reading_columns = list((projection.get("reading_columns") or {}).get(public_name) or ())
+        if configured_reading_columns:
+            public["reading_columns"] = [str(value) for value in configured_reading_columns]
         datasets.append(CommunityDataset(public=public, rows=rows))
         for section in sections:
             if section["id"] == section_id and dataset_id not in section["dataset_refs"]:
@@ -1628,7 +2072,7 @@ def project_community_bundle(
         },
         domain={
             "entity_fields": _json_safe(derived.get("entity_fields") or {}),
-            "facts": _json_safe(domain_facts),
+            "facts": _json_safe({key: value for key, value in domain_facts.items() if key != "data_dictionary"}),
             "data_dictionary": _json_safe(dictionary),
             "extensions": _json_safe(derived.get("semantic") or {}),
         },

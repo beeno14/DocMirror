@@ -77,6 +77,8 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "credit_lines": (
         ("credit_line_id", ("credit_line_id",)),
         ("account_id", ("account_id",)),
+        ("account_identifier", ("account_identifier",)),
+        ("institution", ("management_institution", "institution")),
         ("facility_type", ("facility_type",)),
         ("total_limit", ("total_limit",)),
         ("used_limit", ("used_limit",)),
@@ -455,6 +457,56 @@ def _normalize_record(collection: str, record: dict[str, Any], index: int) -> di
         value = _normalized_value(target, value)
         if value not in (None, ""):
             normalized[target] = value
+    if collection == "credit_accounts":
+        account_type = str(normalized.get("account_type") or "")
+        status = str(normalized.get("status") or "").lower()
+        normalized["account_state"] = (
+            "open" if status in {"active", "inactive"} else "closed" if status in {"closed", "settled"} else "unknown"
+        )
+        normalized["activation_state"] = (
+            "active"
+            if account_type == "credit_card" and status == "active"
+            else "inactive"
+            if account_type == "credit_card" and status == "inactive"
+            else "not_applicable"
+        )
+        normalized["payoff_state"] = (
+            "not_applicable"
+            if account_type == "credit_card"
+            else "settled"
+            if status in {"closed", "settled"}
+            else "outstanding"
+            if status == "active"
+            else "unknown"
+        )
+        for field in ("credit_limit", "used_amount", "loan_amount", "balance"):
+            applicable = not (
+                (field in {"credit_limit", "used_amount"} and account_type == "loan")
+                or (field == "loan_amount" and account_type in {"credit_card", "credit_line"})
+            )
+            normalized[f"{field}_status"] = (
+                "reported"
+                if normalized.get(field) not in (None, "")
+                else "not_reported"
+                if applicable
+                else "not_applicable"
+            )
+    elif collection == "credit_lines":
+        status = str(normalized.get("status") or "").lower()
+        normalized["account_state"] = (
+            "open" if status in {"active", "inactive"} else "closed" if status in {"closed", "settled"} else "unknown"
+        )
+        normalized["payoff_state"] = (
+            "settled"
+            if status in {"closed", "settled"}
+            else "outstanding"
+            if status == "active"
+            else "unknown"
+        )
+        for field in ("total_limit", "used_limit"):
+            normalized[f"{field}_status"] = (
+                "reported" if normalized.get(field) not in (None, "") else "not_reported"
+            )
     out["normalized"] = normalized
     try:
         confidence = max(0.0, min(1.0, float(out.get("confidence") or 0.0)))
@@ -559,6 +611,34 @@ def _quarantined_fields(collections: dict[str, list[dict[str, Any]]]) -> list[di
     return out
 
 
+def _record_has_auditable_evidence(record: dict[str, Any]) -> bool:
+    """Return true only for traceable geometry/atom/structure references."""
+    refs = [
+        *list(record.get("source_refs") or []),
+        *list(record.get("source_cell_refs") or []),
+    ]
+    if record.get("evidence_ids") or record.get("bbox"):
+        return True
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        if any(
+            ref.get(key) not in (None, "", [])
+            for key in (
+                "node_id",
+                "node_ids",
+                "evidence_id",
+                "evidence_ids",
+                "bbox",
+                "structure_id",
+                "grid_id",
+                "table_id",
+            )
+        ):
+            return True
+    return False
+
+
 def _build_audit(
     *,
     parse_result: Any,
@@ -574,7 +654,7 @@ def _build_audit(
     collection_audit: dict[str, Any] = {}
     issues: list[str] = []
     for name, records in collections.items():
-        with_evidence = sum(bool(record.get("source_refs") or record.get("source_cell_refs")) for record in records)
+        with_evidence = sum(_record_has_auditable_evidence(record) for record in records)
         evidence_coverage = round(with_evidence / len(records), 4) if records else None
         collection_conflicts = sum(item.get("collection") == name for item in conflicts)
         collection_audit[name] = {
@@ -632,11 +712,17 @@ def _build_audit(
         issues.append("candidate_conflicts")
     if quarantined:
         issues.append("quarantined_fields")
+    evidence_complete = all(
+        not summary["count"] or summary["evidence_coverage"] == 1.0
+        for summary in collection_audit.values()
+    )
     return {
         "schema_version": "credit_business.v1",
         "report_subtype": report_subtype,
         "content_mode": content_mode,
         **completeness,
+        "source_page_complete": completeness["document_complete"],
+        "evidence_complete": evidence_complete,
         "status": "pass" if not issues else "review",
         "collections": collection_audit,
         "conflicts": conflicts,
@@ -691,6 +777,11 @@ def assemble_credit_report_business(
     )
     # Keep a stable public collection order in the returned mapping and audit.
     collections = {name: collections[name] for name in _COLLECTION_ID_KEYS}
+    from docmirror.plugins.credit_report.semantic_enrichment import (
+        enrich_credit_report_record_evidence,
+    )
+
+    enrich_credit_report_record_evidence(parse_result, collections)
 
     native_summary = native.get("credit_summary") if isinstance(native.get("credit_summary"), dict) else {}
     credit_summary = {

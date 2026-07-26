@@ -36,6 +36,8 @@ _INQUIRY_REASONS = tuple(
             "本人查询（自助查询机）",
             "本人查询(自助查询机)",
             "担保资格审查",
+            "资信审查",
+            "融资审批",
             "信用卡审批",
             "贷款审批",
             "贷后管理",
@@ -121,6 +123,156 @@ def _source_refs(page: int, method: str) -> list[dict[str, Any]]:
     return [ref]
 
 
+def _cell_texts(row: Any) -> list[str]:
+    return [str(getattr(cell, "text", "") or "").strip() for cell in (getattr(row, "cells", None) or [])]
+
+
+def _reported_count(value: str) -> int | None:
+    compact = _compact(value)
+    if not compact or compact == "--":
+        return None
+    number = _number(value)
+    return int(number) if isinstance(number, int | float) else None
+
+
+def _personal_brief_summary_from_canonical_tables(parse_result: Any) -> dict[str, Any]:
+    """Read source-defined personal-brief counts without changing ``--`` to zero."""
+    row_names = {
+        "账户数": "source_account_counts",
+        "未结清/未销户账户数": "source_unclosed_account_counts",
+        "发生过逾期的账户数": "source_overdue_account_counts",
+        "发生过90天以上逾期的账户数": "source_over_90_days_account_counts",
+    }
+    column_names = ("credit_card", "housing_loan", "other_loan", "other_business")
+    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+        page_number = int(getattr(page, "page_number", 0) or page_index)
+        for table in getattr(page, "tables", None) or []:
+            extracted: dict[str, Any] = {}
+            for row in getattr(table, "rows", None) or []:
+                cells = _cell_texts(row)
+                if not cells:
+                    continue
+                row_key = row_names.get(_compact(cells[0]))
+                if not row_key:
+                    continue
+                values = [_reported_count(cells[index]) if index < len(cells) else None for index in range(1, 5)]
+                extracted[row_key] = dict(zip(column_names, values, strict=True))
+            if "source_unclosed_account_counts" not in extracted:
+                continue
+            unclosed = extracted["source_unclosed_account_counts"]
+            account_counts = extracted.get("source_account_counts", {})
+            overdue = extracted.get("source_overdue_account_counts", {})
+            over_90 = extracted.get("source_over_90_days_account_counts", {})
+            return {
+                **extracted,
+                "source_account_count": (
+                    sum(value for value in account_counts.values() if value is not None)
+                    if any(value is not None for value in account_counts.values())
+                    else None
+                ),
+                "source_unclosed_account_count": sum(value for value in unclosed.values() if value is not None),
+                "source_overdue_account_count": (
+                    sum(value for value in overdue.values() if value is not None)
+                    if any(value is not None for value in overdue.values())
+                    else None
+                ),
+                "source_overdue_account_count_status": (
+                    "reported" if any(value is not None for value in overdue.values()) else "not_reported"
+                ),
+                "source_over_90_days_account_count": (
+                    sum(value for value in over_90.values() if value is not None)
+                    if any(value is not None for value in over_90.values())
+                    else None
+                ),
+                "source_over_90_days_account_count_status": (
+                    "reported" if any(value is not None for value in over_90.values()) else "not_reported"
+                ),
+                "source_summary_table_id": str(getattr(table, "table_id", "") or ""),
+                "source_summary_page": page_number,
+            }
+    return {}
+
+
+def _page_text_blocks(parse_result: Any) -> list[tuple[int, str]]:
+    blocks: list[tuple[int, str]] = []
+    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+        page_number = int(getattr(page, "page_number", 0) or page_index)
+        for block in getattr(page, "texts", None) or []:
+            content = str(getattr(block, "content", "") or "").strip()
+            if content:
+                blocks.append((page_number, content))
+    return blocks
+
+
+def extract_personal_brief_section_content(parse_result: Any, full_text: str) -> dict[str, Any]:
+    """Extract explicit empty-state statements and the numbered report notes."""
+    blocks = _page_text_blocks(parse_result)
+
+    def statement_after(heading: str) -> tuple[int, str]:
+        for index, (page, content) in enumerate(blocks):
+            if _compact(content) != heading:
+                continue
+            for next_page, candidate in blocks[index + 1 :]:
+                if next_page != page:
+                    break
+                compact = _compact(candidate)
+                if compact and not re.fullmatch(r"第\d+页，共\d+页", compact):
+                    return page, re.sub(r"\s+", " ", candidate).strip()
+        text = _linear(full_text)
+        marker = text.find(heading)
+        if marker < 0:
+            return 0, ""
+        remainder = text[marker + len(heading) :]
+        end = min(
+            [position for value in ("非信贷交易记录", "公共记录", "查询记录", "说明") if (position := remainder.find(value)) >= 0]
+            or [len(remainder)]
+        )
+        return _source_page(_page_texts(parse_result), heading), remainder[:end].strip()
+
+    non_credit_page, non_credit_statement = statement_after("非信贷交易记录")
+    public_page, public_statement = statement_after("公共记录")
+    notes: list[dict[str, Any]] = []
+    for index, (page, content) in enumerate(blocks):
+        if _compact(content) != "说明":
+            continue
+        note_text = "\n".join(
+            candidate
+            for next_page, candidate in blocks[index + 1 :]
+            if next_page == page and not re.fullmatch(r"\s*第\s*\d+\s*页，共\s*\d+\s*页\s*", candidate)
+        )
+        for match in re.finditer(r"(?ms)(\d+)\.\s*(.*?)(?=^\d+\.|\Z)", note_text):
+            sequence = int(match.group(1))
+            content_value = re.sub(r"\s+", " ", match.group(2)).strip()
+            if not content_value:
+                continue
+            notes.append(
+                {
+                    "note_id": _stable_id("credit_report_note", sequence, content_value),
+                    "sequence": sequence,
+                    "content": content_value,
+                    "source": "personal_brief_notes",
+                    "source_refs": _source_refs(page, "native_text_note"),
+                    "confidence": 1.0,
+                }
+            )
+        break
+    return {
+        "non_credit_transaction_summary": {
+            "record_status": "no_records" if "没有" in non_credit_statement else "reported",
+            "lookback_years": 5 if "5年" in non_credit_statement else None,
+            "source_statement": non_credit_statement,
+            "source_page": non_credit_page or None,
+        },
+        "public_record_summary": {
+            "record_status": "no_records" if "没有" in public_statement else "reported",
+            "lookback_years": 5 if "5年" in public_statement else None,
+            "source_statement": public_statement,
+            "source_page": public_page or None,
+        },
+        "report_notes": notes,
+    }
+
+
 def extract_native_credit_business(
     parse_result: Any,
     full_text: str,
@@ -146,6 +298,7 @@ def _extract_personal_brief(parse_result: Any, full_text: str) -> dict[str, Any]
     inquiries = _personal_inquiries(parse_result, text, page_texts)
     overdue = _overdue_from_personal_accounts(accounts)
     credit_lines = _personal_credit_lines(accounts)
+    source_summary = _personal_brief_summary_from_canonical_tables(parse_result)
     return {
         "credit_accounts": accounts,
         "credit_lines": credit_lines,
@@ -156,14 +309,24 @@ def _extract_personal_brief(parse_result: Any, full_text: str) -> dict[str, Any]
             "source": "personal_brief_native_text",
             "account_count": len(accounts),
             "active_account_count": sum(account.get("account_status") == "active" for account in accounts),
+            "active_account_count_basis": "derived_account_status_active",
+            "activated_credit_card_account_count": sum(
+                account.get("account_type") == "credit_card" and account.get("account_status") == "active"
+                for account in accounts
+            ),
+            "inactive_credit_card_account_count": sum(
+                account.get("account_type") == "credit_card" and account.get("account_status") == "inactive"
+                for account in accounts
+            ),
             "settled_account_count": sum(
                 account.get("account_status") in {"settled", "closed"} for account in accounts
             ),
-            "overdue_account_count": len(overdue),
+            "derived_ever_overdue_account_count": len(overdue),
             "repayment_liability_count": len(liabilities),
             "inquiry_count": len(inquiries),
             "institution_inquiry_count": sum(item.get("inquiry_type") == "institution" for item in inquiries),
             "personal_inquiry_count": sum(item.get("inquiry_type") == "personal" for item in inquiries),
+            **source_summary,
         },
     }
 
@@ -178,6 +341,8 @@ def _personal_credit_lines(accounts: list[dict[str, Any]]) -> list[dict[str, Any
             {
                 "credit_line_id": _stable_id("credit_line", account_id),
                 "account_id": account_id,
+                "account_identifier": account.get("account_identifier"),
+                "management_institution": account.get("management_institution"),
                 "facility_type": account.get("business_type") or "贷款授信",
                 "total_limit": account.get("credit_limit"),
                 "used_limit": account.get("balance"),
@@ -271,12 +436,25 @@ def _personal_account_from_chunk(
             business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)", compact_body)
         business_type = business_match.group(1) if business_match else "贷款"
 
-    currency_match = re.search(r"[（(](人民币|美元|欧元|港币)(?:账户)?", compact_body)
-    currency_label = currency_match.group(1) if currency_match else "人民币"
-    currency = {"人民币": "CNY", "美元": "USD", "欧元": "EUR", "港币": "HKD"}.get(
-        currency_label,
-        currency_label,
+    currency_match = re.search(
+        r"[（(](人民币|美元|欧元|港币|加元|加拿大元|新西兰元|日元|新加坡元|英镑|澳大利亚元|澳元)(?:账户)?",
+        compact_body,
     )
+    currency_label = currency_match.group(1) if currency_match else "人民币"
+    currency = {
+        "人民币": "CNY",
+        "美元": "USD",
+        "欧元": "EUR",
+        "港币": "HKD",
+        "加元": "CAD",
+        "加拿大元": "CAD",
+        "新西兰元": "NZD",
+        "日元": "JPY",
+        "新加坡元": "SGD",
+        "英镑": "GBP",
+        "澳大利亚元": "AUD",
+        "澳元": "AUD",
+    }.get(currency_label, currency_label)
     card_tail_match = re.search(r"卡片尾号[:：]?(\d{3,8})", compact_body)
     card_tail = card_tail_match.group(1) if card_tail_match else ""
     page = _source_page(page_texts, chunk[:120])

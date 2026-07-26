@@ -47,6 +47,7 @@ class CreditReportPlugin(CommunityProjector):
             ("subject_name", ("被查询者姓名", "企业名称", "姓名", "Name", "报告主体")),
             ("id_number", ("被查询者证件号码", "身份证号", "证件号码", "ID Number")),
             ("id_type", ("被查询者证件类型", "证件类型", "ID Type")),
+            ("marital_status", ("婚姻状况",)),
             ("unified_social_credit_code", ("统一社会信用代码",)),
             ("zhongzheng_code", ("中征码", "贷款卡编码", "贷款卡号")),
             ("query_institution", ("查询机构",)),

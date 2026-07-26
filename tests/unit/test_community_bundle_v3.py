@@ -322,6 +322,45 @@ def test_csv_preserves_signed_numbers_but_neutralizes_text_formulas() -> None:
     assert status["csv_escape_applied"] == "true"
 
 
+def test_long_identifiers_are_excel_safe_and_sensitive_fields_are_masked_in_markdown() -> None:
+    candidate = _candidate(
+        [
+            {
+                "repayment_id": "rep_1",
+                "month": "2025-01",
+                "status": "N",
+                "account_identifier": "123456789012345678",
+            }
+        ]
+    )
+    candidate["data"]["fields"]["id_number"] = "350600198703032041"
+    candidate["data"]["data_dictionary"]["fields"]["id_number"] = {
+        "label": "证件号码",
+        "type": "long_id",
+        "sensitive": True,
+        "display": "masked",
+    }
+    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"]["account_identifier"] = {
+        "label": "账户标识",
+        "type": "long_id",
+        "sensitive": True,
+        "display": "masked",
+    }
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    bundle = project_community_bundle(result, file_id="001", document_id="doc_sensitive")
+    csv_content = next(iter(bundle.render_dataset_csvs().values()))
+    rows = list(csv.DictReader(io.StringIO(csv_content.lstrip("\ufeff"))))
+    enhanced = bundle.render_enhanced_markdown()
+
+    assert rows[0]["account_identifier"] == "'123456789012345678"
+    assert "3506**********2041" in enhanced
+    assert "350600198703032041" not in enhanced
+    assert "1234**********5678" in enhanced
+
+
 def test_audit_uses_canonical_field_keys_with_original_source_values() -> None:
     candidate = _candidate(
         [
@@ -411,6 +450,7 @@ def test_json_csv_and_enhanced_markdown_share_public_inquiry_occurrences() -> No
     json_ids = [row["record_id"] for row in inquiry_dataset["rows"]]
     assert len(json_ids) == len(set(json_ids)) == 2
     assert [row["record_id"] for row in csv_rows] == json_ids
+    assert "#### institution" in enhanced
     assert "| 25 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
     assert "| 26 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
 

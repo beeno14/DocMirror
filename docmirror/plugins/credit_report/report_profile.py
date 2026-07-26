@@ -20,6 +20,11 @@ REPORT_SUBTYPES = frozenset({"personal_brief", "personal_detail", "enterprise"})
 
 _PERSON_ID_RE = re.compile(r"^(?:\d{15}|\d{17}[\dX]|[\dX*]{15,18})$")
 _USCC_RE = re.compile(r"^[0-9A-HJ-NPQRTUWXY]{18}$")
+_MARITAL_STATUS_CODES = {
+    "未婚": "unmarried",
+    "已婚": "married",
+    "离婚": "divorced",
+}
 
 
 def _compact(text: str) -> str:
@@ -190,6 +195,23 @@ def _normalize_date_time(value: str) -> str:
     return date
 
 
+def _recover_personal_marital_status(parse_result: Any, header: str) -> str:
+    """Recover the report subject's marital status from the cover identity block."""
+    candidates: list[str] = []
+    for page in list(getattr(parse_result, "pages", []) or [])[:1]:
+        candidates.extend(
+            str(getattr(block, "content", "") or "")
+            for block in getattr(page, "texts", []) or []
+            if str(getattr(block, "content", "") or "").strip()
+        )
+    candidates.append(header)
+    for candidate in candidates:
+        match = re.search(r"(?:婚姻状况\s*[:：]?\s*)?(未婚|已婚|离婚)", candidate)
+        if match:
+            return _MARITAL_STATUS_CODES[match.group(1)]
+    return ""
+
+
 def recover_credit_report_header_fields(
     parse_result: Any,
     full_text: str = "",
@@ -251,6 +273,10 @@ def recover_credit_report_header_fields(
         )
         if id_type:
             fields["id_type"] = id_type
+
+        marital_status = _recover_personal_marital_status(parse_result, header)
+        if marital_status:
+            fields["marital_status"] = marital_status
 
     report_number = re.sub(
         r"\D",

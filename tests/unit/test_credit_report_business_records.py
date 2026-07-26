@@ -3,11 +3,14 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow, TextBlock
 from docmirror.plugins.credit_report.business_records import (
     _merge_enterprise_accounts,
     derive_overdue_records,
     extract_native_credit_business,
+    extract_personal_brief_section_content,
 )
 
 
@@ -51,6 +54,8 @@ def test_personal_brief_extracts_narrative_accounts_and_inquiry_ledger() -> None
     assert len(business["inquiry_records"]) == 3
     assert business["credit_summary"]["institution_inquiry_count"] == 2
     assert business["credit_summary"]["personal_inquiry_count"] == 1
+    assert business["credit_summary"]["activated_credit_card_account_count"] == 1
+    assert business["credit_summary"]["inactive_credit_card_account_count"] == 0
 
 
 def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
@@ -69,6 +74,100 @@ def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
 
     assert len(business["credit_accounts"]) == 2
     assert len({item["account_id"] for item in business["credit_accounts"]}) == 2
+
+
+def test_personal_brief_preserves_source_summary_nulls_and_unclosed_definition() -> None:
+    table = TableBlock(
+        table_id="pt_1_0",
+        headers=["", "信用卡", "贷款", "", "其他业务"],
+        rows=[
+            TableRow(
+                cells=[
+                    CellValue(text="账户数"),
+                    CellValue(text="21"),
+                    CellValue(text="2"),
+                    CellValue(text="22"),
+                    CellValue(text="--"),
+                ]
+            ),
+            TableRow(
+                cells=[
+                    CellValue(text="未结清/未销户账户数"),
+                    CellValue(text="18"),
+                    CellValue(text="--"),
+                    CellValue(text="11"),
+                    CellValue(text="--"),
+                ]
+            ),
+            TableRow(
+                cells=[
+                    CellValue(text="发生过逾期的账户数"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                ]
+            ),
+            TableRow(
+                cells=[
+                    CellValue(text="发生过90天以上逾期的账户数"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                    CellValue(text="--"),
+                ]
+            ),
+        ],
+    )
+    result = SimpleNamespace(pages=[PageContent(page_number=1, tables=[table])])
+
+    business = extract_native_credit_business(
+        result,
+        "个人信用报告（个人版）",
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    summary = business["credit_summary"]
+    assert summary["source_account_count"] == 45
+    assert summary["source_unclosed_account_count"] == 29
+    assert summary["source_unclosed_account_counts"] == {
+        "credit_card": 18,
+        "housing_loan": None,
+        "other_loan": 11,
+        "other_business": None,
+    }
+    assert summary["source_overdue_account_count"] is None
+    assert summary["source_overdue_account_count_status"] == "not_reported"
+
+
+def test_personal_brief_extracts_empty_sections_and_all_numbered_notes() -> None:
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=3,
+                texts=[
+                    TextBlock(content="非信贷交易记录"),
+                    TextBlock(content="系统中没有您最近5年内的非信贷交易记录。"),
+                    TextBlock(content="公共记录"),
+                    TextBlock(content="系统中没有您最近5年内的公共信息记录。"),
+                ],
+            ),
+            PageContent(
+                page_number=8,
+                texts=[
+                    TextBlock(content="说明"),
+                    TextBlock(content="1.第一条说明。\n2.第二条说明。\n3.第三条说明。\n4.第四条说明。\n5.第五条说明。"),
+                ],
+            ),
+        ]
+    )
+
+    content = extract_personal_brief_section_content(result, "")
+
+    assert content["non_credit_transaction_summary"]["record_status"] == "no_records"
+    assert content["public_record_summary"]["record_status"] == "no_records"
+    assert [note["sequence"] for note in content["report_notes"]] == [1, 2, 3, 4, 5]
 
 
 def test_personal_brief_keeps_identical_inquiry_occurrences_with_distinct_sequences() -> None:
@@ -91,6 +190,27 @@ def test_personal_brief_keeps_identical_inquiry_occurrences_with_distinct_sequen
     inquiries = business["inquiry_records"]
     assert [item["sequence"] for item in inquiries] == [25, 26]
     assert len({item["inquiry_id"] for item in inquiries}) == 2
+
+
+@pytest.mark.parametrize("reason", ["资信审查", "融资审批"])
+def test_personal_brief_recognizes_additional_institution_inquiry_reasons(reason: str) -> None:
+    text = f"""
+    个人信用报告 查询记录
+    机构查询记录明细
+    编号 查询日期 查询机构 查询原因
+    8 2023年12月22日 福建永鸿兴融资担保有限公司 {reason}
+    个人查询记录明细
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert business["inquiry_records"][0]["sequence"] == 8
+    assert business["inquiry_records"][0]["reason"] == reason
 
 
 def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() -> None:
@@ -137,6 +257,8 @@ def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() 
     assert liability["balance"] == 20000
     assert business["credit_summary"]["repayment_liability_count"] == 1
     assert business["credit_summary"]["personal_inquiry_count"] == 1
+    assert business["credit_summary"]["activated_credit_card_account_count"] == 0
+    assert business["credit_summary"]["inactive_credit_card_account_count"] == 1
 
 
 def test_enterprise_extracts_summary_facilities_accounts_and_public_records() -> None:
