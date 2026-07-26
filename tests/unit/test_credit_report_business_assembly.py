@@ -36,6 +36,38 @@ def test_canonical_repayment_records_use_repayment_identity_not_account_identity
     ]
 
 
+def test_repayment_liability_records_keep_identity_and_normalized_values() -> None:
+    records = _records(
+        "repayment_liability_records",
+        [{"liability_id": "liability-1", "related_party_name": "张三"}],
+    )
+    assert records[0]["record_id"] == "liability-1"
+
+    assembled = assemble_credit_report_business(
+        _result(),
+        "",
+        report_subtype="personal_brief",
+        content_mode="native_text",
+        existing_collections={
+            "repayment_liability_records": [
+                {
+                    "liability_id": "liability-1",
+                    "liability_date": "2024年1月2日",
+                    "management_institution": "示例银行",
+                    "responsibility_amount": "50,000",
+                    "balance": "20,000",
+                }
+            ]
+        },
+    )
+
+    normalized = assembled["repayment_liability_records"][0]["normalized"]
+    assert normalized["liability_date"] == "2024-01-02"
+    assert normalized["institution"] == "示例银行"
+    assert normalized["responsibility_amount"] == 50000
+    assert normalized["balance"] == 20000
+
+
 def test_assembly_adds_normalized_view_without_removing_legacy_fields() -> None:
     account = {
         "source_structure_id": "account-1",

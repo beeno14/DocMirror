@@ -4,7 +4,7 @@
   "title": "DocMirror Community Bundle JSON v3",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "document", "sections", "datasets", "files", "warnings"],
+  "required": ["schema", "document", "sections", "datasets", "reading", "files", "warnings"],
   "properties": {
     "schema": {
       "type": "object",
@@ -49,12 +49,14 @@
       "type": "array",
       "items": {"$ref": "#/$defs/dataset"}
     },
+    "reading": {"$ref": "#/$defs/reading"},
     "files": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["content_md", "datasets_dir", "dataset_audit_csv"],
+      "required": ["content_md", "enhanced_reading_md", "datasets_dir", "dataset_audit_csv"],
       "properties": {
         "content_md": {"type": "string", "pattern": "_content\\.md$"},
+        "enhanced_reading_md": {"type": "string", "pattern": "_enhanced_reading\\.md$"},
         "datasets_dir": {"type": "string", "pattern": "_datasets$"},
         "dataset_audit_csv": {"type": "string", "pattern": "_datasets/_audit_cells\\.csv$"}
       }
@@ -191,6 +193,40 @@
           "description": "Complete structured records for self-contained JSON API consumers.",
           "items": {"$ref": "#/$defs/record"}
         }
+      }
+    },
+    "readingTable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "dataset_id", "section_id", "title", "column_keys", "row_count"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "dataset_id": {"type": "string", "minLength": 1},
+        "section_id": {"type": "string"},
+        "title": {"type": "string"},
+        "column_keys": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "row_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "readingFlowEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["order", "kind", "ref_id"],
+      "properties": {
+        "order": {"type": "integer", "minimum": 1},
+        "kind": {"enum": ["document", "section", "dataset"]},
+        "ref_id": {"type": "string"}
+      }
+    },
+    "reading": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "profile", "document_flow", "tables"],
+      "properties": {
+        "version": {"const": "1.0"},
+        "profile": {"const": "community"},
+        "document_flow": {"type": "array", "items": {"$ref": "#/$defs/readingFlowEntry"}},
+        "tables": {"type": "array", "items": {"$ref": "#/$defs/readingTable"}}
       }
     }
   }

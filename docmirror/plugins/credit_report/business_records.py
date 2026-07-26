@@ -31,6 +31,8 @@ _INQUIRY_REASONS = tuple(
             "法人代表、负责人、高管等资信审查",
             "本人查询（互联网个人信用信息服务平台）",
             "本人查询(互联网个人信用信息服务平台)",
+            "本人查询（商业银行网上银行）",
+            "本人查询(商业银行网上银行)",
             "本人查询（自助查询机）",
             "本人查询(自助查询机)",
             "担保资格审查",
@@ -140,12 +142,14 @@ def _extract_personal_brief(parse_result: Any, full_text: str) -> dict[str, Any]
     text = _linear(full_text)
     page_texts = _page_texts(parse_result)
     accounts = _personal_accounts(text, page_texts)
+    liabilities = _personal_repayment_liabilities(text, page_texts)
     inquiries = _personal_inquiries(parse_result, text, page_texts)
     overdue = _overdue_from_personal_accounts(accounts)
     credit_lines = _personal_credit_lines(accounts)
     return {
         "credit_accounts": accounts,
         "credit_lines": credit_lines,
+        "repayment_liability_records": liabilities,
         "overdue_records": overdue,
         "inquiry_records": inquiries,
         "credit_summary": {
@@ -156,6 +160,7 @@ def _extract_personal_brief(parse_result: Any, full_text: str) -> dict[str, Any]
                 account.get("account_status") in {"settled", "closed"} for account in accounts
             ),
             "overdue_account_count": len(overdue),
+            "repayment_liability_count": len(liabilities),
             "inquiry_count": len(inquiries),
             "institution_inquiry_count": sum(item.get("inquiry_type") == "institution" for item in inquiries),
             "personal_inquiry_count": sum(item.get("inquiry_type") == "personal" for item in inquiries),
@@ -196,6 +201,10 @@ def _personal_accounts(text: str, page_texts: list[tuple[int, str, str]]) -> lis
     accounts: list[dict[str, Any]] = []
     for index, match in enumerate(starts):
         end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        for marker in ("相关还款责任信息", "非信贷交易记录", "公共记录", "查询记录"):
+            marker_at = text.find(marker, match.end(), end)
+            if marker_at >= 0:
+                end = min(end, marker_at)
         chunk = text[match.start() : end].strip()
         if not any(marker in chunk for marker in ("贷记卡", "准贷记卡", "贷款", "授信")):
             continue
@@ -214,6 +223,17 @@ def _personal_accounts(text: str, page_texts: list[tuple[int, str, str]]) -> lis
             account["account_id"],
             account["sequence"],
         )
+        if "ever_overdue" not in account:
+            states = list(
+                re.finditer(
+                    r"从未发生过逾期|从未逾期过|发生过逾期",
+                    text[: match.start()],
+                )
+            )
+            if states:
+                account["ever_overdue"] = not states[-1].group(0).startswith("从未")
+                if not account["ever_overdue"]:
+                    account["overdue_months_last_5y"] = 0
         accounts.append(account)
     return accounts
 
@@ -234,28 +254,30 @@ def _personal_account_from_chunk(
     if len(institution) < 4 or len(institution) > 80:
         return None
     body = remainder[action_match.end() :]
+    compact_chunk = _compact(chunk)
+    compact_body = _compact(body)
 
-    if "贷记卡" in body or "准贷记卡" in body:
+    if "贷记卡" in compact_body or "准贷记卡" in compact_body:
         account_type = "credit_card"
-        business_type = "准贷记卡" if "准贷记卡" in body else "贷记卡"
-    elif "授信" in body and re.search(r"贷款授信", body):
+        business_type = "准贷记卡" if "准贷记卡" in compact_body else "贷记卡"
+    elif "授信" in compact_body and re.search(r"贷款授信", compact_body):
         account_type = "credit_line"
-        business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)授信", body)
+        business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)授信", compact_body)
         business_type = business_match.group(1) if business_match else "贷款授信"
     else:
         account_type = "loan"
-        business_match = re.search(r"[）)]\s*([\u3400-\u9fff（）()]{1,30}贷款)", body)
+        business_match = re.search(r"[）)]([\u3400-\u9fff（）()]{1,30}贷款)", compact_body)
         if not business_match:
-            business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)", body)
+            business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)", compact_body)
         business_type = business_match.group(1) if business_match else "贷款"
 
-    currency_match = re.search(r"[（(](人民币|美元|欧元|港币)(?:账户)?", body)
+    currency_match = re.search(r"[（(](人民币|美元|欧元|港币)(?:账户)?", compact_body)
     currency_label = currency_match.group(1) if currency_match else "人民币"
     currency = {"人民币": "CNY", "美元": "USD", "欧元": "EUR", "港币": "HKD"}.get(
         currency_label,
         currency_label,
     )
-    card_tail_match = re.search(r"卡片尾号\s*[:：]?\s*(\d{3,8})", body)
+    card_tail_match = re.search(r"卡片尾号[:：]?(\d{3,8})", compact_body)
     card_tail = card_tail_match.group(1) if card_tail_match else ""
     page = _source_page(page_texts, chunk[:120])
     account: dict[str, Any] = {
@@ -264,7 +286,15 @@ def _personal_account_from_chunk(
         "business_type": business_type,
         "open_date": open_date,
         "currency": currency,
-        "account_status": "closed" if "销户" in body else "settled" if "已结清" in body else "active",
+        "account_status": (
+            "closed"
+            if "销户" in compact_body
+            else "settled"
+            if "已结清" in compact_body
+            else "inactive"
+            if "尚未激活" in compact_body
+            else "active"
+        ),
         "source": "personal_brief_narrative",
         "source_refs": _source_refs(page, "native_text_narrative"),
         "confidence": 0.94,
@@ -273,41 +303,42 @@ def _personal_account_from_chunk(
         account["card_tail"] = card_tail
 
     patterns = {
-        "loan_amount": r"发放的\s*([\d,]+(?:\.\d+)?)\s*元",
-        "credit_limit": r"信用额度\s*([\d,]+(?:\.\d+)?)",
-        "balance": r"余额(?:为)?\s*([\d,]+(?:\.\d+)?)",
-        "used_amount": r"已使用额度\s*([\d,]+(?:\.\d+)?)",
+        "loan_amount": r"发放的([\d,]+(?:\.\d+)?)元",
+        "credit_limit": r"信用额度([\d,]+(?:\.\d+)?)",
+        "balance": r"(?<!大额专项分期)(?<!分期)余额(?:为)?([\d,]+(?:\.\d+)?)",
+        "used_amount": r"已使用额度([\d,]+(?:\.\d+)?)",
+        "unbilled_installment_balance": r"(?:未出单的)?大额专项分期余额([\d,]+(?:\.\d+)?)",
     }
     for field, pattern in patterns.items():
-        amount_match = re.search(pattern, chunk)
+        amount_match = re.search(pattern, compact_chunk)
         if amount_match:
             account[field] = _number(amount_match.group(1))
 
-    due_match = re.search(r"(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)到期", chunk)
+    due_match = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)到期", compact_chunk)
     if due_match:
         account["due_date"] = _iso_date(due_match.group(1))
-    close_match = re.search(r"(20\d{2}年\s*\d{1,2}月)(?:已结清|销户)", chunk)
+    close_match = re.search(r"(20\d{2}年\d{1,2}月)(?:已结清|销户)", compact_chunk)
     if close_match:
         account["close_date"] = _iso_month(close_match.group(1))
-    validity_match = re.search(r"额度有效期至\s*(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)", chunk)
+    validity_match = re.search(r"额度有效期至(20\d{2}年\d{1,2}月\d{1,2}日)", compact_chunk)
     if validity_match and "due_date" not in account:
         account["due_date"] = _iso_date(validity_match.group(1))
-    as_of_match = re.search(r"截\s*至\s*(20\d{2}年\s*\d{1,2}月(?:\s*\d{1,2}日)?)", chunk)
+    as_of_match = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)", compact_chunk)
     if as_of_match:
         account["information_as_of"] = _iso_date(as_of_match.group(1)) or _iso_month(as_of_match.group(1))
 
-    overdue_months = re.search(r"最近5年内有\s*(\d+)\s*个月处于逾期状态", chunk)
+    overdue_months = re.search(r"最近5年内有(\d+)个月处于逾期状态", compact_chunk)
     if overdue_months:
         account["overdue_months_last_5y"] = int(overdue_months.group(1))
         account["ever_overdue"] = True
-    elif "从未发生过逾期" in chunk or "从未逾期过" in chunk:
+    elif "从未发生过逾期" in compact_chunk or "从未逾期过" in compact_chunk:
         account["overdue_months_last_5y"] = 0
         account["ever_overdue"] = False
-    if "当前无逾期" in chunk:
+    if "当前无逾期" in compact_chunk:
         account["current_overdue"] = False
-    if "没有发生过90天以上" in chunk or "没有发生过90天以上的逾期" in chunk:
+    if "没有发生过90天以上" in compact_chunk or "没有发生过90天以上的逾期" in compact_chunk:
         account["over_90_days"] = False
-    elif "发生过90天以上" in chunk:
+    elif "发生过90天以上" in compact_chunk:
         account["over_90_days"] = True
     account["account_id"] = _stable_id(
         "credit_account",
@@ -321,6 +352,90 @@ def _personal_account_from_chunk(
         account.get("loan_amount"),
     )
     return account
+
+
+def _personal_repayment_liabilities(
+    text: str,
+    page_texts: list[tuple[int, str, str]],
+) -> list[dict[str, Any]]:
+    """Extract personal-brief related repayment-responsibility narratives."""
+    section_start = text.find("相关还款责任信息")
+    if section_start < 0:
+        return []
+    section_end = len(text)
+    for marker in ("非信贷交易记录", "公共记录", "查询记录"):
+        marker_at = text.find(marker, section_start + len("相关还款责任信息"))
+        if marker_at >= 0:
+            section_end = min(section_end, marker_at)
+    section = text[section_start:section_end]
+    starts = list(
+        re.finditer(
+            rf"{_ACCOUNT_DATE_PATTERN}(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{0,400}}?承担相关还款责任)",
+            section,
+        )
+    )
+    records: list[dict[str, Any]] = []
+    for index, match in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(section)
+        chunk = section[match.start() : end].strip()
+        compact = _compact(chunk)
+        core = re.search(
+            r"^(20\d{2}年\d{1,2}月\d{1,2}日)，?为"
+            r"(.+?)（证件类型：(.+?)，证件号码：(.+?)）"
+            r"在(.+?)办理的(.+?)承担相关还款责任，"
+            r"责任人类型为(.+?)，相关还款责任金额([\d,.]+|--)"
+            r"(?:（保证合同编号：(.+?)）)?。",
+            compact,
+        )
+        if not core:
+            continue
+        remainder = compact[core.end() :]
+        snapshot = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)，", remainder)
+        balance = re.search(r"余额([\d,.]+)(?:（?人民币元）?)?", remainder)
+        liability_date = _iso_date(core.group(1))
+        party_name = core.group(2)
+        party_id_type = core.group(3)
+        party_id_number = core.group(4)
+        institution = core.group(5)
+        business_type = core.group(6)
+        responsibility_type = core.group(7)
+        amount_text = core.group(8)
+        contract_number = core.group(9) or ""
+        page = _source_page(page_texts, chunk[:120])
+        sequence = len(records) + 1
+        record: dict[str, Any] = {
+            "liability_id": _stable_id(
+                "repayment_liability",
+                liability_date,
+                party_id_number,
+                institution,
+                contract_number,
+                amount_text,
+                sequence,
+            ),
+            "sequence": sequence,
+            "liability_date": liability_date,
+            "related_party_name": party_name,
+            "related_party_id_type": party_id_type,
+            "related_party_id_number": party_id_number,
+            "management_institution": institution,
+            "business_type": business_type,
+            "responsibility_type": responsibility_type,
+            "responsibility_amount": _number(amount_text),
+            "responsibility_amount_reported": amount_text != "--",
+            "currency": "CNY",
+            "source": "personal_brief_repayment_liability",
+            "source_refs": _source_refs(page, "native_text_narrative"),
+            "confidence": 0.94,
+        }
+        if contract_number:
+            record["contract_number"] = contract_number
+        if snapshot:
+            record["snapshot_date"] = _iso_date(snapshot.group(1)) or _iso_month(snapshot.group(1))
+        if balance:
+            record["balance"] = _number(balance.group(1))
+        records.append(record)
+    return records
 
 
 def _personal_inquiries(
@@ -350,7 +465,14 @@ def _personal_inquiries(
             continue
         seen.add(record_id)
         out.append(record)
-    return out
+    return sorted(
+        out,
+        key=lambda record: (
+            0 if record.get("inquiry_type") == "institution" else 1,
+            int(record.get("sequence") or 0),
+            str(record.get("inquiry_date") or ""),
+        ),
+    )
 
 
 def _reconstructed_institution_inquiries(parse_result: Any) -> list[dict[str, Any]]:
@@ -378,6 +500,7 @@ def _reconstructed_institution_inquiries(parse_result: Any) -> list[dict[str, An
                 "inquiry_id": _stable_id(
                     "credit_inquiry",
                     "institution",
+                    sequence,
                     query_date,
                     institution,
                     reason,
@@ -430,7 +553,14 @@ def _inquiry_rows(
         page = _source_page(page_texts, f"{match.group(1)}{match.group(2)}{institution[:12]}")
         out.append(
             {
-                "inquiry_id": _stable_id("credit_inquiry", inquiry_type, query_date, institution, reason),
+                "inquiry_id": _stable_id(
+                    "credit_inquiry",
+                    inquiry_type,
+                    int(match.group(1)),
+                    query_date,
+                    institution,
+                    reason,
+                ),
                 "sequence": int(match.group(1)),
                 "inquiry_type": inquiry_type,
                 "inquiry_date": query_date,

@@ -9,7 +9,7 @@ from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
 
-_DEFAULT_RECORD_ID_KEYS = ("record_id", "account_id", "inquiry_id", "public_record_id")
+_DEFAULT_RECORD_ID_KEYS = ("record_id", "account_id", "liability_id", "inquiry_id", "public_record_id")
 _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 
 
@@ -93,6 +93,9 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
 
     report_subtype = detect_credit_report_subtype(parse_result, full_text)
     content_mode = detect_credit_report_content_mode(parse_result)
+    if report_subtype == "personal_brief":
+        domain_facts.pop("query_institution", None)
+        field_details.pop("query_institution", None)
     recovered_header = recover_credit_report_header_fields(
         parse_result,
         full_text,
@@ -144,6 +147,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         existing_collections={
             "credit_accounts": credit_accounts,
             "credit_lines": [],
+            "repayment_liability_records": [],
             "repayment_records": repayment_records,
             "overdue_records": [],
             "inquiry_records": list(scanned_business.get("inquiry_records") or []),
@@ -154,6 +158,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     dataset_names = (
         "credit_accounts",
         "credit_lines",
+        "repayment_liability_records",
         "repayment_records",
         "overdue_records",
         "inquiry_records",

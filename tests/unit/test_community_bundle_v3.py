@@ -108,7 +108,7 @@ def _with_projection(result: ParseResult, candidate: dict) -> ParseResult:
     return result
 
 
-def test_public_json_has_exact_six_blocks_and_complete_dataset_rows() -> None:
+def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
     records = [{"repayment_id": f"rep_{i}", "month": f"2025-{i:02d}", "status": "N"} for i in range(1, 13)]
     result = _with_projection(
         ParseResult(entities=DocumentEntities(document_type="credit_report")),
@@ -117,7 +117,7 @@ def test_public_json_has_exact_six_blocks_and_complete_dataset_rows() -> None:
     bundle = project_community_bundle(result, file_id="001", document_id="doc_test")
     payload = bundle.json_payload()
 
-    assert set(payload) == {"schema", "document", "sections", "datasets", "files", "warnings"}
+    assert set(payload) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert payload["schema"]["version"] == "3.0.0"
     assert payload["schema"]["domain"] == "personal_credit_report_detailed"
     assert payload["datasets"][0]["row_count"] == 12
@@ -134,6 +134,8 @@ def test_public_json_has_exact_six_blocks_and_complete_dataset_rows() -> None:
         f"repayment_records:r{index:06d}" for index in range(1, 13)
     ]
     assert payload["datasets"][0]["rows"][0]["normalized"]["month"] == "2025-01"
+    assert payload["reading"]["profile"] == "community"
+    assert payload["reading"]["tables"][0]["dataset_id"] == payload["datasets"][0]["id"]
     assert validate_projection_payload("community", payload).valid
 
 
@@ -306,6 +308,46 @@ def test_different_logical_datasets_are_written_to_different_wide_csvs() -> None
     inquiry_header = next(csv.reader(io.StringIO(csvs["001_datasets/inquiry_records.csv"].lstrip("\ufeff"))))
     assert repayment_header == ["record_id", "_page_start", "_page_end", "month", "status"]
     assert inquiry_header == ["record_id", "_page_start", "_page_end", "institution", "query_date"]
+
+
+def test_json_csv_and_enhanced_markdown_share_public_inquiry_occurrences() -> None:
+    candidate = _candidate()
+    candidate["data"]["inquiry_records"] = [
+        {
+            "inquiry_id": "credit_inquiry:25",
+            "sequence": 25,
+            "inquiry_date": "2024-09-10",
+            "institution": "中国银行股份有限公司福建省分行",
+            "reason": "贷后管理",
+            "inquiry_type": "institution",
+        },
+        {
+            "inquiry_id": "credit_inquiry:26",
+            "sequence": 26,
+            "inquiry_date": "2024-09-10",
+            "institution": "中国银行股份有限公司福建省分行",
+            "reason": "贷后管理",
+            "inquiry_type": "institution",
+        },
+    ]
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    bundle = project_community_bundle(result, file_id="001", document_id="doc_test")
+
+    payload = bundle.json_payload()
+    inquiry_dataset = next(dataset for dataset in payload["datasets"] if dataset["name"] == "inquiry_records")
+    csv_rows = list(
+        csv.DictReader(io.StringIO(bundle.render_dataset_csvs()[inquiry_dataset["csv"]].lstrip("\ufeff")))
+    )
+    enhanced = bundle.render_enhanced_markdown()
+
+    json_ids = [row["record_id"] for row in inquiry_dataset["rows"]]
+    assert len(json_ids) == len(set(json_ids)) == 2
+    assert [row["record_id"] for row in csv_rows] == json_ids
+    assert "| 25 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
+    assert "| 26 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
 
 
 def test_payment_records_use_transaction_business_name() -> None:

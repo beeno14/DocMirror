@@ -122,6 +122,33 @@ def test_validator_detects_missing_markdown_profile(tmp_path: Path) -> None:
     assert "content: DMP profile marker missing" in issues
 
 
+def test_validator_detects_non_community_enhanced_reading(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "enhanced_marker_loss")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    enhanced_path = community_path.parent / payload["files"]["enhanced_reading_md"]
+    enhanced_path.write_text("private rendering", encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert "enhanced_reading: DMP profile marker missing" in issues
+    assert "enhanced_reading: Community reading profile marker missing" in issues
+
+
+def test_validator_detects_reading_model_dataset_divergence(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "reading_model_divergence")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    payload["reading"]["tables"][0]["row_count"] = 1
+    payload["reading"]["document_flow"] = [
+        entry for entry in payload["reading"]["document_flow"] if entry["kind"] != "dataset"
+    ]
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any("reading.tables[0]: row_count=1, JSON rows=2" in issue for issue in issues)
+    assert any("reading.document_flow: missing datasets=" in issue for issue in issues)
+
+
 def test_validator_detects_completeness_contradiction(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "completeness_contradiction")
     payload = json.loads(community_path.read_text(encoding="utf-8"))

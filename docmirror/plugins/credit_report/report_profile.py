@@ -268,13 +268,14 @@ def recover_credit_report_header_fields(
     if report_time:
         fields["report_time"] = report_time
 
-    query_institution = _search(
-        header,
-        r"查询机构\s*[:：]?\s*(.{2,100}?)(?=\s+(?:查询原因|报告时间|查询时间|第\s*\d+\s*页)\s*[:：]?)",
-    )
-    query_institution = re.sub(r"\s+", "", query_institution)
-    if query_institution:
-        fields["query_institution"] = query_institution
+    if subtype != "personal_brief":
+        query_institution = _search(
+            header,
+            r"查询机构\s*[:：]?\s*(.{2,100}?)(?=\s+(?:查询原因|报告时间|查询时间|第\s*\d+\s*页)\s*[:：]?)",
+        )
+        query_institution = re.sub(r"\s+", "", query_institution)
+        if query_institution:
+            fields["query_institution"] = query_institution
 
     if subtype == "personal_detail":
         fields.update(_recover_personal_query_table_fields(parse_result))

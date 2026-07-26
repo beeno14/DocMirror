@@ -47,8 +47,7 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     assert written["enhanced_reading"].is_file()
     enhanced = written["enhanced_reading"].read_text(encoding="utf-8")
     assert 'mode="enhanced"' in enhanced
-    assert 'plugin="business_license"' in enhanced
-    assert 'transforms="0"' in enhanced
+    assert 'source="community"' in enhanced
     assert written["datasets"].name == "001_datasets"
     assert written["datasets"].is_dir()
     assert (written["datasets"] / "_audit_cells.csv").is_file()
@@ -58,9 +57,10 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     comm_data = json.loads(written["community"].read_text(encoding="utf-8"))
     assert comm_data["schema"]["version"] == "3.0.0"
     assert comm_data["document"]["id"] == f"doc_{task_id}_001"
-    assert set(comm_data) == {"schema", "document", "sections", "datasets", "files", "warnings"}
+    assert set(comm_data) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert comm_data["files"] == {
         "content_md": "001_content.md",
+        "enhanced_reading_md": "001_enhanced_reading.md",
         "datasets_dir": "001_datasets",
         "dataset_audit_csv": "001_datasets/_audit_cells.csv",
     }

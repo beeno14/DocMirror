@@ -50,6 +50,6 @@ def test_real_document_projects_to_community_v3(
     payload = build_community_projection(result, file_path=str(fixture))
 
     assert payload is not None
-    assert set(payload) == {"schema", "document", "sections", "datasets", "files", "warnings"}
+    assert set(payload) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert payload["sections"]
     assert validate_projection_payload("community", payload).valid

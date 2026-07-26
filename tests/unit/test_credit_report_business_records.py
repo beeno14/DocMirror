@@ -71,6 +71,74 @@ def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
     assert len({item["account_id"] for item in business["credit_accounts"]}) == 2
 
 
+def test_personal_brief_keeps_identical_inquiry_occurrences_with_distinct_sequences() -> None:
+    text = """
+    个人信用报告 查询记录
+    机构查询记录明细
+    编号 查询日期 查询机构 查询原因
+    25 2024年09月10日 中国银行股份有限公司福建省分行 贷后管理
+    26 2024年09月10日 中国银行股份有限公司福建省分行 贷后管理
+    个人查询记录明细
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    inquiries = business["inquiry_records"]
+    assert [item["sequence"] for item in inquiries] == [25, 26]
+    assert len({item["inquiry_id"] for item in inquiries}) == 2
+
+
+def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() -> None:
+    text = """
+    个人信用报告 信贷记录
+    从未发生过逾期的账户明细如下：
+    2024年01月02日示例银行信用卡中心发放的贷记卡（人民币账户，卡片尾号：1234）。
+    截至2025年03月，信用额
+    度10,000，已使用额
+    度0，大额专项分期余
+    额300，尚未激活。
+    相关还款责任信息
+    2023年04月05日，为张三（证件类型：身份证，证件号码：110101199001011234）
+    在示例商业银行办理的个人经营性贷款承担相关还款责任，责任人类型为保证人，
+    相关还款责任金额50,000（保证合同编号：HT-001）。
+    截至2025年03月，余额20,000（人民币元）。
+    查询记录
+    机构查询记录明细
+    个人查询记录明细
+    1 2025年04月06日 本人查询（商业银行网上银行）
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    account = business["credit_accounts"][0]
+    assert account["credit_limit"] == 10000
+    assert account["used_amount"] == 0
+    assert account["unbilled_installment_balance"] == 300
+    assert account["account_status"] == "inactive"
+    assert account["ever_overdue"] is False
+    assert "balance" not in account
+
+    liability = business["repayment_liability_records"][0]
+    assert liability["related_party_name"] == "张三"
+    assert liability["management_institution"] == "示例商业银行"
+    assert liability["responsibility_amount"] == 50000
+    assert liability["contract_number"] == "HT-001"
+    assert liability["snapshot_date"] == "2025-03"
+    assert liability["balance"] == 20000
+    assert business["credit_summary"]["repayment_liability_count"] == 1
+    assert business["credit_summary"]["personal_inquiry_count"] == 1
+
+
 def test_enterprise_extracts_summary_facilities_accounts_and_public_records() -> None:
     text = """
     企业信用报告 信息概要

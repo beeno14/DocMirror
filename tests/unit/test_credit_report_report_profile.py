@@ -37,6 +37,20 @@ def test_personal_brief_native_header_recovery_stops_at_adjacent_labels() -> Non
     assert fields["content_mode"] == "native_text"
 
 
+def test_personal_brief_does_not_treat_inquiry_ledger_as_header_institution() -> None:
+    result = _result(PageContent(page_number=1))
+    text = """
+    个人信用报告 信贷记录
+    查询记录 机构查询记录明细
+    编号 查询日期 查询机构 查询原因
+    1 2024年10月01日 示例银行 贷款审批
+    """
+
+    fields = recover_credit_report_header_fields(result, text, report_subtype="personal_brief")
+
+    assert "query_institution" not in fields
+
+
 def test_personal_detail_scan_profile_and_header_recovery() -> None:
     result = _result(PageContent(page_number=1, page_mode="scanned_ocr"))
     text = """

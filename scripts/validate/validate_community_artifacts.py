@@ -15,8 +15,11 @@ from typing import Any
 from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.output.markdown_renderer import MARKDOWN_PROFILE_MARKER, validate_markdown
 
-_TOP_LEVEL_BLOCKS = {"schema", "document", "sections", "datasets", "files", "warnings"}
+_TOP_LEVEL_BLOCKS = {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
 _RECORD_BLOCKS = {"record_id", "normalized", "canonical_raw", "raw", "source"}
+_COMMUNITY_READING_MARKER = (
+    '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community" -->'
+)
 _AUDIT_COLUMNS = {
     "dataset_id",
     "record_id",
@@ -151,12 +154,15 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
     root = path.parent
     files = payload.get("files") if isinstance(payload.get("files"), dict) else {}
     content_path = _companion_path(root, files.get("content_md"), "content", issues)
+    enhanced_path = _companion_path(root, files.get("enhanced_reading_md"), "enhanced_reading", issues)
     audit_path = _companion_path(root, files.get("dataset_audit_csv"), "audit", issues)
 
     datasets = payload.get("datasets") if isinstance(payload.get("datasets"), list) else []
     dataset_ids: set[str] = set()
     dataset_record_ids: dict[str, set[str]] = {}
     expected_audited_ids: dict[str, set[str]] = {}
+    dataset_row_counts: dict[str, int] = {}
+    dataset_column_keys: dict[str, set[str]] = {}
     for index, dataset in enumerate(datasets):
         if not isinstance(dataset, dict):
             issues.append(f"dataset[{index}]: must be an object")
@@ -205,6 +211,12 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
             issues.append(f"{dataset_id}: duplicate record_id")
         dataset_record_ids[dataset_id] = set(record_ids)
         expected_audited_ids[dataset_id] = audited_ids
+        dataset_row_counts[dataset_id] = len(rows)
+        dataset_column_keys[dataset_id] = {
+            str(column.get("key") or "")
+            for column in dataset.get("columns") or []
+            if isinstance(column, dict) and column.get("key")
+        }
 
         csv_path = _companion_path(root, dataset.get("csv"), f"{dataset_id}.csv", issues)
         if csv_path is None:
@@ -217,6 +229,69 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         if csv_ids != record_ids:
             issues.append(f"{dataset_id}: ordered record_id mismatch between JSON and CSV")
 
+    reading = payload.get("reading") if isinstance(payload.get("reading"), dict) else {}
+    reading_tables = reading.get("tables") if isinstance(reading.get("tables"), list) else []
+    table_dataset_ids: list[str] = []
+    for index, table in enumerate(reading_tables):
+        if not isinstance(table, dict):
+            issues.append(f"reading.tables[{index}]: must be an object")
+            continue
+        dataset_id = str(table.get("dataset_id") or "")
+        table_dataset_ids.append(dataset_id)
+        if dataset_id not in dataset_ids:
+            issues.append(f"reading.tables[{index}]: unknown dataset_id={dataset_id}")
+            continue
+        if table.get("row_count") != dataset_row_counts[dataset_id]:
+            issues.append(
+                f"reading.tables[{index}]: row_count={table.get('row_count')}, "
+                f"JSON rows={dataset_row_counts[dataset_id]}"
+            )
+        column_keys = [str(key) for key in table.get("column_keys") or []]
+        unknown_keys = set(column_keys) - dataset_column_keys[dataset_id]
+        if unknown_keys:
+            issues.append(f"reading.tables[{index}]: unknown column_keys={sorted(unknown_keys)}")
+    if len(table_dataset_ids) != len(set(table_dataset_ids)):
+        issues.append("reading.tables: duplicate dataset_id")
+    missing_table_ids = dataset_ids - set(table_dataset_ids)
+    if missing_table_ids:
+        issues.append(f"reading.tables: missing datasets={sorted(missing_table_ids)}")
+
+    sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
+    section_ids = {
+        str(section.get("id") or "")
+        for section in sections
+        if isinstance(section, dict) and section.get("id")
+    }
+    document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    document_id = str(document.get("id") or "")
+    flow = reading.get("document_flow") if isinstance(reading.get("document_flow"), list) else []
+    flow_orders: list[int] = []
+    flow_dataset_ids: list[str] = []
+    for index, entry in enumerate(flow):
+        if not isinstance(entry, dict):
+            issues.append(f"reading.document_flow[{index}]: must be an object")
+            continue
+        order = entry.get("order")
+        if isinstance(order, int):
+            flow_orders.append(order)
+        kind = str(entry.get("kind") or "")
+        ref_id = str(entry.get("ref_id") or "")
+        if kind == "document" and ref_id != document_id:
+            issues.append(f"reading.document_flow[{index}]: unknown document ref_id={ref_id}")
+        elif kind == "section" and ref_id not in section_ids:
+            issues.append(f"reading.document_flow[{index}]: unknown section ref_id={ref_id}")
+        elif kind == "dataset":
+            flow_dataset_ids.append(ref_id)
+            if ref_id not in dataset_ids:
+                issues.append(f"reading.document_flow[{index}]: unknown dataset ref_id={ref_id}")
+    if flow_orders != list(range(1, len(flow) + 1)):
+        issues.append("reading.document_flow: order must be contiguous and match array order")
+    if len(flow_dataset_ids) != len(set(flow_dataset_ids)):
+        issues.append("reading.document_flow: duplicate dataset ref_id")
+    missing_flow_ids = dataset_ids - set(flow_dataset_ids)
+    if missing_flow_ids:
+        issues.append(f"reading.document_flow: missing datasets={sorted(missing_flow_ids)}")
+
     if content_path is not None:
         markdown = content_path.read_text(encoding="utf-8")
         if not markdown.strip():
@@ -224,6 +299,16 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         if MARKDOWN_PROFILE_MARKER not in markdown:
             issues.append("content: DMP profile marker missing")
         issues.extend(f"content: {issue}" for issue in validate_markdown(markdown))
+
+    if enhanced_path is not None:
+        enhanced = enhanced_path.read_text(encoding="utf-8")
+        if not enhanced.strip():
+            issues.append("enhanced_reading: Markdown is empty")
+        if MARKDOWN_PROFILE_MARKER not in enhanced:
+            issues.append("enhanced_reading: DMP profile marker missing")
+        if _COMMUNITY_READING_MARKER not in enhanced:
+            issues.append("enhanced_reading: Community reading profile marker missing")
+        issues.extend(f"enhanced_reading: {issue}" for issue in validate_markdown(enhanced))
 
     if audit_path is not None:
         with audit_path.open(encoding="utf-8-sig", newline="") as stream:

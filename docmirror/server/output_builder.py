@@ -33,21 +33,6 @@ logger = logging.getLogger(__name__)
 PROJECTOR_TIMEOUT_SECONDS = max(0.01, float(os.getenv("DOCMIRROR_PROJECTOR_TIMEOUT_S", "300")))
 
 
-def _resolve_reading_projection(result: Any) -> Any | None:
-    """Resolve optional plugin reading state for a detached post-seal read view."""
-    try:
-        from docmirror.plugins._runtime.plugin_registry import registry
-
-        entities = getattr(result, "entities", None)
-        document_type = str(getattr(entities, "document_type", "") or "")
-        projector = registry.get_projector(document_type, "community")
-        provider = getattr(projector, "reading_projection", None)
-        return provider(result) if callable(provider) else None
-    except Exception:
-        logger.warning("Unable to build enhanced reading projection", exc_info=True)
-        return None
-
-
 def materialize_community_bundle(
     payload: dict[str, Any],
     result: Any,
@@ -85,6 +70,7 @@ def materialize_community_bundle(
     files.update(
         {
             "content_md": f"{file_id}_content.md",
+            "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
             "dataset_audit_csv": f"{file_id}_datasets/_audit_cells.csv",
         }
@@ -106,7 +92,6 @@ def materialize_community_bundle(
         files=files,
         warnings=list(projected.get("warnings") or []),
         result=result,
-        reading_projection=_resolve_reading_projection(result),
     )
 
 

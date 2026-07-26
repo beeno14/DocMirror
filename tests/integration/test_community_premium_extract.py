@@ -85,6 +85,6 @@ def test_public_fixture_can_be_perceived(domain: str, fixture: Path):
         file_path=str(fixture),
     )
     assert output is not None, domain
-    assert set(output) == {"schema", "document", "sections", "datasets", "files", "warnings"}
+    assert set(output) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert output["sections"], domain
     assert validate_projection_payload("community", output).valid, domain

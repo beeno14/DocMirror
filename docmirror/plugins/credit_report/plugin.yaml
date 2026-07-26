@@ -30,12 +30,13 @@ projection:
   summary_facts: {credit_summary: credit_summary}
   internal_facts: [credit_extraction_audit]
   section_markers:
-    credit_accounts: [credit]
-    credit_lines: [credit]
-    repayment_records: [credit, repayment]
-    overdue_records: [credit, repayment]
-    public_records: [public]
-    inquiry_records: [inquir]
+    credit_accounts: [credit_details]
+    credit_lines: [credit_details]
+    repayment_liability_records: [credit_details]
+    repayment_records: [credit_details, repayment_history]
+    overdue_records: [credit_details, repayment_history]
+    public_records: [public_records]
+    inquiry_records: [inquiries]
   section_type_markers:
     信息概要: credit_summary
     基本信息: basic_information
@@ -54,6 +55,7 @@ projection_outputs:
   datasets:
     - credit_accounts
     - credit_lines
+    - repayment_liability_records
     - repayment_records
     - overdue_records
     - inquiry_records

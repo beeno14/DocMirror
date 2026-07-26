@@ -23,7 +23,7 @@ class ArtifactWriter:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         try:
-            with temporary.open("w", encoding=encoding) as stream:
+            with temporary.open("w", encoding=encoding, newline="") as stream:
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())

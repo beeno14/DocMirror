@@ -152,7 +152,7 @@ def test_credit_projection_uses_reconstructed_order_for_dataset_and_csv() -> Non
     assert "平安融易（江苏）融资担保有限公," not in inquiry_csv
 
 
-def test_plugin_enhanced_markdown_joins_fragments_without_changing_canonical_markdown() -> None:
+def test_community_enhanced_markdown_uses_projected_rows_without_changing_canonical_markdown() -> None:
     result = _result()
     sealed = seal_parse_result(result)
     fingerprint = sealed.integrity_fingerprint
@@ -162,26 +162,35 @@ def test_plugin_enhanced_markdown_joins_fragments_without_changing_canonical_mar
         sealed,
         projection_data=projection.model_dump(mode="python"),
     )
-    bundle.reading_projection = plugin.reading_projection(sealed.to_read_view())
 
     canonical = bundle.render_markdown()
     enhanced = bundle.render_enhanced_markdown()
 
     assert enhanced is not None
-    assert 'docmirror:reading-profile version="1.0"' in enhanced
-    assert 'plugin="credit_report"' in enhanced
+    assert 'docmirror:reading-profile version="2.0"' in enhanced
+    assert 'source="community"' in enhanced
     assert "平安融易（江苏）融资担保有限公\n\n担保资格审查\n\n司" in canonical
-    assert "平安融易（江苏）融资担保有限公司\n\n担保资格审查" in enhanced
-    assert "福建漳州农村商业银行股份有限公司\n\n法人代表、负责人、高管等资信审查" in enhanced
-    assert "不应调整有限公\n\n贷款审批\n\n司" in enhanced
+    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | institution |" in enhanced
+    assert (
+        "| 103 | 2023-04-28 | 福建漳州农村商业银行股份有限公司 | "
+        "法人代表、负责人、高管等资信审查 | institution |"
+    ) in enhanced
+    assert "不应调整有限公" not in enhanced
     assert sealed.integrity_fingerprint == fingerprint
     assert sealed.verify_integrity()
 
 
-def test_write_outputs_persists_enhanced_reading_without_mutating_parse_result(tmp_path) -> None:
+def test_write_outputs_persists_enhanced_reading_without_private_reading_projection(
+    tmp_path,
+    monkeypatch,
+) -> None:
     result = _result()
     before = copy.deepcopy(result.model_dump(mode="python"))
 
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("private reading projection must not render Community Markdown")
+
+    monkeypatch.setattr(CreditReportPlugin, "reading_projection", fail_if_called)
     _task_id, written = write_outputs(
         result,
         tmp_path,
@@ -195,7 +204,8 @@ def test_write_outputs_persists_enhanced_reading_without_mutating_parse_result(t
     enhanced = enhanced_path.read_text(encoding="utf-8")
     assert enhanced_path.name == "001_enhanced_reading.md"
     assert "平安融易（江苏）融资担保有限公\n\n担保资格审查\n\n司" in canonical
-    assert "平安融易（江苏）融资担保有限公司\n\n担保资格审查" in enhanced
+    assert "| 2 | 2025-01-22 | 平安融易（江苏）融资担保有限公司 | 担保资格审查 | institution |" in enhanced
+    assert 'source="community"' in enhanced
     assert result.model_dump(mode="python") == before
 
 

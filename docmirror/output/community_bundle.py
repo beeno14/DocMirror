@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from docmirror.output.markdown_renderer import render_enhanced_markdown, render_markdown
+from docmirror.output.markdown_renderer import render_markdown
 
 _SYSTEM_COLUMNS = ("record_id", "_page_start", "_page_end")
 _AUDIT_COLUMNS = (
@@ -34,6 +34,43 @@ _AUDIT_COLUMNS = (
     "evidence_ref",
     "csv_escape_applied",
 )
+
+_READING_COLUMN_PREFERENCES: dict[str, tuple[str, ...]] = {
+    "credit_accounts": (
+        "sequence",
+        "account_type",
+        "institution",
+        "business_type",
+        "open_date",
+        "credit_limit",
+        "loan_amount",
+        "balance",
+        "status",
+    ),
+    "credit_lines": (
+        "facility_type",
+        "institution",
+        "total_limit",
+        "used_limit",
+        "status",
+    ),
+    "repayment_liability_records": (
+        "sequence",
+        "liability_date",
+        "related_party_name",
+        "institution",
+        "business_type",
+        "responsibility_amount",
+        "balance",
+    ),
+    "inquiry_records": (
+        "sequence",
+        "inquiry_date",
+        "institution",
+        "reason",
+        "inquiry_type",
+    ),
+}
 
 _NON_DATASET_KEYS = frozenset(
     {
@@ -456,10 +493,34 @@ def _physical_marker_row_count(result: Any, markers: set[str]) -> int:
 def _dataset_completeness(
     result: Any,
     key: str,
-    emitted: int,
+    rows: list[Any],
     projection: dict[str, Any],
 ) -> dict[str, Any]:
     """Resolve an independent expected count where the physical contract permits it."""
+    emitted = len(rows)
+    if key == "inquiry_records":
+        sequences: dict[str, set[int]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            normalized, raw = _record_pools(row)
+            inquiry_type = str(normalized.get("inquiry_type", raw.get("inquiry_type", "")) or "unknown")
+            try:
+                sequence = int(normalized.get("sequence", raw.get("sequence", 0)) or 0)
+            except (TypeError, ValueError):
+                sequence = 0
+            if sequence > 0:
+                sequences.setdefault(inquiry_type, set()).add(sequence)
+        if sequences:
+            expected = sum(max(values) for values in sequences.values())
+            return {
+                "expected_row_count": expected,
+                "emitted_row_count": emitted,
+                "omitted_row_count": max(0, expected - emitted),
+                "verified": expected == emitted
+                and all(values == set(range(1, max(values) + 1)) for values in sequences.values()),
+                "basis": "source_sequence_ledger",
+            }
     policy = (projection.get("completeness") or {}).get(key) or {}
     if policy.get("basis") == "physical_marker_rows":
         markers = {re.sub(r"\s+", "", str(value)) for value in policy.get("first_column_values") or []}
@@ -485,6 +546,154 @@ def _warning_code(raw: str) -> str:
     base = raw.split(":", 1)[0]
     code = re.sub(r"[^0-9A-Za-z]+", "_", base).strip("_").upper()
     return code or "PARTIAL_PARSE"
+
+
+def _reading_column_keys(dataset: dict[str, Any]) -> list[str]:
+    available = [str(column.get("key") or "") for column in dataset.get("columns") or [] if column.get("key")]
+    preferred = _READING_COLUMN_PREFERENCES.get(str(dataset.get("name") or ""), ())
+    selected = [key for key in preferred if key in available]
+    return selected or available
+
+
+def _build_public_reading_model(
+    document: dict[str, Any],
+    sections: list[dict[str, Any]],
+    datasets: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a public, replayable reading plan over Community data."""
+    datasets_by_id = {str(dataset.get("id") or ""): dataset for dataset in datasets}
+    tables: list[dict[str, Any]] = []
+    flow: list[dict[str, Any]] = [{"order": 1, "kind": "document", "ref_id": str(document.get("id") or "")}]
+    attached: set[str] = set()
+
+    def append(kind: str, ref_id: str) -> None:
+        flow.append({"order": len(flow) + 1, "kind": kind, "ref_id": ref_id})
+
+    for section in sections:
+        section_id = str(section.get("id") or "")
+        append("section", section_id)
+        for dataset_id in section.get("dataset_refs") or []:
+            dataset_id = str(dataset_id)
+            dataset = datasets_by_id.get(dataset_id)
+            if dataset is None or dataset_id in attached:
+                continue
+            tables.append(
+                {
+                    "id": f"reading:{dataset_id}",
+                    "dataset_id": dataset_id,
+                    "section_id": section_id,
+                    "title": str(dataset.get("label") or dataset.get("name") or dataset_id),
+                    "column_keys": _reading_column_keys(dataset),
+                    "row_count": int(dataset.get("row_count") or 0),
+                }
+            )
+            append("dataset", dataset_id)
+            attached.add(dataset_id)
+
+    for dataset in datasets:
+        dataset_id = str(dataset.get("id") or "")
+        if not dataset_id or dataset_id in attached:
+            continue
+        tables.append(
+            {
+                "id": f"reading:{dataset_id}",
+                "dataset_id": dataset_id,
+                "section_id": str(dataset.get("section_id") or ""),
+                "title": str(dataset.get("label") or dataset.get("name") or dataset_id),
+                "column_keys": _reading_column_keys(dataset),
+                "row_count": int(dataset.get("row_count") or 0),
+            }
+        )
+        append("dataset", dataset_id)
+
+    return {
+        "version": "1.0",
+        "profile": "community",
+        "document_flow": flow,
+        "tables": tables,
+    }
+
+
+def _markdown_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return str(value).replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", "<br>")
+
+
+def render_community_reading_markdown(payload: dict[str, Any]) -> str:
+    """Transcribe a public Community payload without accessing ParseResult."""
+    document = payload.get("document") or {}
+    sections = {str(section.get("id") or ""): section for section in payload.get("sections") or []}
+    datasets = {str(dataset.get("id") or ""): dataset for dataset in payload.get("datasets") or []}
+    reading = payload.get("reading") or {}
+    tables = {str(table.get("dataset_id") or ""): table for table in reading.get("tables") or []}
+    parts = [
+        '<!-- docmirror:markdown-profile version="1.0" -->',
+        '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community" -->',
+        f"# {_markdown_text(document.get('title') or document.get('type') or 'Document')}",
+    ]
+    metadata = [
+        ("Document type", document.get("type")),
+        ("Pages", document.get("page_count")),
+    ]
+    for label, value in metadata:
+        if value not in (None, ""):
+            parts.append(f"**{label}:** {_markdown_text(value)}")
+
+    rendered_sections: set[str] = set()
+    for entry in reading.get("document_flow") or []:
+        kind = str(entry.get("kind") or "")
+        ref_id = str(entry.get("ref_id") or "")
+        if kind == "section":
+            section = sections.get(ref_id)
+            if section is None:
+                continue
+            rendered_sections.add(ref_id)
+            parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or ref_id)}")
+            for item in section.get("items") or []:
+                parts.append(f"**{_markdown_text(item.get('label') or item.get('key'))}:** {_markdown_text(item.get('value'))}")
+            for group in section.get("groups") or []:
+                parts.append(f"### {_markdown_text(group.get('label') or group.get('key'))}")
+                for item in group.get("items") or []:
+                    parts.append(
+                        f"**{_markdown_text(item.get('label') or item.get('key'))}:** "
+                        f"{_markdown_text(item.get('value'))}"
+                    )
+            continue
+        if kind != "dataset":
+            continue
+        dataset = datasets.get(ref_id)
+        table = tables.get(ref_id)
+        if dataset is None or table is None:
+            continue
+        parts.append(f"### {_markdown_text(table.get('title') or dataset.get('label') or ref_id)}")
+        column_by_key = {
+            str(column.get("key") or ""): column for column in dataset.get("columns") or [] if column.get("key")
+        }
+        keys = [str(key) for key in table.get("column_keys") or [] if str(key) in column_by_key]
+        if not keys:
+            parts.append("_No displayable columns._")
+            continue
+        labels = [_markdown_text(column_by_key[key].get("label") or key) for key in keys]
+        lines = [
+            "| " + " | ".join(labels) + " |",
+            "| " + " | ".join("---" for _ in keys) + " |",
+        ]
+        for row in dataset.get("rows") or []:
+            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+            values = [_markdown_text(normalized.get(key, canonical_raw.get(key))) for key in keys]
+            lines.append("| " + " | ".join(values) + " |")
+        parts.append("\n".join(lines))
+
+    for section_id, section in sections.items():
+        if section_id not in rendered_sections:
+            parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or section_id)}")
+    return "\n\n".join(part for part in parts if part).rstrip() + "\n"
 
 
 @dataclass
@@ -541,22 +750,24 @@ class CommunityBundle:
     files: dict[str, str]
     warnings: list[dict[str, Any]]
     result: Any
-    reading_projection: Any | None = None
 
     def json_payload(self) -> dict[str, Any]:
         sections_by_id = {str(section["id"]): section for section in self.sections}
+        public_sections = [self._public_section(section) for section in self.sections]
+        public_datasets = [
+            dataset.to_payload(
+                fallback_page_range=list(
+                    sections_by_id.get(str(dataset.public.get("section_id") or ""), {}).get("page_range") or []
+                )
+            )
+            for dataset in self.datasets
+        ]
         return {
             "schema": self.schema,
             "document": self.document,
-            "sections": [self._public_section(section) for section in self.sections],
-            "datasets": [
-                dataset.to_payload(
-                    fallback_page_range=list(
-                        sections_by_id.get(str(dataset.public.get("section_id") or ""), {}).get("page_range") or []
-                    )
-                )
-                for dataset in self.datasets
-            ],
+            "sections": public_sections,
+            "datasets": public_datasets,
+            "reading": _build_public_reading_model(self.document, public_sections, public_datasets),
             "files": self.files,
             "warnings": self.warnings,
         }
@@ -581,34 +792,26 @@ class CommunityBundle:
         return markdown
 
     def render_enhanced_markdown(self) -> str:
-        """Render the fixed enhanced view, using canonical content as fallback."""
-        entities = getattr(self.result, "entities", None)
-        plugin_id = str(getattr(entities, "document_type", "") or self.schema.get("domain") or "generic")
-        return render_enhanced_markdown(
-            self.result,
-            self.reading_projection,
-            fallback_plugin_id=plugin_id,
-        )
+        """Transcribe the public Community reading model."""
+        return render_community_reading_markdown(self.json_payload())
 
     def render_dataset_csvs(self) -> dict[str, str]:
-        """Render one intuitive wide CSV per logical dataset."""
+        """Render CSV sister projections from the same public payload as JSON."""
         rendered: dict[str, str] = {}
-        sections_by_id = {str(section["id"]): section for section in self.sections}
-        for dataset in self.datasets:
-            public = dataset.public
+        for public in self.json_payload().get("datasets") or []:
             relative_path = str(public["csv"])
             columns = list(public.get("columns") or [])
             fieldnames = [*_SYSTEM_COLUMNS, *(str(column["key"]) for column in columns)]
             output = io.StringIO(newline="")
-            writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\r\n")
+            writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
             writer.writeheader()
-            section = sections_by_id.get(str(public.get("section_id") or ""), {})
-            for index, row in enumerate(dataset.rows, start=1):
-                normalized, raw = _record_pools(row)
-                page_range = _page_range(row, section.get("page_range") or [])
-                record_id = _canonical_record_id(row, str(public["id"]), index)
+            for row in public.get("rows") or []:
+                normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+                raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+                source = row.get("source") if isinstance(row.get("source"), dict) else {}
+                page_range = list(source.get("page_range") or [])
                 output_row: dict[str, Any] = {
-                    "record_id": record_id,
+                    "record_id": str(row.get("record_id") or ""),
                     "_page_start": page_range[0] if page_range else "",
                     "_page_end": page_range[-1] if page_range else "",
                 }
@@ -672,7 +875,7 @@ class CommunityBundle:
     def render_audit_csv(self) -> str:
         """Render field-level normalized/raw values and evidence for all datasets."""
         output = io.StringIO(newline="")
-        writer = csv.DictWriter(output, fieldnames=list(_AUDIT_COLUMNS), extrasaction="ignore", lineterminator="\r\n")
+        writer = csv.DictWriter(output, fieldnames=list(_AUDIT_COLUMNS), extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         sections_by_id = {str(section["id"]): section for section in self.sections}
         for dataset in self.datasets:
@@ -1012,12 +1215,24 @@ def project_community_bundle(
             "schema_version": "1.0",
             "status": "complete" if rows else "empty",
             "columns": _dataset_columns(rows, dictionary, key),
-            "completeness": _dataset_completeness(result, key, len(rows), projection),
+            "completeness": _dataset_completeness(result, key, rows, projection),
         }
         datasets.append(CommunityDataset(public=public, rows=rows))
         for section in sections:
             if section["id"] == section_id and dataset_id not in section["dataset_refs"]:
                 section["dataset_refs"].append(dataset_id)
+
+    datasets_by_section: dict[str, list[CommunityDataset]] = {}
+    for dataset in datasets:
+        datasets_by_section.setdefault(str(dataset.public.get("section_id") or ""), []).append(dataset)
+    for section in sections:
+        pages = list(section.get("page_range") or [])
+        for dataset in datasets_by_section.get(str(section.get("id") or ""), []):
+            for row in dataset.rows:
+                pages.extend(_page_range(row, []))
+        positive_pages = [int(page) for page in pages if isinstance(page, (int, float)) and int(page) > 0]
+        if positive_pages:
+            section["page_range"] = [min(positive_pages), max(positive_pages)]
 
     warnings: list[dict[str, Any]] = []
     seen_warnings: set[tuple[str, str]] = set()
@@ -1070,6 +1285,7 @@ def project_community_bundle(
         datasets=datasets,
         files={
             "content_md": f"{file_id}_content.md",
+            "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
             "dataset_audit_csv": f"{file_id}_datasets/_audit_cells.csv",
         },
