@@ -71,6 +71,7 @@ def test_repayment_liability_records_keep_identity_and_normalized_values() -> No
 def test_assembly_adds_normalized_view_without_removing_legacy_fields() -> None:
     account = {
         "source_structure_id": "account-1",
+        "sequence": 7,
         "management_institution": {"normalized_value": "示例银行"},
         "account_status": {"normalized_value": "正常"},
         "open_date": {"normalized_value": "2024/1/2"},
@@ -90,6 +91,7 @@ def test_assembly_adds_normalized_view_without_removing_legacy_fields() -> None:
 
     actual = assembled["credit_accounts"][0]
     assert actual["management_institution"] == {"normalized_value": "示例银行"}
+    assert actual["normalized"]["sequence"] == 7
     assert actual["normalized"]["institution"] == "示例银行"
     assert actual["normalized"]["open_date"] == "2024-01-02"
     assert actual["normalized"]["loan_amount"] == 1200.5
@@ -165,6 +167,40 @@ def test_assembly_normalizes_repayment_and_derives_overdue() -> None:
     assert actual["normalized"]["overdue_amount"] == 300
     assert actual["source_refs"][0]["source"] == "repayment_micro_grid"
     assert assembled["overdue_records"][0]["normalized"]["overdue_level"] == 2
+
+
+def test_assembly_normalizes_overdue_account_business_fields() -> None:
+    assembled = assemble_credit_report_business(
+        _result(),
+        "",
+        report_subtype="personal_brief",
+        content_mode="native_text",
+        existing_collections={
+            "overdue_records": [
+                {
+                    "overdue_id": "overdue-1",
+                    "account_id": "account-1",
+                    "sequence": "3",
+                    "account_type": "loan",
+                    "management_institution": "示例银行",
+                    "business_type": "个人经营性贷款",
+                    "open_date": "2024年01月02日",
+                    "overdue_months": "6",
+                    "over_90_days_months": "3",
+                    "current_overdue_status": "overdue",
+                }
+            ]
+        },
+    )
+
+    normalized = assembled["overdue_records"][0]["normalized"]
+    assert normalized["sequence"] == 3
+    assert normalized["institution"] == "示例银行"
+    assert normalized["business_type"] == "个人经营性贷款"
+    assert normalized["open_date"] == "2024-01-02"
+    assert normalized["overdue_months"] == 6
+    assert normalized["over_90_days_months"] == 3
+    assert normalized["current_overdue_status"] == "overdue"
 
 
 def test_assembly_marks_truncated_document_for_review() -> None:

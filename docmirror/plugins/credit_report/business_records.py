@@ -17,6 +17,8 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docmirror.plugins.credit_report.currency_codes import normalize_currency_code
+
 _DATE_CN_RE = re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日")
 _ACCOUNT_DATE_PATTERN = r"20\d{2}年\s*\d{1,2}月\s*\d{1,2}日"
 _ACCOUNT_START_RE = re.compile(
@@ -364,6 +366,7 @@ def _personal_accounts(text: str, page_texts: list[tuple[int, str, str]]) -> lis
     # account start.
     starts = list(_ACCOUNT_START_RE.finditer(text))
     accounts: list[dict[str, Any]] = []
+    source_sequences = {"credit_card": 0, "loan": 0}
     for index, match in enumerate(starts):
         end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
         for marker in ("相关还款责任信息", "非信贷交易记录", "公共记录", "查询记录"):
@@ -378,14 +381,17 @@ def _personal_accounts(text: str, page_texts: list[tuple[int, str, str]]) -> lis
         account = _personal_account_from_chunk(chunk, page_texts)
         if not account or not account.get("account_id"):
             continue
-        # Several cards can legitimately share institution, opening date,
-        # currency, and even limit while the brief report masks their account
-        # numbers. Preserve every numbered narrative entry and make its ordinal
-        # part of the stable surrogate key instead of collapsing it.
-        account["sequence"] = len(accounts) + 1
+        # The printed report owns two numbered account lists: credit cards and
+        # loans. Loan facilities share the loan list. Preserve those source
+        # ordinals in Community data instead of inventing one document-wide
+        # sequence, while retaining the group in the surrogate identity.
+        source_group = "credit_card" if account.get("account_type") == "credit_card" else "loan"
+        source_sequences[source_group] += 1
+        account["sequence"] = source_sequences[source_group]
         account["account_id"] = _stable_id(
             "credit_account",
             account["account_id"],
+            source_group,
             account["sequence"],
         )
         if "ever_overdue" not in account:
@@ -436,25 +442,7 @@ def _personal_account_from_chunk(
             business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)", compact_body)
         business_type = business_match.group(1) if business_match else "贷款"
 
-    currency_match = re.search(
-        r"[（(](人民币|美元|欧元|港币|加元|加拿大元|新西兰元|日元|新加坡元|英镑|澳大利亚元|澳元)(?:账户)?",
-        compact_body,
-    )
-    currency_label = currency_match.group(1) if currency_match else "人民币"
-    currency = {
-        "人民币": "CNY",
-        "美元": "USD",
-        "欧元": "EUR",
-        "港币": "HKD",
-        "加元": "CAD",
-        "加拿大元": "CAD",
-        "新西兰元": "NZD",
-        "日元": "JPY",
-        "新加坡元": "SGD",
-        "英镑": "GBP",
-        "澳大利亚元": "AUD",
-        "澳元": "AUD",
-    }.get(currency_label, currency_label)
+    currency = _personal_account_currency(compact_body)
     card_tail_match = re.search(r"卡片尾号[:：]?(\d{3,8})", compact_body)
     card_tail = card_tail_match.group(1) if card_tail_match else ""
     page = _source_page(page_texts, chunk[:120])
@@ -514,7 +502,14 @@ def _personal_account_from_chunk(
         account["ever_overdue"] = False
     if "当前无逾期" in compact_chunk:
         account["current_overdue"] = False
-    if "没有发生过90天以上" in compact_chunk or "没有发生过90天以上的逾期" in compact_chunk:
+    elif "当前有逾期" in compact_chunk:
+        account["current_overdue"] = True
+    over_90_months = re.search(r"其中(\d+)个月逾期超过90天", compact_chunk)
+    if over_90_months:
+        account["over_90_days_months"] = int(over_90_months.group(1))
+        account["over_90_days"] = int(over_90_months.group(1)) > 0
+    elif "没有发生过90天以上" in compact_chunk or "没有发生过90天以上的逾期" in compact_chunk:
+        account["over_90_days_months"] = 0
         account["over_90_days"] = False
     elif "发生过90天以上" in compact_chunk:
         account["over_90_days"] = True
@@ -530,6 +525,21 @@ def _personal_account_from_chunk(
         account.get("loan_amount"),
     )
     return account
+
+
+def _personal_account_currency(compact_body: str) -> str:
+    """Read the explicitly printed account currency, defaulting only if absent."""
+    for match in re.finditer(r"[（(]([^()（）]{1,48})[）)]", compact_body):
+        segment = match.group(1).split("，", 1)[0].split(",", 1)[0]
+        has_account_marker = segment.endswith("账户")
+        label = segment.removesuffix("账户").removesuffix("币种")
+        normalized = normalize_currency_code(label)
+        if normalized:
+            return normalized
+        # A future or non-ISO account label is still more truthful than CNY.
+        if has_account_marker and label:
+            return label
+    return "CNY"
 
 
 def _personal_repayment_liabilities(
@@ -721,14 +731,18 @@ def _inquiry_rows(
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(section)
         rest = _compact(section[match.end() : end])
-        reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in rest), "")
-        if not reason:
+        source_reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in rest), "")
+        if not source_reason:
             continue
-        institution = "本人" if inquiry_type == "personal" else rest.split(reason, 1)[0]
+        source_reason = source_reason.replace("(", "（").replace(")", "）")
+        institution = "本人" if inquiry_type == "personal" else rest.split(source_reason, 1)[0]
         if not institution or len(institution) > 100:
             continue
         query_date = _iso_date(match.group(2))
         page = _source_page(page_texts, f"{match.group(1)}{match.group(2)}{institution[:12]}")
+        query_channel_match = re.search(r"[（(]([^）)]+)[）)]", source_reason)
+        query_channel = query_channel_match.group(1) if query_channel_match else ""
+        reason = "本人查询" if inquiry_type == "personal" else source_reason
         out.append(
             {
                 "inquiry_id": _stable_id(
@@ -737,13 +751,15 @@ def _inquiry_rows(
                     int(match.group(1)),
                     query_date,
                     institution,
-                    reason,
+                    source_reason,
                 ),
                 "sequence": int(match.group(1)),
                 "inquiry_type": inquiry_type,
                 "inquiry_date": query_date,
                 "institution": institution,
-                "reason": reason.replace("(", "（").replace(")", "）"),
+                "reason": reason,
+                "source_reason": source_reason,
+                **({"query_channel": query_channel} if query_channel else {}),
                 "source": "personal_brief_inquiry_ledger",
                 "source_refs": _source_refs(page, "native_text_ledger"),
                 "confidence": 0.97,
@@ -758,14 +774,30 @@ def _overdue_from_personal_accounts(accounts: list[dict[str, Any]]) -> list[dict
         if not account.get("ever_overdue"):
             continue
         account_id = str(account.get("account_id") or "")
+        current_overdue = account.get("current_overdue")
         out.append(
             {
                 "overdue_id": _stable_id("credit_overdue", account_id, "last_5_years"),
                 "account_id": account_id,
+                "sequence": account.get("sequence"),
+                "account_type": account.get("account_type"),
+                "management_institution": account.get("management_institution"),
+                "business_type": account.get("business_type"),
+                "card_tail": account.get("card_tail"),
+                "open_date": account.get("open_date"),
+                "currency": account.get("currency"),
                 "period_scope": "last_5_years",
                 "overdue_months": int(account.get("overdue_months_last_5y") or 0),
+                "over_90_days_months": account.get("over_90_days_months"),
                 "over_90_days": account.get("over_90_days"),
-                "current_overdue": account.get("current_overdue"),
+                "current_overdue": current_overdue,
+                "current_overdue_status": (
+                    "overdue"
+                    if current_overdue is True
+                    else "not_overdue"
+                    if current_overdue is False
+                    else "not_reported"
+                ),
                 "source": "personal_brief_account_narrative",
                 "source_refs": list(account.get("source_refs") or []),
                 "confidence": account.get("confidence", 0.9),
@@ -941,10 +973,8 @@ def _set_if_value(target: dict[str, Any], key: str, value: Any) -> None:
 
 def _currency_code(value: str) -> str:
     compact = _compact(value)
-    for label, code in (("人民币", "CNY"), ("美元", "USD"), ("欧元", "EUR"), ("港币", "HKD")):
-        if label in compact:
-            return code
-    return compact if compact and compact != "--" else ""
+    normalized = normalize_currency_code(compact)
+    return normalized or (compact if compact and compact != "--" else "")
 
 
 def _enterprise_summary(text: str, *, parse_result: Any | None = None) -> dict[str, Any]:

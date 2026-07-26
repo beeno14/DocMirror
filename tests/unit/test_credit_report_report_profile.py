@@ -36,6 +36,7 @@ def test_personal_brief_native_header_recovery_stops_at_adjacent_labels() -> Non
     assert fields["id_number"] == "11010519491231002X"
     assert fields["marital_status"] == "married"
     assert fields["report_time"] == "2026-07-19T09:08:07"
+    assert fields["document_label"] == "个人信用报告"
     assert fields["report_subtype"] == "personal_brief"
     assert fields["content_mode"] == "native_text"
 
@@ -106,6 +107,7 @@ def test_personal_detail_scan_profile_and_header_recovery() -> None:
     assert detect_credit_report_content_mode(result) == "scanned_ocr"
     assert fields["subject_name"] == "李四"
     assert fields["id_number"] == "11010519491231002X"
+    assert fields["document_label"] == "个人信用报告（本人版）"
     assert fields["report_subtype"] == "personal_detail"
     assert fields["content_mode"] == "scanned_ocr"
 
@@ -170,6 +172,7 @@ def test_enterprise_header_recovers_company_identifiers_and_no_number() -> None:
     assert fields["query_institution"] == "中国工商银行股份有限公司上海市分行"
     assert fields["report_number"] == "2026071900012345678903"
     assert fields["report_time"] == "2026-07-19T10:40:34"
+    assert fields["document_label"] == "企业信用报告（自主查询版）"
     assert fields["report_subtype"] == "enterprise"
 
 

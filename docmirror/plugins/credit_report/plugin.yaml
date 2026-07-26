@@ -34,6 +34,7 @@ projection:
     public_record_summary: public_records
   internal_facts: [credit_extraction_audit]
   internal_fields:
+    - document_label
     - classification_source
     - doc_type_hint_source
     - user_doc_type_hint
@@ -106,6 +107,16 @@ projection:
       - responsibility_amount
       - balance
       - currency
+    overdue_records:
+      - sequence
+      - account_type
+      - institution
+      - business_type
+      - card_tail
+      - open_date
+      - overdue_months
+      - over_90_days_months
+      - current_overdue_status
     inquiry_records:
       - sequence
       - inquiry_date

@@ -227,6 +227,16 @@ def recover_credit_report_header_fields(
     header = text[:12_000]
     subtype = report_subtype or detect_credit_report_subtype(parse_result, text)
     fields: dict[str, str] = {}
+    title_match = re.search(
+        r"(企业信用报告|个人信用报告)([（(](?:本人版|个人版|自主查询版)[）)])?",
+        header,
+    )
+    if title_match:
+        fields["document_label"] = "".join(
+            part.replace("(", "（").replace(")", "）")
+            for part in title_match.groups()
+            if part
+        )
 
     if subtype == "enterprise":
         subject_name = _search(

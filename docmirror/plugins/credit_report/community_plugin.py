@@ -61,34 +61,22 @@ class CreditReportPlugin(CommunityProjector):
         return derive_credit_report_projection(self, parse_result, text)
 
     def reading_projection(self, parse_result):
-        from docmirror.output.reading_projection import ReadingProjection
-        from docmirror.plugins.credit_report.account_reading_order import (
-            build_account_reading_projection,
-        )
-        from docmirror.plugins.credit_report.inquiry_reading_order import (
-            build_institution_inquiry_reading_projection,
-        )
         from docmirror.plugins.credit_report.report_profile import (
             detect_credit_report_content_mode,
             detect_credit_report_subtype,
         )
+        from docmirror.plugins.credit_report.variant_router import (
+            resolve_credit_report_variant,
+        )
 
         text = str(parse_result.full_text or parse_result.raw_text or "")
-        if detect_credit_report_subtype(parse_result, text) != "personal_brief":
-            return None
-        if detect_credit_report_content_mode(parse_result) not in {"native_text", "mixed"}:
-            return None
-        projections = (
-            build_account_reading_projection(parse_result),
-            build_institution_inquiry_reading_projection(parse_result),
+        report_subtype = detect_credit_report_subtype(parse_result, text)
+        content_mode = detect_credit_report_content_mode(parse_result)
+        variant = resolve_credit_report_variant(report_subtype, content_mode)
+        return variant.build_reading_projection(
+            parse_result,
+            content_mode=content_mode,
         )
-        transforms = tuple(
-            transform
-            for projection in projections
-            if projection is not None
-            for transform in projection.transforms
-        )
-        return ReadingProjection(plugin_id="credit_report", transforms=transforms) if transforms else None
 
 
 plugin = CreditReportPlugin()

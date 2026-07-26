@@ -12,6 +12,10 @@ from docmirror.plugins.credit_report.business_records import (
     extract_native_credit_business,
     extract_personal_brief_section_content,
 )
+from docmirror.plugins.credit_report.currency_codes import (
+    ISO_4217_CURRENT_CODES,
+    normalize_currency_code,
+)
 
 
 def _result(text: str) -> SimpleNamespace:
@@ -47,11 +51,21 @@ def test_personal_brief_extracts_narrative_accounts_and_inquiry_ledger() -> None
 
     assert len(business["credit_accounts"]) == 3
     assert len({item["account_id"] for item in business["credit_accounts"]}) == 3
+    assert [item["sequence"] for item in business["credit_accounts"]] == [1, 1, 2]
     assert business["credit_accounts"][1]["loan_amount"] == 300000
     assert business["credit_lines"][0]["total_limit"] == 500000
     assert business["credit_lines"][0]["used_limit"] == 120000
-    assert business["overdue_records"][0]["overdue_months"] == 1
+    overdue = business["overdue_records"][0]
+    assert overdue["sequence"] == 1
+    assert overdue["management_institution"] == "示例银行信用卡中心"
+    assert overdue["overdue_months"] == 1
+    assert overdue["over_90_days_months"] == 0
+    assert overdue["current_overdue_status"] == "not_overdue"
     assert len(business["inquiry_records"]) == 3
+    personal_inquiry = business["inquiry_records"][-1]
+    assert personal_inquiry["reason"] == "本人查询"
+    assert personal_inquiry["source_reason"] == "本人查询（互联网个人信用信息服务平台）"
+    assert personal_inquiry["query_channel"] == "互联网个人信用信息服务平台"
     assert business["credit_summary"]["institution_inquiry_count"] == 2
     assert business["credit_summary"]["personal_inquiry_count"] == 1
     assert business["credit_summary"]["activated_credit_card_account_count"] == 1
@@ -74,6 +88,64 @@ def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
 
     assert len(business["credit_accounts"]) == 2
     assert len({item["account_id"] for item in business["credit_accounts"]}) == 2
+
+
+def test_personal_brief_preserves_complete_overdue_business_facts() -> None:
+    text = """
+    个人信用报告 信贷记录
+    2024年01月02日示例商业银行发放的300,000元（人民币）个人经营性贷款，
+    2026年02月03日到期。截至2025年11月，余额200,000，当前有逾期。
+    最近5年内有6个月处于逾期状态，其中3个月逾期超过90天。
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    overdue = business["overdue_records"][0]
+    assert overdue["sequence"] == 1
+    assert overdue["account_type"] == "loan"
+    assert overdue["management_institution"] == "示例商业银行"
+    assert overdue["business_type"] == "个人经营性贷款"
+    assert overdue["open_date"] == "2024-01-02"
+    assert overdue["currency"] == "CNY"
+    assert overdue["overdue_months"] == 6
+    assert overdue["over_90_days_months"] == 3
+    assert overdue["over_90_days"] is True
+    assert overdue["current_overdue"] is True
+    assert overdue["current_overdue_status"] == "overdue"
+
+
+def test_personal_brief_normalizes_global_currency_names_without_false_cny() -> None:
+    text = """
+    个人信用报告 信贷记录
+    2020年01月01日示例银行信用卡中心发放的贷记卡（香港元账户）。截至2024年11月，余额0。
+    2020年01月02日示例银行信用卡中心发放的贷记卡（瑞士法郎账户）。截至2024年11月，余额0。
+    2020年01月03日示例银行信用卡中心发放的贷记卡（未来测试币账户）。截至2024年11月，余额0。
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert [item["currency"] for item in business["credit_accounts"]] == [
+        "HKD",
+        "CHF",
+        "未来测试币",
+    ]
+
+
+def test_currency_registry_accepts_every_current_iso_4217_list_one_code() -> None:
+    assert len(ISO_4217_CURRENT_CODES) == 178
+    assert {normalize_currency_code(code) for code in ISO_4217_CURRENT_CODES} == ISO_4217_CURRENT_CODES
+    assert normalize_currency_code("加勒比盾") == "XCG"
+    assert normalize_currency_code("津巴布韦金") == "ZWG"
 
 
 def test_personal_brief_preserves_source_summary_nulls_and_unclosed_definition() -> None:
@@ -257,6 +329,9 @@ def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() 
     assert liability["balance"] == 20000
     assert business["credit_summary"]["repayment_liability_count"] == 1
     assert business["credit_summary"]["personal_inquiry_count"] == 1
+    personal_inquiry = business["inquiry_records"][0]
+    assert personal_inquiry["reason"] == "本人查询"
+    assert personal_inquiry["query_channel"] == "商业银行网上银行"
     assert business["credit_summary"]["activated_credit_card_account_count"] == 0
     assert business["credit_summary"]["inactive_credit_card_account_count"] == 1
 

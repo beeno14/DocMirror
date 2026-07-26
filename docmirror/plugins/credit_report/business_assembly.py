@@ -36,6 +36,7 @@ _COLLECTION_ID_KEYS = {
 _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "credit_accounts": (
         ("account_id", ("account_id",)),
+        ("sequence", ("sequence",)),
         ("account_type", ("account_type",)),
         ("institution", ("management_institution", "institution")),
         ("business_type", ("business_type",)),
@@ -116,14 +117,23 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "overdue_records": (
         ("overdue_id", ("overdue_id",)),
         ("account_id", ("account_id",)),
+        ("sequence", ("sequence",)),
+        ("account_type", ("account_type",)),
+        ("institution", ("management_institution", "institution")),
+        ("business_type", ("business_type",)),
+        ("card_tail", ("card_tail",)),
+        ("open_date", ("open_date",)),
+        ("currency", ("currency",)),
         ("period_scope", ("period_scope",)),
         ("year", ("year",)),
         ("month", ("month",)),
         ("overdue_level", ("overdue_level",)),
         ("overdue_amount", ("overdue_amount",)),
         ("overdue_months", ("overdue_months",)),
+        ("over_90_days_months", ("over_90_days_months",)),
         ("five_tier_class", ("five_tier_class",)),
         ("current_overdue", ("current_overdue",)),
+        ("current_overdue_status", ("current_overdue_status",)),
         ("over_90_days", ("over_90_days",)),
     ),
     "inquiry_records": (
@@ -133,6 +143,8 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("inquiry_date", ("inquiry_date",)),
         ("institution", ("institution",)),
         ("reason", ("reason",)),
+        ("source_reason", ("source_reason",)),
+        ("query_channel", ("query_channel",)),
     ),
     "public_records": (
         ("public_record_id", ("public_record_id",)),
@@ -172,6 +184,7 @@ _NUMBER_FIELDS = frozenset(
         "used_limit",
         "available_limit",
         "overdue_months",
+        "over_90_days_months",
         "overdue_level",
         "repayment_periods",
         "remaining_periods",

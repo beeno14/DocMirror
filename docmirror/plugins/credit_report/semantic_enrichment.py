@@ -202,7 +202,7 @@ def credit_report_data_dictionary() -> dict[str, Any]:
         "repayment_liability_count": descriptor("相关还款责任记录数", type_="integer"),
         "inquiry_count": descriptor("查询记录总数", type_="integer"),
         "institution_inquiry_count": descriptor("机构查询记录数", type_="integer"),
-        "personal_inquiry_count": descriptor("本人查询记录数", type_="integer"),
+        "personal_inquiry_count": descriptor("个人查询记录数", type_="integer"),
         "projected_account_count": descriptor("投影账户数", type_="integer"),
         "source_summary_table_id": descriptor("源概要表标识"),
         "source_summary_page": descriptor("源概要表页码", type_="integer"),
@@ -220,7 +220,7 @@ def credit_report_data_dictionary() -> dict[str, Any]:
         "other_business": descriptor("其他业务"),
     }
     common_account_columns = {
-        "sequence": descriptor("序号", type_="integer"),
+        "sequence": descriptor("组内序号", type_="integer"),
         "account_id": descriptor("账户记录ID"),
         "account_identifier": descriptor("账户标识", type_="long_id", sensitive=True),
         "account_type": descriptor("账户类型", type_="enum"),
@@ -288,13 +288,42 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "currency": descriptor("币种", type_="currency"),
             }
         },
+        "overdue_records": {
+            "definition": "一行对应一个曾发生逾期的信贷账户及其最近5年逾期事实。",
+            "columns": {
+                key: value
+                for key, value in common_account_columns.items()
+                if key
+                in {
+                    "sequence",
+                    "account_id",
+                    "account_type",
+                    "institution",
+                    "business_type",
+                    "card_tail",
+                    "open_date",
+                    "currency",
+                }
+            }
+            | {
+                "overdue_id": descriptor("逾期记录ID"),
+                "period_scope": descriptor("统计期间", type_="enum"),
+                "overdue_months": descriptor("最近5年逾期月数", type_="integer"),
+                "over_90_days_months": descriptor("其中超过90天月数", type_="integer"),
+                "current_overdue": descriptor("当前是否逾期", type_="boolean"),
+                "current_overdue_status": descriptor("当前逾期状态", type_="enum"),
+                "over_90_days": descriptor("是否发生过90天以上逾期", type_="boolean"),
+            },
+        },
         "inquiry_records": {
-            "definition": "机构查询和本人查询共享事实表；展示时按 inquiry_type 分组。",
+            "definition": "机构查询和个人查询共享事实表；展示时按 inquiry_type 分组。",
             "columns": {
                 "sequence": descriptor("组内序号", type_="integer"),
                 "inquiry_date": descriptor("查询日期", type_="date"),
                 "institution": descriptor("查询机构"),
                 "reason": descriptor("查询原因"),
+                "source_reason": descriptor("源文查询原因"),
+                "query_channel": descriptor("查询渠道"),
                 "inquiry_type": descriptor("查询类型", type_="enum"),
             },
         },
@@ -330,7 +359,13 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "not_applicable": "不适用",
                 "unknown": "未知",
             },
-            "inquiry_type": {"institution": "机构查询", "personal": "本人查询"},
+            "inquiry_type": {"institution": "机构查询", "personal": "个人查询"},
+            "period_scope": {"last_5_years": "最近5年", "account_snapshot": "账户快照", "month": "月份"},
+            "current_overdue_status": {
+                "overdue": "当前有逾期",
+                "not_overdue": "当前无逾期",
+                "not_reported": "未报告",
+            },
             "record_status": {"no_records": "无记录", "reported": "已报告"},
             "marital_status": {
                 "unmarried": "未婚",

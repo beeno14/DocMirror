@@ -62,24 +62,23 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         _extract_credit_accounts_from_local_structure_evidence,
         _has_credit_repayment_structures,
         _recover_credit_subject_identity,
-        build_credit_sections_light,
     )
     from docmirror.plugins._base.kv_projection import extract_kv_projection
     from docmirror.plugins.credit_report.business_assembly import assemble_credit_report_business
-    from docmirror.plugins.credit_report.business_records import extract_personal_brief_section_content
     from docmirror.plugins.credit_report.report_profile import (
         detect_credit_report_content_mode,
         detect_credit_report_subtype,
         recover_credit_report_header_fields,
     )
     from docmirror.plugins.credit_report.scanned_business import (
-        extract_scanned_credit_business,
         link_repayment_records_to_accounts,
     )
     from docmirror.plugins.credit_report.semantic_enrichment import (
         credit_report_data_dictionary,
-        credit_report_semantic_extensions,
         enrich_credit_report_record_evidence,
+    )
+    from docmirror.plugins.credit_report.variant_router import (
+        resolve_credit_report_variant,
     )
 
     base = extract_kv_projection(
@@ -106,7 +105,8 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
 
     report_subtype = detect_credit_report_subtype(parse_result, full_text)
     content_mode = detect_credit_report_content_mode(parse_result)
-    if report_subtype == "personal_brief":
+    variant = resolve_credit_report_variant(report_subtype, content_mode)
+    if not variant.keep_query_institution:
         domain_facts.pop("query_institution", None)
         field_details.pop("query_institution", None)
     recovered_header = recover_credit_report_header_fields(
@@ -127,9 +127,11 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     domain_facts["field_details"] = field_details
 
     source_domain = _domain_specific(parse_result)
-    scanned_business: dict[str, Any] = {}
-    if content_mode in {"scanned_ocr", "mixed"}:
-        scanned_business = extract_scanned_credit_business(parse_result, full_text)
+    scanned_business = variant.extract_auxiliary_business(
+        parse_result,
+        full_text,
+        content_mode=content_mode,
+    )
 
     repayment_records = list(source_domain.get("credit_repayment_records") or [])
     if not repayment_records and (
@@ -168,24 +170,14 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         },
         existing_summary=dict(scanned_business.get("credit_summary") or {}),
     )
-    dataset_names = [
-        "credit_accounts",
-        "repayment_liability_records",
-        "repayment_records",
-        "overdue_records",
-        "inquiry_records",
-        "public_records",
-    ]
-    if report_subtype != "personal_brief":
-        dataset_names.insert(1, "credit_lines")
+    dataset_names = variant.dataset_names()
     datasets = {name: rows for name in dataset_names if (rows := _records(name, assembled.get(name)))}
     if assembled.get("credit_summary"):
         domain_facts["credit_summary"] = dict(assembled["credit_summary"])
     if assembled.get("credit_extraction_audit"):
         domain_facts["credit_extraction_audit"] = dict(assembled["credit_extraction_audit"])
-    section_content: dict[str, Any] = {}
-    if report_subtype == "personal_brief":
-        section_content = extract_personal_brief_section_content(parse_result, full_text)
+    section_content = variant.build_section_content(parse_result, full_text)
+    if section_content:
         for fact_name in ("non_credit_transaction_summary", "public_record_summary"):
             value = section_content.get(fact_name)
             if isinstance(value, dict) and value.get("source_statement"):
@@ -223,9 +215,9 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         document_type=base.document_type,
         entity_fields=entity_fields,
         domain_facts=domain_facts,
-        semantic=credit_report_semantic_extensions(report_subtype=report_subtype),
+        semantic=variant.semantic_extensions(),
         datasets=datasets,
-        sections=tuple(build_credit_sections_light(parse_result, full_text)),
+        sections=variant.build_sections(parse_result, full_text),
         warnings=warnings,
         evidence_ids=evidence_ids,
         confidence=base.confidence,
