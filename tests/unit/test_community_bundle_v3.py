@@ -115,9 +115,26 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
         _candidate(records),
     )
     bundle = project_community_bundle(result, file_id="001", document_id="doc_test")
-    payload = bundle.json_payload()
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
 
     assert set(payload) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
+    assert semantic["schema"] == {
+        "name": "docmirror.community.semantic",
+        "version": "1.0.0",
+        "edition": "community",
+        "document_type": "personal_credit_report_detailed",
+    }
+    assert semantic["source"]["fingerprint"]
+    assert semantic["classification"]["projector_id"]
+    assert semantic["datasets"] == payload["datasets"]
+    assert len(semantic["bindings"]) == 12
+    assert {binding["record_id"] for binding in semantic["bindings"]} == {
+        row["record_id"] for row in semantic["datasets"][0]["rows"]
+    }
+    assert semantic["reading"] == payload["reading"]
+    assert semantic["structure"]["sections"][0]["id"] == payload["sections"][0]["id"]
+    assert validate_projection_payload("community_semantic", semantic).valid
     assert payload["schema"]["version"] == "3.0.0"
     assert payload["schema"]["domain"] == "personal_credit_report_detailed"
     assert payload["datasets"][0]["row_count"] == 12
@@ -137,6 +154,51 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
     assert payload["reading"]["profile"] == "community"
     assert payload["reading"]["tables"][0]["dataset_id"] == payload["datasets"][0]["id"]
     assert validate_projection_payload("community", payload).valid
+
+
+def test_semantic_schema_allows_document_type_specific_extensions() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate([{"month": "2025-01", "status": "N"}]),
+    )
+    bundle = project_community_bundle(result, document_id="doc_semantic_extensions")
+    semantic = bundle.semantic_payload()
+    semantic["domain"]["credit_report"] = {
+        "reported_summary_grid": {
+            "headers": [["信用卡", "贷款"], ["", "购房", "其他"]],
+            "cells": [{"metric": "账户数", "values": [21, 2, 22]}],
+        },
+        "说明": ["公开语义扩展可以因文档类型而异。"],
+    }
+    semantic["structure"]["sections"][0]["document_specific_role"] = "credit_summary"
+
+    assert validate_projection_payload("community_semantic", semantic).valid
+    assert validate_projection_payload("community", bundle.json_payload(semantic)).valid
+
+
+def test_renderers_use_the_same_frozen_semantic_result() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate([{"month": "2025-01", "status": "N"}]),
+    )
+    bundle = project_community_bundle(result, document_id="doc_semantic_source")
+    semantic = bundle.semantic_payload()
+    semantic_record_id = semantic["datasets"][0]["rows"][0]["record_id"]
+
+    bundle.datasets[0].rows.clear()
+    community = bundle.json_payload(semantic)
+    csv_rows = list(
+        csv.DictReader(
+            io.StringIO(
+                bundle.render_dataset_csvs(semantic)[semantic["datasets"][0]["csv"]].lstrip("\ufeff")
+            )
+        )
+    )
+    enhanced = bundle.render_enhanced_markdown(semantic)
+
+    assert community["datasets"][0]["rows"][0]["record_id"] == semantic_record_id
+    assert csv_rows[0]["record_id"] == semantic_record_id
+    assert "| 2025-01 | N |" in enhanced
 
 
 def test_markdown_contains_every_physical_table_row_without_preview_limit() -> None:
@@ -159,12 +221,15 @@ def test_markdown_contains_every_physical_table_row_without_preview_limit() -> N
     _with_projection(result, _candidate())
     bundle = project_community_bundle(result, document_id="doc_test")
     markdown = bundle.render_markdown()
+    semantic = bundle.semantic_payload()
 
     assert "# 个人信用报告" in markdown
     assert "**姓名:** 洪晓鑫" in markdown
     for index in range(1, 177):
         assert f"| {index} | 状态{index} |" in markdown
     assert "| 合计 | 176 |" in markdown
+    assert any(block["kind"] == "heading" and block["text"] == "个人信用报告" for block in semantic["structure"]["blocks"])
+    assert semantic["structure"]["source_tables"][0]["rows"][-1] == ["合计", "176"]
 
 
 def test_dataset_bundle_has_one_wide_row_per_record_and_cell_audit() -> None:

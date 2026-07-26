@@ -59,16 +59,33 @@ def _write_community_bundle_files(
 ) -> dict[str, Path]:
     """Render and publish the Community index, reading view, and Dataset Bundle."""
     bundle.document["id"] = document_id
+    bundle.files.update(
+        {
+            "semantic_json": f"{file_id}_community_semantic.json",
+            "content_md": f"{file_id}_content.md",
+            "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
+            "datasets_dir": f"{file_id}_datasets",
+            "dataset_audit_csv": f"{file_id}_datasets/_audit_cells.csv",
+        }
+    )
+    for dataset in bundle.datasets:
+        csv_name = Path(str(dataset.public.get("csv") or f"{dataset.public.get('id') or 'dataset'}.csv")).name
+        dataset.public["csv"] = f"{file_id}_datasets/{csv_name}"
     targets = {
         "community": task_dir / f"{file_id}_community.json",
+        "community_semantic": task_dir / f"{file_id}_community_semantic.json",
         "content": task_dir / f"{file_id}_content.md",
         "enhanced_reading": task_dir / f"{file_id}_enhanced_reading.md",
         "datasets": task_dir / f"{file_id}_datasets",
     }
     content = bundle.render_markdown()
-    enhanced_reading = bundle.render_enhanced_markdown()
-    community_payload = bundle.json_payload()
-    dataset_csvs = bundle.render_dataset_csvs()
+    semantic_payload = bundle.semantic_payload()
+    enhanced_reading = bundle.render_enhanced_markdown(semantic_payload)
+    community_payload = bundle.json_payload(semantic_payload)
+    dataset_csvs = bundle.render_dataset_csvs(semantic_payload)
+    semantic_validation = validate_projection_payload("community_semantic", semantic_payload)
+    if not semantic_validation.valid:
+        raise ValueError("Community semantic schema validation failed: " + "; ".join(semantic_validation.errors))
     schema_validation = validate_projection_payload("community", community_payload)
     if not schema_validation.valid:
         raise ValueError("Community schema validation failed: " + "; ".join(schema_validation.errors))
@@ -76,12 +93,16 @@ def _write_community_bundle_files(
     if conservation_issues:
         raise ValueError("Community dataset conservation failed: " + "; ".join(conservation_issues))
     writer = ArtifactWriter(task_dir)
+    writer.write_text(
+        targets["community_semantic"].name,
+        dumps_json(semantic_payload, ensure_ascii=False, indent=2),
+    )
     writer.write_text(targets["community"].name, dumps_json(community_payload, ensure_ascii=False, indent=2))
     writer.write_text(targets["content"].name, content)
     writer.write_text(targets["enhanced_reading"].name, enhanced_reading)
     for relative_path, csv_content in dataset_csvs.items():
         writer.write_text(relative_path, csv_content)
-    writer.write_text(f"{file_id}_datasets/_audit_cells.csv", bundle.render_audit_csv())
+    writer.write_text(f"{file_id}_datasets/_audit_cells.csv", bundle.render_audit_csv(semantic_payload))
     return targets
 
 

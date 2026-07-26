@@ -18,7 +18,7 @@ from docmirror.output.markdown_renderer import MARKDOWN_PROFILE_MARKER, validate
 _TOP_LEVEL_BLOCKS = {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
 _RECORD_BLOCKS = {"record_id", "normalized", "canonical_raw", "raw", "source"}
 _COMMUNITY_READING_MARKER = (
-    '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community" -->'
+    '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->'
 )
 _AUDIT_COLUMNS = {
     "dataset_id",
@@ -153,9 +153,89 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
 
     root = path.parent
     files = payload.get("files") if isinstance(payload.get("files"), dict) else {}
+    semantic_path = _companion_path(root, files.get("semantic_json"), "semantic", issues)
     content_path = _companion_path(root, files.get("content_md"), "content", issues)
     enhanced_path = _companion_path(root, files.get("enhanced_reading_md"), "enhanced_reading", issues)
     audit_path = _companion_path(root, files.get("dataset_audit_csv"), "audit", issues)
+
+    semantic: dict[str, Any] = {}
+    if semantic_path is not None:
+        try:
+            loaded_semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            issues.append(f"semantic: invalid JSON: {exc}")
+        else:
+            if not isinstance(loaded_semantic, dict):
+                issues.append("semantic: top level must be an object")
+            else:
+                semantic = loaded_semantic
+                semantic_validation = validate_projection_payload("community_semantic", semantic)
+                issues.extend(f"semantic schema: {error}" for error in semantic_validation.errors)
+                semantic_structure = (
+                    semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
+                )
+                if semantic.get("document") != payload.get("document"):
+                    issues.append("semantic: document diverges from Community JSON")
+                if semantic_structure.get("sections") is not None:
+                    projected_sections = [
+                        {
+                            key: value
+                            for key, value in section.items()
+                            if key not in {"block_refs", "source_table_refs"} and not key.startswith("_")
+                        }
+                        for section in semantic_structure.get("sections") or []
+                        if isinstance(section, dict)
+                    ]
+                    if projected_sections != payload.get("sections"):
+                        issues.append("semantic: sections diverge from Community JSON")
+                if semantic.get("datasets") != payload.get("datasets"):
+                    issues.append("semantic: datasets diverge from Community JSON")
+                if semantic.get("reading") != payload.get("reading"):
+                    issues.append("semantic: reading plan diverges from Community JSON")
+                semantic_dataset_records = {
+                    (str(dataset.get("id") or ""), str(row.get("record_id") or ""))
+                    for dataset in semantic.get("datasets") or []
+                    if isinstance(dataset, dict)
+                    for row in dataset.get("rows") or []
+                    if isinstance(row, dict)
+                }
+                semantic_block_ids = {
+                    str(block.get("id") or "")
+                    for block in semantic_structure.get("blocks") or []
+                    if isinstance(block, dict)
+                }
+                semantic_table_ids = {
+                    str(table.get("id") or "")
+                    for table in semantic_structure.get("source_tables") or []
+                    if isinstance(table, dict)
+                }
+                bound_records: list[tuple[str, str]] = []
+                for index, binding in enumerate(semantic.get("bindings") or []):
+                    if not isinstance(binding, dict):
+                        issues.append(f"semantic.bindings[{index}]: must be an object")
+                        continue
+                    record_key = (
+                        str(binding.get("dataset_id") or ""),
+                        str(binding.get("record_id") or ""),
+                    )
+                    bound_records.append(record_key)
+                    if record_key not in semantic_dataset_records:
+                        issues.append(f"semantic.bindings[{index}]: unknown dataset/record={record_key}")
+                    unknown_blocks = set(binding.get("source_block_refs") or []) - semantic_block_ids
+                    if unknown_blocks:
+                        issues.append(
+                            f"semantic.bindings[{index}]: unknown source_block_refs={sorted(unknown_blocks)}"
+                        )
+                    unknown_tables = set(binding.get("source_table_refs") or []) - semantic_table_ids
+                    if unknown_tables:
+                        issues.append(
+                            f"semantic.bindings[{index}]: unknown source_table_refs={sorted(unknown_tables)}"
+                        )
+                if len(bound_records) != len(set(bound_records)):
+                    issues.append("semantic.bindings: duplicate dataset/record binding")
+                missing_bindings = semantic_dataset_records - set(bound_records)
+                if missing_bindings:
+                    issues.append(f"semantic.bindings: {len(missing_bindings)} records are unbound")
 
     datasets = payload.get("datasets") if isinstance(payload.get("datasets"), list) else []
     dataset_ids: set[str] = set()

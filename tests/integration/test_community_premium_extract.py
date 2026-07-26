@@ -58,6 +58,21 @@ def test_premium_projector_returns_community_payload(domain: str):
     assert payload["schema"]["edition"] == "community"
 
 
+@pytest.mark.parametrize("domain", PREMIUM_DOMAINS)
+def test_premium_projector_returns_document_specific_semantic_result(domain: str):
+    sealed = seal_parse_result(_mirror(domain))
+    projector = PluginRegistry().get_projector(domain, "community", sealed_schema=sealed.schema_version)
+
+    assert projector is not None
+    bundle = projector.project_bundle(sealed)
+    semantic = bundle.semantic_payload()
+    assert semantic["schema"]["name"] == "docmirror.community.semantic"
+    assert semantic["schema"]["document_type"] == domain
+    assert semantic["classification"]["document_type"] == domain
+    assert semantic["classification"]["projector_id"]
+    assert validate_projection_payload("community_semantic", semantic).valid
+
+
 def test_unknown_domain_uses_generic_plugin():
     sealed = seal_parse_result(_mirror("id_card"))
     projector = PluginRegistry().get_projector("generic", "community", sealed_schema=sealed.schema_version)

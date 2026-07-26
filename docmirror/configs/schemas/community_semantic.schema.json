@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valuemapglobal.github.io/DocMirror/schemas/community_semantic.schema.json",
+  "title": "DocMirror Community Semantic Result",
+  "description": "Public post-seal semantic document consumed by Community renderers.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "source",
+    "classification",
+    "document",
+    "structure",
+    "datasets",
+    "bindings",
+    "domain",
+    "reading",
+    "files",
+    "warnings",
+    "diagnostics"
+  ],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["name", "version", "edition", "document_type"],
+      "properties": {
+        "name": {"const": "docmirror.community.semantic"},
+        "version": {"const": "1.0.0"},
+        "edition": {"const": "community"},
+        "document_type": {"type": "string", "minLength": 1}
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["parse_result_schema", "fingerprint"],
+      "properties": {
+        "parse_result_schema": {"type": "string", "minLength": 1},
+        "fingerprint": {"type": "string", "minLength": 1},
+        "file": {"type": "object", "additionalProperties": true}
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["document_type", "projector_id", "support_level"],
+      "properties": {
+        "document_type": {"type": "string", "minLength": 1},
+        "projector_id": {"type": "string", "minLength": 1},
+        "support_level": {"type": "string"}
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "type", "title", "page_count", "language", "source_file", "units"]
+    },
+    "structure": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["sections", "blocks", "source_tables"],
+      "properties": {
+        "sections": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "blocks": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/semanticBlock"}
+        },
+        "source_tables": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/sourceTable"}
+        },
+        "reading_flows": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "outline": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "edges": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "relations": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "cross_page_flows": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "suppressed_noise": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        }
+      }
+    },
+    "datasets": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": true}
+    },
+    "bindings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "dataset_id", "record_id", "source_block_refs", "source_table_refs"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "dataset_id": {"type": "string", "minLength": 1},
+          "record_id": {"type": "string", "minLength": 1},
+          "source_block_refs": {"type": "array", "items": {"type": "string"}},
+          "source_table_refs": {"type": "array", "items": {"type": "string"}},
+          "page_range": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "evidence_refs": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "domain": {
+      "type": "object",
+      "description": "Document-type-specific Community facts and extensions.",
+      "additionalProperties": true
+    },
+    "reading": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "semantic_json",
+        "content_md",
+        "enhanced_reading_md",
+        "datasets_dir",
+        "dataset_audit_csv"
+      ]
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": true}
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "semanticBlock": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "kind", "order", "page", "text"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "role": {"type": "string"},
+        "order": {"type": "integer", "minimum": 1},
+        "page": {"type": "integer", "minimum": 1},
+        "text": {"type": "string"},
+        "bbox": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "fact_refs": {"type": "array", "items": {"type": "string"}},
+        "evidence_refs": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "sourceTable": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "page", "order", "headers", "rows"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "page": {"type": "integer", "minimum": 1},
+        "order": {"type": "integer", "minimum": 1},
+        "headers": {"type": "array", "items": {"type": "string"}},
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {"type": "string"}
+          }
+        },
+        "row_models": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        }
+      }
+    }
+  }
+}

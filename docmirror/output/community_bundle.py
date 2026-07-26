@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from docmirror.models.community_semantic import CommunitySemanticResult
 from docmirror.output.markdown_renderer import render_markdown
 
 _SYSTEM_COLUMNS = ("record_id", "_page_start", "_page_end")
@@ -625,7 +626,9 @@ def _markdown_text(value: Any) -> str:
 
 
 def render_community_reading_markdown(payload: dict[str, Any]) -> str:
-    """Transcribe a public Community payload without accessing ParseResult."""
+    """Transcribe a public Community semantic result without accessing ParseResult."""
+    if (payload.get("schema") or {}).get("name") == "docmirror.community.semantic":
+        payload = _community_view_from_semantic(payload)
     document = payload.get("document") or {}
     sections = {str(section.get("id") or ""): section for section in payload.get("sections") or []}
     datasets = {str(dataset.get("id") or ""): dataset for dataset in payload.get("datasets") or []}
@@ -633,7 +636,7 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     tables = {str(table.get("dataset_id") or ""): table for table in reading.get("tables") or []}
     parts = [
         '<!-- docmirror:markdown-profile version="1.0" -->',
-        '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community" -->',
+        '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->',
         f"# {_markdown_text(document.get('title') or document.get('type') or 'Document')}",
     ]
     metadata = [
@@ -696,6 +699,274 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     return "\n\n".join(part for part in parts if part).rstrip() + "\n"
 
 
+def _semantic_source_structure(result: Any, sections: list[dict[str, Any]]) -> dict[str, Any]:
+    """Publish source-order blocks and physical tables without mutating ParseResult."""
+    graph = getattr(result, "document_flow", None)
+
+    def graph_values(name: str) -> list[Any]:
+        values: list[Any] = []
+        for value in list(getattr(graph, name, None) or []):
+            if hasattr(value, "model_dump"):
+                values.append(value.model_dump(mode="json", exclude_none=True))
+            elif isinstance(value, dict):
+                values.append(copy.deepcopy(value))
+        return _json_safe(values)
+
+    graph_nodes = list(getattr(graph, "nodes", None) or [])
+    nodes_by_id = {str(getattr(node, "node_id", "") or ""): node for node in graph_nodes}
+    ordered_nodes: list[Any] = []
+    seen: set[str] = set()
+    for flow in list(getattr(graph, "reading_flow", None) or []):
+        for node_id in list(getattr(flow, "node_ids", None) or []):
+            node_id = str(node_id)
+            node = nodes_by_id.get(node_id)
+            if node is not None and node_id not in seen:
+                ordered_nodes.append(node)
+                seen.add(node_id)
+    ordered_nodes.extend(
+        sorted(
+            (node for node_id, node in nodes_by_id.items() if node_id not in seen),
+            key=lambda node: (
+                int(getattr(node, "page", 1) or 1),
+                int(getattr(node, "reading_order", 0) or 0),
+                str(getattr(node, "node_id", "") or ""),
+            ),
+        )
+    )
+
+    blocks: list[dict[str, Any]] = []
+    for order, node in enumerate(ordered_nodes, start=1):
+        block: dict[str, Any] = {
+            "id": str(getattr(node, "node_id", "") or f"source:block:{order:06d}"),
+            "kind": str(getattr(node, "type", "") or "paragraph"),
+            "role": str(getattr(node, "role", "") or "body"),
+            "order": order,
+            "page": max(1, int(getattr(node, "page", 1) or 1)),
+            "text": str(getattr(node, "text", "") or ""),
+            "fact_refs": [str(value) for value in (getattr(node, "fact_refs", None) or [])],
+            "evidence_refs": [str(value) for value in (getattr(node, "evidence_refs", None) or [])],
+        }
+        bbox = getattr(node, "bbox", None)
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            block["bbox"] = [_json_safe(value) for value in bbox]
+        confidence = getattr(node, "confidence", None)
+        if confidence not in (None, ""):
+            block["confidence"] = _json_safe(confidence)
+        metadata = getattr(node, "metadata", None)
+        if isinstance(metadata, dict) and metadata:
+            block["extensions"] = _json_safe(metadata)
+        blocks.append(block)
+
+    if not blocks:
+        fallback_candidates: list[tuple[int, float, int, dict[str, Any]]] = []
+        serial = 0
+        for page in list(getattr(result, "pages", None) or []):
+            page_number = max(1, int(getattr(page, "page_number", 1) or 1))
+            for text_index, text in enumerate(list(getattr(page, "texts", None) or []), start=1):
+                serial += 1
+                bbox = getattr(text, "bbox", None)
+                level = str(getattr(text, "level", "") or "")
+                kind = "heading" if any(marker in level.lower() for marker in ("title", "heading")) else "paragraph"
+                block = {
+                    "id": f"source:text:p{page_number}:{text_index}",
+                    "kind": kind,
+                    "role": "title" if kind == "heading" else "body",
+                    "page": page_number,
+                    "text": str(getattr(text, "content", "") or ""),
+                    "fact_refs": [],
+                    "evidence_refs": [str(value) for value in (getattr(text, "evidence_ids", None) or [])],
+                }
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    block["bbox"] = [_json_safe(value) for value in bbox]
+                top = float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else float(serial)
+                fallback_candidates.append((page_number, top, serial, block))
+            for pair_index, pair in enumerate(list(getattr(page, "key_values", None) or []), start=1):
+                serial += 1
+                bbox = getattr(pair, "bbox", None)
+                block = {
+                    "id": f"source:key_value:p{page_number}:{pair_index}",
+                    "kind": "key_value",
+                    "role": "body",
+                    "page": page_number,
+                    "text": f"{getattr(pair, 'key', '')}: {getattr(pair, 'value', '')}".strip(),
+                    "key": str(getattr(pair, "key", "") or ""),
+                    "value": str(getattr(pair, "value", "") or ""),
+                    "fact_refs": [],
+                    "evidence_refs": [],
+                }
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    block["bbox"] = [_json_safe(value) for value in bbox]
+                top = float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else float(serial)
+                fallback_candidates.append((page_number, top, serial, block))
+            for table_index, table in enumerate(list(getattr(page, "tables", None) or []), start=1):
+                serial += 1
+                bbox = getattr(table, "bbox", None)
+                table_id = str(getattr(table, "table_id", "") or f"source:table:p{page_number}:{table_index}")
+                block = {
+                    "id": f"source:table_block:p{page_number}:{table_index}",
+                    "kind": "physical_table",
+                    "role": "body",
+                    "page": page_number,
+                    "text": "",
+                    "source_table_ref": table_id,
+                    "fact_refs": [],
+                    "evidence_refs": [str(value) for value in (getattr(table, "evidence_ids", None) or [])],
+                }
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                    block["bbox"] = [_json_safe(value) for value in bbox]
+                top = float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else float(serial)
+                fallback_candidates.append((page_number, top, serial, block))
+        blocks = [
+            {**block, "order": order}
+            for order, (_page, _top, _serial, block) in enumerate(sorted(fallback_candidates), start=1)
+        ]
+
+    source_tables: list[dict[str, Any]] = []
+    table_order = 0
+    for page in list(getattr(result, "pages", None) or []):
+        page_number = max(1, int(getattr(page, "page_number", 1) or 1))
+        for table_index, table in enumerate(list(getattr(page, "tables", None) or []), start=1):
+            table_order += 1
+            table_id = str(getattr(table, "table_id", "") or f"source:table:p{page_number}:{table_index}")
+            source_table: dict[str, Any] = {
+                "id": table_id,
+                "page": page_number,
+                "order": table_order,
+                "headers": [str(value or "") for value in (getattr(table, "headers", None) or [])],
+                "rows": [
+                    [str(getattr(cell, "text", "") or "") for cell in (getattr(row, "cells", None) or [])]
+                    for row in (getattr(table, "rows", None) or [])
+                ],
+                "row_models": [
+                    _json_safe(row.model_dump(mode="json", exclude_none=True))
+                    if hasattr(row, "model_dump")
+                    else _json_safe(row)
+                    for row in (getattr(table, "rows", None) or [])
+                ],
+            }
+            bbox = getattr(table, "bbox", None)
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                source_table["bbox"] = [_json_safe(value) for value in bbox]
+            metadata = getattr(table, "metadata", None)
+            if isinstance(metadata, dict) and metadata:
+                source_table["extensions"] = _json_safe(metadata)
+            extraction_layer = getattr(table, "extraction_layer", None)
+            if extraction_layer not in (None, ""):
+                source_table["extraction_layer"] = str(extraction_layer)
+            source_tables.append(source_table)
+
+    semantic_sections: list[dict[str, Any]] = []
+    for section in sections:
+        public = {key: _json_safe(value) for key, value in section.items() if not key.startswith("_")}
+        page_range = list(public.get("page_range") or [])
+        if len(page_range) == 2:
+            start, end = int(page_range[0]), int(page_range[1])
+            public["block_refs"] = [
+                str(block["id"]) for block in blocks if start <= int(block.get("page") or 1) <= end
+            ]
+            public["source_table_refs"] = [
+                str(table["id"]) for table in source_tables if start <= int(table.get("page") or 1) <= end
+            ]
+        semantic_sections.append(public)
+    return {
+        "sections": semantic_sections,
+        "blocks": blocks,
+        "source_tables": source_tables,
+        "reading_flows": graph_values("reading_flow"),
+        "outline": graph_values("outline"),
+        "edges": graph_values("edges"),
+        "relations": graph_values("relations"),
+        "cross_page_flows": graph_values("cross_page_flows"),
+        "suppressed_noise": graph_values("suppressed_noise"),
+    }
+
+
+def _semantic_bindings(
+    datasets: list[dict[str, Any]],
+    structure: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Bind each public record to available public source blocks and tables."""
+    block_ids = {str(block.get("id") or "") for block in structure.get("blocks") or [] if isinstance(block, dict)}
+    table_ids = {
+        str(table.get("id") or "") for table in structure.get("source_tables") or [] if isinstance(table, dict)
+    }
+    bindings: list[dict[str, Any]] = []
+    for dataset in datasets:
+        dataset_id = str(dataset.get("id") or "")
+        for row in dataset.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            record_id = str(row.get("record_id") or "")
+            source = row.get("source") if isinstance(row.get("source"), dict) else {}
+            source_block_refs: list[str] = []
+            source_table_refs: list[str] = []
+            evidence_refs: list[str] = []
+            refs = [
+                *list(source.get("source_refs") or []),
+                *list(source.get("source_cell_refs") or []),
+            ]
+            for ref in refs:
+                if not isinstance(ref, dict):
+                    continue
+                for node_id in [ref.get("node_id"), *(ref.get("node_ids") or [])]:
+                    node_id = str(node_id or "")
+                    if node_id in block_ids and node_id not in source_block_refs:
+                        source_block_refs.append(node_id)
+                for table_id in (ref.get("table_id"), ref.get("source_table_id")):
+                    table_id = str(table_id or "")
+                    if table_id in table_ids and table_id not in source_table_refs:
+                        source_table_refs.append(table_id)
+                for evidence in [ref.get("evidence_ref"), *(ref.get("evidence_ids") or [])]:
+                    evidence = str(evidence or "")
+                    if evidence and evidence not in evidence_refs:
+                        evidence_refs.append(evidence)
+            for evidence in source.get("evidence_ids") or []:
+                evidence = str(evidence or "")
+                if evidence and evidence not in evidence_refs:
+                    evidence_refs.append(evidence)
+            binding: dict[str, Any] = {
+                "id": f"binding:{dataset_id}:{record_id}",
+                "dataset_id": dataset_id,
+                "record_id": record_id,
+                "source_block_refs": source_block_refs,
+                "source_table_refs": source_table_refs,
+                "evidence_refs": evidence_refs,
+            }
+            page_range = list(source.get("page_range") or [])
+            if len(page_range) == 2:
+                binding["page_range"] = [int(page_range[0]), int(page_range[1])]
+            bindings.append(binding)
+    return bindings
+
+
+def _community_view_from_semantic(semantic: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable Community JSON view of one semantic result."""
+    structure = semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
+    return {
+        "schema": {
+            "name": "docmirror.community",
+            "version": "3.0.0",
+            "edition": "community",
+            "domain": str((semantic.get("classification") or {}).get("document_type") or "generic"),
+            "support_level": str((semantic.get("classification") or {}).get("support_level") or "generic"),
+        },
+        "document": copy.deepcopy(dict(semantic.get("document") or {})),
+        "sections": [
+            {
+                key: copy.deepcopy(value)
+                for key, value in section.items()
+                if key not in {"block_refs", "source_table_refs"} and not key.startswith("_")
+            }
+            for section in (structure.get("sections") or [])
+            if isinstance(section, dict)
+        ],
+        "datasets": copy.deepcopy(list(semantic.get("datasets") or [])),
+        "reading": copy.deepcopy(dict(semantic.get("reading") or {})),
+        "files": copy.deepcopy(dict(semantic.get("files") or {})),
+        "warnings": copy.deepcopy(list(semantic.get("warnings") or [])),
+    }
+
+
 @dataclass
 class CommunityDataset:
     public: dict[str, Any]
@@ -750,8 +1021,14 @@ class CommunityBundle:
     files: dict[str, str]
     warnings: list[dict[str, Any]]
     result: Any
+    source_fingerprint: str = ""
+    parse_result_schema: str = "docmirror.sealed_parse_result.v1"
+    classification: dict[str, Any] = field(default_factory=dict)
+    domain: dict[str, Any] = field(default_factory=dict)
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
-    def json_payload(self) -> dict[str, Any]:
+    def semantic_payload(self) -> dict[str, Any]:
+        """Build and validate the public semantic source for all renderers."""
         sections_by_id = {str(section["id"]): section for section in self.sections}
         public_sections = [self._public_section(section) for section in self.sections]
         public_datasets = [
@@ -762,15 +1039,51 @@ class CommunityBundle:
             )
             for dataset in self.datasets
         ]
-        return {
-            "schema": self.schema,
-            "document": self.document,
-            "sections": public_sections,
-            "datasets": public_datasets,
-            "reading": _build_public_reading_model(self.document, public_sections, public_datasets),
-            "files": self.files,
-            "warnings": self.warnings,
+        reading = _build_public_reading_model(self.document, public_sections, public_datasets)
+        fingerprint = self.source_fingerprint
+        if not fingerprint and callable(getattr(self.result, "fact_fingerprint", None)):
+            fingerprint = str(self.result.fact_fingerprint())
+        classification = {
+            "document_type": str(self.classification.get("document_type") or self.schema.get("domain") or "generic"),
+            "projector_id": str(self.classification.get("projector_id") or "community.generic"),
+            "support_level": str(
+                self.classification.get("support_level") or self.schema.get("support_level") or "generic"
+            ),
+            **{
+                str(key): _json_safe(value)
+                for key, value in self.classification.items()
+                if key not in {"document_type", "projector_id", "support_level"}
+            },
         }
+        structure = _semantic_source_structure(self.result, public_sections)
+        payload = {
+            "schema": {
+                "name": "docmirror.community.semantic",
+                "version": "1.0.0",
+                "edition": "community",
+                "document_type": classification["document_type"],
+            },
+            "source": {
+                "parse_result_schema": self.parse_result_schema,
+                "fingerprint": fingerprint or "unavailable",
+                "file": copy.deepcopy(self.document.get("source_file") or {}),
+            },
+            "classification": classification,
+            "document": copy.deepcopy(self.document),
+            "structure": structure,
+            "datasets": public_datasets,
+            "bindings": _semantic_bindings(public_datasets, structure),
+            "domain": _json_safe(self.domain),
+            "reading": reading,
+            "files": copy.deepcopy(self.files),
+            "warnings": copy.deepcopy(self.warnings),
+            "diagnostics": _json_safe(self.diagnostics),
+        }
+        return CommunitySemanticResult.model_validate(payload).model_dump(mode="json", by_alias=True)
+
+    def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Render the Community JSON API from the public semantic source."""
+        return _community_view_from_semantic(semantic or self.semantic_payload())
 
     @staticmethod
     def _public_section(section: dict[str, Any]) -> dict[str, Any]:
@@ -791,14 +1104,14 @@ class CommunityBundle:
             )
         return markdown
 
-    def render_enhanced_markdown(self) -> str:
+    def render_enhanced_markdown(self, semantic: dict[str, Any] | None = None) -> str:
         """Transcribe the public Community reading model."""
-        return render_community_reading_markdown(self.json_payload())
+        return render_community_reading_markdown(semantic or self.semantic_payload())
 
-    def render_dataset_csvs(self) -> dict[str, str]:
-        """Render CSV sister projections from the same public payload as JSON."""
+    def render_dataset_csvs(self, semantic: dict[str, Any] | None = None) -> dict[str, str]:
+        """Render dataset CSVs directly from the public semantic source."""
         rendered: dict[str, str] = {}
-        for public in self.json_payload().get("datasets") or []:
+        for public in (semantic or self.semantic_payload()).get("datasets") or []:
             relative_path = str(public["csv"])
             columns = list(public.get("columns") or [])
             fieldnames = [*_SYSTEM_COLUMNS, *(str(column["key"]) for column in columns)]
@@ -872,19 +1185,29 @@ class CommunityBundle:
                 issues.append(f"{dataset_id}:csv_json_record_id_divergence")
         return issues
 
-    def render_audit_csv(self) -> str:
-        """Render field-level normalized/raw values and evidence for all datasets."""
+    def render_audit_csv(self, semantic: dict[str, Any] | None = None) -> str:
+        """Render the audit CSV directly from the public semantic datasets."""
         output = io.StringIO(newline="")
         writer = csv.DictWriter(output, fieldnames=list(_AUDIT_COLUMNS), extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
-        sections_by_id = {str(section["id"]): section for section in self.sections}
-        for dataset in self.datasets:
-            public = dataset.public
+        semantic_payload = semantic or self.semantic_payload()
+        structure = semantic_payload.get("structure") if isinstance(semantic_payload.get("structure"), dict) else {}
+        sections_by_id = {
+            str(section["id"]): section
+            for section in (structure.get("sections") or [])
+            if isinstance(section, dict) and section.get("id")
+        }
+        for public in semantic_payload.get("datasets") or []:
+            if not isinstance(public, dict):
+                continue
             section = sections_by_id.get(str(public.get("section_id") or ""), {})
             columns = {str(column["key"]): column for column in public.get("columns") or []}
-            for row_index, row in enumerate(dataset.rows, start=1):
+            for row_index, row in enumerate(public.get("rows") or [], start=1):
+                if not isinstance(row, dict):
+                    continue
                 normalized, raw = _record_pools(row)
-                page_range = _page_range(row, section.get("page_range") or [])
+                source = row.get("source") if isinstance(row.get("source"), dict) else {}
+                page_range = _page_range(source, section.get("page_range") or [])
                 record_id = _canonical_record_id(row, str(public["id"]), row_index)
                 for key in columns:
                     value = normalized.get(key, raw.get(key))
@@ -895,7 +1218,7 @@ class CommunityBundle:
                     value_type = str(column.get("type") or "string")
                     safe_value, value_escaped = _csv_safe_with_flag(_json_value(value, value_type), value_type)
                     safe_raw, raw_escaped = _csv_safe_with_flag(_scalar(raw_value), value_type)
-                    field_evidence = _field_evidence(value, row, page_range)
+                    field_evidence = _field_evidence(value, source, page_range)
                     writer.writerow(
                         {
                             "dataset_id": public.get("id", ""),
@@ -980,6 +1303,8 @@ def project_community_bundle(
 
     if not isinstance(result, SealedParseResult):
         raise TypeError(f"project_community_bundle expects SealedParseResult; got {type(result).__name__}")
+    source_fingerprint = result.integrity_fingerprint
+    parse_result_schema = result.schema_version
     result = result.to_read_view()
     derived = copy.deepcopy(dict(projection_data or {}))
     entities = getattr(result, "entities", None)
@@ -1284,6 +1609,7 @@ def project_community_bundle(
         sections=sections,
         datasets=datasets,
         files={
+            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
@@ -1291,6 +1617,26 @@ def project_community_bundle(
         },
         warnings=warnings,
         result=result,
+        source_fingerprint=source_fingerprint,
+        parse_result_schema=parse_result_schema,
+        classification={
+            "document_type": domain,
+            "projector_id": str(derived.get("projector_id") or "community.generic"),
+            "support_level": _support_level(domain_view, domain),
+            "confidence": _json_safe(derived.get("confidence", 1.0)),
+            "reason": str(derived.get("reason") or "post-seal domain projection"),
+        },
+        domain={
+            "entity_fields": _json_safe(derived.get("entity_fields") or {}),
+            "facts": _json_safe(domain_facts),
+            "data_dictionary": _json_safe(dictionary),
+            "extensions": _json_safe(derived.get("semantic") or {}),
+        },
+        diagnostics={
+            "evidence_ids": [str(value) for value in (derived.get("evidence_ids") or ())],
+            "parser_warnings": parser_warnings,
+            "parser_errors": [str(value) for value in errors],
+        },
     )
 
 

@@ -48,6 +48,13 @@ def _builtin_specs() -> dict[str, ProjectionSchemaSpec]:
             compatibility="current-major; explicit-v2-exporter-required",
         ),
         ProjectionSchemaSpec(
+            name="community_semantic",
+            path=_SCHEMAS_DIR / "community_semantic.schema.json",
+            version="1.0.0",
+            description="Public post-seal semantic source for all Community renderers",
+            compatibility="additive-community-companion",
+        ),
+        ProjectionSchemaSpec(
             name="community_v2",
             path=_SCHEMAS_DIR / "edition_community.schema.json",
             version="2.2",

@@ -18,9 +18,9 @@
         "support_level": {"enum": ["ga", "beta", "generic", "unsupported"]}
       }
     },
-    "document": {
-      "type": "object",
-      "additionalProperties": false,
+      "document": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["id", "type", "title", "page_count", "language", "source_file", "units"],
       "properties": {
         "id": {"type": "string", "minLength": 1},
@@ -50,11 +50,12 @@
       "items": {"$ref": "#/$defs/dataset"}
     },
     "reading": {"$ref": "#/$defs/reading"},
-    "files": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["content_md", "enhanced_reading_md", "datasets_dir", "dataset_audit_csv"],
-      "properties": {
+      "files": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["content_md", "enhanced_reading_md", "datasets_dir", "dataset_audit_csv"],
+        "properties": {
+          "semantic_json": {"type": "string", "pattern": "_community_semantic\\.json$"},
         "content_md": {"type": "string", "pattern": "_content\\.md$"},
         "enhanced_reading_md": {"type": "string", "pattern": "_enhanced_reading\\.md$"},
         "datasets_dir": {"type": "string", "pattern": "_datasets$"},
@@ -88,9 +89,9 @@
       "minItems": 2,
       "maxItems": 2
     },
-    "item": {
-      "type": "object",
-      "additionalProperties": false,
+      "item": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["key", "label", "value", "raw", "type"],
       "properties": {
         "key": {"type": "string", "minLength": 1},
@@ -101,9 +102,9 @@
         "unit": {"type": "string"}
       }
     },
-    "group": {
-      "type": "object",
-      "additionalProperties": false,
+      "group": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["key", "label", "items"],
       "properties": {
         "key": {"type": "string", "minLength": 1},
@@ -111,9 +112,9 @@
         "items": {"type": "array", "items": {"$ref": "#/$defs/item"}}
       }
     },
-    "section": {
-      "type": "object",
-      "additionalProperties": false,
+      "section": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["id", "title", "type", "page_range", "items", "groups", "dataset_refs"],
       "properties": {
         "id": {"type": "string", "minLength": 1},
@@ -125,9 +126,9 @@
         "dataset_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
       }
     },
-    "column": {
-      "type": "object",
-      "additionalProperties": false,
+      "column": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["key", "label", "type", "nullable", "raw_available", "evidence_available"],
       "properties": {
         "key": {"type": "string", "minLength": 1},
@@ -139,9 +140,9 @@
         "evidence_available": {"type": "boolean"}
       }
     },
-    "record": {
-      "type": "object",
-      "additionalProperties": false,
+      "record": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["record_id", "normalized", "canonical_raw", "raw", "source"],
       "properties": {
         "record_id": {"type": "string", "minLength": 1},
@@ -167,9 +168,9 @@
         "basis": {"type": "string", "minLength": 1}
       }
     },
-    "dataset": {
-      "type": "object",
-      "additionalProperties": false,
+      "dataset": {
+        "type": "object",
+        "additionalProperties": true,
       "required": [
         "id", "name", "label", "type", "section_id", "csv", "row_count",
         "grain", "primary_key", "schema_version", "status", "columns", "completeness", "rows"
@@ -195,9 +196,9 @@
         }
       }
     },
-    "readingTable": {
-      "type": "object",
-      "additionalProperties": false,
+      "readingTable": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["id", "dataset_id", "section_id", "title", "column_keys", "row_count"],
       "properties": {
         "id": {"type": "string", "minLength": 1},
@@ -208,9 +209,9 @@
         "row_count": {"type": "integer", "minimum": 0}
       }
     },
-    "readingFlowEntry": {
-      "type": "object",
-      "additionalProperties": false,
+      "readingFlowEntry": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["order", "kind", "ref_id"],
       "properties": {
         "order": {"type": "integer", "minimum": 1},
@@ -218,9 +219,9 @@
         "ref_id": {"type": "string"}
       }
     },
-    "reading": {
-      "type": "object",
-      "additionalProperties": false,
+      "reading": {
+        "type": "object",
+        "additionalProperties": true,
       "required": ["version", "profile", "document_flow", "tables"],
       "properties": {
         "version": {"const": "1.0"},

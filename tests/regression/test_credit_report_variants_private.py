@@ -15,7 +15,7 @@ from docmirror.input.entry.factory import PerceiveOptions, perceive_document
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.server.edition_outputs import write_outputs
-from docmirror.server.output_builder import build_community_projection
+from docmirror.server.output_builder import build_community_bundle
 from scripts.validate.validate_community_artifacts import validate_community_artifacts
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
@@ -71,10 +71,19 @@ def test_credit_report_subtype_projects_complete_v3(
         )
     )
     result = sealed.to_read_view()
-    payload = build_community_projection(sealed, file_path=str(fixture))
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
     assert "report_subtype" not in result.entities.domain_specific
     assert payload is not None
     assert payload["document"]["type"] == public_type
+    assert semantic["classification"]["document_type"] == public_type
+    assert semantic["schema"]["document_type"] == public_type
+    assert semantic["source"]["fingerprint"] == sealed.integrity_fingerprint
+    assert semantic["domain"]["facts"]["report_subtype"] == subtype
+    assert semantic["structure"]["blocks"]
+    assert len(semantic["bindings"]) == sum(dataset["row_count"] for dataset in semantic["datasets"])
+    assert validate_projection_payload("community_semantic", semantic).valid
     assert validate_projection_payload("community", payload).valid
     assert payload["sections"]
     assert any(dataset["row_count"] > 0 for dataset in payload["datasets"])
@@ -92,6 +101,12 @@ def test_credit_report_subtype_projects_complete_v3(
         assert sum(row["normalized"]["inquiry_type"] == "personal" for row in inquiries) == expected_personal
         assert sum(row["normalized"]["status"] == "inactive" for row in accounts) == expected_inactive
         if fixture.name == "赵思雯个人征信.pdf":
+            assert any(block["text"].strip() == "说明" for block in semantic["structure"]["blocks"])
+            assert any(
+                row and row[0] == "账户数"
+                for table in semantic["structure"]["source_tables"]
+                for row in table["rows"]
+            )
             institution_sequences = {
                 int(row["normalized"]["sequence"])
                 for row in inquiries

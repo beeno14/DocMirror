@@ -54,6 +54,7 @@ def test_projection_schema_registry():
     registry = load_projection_registry()
     assert "mirror" in registry
     assert "community" in registry
+    assert "community_semantic" in registry
     assert get_projection_schema("mirror").version == "1.1"
     assert get_projection_schema("community").version == "3.0.0"
     assert get_projection_schema("community").compatibility == "current-major; explicit-v2-exporter-required"
@@ -82,8 +83,16 @@ def test_projection_schema_runtime_validation():
             },
             "sections": [],
             "datasets": [],
+            "reading": {
+                "version": "1.0",
+                "profile": "community",
+                "document_flow": [],
+                "tables": [],
+            },
             "files": {
+                "semantic_json": "001_community_semantic.json",
                 "content_md": "001_content.md",
+                "enhanced_reading_md": "001_enhanced_reading.md",
                 "datasets_dir": "001_datasets",
                 "dataset_audit_csv": "001_datasets/_audit_cells.csv",
             },

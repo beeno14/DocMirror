@@ -149,6 +149,19 @@ def test_validator_detects_reading_model_dataset_divergence(tmp_path: Path) -> N
     assert any("reading.document_flow: missing datasets=" in issue for issue in issues)
 
 
+def test_validator_detects_semantic_dataset_divergence(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "semantic_dataset_divergence")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    semantic_path = community_path.parent / payload["files"]["semantic_json"]
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    semantic["datasets"][0]["rows"].pop()
+    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert "semantic: datasets diverge from Community JSON" in issues
+
+
 def test_validator_detects_completeness_contradiction(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "completeness_contradiction")
     payload = json.loads(community_path.read_text(encoding="utf-8"))

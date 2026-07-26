@@ -21,6 +21,10 @@ class ProjectionData(BaseModel):
     document_type: str | None = None
     entity_fields: dict[str, Any] = Field(default_factory=dict)
     domain_facts: dict[str, Any] = Field(default_factory=dict)
+    semantic: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Document-type-specific public semantic extensions for Community renderers.",
+    )
     datasets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     sections: tuple[dict[str, Any], ...] = ()
     warnings: tuple[str, ...] = ()
@@ -60,6 +64,18 @@ class CommunityProjector:
         return document_type == self.domain_name
 
     def project(self, sealed: Any) -> dict[str, Any] | None:
+        bundle = self.project_bundle(sealed)
+        return bundle.json_payload() if bundle is not None else None
+
+    def project_bundle(
+        self,
+        sealed: Any,
+        *,
+        file_path: str = "",
+        file_id: str = "001",
+        document_id: str = "",
+    ) -> Any | None:
+        """Build the public semantic Community bundle from one sealed result."""
         from docmirror.models.sealed import SealedParseResult
         from docmirror.output.community_bundle import project_community_bundle
 
@@ -75,14 +91,16 @@ class CommunityProjector:
         )
         bundle = project_community_bundle(
             sealed,
+            file_path=file_path,
+            file_id=file_id,
+            document_id=document_id,
             projection_data=derived.model_dump(mode="python"),
             projection_policy=load_projection_policy(type(self).__module__.rsplit(".", 1)[0]),
         )
         bundle.render_markdown()
-        payload = bundle.json_payload()
         if sealed.integrity_fingerprint != before or not sealed.verify_integrity():
             raise RuntimeError("Post-seal projector changed the sealed snapshot")
-        return payload
+        return bundle
 
 
 __all__ = ["CommunityProjector", "ProjectionData", "load_projection_policy"]

@@ -40,6 +40,8 @@ def materialize_community_bundle(
     file_path: str = "",
     file_id: str = "001",
     document_id: str = "",
+    source_fingerprint: str = "",
+    parse_result_schema: str = "docmirror.sealed_parse_result.v1",
 ):
     """Restore Community renderer state and apply request-specific delivery names."""
     from docmirror.output.community_bundle import CommunityBundle, CommunityDataset
@@ -69,6 +71,7 @@ def materialize_community_bundle(
     files = dict(projected.get("files") or {})
     files.update(
         {
+            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
@@ -92,10 +95,19 @@ def materialize_community_bundle(
         files=files,
         warnings=list(projected.get("warnings") or []),
         result=result,
+        source_fingerprint=source_fingerprint,
+        parse_result_schema=parse_result_schema,
+        classification={
+            "document_type": str((projected.get("schema") or {}).get("domain") or "generic"),
+            "projector_id": "community.compatibility_adapter",
+            "support_level": str((projected.get("schema") or {}).get("support_level") or "generic"),
+        },
+        domain={"compatibility_projection": copy.deepcopy(projected.get("document") or {})},
+        diagnostics={"materialized_from_community_json": True},
     )
 
 
-def build_community_projection(
+def build_community_bundle(
     result,
     full_text: str = "",
     *,
@@ -103,14 +115,15 @@ def build_community_projection(
     file_id: str = "001",
     document_id: str = "",
     on_progress: Callable[[str, float, str], None] | None = None,
-) -> dict | None:
-    """Build Community JSON through the post-seal PluginRegistry boundary."""
+):
+    """Build the semantic Community bundle through the plugin boundary."""
     from docmirror.models.schemas.registry import validate_projection_payload
     from docmirror.models.sealed import SealedParseResult
+    from docmirror.plugins._base.projector import CommunityProjector
     from docmirror.plugins._runtime.plugin_registry import registry
 
     if not isinstance(result, SealedParseResult):
-        raise TypeError(f"build_community_projection expects SealedParseResult; got {type(result).__name__}")
+        raise TypeError(f"build_community_bundle expects SealedParseResult; got {type(result).__name__}")
     if not result.verify_integrity():
         raise RuntimeError("Projector boundary violation: invalid sealed snapshot")
     detected_type = str(result.to_read_view().entities.document_type or "generic")
@@ -127,26 +140,67 @@ def build_community_projection(
         )
     if projector is None:
         raise RuntimeError("No Community projector is registered")
-    projected = projector.project(result)
-    if projected is None or not isinstance(projected, dict):
-        raise RuntimeError(f"{detected_type}:community projector returned no payload")
+    project_bundle = getattr(projector, "project_bundle", None)
+    derives_semantic = not isinstance(projector, CommunityProjector) or type(projector).derive is not CommunityProjector.derive
+    if callable(project_bundle) and derives_semantic:
+        bundle = project_bundle(
+            result,
+            file_path=file_path,
+            file_id=file_id,
+            document_id=document_id,
+        )
+    else:
+        projected = projector.project(result)
+        if projected is None or not isinstance(projected, dict):
+            raise RuntimeError(f"{detected_type}:community projector returned no payload")
+        bundle = materialize_community_bundle(
+            projected,
+            result.to_read_view(),
+            file_path=file_path,
+            file_id=file_id,
+            document_id=document_id,
+            source_fingerprint=result.integrity_fingerprint,
+            parse_result_schema=result.schema_version,
+        )
+    if bundle is None:
+        raise RuntimeError(f"{detected_type}:community projector returned no semantic bundle")
     if not result.verify_integrity():
         raise RuntimeError("Projector boundary violation: sealed snapshot changed")
-    bundle = materialize_community_bundle(
-        projected,
-        result.to_read_view(),
-        file_path=file_path,
-        file_id=file_id,
-        document_id=document_id,
-    )
     bundle.render_markdown()
-    payload = bundle.json_payload()
+    semantic = bundle.semantic_payload()
+    semantic_validation = validate_projection_payload("community_semantic", semantic)
+    if not semantic_validation.valid:
+        raise RuntimeError("Community semantic schema validation failed: " + "; ".join(semantic_validation.errors))
+    payload = bundle.json_payload(semantic)
     validation = validate_projection_payload("community", payload)
     if not validation.valid:
         raise RuntimeError("Community schema validation failed: " + "; ".join(validation.errors))
     conservation_issues = bundle.conservation_issues(payload=payload)
     if conservation_issues:
         raise RuntimeError("Community dataset conservation failed: " + "; ".join(conservation_issues))
+    return bundle
+
+
+def build_community_projection(
+    result,
+    full_text: str = "",
+    *,
+    file_path: str = "",
+    file_id: str = "001",
+    document_id: str = "",
+    on_progress: Callable[[str, float, str], None] | None = None,
+) -> dict | None:
+    """Render Community JSON from the post-seal semantic bundle."""
+    bundle = build_community_bundle(
+        result,
+        full_text,
+        file_path=file_path,
+        file_id=file_id,
+        document_id=document_id,
+        on_progress=on_progress,
+    )
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
     return payload
 
 
@@ -335,10 +389,9 @@ def build_all_projections(
     community_t0 = time.perf_counter()
     if on_progress:
         on_progress("community_plugin", 25.0, "Building Community projection...")
-    community = build_community_projection(sealed, file_path=file_path)
-    if community is None:
-        raise RuntimeError("Community projector returned no payload")
-    community_bundle = materialize_community_bundle(community, sealed.to_read_view())
+    community_bundle = build_community_bundle(sealed, file_path=file_path)
+    community_semantic = community_bundle.semantic_payload()
+    community = community_bundle.json_payload(community_semantic)
     if on_progress:
         on_progress("community_plugin", 100.0, "Community projection ready")
     timings["community_ms"] = (time.perf_counter() - community_t0) * 1000
@@ -445,6 +498,7 @@ def build_all_projections(
     outputs: dict[str, Any] = {
         "mirror": mirror,
         "community": community,
+        "community_semantic": community_semantic,
         "enterprise": enterprise,
         "finance": finance,
         "edition_availability": commercial_availability,

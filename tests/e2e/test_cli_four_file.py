@@ -40,14 +40,16 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     task_id, written = write_outputs(result, tmp_path, file_id="001", task_id="test_task_001")
 
     assert task_id == "test_task_001"
-    assert {"mirror", "community", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert {"mirror", "community", "community_semantic", "content", "enhanced_reading", "datasets"} <= set(written)
     assert written["community"].is_file()
+    assert written["community_semantic"].name == "001_community_semantic.json"
+    assert written["community_semantic"].is_file()
     assert written["content"].name == "001_content.md"
     assert written["enhanced_reading"].name == "001_enhanced_reading.md"
     assert written["enhanced_reading"].is_file()
     enhanced = written["enhanced_reading"].read_text(encoding="utf-8")
     assert 'mode="enhanced"' in enhanced
-    assert 'source="community"' in enhanced
+    assert 'source="community-semantic"' in enhanced
     assert written["datasets"].name == "001_datasets"
     assert written["datasets"].is_dir()
     assert (written["datasets"] / "_audit_cells.csv").is_file()
@@ -59,6 +61,7 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     assert comm_data["document"]["id"] == f"doc_{task_id}_001"
     assert set(comm_data) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert comm_data["files"] == {
+        "semantic_json": "001_community_semantic.json",
         "content_md": "001_content.md",
         "enhanced_reading_md": "001_enhanced_reading.md",
         "datasets_dir": "001_datasets",
@@ -91,7 +94,7 @@ def test_write_outputs_can_omit_cli_support_files(tmp_path: Path):
     )
 
     task_dir = tmp_path / task_id
-    assert {"community", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert {"community", "community_semantic", "content", "enhanced_reading", "datasets"} <= set(written)
     assert "mirror" not in written
     assert not (task_dir / "001_mirror.json").exists()
     assert not (task_dir / "manifest.json").exists()
