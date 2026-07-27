@@ -35,7 +35,12 @@ projection:
     enterprise_stakeholders: 出资人及主要人员
     enterprise_relationships: 关联关系
     enterprise_facility_summary: 授信额度汇总
+    enterprise_closed_credit_summary: 已结清信贷信息概要
+    enterprise_repayment_responsibility_summary: 相关还款责任信息概要
+    enterprise_attachment_accounts: 附件账户及业务清单
     enterprise_credit_supplement: 信用记录补充信息
+    enterprise_attachment_credit_details: 附件信贷明细
+    enterprise_special_transactions: 特定交易提示
   summary_facts:
     credit_summary: credit_summary
     non_credit_transaction_summary: non_credit_transactions
@@ -72,7 +77,12 @@ projection:
     enterprise_stakeholders: [basic_information]
     enterprise_relationships: [basic_information]
     enterprise_facility_summary: [credit_summary]
+    enterprise_closed_credit_summary: [credit_summary]
+    enterprise_repayment_responsibility_summary: [credit_summary]
+    enterprise_attachment_accounts: [credit_supplement]
     enterprise_credit_supplement: [credit_supplement]
+    enterprise_attachment_credit_details: [credit_supplement]
+    enterprise_special_transactions: [credit_supplement]
   section_type_markers:
     信息概要: credit_summary
     基本信息: basic_information
@@ -204,6 +214,36 @@ projection:
       - utilization_rate
       - currency
       - amount_unit
+    enterprise_closed_credit_summary:
+      - transaction_group
+      - business_category
+      - normal_account_count
+      - attention_account_count
+      - adverse_account_count
+      - total_account_count
+    enterprise_repayment_responsibility_summary:
+      - responsibility_type
+      - recovered_responsibility_amount
+      - recovered_account_count
+      - recovered_balance
+      - other_credit_responsibility_amount
+      - other_credit_account_count
+      - other_credit_balance
+      - other_credit_attention_balance
+      - other_credit_adverse_balance
+      - currency
+      - amount_unit
+    enterprise_attachment_accounts:
+      - business_category
+      - source_sequence
+      - attachment_record_type
+      - account_identifier
+      - institution
+      - business_type
+      - account_status
+      - five_tier_class
+      - source_page
+      - source_page_end
     enterprise_credit_supplement:
       - account_identifier
       - institution
@@ -223,6 +263,36 @@ projection:
       - actual_repayment_amount
       - repayment_method
       - remaining_periods
+      - currency
+      - amount_unit
+    enterprise_attachment_credit_details:
+      - business_category
+      - account_identifier
+      - institution
+      - business_type
+      - account_status
+      - open_date
+      - due_date
+      - currency
+      - amount
+      - amount_unit
+      - close_date
+      - five_tier_class
+      - last_repayment_date
+      - repayment_method
+      - advance_flag
+    enterprise_special_transactions:
+      - account_identifier
+      - institution
+      - business_type
+      - business_category
+      - transaction_type
+      - transaction_date
+      - transaction_amount
+      - due_date_change_months
+      - transaction_detail
+      - currency
+      - amount_unit
 
 resources:
   field_schema: resources/field_schema.yaml

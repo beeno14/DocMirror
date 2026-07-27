@@ -21,7 +21,15 @@ _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 _DATASET_RECORD_ID_KEYS = {
     "credit_lines": ("record_id", "credit_line_id"),
     "enterprise_facility_summary": ("record_id", "credit_line_id"),
+    "enterprise_closed_credit_summary": ("record_id", "closed_summary_id"),
+    "enterprise_repayment_responsibility_summary": (
+        "record_id",
+        "responsibility_summary_id",
+    ),
+    "enterprise_attachment_accounts": ("record_id", "attachment_account_id"),
     "enterprise_credit_supplement": ("record_id", "supplement_id"),
+    "enterprise_attachment_credit_details": ("record_id", "attachment_detail_id"),
+    "enterprise_special_transactions": ("record_id", "special_transaction_id"),
 }
 
 
@@ -60,6 +68,19 @@ def _account_structure_warnings(accounts: list[dict[str, Any]]) -> tuple[str, ..
     if failure_rate <= 0.3:
         return ()
     return (f"credit:account_structure_collapse:failure_rate={failure_rate:.3f}",)
+
+
+def _enterprise_scope_warnings(
+    report_subtype: str,
+    summary: dict[str, Any],
+) -> tuple[str, ...]:
+    if report_subtype != "enterprise" or not summary.get("source_display_limited"):
+        return ()
+    return (
+        "credit:enterprise_source_display_limited:"
+        "the source report states that only part of the credit records are shown; "
+        "attachment records are exported in separate enterprise datasets",
+    )
 
 
 def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: str = "") -> ProjectionData:
@@ -233,7 +254,16 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         entity_fields["marital_status"] = domain_facts["marital_status"]
     variant.refine_entity_fields(entity_fields)
     assembled_accounts = list(assembled.get("credit_accounts") or [])
-    warnings = tuple(dict.fromkeys((*base.warnings, *_account_structure_warnings(assembled_accounts))))
+    assembled_summary = dict(assembled.get("credit_summary") or {})
+    warnings = tuple(
+        dict.fromkeys(
+            (
+                *base.warnings,
+                *_account_structure_warnings(assembled_accounts),
+                *_enterprise_scope_warnings(report_subtype, assembled_summary),
+            )
+        )
+    )
     return ProjectionData(
         projector_id=base.projector_id,
         document_type=base.document_type,

@@ -126,6 +126,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         {
             "amount_unit": "CNY_10K",
             "contributor_count": 0,
+            "contributor_source_page": None,
             "contributor_status": "no_records",
             "currency": "CNY",
             "registered_capital_amount": "100",
@@ -232,7 +233,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert appendix_position > enhanced.index("## 信用记录补充信息")
     assert "审计舍入容差" not in enhanced[:appendix_position]
     audit_appendix = enhanced[appendix_position:]
-    assert "### 源文账户余额矛盾（审计信息）" in audit_appendix
+    assert "### 账户余额可比性检查（审计信息）" in audit_appendix
     assert "**源报告账户余额合计:** 65.41" in audit_appendix
     assert "**账户明细余额计算合计:** 65.42" in audit_appendix
     assert "**两者差额:** 0.01" in audit_appendix
@@ -298,8 +299,134 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "enterprise_stakeholders": 1,
         "enterprise_relationships": 1,
         "enterprise_facility_summary": 2,
+        "enterprise_attachment_accounts": 3,
         "enterprise_credit_supplement": 34,
     }
+
+
+def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() -> None:
+    fixtures = sorted(_DIGITAL_ENTERPRISE_DIR.glob("*20250710.pdf"))
+    if not fixtures:
+        pytest.skip("audited 77-page digital-enterprise fixture is unavailable")
+    fixture = fixtures[0]
+    sealed = asyncio.run(
+        perceive_document(
+            fixture,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    facts = semantic["domain"]["facts"]
+
+    credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
+    assert [row["account_identifier"] for row in credit_lines] == [
+        "B11215800H0001N24044608",
+        "B11215800H0001N25027358",
+    ]
+    assert [(row["total_limit"], row["used_limit"]) for row in credit_lines] == [
+        ("500", "300"),
+        ("400", "300"),
+    ]
+    assert datasets["credit_lines"]["completeness"]["verified"] is True
+    assert datasets["credit_lines"]["completeness"]["expected_row_count"] == 2
+
+    assert facts["business_registration_number"] == "913100005515731558"
+    capital = datasets["enterprise_capital_summary"]["rows"][0]["normalized"]
+    assert capital["registered_capital_amount"] == "6000"
+    assert capital["currency"] == "CNY"
+    assert capital["amount_unit"] == "CNY_10K"
+    assert capital["source_page"] == 4
+    assert capital["contributor_source_page"] == 5
+
+    closed = [
+        row["normalized"]
+        for row in datasets["enterprise_closed_credit_summary"]["rows"]
+        if not row["normalized"]["is_total"]
+    ]
+    assert {
+        row["business_category"]: row["total_account_count"]
+        for row in closed
+    } == {
+        "中长期借款": 13,
+        "短期借款": 77,
+        "贴现": 304,
+        "银行承兑汇票": 1,
+        "其他担保交易": 7,
+    }
+    responsibility = next(
+        row["normalized"]
+        for row in datasets["enterprise_repayment_responsibility_summary"]["rows"]
+        if not row["normalized"]["is_total"]
+    )
+    assert responsibility["other_credit_responsibility_amount"] == "4055"
+    assert responsibility["other_credit_account_count"] == 3
+    assert responsibility["other_credit_balance"] == "2180"
+
+    attachment_accounts = [
+        row["normalized"] for row in datasets["enterprise_attachment_accounts"]["rows"]
+    ]
+    histories = [
+        row["normalized"] for row in datasets["enterprise_credit_supplement"]["rows"]
+    ]
+    details = [
+        row["normalized"]
+        for row in datasets["enterprise_attachment_credit_details"]["rows"]
+    ]
+    transactions = [
+        row["normalized"] for row in datasets["enterprise_special_transactions"]["rows"]
+    ]
+    assert len(attachment_accounts) == 201
+    assert sum(
+        row["attachment_record_type"] == "account"
+        and row["account_status"] == "settled"
+        for row in attachment_accounts
+    ) == 190
+    assert sum(
+        row["attachment_record_type"] == "account"
+        and row["account_status"] == "active"
+        for row in attachment_accounts
+    ) == 8
+    assert sum(row["attachment_record_type"] == "business" for row in attachment_accounts) == 3
+    assert len(histories) == 465
+    assert max(row["source_page"] for row in histories) == 77
+    assert histories[0]["account_identifier"] == "G10312900H000131055214010025006"
+    assert histories[0]["institution"] == "上海农村商业银行股份有限公司宝山支行"
+    assert len(details) == 109
+    assert max(row["source_page"] for row in details) == 77
+    assert len(transactions) == 23
+    attachment_ids = {row["attachment_account_id"] for row in attachment_accounts}
+    assert all(row["attachment_account_id"] in attachment_ids for row in histories)
+    assert all(row["attachment_account_id"] in attachment_ids for row in details)
+    assert all(row["attachment_account_id"] in attachment_ids for row in transactions)
+
+    summary = facts["credit_summary"]
+    assert summary["source_display_limited"] is True
+    assert summary["attachment_account_count"] == 201
+    assert summary["attachment_credit_detail_count"] == 109
+    assert summary["attachment_special_transaction_count"] == 23
+    assert datasets["credit_accounts"]["status"] == "partial"
+
+    enhanced = bundle.render_enhanced_markdown(semantic)
+    for expected in (
+        "工商注册号",
+        "6000",
+        "已结清信贷信息概要",
+        "相关还款责任信息概要",
+        "附件账户及业务清单",
+        "附件信贷明细",
+        "特定交易提示",
+        "信贷账户及附件说明",
+        "账户余额可比性检查（审计信息）",
+    ):
+        assert expected in enhanced
 
 
 def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_separate() -> None:

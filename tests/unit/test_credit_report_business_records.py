@@ -17,10 +17,14 @@ from docmirror.plugins.credit_report.currency_codes import (
     normalize_currency_code,
 )
 from docmirror.plugins.credit_report.enterprise_native.extraction import (
+    extract_enterprise_attachment_datasets,
     extract_enterprise_capital_summary,
+    extract_enterprise_credit_lines_from_tables,
+    extract_enterprise_identity_facts,
     extract_enterprise_report_metadata,
     extract_enterprise_report_metadata_records,
     extract_enterprise_report_notes,
+    extract_enterprise_summary_datasets,
 )
 from docmirror.plugins.credit_report.personal_brief_native.extraction import (
     extract_personal_brief_section_content,
@@ -31,6 +35,175 @@ def _result(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
     )
+
+
+def _native_table(
+    table_id: str,
+    rows: list[list[str]],
+    *,
+    top: float = 0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        table_id=table_id,
+        metadata={"raw_rows": rows},
+        headers=[],
+        rows=[],
+        bbox=[0, top, 100, top + 10],
+    )
+
+
+def _native_text(content: str, *, top: float) -> SimpleNamespace:
+    return SimpleNamespace(content=content, bbox=[0, top, 100, top + 5])
+
+
+def test_enterprise_facility_detail_emits_every_declared_row_pair() -> None:
+    table = _native_table(
+        "facility",
+        [
+            ["授信信息", "", "", "共 2 笔", "", "", ""],
+            ["授信协议编号", "授信机构", "授信额度类型", "额度循环标志", "生效日期", "到期日", "信息报告日期"],
+            ["", "币种", "授信额度", "已用额度", "授信限额", "授信限额编号", ""],
+            ["B11215800H0001N24044608", "示例银行", "贷款", "否", "2024-11-19", "2025-11-13", "2025-06-20"],
+            ["", "人民币元", "500", "300", "900", "LIMIT001", ""],
+            ["B11215800H0001N25027358", "示例银行", "贷款", "否", "2025-06-26", "2026-06-19", "2025-06-26"],
+            ["", "人民币元", "400", "300", "900", "LIMIT001", ""],
+        ],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=6, source_page_number=6, tables=[table], texts=[])]
+    )
+
+    rows = extract_enterprise_credit_lines_from_tables(result, [])
+
+    assert [row["account_identifier"] for row in rows] == [
+        "B11215800H0001N24044608",
+        "B11215800H0001N25027358",
+    ]
+    assert [(row["total_limit"], row["used_limit"]) for row in rows] == [
+        (500, 300),
+        (400, 300),
+    ]
+
+
+def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> None:
+    identity = _native_table(
+        "identity",
+        [
+            ["企业名称", "示例企业"],
+            ["中征码", "123456789"],
+            ["统一社会信用代码", "913100001234567890"],
+            ["工商注册号", "913100001234567890"],
+        ],
+    )
+    responsibility = _native_table(
+        "responsibility",
+        [
+            ["", "还款责任金额", "账户数", "余额", "还款责任金额", "账户数", "余额", "关注类余额", "不良类余额"],
+            ["保证人/反担保人", "0", "0", "0", "4055", "3", "2180", "0", "0"],
+            ["合计", "0", "0", "0", "4055", "3", "2180", "0", "0"],
+        ],
+    )
+    closed = _native_table(
+        "closed",
+        [
+            ["", "正常类账户数", "关注类账户数", "不良类账户数", "合计"],
+            ["中长期借款", "13", "0", "0", "13"],
+            ["短期借款", "77", "0", "0", "77"],
+            ["贴现", "304", "0", "0", "304"],
+            ["合计", "394", "0", "0", "394"],
+        ],
+    )
+    capital = _native_table(
+        "capital",
+        [
+            ["类型", "出资方", "身份标识类型", "身份标识号码", "出资比例"],
+            ["股东", "示例股东", "身份证", "123456789012345678", "100%"],
+            ["信息来源机构：示例银行 更新日期：2025-07-01", "", "", "", ""],
+        ],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=3,
+                texts=[],
+                tables=[identity],
+            ),
+            SimpleNamespace(
+                page_number=4,
+                source_page_number=4,
+                texts=[_native_text("注册资本折人民币合计 6000万元", top=100)],
+                tables=[responsibility, closed],
+            ),
+            SimpleNamespace(
+                page_number=5,
+                source_page_number=5,
+                texts=[],
+                tables=[capital],
+            ),
+        ]
+    )
+
+    assert extract_enterprise_identity_facts(result)["business_registration_number"] == (
+        "913100001234567890"
+    )
+    capital_rows = extract_enterprise_capital_summary(result)
+    assert capital_rows[0]["registered_capital_amount"] == 6000
+    assert capital_rows[0]["source_page"] == 4
+    assert capital_rows[0]["contributor_source_page"] == 5
+    datasets = extract_enterprise_summary_datasets(result)
+    assert [
+        row["total_account_count"]
+        for row in datasets["enterprise_closed_credit_summary"]
+        if row["business_category"] != "合计"
+    ] == [13, 77, 304]
+    responsibility_row = datasets["enterprise_repayment_responsibility_summary"][0]
+    assert responsibility_row["other_credit_responsibility_amount"] == 4055
+    assert responsibility_row["other_credit_account_count"] == 3
+    assert responsibility_row["other_credit_balance"] == 2180
+
+
+def test_enterprise_attachment_history_binds_to_visual_account_context() -> None:
+    history_rows = [
+        ["信息报告日期", "余额", "余额变化日期", "五级分类", "五级分类认定日期", "逾期总额", "逾期本金"],
+        ["", "逾期月数", "最近一次约定还款日期", "最近一次应还总额", "最近一次实际还款日期", "最近一次实还总额", "最近一次还款形式"],
+        ["2024-04-27", "0", "2024-04-26", "正常", "2024-04-26", "0", "0"],
+        ["", "0", "2024-04-26", "251", "2024-04-26", "251", "正常还款"],
+    ]
+    page = SimpleNamespace(
+        page_number=15,
+        source_page_number=15,
+        texts=[
+            _native_text("附件1：信用记录补充信息（一）中长期借款的历史表现", top=0),
+            _native_text("1.已结清账户编号：G10312900H000131055214010025006", top=20),
+            _native_text("授信机构：上海农村商业银行股份有限公司宝山支行", top=30),
+            _native_text("业务种类：流动资金贷款", top=40),
+            _native_text("2.已结清账户编号：D10023010H0001030124090900000039", top=100),
+            _native_text("授信机构：南京银行股份有限公司上海分行", top=110),
+            _native_text("业务种类：流动资金贷款", top=120),
+        ],
+        tables=[
+            _native_table("history-1", history_rows, top=50),
+            _native_table(
+                "history-2",
+                [
+                    *history_rows[:2],
+                    ["2025-06-20", "500", "2024-09-09", "正常", "2024-09-09", "0", "0"],
+                    ["", "0", "2025-06-20", "1.77", "2025-06-20", "1.77", "正常还款"],
+                ],
+                top=130,
+            ),
+        ],
+    )
+
+    datasets = extract_enterprise_attachment_datasets(SimpleNamespace(pages=[page]))
+    rows = datasets["enterprise_credit_supplement"]
+
+    assert len(rows) == 2
+    assert rows[0]["account_identifier"] == "G10312900H000131055214010025006"
+    assert rows[0]["institution"] == "上海农村商业银行股份有限公司宝山支行"
+    assert rows[1]["account_identifier"] == "D10023010H0001030124090900000039"
+    assert rows[1]["institution"] == "南京银行股份有限公司上海分行"
 
 
 def test_enterprise_capital_and_report_metadata_preserve_separate_business_meanings() -> None:
