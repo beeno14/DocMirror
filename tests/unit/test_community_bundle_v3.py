@@ -529,6 +529,89 @@ def test_record_card_title_separator_is_plugin_configurable() -> None:
     assert "#### 1 · 中长期贷款" not in enhanced
 
 
+def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> None:
+    candidate = _candidate()
+    candidate["data"]["credit_accounts"] = [
+        {
+            "account_id": "card:1",
+            "sequence": 1,
+            "account_type": "credit_card",
+            "institution": "发卡银行",
+            "credit_limit": 2240000,
+        },
+        {
+            "account_id": "loan:1",
+            "sequence": 1,
+            "account_type": "loan",
+            "institution": "贷款银行",
+            "loan_amount": 315000,
+        },
+        {
+            "account_id": "other:1",
+            "sequence": 1,
+            "account_type": "other",
+            "institution": "其他机构",
+        },
+    ]
+    candidate["data"]["data_dictionary"]["datasets"]["credit_accounts"] = {
+        "columns": {
+            "sequence": {"label": "组内序号", "type": "integer"},
+            "account_type": {"label": "账户类型", "type": "enum"},
+            "institution": {"label": "管理机构", "type": "string"},
+            "credit_limit": {"label": "信用额度", "type": "money"},
+            "loan_amount": {"label": "贷款发放金额", "type": "money"},
+        }
+    }
+    candidate["data"]["data_dictionary"]["enums"] = {
+        "account_type": {
+            "credit_card": "信用卡",
+            "loan": "贷款",
+            "other": "其他账户",
+        }
+    }
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "enhanced_markdown": {
+            "dataset_layouts": {
+                "credit_accounts": {
+                    "mode": "partitioned_tables",
+                    "partition_by": "account_type",
+                    "partitions": [
+                        {
+                            "value": "credit_card",
+                            "title": "信用卡账户",
+                            "columns": ["sequence", "institution", "credit_limit"],
+                        },
+                        {
+                            "value": "loan",
+                            "title": "贷款账户",
+                            "columns": ["sequence", "institution", "loan_amount"],
+                        },
+                    ],
+                }
+            }
+        }
+    }
+
+    enhanced = project_community_bundle(result, document_id="doc_partitioned").render_enhanced_markdown()
+    card_table = enhanced.split("#### 信用卡账户", maxsplit=1)[1].split("\n#### ", maxsplit=1)[0]
+    loan_table = enhanced.split("#### 贷款账户", maxsplit=1)[1].split("\n#### ", maxsplit=1)[0]
+
+    assert enhanced.index("#### 信用卡账户") < enhanced.index("#### 贷款账户")
+    assert "| 组内序号 | 管理机构 | 信用额度 |" in card_table
+    assert "贷款发放金额" not in card_table
+    assert "| 1 | 发卡银行 | 2240000 |" in card_table
+    assert "| 组内序号 | 管理机构 | 贷款发放金额 |" in loan_table
+    assert "信用额度" not in loan_table
+    assert "| 1 | 贷款银行 | 315000 |" in loan_table
+    assert "#### 其他账户" in enhanced
+    assert "其他机构" in enhanced
+    assert "2,240,000" not in enhanced
+
+
 def test_audit_reconciliation_can_render_in_appendix_and_audit_csv_only() -> None:
     result = _with_projection(
         ParseResult(entities=DocumentEntities(document_type="credit_report")),

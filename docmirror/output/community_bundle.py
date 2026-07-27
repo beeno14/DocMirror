@@ -904,7 +904,47 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             return "\n".join(lines)
 
         dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
-        if dataset_layout.get("mode") == "record_cards":
+        if dataset_layout.get("mode") == "partitioned_tables":
+            partition_by = str(dataset_layout.get("partition_by") or "")
+            partition_specs = [
+                spec
+                for spec in dataset_layout.get("partitions") or []
+                if isinstance(spec, dict) and spec.get("value") not in (None, "")
+            ]
+            if partition_by not in column_by_key or not partition_specs:
+                parts.append(render_rows(dataset_rows))
+                continue
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in dataset_rows:
+                partition_value = str(row_value(row, partition_by) or "unknown")
+                grouped.setdefault(partition_value, []).append(row)
+            rendered_values: set[str] = set()
+            for spec in partition_specs:
+                partition_value = str(spec["value"])
+                rows = grouped.get(partition_value)
+                if not rows or partition_value in rendered_values:
+                    continue
+                partition_keys = [
+                    str(key)
+                    for key in spec.get("columns") or []
+                    if str(key) in column_by_key
+                ]
+                parts.append(
+                    f"#### {_markdown_text(spec.get('title') or partition_value)}"
+                )
+                parts.append(render_rows(rows, partition_keys or keys))
+                rendered_values.add(partition_value)
+            for partition_value in sorted(set(grouped) - rendered_values):
+                shown_partition = _markdown_display(
+                    partition_value,
+                    key=partition_by,
+                    descriptor=column_by_key[partition_by],
+                    dictionary=dictionary,
+                    privacy_mode=privacy_mode,
+                )
+                parts.append(f"#### {_markdown_text(shown_partition)}")
+                parts.append(render_rows(grouped[partition_value]))
+        elif dataset_layout.get("mode") == "record_cards":
             configured_title_separator = dataset_layout.get("title_separator")
             title_separator = (
                 " · "

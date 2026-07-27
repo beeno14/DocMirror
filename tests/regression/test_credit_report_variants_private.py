@@ -417,6 +417,38 @@ def test_credit_report_subtype_projects_complete_v3(
         assert all(row["source_reason"].startswith("本人查询") for row in personal_inquiries)
         assert sum(row["normalized"]["status"] == "inactive" for row in accounts) == expected_inactive
         enhanced_preview = bundle.render_enhanced_markdown(semantic)
+        account_types = {row["normalized"]["account_type"] for row in accounts}
+        if "credit_card" in account_types:
+            assert "#### 信用卡账户" in enhanced_preview
+            credit_card_preview = enhanced_preview.split("#### 信用卡账户", maxsplit=1)[1].split(
+                "\n#### ",
+                maxsplit=1,
+            )[0]
+            assert "信用额度" in credit_card_preview
+            assert "贷款发放金额" not in credit_card_preview
+        if "loan" in account_types:
+            assert "#### 贷款账户" in enhanced_preview
+            loan_preview = enhanced_preview.split("#### 贷款账户", maxsplit=1)[1].split(
+                "\n#### ",
+                maxsplit=1,
+            )[0]
+            assert "贷款发放金额" in loan_preview
+            assert "信用额度" not in loan_preview
+        if "credit_line" in account_types:
+            assert "#### 贷款授信" in enhanced_preview
+        if liabilities:
+            liability_preview = enhanced_preview.split("### 相关还款责任信息", maxsplit=1)[1].split(
+                "\n### ",
+                maxsplit=1,
+            )[0]
+            assert (
+                "| 组内序号 | 责任发生日期 | 相关方名称 | 管理机构 | 业务类型 | "
+                "责任金额 | 余额 | 币种 |"
+            ) in liability_preview
+            assert "| sequence |" not in liability_preview
+            assert "liability date" not in liability_preview
+            assert "related party name" not in liability_preview
+            assert "responsibility amount" not in liability_preview
         information_summary_preview = enhanced_preview.split("## 信息概要", maxsplit=1)[1].split(
             "\n## 信贷记录",
             maxsplit=1,
