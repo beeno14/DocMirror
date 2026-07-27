@@ -12,7 +12,7 @@ from docmirror.layout.scene.evidence_types import Evidence
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult, TextBlock
 
 
-def test_evidence_engine_sets_canonical_document_type_alias():
+def test_automatic_bank_reconciliation_alias_is_emitted_as_bank_statement():
     result = ParseResult(
         full_text="银行对账单 sample",
         entities=DocumentEntities(document_type="unknown"),
@@ -24,8 +24,21 @@ def test_evidence_engine_sets_canonical_document_type_alias():
     ):
         out = EvidenceEngine().process(result)
     ds = out.entities.domain_specific or {}
+    assert out.entities.document_type == "bank_statement"
+    assert "canonical_document_type" not in ds
+
+
+def test_forced_bank_reconciliation_alias_remains_compatible():
+    result = ParseResult(entities=DocumentEntities(document_type="unknown"))
+    result.entities.domain_specific = {
+        "user_doc_type_hint": "bank_reconciliation",
+        "user_doc_type_hint_strength": "force",
+    }
+
+    out = EvidenceEngine().process(result)
+
     assert out.entities.document_type == "bank_reconciliation"
-    assert ds.get("canonical_document_type") == "bank_statement"
+    assert out.entities.domain_specific["canonical_document_type"] == "bank_statement"
 
 
 def test_evidence_engine_maps_enterprise_credit_to_community_credit_plugin():
