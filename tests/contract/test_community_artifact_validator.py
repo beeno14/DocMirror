@@ -191,6 +191,32 @@ def test_validator_detects_audit_record_loss(tmp_path: Path) -> None:
     assert "ds_transactions: 1 records missing from audit CSV" in issues
 
 
+def test_validator_accepts_reserved_reconciliation_audit_rows(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "reconciliation_audit")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    audit_path = community_path.parent / payload["files"]["dataset_audit_csv"]
+    with audit_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    rows.append(
+        {
+            **{key: "" for key in rows[0]},
+            "dataset_id": "_audit_reconciliations",
+            "record_id": "audit:credit_account_balance",
+            "field_key": "difference",
+            "value": "0.01",
+            "raw": "0.01",
+            "value_type": "decimal",
+            "csv_escape_applied": "false",
+        }
+    )
+    with audit_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    assert validate_community_artifacts(community_path) == []
+
+
 def test_payment_direction_cells_counts_gfm_data_rows_separately_from_headers() -> None:
     markdown = """| 收/支 | 金额 |
 | --- | ---: |

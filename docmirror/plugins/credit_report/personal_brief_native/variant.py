@@ -23,11 +23,27 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
         )
 
     def build_section_content(self, parse_result: Any, full_text: str) -> dict[str, Any]:
-        from docmirror.plugins.credit_report.business_records import (
+        from docmirror.plugins.credit_report.personal_brief_native.extraction import (
             extract_personal_brief_section_content,
         )
 
         return extract_personal_brief_section_content(parse_result, full_text)
+
+    def extract_native_business(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        content_mode: str,
+    ) -> dict[str, Any]:
+        """Extract only native personal-brief business records."""
+        if content_mode not in self.expected_content_modes:
+            return {}
+        from docmirror.plugins.credit_report.personal_brief_native.extraction import (
+            extract_personal_brief_native_business,
+        )
+
+        return extract_personal_brief_native_business(parse_result, full_text)
 
     def build_reading_projection(
         self,

@@ -1,0 +1,1314 @@
+# Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Canonical-table refinements for native enterprise credit reports.
+
+Enterprise account cards use stacked header/detail/repayment rows and may
+continue across a page boundary.  This module interprets those already-sealed
+physical tables without changing or supplementing ``ParseResult``.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from decimal import Decimal, InvalidOperation
+from typing import Any
+
+_ACCOUNT_CATEGORIES = frozenset({"中长期借款", "短期借款", "循环透支", "贴现"})
+_FIVE_TIER_CLASSES = frozenset({"正常", "关注", "次级", "可疑", "损失", "违约", "未分类"})
+_CURRENCY_CODES = {
+    "人民币": "CNY",
+    "人民币元": "CNY",
+    "美元": "USD",
+    "欧元": "EUR",
+    "港币": "HKD",
+}
+
+
+def _compact(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def _number(value: Any) -> int | float | None:
+    raw = re.sub(r"[^0-9.-]", "", str(value or "").replace(",", ""))
+    if not raw or raw in {"-", ".", "-."}:
+        return None
+    try:
+        number = Decimal(raw)
+    except InvalidOperation:
+        return None
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def _date(value: Any) -> str:
+    raw = _compact(value)
+    match = re.fullmatch(r"(20\d{2})[-年./](\d{1,2})[-月./](\d{1,2})日?", raw)
+    if not match:
+        return ""
+    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+
+
+def _identifier(value: Any) -> str:
+    return re.sub(r"[^0-9A-Z]", "", _compact(value).upper())
+
+
+def _stable_id(prefix: str, *parts: Any) -> str:
+    payload = "|".join(_compact(part).upper() for part in parts)
+    return f"{prefix}:{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _raw_table_rows(table: Any) -> list[list[str]]:
+    metadata = dict(getattr(table, "metadata", None) or {})
+    raw_rows = metadata.get("raw_rows")
+    if isinstance(raw_rows, list) and raw_rows:
+        return [[_compact(value) for value in row] for row in raw_rows if isinstance(row, list)]
+    rows: list[list[str]] = []
+    headers = list(getattr(table, "headers", None) or [])
+    if headers:
+        rows.append([_compact(value) for value in headers])
+    for row in getattr(table, "rows", None) or []:
+        rows.append([_compact(getattr(cell, "text", cell)) for cell in (getattr(row, "cells", None) or [])])
+    return rows
+
+
+def _table_stream(parse_result: Any):
+    for page in getattr(parse_result, "pages", None) or []:
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+        for table in getattr(page, "tables", None) or []:
+            rows = _raw_table_rows(table)
+            if rows:
+                yield page_number, str(getattr(table, "table_id", "") or ""), rows
+
+
+def _table_headings(parse_result: Any) -> dict[str, str]:
+    """Return the closest preceding page heading for each physical table."""
+    headings: dict[str, str] = {}
+    for page in getattr(parse_result, "pages", None) or []:
+        text_blocks: list[tuple[float, str]] = []
+        for block in getattr(page, "texts", None) or []:
+            bbox = list(getattr(block, "bbox", None) or [])
+            content = _compact(getattr(block, "content", ""))
+            if len(bbox) >= 4 and content:
+                text_blocks.append((float(bbox[3]), content))
+        for table in getattr(page, "tables", None) or []:
+            table_id = str(getattr(table, "table_id", "") or "")
+            bbox = list(getattr(table, "bbox", None) or [])
+            if not table_id or len(bbox) < 2:
+                continue
+            table_top = float(bbox[1])
+            preceding = [(bottom, content) for bottom, content in text_blocks if bottom <= table_top]
+            if preceding:
+                headings[table_id] = max(preceding, key=lambda item: item[0])[1]
+    return headings
+
+
+def _page_texts(parse_result: Any) -> dict[int, str]:
+    """Return compact source text by page for enterprise metadata recovery."""
+    values: dict[int, str] = {}
+    for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+        page_number = int(
+            getattr(page, "source_page_number", 0)
+            or getattr(page, "page_number", 0)
+            or index
+        )
+        values[page_number] = "\n".join(
+            str(getattr(block, "content", "") or "")
+            for block in getattr(page, "texts", None) or []
+            if getattr(block, "content", None)
+        )
+    return values
+
+
+def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
+    """Parse source institution and update date from a table footer."""
+    for row in rows:
+        text = "".join(_compact(value) for value in row)
+        if "信息来源机构" not in text:
+            continue
+        source_match = re.search(
+            r"信息来源机构[:：]?(.*?)(?=更新日期[:：]?|$)",
+            text,
+        )
+        date_match = re.search(
+            r"更新日期[:：]?((?:19|20)\d{2}[-年./]\d{1,2}[-月./]\d{1,2})日?",
+            text,
+        )
+        metadata: dict[str, str] = {}
+        if source_match and _compact(source_match.group(1)):
+            metadata["source_institution"] = _compact(source_match.group(1))
+        if date_match:
+            metadata["update_date"] = _date(date_match.group(1))
+        return metadata
+    return {}
+
+
+def _source_ref(page: int, table_id: str, row: int) -> dict[str, Any]:
+    return {
+        "source": "canonical_physical_table",
+        "page": page,
+        "table_id": table_id,
+        "row": row,
+    }
+
+
+def _append_ref(record: dict[str, Any], page: int, table_id: str, row: int) -> None:
+    ref = _source_ref(page, table_id, row)
+    refs = record.setdefault("source_refs", [])
+    if ref not in refs:
+        refs.append(ref)
+
+
+def _is_account_header(row: list[str]) -> bool:
+    return bool(
+        row
+        and "账户编号" in row[0]
+        and any("授信机构" in cell for cell in row)
+        and any("业务种类" in cell or "业务类型" in cell for cell in row)
+        and any("开立日期" in cell or "开户日期" in cell for cell in row)
+        and any("借款金额" in cell or "信用额度" in cell for cell in row)
+    )
+
+
+def _is_primary_account_row(
+    row: list[str],
+    *,
+    open_date_index: int,
+    due_date_index: int,
+    amount_index: int,
+) -> bool:
+    return bool(
+        len(row) > max(open_date_index, due_date_index, amount_index)
+        and len(_identifier(row[0])) >= 10
+        and _date(row[open_date_index])
+        and _date(row[due_date_index])
+        and _number(row[amount_index]) is not None
+    )
+
+
+def _is_account_detail_row(row: list[str]) -> bool:
+    return bool(len(row) >= 4 and _number(row[2]) is not None and row[3] in _FIVE_TIER_CLASSES)
+
+
+def _finalize_account(record: dict[str, Any] | None, out: list[dict[str, Any]]) -> None:
+    if not record:
+        return
+    identifier = _identifier(record.get("account_identifier"))
+    if len(identifier) < 12:
+        return
+    record["account_identifier"] = identifier
+    record["account_id"] = f"credit_account:{identifier}"
+    record["sequence"] = len(out) + 1
+    out.append(record)
+
+
+def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str, Any]]:
+    """Read current and settled enterprise account cards.
+
+    Account-history and appendix tables deliberately do not qualify because
+    their headers lack the source account-card amount labels.
+    """
+    accounts: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    category = ""
+    amount_field = "loan_amount"
+    header_seen = False
+    settled_schema = False
+    institution_index = 1
+    business_type_index = 2
+    open_date_index = 3
+    due_date_index = 4
+    currency_index = 5
+    amount_index = 6
+
+    for page, table_id, rows in _table_stream(parse_result):
+        for row_index, row in enumerate(rows):
+            cells = [*row, *([""] * max(0, 8 - len(row)))]
+            first = cells[0]
+            if first in _ACCOUNT_CATEGORIES and any("共" in cell and "笔" in cell for cell in cells):
+                _finalize_account(current, accounts)
+                current = None
+                category = first
+                header_seen = False
+                settled_schema = False
+                continue
+            if _is_account_header(cells):
+                _finalize_account(current, accounts)
+                current = None
+                header_seen = True
+                amount_field = "credit_limit" if any("信用额度" in cell for cell in cells) else "loan_amount"
+                institution_index = next(
+                    (index for index, value in enumerate(cells) if "授信机构" in value),
+                    1,
+                )
+                business_type_index = next(
+                    (
+                        index
+                        for index, value in enumerate(cells)
+                        if "业务种类" in value or "业务类型" in value
+                    ),
+                    2,
+                )
+                open_date_index = next(
+                    (
+                        index
+                        for index, value in enumerate(cells)
+                        if "开立日期" in value or "开户日期" in value
+                    ),
+                    3,
+                )
+                due_date_index = next(
+                    (index for index, value in enumerate(cells) if "到期日" in value),
+                    4,
+                )
+                currency_index = next(
+                    (index for index, value in enumerate(cells) if value == "币种"),
+                    5,
+                )
+                amount_index = next(
+                    (
+                        index
+                        for index, value in enumerate(cells)
+                        if "借款金额" in value or "信用额度" in value
+                    ),
+                    6,
+                )
+                settled_schema = any(
+                    "关闭日期" in cell
+                    for following in rows[row_index + 1 : row_index + 3]
+                    for cell in following
+                )
+                continue
+            if header_seen and _is_primary_account_row(
+                cells,
+                open_date_index=open_date_index,
+                due_date_index=due_date_index,
+                amount_index=amount_index,
+            ):
+                _finalize_account(current, accounts)
+                identifier = _identifier(first)
+                current = {
+                    "account_id": f"credit_account:{identifier}",
+                    "account_identifier": identifier,
+                    "account_type": "enterprise_credit",
+                    "business_category": category,
+                    "management_institution": _compact(cells[institution_index]),
+                    "business_type": _compact(cells[business_type_index]),
+                    "open_date": _date(cells[open_date_index]),
+                    "due_date": _date(cells[due_date_index]),
+                    "currency": _CURRENCY_CODES.get(
+                        _compact(cells[currency_index]),
+                        _compact(cells[currency_index]),
+                    ),
+                    amount_field: _number(cells[amount_index]),
+                    "amount_unit": "CNY_10K",
+                    "account_status": "settled" if settled_schema else "active",
+                    "source": "canonical_enterprise_account_card",
+                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "confidence": 1.0,
+                }
+                continue
+            if current and settled_schema and len(cells) >= 8 and _date(cells[1]):
+                current["close_date"] = _date(cells[1])
+                if cells[2] in _FIVE_TIER_CLASSES:
+                    current["five_tier_class"] = cells[2]
+                current["last_repayment_date"] = _date(cells[3])
+                current["repayment_method"] = _compact(cells[5])
+                current["history_status"] = _compact(cells[7])
+                current["payoff_state"] = "settled"
+                current["account_state"] = "closed"
+                _append_ref(current, page, table_id, row_index)
+                _finalize_account(current, accounts)
+                current = None
+                continue
+            if current and _is_account_detail_row(cells):
+                suffix = _identifier(first)
+                if suffix:
+                    current["account_identifier"] = f"{_identifier(current.get('account_identifier'))}{suffix}"
+                current["guarantee_type"] = _compact(cells[1])
+                current["balance"] = _number(cells[2])
+                current["five_tier_class"] = cells[3]
+                overdue_values = (
+                    _number(cells[4]),
+                    _number(cells[5]),
+                    _number(cells[6]),
+                )
+                current["current_overdue_amount"] = overdue_values[0]
+                current["overdue_principal"] = overdue_values[1]
+                current["current_overdue_periods"] = overdue_values[2]
+                current["last_repayment_date"] = _date(cells[7])
+                reported_values = [value for value in overdue_values if value is not None]
+                if len(reported_values) == len(overdue_values):
+                    current["current_overdue"] = any(value != 0 for value in reported_values)
+                    current["current_overdue_status"] = (
+                        "overdue" if current["current_overdue"] else "not_overdue"
+                    )
+                elif not reported_values:
+                    current.pop("current_overdue", None)
+                    current["current_overdue_status"] = "not_reported"
+                else:
+                    current["current_overdue_status"] = "partially_reported"
+                    if any(value != 0 for value in reported_values):
+                        current["current_overdue"] = True
+                _append_ref(current, page, table_id, row_index)
+                continue
+            if current and len(cells) >= 3 and _number(cells[1]) is not None and "还款" in cells[2]:
+                current["actual_payment"] = _number(cells[1])
+                current["repayment_method"] = cells[2]
+                if category == "循环透支":
+                    current["remaining_periods"] = _number(cells[3])
+                    current["special_transaction"] = "" if cells[4] == "--" else cells[4]
+                    current["credit_agreement_identifier"] = _identifier(cells[5])
+                    current["history_status"] = "" if cells[6] == "--" else cells[6]
+                else:
+                    current["special_transaction"] = "" if cells[3] == "--" else cells[3]
+                    current["credit_agreement_identifier"] = _identifier(cells[4])
+                    current["history_status"] = "" if cells[5] == "--" else cells[5]
+                report_date = next(
+                    (_date(value) for value in reversed(cells) if _date(value)),
+                    "",
+                )
+                if report_date:
+                    current["snapshot_date"] = report_date
+                _append_ref(current, page, table_id, row_index)
+
+    _finalize_account(current, accounts)
+    return accounts
+
+
+def _facility_summary_lines(parse_result: Any) -> list[dict[str, Any]]:
+    for page, table_id, rows in _table_stream(parse_result):
+        for row_index, row in enumerate(rows[:-2]):
+            if not (len(row) >= 6 and "非循环信用额度" in row[0] and "循环信用额度" in row[3]):
+                continue
+            labels = rows[row_index + 1]
+            values = rows[row_index + 2]
+            if len(labels) < 6 or len(values) < 6:
+                continue
+            if [_compact(value) for value in labels[:6]] != [
+                "总额",
+                "已用额度",
+                "剩余可用额度",
+                "总额",
+                "已用额度",
+                "剩余可用额度",
+            ]:
+                continue
+            numbers = [_number(value) for value in values[:6]]
+            if any(value is None for value in numbers):
+                continue
+            return [
+                {
+                    "credit_line_id": _stable_id("credit_line", "non_revolving", table_id),
+                    "facility_type": "non_revolving",
+                    "total_limit": numbers[0],
+                    "used_limit": numbers[1],
+                    "available_limit": numbers[2],
+                    "currency": "CNY",
+                    "amount_unit": "CNY_10K",
+                    "source": "canonical_enterprise_facility_summary",
+                    "source_refs": [_source_ref(page, table_id, row_index + 2)],
+                    "confidence": 1.0,
+                },
+                {
+                    "credit_line_id": _stable_id("credit_line", "revolving", table_id),
+                    "facility_type": "revolving",
+                    "total_limit": numbers[3],
+                    "used_limit": numbers[4],
+                    "available_limit": numbers[5],
+                    "currency": "CNY",
+                    "amount_unit": "CNY_10K",
+                    "source": "canonical_enterprise_facility_summary",
+                    "source_refs": [_source_ref(page, table_id, row_index + 2)],
+                    "confidence": 1.0,
+                },
+            ]
+    return []
+
+
+def extract_enterprise_facility_summary(parse_result: Any) -> list[dict[str, Any]]:
+    """Return one typed row for each facility-summary class."""
+    rows = _facility_summary_lines(parse_result)
+    for sequence, row in enumerate(rows, start=1):
+        row["sequence"] = sequence
+        total = row.get("total_limit")
+        used = row.get("used_limit")
+        if isinstance(total, (int, float)) and total:
+            row["utilization_rate"] = round(float(used or 0) / float(total), 6)
+    return rows
+
+
+def _facility_details(parse_result: Any) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    seen_agreements: set[str] = set()
+    for page, table_id, rows in _table_stream(parse_result):
+        for row_index, row in enumerate(rows):
+            if not row:
+                continue
+            if row[0].startswith("授信信息"):
+                header_index = row_index + 1
+            elif "授信协议编号" in row[0]:
+                header_index = row_index
+            else:
+                continue
+            if header_index + 3 >= len(rows):
+                continue
+            header = rows[header_index]
+            subheader = rows[header_index + 1]
+            primary = rows[header_index + 2]
+            amounts = rows[header_index + 3]
+            if not (
+                header
+                and "授信协议编号" in header[0]
+                and len(primary) >= 7
+                and len(amounts) >= 4
+                and "授信额度" in subheader
+                and "已用额度" in subheader
+            ):
+                continue
+            agreement = _identifier(primary[0])
+            if len(agreement) < 12 or agreement in seen_agreements:
+                continue
+            seen_agreements.add(agreement)
+            revolving = _compact(primary[3]) in {"是", "Y", "YES", "循环"}
+            details.append(
+                {
+                    "credit_line_id": f"credit_line:{agreement}",
+                    "account_identifier": agreement,
+                    "management_institution": _compact(primary[1]),
+                    "facility_type": "revolving" if revolving else "non_revolving",
+                    "facility_product": _compact(primary[2]),
+                    "revolving_flag": revolving,
+                    "effective_date": _date(primary[4]),
+                    "due_date": _date(primary[5]),
+                    "snapshot_date": _date(primary[6]),
+                    "currency": _CURRENCY_CODES.get(_compact(amounts[1]), _compact(amounts[1])),
+                    "total_limit": _number(amounts[2]),
+                    "used_limit": _number(amounts[3]),
+                    "facility_limit": _number(amounts[4]) if len(amounts) > 4 else None,
+                    "limit_identifier": _identifier(amounts[5]) if len(amounts) > 5 else "",
+                    "amount_unit": "CNY_10K",
+                    "source": "canonical_enterprise_facility_detail",
+                    "source_refs": [
+                        _source_ref(page, table_id, header_index + 2),
+                        _source_ref(page, table_id, header_index + 3),
+                    ],
+                    "confidence": 1.0,
+                }
+            )
+    return details
+
+
+def extract_enterprise_credit_lines_from_tables(
+    parse_result: Any,
+    accounts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return source-grained facility cards, never aggregate pseudo-records."""
+    details = _facility_details(parse_result)
+    for line in details:
+        institution = _compact(line.get("management_institution"))
+        candidates = [
+            account
+            for account in accounts
+            if institution and _compact(account.get("management_institution")) == institution
+        ]
+        if len(candidates) == 1:
+            line["account_id"] = candidates[0]["account_id"]
+            line["account_status"] = candidates[0].get("account_status")
+    return details
+
+
+_PROFILE_LABELS = frozenset(
+    {
+        "经济类型",
+        "组织机构类型",
+        "企业规模",
+        "所属行业",
+        "成立年份",
+        "登记证书有效截止日期",
+        "登记地址",
+        "办公/经营地址",
+        "存续状态",
+    }
+)
+
+_IDENTITY_LABELS = {
+    "企业名称": "subject_name",
+    "中征码": "zhongzheng_code",
+    "统一社会信用代码": "unified_social_credit_code",
+    "组织机构代码": "organization_code",
+    "纳税人识别号（国税）": "national_tax_id",
+    "纳税人识别号（地税）": "local_tax_id",
+}
+
+
+def extract_enterprise_identity_facts(parse_result: Any) -> dict[str, Any]:
+    """Read all enterprise identity codes from the canonical identity table."""
+    facts: dict[str, Any] = {}
+    for _page, _table_id, rows in _table_stream(parse_result):
+        labels = {row[0] for row in rows if len(row) >= 2}
+        if not {"企业名称", "中征码", "统一社会信用代码"} <= labels:
+            continue
+        for row in rows:
+            if len(row) < 2:
+                continue
+            field = _IDENTITY_LABELS.get(row[0])
+            if field and row[1] and row[1] != "--":
+                facts[field] = row[1]
+        break
+    return facts
+
+
+def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
+    """Read overview facts that are represented as compact canonical tables."""
+    summary: dict[str, Any] = {}
+    overview_labels = {
+        "首次有信贷交易的年份": "first_credit_year",
+        "发生信贷交易的机构数": "credit_institution_count",
+        "当前有未结清信贷交易的机构数": "active_credit_institution_count",
+        "首次有相关还款责任的年份": "first_repayment_responsibility_year",
+    }
+    public_labels = {
+        "非信贷交易账户数": "non_credit_accounts",
+        "欠税记录条数": "tax_arrears",
+        "民事判决记录条数": "civil_judgments",
+        "强制执行记录条数": "enforcements",
+        "行政处罚记录条数": "administrative_penalties",
+    }
+    for _page, _table_id, rows in _table_stream(parse_result):
+        if not rows:
+            continue
+        headers = rows[0]
+        if len(rows) >= 2 and all(
+            any(label in header for header in headers) for label in overview_labels
+        ):
+            values = rows[1]
+            for index, header in enumerate(headers):
+                field = next((key for label, key in overview_labels.items() if label in header), "")
+                if not field:
+                    continue
+                value = values[index] if index < len(values) else ""
+                number = _number(value)
+                if number is not None:
+                    summary[field] = int(number)
+                elif field == "first_repayment_responsibility_year" and value == "--":
+                    summary["first_repayment_responsibility_year_status"] = "not_reported"
+        if len(rows) >= 2 and all(
+            any(label in header for header in headers) for label in public_labels
+        ):
+            values = rows[1]
+            counts: dict[str, int] = {}
+            for index, header in enumerate(headers):
+                field = next((key for label, key in public_labels.items() if label in header), "")
+                number = _number(values[index] if index < len(values) else "")
+                if field and number is not None:
+                    counts[field] = int(number)
+            if counts:
+                summary["public_record_counts"] = counts
+        signature = "".join(headers)
+        if "借贷交易" not in signature or "担保交易" not in signature:
+            continue
+        for row in rows[1:]:
+            if len(row) >= 4 and row[0] == "余额" and row[2] == "余额":
+                summary["credit_balance"] = _number(row[1])
+                summary["guarantee_balance"] = _number(row[3])
+                summary["amount_unit"] = "CNY_10K"
+            for index, value in enumerate(row[:-1]):
+                number = _number(row[index + 1])
+                if number is None:
+                    continue
+                if "被追偿余额" in value:
+                    summary["recovered_debt_balance"] = number
+                elif "关注类余额" in value:
+                    target = (
+                        "credit_attention_balance"
+                        if index < 2
+                        else "guarantee_attention_balance"
+                    )
+                    summary[target] = number
+                elif "不良类余额" in value:
+                    target = (
+                        "credit_adverse_balance"
+                        if index < 2
+                        else "guarantee_adverse_balance"
+                    )
+                    summary[target] = number
+    return summary
+
+
+def _placeholder_row(row: list[str]) -> bool:
+    meaningful = [_compact(value) for value in row if _compact(value)]
+    return bool(meaningful) and all(value in {"--", "-", "—"} for value in meaningful)
+
+
+def extract_enterprise_capital_summary(parse_result: Any) -> list[dict[str, Any]]:
+    """Separate registered capital from contributor-record availability."""
+    headings = _table_headings(parse_result)
+    page_texts = _page_texts(parse_result)
+    for page, table_id, rows in _table_stream(parse_result):
+        if not rows:
+            continue
+        signature = "".join(rows[0])
+        if not all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
+            continue
+        data_rows = [
+            row
+            for row in rows[1:]
+            if row and not row[0].startswith("信息来源")
+        ]
+        contributor_status = (
+            "no_records"
+            if data_rows and all(_placeholder_row(row) for row in data_rows)
+            else "reported"
+        )
+        source_text = "\n".join((headings.get(table_id, ""), page_texts.get(page, "")))
+        capital_match = re.search(
+            r"注册资本(?:折人民币)?(?:合计)?[:：]?\s*([0-9][0-9,.]*)\s*(万元|元)",
+            source_text,
+        )
+        capital_amount = _number(capital_match.group(1)) if capital_match else None
+        amount_unit = "CNY_10K" if capital_match and capital_match.group(2) == "万元" else "CNY"
+        record: dict[str, Any] = {
+            "sequence": 1,
+            "contributor_status": contributor_status,
+            "contributor_count": sum(
+                1 for row in data_rows if not _placeholder_row(row)
+            ),
+            "source_page": page,
+            "source": "canonical_enterprise_capital_table",
+            "source_refs": [_source_ref(page, table_id, 0)],
+            "confidence": 1.0,
+            **_table_source_metadata(rows),
+        }
+        if capital_amount is not None:
+            record.update(
+                {
+                    "registered_capital_amount": capital_amount,
+                    "currency": "CNY",
+                    "amount_unit": amount_unit,
+                }
+            )
+        return [record]
+    return []
+
+
+def extract_enterprise_profile_status(parse_result: Any) -> dict[str, Any]:
+    """Compatibility helper exposing the accurately scoped contributor status."""
+    rows = extract_enterprise_capital_summary(parse_result)
+    if not rows:
+        return {}
+    return {"contributor_status": rows[0]["contributor_status"]}
+
+
+def extract_enterprise_report_metadata(
+    parse_result: Any,
+    full_text: str = "",
+) -> dict[str, Any]:
+    """Recover report-edition and exchange-rate metadata from native text."""
+    text = full_text or "\n".join(_page_texts(parse_result).values())
+    compact = _compact(text)
+    facts: dict[str, Any] = {}
+    if "自主查询版" in compact:
+        facts["report_edition"] = "independent_query"
+    exchange_match = re.search(
+        r"汇率[（(]美元折人民币[）)][:：]?([0-9]+(?:\.[0-9]+)?)"
+        r".{0,30}?有效期[:：]?((?:19|20)\d{2}[-/.]\d{1,2})",
+        compact,
+    )
+    if exchange_match:
+        facts["exchange_rate_usd_cny"] = _number(exchange_match.group(1))
+        period = exchange_match.group(2).replace("/", "-").replace(".", "-")
+        year, month = period.split("-", 1)
+        facts["exchange_rate_effective_period"] = f"{int(year):04d}-{int(month):02d}"
+    return facts
+
+
+def extract_enterprise_report_metadata_records(
+    parse_result: Any,
+    full_text: str = "",
+) -> dict[str, list[dict[str, Any]]]:
+    """Return cover and report-note metadata at their source-page grain."""
+    metadata = extract_enterprise_report_metadata(parse_result, full_text)
+    page_texts = _page_texts(parse_result)
+    datasets: dict[str, list[dict[str, Any]]] = {}
+
+    report_edition = metadata.get("report_edition")
+    if report_edition:
+        page = next(
+            (
+                page_number
+                for page_number, text in page_texts.items()
+                if "自主查询版" in _compact(text)
+            ),
+            None,
+        )
+        record: dict[str, Any] = {
+            "sequence": 1,
+            "report_edition": report_edition,
+            "source": "enterprise_report_cover",
+            "confidence": 1.0,
+        }
+        if page is not None:
+            record["source_page"] = page
+            record["source_refs"] = [{"source": "native_text_report_edition", "page": page}]
+        datasets["enterprise_report_metadata"] = [record]
+
+    exchange_rate = metadata.get("exchange_rate_usd_cny")
+    exchange_period = metadata.get("exchange_rate_effective_period")
+    if exchange_rate is not None or exchange_period:
+        page = next(
+            (
+                page_number
+                for page_number, text in page_texts.items()
+                if "汇率" in _compact(text) and "有效期" in _compact(text)
+            ),
+            None,
+        )
+        record = {
+            "sequence": 1,
+            "exchange_rate_usd_cny": exchange_rate,
+            "exchange_rate_effective_period": exchange_period,
+            "source": "enterprise_report_notes",
+            "confidence": 1.0,
+        }
+        if page is not None:
+            record["source_page"] = page
+            record["source_refs"] = [{"source": "native_text_exchange_rate", "page": page}]
+        datasets["enterprise_exchange_rates"] = [record]
+    return datasets
+
+
+def extract_enterprise_report_notes(parse_result: Any) -> list[dict[str, Any]]:
+    """Transcribe numbered enterprise report notes from their source page."""
+    for page, page_text in _page_texts(parse_result).items():
+        heading = re.search(r"报告说明", page_text)
+        if heading is None:
+            continue
+        note_text = page_text[heading.end() :]
+        note_text = re.split(r"汇率[（(]美元折人民币[）)]", note_text, maxsplit=1)[0]
+        note_text = re.sub(r"第\s*\d+\s*页\s*/\s*共\s*\d+\s*页", "", note_text)
+        notes: list[dict[str, Any]] = []
+        for match in re.finditer(
+            r"(?ms)(?<!\d)(\d{1,2})[.．、]\s*(.*?)(?=(?<!\d)\d{1,2}[.．、]\s*|\Z)",
+            note_text,
+        ):
+            sequence = int(match.group(1))
+            content = re.sub(r"\s*\n\s*", "", match.group(2))
+            content = re.sub(r"[ \t]+", " ", content).strip()
+            if not content:
+                continue
+            notes.append(
+                {
+                    "note_id": _stable_id("enterprise_report_note", sequence, content),
+                    "sequence": sequence,
+                    "content": content,
+                    "source_page": page,
+                    "source": "enterprise_report_notes",
+                    "source_refs": [{"source": "native_text_report_note", "page": page}],
+                    "confidence": 1.0,
+                }
+            )
+        if notes:
+            return notes
+    return []
+
+
+def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
+    """Extract enterprise-only profile and related-party tables."""
+    profile: list[dict[str, Any]] = []
+    stakeholders: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
+    headings = _table_headings(parse_result)
+    for page, table_id, rows in _table_stream(parse_result):
+        if not rows:
+            continue
+        headers = rows[0]
+        signature = "".join(headers)
+        source_metadata = _table_source_metadata(rows)
+        if any(row and row[0] in _PROFILE_LABELS for row in rows):
+            for row_index, row in enumerate(rows):
+                if len(row) < 2 or row[0] not in _PROFILE_LABELS:
+                    continue
+                profile.append(
+                    {
+                        "sequence": len(profile) + 1,
+                        "field": row[0],
+                        "value": row[1],
+                        "source_institution": row[3] if len(row) > 3 else "",
+                        "page": page,
+                        "source": "canonical_enterprise_profile_table",
+                        "source_refs": [_source_ref(page, table_id, row_index)],
+                        "confidence": 1.0,
+                    }
+                )
+            continue
+        if all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
+            for row_index, row in enumerate(rows[1:], start=1):
+                if len(row) < 4 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
+                    continue
+                stakeholders.append(
+                    {
+                        "sequence": len(stakeholders) + 1,
+                        "role": row[0],
+                        "name": row[1],
+                        "identity_type": row[2],
+                        "identity_number": row[3],
+                        "ownership_percentage": row[4] if len(row) > 4 else "",
+                        **source_metadata,
+                        "page": page,
+                        "source": "canonical_enterprise_stakeholder_table",
+                        "source_refs": [_source_ref(page, table_id, row_index)],
+                        "confidence": 1.0,
+                    }
+                )
+            continue
+        management_header = all(marker in signature for marker in ("职位", "姓名", "证件号码"))
+        management_continuation = not management_header and any(
+            len(row) >= 4
+            and row[2] in {"身份证", "护照", "港澳居民来往内地通行证"}
+            and len(_identifier(row[3])) >= 8
+            for row in rows
+        )
+        if management_header or management_continuation:
+            start_index = 1 if management_header else 0
+            for row_index, row in enumerate(rows[start_index:], start=start_index):
+                if len(row) < 4 or not row[0] or row[0].startswith("信息来源"):
+                    continue
+                stakeholders.append(
+                    {
+                        "sequence": len(stakeholders) + 1,
+                        "role": row[0],
+                        "name": row[1],
+                        "identity_type": row[2],
+                        "identity_number": row[3],
+                        **source_metadata,
+                        "page": page,
+                        "source": "canonical_enterprise_management_table",
+                        "source_refs": [_source_ref(page, table_id, row_index)],
+                        "confidence": 1.0,
+                    }
+                )
+            continue
+        relationship_headers = (
+            all(marker in signature for marker in ("类型", "名称", "身份标识号码"))
+            or all(marker in signature for marker in ("名称", "身份标识类型", "身份标识号码"))
+        )
+        if relationship_headers:
+            for row_index, row in enumerate(rows[1:], start=1):
+                if len(row) < 3 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
+                    continue
+                has_type_column = "类型" == headers[0]
+                heading = headings.get(table_id, "")
+                relationship_type = (
+                    row[0]
+                    if has_type_column
+                    else ("actual_controller" if "实际控制人" in heading else "related_enterprise")
+                )
+                relationships.append(
+                    {
+                        "sequence": len(relationships) + 1,
+                        "relationship_type": relationship_type,
+                        "name": row[1] if has_type_column else row[0],
+                        "identity_type": row[2] if has_type_column else row[1],
+                        "identity_number": row[3] if has_type_column and len(row) > 3 else row[2],
+                        **source_metadata,
+                        "page": page,
+                        "source": "canonical_enterprise_relationship_table",
+                        "source_refs": [_source_ref(page, table_id, row_index)],
+                        "confidence": 1.0,
+                    }
+                )
+    return {
+        "enterprise_profile_fields": profile,
+        "enterprise_stakeholders": stakeholders,
+        "enterprise_relationships": relationships,
+    }
+
+
+def extract_enterprise_supplement_rows(parse_result: Any) -> list[dict[str, Any]]:
+    """Join paired physical rows into account-linked monthly history records."""
+    tables = list(_table_stream(parse_result))
+    accounts = [
+        account
+        for account in extract_enterprise_accounts_from_tables(parse_result)
+        if account.get("account_status") != "settled"
+    ]
+    if not accounts:
+        return []
+
+    def history_header(rows: list[list[str]]) -> bool:
+        signature = "".join(rows[0]) if rows else ""
+        return "信息报告日期" in signature and "余额" in signature and "余额变化日期" in signature
+
+    records: list[dict[str, Any]] = []
+    started = False
+    account_index = -1
+    current_account: dict[str, Any] = {}
+    pending: tuple[list[str], int, str, int] | None = None
+
+    def emit(primary: list[str], secondary: list[str], page: int, table_id: str, row_index: int) -> None:
+        width = max(len(primary), len(secondary))
+        primary = [*primary, *([""] * (width - len(primary)))]
+        secondary = [*secondary, *([""] * (width - len(secondary)))]
+        report_date = _date(primary[0])
+        if not report_date or not current_account:
+            return
+        revolving = width >= 8
+        account_identifier = str(current_account.get("account_identifier") or "")
+        first_page, first_table, first_row = pending[1:] if pending else (page, table_id, row_index)
+        record = {
+            "supplement_id": _stable_id("enterprise_history", account_identifier, report_date),
+            "sequence": len(records) + 1,
+            "account_id": current_account.get("account_id"),
+            "account_identifier": account_identifier,
+            "institution": current_account.get("management_institution"),
+            "business_type": current_account.get("business_type"),
+            "business_category": current_account.get("business_category"),
+            "report_date": report_date,
+            "balance": _number(primary[1]),
+            "balance_change_date": _date(primary[2]),
+            "five_tier_class": primary[3] if primary[3] != "--" else "",
+            "classification_date": _date(primary[4]),
+            "overdue_total": _number(primary[5]),
+            "overdue_principal": _number(primary[6]),
+            "overdue_months": _number(primary[7] if revolving else secondary[1]),
+            "scheduled_repayment_date": _date(secondary[1] if revolving else secondary[2]),
+            "scheduled_repayment_amount": _number(secondary[2] if revolving else secondary[3]),
+            "actual_repayment_date": _date(secondary[3] if revolving else secondary[4]),
+            "actual_repayment_amount": _number(secondary[4] if revolving else secondary[5]),
+            "repayment_method": (
+                ""
+                if (secondary[5] if revolving else secondary[6]) == "--"
+                else (secondary[5] if revolving else secondary[6])
+            ),
+            "remaining_periods": _number(secondary[6]) if revolving else None,
+            "source_page": first_page,
+            "source_table_id": first_table,
+            "source": "canonical_enterprise_monthly_history",
+            "source_refs": [],
+            "confidence": 1.0,
+        }
+        record["source_refs"] = [
+            _source_ref(first_page, first_table, first_row),
+            _source_ref(page, table_id, row_index),
+        ]
+        records.append(record)
+
+    for page, table_id, rows in tables:
+        is_header = history_header(rows)
+        if is_header:
+            started = True
+            pending = None
+            account_index += 1
+            current_account = accounts[account_index] if account_index < len(accounts) else {}
+            data_rows = rows[2:]
+            offset = 2
+        elif started:
+            data_rows = rows
+            offset = 0
+        else:
+            continue
+        for local_index, row in enumerate(data_rows):
+            row_index = local_index + offset
+            values = [_compact(value) for value in row]
+            if _date(values[0] if values else ""):
+                pending = (values, page, table_id, row_index)
+                continue
+            if pending and values and not values[0]:
+                emit(pending[0], values, page, table_id, row_index)
+                pending = None
+    return records
+
+
+_PUBLIC_TABLE_TYPES = {
+    "公用事业单位名称": "utility_payment",
+    "主管税务机关": "tax_arrears",
+    "许可部门": "license",
+    "认证部门": "certification",
+    "认定部门": "qualification",
+    "奖励部门": "award",
+    "批准部门出口商品名称生效日期": "export_quality",
+    "批准部门免验商品名称免验号截止日期": "inspection_exemption",
+    "监管部门管辖直属局监管级别生效日期截止日期": "regulatory_supervision",
+    "专利名称": "patent",
+    "所属名录": "financing_restriction",
+    "数据提供机构说明": "data_provider_statement",
+    "征信中心说明": "credit_bureau_statement",
+    "信息主体声明": "subject_statement",
+    "异议标注": "dispute_annotation",
+}
+
+
+def _public_type(headers: list[str], rows: list[list[str]]) -> str:
+    signature = "".join(headers)
+    for marker, record_type in _PUBLIC_TABLE_TYPES.items():
+        if marker in signature:
+            return record_type
+    text = "".join("".join(row) for row in rows[:3])
+    if "立案法院" in text:
+        return "civil_judgment"
+    if "执行法院" in text:
+        return "enforcement"
+    if "处罚机构" in text or "违法行为" in text or "处罚决定" in text:
+        return "administrative_penalty"
+    if "初缴年月" in text or ("职工人数" in text and "缴费基数" in text):
+        return "social_security_payment"
+    return ""
+
+
+def _split_label_value(value: str) -> tuple[str, str]:
+    if "：" in value:
+        label, content = value.split("：", 1)
+        return _compact(label), _compact(content)
+    if ":" in value:
+        label, content = value.split(":", 1)
+        return _compact(label), _compact(content)
+    return "", _compact(value)
+
+
+def _public_date(details: dict[str, Any], *labels: str) -> str:
+    for label in labels:
+        for key, value in details.items():
+            if label in key:
+                parsed = _date(value)
+                if parsed:
+                    return parsed
+    return ""
+
+
+def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dict[str, Any]]:
+    """Project typed public-record tables without cross-section text bleed."""
+    records: list[dict[str, Any]] = []
+    for page, table_id, rows in _table_stream(parse_result):
+        if not rows:
+            continue
+        headers = rows[0]
+        record_type = _public_type(headers, rows)
+        if not record_type:
+            continue
+        structured_table = any(marker in "".join(headers) for marker in _PUBLIC_TABLE_TYPES)
+        key_value_table = not structured_table and any(
+            "：" in cell or ":" in cell for row in rows for cell in row
+        )
+        entries: list[tuple[int, dict[str, Any]]] = []
+        if key_value_table:
+            details: dict[str, Any] = {}
+            for row in rows:
+                for value in row:
+                    label, content = _split_label_value(value)
+                    if label and content:
+                        details[label] = content
+            if details:
+                entries.append((0, details))
+        else:
+            for row_index, row in enumerate(rows[1:], start=1):
+                if not any(_compact(value) for value in row):
+                    continue
+                details = {
+                    _compact(label): _compact(value)
+                    for label, value in zip(headers, row)
+                    if _compact(label) and _compact(value)
+                }
+                if details:
+                    entries.append((row_index, details))
+        for row_index, details in entries:
+            authority = next(
+                (
+                    value
+                    for key, value in details.items()
+                    if any(marker in key for marker in ("部门", "机关", "法院", "单位名称", "机构"))
+                ),
+                "",
+            )
+            category = next(
+                (
+                    value
+                    for key, value in details.items()
+                    if any(marker in key for marker in ("类型", "案由", "名称", "级别"))
+                ),
+                "",
+            )
+            content = "；".join(f"{key}：{value}" for key, value in details.items())
+            record = {
+                "public_record_id": _stable_id(
+                    "public_record",
+                    record_type,
+                    page,
+                    table_id,
+                    row_index,
+                    content,
+                ),
+                "record_type": record_type,
+                "authority": authority,
+                "category": category,
+                "start_date": _public_date(
+                    details,
+                    "生效日期",
+                    "许可日期",
+                    "认证日期",
+                    "批准日期",
+                    "授予日期",
+                    "申请日期",
+                    "统计日期",
+                    "添加日期",
+                    "立案日期",
+                    "处罚日期",
+                    "最近一次缴费日期",
+                ),
+                "end_date": _public_date(details, "截止日期", "有效截止日期"),
+                "content": content,
+                "details": details,
+                "page": page,
+                "source": "canonical_enterprise_public_record_table",
+                "source_refs": [_source_ref(page, table_id, row_index)],
+                "confidence": 1.0,
+            }
+            if (
+                record_type == "administrative_penalty"
+                and records
+                and records[-1].get("record_type") == record_type
+                and int(records[-1].get("page") or 0) + 1 >= page
+            ):
+                previous = records[-1]
+                previous["details"].update(details)
+                previous["content"] = "；".join(
+                    f"{key}：{value}" for key, value in previous["details"].items()
+                )
+                previous["source_refs"].extend(record["source_refs"])
+                continue
+            records.append(record)
+    for index, record in enumerate(records, start=1):
+        record["sequence"] = index
+    return records
+
+
+def _reported_account_summary(parse_result: Any) -> dict[str, Any]:
+    for page, table_id, rows in _table_stream(parse_result):
+        for row_index, row in enumerate(rows):
+            if not (len(row) >= 9 and row[0] == "" and row[1] == "正常类" and row[7] == "合计"):
+                continue
+            counts: dict[str, int] = {}
+            balances: dict[str, int | float] = {}
+            for values in rows[row_index + 1 :]:
+                if len(values) < 9:
+                    continue
+                category = values[0]
+                if category in _ACCOUNT_CATEGORIES:
+                    count = _number(values[7])
+                    balance = _number(values[8])
+                    if isinstance(count, int):
+                        counts[category] = count
+                    if balance is not None:
+                        balances[category] = balance
+                elif category == "合计":
+                    count = _number(values[7])
+                    balance = _number(values[8])
+                    if count is not None:
+                        return {
+                            "reported_account_count": int(count),
+                            "reported_account_counts": counts,
+                            "reported_account_balances": balances,
+                            "reported_account_balance": balance,
+                            "source_account_summary_table_id": table_id,
+                            "source_account_summary_page": page,
+                        }
+    return {}
+
+
+def _merge_accounts(
+    original: list[dict[str, Any]],
+    canonical: list[dict[str, Any]],
+    expected: int | None,
+) -> list[dict[str, Any]]:
+    if not canonical:
+        return original
+    # Canonical account cards and heuristic history/appendix candidates have
+    # different grains.  Once cards exist, mixing the two populations creates
+    # duplicates and field-shifted pseudo-accounts.
+    return canonical
+
+
+def refine_enterprise_business(
+    parse_result: Any,
+    business: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace heuristic enterprise candidates when canonical cards reconcile."""
+    refined = dict(business)
+    summary = dict(refined.get("credit_summary") or {})
+    summary.update(extract_enterprise_overview(parse_result))
+    reported = _reported_account_summary(parse_result)
+    summary.update(reported)
+    expected = reported.get("reported_account_count")
+    canonical_accounts = extract_enterprise_accounts_from_tables(parse_result)
+    accounts = _merge_accounts(
+        list(refined.get("credit_accounts") or []),
+        canonical_accounts,
+        int(expected) if isinstance(expected, int) else None,
+    )
+    credit_lines = extract_enterprise_credit_lines_from_tables(parse_result, accounts)
+    public_records = extract_enterprise_public_records_from_tables(parse_result)
+    refined["credit_lines"] = credit_lines
+    summary["reported_credit_line_count"] = len(credit_lines)
+    if public_records:
+        refined["public_records"] = public_records
+        summary["public_record_count"] = len(public_records)
+        public_record_counts: dict[str, int] = {}
+        for record in public_records:
+            record_type = str(record.get("record_type") or "unknown")
+            public_record_counts[record_type] = public_record_counts.get(record_type, 0) + 1
+        summary["public_record_counts"] = public_record_counts
+    refined["credit_accounts"] = accounts
+    summary["account_population_comparable"] = bool(
+        isinstance(expected, int) and expected == len(canonical_accounts)
+    )
+    facility_summaries = _facility_summary_lines(parse_result)
+    if facility_summaries:
+        summary["facility_summary"] = {
+            str(line["facility_type"]): {
+                key: line.get(key)
+                for key in ("total_limit", "used_limit", "available_limit", "currency", "amount_unit")
+            }
+            for line in facility_summaries
+        }
+        summary["facility_summary_record_count"] = len(facility_summaries)
+    summary.update(
+        {
+            "extracted_account_count": len(accounts),
+            "canonical_table_account_count": len(canonical_accounts),
+            "credit_line_count": len(refined.get("credit_lines") or []),
+        }
+    )
+    refined["credit_summary"] = summary
+    return refined
+
+
+def extract_enterprise_native_business(
+    parse_result: Any,
+    full_text: str,
+) -> dict[str, Any]:
+    """Transform a ParseResult into enterprise-native business candidates."""
+    from docmirror.plugins.credit_report.business_records import (
+        extract_enterprise_native_candidates,
+    )
+
+    candidates = extract_enterprise_native_candidates(parse_result, full_text)
+    return refine_enterprise_business(parse_result, candidates)
+
+
+__all__ = [
+    "extract_enterprise_accounts_from_tables",
+    "extract_enterprise_credit_lines_from_tables",
+    "extract_enterprise_native_business",
+    "extract_enterprise_facility_summary",
+    "extract_enterprise_identity_facts",
+    "extract_enterprise_overview",
+    "extract_enterprise_capital_summary",
+    "extract_enterprise_profile_datasets",
+    "extract_enterprise_profile_status",
+    "extract_enterprise_public_records_from_tables",
+    "extract_enterprise_report_metadata",
+    "extract_enterprise_report_metadata_records",
+    "extract_enterprise_report_notes",
+    "extract_enterprise_supplement_rows",
+    "refine_enterprise_business",
+]

@@ -35,6 +35,7 @@ _AUDIT_COLUMNS = {
     "evidence_ref",
     "csv_escape_applied",
 }
+_RESERVED_AUDIT_DATASET_IDS = {"_audit_reconciliations"}
 PAYMENT_DIRECTIONS = ("收入", "支出", "其他", "不计收支")
 
 
@@ -171,9 +172,7 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
                 semantic = loaded_semantic
                 semantic_validation = validate_projection_payload("community_semantic", semantic)
                 issues.extend(f"semantic schema: {error}" for error in semantic_validation.errors)
-                semantic_structure = (
-                    semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
-                )
+                semantic_structure = semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
                 if semantic.get("document") != payload.get("document"):
                     issues.append("semantic: document diverges from Community JSON")
                 if semantic_structure.get("sections") is not None:
@@ -223,14 +222,10 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
                         issues.append(f"semantic.bindings[{index}]: unknown dataset/record={record_key}")
                     unknown_blocks = set(binding.get("source_block_refs") or []) - semantic_block_ids
                     if unknown_blocks:
-                        issues.append(
-                            f"semantic.bindings[{index}]: unknown source_block_refs={sorted(unknown_blocks)}"
-                        )
+                        issues.append(f"semantic.bindings[{index}]: unknown source_block_refs={sorted(unknown_blocks)}")
                     unknown_tables = set(binding.get("source_table_refs") or []) - semantic_table_ids
                     if unknown_tables:
-                        issues.append(
-                            f"semantic.bindings[{index}]: unknown source_table_refs={sorted(unknown_tables)}"
-                        )
+                        issues.append(f"semantic.bindings[{index}]: unknown source_table_refs={sorted(unknown_tables)}")
                 if len(bound_records) != len(set(bound_records)):
                     issues.append("semantic.bindings: duplicate dataset/record binding")
                 missing_bindings = semantic_dataset_records - set(bound_records)
@@ -265,7 +260,7 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
             if omitted != expected_omitted:
                 issues.append(f"{dataset_id}: omitted_row_count={omitted}, expected={expected_omitted}")
             verified = completeness.get("verified")
-            if verified is not (expected == emitted):
+            if verified is True and expected != emitted:
                 issues.append(f"{dataset_id}: completeness.verified contradicts expected/emitted counts")
 
         record_ids: list[str] = []
@@ -338,9 +333,7 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
 
     sections = payload.get("sections") if isinstance(payload.get("sections"), list) else []
     section_ids = {
-        str(section.get("id") or "")
-        for section in sections
-        if isinstance(section, dict) and section.get("id")
+        str(section.get("id") or "") for section in sections if isinstance(section, dict) and section.get("id")
     }
     document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
     document_id = str(document.get("id") or "")
@@ -401,6 +394,10 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         for row_index, row in enumerate(audit_rows):
             dataset_id = str(row.get("dataset_id") or "")
             record_id = str(row.get("record_id") or "")
+            if dataset_id in _RESERVED_AUDIT_DATASET_IDS:
+                if not record_id or not str(row.get("field_key") or ""):
+                    issues.append(f"audit[{row_index}]: incomplete reserved audit row")
+                continue
             if dataset_id not in dataset_record_ids:
                 issues.append(f"audit[{row_index}]: unknown dataset_id={dataset_id}")
                 continue

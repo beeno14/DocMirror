@@ -20,8 +20,8 @@ from typing import Any
 
 from docmirror.plugins.credit_report.business_records import (
     derive_overdue_records,
-    extract_native_credit_business,
 )
+from docmirror.plugins.credit_report.variant_router import resolve_credit_report_variant
 
 _COLLECTION_ID_KEYS = {
     "credit_accounts": "account_id",
@@ -40,10 +40,15 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("account_type", ("account_type",)),
         ("institution", ("management_institution", "institution")),
         ("business_type", ("business_type",)),
+        ("business_category", ("business_category",)),
         ("account_identifier", ("account_identifier",)),
         ("card_tail", ("card_tail",)),
         ("status", ("account_status", "status")),
         ("repayment_method", ("repayment_method",)),
+        ("guarantee_type", ("guarantee_type",)),
+        ("special_transaction", ("special_transaction",)),
+        ("credit_agreement_identifier", ("credit_agreement_identifier",)),
+        ("history_status", ("history_status",)),
         ("co_borrower_flag", ("co_borrower_flag",)),
         ("repayment_frequency", ("repayment_frequency",)),
         ("repayment_periods", ("repayment_periods",)),
@@ -51,6 +56,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("due_date", ("due_date",)),
         ("close_date", ("close_date",)),
         ("currency", ("currency",)),
+        ("amount_unit", ("amount_unit",)),
         ("credit_limit", ("credit_limit",)),
         ("loan_amount", ("loan_amount",)),
         ("balance", ("balance",)),
@@ -62,6 +68,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("last_repayment_date", ("last_repayment_date",)),
         ("current_overdue_periods", ("current_overdue_periods",)),
         ("current_overdue_amount", ("current_overdue_amount",)),
+        ("overdue_principal", ("overdue_principal",)),
         ("overdue_principal_31_60", ("overdue_principal_31_60",)),
         ("overdue_principal_61_90", ("overdue_principal_61_90",)),
         ("overdue_principal_91_180", ("overdue_principal_91_180",)),
@@ -72,6 +79,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("five_tier_class", ("five_tier_class",)),
         ("ever_overdue", ("ever_overdue",)),
         ("current_overdue", ("current_overdue",)),
+        ("current_overdue_status", ("current_overdue_status",)),
         ("over_90_days", ("over_90_days",)),
         ("overdue_months", ("overdue_months_last_5y", "overdue_months")),
     ),
@@ -81,9 +89,16 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("account_identifier", ("account_identifier",)),
         ("institution", ("management_institution", "institution")),
         ("facility_type", ("facility_type",)),
+        ("facility_product", ("facility_product",)),
+        ("revolving_flag", ("revolving_flag",)),
+        ("effective_date", ("effective_date",)),
+        ("due_date", ("due_date",)),
+        ("snapshot_date", ("snapshot_date",)),
         ("total_limit", ("total_limit",)),
         ("used_limit", ("used_limit",)),
         ("available_limit", ("available_limit",)),
+        ("facility_limit", ("facility_limit",)),
+        ("limit_identifier", ("limit_identifier",)),
         ("currency", ("currency",)),
         ("amount_unit", ("amount_unit",)),
         ("status", ("account_status", "status")),
@@ -161,6 +176,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
 _DATE_FIELDS = frozenset(
     {
         "open_date",
+        "effective_date",
         "due_date",
         "close_date",
         "snapshot_date",
@@ -183,6 +199,7 @@ _NUMBER_FIELDS = frozenset(
         "total_limit",
         "used_limit",
         "available_limit",
+        "facility_limit",
         "overdue_months",
         "over_90_days_months",
         "overdue_level",
@@ -510,16 +527,10 @@ def _normalize_record(collection: str, record: dict[str, Any], index: int) -> di
             "open" if status in {"active", "inactive"} else "closed" if status in {"closed", "settled"} else "unknown"
         )
         normalized["payoff_state"] = (
-            "settled"
-            if status in {"closed", "settled"}
-            else "outstanding"
-            if status == "active"
-            else "unknown"
+            "settled" if status in {"closed", "settled"} else "outstanding" if status == "active" else "unknown"
         )
-        for field in ("total_limit", "used_limit"):
-            normalized[f"{field}_status"] = (
-                "reported" if normalized.get(field) not in (None, "") else "not_reported"
-            )
+        for field in ("total_limit", "used_limit", "available_limit"):
+            normalized[f"{field}_status"] = "reported" if normalized.get(field) not in (None, "") else "not_reported"
     out["normalized"] = normalized
     try:
         confidence = max(0.0, min(1.0, float(out.get("confidence") or 0.0)))
@@ -709,6 +720,71 @@ def _build_audit(
         )
         if not matched:
             issues.append("reconciliation_failed:credit_account_count")
+    reported_balance = _number(credit_summary.get("reported_account_balance"))
+    if report_subtype == "enterprise" and reported_balance is not None:
+        accounts = collections["credit_accounts"]
+
+        def account_value(record: dict[str, Any], key: str) -> Any:
+            normalized = record.get("normalized")
+            if isinstance(normalized, dict) and normalized.get(key) not in (None, ""):
+                return normalized[key]
+            return record.get(key)
+
+        detail_balances = [
+            _number(account_value(account, "balance"))
+            for account in accounts
+            if account_value(account, "balance") not in (None, "")
+        ]
+        currencies = {str(account_value(account, "currency") or "") for account in accounts}
+        amount_units = {str(account_value(account, "amount_unit") or "") for account in accounts}
+        balances_are_comparable = bool(
+            credit_summary.get("account_population_comparable")
+            and len(detail_balances) == len(accounts)
+            and all(value is not None for value in detail_balances)
+            and len(currencies) == 1
+            and len(amount_units) == 1
+        )
+        balance_reconciliation: dict[str, Any] = {
+            "name": "credit_account_balance",
+            "expected": reported_balance,
+            "actual": None,
+            "difference": None,
+            "tolerance": None,
+            "matched": None,
+            "status": "not_comparable",
+        }
+        if len(currencies) == 1 and "" not in currencies:
+            balance_reconciliation["currency"] = next(iter(currencies))
+        if len(amount_units) == 1 and "" not in amount_units:
+            balance_reconciliation["amount_unit"] = next(iter(amount_units))
+        if balances_are_comparable:
+            detail_total = sum(
+                Decimal(str(value))
+                for value in detail_balances
+                if value is not None
+            )
+            reported_total = Decimal(str(reported_balance))
+            difference = detail_total - reported_total
+            tolerance = Decimal("0.005") * Decimal(len(detail_balances) + 1)
+            within_tolerance = abs(difference) <= tolerance
+            balance_reconciliation.update(
+                {
+                    "actual": _number(detail_total),
+                    "difference": _number(difference),
+                    "tolerance": _number(tolerance),
+                    "matched": within_tolerance,
+                    "status": (
+                        "exact"
+                        if difference == 0
+                        else "within_rounding_tolerance"
+                        if within_tolerance
+                        else "mismatch"
+                    ),
+                }
+            )
+            if not within_tolerance:
+                issues.append("reconciliation_failed:credit_account_balance")
+        reconciliations.append(balance_reconciliation)
     compact_text = re.sub(r"\s+", "", str(full_text or ""))
     if report_subtype == "personal_detail":
         if not collections["credit_accounts"] and (
@@ -726,8 +802,7 @@ def _build_audit(
     if quarantined:
         issues.append("quarantined_fields")
     evidence_complete = all(
-        not summary["count"] or summary["evidence_coverage"] == 1.0
-        for summary in collection_audit.values()
+        not summary["count"] or summary["evidence_coverage"] == 1.0 for summary in collection_audit.values()
     )
     return {
         "schema_version": "credit_business.v1",
@@ -756,10 +831,10 @@ def assemble_credit_report_business(
 ) -> dict[str, Any]:
     """Assemble subtype candidates into one backward-compatible business view."""
     existing_collections = existing_collections or {}
-    native = extract_native_credit_business(
+    variant = resolve_credit_report_variant(report_subtype, content_mode)
+    native = variant.extract_native_business(
         parse_result,
         full_text,
-        report_subtype=report_subtype,
         content_mode=content_mode,
     )
     conflicts: list[dict[str, Any]] = []

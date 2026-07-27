@@ -3,6 +3,10 @@
 
 """Architecture contracts for the three credit-report variant packages."""
 
+from types import SimpleNamespace
+
+from docmirror.plugins.credit_report.enterprise_native import extraction as enterprise_extraction
+from docmirror.plugins.credit_report.personal_brief_native import extraction as personal_brief_extraction
 from docmirror.plugins.credit_report.variant_router import (
     registered_credit_report_variants,
     resolve_credit_report_variant,
@@ -55,3 +59,62 @@ def test_unknown_credit_report_variant_preserves_legacy_fallback_shape() -> None
     assert unknown.variant_id == "unknown"
     assert unknown.report_subtype == "unknown"
     assert "credit_lines" in unknown.dataset_names()
+
+
+def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatch) -> None:
+    parse_result = SimpleNamespace()
+    personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    personal_detail = resolve_credit_report_variant("personal_detail", "scanned_ocr")
+    monkeypatch.setattr(
+        personal_brief_extraction,
+        "extract_personal_brief_native_business",
+        lambda _result, _text: {"owner": "personal_brief_native"},
+    )
+    monkeypatch.setattr(
+        enterprise_extraction,
+        "extract_enterprise_native_business",
+        lambda _result, _text: {"owner": "enterprise_native"},
+    )
+
+    assert personal_brief.extract_native_business(
+        parse_result,
+        "",
+        content_mode="native_text",
+    ) == {"owner": "personal_brief_native"}
+    assert enterprise.extract_native_business(
+        parse_result,
+        "",
+        content_mode="native_text",
+    ) == {"owner": "enterprise_native"}
+    assert personal_detail.extract_native_business(
+        parse_result,
+        "",
+        content_mode="scanned_ocr",
+    ) == {}
+
+
+def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relationships() -> None:
+    personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+
+    personal_dictionary = personal_brief.data_dictionary()
+    enterprise_dictionary = enterprise.data_dictionary()
+    personal_semantic = personal_brief.semantic_extensions()
+    enterprise_semantic = enterprise.semantic_extensions()
+
+    assert "id_number" in personal_dictionary["fields"]
+    assert "marital_status" in personal_dictionary["fields"]
+    assert "id_number" not in enterprise_dictionary["fields"]
+    assert "marital_status" not in enterprise_dictionary["fields"]
+    assert "个人简版" in personal_dictionary["datasets"]["credit_accounts"]["definition"]
+    assert "个人简版" not in enterprise_dictionary["datasets"]["credit_accounts"]["definition"]
+    assert personal_semantic["presentation_policy"]["classification"] == (
+        "highly_sensitive_personal_financial_data"
+    )
+    assert enterprise_semantic["presentation_policy"]["classification"] == (
+        "sensitive_enterprise_credit_data"
+    )
+    assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
+        "independent_enterprise_facility_records"
+    )

@@ -6,15 +6,24 @@ from types import SimpleNamespace
 import pytest
 
 from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow, TextBlock
+from docmirror.plugins.credit_report.business_assembly import _build_audit
 from docmirror.plugins.credit_report.business_records import (
     _merge_enterprise_accounts,
     derive_overdue_records,
     extract_native_credit_business,
-    extract_personal_brief_section_content,
 )
 from docmirror.plugins.credit_report.currency_codes import (
     ISO_4217_CURRENT_CODES,
     normalize_currency_code,
+)
+from docmirror.plugins.credit_report.enterprise_native.extraction import (
+    extract_enterprise_capital_summary,
+    extract_enterprise_report_metadata,
+    extract_enterprise_report_metadata_records,
+    extract_enterprise_report_notes,
+)
+from docmirror.plugins.credit_report.personal_brief_native.extraction import (
+    extract_personal_brief_section_content,
 )
 
 
@@ -22,6 +31,170 @@ def _result(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
     )
+
+
+def test_enterprise_capital_and_report_metadata_preserve_separate_business_meanings() -> None:
+    capital_table = TableBlock(
+        table_id="capital",
+        metadata={
+            "raw_rows": [
+                ["类型", "出资方", "身份标识类型", "身份标识号码", "出资比例"],
+                ["--", "--", "--", "--", "--"],
+                ["信息来源机构：示例银行 更新日期：2022-10-08", "", "", "", ""],
+            ]
+        },
+    )
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=4,
+                texts=[TextBlock(content="注册资本折人民币合计 100万元")],
+                tables=[capital_table],
+            )
+        ]
+    )
+
+    assert extract_enterprise_capital_summary(result) == [
+        {
+            "sequence": 1,
+            "contributor_status": "no_records",
+            "contributor_count": 0,
+            "source_page": 4,
+            "source": "canonical_enterprise_capital_table",
+            "source_refs": [
+                {
+                    "source": "canonical_physical_table",
+                    "page": 4,
+                    "table_id": "capital",
+                    "row": 0,
+                }
+            ],
+            "confidence": 1.0,
+            "source_institution": "示例银行",
+            "update_date": "2022-10-08",
+            "registered_capital_amount": 100,
+            "currency": "CNY",
+            "amount_unit": "CNY_10K",
+        }
+    ]
+    assert extract_enterprise_report_metadata(
+        result,
+        "企业信用报告（自主查询版） 汇率（美元折人民币）：6.96 有效期：2023-01",
+    ) == {
+        "report_edition": "independent_query",
+        "exchange_rate_usd_cny": 6.96,
+        "exchange_rate_effective_period": "2023-01",
+    }
+
+
+def test_enterprise_report_cover_notes_and_exchange_keep_source_page_grain() -> None:
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="企业信用报告\n（自主查询版）")],
+            ),
+            PageContent(
+                page_number=2,
+                texts=[
+                    TextBlock(content="报告说明"),
+                    TextBlock(
+                        content=(
+                            "1．第一条说明跨\n行续写。\n"
+                            "2．第二条说明。\n"
+                            "汇率（美元折人民币）：6.96　有效期：2023-01\n"
+                            "第 2 页/共8 页"
+                        )
+                    ),
+                ],
+            ),
+            PageContent(page_number=3, texts=[TextBlock(content="身份标识")]),
+        ]
+    )
+
+    assert extract_enterprise_report_notes(result) == [
+        {
+            "note_id": extract_enterprise_report_notes(result)[0]["note_id"],
+            "sequence": 1,
+            "content": "第一条说明跨行续写。",
+            "source_page": 2,
+            "source": "enterprise_report_notes",
+            "source_refs": [{"source": "native_text_report_note", "page": 2}],
+            "confidence": 1.0,
+        },
+        {
+            "note_id": extract_enterprise_report_notes(result)[1]["note_id"],
+            "sequence": 2,
+            "content": "第二条说明。",
+            "source_page": 2,
+            "source": "enterprise_report_notes",
+            "source_refs": [{"source": "native_text_report_note", "page": 2}],
+            "confidence": 1.0,
+        },
+    ]
+    metadata = extract_enterprise_report_metadata_records(result)
+    assert metadata["enterprise_report_metadata"][0]["source_page"] == 1
+    assert metadata["enterprise_report_metadata"][0]["report_edition"] == "independent_query"
+    assert metadata["enterprise_exchange_rates"][0]["source_page"] == 2
+    assert metadata["enterprise_exchange_rates"][0]["exchange_rate_usd_cny"] == 6.96
+    assert metadata["enterprise_exchange_rates"][0]["exchange_rate_effective_period"] == "2023-01"
+
+
+def test_enterprise_balance_reconciliation_is_audit_only() -> None:
+    accounts = [
+        {
+            "account_id": f"credit_account:{index}",
+            "balance": balance,
+            "currency": "CNY",
+            "amount_unit": "CNY_10K",
+            "source": "canonical_physical_table",
+            "source_refs": [{"source": "canonical_physical_table", "page": 4 + index}],
+        }
+        for index, balance in enumerate((34.88, 4.67, 25.87), start=1)
+    ]
+    summary = {
+        "reported_account_count": 3,
+        "reported_account_balance": 65.41,
+        "account_population_comparable": True,
+    }
+    audit = _build_audit(
+        parse_result=SimpleNamespace(pages=[]),
+        full_text="企业信用报告",
+        report_subtype="enterprise",
+        content_mode="native_text",
+        collections={
+            "credit_accounts": accounts,
+            "credit_lines": [],
+            "repayment_liability_records": [],
+            "repayment_records": [],
+            "overdue_records": [],
+            "inquiry_records": [],
+            "public_records": [],
+        },
+        conflicts=[],
+        credit_summary=summary,
+    )
+
+    assert "detail_account_balance" not in summary
+    assert "account_balance_difference" not in summary
+    assert "account_balance_reconciliation_tolerance" not in summary
+    assert "account_balance_reconciliation_status" not in summary
+    reconciliation = next(
+        item
+        for item in audit["reconciliations"]
+        if item["name"] == "credit_account_balance"
+    )
+    assert reconciliation == {
+        "name": "credit_account_balance",
+        "expected": 65.41,
+        "actual": 65.42,
+        "difference": 0.01,
+        "tolerance": 0.02,
+        "currency": "CNY",
+        "amount_unit": "CNY_10K",
+        "matched": True,
+        "status": "within_rounding_tolerance",
+    }
 
 
 def test_personal_brief_extracts_narrative_accounts_and_inquiry_ledger() -> None:
@@ -88,6 +261,34 @@ def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
 
     assert len(business["credit_accounts"]) == 2
     assert len({item["account_id"] for item in business["credit_accounts"]}) == 2
+
+
+def test_personal_brief_card_type_uses_issued_product_not_later_heading() -> None:
+    text = """
+    个人信用报告 信贷记录
+    2022年07月19日华夏银行信用卡中心发放的贷记卡（人民币账户）。
+    最近5年内有3个月处于逾期状态，其中2个月逾期超过90天。
+    从未逾期过的贷记卡及透支未超过60天的准贷记卡账户明细如下：
+    2023年08月20日示例银行信用卡中心发放的准贷记卡（人民币账户）。
+    最近5年内有1个月处于逾期状态。
+    从未逾期过的贷记卡账户明细如下：
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert [row["business_type"] for row in business["credit_accounts"]] == [
+        "贷记卡",
+        "准贷记卡",
+    ]
+    assert [row["business_type"] for row in business["overdue_records"]] == [
+        "贷记卡",
+        "准贷记卡",
+    ]
 
 
 def test_personal_brief_preserves_complete_overdue_business_facts() -> None:
@@ -373,8 +574,8 @@ def test_enterprise_extracts_summary_facilities_accounts_and_public_records() ->
     assert business["credit_summary"]["first_credit_year"] == 2019
     assert business["credit_summary"]["active_credit_institution_count"] == 2
     assert business["credit_summary"]["credit_balance"] == 37311.68
-    assert len(business["credit_lines"]) == 2
-    assert business["credit_lines"][0]["available_limit"] == 500
+    # Aggregate facility totals are summary facts, not source-grained records.
+    assert business["credit_lines"] == []
     assert len(business["credit_accounts"]) == 1
     assert business["credit_accounts"][0]["account_status"] == "active"
     assert {item["record_type"] for item in business["public_records"]} == {
@@ -436,6 +637,159 @@ def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers
     assert business["credit_summary"]["recovered_debt_balance"] == 0
 
 
+def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility_values() -> None:
+    summary = TableBlock(
+        table_id="pt_summary",
+        metadata={
+            "raw_rows": [
+                ["", "正常类", "", "关注类", "", "不良类", "", "合计", ""],
+                ["", "账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"],
+                ["中长期借款", "1", "34.88", "0", "0", "0", "0", "1", "34.88"],
+                ["循环透支", "1", "25.87", "0", "0", "0", "0", "1", "25.87"],
+                ["合计", "2", "60.75", "0", "0", "0", "0", "2", "60.75"],
+            ]
+        },
+    )
+    facilities = TableBlock(
+        table_id="pt_facilities",
+        metadata={
+            "raw_rows": [
+                ["非循环信用额度", "", "", "循环信用额度", "", ""],
+                ["总额", "已用额度", "剩余可用额度", "总额", "已用额度", "剩余可用额度"],
+                ["0", "0", "0", "34.33", "25.87", "8.47"],
+            ]
+        },
+    )
+    first_page = TableBlock(
+        table_id="pt_account_start",
+        metadata={
+            "raw_rows": [
+                ["中长期借款", "", "", "", "共 1 笔", "", "", ""],
+                ["账户编号", "授信机构", "业务种类", "开立日期", "到期日", "币种", "借款金额", "发放形式"],
+                [
+                    "Y10061000H00",
+                    "示例汽车金融有限公司",
+                    "固定资产贷款",
+                    "2021-08-03",
+                    "2024-08-03",
+                    "人民币元",
+                    "62.99",
+                    "新增",
+                ],
+            ]
+        },
+    )
+    continuation = TableBlock(
+        table_id="pt_account_continuation",
+        metadata={
+            "raw_rows": [
+                ["01EIP1967714", "组合", "34.88", "正常", "0", "0", "0", "2023-01-03"],
+                ["", "1.94", "正常还款", "--", "--", "见附件", "2023-01-03", ""],
+            ]
+        },
+    )
+    revolving = TableBlock(
+        table_id="pt_revolving",
+        metadata={
+            "raw_rows": [
+                ["循环透支", "", "", "", "共 1 笔", "", "", ""],
+                ["账户编号", "授信机构", "业务种类", "开立日期", "到期日", "币种", "信用额度", "发放形式"],
+                [
+                    "D10055840H0001LE20220228XS000007641",
+                    "示例银行股份有限公司",
+                    "流动资金贷款",
+                    "2022-02-28",
+                    "2023-02-28",
+                    "人民币元",
+                    "34.10",
+                    "新增",
+                ],
+                ["", "保证", "25.87", "正常", "0", "0", "0", "2022-12-07"],
+                [
+                    "",
+                    "2.10",
+                    "正常还款",
+                    "21",
+                    "--",
+                    "D10055840H0001CE20220228XS000007641",
+                    "见附件",
+                    "2022-12-31",
+                ],
+            ]
+        },
+    )
+    facility_detail = TableBlock(
+        table_id="pt_facility_detail",
+        metadata={
+            "raw_rows": [
+                ["授信信息", "", "", "共 1 笔", "", "", ""],
+                ["授信协议编号", "授信机构", "授信额度类型", "额度循环标志", "生效日期", "到期日", "信息报告日期"],
+                ["", "币种", "授信额度", "已用额度", "授信限额", "授信限额编号", ""],
+                [
+                    "D10055840H0001CE20220228XS000007641",
+                    "示例银行股份有限公司",
+                    "贷款",
+                    "是",
+                    "2023-01-07",
+                    "2023-02-28",
+                    "2023-01-07",
+                ],
+                ["", "人民币元", "34.33", "25.87", "--", "--", ""],
+            ]
+        },
+    )
+    result = SimpleNamespace(
+        pages=[
+            PageContent(page_number=3, tables=[summary, facilities]),
+            PageContent(page_number=4, tables=[first_page]),
+            PageContent(page_number=5, tables=[continuation, revolving, facility_detail]),
+        ]
+    )
+
+    business = extract_native_credit_business(
+        result,
+        "企业信用报告",
+        report_subtype="enterprise",
+        content_mode="native_text",
+    )
+
+    assert [account["account_identifier"] for account in business["credit_accounts"]] == [
+        "Y10061000H0001EIP1967714",
+        "D10055840H0001LE20220228XS000007641",
+    ]
+    first, second = business["credit_accounts"]
+    assert first["balance"] == 34.88
+    assert first["loan_amount"] == 62.99
+    assert first["snapshot_date"] == "2023-01-03"
+    assert second["balance"] == 25.87
+    assert second["credit_limit"] == 34.1
+    assert "loan_amount" not in second
+    assert business["credit_summary"]["reported_account_count"] == 2
+    assert "detail_account_balance" not in business["credit_summary"]
+    assert "account_balance_reconciliation_tolerance" not in business["credit_summary"]
+    assert len(business["credit_lines"]) == 1
+    facility = business["credit_lines"][0]
+    assert (facility["total_limit"], facility["used_limit"]) == (34.33, 25.87)
+    assert "available_limit" not in facility
+    assert facility["account_id"] == second["account_id"]
+    assert business["credit_summary"]["facility_summary"] == {
+        "non_revolving": {
+            "total_limit": 0,
+            "used_limit": 0,
+            "available_limit": 0,
+            "currency": "CNY",
+            "amount_unit": "CNY_10K",
+        },
+        "revolving": {
+            "total_limit": 34.33,
+            "used_limit": 25.87,
+            "available_limit": 8.47,
+            "currency": "CNY",
+            "amount_unit": "CNY_10K",
+        },
+    }
+
+
 def test_enterprise_merge_rejects_truncated_canonical_account_prefix() -> None:
     canonical = [
         {
@@ -463,6 +817,65 @@ def test_enterprise_merge_rejects_truncated_canonical_account_prefix() -> None:
         "D10123320H000170060110009026522",
         "D10123320H000170060110009027778",
     }
+
+
+def test_enterprise_settled_cards_keep_closed_status_and_do_not_absorb_later_tables() -> None:
+    settled = TableBlock(
+        table_id="settled",
+        metadata={
+            "raw_rows": [
+                ["账户编号", "授信机构", "业务种类", "开立日期", "到期日", "", "币种", "借款金额"],
+                ["", "关闭日期", "五级分类", "最后一次还款日期", "", "最后一次还款形式", "", "历史表现"],
+                [
+                    "N101W5810H00010123",
+                    "示例银行",
+                    "固定资产贷款",
+                    "2012-07-01",
+                    "2015-06-30",
+                    "",
+                    "人民币",
+                    "100",
+                ],
+                ["", "2015-06-30", "次级", "2015-06-30", "", "担保代偿", "", "见附件"],
+                [
+                    "N101W5810H00012432",
+                    "示例银行",
+                    "固定资产贷款",
+                    "2013-02-01",
+                    "2015-07-31",
+                    "",
+                    "人民币",
+                    "80",
+                ],
+                ["", "2015-07-31", "--", "2015-07-31", "", "正常还款", "", "见附件"],
+            ]
+        },
+    )
+    unrelated = TableBlock(
+        table_id="liability",
+        metadata={
+            "raw_rows": [
+                ["", "借款金额", "余额", "五级分类"],
+                ["", "37.5", "37.5", "正常"],
+            ]
+        },
+    )
+    result = SimpleNamespace(pages=[PageContent(page_number=8, tables=[settled, unrelated])])
+
+    business = extract_native_credit_business(
+        result,
+        "企业信用报告",
+        report_subtype="enterprise",
+        content_mode="native_text",
+    )
+
+    assert len(business["credit_accounts"]) == 2
+    assert [record["account_status"] for record in business["credit_accounts"]] == ["settled", "settled"]
+    assert [record["close_date"] for record in business["credit_accounts"]] == [
+        "2015-06-30",
+        "2015-07-31",
+    ]
+    assert all("balance" not in record for record in business["credit_accounts"])
 
 
 def test_enterprise_public_records_support_one_cell_per_text_line() -> None:

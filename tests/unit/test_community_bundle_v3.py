@@ -144,9 +144,18 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
         "expected_row_count": 12,
         "emitted_row_count": 12,
         "omitted_row_count": 0,
-        "verified": True,
-        "basis": "canonical_dataset",
+        "verified": False,
+        "basis": "emitted_records_only",
     }
+    assert payload["datasets"][0]["status"] == "partial"
+    assert payload["warnings"] == [
+        {
+            "code": "DATASET_COMPLETENESS_UNVERIFIED",
+            "level": "warning",
+            "message": "dataset ds_repayment_records has 12 emitted records but no independent source count",
+            "dataset_id": "ds_repayment_records",
+        }
+    ]
     assert [row["record_id"] for row in payload["datasets"][0]["rows"]] == [
         f"repayment_records:r{index:06d}" for index in range(1, 13)
     ]
@@ -154,6 +163,34 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
     assert payload["reading"]["profile"] == "community"
     assert payload["reading"]["tables"][0]["dataset_id"] == payload["datasets"][0]["id"]
     assert validate_projection_payload("community", payload).valid
+
+
+def test_source_report_count_can_verify_dataset_completeness() -> None:
+    candidate = _candidate()
+    candidate["data"]["credit_accounts"] = [
+        {"account_id": "account:1"},
+        {"account_id": "account:2"},
+    ]
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    _PROJECTIONS[id(result)]["domain_facts"]["credit_summary"] = {
+        "reported_account_count": 2,
+    }
+
+    payload = project_community_bundle(result, document_id="doc_verified").json_payload()
+    dataset = next(item for item in payload["datasets"] if item["name"] == "credit_accounts")
+
+    assert dataset["status"] == "complete"
+    assert dataset["completeness"] == {
+        "expected_row_count": 2,
+        "emitted_row_count": 2,
+        "omitted_row_count": 0,
+        "verified": True,
+        "basis": "source_report_summary",
+    }
+    assert payload["warnings"] == []
 
 
 def test_semantic_schema_allows_document_type_specific_extensions() -> None:
@@ -189,9 +226,7 @@ def test_renderers_use_the_same_frozen_semantic_result() -> None:
     community = bundle.json_payload(semantic)
     csv_rows = list(
         csv.DictReader(
-            io.StringIO(
-                bundle.render_dataset_csvs(semantic)[semantic["datasets"][0]["csv"]].lstrip("\ufeff")
-            )
+            io.StringIO(bundle.render_dataset_csvs(semantic)[semantic["datasets"][0]["csv"]].lstrip("\ufeff"))
         )
     )
     enhanced = bundle.render_enhanced_markdown(semantic)
@@ -228,7 +263,9 @@ def test_markdown_contains_every_physical_table_row_without_preview_limit() -> N
     for index in range(1, 177):
         assert f"| {index} | 状态{index} |" in markdown
     assert "| 合计 | 176 |" in markdown
-    assert any(block["kind"] == "heading" and block["text"] == "个人信用报告" for block in semantic["structure"]["blocks"])
+    assert any(
+        block["kind"] == "heading" and block["text"] == "个人信用报告" for block in semantic["structure"]["blocks"]
+    )
     assert semantic["structure"]["source_tables"][0]["rows"][-1] == ["合计", "176"]
 
 
@@ -442,9 +479,7 @@ def test_json_csv_and_enhanced_markdown_share_public_inquiry_occurrences() -> No
 
     payload = bundle.json_payload()
     inquiry_dataset = next(dataset for dataset in payload["datasets"] if dataset["name"] == "inquiry_records")
-    csv_rows = list(
-        csv.DictReader(io.StringIO(bundle.render_dataset_csvs()[inquiry_dataset["csv"]].lstrip("\ufeff")))
-    )
+    csv_rows = list(csv.DictReader(io.StringIO(bundle.render_dataset_csvs()[inquiry_dataset["csv"]].lstrip("\ufeff"))))
     enhanced = bundle.render_enhanced_markdown()
 
     json_ids = [row["record_id"] for row in inquiry_dataset["rows"]]
@@ -453,6 +488,113 @@ def test_json_csv_and_enhanced_markdown_share_public_inquiry_occurrences() -> No
     assert "#### institution" in enhanced
     assert "| 25 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
     assert "| 26 | 2024-09-10 | 中国银行股份有限公司福建省分行 | 贷后管理 | institution |" in enhanced
+
+
+def test_record_card_title_separator_is_plugin_configurable() -> None:
+    candidate = _candidate(
+        [
+            {
+                "repayment_id": "rep_1",
+                "sequence": 1,
+                "business_category": "中长期贷款",
+            }
+        ]
+    )
+    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"].update(
+        {
+            "sequence": {"label": "序号", "type": "integer"},
+            "business_category": {"label": "业务类别", "type": "string"},
+        }
+    )
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "enhanced_markdown": {
+            "dataset_layouts": {
+                "repayment_records": {
+                    "mode": "record_cards",
+                    "title_fields": ["sequence", "business_category"],
+                    "title_separator": ". ",
+                    "columns": ["sequence", "business_category"],
+                }
+            }
+        }
+    }
+
+    enhanced = project_community_bundle(result, document_id="doc_title_separator").render_enhanced_markdown()
+
+    assert "#### 1. 中长期贷款" in enhanced
+    assert "#### 1 · 中长期贷款" not in enhanced
+
+
+def test_audit_reconciliation_can_render_in_appendix_and_audit_csv_only() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate([{"repayment_id": "rep_1", "month": "2025-01", "status": "N"}]),
+    )
+    projection = _PROJECTIONS[id(result)]
+    projection["domain_facts"]["credit_extraction_audit"] = {
+        "reconciliations": [
+            {
+                "name": "credit_account_balance",
+                "expected": 65.41,
+                "actual": 65.42,
+                "difference": 0.01,
+                "tolerance": 0.02,
+                "matched": True,
+                "status": "within_rounding_tolerance",
+            }
+        ]
+    }
+    projection["semantic"] = {
+        "audit_csv": {
+            "reconciliations": [
+                {
+                    "name": "credit_account_balance",
+                    "fields": ["expected", "actual", "difference", "tolerance", "status"],
+                }
+            ]
+        },
+        "enhanced_markdown": {
+            "appendix": {
+                "title": "附录：审计信息",
+                "audit_reconciliations": [
+                    {
+                        "name": "credit_account_balance",
+                        "title": "源文余额矛盾",
+                        "fields": [
+                            {"key": "expected", "label": "源报告值"},
+                            {"key": "actual", "label": "明细计算值"},
+                            {"key": "difference", "label": "差额"},
+                        ],
+                        "note": "仅作审计提示，不改写业务数据。",
+                    }
+                ],
+            }
+        },
+    }
+    bundle = project_community_bundle(result, document_id="doc_audit_reconciliation")
+    semantic = bundle.semantic_payload()
+    enhanced = bundle.render_enhanced_markdown(semantic)
+    audit_rows = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
+
+    assert "### 源文余额矛盾" in enhanced
+    assert "**源报告值:** 65.41" in enhanced
+    assert "**明细计算值:** 65.42" in enhanced
+    assert "不改写业务数据" in enhanced
+    reconciliation_rows = [
+        row for row in audit_rows if row["dataset_id"] == "_audit_reconciliations"
+    ]
+    assert {row["field_key"]: row["value"] for row in reconciliation_rows} == {
+        "expected": "65.41",
+        "actual": "65.42",
+        "difference": "0.01",
+        "tolerance": "0.02",
+        "status": "within_rounding_tolerance",
+    }
+    assert len(bundle.json_payload(semantic)["datasets"][0]["rows"]) == 1
 
 
 def test_payment_records_use_transaction_business_name() -> None:

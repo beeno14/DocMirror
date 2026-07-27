@@ -18,12 +18,21 @@ _DEFAULT_RECORD_ID_KEYS = (
     "note_id",
 )
 _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
+_DATASET_RECORD_ID_KEYS = {
+    "credit_lines": ("record_id", "credit_line_id"),
+    "enterprise_facility_summary": ("record_id", "credit_line_id"),
+    "enterprise_credit_supplement": ("record_id", "supplement_id"),
+}
 
 
 def _records(dataset_id: str, values: Any) -> list[dict[str, Any]]:
     """Give projected business records stable canonical record identities."""
     rows: list[dict[str, Any]] = []
-    id_keys = _REPAYMENT_RECORD_ID_KEYS if dataset_id == "repayment_records" else _DEFAULT_RECORD_ID_KEYS
+    id_keys = (
+        _REPAYMENT_RECORD_ID_KEYS
+        if dataset_id == "repayment_records"
+        else _DATASET_RECORD_ID_KEYS.get(dataset_id, _DEFAULT_RECORD_ID_KEYS)
+    )
     for index, value in enumerate(values or (), start=1):
         if not isinstance(value, dict):
             continue
@@ -74,7 +83,6 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         link_repayment_records_to_accounts,
     )
     from docmirror.plugins.credit_report.semantic_enrichment import (
-        credit_report_data_dictionary,
         enrich_credit_report_record_evidence,
     )
     from docmirror.plugins.credit_report.variant_router import (
@@ -124,6 +132,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
             "source": "credit_report_header",
             "confidence": 0.95 if field_name not in {"report_subtype", "content_mode"} else 1.0,
         }
+    variant.refine_domain_facts(domain_facts, field_details)
     domain_facts["field_details"] = field_details
 
     source_domain = _domain_specific(parse_result)
@@ -139,13 +148,15 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     ):
         repayment_records = _ensure_credit_repayment_records(parse_result)
 
-    credit_accounts = _canonicalize_credit_accounts(list(scanned_business.get("credit_accounts") or []))
-    if not credit_accounts:
-        credit_accounts = _canonicalize_credit_accounts(list(source_domain.get("credit_accounts") or []))
-    if not credit_accounts:
-        credit_accounts = _canonicalize_credit_accounts(
-            _extract_credit_accounts_from_local_structure_evidence(parse_result)
-        )
+    credit_accounts: list[dict[str, Any]] = []
+    if variant.use_generic_credit_accounts():
+        credit_accounts = _canonicalize_credit_accounts(list(scanned_business.get("credit_accounts") or []))
+        if not credit_accounts:
+            credit_accounts = _canonicalize_credit_accounts(list(source_domain.get("credit_accounts") or []))
+        if not credit_accounts:
+            credit_accounts = _canonicalize_credit_accounts(
+                _extract_credit_accounts_from_local_structure_evidence(parse_result)
+            )
 
     from docmirror.models.mirror.domain_access import micro_grid_structures_from_domain_specific
 
@@ -178,6 +189,9 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         domain_facts["credit_extraction_audit"] = dict(assembled["credit_extraction_audit"])
     section_content = variant.build_section_content(parse_result, full_text)
     if section_content:
+        supplemental_facts = section_content.get("facts")
+        if isinstance(supplemental_facts, dict):
+            domain_facts.update(supplemental_facts)
         for fact_name in ("non_credit_transaction_summary", "public_record_summary"):
             value = section_content.get(fact_name)
             if isinstance(value, dict) and value.get("source_statement"):
@@ -186,7 +200,15 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         if report_notes:
             enrich_credit_report_record_evidence(parse_result, {"report_notes": report_notes})
             datasets["report_notes"] = _records("report_notes", report_notes)
-    domain_facts["data_dictionary"] = credit_report_data_dictionary()
+        supplemental_datasets = section_content.get("datasets")
+        if isinstance(supplemental_datasets, dict):
+            for dataset_name, records in supplemental_datasets.items():
+                typed_records = [record for record in (records or []) if isinstance(record, dict)]
+                if not typed_records:
+                    continue
+                enrich_credit_report_record_evidence(parse_result, {str(dataset_name): typed_records})
+                datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
+    domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
         dict.fromkeys(
             [
@@ -209,7 +231,9 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         entity_fields["subject_id"] = domain_facts["id_number"]
     if domain_facts.get("marital_status"):
         entity_fields["marital_status"] = domain_facts["marital_status"]
-    warnings = tuple(dict.fromkeys((*base.warnings, *_account_structure_warnings(credit_accounts))))
+    variant.refine_entity_fields(entity_fields)
+    assembled_accounts = list(assembled.get("credit_accounts") or [])
+    warnings = tuple(dict.fromkeys((*base.warnings, *_account_structure_warnings(assembled_accounts))))
     return ProjectionData(
         projector_id=base.projector_id,
         document_type=base.document_type,

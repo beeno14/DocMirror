@@ -236,6 +236,7 @@ def credit_report_data_dictionary() -> dict[str, Any]:
             type_="currency",
             definition="所有金额只可在相同币种内聚合。",
         ),
+        "amount_unit": descriptor("金额单位"),
         "credit_limit": descriptor("信用额度", type_="money"),
         "credit_limit_status": descriptor("信用额度报告状态", type_="enum"),
         "used_amount": descriptor("已使用额度", type_="money"),
@@ -279,6 +280,8 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "total_limit_status": descriptor("总额度报告状态", type_="enum"),
                 "used_limit": descriptor("已用额度", type_="money"),
                 "used_limit_status": descriptor("已用额度报告状态", type_="enum"),
+                "available_limit": descriptor("剩余可用额度", type_="money"),
+                "available_limit_status": descriptor("剩余可用额度报告状态", type_="enum"),
             },
         },
         "repayment_liability_records": {

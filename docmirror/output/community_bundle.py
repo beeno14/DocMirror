@@ -433,7 +433,9 @@ def _dataset_columns(rows: list[Any], dictionary: dict[str, Any], dataset_id: st
             column["unit"] = str(info["unit"])
         if str(info.get("format") or info.get("type") or "").lower() == "long_id":
             column["format"] = "long_id"
-        for metadata_key in ("definition", "sensitive", "display", "aggregation"):
+        if str(info.get("display_format") or info.get("type") or "").lower() == "percentage":
+            column["display_format"] = "percentage"
+        for metadata_key in ("definition", "sensitive", "display", "display_format", "aggregation"):
             if info.get(metadata_key) not in (None, ""):
                 column[metadata_key] = _json_safe(info[metadata_key])
         columns.append(column)
@@ -504,9 +506,36 @@ def _dataset_completeness(
     key: str,
     rows: list[Any],
     projection: dict[str, Any],
+    data: dict[str, Any],
 ) -> dict[str, Any]:
     """Resolve an independent expected count where the physical contract permits it."""
     emitted = len(rows)
+    summary = data.get("credit_summary") if isinstance(data.get("credit_summary"), dict) else {}
+    independent_count_keys = {
+        "credit_accounts": ("reported_account_count", "source_account_count"),
+        "credit_lines": ("reported_credit_line_count",),
+    }
+    count_keys = independent_count_keys.get(key, ())
+    if key == "credit_accounts" and summary.get("account_population_comparable") is False:
+        count_keys = ()
+    expected = next(
+        (
+            int(summary[count_key])
+            for count_key in count_keys
+            if isinstance(summary.get(count_key), int)
+            and not isinstance(summary.get(count_key), bool)
+            and int(summary[count_key]) >= 0
+        ),
+        None,
+    )
+    if expected is not None:
+        return {
+            "expected_row_count": expected,
+            "emitted_row_count": emitted,
+            "omitted_row_count": max(0, expected - emitted),
+            "verified": expected == emitted,
+            "basis": "source_report_summary",
+        }
     if key == "inquiry_records":
         sequences: dict[str, set[int]] = {}
         for row in rows:
@@ -546,8 +575,8 @@ def _dataset_completeness(
         "expected_row_count": emitted,
         "emitted_row_count": emitted,
         "omitted_row_count": 0,
-        "verified": True,
-        "basis": "canonical_dataset",
+        "verified": False,
+        "basis": "emitted_records_only",
     }
 
 
@@ -652,16 +681,23 @@ def _markdown_display(
     dictionary: dict[str, Any],
     privacy_mode: str = "masked",
 ) -> str:
-    if privacy_mode != "full" and (
-        descriptor.get("sensitive") is True or descriptor.get("display") == "masked"
-    ):
+    if privacy_mode != "full" and (descriptor.get("sensitive") is True or descriptor.get("display") == "masked"):
         return _markdown_text(_masked_display(value))
+    if descriptor.get("display_format") == "percentage" or descriptor.get("type") == "percentage":
+        try:
+            return _markdown_text(f"{float(value) * 100:.2f}%")
+        except (TypeError, ValueError):
+            pass
     enums = dictionary.get("enums") if isinstance(dictionary.get("enums"), dict) else {}
     enum_values = enums.get(key) if isinstance(enums.get(key), dict) else {}
     if not enum_values and key.endswith("_status"):
         enum_values = enums.get("reporting_status") if isinstance(enums.get("reporting_status"), dict) else {}
-    if isinstance(value, (str, int, float, bool)) and value in enum_values:
-        return _markdown_text(enum_values[value])
+    if isinstance(value, (str, int, float, bool)):
+        enum_value = enum_values.get(value)
+        if enum_value is None and isinstance(value, bool):
+            enum_value = enum_values.get(str(value).lower())
+        if enum_value is not None:
+            return _markdown_text(enum_value)
     return _markdown_text(value)
 
 
@@ -669,16 +705,10 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     """Transcribe a public Community semantic result without accessing ParseResult."""
     semantic_domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
     dictionary = (
-        semantic_domain.get("data_dictionary")
-        if isinstance(semantic_domain.get("data_dictionary"), dict)
-        else {}
+        semantic_domain.get("data_dictionary") if isinstance(semantic_domain.get("data_dictionary"), dict) else {}
     )
     extensions = semantic_domain.get("extensions") if isinstance(semantic_domain.get("extensions"), dict) else {}
-    presentation = (
-        extensions.get("enhanced_markdown")
-        if isinstance(extensions.get("enhanced_markdown"), dict)
-        else {}
-    )
+    presentation = extensions.get("enhanced_markdown") if isinstance(extensions.get("enhanced_markdown"), dict) else {}
     privacy_mode = str(presentation.get("privacy_mode") or "masked")
     if (payload.get("schema") or {}).get("name") == "docmirror.community.semantic":
         payload = _community_view_from_semantic(payload)
@@ -762,9 +792,10 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
 
     rendered_sections: set[str] = set()
     section_layouts = (
-        presentation.get("section_layouts")
-        if isinstance(presentation.get("section_layouts"), dict)
-        else {}
+        presentation.get("section_layouts") if isinstance(presentation.get("section_layouts"), dict) else {}
+    )
+    dataset_layouts = (
+        presentation.get("dataset_layouts") if isinstance(presentation.get("dataset_layouts"), dict) else {}
     )
     for entry in reading.get("document_flow") or []:
         kind = str(entry.get("kind") or "")
@@ -778,8 +809,12 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             layout = section_layouts.get(str(section.get("type") or ""))
             if isinstance(layout, dict):
                 items, groups = section_pools(section)
-                rendered_item_keys: set[str] = set()
-                rendered_group_keys: set[str] = set()
+                rendered_item_keys: set[str] = {
+                    str(key) for key in layout.get("hidden_fields") or []
+                }
+                rendered_group_keys: set[str] = {
+                    str(key) for key in layout.get("hidden_groups") or []
+                }
                 for group_spec in layout.get("groups") or []:
                     if not isinstance(group_spec, dict):
                         continue
@@ -807,18 +842,12 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                         parts.append(f"### {_markdown_text(group_spec.get('title') or '概要')}")
                         parts.extend(group_parts)
                 if not layout.get("omit_unlisted", False):
-                    parts.extend(
-                        item_line(item)
-                        for key, item in items.items()
-                        if key not in rendered_item_keys
-                    )
+                    parts.extend(item_line(item) for key, item in items.items() if key not in rendered_item_keys)
                     for key, group in groups.items():
                         if key in rendered_group_keys:
                             continue
                         parts.append(f"### {_markdown_text(group.get('label') or group.get('key'))}")
-                        parts.extend(
-                            item_line(item) for item in group.get("items") or [] if isinstance(item, dict)
-                        )
+                        parts.extend(item_line(item) for item in group.get("items") or [] if isinstance(item, dict))
             else:
                 for item in section.get("items") or []:
                     parts.append(item_line(item))
@@ -832,45 +861,136 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         table = tables.get(ref_id)
         if dataset is None or table is None:
             continue
-        parts.append(f"### {_markdown_text(table.get('title') or dataset.get('label') or ref_id)}")
+        dataset_layout = dataset_layouts.get(str(dataset.get("name") or ""))
+        if not isinstance(dataset_layout, dict):
+            dataset_layout = {}
+        if not dataset_layout.get("hide_title", False):
+            parts.append(f"### {_markdown_text(table.get('title') or dataset.get('label') or ref_id)}")
         column_by_key = {
             str(column.get("key") or ""): column for column in dataset.get("columns") or [] if column.get("key")
         }
-        keys = [str(key) for key in table.get("column_keys") or [] if str(key) in column_by_key]
+        configured_keys = dataset_layout.get("columns") or table.get("column_keys") or []
+        keys = [str(key) for key in configured_keys if str(key) in column_by_key]
         if not keys:
             parts.append("_No displayable columns._")
             continue
-        labels = [_markdown_text(column_by_key[key].get("label") or key) for key in keys]
-        def render_rows(rows: list[dict[str, Any]]) -> str:
+        def row_value(row: dict[str, Any], key: str) -> Any:
+            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+            return normalized.get(key, canonical_raw.get(key))
+
+        def display_value(row: dict[str, Any], key: str) -> str:
+            return _markdown_display(
+                row_value(row, key),
+                key=key,
+                descriptor=column_by_key[key],
+                dictionary=dictionary,
+                privacy_mode=privacy_mode,
+            )
+
+        def render_rows(rows: list[dict[str, Any]], row_keys: list[str] | None = None) -> str:
+            active_keys = row_keys or keys
+            active_labels = [
+                _markdown_text(column_by_key[key].get("label") or key)
+                for key in active_keys
+            ]
             lines = [
-                "| " + " | ".join(labels) + " |",
-                "| " + " | ".join("---" for _ in keys) + " |",
+                "| " + " | ".join(active_labels) + " |",
+                "| " + " | ".join("---" for _ in active_keys) + " |",
             ]
             for row in rows:
-                normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
-                canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
-                values = [
-                    _markdown_display(
-                        normalized.get(key, canonical_raw.get(key)),
-                        key=key,
-                        descriptor=column_by_key[key],
-                        dictionary=dictionary,
-                        privacy_mode=privacy_mode,
-                    )
-                    for key in keys
-                ]
+                values = [display_value(row, key) for key in active_keys]
                 lines.append("| " + " | ".join(values) + " |")
             return "\n".join(lines)
 
         dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
-        if dataset.get("name") == "inquiry_records" and "inquiry_type" in keys:
+        if dataset_layout.get("mode") == "record_cards":
+            configured_title_separator = dataset_layout.get("title_separator")
+            title_separator = (
+                " · "
+                if configured_title_separator is None
+                else str(configured_title_separator)
+            )
+            title_fields = [
+                str(key)
+                for key in dataset_layout.get("title_fields") or []
+                if str(key) in column_by_key
+            ]
+            for index, row in enumerate(dataset_rows, start=1):
+                title_values = [
+                    display_value(row, key)
+                    for key in title_fields
+                    if row_value(row, key) not in (None, "", [], {})
+                ]
+                parts.append(
+                    f"#### {_markdown_text(title_separator.join(title_values) or f'记录 {index}')}"
+                )
+                for key in keys:
+                    value = row_value(row, key)
+                    if value in (None, "", [], {}):
+                        continue
+                    parts.append(
+                        f"**{_markdown_text(column_by_key[key].get('label') or key)}:** "
+                        f"{display_value(row, key)}"
+                    )
+        elif dataset_layout.get("mode") == "grouped_table":
+            group_by = str(dataset_layout.get("group_by") or "")
+            metadata_keys = [
+                str(key)
+                for key in dataset_layout.get("group_metadata") or []
+                if str(key) in column_by_key
+            ]
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in dataset_rows:
+                group_value = str(row_value(row, group_by) or "未关联账户")
+                grouped.setdefault(group_value, []).append(row)
+            for group_value, rows in grouped.items():
+                descriptor = column_by_key.get(group_by, {})
+                shown_group = _markdown_display(
+                    group_value,
+                    key=group_by,
+                    descriptor=descriptor,
+                    dictionary=dictionary,
+                    privacy_mode=privacy_mode,
+                )
+                parts.append(f"#### 账户 {shown_group}")
+                first = rows[0]
+                for key in metadata_keys:
+                    value = row_value(first, key)
+                    if value in (None, "", [], {}):
+                        continue
+                    parts.append(
+                        f"**{_markdown_text(column_by_key[key].get('label') or key)}:** "
+                        f"{display_value(first, key)}"
+                    )
+                column_groups = [
+                    group
+                    for group in dataset_layout.get("column_groups") or []
+                    if isinstance(group, dict)
+                ]
+                if column_groups:
+                    for column_group in column_groups:
+                        group_keys = [
+                            str(key)
+                            for key in column_group.get("columns") or []
+                            if str(key) in column_by_key
+                        ]
+                        if not group_keys:
+                            continue
+                        parts.append(
+                            f"##### {_markdown_text(column_group.get('title') or '明细')}"
+                        )
+                        parts.append(render_rows(rows, group_keys))
+                else:
+                    parts.append(render_rows(rows))
+        elif dataset.get("name") == "inquiry_records" and "inquiry_type" in keys:
             grouped: dict[str, list[dict[str, Any]]] = {}
             for row in dataset_rows:
                 normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
                 canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
                 group_key = str(normalized.get("inquiry_type", canonical_raw.get("inquiry_type")) or "unknown")
                 grouped.setdefault(group_key, []).append(row)
-            enum_labels = ((dictionary.get("enums") or {}).get("inquiry_type") or {})
+            enum_labels = (dictionary.get("enums") or {}).get("inquiry_type") or {}
             for group_key in ("institution", "personal", *sorted(set(grouped) - {"institution", "personal"})):
                 rows = grouped.get(group_key)
                 if not rows:
@@ -899,6 +1019,52 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             item = document_item(spec) if isinstance(spec, dict) else None
             if item is not None:
                 appendix_parts.append(item_line(item))
+        facts = semantic_domain.get("facts") if isinstance(semantic_domain.get("facts"), dict) else {}
+        audit = facts.get("credit_extraction_audit") if isinstance(facts.get("credit_extraction_audit"), dict) else {}
+        reconciliations = {
+            str(item.get("name") or ""): item
+            for item in audit.get("reconciliations") or []
+            if isinstance(item, dict) and item.get("name")
+        }
+        for spec in appendix.get("audit_reconciliations") or []:
+            if not isinstance(spec, dict):
+                continue
+            reconciliation = reconciliations.get(str(spec.get("name") or ""))
+            if reconciliation is None:
+                continue
+            reconciliation_parts: list[str] = []
+            for field_spec in spec.get("fields") or []:
+                if not isinstance(field_spec, dict):
+                    continue
+                key = str(field_spec.get("key") or "")
+                value = reconciliation.get(key)
+                if not key or value in (None, "", [], {}):
+                    continue
+                value_labels = (
+                    field_spec.get("value_labels")
+                    if isinstance(field_spec.get("value_labels"), dict)
+                    else {}
+                )
+                shown = value_labels.get(value)
+                if shown is None:
+                    shown = _markdown_display(
+                        value,
+                        key=key,
+                        descriptor=field_spec,
+                        dictionary=dictionary,
+                        privacy_mode=privacy_mode,
+                    )
+                reconciliation_parts.append(
+                    f"**{_markdown_text(field_spec.get('label') or key)}:** "
+                    f"{_markdown_text(shown)}"
+                )
+            if reconciliation_parts:
+                appendix_parts.append(
+                    f"### {_markdown_text(spec.get('title') or reconciliation.get('name'))}"
+                )
+                appendix_parts.extend(reconciliation_parts)
+                if spec.get("note"):
+                    appendix_parts.append(f"**处理原则:** {_markdown_text(spec['note'])}")
         if appendix_parts:
             parts.append(f"## {_markdown_text(appendix.get('title') or '附录')}")
             parts.extend(appendix_parts)
@@ -1122,11 +1288,7 @@ def _semantic_source_structure(
             {
                 "id": f"{logical_id}:p{page}",
                 "page": page,
-                "record_ids": [
-                    model["record_id"]
-                    for model in row_models
-                    if page in (model.get("page_range") or [])
-                ],
+                "record_ids": [model["record_id"] for model in row_models if page in (model.get("page_range") or [])],
                 "repeated_header": page != page_start,
             }
             for page in sorted(set(pages))
@@ -1199,7 +1361,11 @@ def _semantic_source_structure(
                     node_id = str(node_id or "")
                     if node_id:
                         index = next(
-                            (position for position, block in enumerate(blocks) if str(block.get("id") or "") == node_id),
+                            (
+                                position
+                                for position, block in enumerate(blocks)
+                                if str(block.get("id") or "") == node_id
+                            ),
                             None,
                         )
                         if index is not None:
@@ -1218,9 +1384,7 @@ def _semantic_source_structure(
             data_start -= 1
         data_end = next_heading(max(indexes))
         claimed_by_dataset_sections[section_id] = set(range(data_start, data_end))
-    all_dataset_claims = {
-        index for claimed in claimed_by_dataset_sections.values() for index in claimed
-    }
+    all_dataset_claims = {index for claimed in claimed_by_dataset_sections.values() for index in claimed}
 
     semantic_sections: list[dict[str, Any]] = []
     for section in sections:
@@ -1255,9 +1419,7 @@ def _semantic_source_structure(
                 semantic_sections.append(public)
                 continue
             start, end = int(page_range[0]), int(page_range[1])
-            public["block_refs"] = [
-                str(block["id"]) for block in blocks if start <= int(block.get("page") or 1) <= end
-            ]
+            public["block_refs"] = [str(block["id"]) for block in blocks if start <= int(block.get("page") or 1) <= end]
             public["source_table_refs"] = [
                 str(table["id"]) for table in source_tables if start <= int(table.get("page") or 1) <= end
             ]
@@ -1425,7 +1587,9 @@ class CommunityDataset:
         metadata["row_count"] = emitted
         metadata["primary_key"] = "record_id"
         metadata["status"] = (
-            "empty" if emitted == 0 and expected == 0 else ("complete" if expected == emitted else "partial")
+            "empty"
+            if emitted == 0 and expected == 0
+            else ("complete" if completeness["verified"] and expected == emitted else "partial")
         )
         metadata["completeness"] = completeness
         metadata["rows"] = projected_rows
@@ -1661,6 +1825,46 @@ class CommunityBundle:
                             "csv_escape_applied": "true" if value_escaped or raw_escaped else "false",
                         }
                     )
+        domain = semantic_payload.get("domain") if isinstance(semantic_payload.get("domain"), dict) else {}
+        extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
+        audit_csv = extensions.get("audit_csv") if isinstance(extensions.get("audit_csv"), dict) else {}
+        facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
+        audit = facts.get("credit_extraction_audit") if isinstance(facts.get("credit_extraction_audit"), dict) else {}
+        reconciliations = {
+            str(item.get("name") or ""): item
+            for item in audit.get("reconciliations") or []
+            if isinstance(item, dict) and item.get("name")
+        }
+        for spec in audit_csv.get("reconciliations") or []:
+            if not isinstance(spec, dict):
+                continue
+            name = str(spec.get("name") or "")
+            reconciliation = reconciliations.get(name)
+            if reconciliation is None:
+                continue
+            for key in (str(value) for value in spec.get("fields") or []):
+                value = reconciliation.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                value_type = _type_of(value)
+                safe_value, value_escaped = _csv_safe_with_flag(value, value_type)
+                unit = (
+                    reconciliation.get("amount_unit", "")
+                    if key in {"expected", "actual", "difference", "tolerance"}
+                    else ""
+                )
+                writer.writerow(
+                    {
+                        "dataset_id": "_audit_reconciliations",
+                        "record_id": f"audit:{name}",
+                        "field_key": key,
+                        "value": safe_value,
+                        "raw": safe_value,
+                        "value_type": value_type,
+                        "unit": unit,
+                        "csv_escape_applied": "true" if value_escaped else "false",
+                    }
+                )
         return "\ufeff" + output.getvalue()
 
 
@@ -1981,7 +2185,7 @@ def project_community_bundle(
             "schema_version": "1.0",
             "status": "complete" if rows else "empty",
             "columns": _dataset_columns(rows, dictionary, key),
-            "completeness": _dataset_completeness(result, key, rows, projection),
+            "completeness": _dataset_completeness(result, key, rows, projection, data),
         }
         configured_reading_columns = list((projection.get("reading_columns") or {}).get(public_name) or ())
         if configured_reading_columns:
@@ -2029,17 +2233,32 @@ def project_community_bundle(
     for dataset in datasets:
         completeness = dataset.public.get("completeness") or {}
         if completeness.get("verified") is False:
-            warnings.append(
-                {
-                    "code": "DATASET_ROW_COUNT_MISMATCH",
-                    "level": "error",
-                    "message": (
-                        f"dataset {dataset.public.get('id')} emitted {completeness.get('emitted_row_count')} "
-                        f"of {completeness.get('expected_row_count')} expected records"
-                    ),
-                    "dataset_id": str(dataset.public.get("id") or ""),
-                }
-            )
+            emitted = completeness.get("emitted_row_count")
+            expected = completeness.get("expected_row_count")
+            independently_counted = completeness.get("basis") != "emitted_records_only"
+            if independently_counted:
+                warnings.append(
+                    {
+                        "code": "DATASET_ROW_COUNT_MISMATCH",
+                        "level": "error",
+                        "message": (
+                            f"dataset {dataset.public.get('id')} emitted {emitted} of {expected} expected records"
+                        ),
+                        "dataset_id": str(dataset.public.get("id") or ""),
+                    }
+                )
+            else:
+                warnings.append(
+                    {
+                        "code": "DATASET_COMPLETENESS_UNVERIFIED",
+                        "level": "warning",
+                        "message": (
+                            f"dataset {dataset.public.get('id')} has {emitted} emitted records "
+                            "but no independent source count"
+                        ),
+                        "dataset_id": str(dataset.public.get("id") or ""),
+                    }
+                )
 
     return CommunityBundle(
         schema={
