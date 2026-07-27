@@ -16,12 +16,22 @@ from docmirror.plugins.bank_statement.header_resolve import normalize_header_cel
 logger = logging.getLogger(__name__)
 
 _STANDARD_HEADER = ["交易日期", "收/支", "交易金额", "余额", "摘要", "对方账号", "对方户名", "机构", "柜员", "备注"]
-_DATE_RE = re.compile(r"(20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2})")
+_DATE_RE = re.compile(r"(?<!\d)(20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2})(?!\d)")
 _DIRECTION_RE = re.compile(r"(收入|收人|支出|支山|支鼎|攴出)")
-_AMOUNT_TOKEN_RE = re.compile(r"\d{1,3}(?:,\d{3})*(?:\.\s*\d{2})|\d+\.\s*\d{2}")
+_AMOUNT_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\s*\d{2}")
 _ACCOUNT_RE = re.compile(r"\b\d{7,24}\b")
 _NOISE_RE = re.compile(r"第\s*\d+\s*页|业务用章|交易机构|产品说明|账号序号|起始日期|终止日期")
 _CACHE_KEY = "_bank_ocr_implicit_recovery"
+_TEXT_BLOCK_TYPES = {"paragraph", "list", "footer", "unknown", "text"}
+_MIN_DISTRIBUTED_ROWS = 3
+_MIN_DISTRIBUTED_VALID_RATIO = 0.6
+_PAGE_MARKER_RE = re.compile(r"<!--\s*docmirror:page\b[^>]*-->")
+_OPENING_BALANCE_MARKERS = (
+    "上页余额",
+    "期初余额",
+    "起始余额",
+    "opening balance",
+)
 
 
 def recover_ocr_implicit_ledger_tables(parse_result: Any, full_text: str = "") -> list[list[list[str]]]:
@@ -194,11 +204,13 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
         ordered = sorted(blocks, key=_block_sort_key)
         header_idx = next((idx for idx, block in enumerate(ordered) if _is_paragraph_ledger_header(block)), -1)
         if header_idx < 0:
+            header_idx = _distributed_header_end(ordered)
+        if header_idx < 0:
             continue
         rows: list[list[str]] = []
         prev_balance: float | None = None
         for block in ordered[header_idx + 1 :]:
-            if str(block.get("type") or "") not in {"paragraph", "list", "footer", "unknown", "text"}:
+            if str(block.get("type") or "") not in _TEXT_BLOCK_TYPES:
                 continue
             text = _clean_cell(block.get("text"))
             if not text or _is_header_or_meta_text(text):
@@ -212,10 +224,97 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
                     prev_balance = float(row[3])
                 except ValueError:
                     prev_balance = None
+        if len(rows) < _MIN_DISTRIBUTED_ROWS:
+            distributed_rows = _extract_distributed_ledger_rows(ordered, header_idx)
+            if distributed_rows:
+                rows = distributed_rows
         if rows:
             rows = _repair_balance_chain_rows(rows)
             tables.append([_STANDARD_HEADER, *rows])
     return tables
+
+
+def _distributed_header_end(ordered: list[dict[str, Any]]) -> int:
+    """Find a ledger header whose column labels were emitted as separate blocks."""
+    accumulated: list[str] = []
+    support_groups = (
+        ("摘要",),
+        ("收/支", "收支", "收入/支出", "借/贷", "借贷"),
+        ("对方账号", "对方账户"),
+        ("对方户名", "对方名称"),
+        ("序号",),
+        ("交易流水号", "流水号", "凭证号", "支票号码"),
+    )
+    for idx, block in enumerate(ordered[:80]):
+        if str(block.get("type") or "") not in _TEXT_BLOCK_TYPES:
+            continue
+        text = normalize_header_cell(str(block.get("text") or ""))
+        if not text:
+            continue
+        accumulated.append(text)
+        joined = "".join(accumulated)
+        has_date = "交易日期" in joined or "记账日期" in joined
+        has_amount = any(
+            marker
+            in joined
+            for marker in (
+                "交易金额",
+                "发生额",
+                "收入金额",
+                "支出金额",
+                "借方/贷方金额",
+                "借贷方金额",
+            )
+        )
+        has_balance = "余额" in joined
+        support_count = sum(any(marker in joined for marker in group) for group in support_groups)
+        if has_date and has_amount and has_balance and support_count >= 2:
+            return idx
+    return -1
+
+
+def _extract_distributed_ledger_rows(
+    ordered: list[dict[str, Any]],
+    header_idx: int,
+) -> list[list[str]]:
+    """Parse rows whose fields are spread across positioned text blocks."""
+    values: list[str] = []
+    for block in ordered[header_idx + 1 :]:
+        if str(block.get("type") or "") not in _TEXT_BLOCK_TYPES:
+            continue
+        text = _clean_cell(block.get("text"))
+        if not text or _is_header_or_meta_text(text):
+            continue
+        values.append(text)
+    fragments = _date_anchored_fragments(" ".join(values))
+    if not fragments:
+        return []
+
+    rows: list[list[str]] = []
+    prev_balance: float | None = None
+    for fragment in fragments:
+        row = _parse_paragraph_ledger_fragment(fragment, prev_balance=prev_balance)
+        if not row:
+            continue
+        rows.append(row)
+        try:
+            prev_balance = float(row[3])
+        except ValueError:
+            prev_balance = None
+    if len(rows) < _MIN_DISTRIBUTED_ROWS:
+        return []
+    if len(rows) / len(fragments) < _MIN_DISTRIBUTED_VALID_RATIO:
+        return []
+    return rows
+
+
+def _date_anchored_fragments(text: str) -> list[str]:
+    """Split distributed rows from each date anchor to the next date anchor."""
+    matches = list(_DATE_RE.finditer(text))
+    return [
+        text[match.start() : matches[idx + 1].start() if idx + 1 < len(matches) else len(text)].strip()
+        for idx, match in enumerate(matches)
+    ]
 
 
 def _block_sort_key(block: dict[str, Any]) -> tuple[float, float]:
@@ -304,7 +403,8 @@ def _choose_amount_balance(
 ) -> tuple[float | None, float | None]:
     if prev_balance is not None:
         best: tuple[float, float, float] | None = None
-        for amount_idx, (_, amount, _) in enumerate(amounts):
+        for amount_idx, (_, raw_amount, _) in enumerate(amounts):
+            amount = abs(raw_amount)
             if amount <= 0:
                 continue
             for balance_idx, (_, balance, _) in enumerate(amounts):
@@ -319,7 +419,12 @@ def _choose_amount_balance(
             return best[1], best[2]
 
     if len(amounts) >= 2:
-        return amounts[0][1], amounts[1][1]
+        signed = next((item for item in amounts if item[0].startswith(("+", "-"))), None)
+        if signed is not None:
+            balance = next((item for item in amounts if item is not signed), None)
+            if balance is not None:
+                return abs(signed[1]), balance[1]
+        return abs(amounts[0][1]), amounts[1][1]
     return None, None
 
 
@@ -516,6 +621,11 @@ def _normalize_direction(value: str) -> str:
         return "收入"
     if any(token in text for token in ("支出", "支山", "支鼎", "攴出")):
         return "支出"
+    signed_amount = _AMOUNT_TOKEN_RE.search(text)
+    if signed_amount and signed_amount.group(0).startswith("-"):
+        return "支出"
+    if signed_amount and signed_amount.group(0).startswith("+"):
+        return "收入"
     return ""
 
 
@@ -543,8 +653,143 @@ def _clean_cell(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").replace("\n", " ")).strip()
 
 
-def _recover_from_text(_full_text: str) -> list[list[list[str]]]:
-    return []
+def _recover_from_text(full_text: str) -> list[list[list[str]]]:
+    """Recover a borderless ledger emitted as one OCR text block per page."""
+    if not full_text.strip():
+        return []
+
+    pages = [part for part in _PAGE_MARKER_RE.split(full_text) if part.strip()] or [full_text]
+    tables: list[list[list[str]]] = []
+    for page_text in pages:
+        lines = [_clean_cell(line) for line in page_text.splitlines() if _clean_cell(line)]
+        blocks = [{"type": "paragraph", "text": line} for line in lines]
+        header_idx = _distributed_header_end(blocks)
+        if header_idx < 0:
+            continue
+
+        body = " ".join(lines[header_idx + 1 :])
+        fragments = _date_suffix_fragments(body)
+        if not fragments:
+            continue
+        opening_balance = _opening_balance(" ".join(lines[: header_idx + 1]))
+        rows = _parse_unpositioned_rows(fragments, opening_balance=opening_balance)
+        if len(rows) < _MIN_DISTRIBUTED_ROWS:
+            continue
+        if len(rows) / len(fragments) < _MIN_DISTRIBUTED_VALID_RATIO:
+            continue
+        tables.append([_STANDARD_HEADER, *rows])
+    return tables
+
+
+def _date_suffix_fragments(text: str) -> list[str]:
+    """Split OCR text where the transaction date may trail the other row fields."""
+    matches = list(_DATE_RE.finditer(text))
+    if not matches:
+        return []
+    fragments: list[str] = []
+    start = 0
+    for match in matches:
+        fragment = text[start : match.end()].strip()
+        start = match.end()
+        if fragment:
+            fragments.append(fragment)
+    return fragments
+
+
+def _opening_balance(text: str) -> float | None:
+    normalized = text.lower()
+    for marker in _OPENING_BALANCE_MARKERS:
+        marker_idx = normalized.find(marker.lower())
+        if marker_idx < 0:
+            continue
+        amounts = _amount_tokens(text[marker_idx : marker_idx + 80])
+        if amounts:
+            return amounts[0][1]
+    return None
+
+
+def _parse_unpositioned_rows(
+    fragments: list[str],
+    *,
+    opening_balance: float | None,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    prev_balance = opening_balance
+    for fragment in fragments:
+        row = _parse_unpositioned_fragment(fragment, prev_balance=prev_balance)
+        if not row:
+            continue
+        rows.append(row)
+        try:
+            prev_balance = float(row[3])
+        except ValueError:
+            prev_balance = None
+    return _repair_balance_chain_rows(rows)
+
+
+def _parse_unpositioned_fragment(fragment: str, *, prev_balance: float | None) -> list[str]:
+    date_match = _DATE_RE.search(fragment)
+    amounts = _amount_tokens(fragment)
+    if date_match is None or len(amounts) < 2:
+        return []
+
+    explicit_direction = _normalize_direction(fragment)
+    marker_directions = [
+        _amount_marker_direction(fragment, token[2], token[0])
+        for token in amounts
+    ]
+    debit_amount_indexes = {
+        idx for idx, direction in enumerate(marker_directions) if direction == "支出"
+    }
+    candidates: list[tuple[float, str, float, float]] = []
+    for amount_idx, amount_token in enumerate(amounts):
+        if debit_amount_indexes and amount_idx not in debit_amount_indexes:
+            continue
+        amount = abs(amount_token[1])
+        if amount <= 0:
+            continue
+        marker_direction = marker_directions[amount_idx]
+        directions = [explicit_direction or marker_direction] if explicit_direction or marker_direction else ["收入", "支出"]
+        for balance_idx, balance_token in enumerate(amounts):
+            if balance_idx == amount_idx:
+                continue
+            balance = balance_token[1]
+            for direction in directions:
+                score = 0.03 * max(abs(amount_idx - balance_idx) - 1, 0)
+                if marker_directions[balance_idx] == "支出":
+                    score += 2.0
+                if prev_balance is not None:
+                    expected = prev_balance + amount if direction == "收入" else prev_balance - amount
+                    score += min(abs(expected - balance) / max(amount, 1.0), 20.0)
+                elif balance_idx < amount_idx:
+                    score += 0.01
+                candidates.append((score, direction, amount, balance))
+    if not candidates:
+        return []
+
+    _, direction, amount, balance = min(candidates, key=lambda item: item[0])
+    counter_account = _extract_counter_account(fragment)
+    return [
+        _normalize_date(date_match.group(1)),
+        direction,
+        f"{amount:.2f}",
+        f"{balance:.2f}",
+        _extract_summary(fragment),
+        counter_account,
+        _extract_counterparty_from_fragment(fragment, counter_account),
+        "",
+        "",
+        "",
+    ]
+
+
+def _amount_marker_direction(text: str, start: int, raw_amount: str) -> str:
+    tail = text[start + len(raw_amount) : start + len(raw_amount) + 8]
+    if "借" in tail:
+        return "支出"
+    if "贷" in tail:
+        return "收入"
+    return ""
 
 
 __all__ = ["recover_ocr_implicit_ledger_tables", "recovered_ocr_implicit_row_count"]

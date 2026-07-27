@@ -37,7 +37,8 @@ STYLE_ID = "grid_standard"
 
 _SPLIT_DEBIT_KEYS = ("支出", "支出金额", "借方发生额", "借方")
 _SPLIT_CREDIT_KEYS = ("收入", "收入金额", "贷方发生额", "贷方")
-_DIRECTION_KEYS = ("收/支", "收支", "方向", "交易方向", "月收/支")
+_DIRECTION_KEYS = ("收/支", "收支", "方向", "交易方向", "月收/支", "借贷", "借/贷", "借贷标志", "Dc Flg")
+_MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
@@ -54,9 +55,12 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
     directed = _normalize_direction_amount(raw_txn, plugin)
     if directed is not None:
         return directed
+    embedded = _normalize_embedded_direction_amount(raw_txn, plugin)
+    if embedded is not None:
+        return embedded
 
-    income = normalize_amount(_cell_value(raw_txn, *_SPLIT_CREDIT_KEYS))
-    expense = normalize_amount(_cell_value(raw_txn, *_SPLIT_DEBIT_KEYS))
+    income = _normalize_monetary_cell(_cell_value(raw_txn, *_SPLIT_CREDIT_KEYS))
+    expense = _normalize_monetary_cell(_cell_value(raw_txn, *_SPLIT_DEBIT_KEYS))
     if income is None and expense is None:
         return None
     income = float(income or 0)
@@ -69,7 +73,7 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
         normalized["counter_party"] = _clean_wrapped_text(str(normalized.get("counter_party") or ""))
     if normalized.get("counter_account"):
         normalized["counter_account"] = _clean_account(str(normalized.get("counter_account") or ""))
-    balance = normalize_amount(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
+    balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
     if balance is not None:
         normalized["balance"] = float(balance)
     reference = _cell_value(raw_txn, "交易流水号", "流水号", "Reference")
@@ -101,7 +105,7 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
 
 def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
     direction_raw = _cell_value(raw_txn, *_DIRECTION_KEYS)
-    amount = normalize_amount(_cell_value(raw_txn, "交易金额", "金额", "发生额", "Amount"))
+    amount = _normalize_monetary_cell(_cell_value(raw_txn, "交易金额", "金额", "发生额", "Amount"))
     if not direction_raw or amount is None or float(amount or 0) <= 0:
         return None
     direction = _normalize_direction_text(direction_raw)
@@ -112,7 +116,7 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
     normalized["direction"] = direction
-    balance = normalize_amount(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
+    balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
     if balance is not None:
         normalized["balance"] = float(balance)
     if normalized.get("counter_party"):
@@ -122,11 +126,50 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
     return normalized
 
 
+def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
+    value = _cell_value(raw_txn, "交易金额", "金额", "发生额", "Amount")
+    amount = _normalize_monetary_cell(value)
+    if amount is None or float(amount) <= 0:
+        return None
+    match = _MONEY_PREFIX_RE.search(str(value or "").strip())
+    suffix = str(value or "")[match.end() :] if match else ""
+    markers = re.findall(r"[收支借贷]", suffix)
+    if not markers:
+        summary = _cell_value(raw_txn, "摘要", "交易摘要", "Description", "Memo")
+        trailing = re.search(r"([收支借贷])\s*$", summary)
+        markers = [trailing.group(1)] if trailing else []
+    marker = markers[-1] if markers else ""
+    if marker in {"收", "贷"}:
+        direction = "income"
+    elif marker in {"支", "借"} or ("付" in suffix and "收" not in suffix):
+        direction = "expense"
+    else:
+        return None
+
+    normalized = plugin._normalize(raw_txn)
+    normalized["amount"] = float(amount)
+    normalized["amount_cny"] = float(amount)
+    normalized["direction"] = direction
+    balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
+    if balance is not None:
+        normalized["balance"] = float(balance)
+    return normalized
+
+
+def _normalize_monetary_cell(value: str) -> float | None:
+    match = _MONEY_PREFIX_RE.search(str(value or "").strip())
+    return normalize_amount(match.group(1)) if match else None
+
+
 def _normalize_direction_text(value: str) -> str:
     text = str(value or "").strip()
     if any(token in text for token in ("收入", "收人")):
         return "income"
     if any(token in text for token in ("支出", "支山", "支鼎", "攴出")):
+        return "expense"
+    if "贷" in text or re.search(r"\bCr\b", text, re.IGNORECASE):
+        return "income"
+    if "借" in text or re.search(r"\bDr\b", text, re.IGNORECASE):
         return "expense"
     return ""
 

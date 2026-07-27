@@ -61,7 +61,20 @@ def reconstruct_tables(
     spe_primary = (structure_spe or {}).get("primary")
     spe_mode = (structure_spe or {}).get("table_extraction")
 
-    if canonical_tables:
+    canonical_rows = _usable_bank_ledger_row_count(canonical_tables)
+    if canonical_rows > 0:
+        pipe_detected = detect_pipe_header_in_text(full_text)
+        pipe_tables = build_tables_from_pipe_text(full_text) if pipe_detected else []
+        pipe_rows = sum(max(len(table) - 1, 0) for table in pipe_tables)
+        if pipe_rows > canonical_rows:
+            return pipe_tables, ReconstructionMeta(
+                source="pipe_text",
+                expected_primary_rows=pipe_rows,
+                pipe_header_detected=True,
+                pages_scanned=page_count,
+                spe_primary=spe_primary,
+                spe_table_extraction=spe_mode,
+            )
         expected = _canonical_table_expected_rows(
             canonical_tables,
             parse_result=parse_result,
@@ -126,6 +139,26 @@ def reconstruct_tables(
         pipe_header_detected=pipe_detected,
         pages_scanned=page_count,
     )
+
+
+def _usable_bank_ledger_row_count(canonical_tables: list[list[list[str]]]) -> int:
+    """Return transaction-like row count in semantically usable bank tables."""
+    from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY
+    from docmirror.plugins.bank_statement.header_resolve import detect_headers
+    from docmirror.plugins.bank_statement.row_extract import count_transaction_data_rows
+
+    count = 0
+    for table in canonical_tables:
+        if not table:
+            continue
+        header = detect_headers([table], BANK_COLUMN_REGISTRY)
+        if header is None:
+            continue
+        fields = set(header.col_map)
+        if not ({"amount", "balance"}.issubset(fields) and fields.intersection({"date", "timestamp"})):
+            continue
+        count += count_transaction_data_rows([table], header)
+    return count
 
 
 def _canonical_table_expected_rows(

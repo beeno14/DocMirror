@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 _DEBIT_CREDIT_REQUIRED = ("借方发生额", "贷方发生额", "余额")
 _INCOME_EXPENSE_REQUIRED = ("支出金额", "收入金额", "余额")
-_ROW_ANCHOR_HEADERS = ("序号", "交易日期", "会计日期", "日期")
+_AMOUNT_HEADERS = ("交易金额", "发生额", "借方/贷方金额", "支/收交易金额")
+_ROW_ANCHOR_HEADERS = ("序号", "交易日期", "交易时间", "记账日期", "会计日期", "日期")
 _FOOTER_MARKERS = (
     "当前账单借方发生数",
     "当前账单贷方发生数",
@@ -320,6 +321,10 @@ def is_wide_bank_header(row: list[str] | tuple[str, ...] | None) -> bool:
     has_required = all(normalize_header_cell(item) in joined for item in _DEBIT_CREDIT_REQUIRED) or all(
         normalize_header_cell(item) in joined for item in _INCOME_EXPENSE_REQUIRED
     )
+    has_required = has_required or (
+        normalize_header_cell("余额") in joined
+        and any(normalize_header_cell(item) in joined for item in _AMOUNT_HEADERS)
+    )
     has_anchor = any(normalize_header_cell(item) in joined for item in _ROW_ANCHOR_HEADERS)
     return has_required and has_anchor
 
@@ -345,13 +350,10 @@ def _select_wide_bank_table(table: list[list[str]]) -> list[list[str]]:
 
 
 def _looks_like_transaction_row(row: list[str]) -> bool:
-    first = str(row[0] or "").strip()
     joined = " ".join(str(cell or "").strip() for cell in row)
-    if not re.fullmatch(r"\d{1,6}", first):
+    if not re.search(r"(?<!\d)\d{8}(?!\d)|\d{4}[-/]\d{1,2}[-/]\d{1,2}", joined):
         return False
-    if not re.search(r"\b\d{8}\b|\b\d{4}-\d{2}-\d{2}\b", joined):
-        return False
-    if not re.search(r"(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}", joined):
+    if not re.search(r"(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{1,2}", joined):
         return False
     return True
 
