@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from pathlib import Path
 
 from docmirror.framework.middlewares.base import BaseMiddleware
@@ -67,11 +68,13 @@ class EvidenceEngine(BaseMiddleware):
         # Phase 1: Collect evidence from all sources
         classification_text = result.full_text
         cover_text = self._cover_page_text(result)
+        title_text = self._title_region_text(result)
         if cover_text:
             # Cover letter / title block often holds issuer keywords omitted from table cells.
             classification_text = f"{cover_text}\n{classification_text}"
         all_evidence.extend(self._keyword_evidence(classification_text))
-        all_evidence.extend(self._text_frame_evidence(classification_text, cover_text))
+        all_evidence.extend(self._text_frame_evidence(classification_text, cover_text, title_text))
+        all_evidence.extend(self._bank_ledger_structure_evidence(result, title_text))
         all_evidence.extend(self._header_evidence(result.all_tables()))
         all_evidence.extend(self._user_hint_evidence(result))
         all_evidence.extend(self._extractor_scene_evidence(result))
@@ -80,14 +83,18 @@ class EvidenceEngine(BaseMiddleware):
         all_evidence.extend(self._entity_evidence(result.kv_entities))
         all_evidence.extend(self._visual_evidence(result.pages))
 
-        # Phase 2: Fuse evidence (extractor scene hint shields its category from keyword veto)
+        # Phase 2: Fuse evidence. Strong document identity signals shield their
+        # category from body-keyword vetoes.
         protected = self._protected_extractor_categories(result, include_filename=not forced_hint)
+        protected.update(self._protected_document_categories(all_evidence))
         verdict, confidence, fused_evidence = self._fuse_evidence(
             all_evidence,
             protected=protected,
         )
 
         # Phase 3: Apply verdict
+        if verdict == "bank_reconciliation" and not forced_hint:
+            verdict = "bank_statement"
         doc_type = verdict if confidence >= 0.3 else "generic"
         if forced_hint:
             doc_type = forced_hint
@@ -175,6 +182,55 @@ class EvidenceEngine(BaseMiddleware):
                 parts.extend(str(h) for h in table.headers if h)
         return "\n".join(parts)
 
+    def _title_region_text(self, result: ParseResult) -> str:
+        """Build a bounded first-page identity region without using the filename."""
+        if not result.pages:
+            return ""
+        page = result.pages[0]
+        positioned = [
+            block
+            for block in page.texts
+            if block.bbox is not None and len(block.bbox) >= 4
+        ]
+        if positioned:
+            min_y = min(float(block.bbox[1]) for block in positioned)
+            max_y = max(float(block.bbox[3]) for block in positioned)
+            top_limit = (
+                float(page.height) * 0.40
+                if page.height
+                else min_y + (max_y - min_y) * 0.40
+            )
+            blocks = sorted(
+                (block for block in positioned if float(block.bbox[1]) <= top_limit),
+                key=lambda block: (float(block.bbox[1]), float(block.bbox[0])),
+            )
+            blocks.extend(
+                block
+                for block in page.texts
+                if block.bbox is None
+                and getattr(block.level, "value", str(block.level)) in ("title", "h1", "h2")
+            )
+            if not blocks:
+                blocks = sorted(page.texts, key=lambda block: block.reading_order)[:12]
+        else:
+            blocks = sorted(page.texts, key=lambda block: block.reading_order)[:12]
+        parts: list[str] = []
+        for block in blocks[:20]:
+            if block.content:
+                parts.append(block.content)
+        for pair in page.key_values[:12]:
+            if pair.key or pair.value:
+                parts.append(f"{pair.key}: {pair.value}")
+        for table in page.tables[:1]:
+            parts.extend(str(header) for header in table.headers if header)
+        return "\n".join(parts)[:4000]
+
+    @staticmethod
+    def _normalized_match_text(value: str) -> str:
+        """Normalize compatibility glyphs and layout whitespace for exact matching."""
+        normalized = unicodedata.normalize("NFKC", str(value or ""))
+        return re.sub(r"\s+", "", normalized).casefold()
+
     def _extractor_scene_hint(self, result: ParseResult) -> tuple[str | None, float]:
         """Extractor/EPO scene hint attached during Mirror extraction."""
         ds = getattr(result.entities, "domain_specific", None) or {}
@@ -216,7 +272,12 @@ class EvidenceEngine(BaseMiddleware):
             )
         ]
 
-    def _text_frame_evidence(self, document_text: str, cover_text: str) -> list[Evidence]:
+    def _text_frame_evidence(
+        self,
+        document_text: str,
+        cover_text: str,
+        title_text: str = "",
+    ) -> list[Evidence]:
         """Evaluate document/cover signatures declared by plugin scene resources."""
         evidence: list[Evidence] = []
         for scene, spec in get_scene_evidence_specs().items():
@@ -224,19 +285,36 @@ class EvidenceEngine(BaseMiddleware):
                 if not isinstance(rule, dict):
                     continue
                 scope = str(rule.get("scope") or "document")
-                source_text = cover_text if scope == "cover" else document_text
-                compact = re.sub(r"\s+", "", source_text or "")
+                if scope == "cover":
+                    source_text = cover_text
+                elif scope == "title":
+                    source_text = title_text
+                else:
+                    source_text = document_text
+                normalized_source = unicodedata.normalize("NFKC", str(source_text or ""))
+                compact_raw = re.sub(r"\s+", "", normalized_source)
+                compact = compact_raw.casefold()
                 if not compact:
                     continue
                 required = [str(value) for value in rule.get("required") or [] if str(value)]
-                if required and not all(re.sub(r"\s+", "", value) in compact for value in required):
+                if required and not all(self._normalized_match_text(value) in compact for value in required):
+                    continue
+                required_groups = [
+                    [str(value) for value in group if str(value)]
+                    for group in rule.get("required_groups") or []
+                    if isinstance(group, list)
+                ]
+                if any(
+                    not any(self._normalized_match_text(value) in compact for value in group)
+                    for group in required_groups
+                ):
                     continue
                 candidate_pattern = str(rule.get("candidate_pattern") or "")
                 candidate_field_type = str(rule.get("candidate_field_type") or "")
                 if candidate_pattern and candidate_field_type:
                     from docmirror.ocr.correction.validator_registry import ValidatorRegistry
 
-                    candidates = re.findall(candidate_pattern, compact)
+                    candidates = re.findall(candidate_pattern, compact_raw)
                     outcomes = [
                         ValidatorRegistry.default().evaluate(
                             str(candidate),
@@ -249,7 +327,11 @@ class EvidenceEngine(BaseMiddleware):
                         continue
                 groups = [group for group in rule.get("signal_groups") or [] if isinstance(group, list)]
                 matched = [
-                    [str(token) for token in group if str(token) and re.sub(r"\s+", "", str(token)) in compact]
+                    [
+                        str(token)
+                        for token in group
+                        if str(token) and self._normalized_match_text(str(token)) in compact
+                    ]
                     for group in groups
                 ]
                 matched = [tokens for tokens in matched if tokens]
@@ -265,10 +347,146 @@ class EvidenceEngine(BaseMiddleware):
                         category=scene,
                         weight=weight,
                         direction=1,
-                        detail=f"plugin text signature matched {len(matched)}/{len(groups)} groups",
+                        detail=(
+                            f"plugin text signature matched {len(matched)}/{len(groups)} groups"
+                            f" with {len(required_groups)} required groups"
+                        ),
                     )
                 )
         return evidence
+
+    def _bank_ledger_structure_evidence(
+        self,
+        result: ParseResult,
+        title_text: str,
+    ) -> list[Evidence]:
+        """Confirm a titleless bank-ledger continuation from strict table structure."""
+        if self._has_payment_platform_identity(result, title_text):
+            return []
+
+        tables = []
+        for page in result.pages[:2]:
+            for table in page.tables:
+                rows = [list(table.headers)] if table.headers else []
+                rows.extend(row.cell_texts for row in table.rows)
+                if rows:
+                    tables.append(rows)
+        if not tables:
+            return []
+
+        from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY
+        from docmirror.plugins.bank_statement.header_resolve import detect_headers
+        from docmirror.plugins.bank_statement.row_extract import count_transaction_data_rows
+
+        header = detect_headers(tables, BANK_COLUMN_REGISTRY, prefer_strict=True)
+        if header is not None:
+            fields = set(header.col_map)
+            has_date = bool(fields & {"date", "timestamp"})
+            required = has_date and {"amount", "balance"} <= fields
+            supporting = fields & {
+                "summary",
+                "direction",
+                "counter_party",
+                "counter_account",
+                "counter_bank_name",
+                "channel",
+            }
+            if required and len(supporting) >= 2 and count_transaction_data_rows(tables, header) >= 3:
+                return [
+                    Evidence(
+                        source="bank_ledger_structure",
+                        category="bank_statement",
+                        weight=0.82,
+                        direction=1,
+                        detail=(
+                            "strict bank ledger header with date, amount, balance, "
+                            f"{len(supporting)} supporting fields"
+                        ),
+                    )
+                ]
+
+        nonempty_rows = [
+            row
+            for table in tables
+            for row in table
+            if any(str(cell or "").strip() for cell in row)
+        ]
+        candidate_rows = [row for row in nonempty_rows if self._is_bank_continuation_row(row)]
+        if len(candidate_rows) < 8 or len(candidate_rows) / max(len(nonempty_rows), 1) < 0.60:
+            return []
+
+        account_rows = sum(
+            any(
+                re.search(r"\d{12,}", re.sub(r"\s+", "", str(cell or "")))
+                for cell in row
+            )
+            for row in candidate_rows
+        )
+        bank_rows = sum(
+            any(
+                token in self._normalized_match_text("".join(str(cell or "") for cell in row))
+                for token in ("银行", "农商行", "农信", "信用社")
+            )
+            for row in candidate_rows
+        )
+        if account_rows < 3 or bank_rows < 3:
+            return []
+
+        return [
+            Evidence(
+                source="bank_ledger_structure",
+                category="bank_statement",
+                weight=0.78,
+                direction=1,
+                detail=(
+                    f"titleless continuation ledger rows={len(candidate_rows)} "
+                    f"account_rows={account_rows} bank_rows={bank_rows}"
+                ),
+            )
+        ]
+
+    def _has_payment_platform_identity(self, result: ParseResult, title_text: str) -> bool:
+        compact_title = self._normalized_match_text(title_text)
+        official_titles = (
+            "微信支付交易明细证明",
+            "微信支付交易明细",
+            "微信支付账单",
+            "支付宝交易明细",
+            "支付宝账单",
+        )
+        if any(self._normalized_match_text(value) in compact_title for value in official_titles):
+            return True
+
+        if not result.pages:
+            return False
+        issuer_tokens = ("财付通支付科技有限公司", "支付宝（中国）网络技术有限公司")
+        for block in result.pages[0].texts:
+            level = getattr(block.level, "value", str(block.level))
+            if level not in ("title", "h1", "h2"):
+                continue
+            compact = self._normalized_match_text(block.content)
+            if any(self._normalized_match_text(value) in compact for value in issuer_tokens):
+                return True
+        return False
+
+    @staticmethod
+    def _is_bank_continuation_row(row: list[str]) -> bool:
+        cells = [
+            re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(cell or "")))
+            for cell in row
+        ]
+        has_date = any(
+            re.match(
+                r"^(?:19|20)\d{2}(?:[-/.年]?\d{2})(?:[-/.月]?\d{2})",
+                cell,
+            )
+            for cell in cells
+        )
+        amounts = sum(
+            bool(re.fullmatch(r"[+-]?\d[\d,]*\.\d{2}", cell))
+            for cell in cells
+        )
+        return has_date and amounts >= 2
 
     def _protected_extractor_categories(
         self,
@@ -287,6 +505,23 @@ class EvidenceEngine(BaseMiddleware):
                 if any(str(token) in file_name for token in spec.get("filename_tokens") or []):
                     protected.add(category)
         return protected
+
+    @staticmethod
+    def _protected_document_categories(evidence_list: list[Evidence]) -> set[str]:
+        """Return categories backed by a strong document identity frame."""
+        identity_sources = {
+            "document_frame",
+            "cover_frame",
+            "document_title",
+            "bank_ledger_structure",
+        }
+        return {
+            evidence.category
+            for evidence in evidence_list
+            if evidence.direction == 1
+            and evidence.source in identity_sources
+            and evidence.weight >= 0.55
+        }
 
     def _filename_evidence(self, result: ParseResult) -> list[Evidence]:
         """Filename tokens (issuer uploads often encode doc type in the name)."""
@@ -355,9 +590,12 @@ class EvidenceEngine(BaseMiddleware):
         compact_text = re.sub(r"\s+", "", full_text)
 
         def keyword_matches(keyword: str) -> bool:
+            compact_keyword = re.sub(r"\s+", "", keyword)
+            if re.fullmatch(r"[A-Za-z]{2,}\d{2,}", compact_keyword):
+                pattern = rf"(?<![A-Za-z0-9]){re.escape(compact_keyword)}(?![A-Za-z0-9])"
+                return re.search(pattern, compact_text) is not None
             if keyword in full_text:
                 return True
-            compact_keyword = re.sub(r"\s+", "", keyword)
             return len(compact_keyword) >= 3 and compact_keyword in compact_text
 
         # Precompute uniqueness weights
@@ -544,57 +782,52 @@ class EvidenceEngine(BaseMiddleware):
         """
         Fuse all evidence signals into a final verdict.
 
-        Algorithm (softmax-based):
-            1. Separate positive evidence and exclusion evidence
-            2. Exclusions are hard vetoes: remove any category with exclusion
-            3. Positive evidence is summed per category, then normalized
-            4. Confidence = best_score / (best_score + second_best_score + epsilon)
-            5. If gap between top 2 < 0.15, mark as ambiguous
+        A category confirmed by the visible first-page title is selected before
+        body-keyword candidates. Otherwise the legacy scoring path is unchanged.
         """
         if not evidence_list:
             return "generic", 0.0, []
 
         protected = protected or set()
-
-        # Hard veto: identify eliminated categories
-        vetoed: set[str] = set()
         positive: list[Evidence] = []
+        identity_confirmed = {
+            evidence.category
+            for evidence in evidence_list
+            if evidence.direction == 1
+            if evidence.source in {"document_title", "bank_ledger_structure"}
+            and evidence.weight >= 0.70
+        }
+
+        vetoed: set[str] = set()
         for ev in evidence_list:
             if ev.direction == -1:
-                if ev.category not in protected:
+                if ev.category not in protected and ev.category not in identity_confirmed:
                     vetoed.add(ev.category)
             else:
                 positive.append(ev)
 
-        # Sum positive evidence per category
         scores: dict[str, float] = {}
-        for ev in positive:
-            if ev.category in vetoed:
+        for evidence in positive:
+            if evidence.category in vetoed:
                 continue
-            scores[ev.category] = scores.get(ev.category, 0.0) + ev.weight
-
+            scores[evidence.category] = scores.get(evidence.category, 0.0) + evidence.weight
         if not scores:
             return "generic", 0.0, [ev.to_dict() for ev in evidence_list]
 
-        # Sort by score descending
-        sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
+        if identity_confirmed:
+            scores = {category: score for category, score in scores.items() if category in identity_confirmed}
+        sorted_scores = sorted(scores.items(), key=lambda item: -item[1])
+
         best_scene, best_score = sorted_scores[0]
         second_score = sorted_scores[1][1] if len(sorted_scores) >= 2 else 0.0
 
-        # Softmax-like relative confidence
+        # Legacy confidence calculation.
         epsilon = 0.001
         rel_confidence = best_score / (best_score + second_score + epsilon)
-
-        # Absolute confidence: keyword hit ratio for best category
-        # Count positive evidence items for best_scene vs total
         best_count = sum(1 for ev in positive if ev.category == best_scene)
-        # abs_confidence = how many evidence dimensions fired for best vs total
         abs_confidence = best_count / max(len(positive), 1)
-
-        # Blend relative (70%) and absolute (30%) scores
         confidence = 0.7 * rel_confidence + 0.3 * abs_confidence
 
-        # Ambiguous detection
         gap = (best_score - second_score) / max(best_score, epsilon)
         fused_evidence = [ev.to_dict() for ev in evidence_list]
         fused_evidence.append(
@@ -606,12 +839,12 @@ class EvidenceEngine(BaseMiddleware):
                 "detail": (
                     f"best={best_scene}({best_score:.3f}) "
                     f"second={sorted_scores[1][0] if len(sorted_scores) >= 2 else 'none'}({second_score:.3f}) "
-                    f"gap={gap:.3f} vetoed={sorted(vetoed)}"
+                    f"identity_confirmed={sorted(identity_confirmed)} vetoed={sorted(vetoed)}"
                 ),
             }
         )
 
-        if gap < 0.15 and len(sorted_scores) >= 2:
+        if not identity_confirmed and gap < 0.15 and len(sorted_scores) >= 2:
             second_scene = sorted_scores[1][0]
             logger.info(f"[EvidenceEngine] Ambiguous: {best_scene} vs {second_scene} (gap={gap:.3f})")
             best_scene, best_score, second_score = self._disambiguate_classification_group(

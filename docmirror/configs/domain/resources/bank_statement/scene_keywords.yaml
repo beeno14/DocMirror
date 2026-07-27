@@ -1,38 +1,54 @@
 version: 1
 scene_keywords:
   bank_reconciliation:
-    include:
-      - 银行对账单
-      - 账户余额
-      - 银行盖章
-      - Reconciliation
-      - Bank Reconciliation
-      - 余额调节
-      - 银行余额
-      - 银行回单
-      - 余额对账
+    include: []
   bank_statement:
+    ambiguity_group: payment_ledger
     ocr_domain: bank_statement
     filename_tokens: [银行流水]
     text_signatures:
+      - scope: title
+        source: document_title
+        required_groups:
+          - [银行流水, 银行交易流水, 交易流水, 活期存款明细账, 账户明细, 账户交易明细, 个人账户对账单, 账户对账单, 银行对账单, 月账单, 交易明细, 交易明细详情]
+          - [账号, 账户号, 卡号, Account No]
+        signal_groups:
+          - [银行, Bank, 开户行, 打印机构]
+          - [户名, 账户名称, 客户名称, Name]
+          - [起止日期, 申请时间, 打印时间, 日期]
+          - [币种, 币别, Currency, CNY, 人民币]
+          - [交易日期, 记账日期, 交易时间, Date]
+          - [交易金额, 发生额, 借方, 贷方, Amount]
+          - [账户余额, 联机余额, 余额, Balance]
+          - [交易摘要, 摘要, 对手信息, 对方户名, Counter Party]
+        min_matches: 4
+        weight: 0.85
       - scope: document
         source: document_frame
+        required_groups:
+          - [银行流水, 银行交易流水, 交易流水, 活期存款明细账, 账户明细, 账户交易明细, 个人账户对账单, 账户对账单, 银行对账单, 月账单, 交易明细, 交易明细详情]
+          - [账号, 账户号, 卡号, Account No]
         signal_groups:
-          - [农村商业银行, 商业银行, 开户行]
-          - [账号, 卡号]
-          - [起止日期, 起始日期, 申请时间]
-          - [交易明细, 交易明细详情]
-          - [余额]
-          - [对方户名, 对方开户行]
-          - [收入/支出金额, 收入, 支出]
-        min_matches: 5
-        weight: 0.55
-        weight_tiers: {6: 0.8}
+          - [银行, 农村商业银行, 商业银行, 开户行, 打印机构]
+          - [户名, 账户名称, 客户名称, Name]
+          - [起止日期, 起始日期, 申请时间, 打印时间, 账单月份, 日期]
+          - [账单币种, 币种, 币别, Currency, CNY, 人民币]
+          - [交易日期, 记账日期, 交易时间, Date]
+          - [交易金额, 发生额, 借方, 贷方, 收入/支出金额, 收入, 支出, Amount]
+          - [账户余额, 联机余额, 余额, Balance]
+          - [交易对手信息, 对手信息, 对手机构, 对手名称, 对方户名, 对方开户行, Counter Party]
+          - [交易摘要, 摘要代码, 摘要, 备注, Customer Type]
+        min_matches: 6
+        weight: 0.75
+        weight_tiers: {8: 0.9}
     header_signatures:
       - [交易时间, 金额, 余额, 对方户名, 摘要]
       - [交易日期, 摘要, 存入, 支出, 余额]
       - [DATE, DESCRIPTION, DEBITS, CREDITS, BALANCE]
       - [记账日期, 交易类型, 对方账号, 对方户名, 金额]
+      - [交易日期, 发生额, 账户余额, 交易对手信息, 摘要代码]
+      - [记账日期, 交易金额, 联机余额, 交易摘要, 对手信息]
+      - [日期, 发生额, 余额, 摘要, 对方户名]
     entity_signatures:
       - fields: [bank_name]
         min_matches: 1
@@ -46,6 +62,14 @@ scene_keywords:
         max_weight: 0.25
     include:
       - 银行流水
+      - 银行交易流水
+      - 交易流水
+      - 活期存款明细账
+      - 个人账户对账单
+      - 账户对账单
+      - 银行对账单
+      - 账户交易明细
+      - 月账单
       - 交易明细
       - 个人客户交易明细
       - 企业客户交易明细

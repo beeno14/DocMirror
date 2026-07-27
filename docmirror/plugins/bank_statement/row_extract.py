@@ -27,6 +27,7 @@ _ISO_DATE_RE = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
 _ISO_DATETIME_RE = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}")
 _COMPACT_DATE_RE = re.compile(r"^\d{8}$")
 _AMOUNT_RE = re.compile(r"^[+-]?\d[\d,]*\.?\d*$")
+_MONEY_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{1,2}")
 _SUMMARY_MARKERS = ("合计", "小计", "本页", "总计")
 
 
@@ -53,7 +54,9 @@ def row_has_transaction_data(row: list[str], *, strict_first_col: bool = False) 
     if strict_first_col and texts:
         has_date = _looks_like_date(texts[0]) or has_date
     has_amount = any(
-        _AMOUNT_RE.match(t.replace(",", "").replace("¥", "").replace("￥", "")) for t in texts if re.search(r"\d", t)
+        _AMOUNT_RE.match(t.replace(",", "").replace("¥", "").replace("￥", "")) or _MONEY_TOKEN_RE.search(t)
+        for t in texts
+        if re.search(r"\d", t)
     )
     return has_date and has_amount
 
