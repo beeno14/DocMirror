@@ -118,8 +118,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     ]
     assert len(supplement) == 34
     assert [
-        sum(row["account_identifier"] == account["account_identifier"] for row in supplement)
-        for account in accounts
+        sum(row["account_identifier"] == account["account_identifier"] for row in supplement) for account in accounts
     ] == [18, 5, 11]
     assert relationships[0]["relationship_type"] == "actual_controller"
     assert capital == [
@@ -184,7 +183,9 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "### 信用记录补充信息" not in enhanced
     assert "##### 余额与风险" in enhanced
     assert "##### 还款表现" in enhanced
-    assert "| 注册资本 | 币种 | 金额单位 | 主要出资人记录数 | 主要出资人信息状态 | 信息来源机构 | 更新日期 |" in enhanced
+    assert (
+        "| 注册资本 | 币种 | 金额单位 | 主要出资人记录数 | 主要出资人信息状态 | 信息来源机构 | 更新日期 |" in enhanced
+    )
     assert "| 100 | 人民币 | 万元（人民币） | 0 | 无记录 | 深圳前海微众银行股份有限公司 | 2022-10-08 |" in enhanced
     assert "#### 100 · 万元（人民币）" not in enhanced
     assert "**信息来源机构:** 深圳前海微众银行股份有限公司" in enhanced
@@ -197,12 +198,10 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         maxsplit=1,
     )[0]
     assert (
-        "| 组内序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | "
-        "开立日期 | 到期日期 | 信息截至日期 |"
+        "| 组内序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | 开立日期 | 到期日期 | 信息截至日期 |"
     ) in account_table
     assert (
-        "| 1 | 中长期借款 | Y10061000H0001EIP1967714 | "
-        "梅赛德斯-奔驰汽车金融有限公司 | 固定资产贷款 | 未结清 |"
+        "| 1 | 中长期借款 | Y10061000H0001EIP1967714 | 梅赛德斯-奔驰汽车金融有限公司 | 固定资产贷款 | 未结清 |"
     ) in account_table
     assert "| 2 | 短期借款 | JQ20220902XS0M00000460UN |" in account_table
     assert "| 3 | 循环透支 | D10055840H0001LE20220228XS000007641 |" in account_table
@@ -226,9 +225,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "account_balance_difference" not in facts["credit_summary"]
     assert "account_balance_reconciliation_tolerance" not in facts["credit_summary"]
     assert "account_balance_reconciliation_status" not in facts["credit_summary"]
-    balance_reconciliation = next(
-        item for item in audit["reconciliations"] if item["name"] == "credit_account_balance"
-    )
+    balance_reconciliation = next(item for item in audit["reconciliations"] if item["name"] == "credit_account_balance")
     assert balance_reconciliation == {
         "name": "credit_account_balance",
         "expected": 65.41,
@@ -248,9 +245,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     audit_appendix = enhanced[appendix_position:]
     assert "### 企业提取完整性审计" in audit_appendix
     assert "enterprise extraction audit" not in enhanced.lower()
-    assert [line for line in enhanced.splitlines() if line.startswith("## ")][-1] == (
-        "## 附录：文档来源与审计信息"
-    )
+    assert [line for line in enhanced.splitlines() if line.startswith("## ")][-1] == ("## 附录：文档来源与审计信息")
     assert "### 账户余额可比性检查（审计信息）" in audit_appendix
     assert "**源报告账户余额合计:** 65.41" in audit_appendix
     assert "**账户明细余额计算合计:** 65.42" in audit_appendix
@@ -280,21 +275,14 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         if item["name"] == "credit_account_balance"
     )
     assert persisted_reconciliation == balance_reconciliation
-    assert "_audit_reconciliations" not in {
-        dataset["name"] for dataset in persisted["datasets"]
-    }
+    assert "_audit_reconciliations" not in {dataset["name"] for dataset in persisted["datasets"]}
     audit_rows = list(
-        csv.DictReader(
-            (
-                written["datasets"] / "_audit_cells.csv"
-            ).read_text(encoding="utf-8-sig").splitlines()
-        )
+        csv.DictReader((written["datasets"] / "_audit_cells.csv").read_text(encoding="utf-8-sig").splitlines())
     )
     reconciliation_rows = [
         row
         for row in audit_rows
-        if row["dataset_id"] == "_audit_reconciliations"
-        and row["record_id"] == "audit:credit_account_balance"
+        if row["dataset_id"] == "_audit_reconciliations" and row["record_id"] == "audit:credit_account_balance"
     ]
     assert {row["field_key"]: row["value"] for row in reconciliation_rows} == {
         "expected": "65.41",
@@ -316,10 +304,10 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "enterprise_capital_summary": 1,
         "enterprise_stakeholders": 1,
         "enterprise_relationships": 1,
-            "enterprise_facility_summary": 2,
-            "enterprise_current_credit_summary": 4,
-            "enterprise_extraction_audit": 5,
-            "enterprise_attachment_accounts": 3,
+        "enterprise_facility_summary": 2,
+        "enterprise_current_credit_summary": 4,
+        "enterprise_extraction_audit": 5,
+        "enterprise_attachment_accounts": 3,
         "enterprise_credit_supplement": 34,
     }
 
@@ -346,7 +334,16 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     facts = semantic["domain"]["facts"]
 
+    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
     credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
+    account_identifiers = {row["account_identifier"] for row in accounts}
+    assert len(accounts) == 97
+    assert {
+        "2142019656",
+        "2142018846",
+        "D10123320H000170060110009028463",
+    }.issubset(account_identifiers)
+    assert "D10123320H000170060110009" not in account_identifiers
     assert [row["account_identifier"] for row in credit_lines] == [
         "B11215800H0001N24044608",
         "B11215800H0001N25027358",
@@ -371,10 +368,7 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         for row in datasets["enterprise_closed_credit_summary"]["rows"]
         if not row["normalized"]["is_total"]
     ]
-    assert {
-        row["business_category"]: row["total_account_count"]
-        for row in closed
-    } == {
+    assert {row["business_category"]: row["total_account_count"] for row in closed} == {
         "中长期借款": 13,
         "短期借款": 77,
         "贴现": 304,
@@ -390,42 +384,86 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     assert responsibility["other_credit_account_count"] == 3
     assert responsibility["other_credit_balance"] == "2180"
 
-    attachment_accounts = [
-        row["normalized"] for row in datasets["enterprise_attachment_accounts"]["rows"]
-    ]
-    histories = [
-        row["normalized"] for row in datasets["enterprise_credit_supplement"]["rows"]
-    ]
-    details = [
-        row["normalized"]
-        for row in datasets["enterprise_attachment_credit_details"]["rows"]
-    ]
-    transactions = [
-        row["normalized"] for row in datasets["enterprise_special_transactions"]["rows"]
-    ]
+    attachment_accounts = [row["normalized"] for row in datasets["enterprise_attachment_accounts"]["rows"]]
+    histories = [row["normalized"] for row in datasets["enterprise_credit_supplement"]["rows"]]
+    details = [row["normalized"] for row in datasets["enterprise_attachment_credit_details"]["rows"]]
+    transactions = [row["normalized"] for row in datasets["enterprise_special_transactions"]["rows"]]
     assert len(attachment_accounts) == 201
-    assert sum(
-        row["attachment_record_type"] == "account"
-        and row["account_status"] == "settled"
-        for row in attachment_accounts
-    ) == 190
-    assert sum(
-        row["attachment_record_type"] == "account"
-        and row["account_status"] == "active"
-        for row in attachment_accounts
-    ) == 8
+    assert (
+        sum(
+            row["attachment_record_type"] == "account" and row["account_status"] == "settled"
+            for row in attachment_accounts
+        )
+        == 190
+    )
+    assert (
+        sum(
+            row["attachment_record_type"] == "account" and row["account_status"] == "active"
+            for row in attachment_accounts
+        )
+        == 8
+    )
     assert sum(row["attachment_record_type"] == "business" for row in attachment_accounts) == 3
-    assert len(histories) == 465
+    assert len(histories) == 477
+    expected_cross_page_history_counts = {
+        "B11313900H0001216450100300036861": 1,
+        "D10123320H000170060110008723060": 2,
+        "D10123320H000170060110007838469": 1,
+        "0231000272200408000100": 1,
+        "F10233450H00012018060500002506": 1,
+        "216160100300390110": 1,
+        "D10123320H00012024010333324851": 1,
+        "D10123320H00012023061260320545": 1,
+        "D10123320H00012022110399785230": 2,
+        "D10123320H00012022051680855235": 1,
+    }
+    assert {
+        account_identifier: sum(row["account_identifier"] == account_identifier for row in histories)
+        for account_identifier in expected_cross_page_history_counts
+    } == expected_cross_page_history_counts
     assert max(row["source_page"] for row in histories) == 77
     assert histories[0]["account_identifier"] == "G10312900H000131055214010025006"
     assert histories[0]["institution"] == "上海农村商业银行股份有限公司宝山支行"
     assert len(details) == 109
+    assert all(row["five_tier_class"] for row in details)
+    assert sum(row["five_tier_class_source"] == "parent_attachment_heading" for row in details) == 8
+    active_discount = next(row for row in details if row["account_identifier"] == "D10123320H00012025070160898220")
+    assert active_discount["guarantee_type"] == "信用/无担保"
+    assert active_discount["snapshot_date"] == "2025-07-01"
+    assert active_discount["credit_agreement_identifier"] == ""
+    assert active_discount["credit_agreement_status"] == "not_reported"
     assert max(row["source_page"] for row in details) == 77
     assert len(transactions) == 23
     attachment_ids = {row["attachment_account_id"] for row in attachment_accounts}
     assert all(row["attachment_account_id"] in attachment_ids for row in histories)
     assert all(row["attachment_account_id"] in attachment_ids for row in details)
     assert all(row["attachment_account_id"] in attachment_ids for row in transactions)
+
+    rendered_csvs = bundle.render_dataset_csvs(semantic)
+    account_csv = next(content for path, content in rendered_csvs.items() if path.endswith("/credit_accounts.csv"))
+    history_csv = next(
+        content for path, content in rendered_csvs.items() if path.endswith("/enterprise_credit_supplement.csv")
+    )
+    detail_csv = next(
+        content for path, content in rendered_csvs.items() if path.endswith("/enterprise_attachment_credit_details.csv")
+    )
+    account_csv_rows = list(csv.DictReader(account_csv.splitlines()))
+    history_csv_rows = list(csv.DictReader(history_csv.splitlines()))
+    detail_csv_rows = list(csv.DictReader(detail_csv.splitlines()))
+    csv_account_identifiers = {row["account_identifier"].lstrip("'") for row in account_csv_rows}
+    assert len(account_csv_rows) == 97
+    assert len(history_csv_rows) == 477
+    assert {
+        "2142019656",
+        "2142018846",
+        "D10123320H000170060110009028463",
+    }.issubset(csv_account_identifiers)
+    active_discount_csv = next(
+        row for row in detail_csv_rows if row["account_identifier"].lstrip("'") == "D10123320H00012025070160898220"
+    )
+    assert active_discount_csv["guarantee_type"] == "信用/无担保"
+    assert active_discount_csv["snapshot_date"] == "2025-07-01"
+    assert active_discount_csv["credit_agreement_status"] == "not_reported"
 
     summary = facts["credit_summary"]
     assert summary["source_display_limited"] is True
@@ -470,32 +508,75 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     enhanced = bundle.render_enhanced_markdown(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     facts = semantic["domain"]["facts"]
+    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
+    details = [row["normalized"] for row in datasets["enterprise_attachment_credit_details"]["rows"]]
 
-    facilities = [
-        row["normalized"] for row in datasets["enterprise_facility_summary"]["rows"]
-    ]
+    assert sum(row["issuance_form"] == "新增" for row in accounts) == 5
+    assert len(details) == 188
+    assert {
+        status: sum(row["credit_agreement_status"] == status for row in details)
+        for status in ("reported", "not_reported", "not_applicable")
+    } == {
+        "reported": 1,
+        "not_reported": 79,
+        "not_applicable": 108,
+    }
+    guarantee_detail = next(
+        row for row in details if row["account_identifier"] == "G10423771H00065402377100013202503281003069991742282"
+    )
+    assert guarantee_detail["guarantee_type"] == ""
+    assert guarantee_detail["counter_guarantee_type"] == "信用/无担保/保证金"
+    assert guarantee_detail["deposit_ratio"] == "0.5"
+    assert guarantee_detail["balance"] == "2000"
+    assert guarantee_detail["risk_exposure_amount"] == "1000"
+    assert guarantee_detail["credit_agreement_identifier"] == "G10423771H00065879024720250329"
+    assert guarantee_detail["credit_agreement_status"] == "reported"
+    assert guarantee_detail["snapshot_date"] == "2025-03-29"
+    for account_identifier, expected_snapshot in (
+        ("G10323310H0001DLC8022025000052", "2025-05-13"),
+        ("G10323310H0001DLC8022025000055", "2025-05-14"),
+    ):
+        detail = next(row for row in details if row["account_identifier"] == account_identifier)
+        assert detail["counter_guarantee_type"] == "信用/无担保/保证金"
+        assert detail["deposit_ratio"] == "0.5"
+        assert detail["credit_agreement_identifier"] == ""
+        assert detail["credit_agreement_status"] == "not_reported"
+        assert detail["snapshot_date"] == expected_snapshot
+
+    detail_csv = next(
+        content
+        for path, content in bundle.render_dataset_csvs(semantic).items()
+        if path.endswith("/enterprise_attachment_credit_details.csv")
+    )
+    detail_csv_rows = list(csv.DictReader(detail_csv.splitlines()))
+    guarantee_detail_csv = next(
+        row
+        for row in detail_csv_rows
+        if row["account_identifier"].lstrip("'") == "G10423771H00065402377100013202503281003069991742282"
+    )
+    assert guarantee_detail_csv["counter_guarantee_type"] == "信用/无担保/保证金"
+    assert guarantee_detail_csv["deposit_ratio"] == "0.5"
+    assert guarantee_detail_csv["balance"] == "2000"
+    assert guarantee_detail_csv["risk_exposure_amount"] == "1000"
+    assert guarantee_detail_csv["credit_agreement_identifier"].lstrip("'") == "G10423771H00065879024720250329"
+    assert guarantee_detail_csv["snapshot_date"] == "2025-03-29"
+
+    facilities = [row["normalized"] for row in datasets["enterprise_facility_summary"]["rows"]]
     assert [
-        (row["facility_type"], row["total_limit"], row["used_limit"], row["available_limit"])
-        for row in facilities
+        (row["facility_type"], row["total_limit"], row["used_limit"], row["available_limit"]) for row in facilities
     ] == [
         ("non_revolving", "3000", "3000", "0"),
         ("revolving", "4900", "4900", "0"),
     ]
 
-    current = [
-        row["normalized"] for row in datasets["enterprise_current_credit_summary"]["rows"]
-    ]
+    current = [row["normalized"] for row in datasets["enterprise_current_credit_summary"]["rows"]]
     assert len(current) == 6
-    assert {
-        row["business_category"]
-        for row in current
-        if row["transaction_group"] == "借贷交易"
-    } == {"短期借款", "贴现", "合计"}
-    guarantee_rows = {
-        row["business_category"]: row
-        for row in current
-        if row["transaction_group"] == "担保交易"
+    assert {row["business_category"] for row in current if row["transaction_group"] == "借贷交易"} == {
+        "短期借款",
+        "贴现",
+        "合计",
     }
+    guarantee_rows = {row["business_category"]: row for row in current if row["transaction_group"] == "担保交易"}
     assert guarantee_rows["银行承兑汇票"]["total_account_count"] == 1
     assert guarantee_rows["银行承兑汇票"]["total_balance"] == "2000"
     assert guarantee_rows["信用证"]["normal_account_count"] == 0
@@ -503,6 +584,48 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert guarantee_rows["信用证"]["total_balance"] == "4000"
     assert guarantee_rows["合计"]["total_account_count"] == 3
     assert guarantee_rows["合计"]["total_balance"] == "6000"
+
+    displayed = [
+        row["normalized"]
+        for row in datasets["enterprise_displayed_credit_summary"]["rows"]
+    ]
+    assert len(displayed) == 7
+    settled_discount = next(
+        row
+        for row in displayed
+        if row["settlement_status"] == "settled"
+        and row["business_category"] == "贴现"
+    )
+    assert settled_discount["source_group_account_count"] == 100
+    assert settled_discount["source_account_count"] == 100
+    assert settled_discount["source_reported_amount"] == "3836.96"
+    assert settled_discount["amount_kind"] == "discount_amount"
+    active_discount = next(
+        row
+        for row in displayed
+        if row["settlement_status"] == "active"
+        and row["business_category"] == "贴现"
+    )
+    assert active_discount["source_group_account_count"] == 77
+    assert active_discount["source_account_count"] == 77
+    assert active_discount["source_reported_amount"] == "7511.68"
+    assert active_discount["overdue_total"] == "0"
+    assert active_discount["overdue_principal"] == "0"
+    displayed_csv = next(
+        content
+        for path, content in bundle.render_dataset_csvs(semantic).items()
+        if path.endswith("/enterprise_displayed_credit_summary.csv")
+    )
+    displayed_csv_rows = list(csv.DictReader(displayed_csv.splitlines()))
+    assert len(displayed_csv_rows) == 7
+    assert any(
+        row["settlement_status"] == "settled"
+        and row["business_category"] == "贴现"
+        and row["source_reported_amount"] == "3836.96"
+        for row in displayed_csv_rows
+    )
+    assert "### 信贷记录明细分组汇总" in enhanced
+    assert "3836.96" in enhanced
 
     responsibility = [
         row["normalized"]
@@ -515,9 +638,7 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert responsibility[0]["other_credit_account_count"] == 1
     assert responsibility[0]["other_credit_balance"] == "1100"
 
-    liabilities = [
-        row["normalized"] for row in datasets["repayment_liability_records"]["rows"]
-    ]
+    liabilities = [row["normalized"] for row in datasets["repayment_liability_records"]["rows"]]
     assert len(liabilities) == 1
     assert liabilities[0]["account_identifier"] == "D10023330H00029030001124000265200"
     assert liabilities[0]["contract_number"] == "D10023330H0002DB2024111100000171"
@@ -622,10 +743,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert datasets["enterprise_credit_supplement"]["row_count"] == 3
     assert datasets["enterprise_attachment_credit_details"]["row_count"] == 10
     assert datasets["enterprise_special_transactions"]["row_count"] == 2
-    audit_rows = [
-        row["normalized"]
-        for row in datasets["enterprise_extraction_audit"]["rows"]
-    ]
+    audit_rows = [row["normalized"] for row in datasets["enterprise_extraction_audit"]["rows"]]
     assert all(row["reconciliation_status"] == "complete" for row in audit_rows)
     assert all(row["unresolved_record_count"] == 0 for row in audit_rows)
     public_record_tokens = {
@@ -654,10 +772,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         "\n## ",
         maxsplit=1,
     )[0]
-    assert (
-        "| 序号 | 记录类型 | 主管/发布机构 | 记录类别 | 生效/发生日期 | 截止日期 | 记录内容 |"
-        in public_record_table
-    )
+    assert "| 序号 | 记录类型 | 主管/发布机构 | 记录类别 | 生效/发生日期 | 截止日期 | 记录内容 |" in public_record_table
     assert public_record_table.count("\n| ") == len(public_records) + 2
     assert "| 许可记录 |" in public_record_table
     assert "| 认证记录 |" in public_record_table
@@ -702,20 +817,24 @@ def test_credit_report_subtype_projects_complete_v3(
     assert payload["sections"]
     assert any(dataset["row_count"] > 0 for dataset in payload["datasets"])
     if subtype == "enterprise":
-        enterprise_datasets = {
-            dataset["name"]: dataset for dataset in payload["datasets"]
-        }
+        enterprise_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
         audit_dataset = enterprise_datasets["enterprise_extraction_audit"]
         audit_rows = [row["normalized"] for row in audit_dataset["rows"]]
+        assert all(row["expected_record_count"] == row["extracted_record_count"] for row in audit_rows)
         assert all(
-            row["expected_record_count"] == row["extracted_record_count"]
-            for row in audit_rows
+            row["reconciliation_status"] == "complete" and row["unresolved_record_count"] == 0 for row in audit_rows
         )
-        assert all(
-            row["reconciliation_status"] == "complete"
-            and row["unresolved_record_count"] == 0
-            for row in audit_rows
-        )
+        displayed_dataset = enterprise_datasets.get("enterprise_displayed_credit_summary")
+        if displayed_dataset is not None:
+            displayed_rows = [row["normalized"] for row in displayed_dataset["rows"]]
+            assert displayed_rows
+            assert all(row["summary_scope"] == "displayed_detail_section" for row in displayed_rows)
+            assert all(row["source_group_account_count"] > 0 for row in displayed_rows)
+            assert all(row["source_account_count"] > 0 for row in displayed_rows)
+    else:
+        assert "enterprise_displayed_credit_summary" not in {
+            dataset["name"] for dataset in payload["datasets"]
+        }
     if fixture.name in _DIGITAL_PERSONAL_BRIEF_EXPECTED:
         expected_accounts, expected_liabilities, expected_inquiries, expected_personal, expected_inactive = (
             _DIGITAL_PERSONAL_BRIEF_EXPECTED[fixture.name]
@@ -761,8 +880,7 @@ def test_credit_report_subtype_projects_complete_v3(
                 maxsplit=1,
             )[0]
             assert (
-                "| 组内序号 | 责任发生日期 | 相关方名称 | 管理机构 | 业务类型 | "
-                "责任金额 | 余额 | 币种 |"
+                "| 组内序号 | 责任发生日期 | 相关方名称 | 管理机构 | 业务类型 | 责任金额 | 余额 | 币种 |"
             ) in liability_preview
             assert "| sequence |" not in liability_preview
             assert "liability date" not in liability_preview
@@ -799,8 +917,7 @@ def test_credit_report_subtype_projects_complete_v3(
             huaxia_overdue = next(
                 row
                 for row in normalized_overdue
-                if row["institution"] == "华夏银行股份有限公司信用卡中心"
-                and row["open_date"] == "2022-07-19"
+                if row["institution"] == "华夏银行股份有限公司信用卡中心" and row["open_date"] == "2022-07-19"
             )
             assert huaxia_account["business_type"] == "贷记卡"
             assert huaxia_overdue["business_type"] == "贷记卡"

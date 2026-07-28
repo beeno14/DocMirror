@@ -12,6 +12,7 @@ shape validator.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -195,6 +196,57 @@ def numeric_row(
     return True
 
 
+def _date_like(value: Any) -> bool:
+    raw = str(value or "").replace(" ", "").strip()
+    return bool(
+        re.fullmatch(
+            r"(?:19|20)\d{2}[-年./]\d{1,2}[-月./]\d{1,2}日?",
+            raw,
+        )
+    )
+
+
+def _number_like(value: Any) -> bool:
+    raw = str(value or "").replace(",", "").replace("，", "").replace(" ", "").strip()
+    if raw in {"", "-", "--", "—"}:
+        return False
+    try:
+        float(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def _settled_account_detail_row(row: Row) -> bool:
+    values = [str(value or "").strip() for value in row]
+    if len(values) != 8:
+        return False
+    suffix = re.sub(r"[^0-9A-Z]", "", values[0].upper())
+    return bool(
+        (not suffix or len(suffix) <= 16)
+        and _date_like(values[1])
+        and values[2] in {"正常", "关注", "次级", "可疑", "损失", "违约", "未分类"}
+        and _date_like(values[3])
+        and (not values[5] or "还款" in values[5])
+    )
+
+
+def _attachment_history_continuation_row(row: Row) -> bool:
+    values = [str(value or "").strip() for value in row]
+    signature = "".join(values)
+    if "逾期月数" in signature and "最近一次约定还款日期" in signature and "最近一次还款形式" in signature:
+        return True
+
+    dense = [value for value in values if value]
+    if not dense or not 6 <= len(dense) <= 8:
+        return False
+    if _date_like(values[0] if values else ""):
+        return True
+    if values and not values[0]:
+        return bool(any(_date_like(value) for value in values[1:]) and any(_number_like(value) for value in values[1:]))
+    return False
+
+
 FACILITY_VALUE_CONTRACT = ContinuationContract(
     name="facility_summary_values",
     expected_columns=frozenset({6}),
@@ -213,7 +265,23 @@ CLOSED_SUMMARY_BODY_CONTRACT = ContinuationContract(
     forbidden_markers=("正常类账户数", "关注类账户数", "不良类账户数"),
 )
 
+ACCOUNT_SETTLED_DETAIL_CONTRACT = ContinuationContract(
+    name="enterprise_account_settled_detail",
+    expected_columns=frozenset({8}),
+    row_predicate=_settled_account_detail_row,
+    forbidden_markers=("账户编号", "授信机构", "业务种类", "借款金额"),
+)
+
+ATTACHMENT_HISTORY_BODY_CONTRACT = ContinuationContract(
+    name="enterprise_attachment_history_body",
+    expected_columns=frozenset({7, 8, 11}),
+    row_predicate=_attachment_history_continuation_row,
+    forbidden_markers=("账户编号", "授信机构", "开户日期", "开立日期", "信息报告日期"),
+)
+
 __all__ = [
+    "ACCOUNT_SETTLED_DETAIL_CONTRACT",
+    "ATTACHMENT_HISTORY_BODY_CONTRACT",
     "CLOSED_SUMMARY_BODY_CONTRACT",
     "ContinuationContract",
     "ContinuationMatch",

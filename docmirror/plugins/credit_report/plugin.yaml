@@ -39,6 +39,7 @@ projection:
     enterprise_facility_summary: 授信额度汇总
     enterprise_current_credit_summary: 当前信贷信息概要
     enterprise_closed_credit_summary: 已结清信贷信息概要
+    enterprise_displayed_credit_summary: 信贷记录明细分组汇总
     enterprise_repayment_responsibility_summary: 相关还款责任信息概要
     enterprise_extraction_audit: 企业提取完整性审计
     enterprise_attachment_accounts: 附件账户及业务清单
@@ -87,6 +88,7 @@ projection:
     enterprise_facility_summary: [credit_summary]
     enterprise_current_credit_summary: [credit_summary]
     enterprise_closed_credit_summary: [credit_summary]
+    enterprise_displayed_credit_summary: [credit_details]
     enterprise_repayment_responsibility_summary: [credit_summary]
     enterprise_attachment_accounts: [credit_supplement]
     enterprise_credit_supplement: [credit_supplement]
@@ -126,6 +128,7 @@ projection:
       - loan_amount_status
       - balance
       - balance_status
+      - issuance_form
       - account_state
       - activation_state
       - payoff_state
@@ -162,6 +165,7 @@ projection:
       - balance
       - currency
     repayment_records:
+      - account_identifier
       - year
       - month
       - status
@@ -256,6 +260,23 @@ projection:
       - attention_account_count
       - adverse_account_count
       - total_account_count
+    enterprise_displayed_credit_summary:
+      - settlement_status
+      - transaction_group
+      - business_category
+      - institution
+      - business_type
+      - five_tier_class
+      - source_group_account_count
+      - source_account_count
+      - source_reported_amount
+      - amount_kind
+      - overdue_total
+      - overdue_principal
+      - advance_flag
+      - summary_scope
+      - currency
+      - amount_unit
     enterprise_repayment_responsibility_summary:
       - responsibility_type
       - recovered_responsibility_amount
@@ -312,7 +333,16 @@ projection:
       - amount
       - amount_unit
       - close_date
+      - guarantee_type
+      - counter_guarantee_type
+      - deposit_ratio
+      - balance
+      - risk_exposure_amount
       - five_tier_class
+      - five_tier_class_source
+      - credit_agreement_identifier
+      - credit_agreement_status
+      - snapshot_date
       - last_repayment_date
       - repayment_method
       - advance_flag

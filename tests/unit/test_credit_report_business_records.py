@@ -217,6 +217,67 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
     ]
 
 
+def test_enterprise_displayed_credit_summaries_preserve_source_reported_grain() -> None:
+    tables = [
+        _native_table(
+            "active-discount",
+            [
+                ["贴现", "", "", "共 77 笔", "", "", ""],
+                ["授信机构", "业务种类", "五级分类", "账户数", "余额", "逾期总额", "逾期本金"],
+                ["示例银行", "有追索权的银行承兑汇票贴现", "正常", "77", "7511.68", "0", "0"],
+            ],
+        ),
+        _native_table(
+            "active-guarantee",
+            [
+                ["银行承兑汇票和信用证", "", "共 3 笔", "", ""],
+                ["授信机构", "业务种类", "五级分类", "账户数", "余额"],
+                ["示例银行", "银行承兑汇票", "正常", "1", "2000"],
+                ["另一银行", "信用证", "未分类", "2", "4000"],
+            ],
+        ),
+        _native_table(
+            "settled-discount",
+            [
+                ["贴现", "", "共 100 笔", "", ""],
+                ["授信机构", "业务种类", "五级分类", "账户数", "贴现金额"],
+                ["示例银行", "有追索权的银行承兑汇票贴现", "正常", "100", "3836.96"],
+            ],
+        ),
+        _native_table(
+            "settled-guarantee",
+            [
+                ["银行承兑汇票和信用证", "", "共 4 笔", "", ""],
+                ["授信机构", "业务种类", "五级分类", "账户数", "垫款标志"],
+                ["示例银行", "银行承兑汇票", "正常", "4", "否"],
+            ],
+        ),
+    ]
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=6, source_page_number=6, tables=tables, texts=[])]
+    )
+
+    rows = extract_enterprise_summary_datasets(result)["enterprise_displayed_credit_summary"]
+
+    assert len(rows) == 5
+    assert {
+        (row["settlement_status"], row["amount_kind"], row["source_reported_amount"])
+        for row in rows
+    } == {
+        ("active", "balance", 7511.68),
+        ("active", "balance", 2000),
+        ("active", "balance", 4000),
+        ("settled", "discount_amount", 3836.96),
+        ("settled", "not_applicable", None),
+    }
+    assert rows[0]["source_group_account_count"] == 77
+    assert rows[0]["source_account_count"] == 77
+    assert rows[0]["overdue_total"] == 0
+    assert rows[0]["overdue_principal"] == 0
+    assert rows[-1]["advance_flag"] == "否"
+    assert all(row["summary_scope"] == "displayed_detail_section" for row in rows)
+
+
 def test_enterprise_repayment_liability_detail_merges_page_continuation() -> None:
     primary = _native_table(
         "liability-primary",

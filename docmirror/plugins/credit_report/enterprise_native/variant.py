@@ -345,6 +345,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "balance": {"label": "余额", "type": "money"},
                 "balance_change_date": {"label": "余额变化日期", "type": "date"},
                 "five_tier_class": {"label": "五级分类", "type": "string"},
+                "five_tier_class_source": {
+                    "label": "五级分类来源",
+                    "type": "string",
+                },
                 "classification_date": {"label": "五级分类认定日期", "type": "date"},
                 "overdue_total": {"label": "逾期总额", "type": "money"},
                 "overdue_principal": {"label": "逾期本金", "type": "money"},
@@ -359,7 +363,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "integer",
                     "definition": "源报告字段为剩余还款月数。",
                 },
+                "issuance_form": {"label": "发放形式", "type": "string"},
                 "guarantee_type": {"label": "担保方式", "type": "string"},
+                "counter_guarantee_type": {"label": "反担保方式", "type": "string"},
+                "deposit_ratio": {"label": "保证金比例", "type": "percentage"},
+                "risk_exposure_amount": {"label": "风险敞口", "type": "money"},
                 "status": {"label": "账户状态", "type": "string"},
                 "current_overdue_amount": {"label": "当前逾期总额", "type": "money"},
                 "current_overdue_periods": {"label": "当前逾期月数", "type": "integer"},
@@ -375,10 +383,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "long_id",
                     "sensitive": True,
                 },
+                "credit_agreement_status": {
+                    "label": "授信协议编号报告状态",
+                    "type": "string",
+                },
                 "history_status": {"label": "历史表现", "type": "string"},
                 "closed_summary_id": {"label": "已结清概要ID", "type": "string"},
                 "current_summary_id": {"label": "当前信贷概要ID", "type": "string"},
+                "displayed_summary_id": {"label": "明细分组汇总ID", "type": "string"},
                 "transaction_group": {"label": "交易分组", "type": "string"},
+                "settlement_status": {"label": "结清状态", "type": "string"},
                 "normal_account_count": {"label": "正常类账户数", "type": "integer"},
                 "normal_balance": {"label": "正常类余额", "type": "money"},
                 "attention_account_count": {"label": "关注类账户数", "type": "integer"},
@@ -387,6 +401,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "adverse_balance": {"label": "不良类余额", "type": "money"},
                 "total_account_count": {"label": "账户合计", "type": "integer"},
                 "total_balance": {"label": "余额合计", "type": "money"},
+                "source_group_account_count": {"label": "源分组账户总数", "type": "integer"},
+                "source_account_count": {"label": "源汇总行账户数", "type": "integer"},
+                "source_reported_amount": {"label": "源报告金额", "type": "money"},
+                "amount_kind": {"label": "源报告金额口径", "type": "string"},
+                "summary_scope": {"label": "汇总口径", "type": "string"},
                 "is_total": {"label": "是否合计行", "type": "boolean"},
                 "responsibility_summary_id": {
                     "label": "还款责任概要ID",
@@ -484,6 +503,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         account_columns["status"] = fields["status"]
         for key in (
             "business_category",
+            "issuance_form",
             "guarantee_type",
             "five_tier_class",
             "current_overdue_amount",
@@ -711,6 +731,43 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
+        dictionary["datasets"]["enterprise_displayed_credit_summary"] = {
+            "definition": (
+                "一行对应信贷记录明细中按机构、业务种类和五级分类展示的一条源汇总行；"
+                "源报告金额与逐笔明细分别保留，不强制调平。"
+            ),
+            "aggregation": "仅用于复现源报告明细分组汇总，不得与账户明细、附件明细或信息概要相加。",
+            "non_additive_with": [
+                "credit_accounts",
+                "enterprise_attachment_credit_details",
+                "enterprise_current_credit_summary",
+                "enterprise_closed_credit_summary",
+            ],
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "sequence",
+                    "displayed_summary_id",
+                    "settlement_status",
+                    "transaction_group",
+                    "business_category",
+                    "institution",
+                    "business_type",
+                    "five_tier_class",
+                    "source_group_account_count",
+                    "source_account_count",
+                    "source_reported_amount",
+                    "amount_kind",
+                    "overdue_total",
+                    "overdue_principal",
+                    "advance_flag",
+                    "summary_scope",
+                    "currency",
+                    "amount_unit",
+                    "source_page",
+                )
+            },
+        }
         dictionary["datasets"]["enterprise_repayment_responsibility_summary"] = {
             "definition": "相关还款责任信息概要中的一种责任类型或合计行一行。",
             "columns": {
@@ -814,7 +871,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "amount",
                     "amount_unit",
                     "close_date",
+                    "guarantee_type",
+                    "counter_guarantee_type",
+                    "deposit_ratio",
+                    "balance",
+                    "risk_exposure_amount",
                     "five_tier_class",
+                    "five_tier_class_source",
+                    "credit_agreement_identifier",
+                    "credit_agreement_status",
+                    "snapshot_date",
                     "last_repayment_date",
                     "repayment_method",
                     "advance_flag",
@@ -909,6 +975,15 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "reported": "已报告",
             "not_reported": "未报告",
         }
+        enums["credit_agreement_status"] = {
+            "reported": "已报告",
+            "not_reported": "未报告",
+            "not_applicable": "不适用",
+        }
+        enums["five_tier_class_source"] = {
+            "detail_table": "信贷明细表",
+            "parent_attachment_heading": "附件业务标题",
+        }
         enums["continuation_complete"] = {"true": "是", "false": "否"}
         enums["continuation_family"] = {
             "current_credit_summary": "当前信贷信息概要",
@@ -951,6 +1026,18 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "active": "未结清",
             "settled": "已结清",
         }
+        enums["settlement_status"] = {
+            "active": "未结清",
+            "settled": "已结清",
+        }
+        enums["amount_kind"] = {
+            "balance": "余额",
+            "discount_amount": "贴现金额",
+            "not_applicable": "不适用",
+        }
+        enums["summary_scope"] = {
+            "displayed_detail_section": "信贷记录明细展示分组",
+        }
         enums["status"] = {
             "active": "未结清",
             "settled": "已结清",
@@ -977,7 +1064,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "relationship": "independent_enterprise_facility_records",
                 "additive": False,
                 "non_additive_with": ["credit_accounts", "credit_summary.facility_summary"],
-            }
+            },
+            "enterprise_displayed_credit_summary": {
+                "relationship": "source_reported_displayed_detail_groups",
+                "additive": False,
+                "non_additive_with": [
+                    "credit_accounts",
+                    "enterprise_attachment_credit_details",
+                    "enterprise_current_credit_summary",
+                    "enterprise_closed_credit_summary",
+                ],
+            },
         }
         semantic["audit_csv"] = {
             "reconciliations": [
@@ -1113,6 +1210,26 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "total_account_count",
                     ],
                 },
+                "enterprise_displayed_credit_summary": {
+                    "mode": "grouped_table",
+                    "group_by": "settlement_status",
+                    "group_title_prefix": "",
+                    "columns": [
+                        "business_category",
+                        "institution",
+                        "business_type",
+                        "five_tier_class",
+                        "source_group_account_count",
+                        "source_account_count",
+                        "source_reported_amount",
+                        "amount_kind",
+                        "overdue_total",
+                        "overdue_principal",
+                        "advance_flag",
+                        "currency",
+                        "amount_unit",
+                    ],
+                },
                 "enterprise_repayment_responsibility_summary": {
                     "columns": [
                         "responsibility_type",
@@ -1201,6 +1318,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "loan_amount",
                         "credit_limit",
                         "balance",
+                        "issuance_form",
                         "guarantee_type",
                         "five_tier_class",
                         "current_overdue_amount",
@@ -1314,7 +1432,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "amount",
                         "amount_unit",
                         "close_date",
+                        "guarantee_type",
+                        "counter_guarantee_type",
+                        "deposit_ratio",
+                        "balance",
+                        "risk_exposure_amount",
                         "five_tier_class",
+                        "five_tier_class_source",
+                        "credit_agreement_identifier",
+                        "credit_agreement_status",
+                        "snapshot_date",
                         "last_repayment_date",
                         "repayment_method",
                         "advance_flag",

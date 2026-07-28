@@ -45,6 +45,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("card_tail", ("card_tail",)),
         ("status", ("account_status", "status")),
         ("repayment_method", ("repayment_method",)),
+        ("issuance_form", ("issuance_form",)),
         ("guarantee_type", ("guarantee_type",)),
         ("special_transaction", ("special_transaction",)),
         ("credit_agreement_identifier", ("credit_agreement_identifier",)),
