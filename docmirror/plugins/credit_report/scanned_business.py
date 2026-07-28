@@ -5,11 +5,17 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 from difflib import SequenceMatcher
 from types import SimpleNamespace
 from typing import Any
+
+from docmirror.plugins.credit_report.value_utils import (
+    compact_text as _compact,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    stable_record_id as _stable_id,
+)
 
 _PROFILE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("gender", ("性别",)),
@@ -66,10 +72,6 @@ _ACCOUNT_SECTION_MARKERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _compact(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or ""))
-
-
 def _plain_field(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
@@ -77,11 +79,6 @@ def _plain_field(value: Any) -> Any:
         if value.get(key) not in (None, ""):
             return value[key]
     return None
-
-
-def _stable_id(prefix: str, *parts: Any) -> str:
-    identity = "|".join(_compact(part).upper() for part in parts)
-    return f"{prefix}:{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _table_matrix(table: Any) -> list[list[str]]:
@@ -1017,7 +1014,7 @@ def extract_scanned_credit_business(parse_result: Any, full_text: str) -> dict[s
     accounts = extract_scanned_credit_accounts(parse_result)
     _reconcile_account_institutions(accounts, inquiries)
     account_count = _reported_account_count(full_text, parse_result)
-    summary = {"source": "scanned_credit_report"}
+    summary: dict[str, Any] = {"source": "scanned_credit_report"}
     if account_count is not None:
         summary["reported_account_count"] = account_count
     return {
@@ -1055,7 +1052,8 @@ def link_repayment_records_to_accounts(
         grid_id = str(first_ref.get("grid_id") or item.get("grid_id") or "")
         grid = grids.get(grid_id, {})
         page = int(grid.get("page") or first_ref.get("page") or 0)
-        grid_bbox = grid.get("bbox") if isinstance(grid.get("bbox"), list) else [0, 0, 0, 0]
+        raw_grid_bbox = grid.get("bbox")
+        grid_bbox: list[Any] = raw_grid_bbox if isinstance(raw_grid_bbox, list) else [0, 0, 0, 0]
         grid_y = float(grid_bbox[1]) if len(grid_bbox) == 4 else 0.0
         current = accounts_by_page.get(page) or []
         preceding = [

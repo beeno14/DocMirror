@@ -12,12 +12,22 @@ derives their overdue view from already-projected records.
 
 from __future__ import annotations
 
-import hashlib
 import re
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from docmirror.plugins.credit_report.currency_codes import normalize_currency_code
+from docmirror.plugins.credit_report.value_utils import (
+    compact_text as _compact,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    linear_text as _linear,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    parse_number as _number,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    stable_record_id as _stable_id,
+)
 
 _DATE_CN_RE = re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日")
 _ACCOUNT_DATE_PATTERN = r"20\d{2}年\s*\d{1,2}月\s*\d{1,2}日"
@@ -25,9 +35,7 @@ _ACCOUNT_START_RE = re.compile(
     rf"{_ACCOUNT_DATE_PATTERN}"
     rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,100}}?(?:发放的|为(?=.{{0,30}}贷款授信)))"
 )
-_PERSONAL_BRIEF_CARD_TYPE_RE = re.compile(
-    r"^(?P<business_type>准贷记卡|贷记卡)(?=[（(，,。；;账户]|$)"
-)
+_PERSONAL_BRIEF_CARD_TYPE_RE = re.compile(r"^(?P<business_type>准贷记卡|贷记卡)(?=[（(，,。；;账户]|$)")
 _ENTERPRISE_ACCOUNT_RE = re.compile(r"(?:\d+\.)?(未结清|已结清)账户编号\s*[:：]?")
 
 _INQUIRY_REASONS = tuple(
@@ -53,15 +61,6 @@ _INQUIRY_REASONS = tuple(
 )
 
 
-def _linear(text: str) -> str:
-    text = str(text or "").replace("**", "").replace("|", " ")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _compact(text: str) -> str:
-    return re.sub(r"\s+", "", str(text or ""))
-
-
 def _iso_date(value: str) -> str:
     match = _DATE_CN_RE.search(str(value or ""))
     if match:
@@ -77,23 +76,6 @@ def _iso_month(value: str) -> str:
     if not match:
         return ""
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
-
-
-def _number(value: str) -> int | float | None:
-    raw = re.sub(r"[^0-9.-]", "", str(value or "").replace(",", ""))
-    if not raw or raw in {"-", ".", "-."}:
-        return None
-    try:
-        number = Decimal(raw)
-    except InvalidOperation:
-        return None
-    return int(number) if number == number.to_integral_value() else float(number)
-
-
-def _stable_id(prefix: str, *parts: Any) -> str:
-    identity = "|".join(_compact(str(part or "")).upper() for part in parts)
-    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:16]
-    return f"{prefix}:{digest}"
 
 
 def _page_texts(parse_result: Any) -> list[tuple[int, str, str]]:
@@ -739,7 +721,8 @@ def _enterprise_accounts_from_canonical_tables(parse_result: Any) -> list[dict[s
         page_number = int(getattr(page, "page_number", 0) or 0)
         for table in getattr(page, "tables", []) or []:
             metadata = dict(getattr(table, "metadata", None) or {})
-            raw_rows = metadata.get("raw_rows") if isinstance(metadata.get("raw_rows"), list) else []
+            raw_rows_value = metadata.get("raw_rows")
+            raw_rows: list[Any] = raw_rows_value if isinstance(raw_rows_value, list) else []
             rows = [[_compact(str(value or "")) for value in row] for row in raw_rows if isinstance(row, list)]
             if not rows:
                 continue
@@ -749,15 +732,15 @@ def _enterprise_accounts_from_canonical_tables(parse_result: Any) -> list[dict[s
                 if schema:
                     schemas_by_width[width] = schema
                     continue
-                schema = schemas_by_width.get(width)
-                if not schema:
+                active_schema = schemas_by_width.get(width)
+                if not active_schema:
                     continue
-                account_col = schema.get("account_identifier", 0)
+                account_col = active_schema.get("account_identifier", 0)
                 raw_identifier = row[account_col] if account_col < len(row) else ""
                 account_identifier = re.sub(r"[^A-Z0-9]", "", raw_identifier.upper())
                 if len(account_identifier) < 12 or not re.search(r"[A-Z]", account_identifier):
                     continue
-                values = {field: row[col] if col < len(row) else "" for field, col in schema.items()}
+                values = {field: row[col] if col < len(row) else "" for field, col in active_schema.items()}
                 record = records.setdefault(
                     account_identifier,
                     {
@@ -926,7 +909,8 @@ def _enterprise_summary_from_canonical_tables(parse_result: Any | None) -> dict[
     for page in getattr(parse_result, "pages", []) or []:
         for table in getattr(page, "tables", []) or []:
             metadata = dict(getattr(table, "metadata", None) or {})
-            raw_rows = metadata.get("raw_rows") if isinstance(metadata.get("raw_rows"), list) else []
+            raw_rows_value = metadata.get("raw_rows")
+            raw_rows: list[Any] = raw_rows_value if isinstance(raw_rows_value, list) else []
             compact_rows = [[_compact(value) for value in row] for row in raw_rows if isinstance(row, list)]
             for row_index, row in enumerate(compact_rows[:-1]):
                 if not (any("借贷交易" in value for value in row) and any("担保交易" in value for value in row)):

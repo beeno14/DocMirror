@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any
+from typing import Any, cast
 
 from docmirror.plugins._base.community_reading_view import (
     assemble_reading_view,
@@ -130,7 +130,8 @@ def _record_pages(value: Any) -> tuple[list[int], list[int]]:
         direct_page = _page_number(record.get("page"))
         if direct_page:
             logical_pages.append(direct_page)
-        refs = record.get("source_refs") if isinstance(record.get("source_refs"), list) else []
+        raw_refs = record.get("source_refs")
+        refs: list[Any] = raw_refs if isinstance(raw_refs, list) else []
         for ref in refs:
             if not isinstance(ref, dict):
                 continue
@@ -206,13 +207,16 @@ def build_credit_report_reading_view(parse_result: Any, data: dict[str, Any]) ->
     sections = normalize_sections(parse_result, list(data.get("sections") or []))
     tables = _merge_by_id(list(data.get("tables") or []), _build_tables(parse_result, data, sections))
     notes = _merge_by_id(list(data.get("notes") or []), extract_labeled_notes(parse_result, sections))
-    return assemble_reading_view(
-        parse_result,
-        fields=dict(data.get("fields") or {}),
-        field_keys=_HEADER_FIELDS,
-        sections=sections,
-        tables=tables,
-        notes=notes,
+    return cast(
+        dict[str, list[dict[str, Any]]],
+        assemble_reading_view(
+            parse_result,
+            fields=dict(data.get("fields") or {}),
+            field_keys=_HEADER_FIELDS,
+            sections=sections,
+            tables=tables,
+            notes=notes,
+        ),
     )
 
 

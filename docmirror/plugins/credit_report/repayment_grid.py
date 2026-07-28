@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from docmirror.ocr.micro_grid.cell_recognition import (
     extract_micro_cell_glyph_template,
@@ -55,7 +55,7 @@ def _text(obj: Any) -> str:
 def _confidence(obj: Any) -> float:
     val = obj.get("confidence") if isinstance(obj, dict) else getattr(obj, "confidence", 1.0)
     try:
-        return float(val)
+        return float(val if val is not None else 1.0)
     except (TypeError, ValueError):
         return 1.0
 
@@ -127,7 +127,7 @@ def _cell_bbox(row_band: dict[str, Any], col_band: dict[str, Any]) -> BBox:
 def _assign_row(
     tokens: list[OCRToken], row_band: dict[str, Any], cols: list[dict[str, Any]]
 ) -> dict[int, list[OCRToken]]:
-    return assign_tokens_to_col_bands(tokens, row_band, cols)
+    return cast(dict[int, list[OCRToken]], assign_tokens_to_col_bands(tokens, row_band, cols))
 
 
 def _token_text(tokens: list[OCRToken], *, allowed: set[str] | None = None) -> str:
@@ -152,7 +152,7 @@ def _normalize_amount_text(text: str) -> str:
     compact = normalized.replace(",", "").replace(".", "")
     if compact and set(compact) == {"0"}:
         return "0"
-    return normalized
+    return str(normalized)
 
 
 def _strong_visual_status(recognition: Any) -> bool:
@@ -231,7 +231,10 @@ def _nearest_year_lines(lines: list[dict[str, Any]], anchor: dict[str, Any]) -> 
 
 
 def _month_col_bands(header_line: dict[str, Any], *, n_months: int = 12) -> list[dict[str, Any]]:
-    return equal_col_bands(header_line["bbox"], count=n_months, start_index=1, role="month")
+    return cast(
+        list[dict[str, Any]],
+        equal_col_bands(header_line["bbox"], count=n_months, start_index=1, role="month"),
+    )
 
 
 def _visual_page_context(
@@ -510,7 +513,7 @@ def reconstruct_repayment_micro_grid_from_lines(
     year_x0 = min(float(year_line["bbox"][0]) for year_line in years)
     year_x1 = max(float(year_line["bbox"][2]) for year_line in years)
     year_y1 = max(float(year_line["bbox"][3]) for year_line in years)
-    year_col_band = {
+    year_col_band: dict[str, Any] = {
         "index": 0,
         "header": "year",
         "role": "year",

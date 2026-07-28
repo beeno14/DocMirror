@@ -16,6 +16,19 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from docmirror.plugins.credit_report.contracts import (
+    CONTENT_MODE_MIXED,
+    CONTENT_MODE_NATIVE,
+    CONTENT_MODE_SCANNED,
+    CONTENT_MODE_UNKNOWN,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    compact_text as _compact,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    linear_text as _linear,
+)
+
 REPORT_SUBTYPES = frozenset({"personal_brief", "personal_detail", "enterprise"})
 
 _PERSON_ID_RE = re.compile(r"^(?:\d{15}|\d{17}[\dX]|[\dX*]{15,18})$")
@@ -25,15 +38,6 @@ _MARITAL_STATUS_CODES = {
     "已婚": "married",
     "离婚": "divorced",
 }
-
-
-def _compact(text: str) -> str:
-    return re.sub(r"\s+", "", str(text or ""))
-
-
-def _linear(text: str) -> str:
-    text = str(text or "").replace("**", "").replace("|", " ")
-    return re.sub(r"\s+", " ", text).strip()
 
 
 def detect_credit_report_subtype(parse_result: Any, full_text: str = "") -> str:
@@ -71,9 +75,11 @@ def detect_credit_report_subtype(parse_result: Any, full_text: str = "") -> str:
         return "personal_brief"
     if "个人信用报告" in compact:
         return (
-            "personal_detail" if detect_credit_report_content_mode(parse_result) == "scanned_ocr" else "personal_brief"
+            "personal_detail"
+            if detect_credit_report_content_mode(parse_result) == CONTENT_MODE_SCANNED
+            else "personal_brief"
         )
-    if detect_credit_report_content_mode(parse_result) == "scanned_ocr":
+    if detect_credit_report_content_mode(parse_result) == CONTENT_MODE_SCANNED:
         return "personal_detail"
     return "unknown"
 
@@ -85,16 +91,16 @@ def detect_credit_report_content_mode(parse_result: Any) -> str:
     ]
     modes = [mode for mode in modes if mode]
     if not modes:
-        return "native_text" if getattr(parse_result, "pages", None) else "unknown"
+        return CONTENT_MODE_NATIVE if getattr(parse_result, "pages", None) else CONTENT_MODE_UNKNOWN
     scanned = sum(mode in {"scanned", "scanned_ocr", "ocr", "image"} for mode in modes)
     native = sum(mode in {"native", "native_text", "digital_text"} for mode in modes)
     if scanned == len(modes):
-        return "scanned_ocr"
+        return CONTENT_MODE_SCANNED
     if native == len(modes):
-        return "native_text"
+        return CONTENT_MODE_NATIVE
     if scanned:
-        return "mixed"
-    return "native_text"
+        return CONTENT_MODE_MIXED
+    return CONTENT_MODE_NATIVE
 
 
 def _search(text: str, pattern: str, *, flags: int = 0) -> str:
@@ -233,9 +239,7 @@ def recover_credit_report_header_fields(
     )
     if title_match:
         fields["document_label"] = "".join(
-            part.replace("(", "（").replace(")", "）")
-            for part in title_match.groups()
-            if part
+            part.replace("(", "（").replace(")", "）") for part in title_match.groups() if part
         )
 
     if subtype == "enterprise":

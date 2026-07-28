@@ -46,4 +46,4 @@ def domain_type_ok(field_key: str, cell: dict) -> bool:
     inferred = tuple(cell.get("inferred_types") or ())
     if cell.get("geometry_status") == "quarantined":
         return False
-    return types_compatible_with_hint(inferred, allowed)
+    return bool(types_compatible_with_hint(inferred, allowed))

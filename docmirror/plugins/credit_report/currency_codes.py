@@ -216,9 +216,7 @@ _ALIASES_BY_CODE: dict[str, tuple[str, ...]] = {
 }
 
 CURRENCY_CODE_BY_ALIAS = {
-    re.sub(r"\s+", "", alias).upper(): code
-    for code, aliases in _ALIASES_BY_CODE.items()
-    for alias in aliases
+    re.sub(r"\s+", "", alias).upper(): code for code, aliases in _ALIASES_BY_CODE.items() for alias in aliases
 }
 _SORTED_ALIASES = tuple(sorted(CURRENCY_CODE_BY_ALIAS, key=len, reverse=True))
 
@@ -232,11 +230,11 @@ def normalize_currency_code(value: str) -> str:
     upper = compact.upper()
     for token in re.findall(r"(?<![A-Z])([A-Z]{3})(?![A-Z])", upper):
         if token in ISO_4217_CURRENT_CODES:
-            return token
+            return str(token)
 
     for alias in _SORTED_ALIASES:
         if alias in upper:
-            return CURRENCY_CODE_BY_ALIAS[alias]
+            return str(CURRENCY_CODE_BY_ALIAS[alias])
     return ""
 
 

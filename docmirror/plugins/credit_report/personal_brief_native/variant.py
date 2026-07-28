@@ -22,7 +22,14 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
             keep_query_institution=False,
         )
 
-    def build_section_content(self, parse_result: Any, full_text: str) -> dict[str, Any]:
+    def build_section_content(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        auxiliary_business: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        del auxiliary_business
         from docmirror.plugins.credit_report.personal_brief_native.extraction import (
             extract_personal_brief_section_content,
         )

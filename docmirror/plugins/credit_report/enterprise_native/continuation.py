@@ -15,7 +15,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-
 Row = list[str]
 RowPredicate = Callable[[Row], bool]
 
@@ -42,7 +41,6 @@ class ContinuationContract:
     row_predicate: RowPredicate
     max_page_gap: int = 1
     forbidden_markers: tuple[str, ...] = ()
-    require_next_physical_table: bool = True
 
 
 @dataclass(frozen=True)
@@ -70,9 +68,7 @@ def _raw_rows(table: Any) -> list[Row]:
     raw_rows = metadata.get("raw_rows")
     if isinstance(raw_rows, list) and raw_rows:
         return [
-            [str(value or "").replace("\n", "").strip() for value in row]
-            for row in raw_rows
-            if isinstance(row, list)
+            [str(value or "").replace("\n", "").strip() for value in row] for row in raw_rows if isinstance(row, list)
         ]
     rows: list[Row] = []
     headers = list(getattr(table, "headers", None) or [])
@@ -80,12 +76,7 @@ def _raw_rows(table: Any) -> list[Row]:
         rows.append([str(value or "").replace("\n", "").strip() for value in headers])
     for row in getattr(table, "rows", None) or []:
         cells = getattr(row, "cells", None) or []
-        rows.append(
-            [
-                str(getattr(cell, "text", cell) or "").replace("\n", "").strip()
-                for cell in cells
-            ]
-        )
+        rows.append([str(getattr(cell, "text", cell) or "").replace("\n", "").strip() for cell in cells])
     return rows
 
 
@@ -93,13 +84,14 @@ class EnterpriseContinuationResolver:
     """Resolve only explicitly authorized enterprise table continuations."""
 
     def __init__(self, parse_result: Any):
+        self.rejections: list[ContinuationRejection] = []
+        prebuilt = getattr(parse_result, "continuation_fragments", None)
+        if prebuilt is not None:
+            self.fragments = tuple(prebuilt)
+            return
         fragments: list[TableFragment] = []
         for page in getattr(parse_result, "pages", None) or []:
-            page_number = int(
-                getattr(page, "source_page_number", 0)
-                or getattr(page, "page_number", 0)
-                or 0
-            )
+            page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
             for table in getattr(page, "tables", None) or []:
                 rows = _raw_rows(table)
                 if not rows:
@@ -113,7 +105,6 @@ class EnterpriseContinuationResolver:
                     )
                 )
         self.fragments = tuple(fragments)
-        self.rejections: list[ContinuationRejection] = []
 
     def following_row(
         self,
@@ -194,12 +185,7 @@ def numeric_row(
     for index in numeric_indexes:
         if index >= len(values):
             return False
-        raw = (
-            str(values[index] or "")
-            .replace(",", "")
-            .replace("，", "")
-            .replace(" ", "")
-        )
+        raw = str(values[index] or "").replace(",", "").replace("，", "").replace(" ", "")
         if raw in {"", "-", "--", "—"}:
             return False
         try:
@@ -227,16 +213,7 @@ CLOSED_SUMMARY_BODY_CONTRACT = ContinuationContract(
     forbidden_markers=("正常类账户数", "关注类账户数", "不良类账户数"),
 )
 
-ATTACHMENT_DETAIL_BODY_CONTRACT = ContinuationContract(
-    name="attachment_credit_detail_body",
-    expected_columns=frozenset({6, 7, 8, 9, 10}),
-    row_predicate=lambda row: any(str(value or "").strip() for value in row),
-    forbidden_markers=("账户编号", "开户日期", "开立日期", "信息报告日期"),
-)
-
-
 __all__ = [
-    "ATTACHMENT_DETAIL_BODY_CONTRACT",
     "CLOSED_SUMMARY_BODY_CONTRACT",
     "ContinuationContract",
     "ContinuationMatch",

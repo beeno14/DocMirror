@@ -8,9 +8,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
-def _compact(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or ""))
+from docmirror.plugins.credit_report.contracts import (
+    CONTENT_MODE_MIXED,
+    CONTENT_MODE_NATIVE,
+    CONTENT_MODE_SCANNED,
+)
+from docmirror.plugins.credit_report.value_utils import compact_text as _compact
 
 
 def _date_anchors(value: Any) -> list[str]:
@@ -26,7 +29,8 @@ def _date_anchors(value: Any) -> list[str]:
 
 
 def _record_anchors(record: dict[str, Any]) -> list[str]:
-    normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+    raw_normalized = record.get("normalized")
+    normalized: dict[str, Any] = raw_normalized if isinstance(raw_normalized, dict) else {}
     values = {**record, **normalized}
     anchors: list[str] = []
     date_value = next(
@@ -308,6 +312,18 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "currency": descriptor("币种", type_="currency"),
             }
         },
+        "repayment_records": {
+            "definition": "一行对应一个账户在一个自然月的还款状态。",
+            "columns": {
+                "repayment_id": descriptor("还款记录ID"),
+                "account_id": descriptor("账户记录ID"),
+                "grid_id": descriptor("还款网格ID"),
+                "year": descriptor("年份", type_="integer"),
+                "month": descriptor("月份", type_="integer"),
+                "status": descriptor("还款状态", type_="enum"),
+                "overdue_amount": descriptor("逾期金额", type_="money"),
+            },
+        },
         "overdue_records": {
             "definition": "一行对应一个曾发生逾期的信贷账户及其最近5年逾期事实。",
             "columns": {
@@ -346,6 +362,19 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "source_reason": descriptor("源文查询原因"),
                 "query_channel": descriptor("查询渠道"),
                 "inquiry_type": descriptor("查询类型", type_="enum"),
+            },
+        },
+        "public_records": {
+            "definition": "一行对应一项源报告公共记录。",
+            "columns": {
+                "public_record_id": descriptor("公共记录ID"),
+                "sequence": descriptor("组内序号", type_="integer"),
+                "record_type": descriptor("公共记录类型", type_="enum"),
+                "authority": descriptor("记录机关"),
+                "category": descriptor("记录类别"),
+                "start_date": descriptor("开始日期", type_="date"),
+                "end_date": descriptor("结束日期", type_="date"),
+                "content": descriptor("记录内容"),
             },
         },
         "report_notes": {
@@ -400,9 +429,9 @@ def credit_report_data_dictionary() -> dict[str, Any]:
                 "enterprise": "企业信用报告",
             },
             "content_mode": {
-                "native_text": "原生文本",
-                "mixed": "混合文本与图像",
-                "scanned": "扫描图像",
+                CONTENT_MODE_NATIVE: "原生文本",
+                CONTENT_MODE_MIXED: "混合文本与图像",
+                CONTENT_MODE_SCANNED: "扫描图像",
             },
             "source": {
                 "personal_brief_native_text": "个人简版信用报告原生文本",

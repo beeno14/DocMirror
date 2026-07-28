@@ -29,6 +29,8 @@ projection:
     enterprise_exchange_rates: 汇率信息
     residence_records: 居住信息
     employment_records: 职业信息
+    statements: 信息主体声明
+    annotations: 异议标注
     repayment_liability_records: 相关还款责任信息
     enterprise_profile_fields: 企业基本信息
     enterprise_capital_summary: 注册资本及主要出资人信息
@@ -72,6 +74,10 @@ projection:
     public_records: [public_records]
     inquiry_records: [inquiries]
     report_notes: [notes]
+    residence_records: [basic_information]
+    employment_records: [basic_information]
+    statements: [notes]
+    annotations: [notes]
     enterprise_report_metadata: [report_metadata]
     enterprise_exchange_rates: [notes]
     enterprise_profile_fields: [basic_information]
@@ -155,6 +161,11 @@ projection:
       - responsibility_amount
       - balance
       - currency
+    repayment_records:
+      - year
+      - month
+      - status
+      - overdue_amount
     overdue_records:
       - sequence
       - account_type
@@ -171,6 +182,14 @@ projection:
       - institution
       - reason
       - inquiry_type
+    public_records:
+      - sequence
+      - record_type
+      - authority
+      - category
+      - start_date
+      - end_date
+      - content
     report_notes:
       - sequence
       - content

@@ -23,6 +23,15 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         """Enterprise stacked cards replace generic row-shaped candidates."""
         return False
 
+    def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
+        """Build reusable enterprise page and table indexes once."""
+        del full_text
+        from docmirror.plugins.credit_report.enterprise_native.extraction import (
+            build_enterprise_extraction_context,
+        )
+
+        return build_enterprise_extraction_context(parse_result)
+
     def extract_native_business(
         self,
         parse_result: Any,
@@ -39,8 +48,15 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
 
         return extract_enterprise_native_business(parse_result, full_text)
 
-    def build_section_content(self, parse_result: Any, full_text: str) -> dict[str, Any]:
+    def build_section_content(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        auxiliary_business: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return enterprise profile datasets without entering personal extractors."""
+        del auxiliary_business
         from docmirror.plugins.credit_report.enterprise_native.extraction import (
             extract_enterprise_attachment_datasets,
             extract_enterprise_capital_summary,
@@ -57,11 +73,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         datasets.update(extract_enterprise_report_metadata_records(parse_result, full_text))
         datasets.update(extract_enterprise_summary_datasets(parse_result))
         datasets.update(extract_enterprise_attachment_datasets(parse_result))
-        datasets["enterprise_extraction_audit"] = (
-            extract_enterprise_continuation_audit(
-                parse_result,
-                datasets=datasets,
-            )
+        datasets["enterprise_extraction_audit"] = extract_enterprise_continuation_audit(
+            parse_result,
+            datasets=datasets,
         )
         datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(parse_result)
         datasets["enterprise_facility_summary"] = extract_enterprise_facility_summary(parse_result)
@@ -183,6 +197,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "unresolved_record_count": {
                     "label": "未解析记录数",
+                    "type": "integer",
+                },
+                "unexpected_record_count": {
+                    "label": "超出源合同的记录数",
                     "type": "integer",
                 },
                 "reconciliation_status": {
@@ -412,15 +430,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "label": "担保交易账户数",
                     "type": "integer",
                 },
-                "guarantee_balance": {"label": "担保交易余额", "type": "money"},
-                "guarantee_attention_balance": {
-                    "label": "担保交易关注类余额",
-                    "type": "money",
-                },
-                "guarantee_adverse_balance": {
-                    "label": "担保交易不良类余额",
-                    "type": "money",
-                },
                 "loan_or_credit_amount": {
                     "label": "借款金额/信用额度",
                     "type": "money",
@@ -521,10 +530,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "repayment_liability_records",
             {},
         )
-        repayment_liabilities["definition"] = (
-            "一行对应企业报告相关还款责任信息明细中的一个账户；"
-            "跨页续表合并为同一行。"
-        )
+        repayment_liabilities["definition"] = "一行对应企业报告相关还款责任信息明细中的一个账户；跨页续表合并为同一行。"
         repayment_liability_columns = repayment_liabilities.setdefault("columns", {})
         for key in (
             "sequence",
@@ -590,9 +596,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         dictionary["datasets"]["enterprise_profile_fields"] = {
             "definition": "企业基本信息源表中的一个字段一行。",
             "columns": {
-                key: fields[key]
-                for key in ("sequence", "field", "value", "source_institution")
-                if key in fields
+                key: fields[key] for key in ("sequence", "field", "value", "source_institution") if key in fields
             },
         }
         dictionary["datasets"]["enterprise_capital_summary"] = {
@@ -870,8 +874,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         }
         dictionary["datasets"]["enterprise_extraction_audit"] = {
             "definition": (
-                "每行核对一种企业报告连续记录的源合同数量与逻辑记录数量；"
-                "不通过相邻表或列数相同进行推断合并。"
+                "每行核对一种企业报告连续记录的源合同数量与逻辑记录数量；不通过相邻表或列数相同进行推断合并。"
             ),
             "columns": {
                 key: fields[key]
@@ -882,6 +885,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "expected_record_count",
                     "extracted_record_count",
                     "unresolved_record_count",
+                    "unexpected_record_count",
                     "reconciliation_status",
                 )
             },
@@ -1136,6 +1140,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "expected_record_count",
                         "extracted_record_count",
                         "unresolved_record_count",
+                        "unexpected_record_count",
                         "reconciliation_status",
                     ],
                 },
@@ -1397,7 +1402,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                             ],
                         },
                     ],
-                }
+                },
             },
             "appendix": {
                 "title": "附录：文档来源与审计信息",
@@ -1423,10 +1428,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                                 },
                             },
                         ],
-                        "note": (
-                            "源报告概要值与账户明细值均按原文保留；"
-                            "审计计算不改写任何业务数据。"
-                        ),
+                        "note": ("源报告概要值与账户明细值均按原文保留；审计计算不改写任何业务数据。"),
                     }
                 ],
                 "document_fields": [
@@ -1454,28 +1456,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             for table in getattr(page, "tables", None) or []:
                 parts.extend(str(value or "") for value in getattr(table, "headers", None) or [])
                 for row in getattr(table, "rows", None) or []:
-                    parts.extend(
-                        str(getattr(cell, "text", "") or "")
-                        for cell in getattr(row, "cells", None) or []
-                    )
+                    parts.extend(str(getattr(cell, "text", "") or "") for cell in getattr(row, "cells", None) or [])
             page_texts.append(
                 (
                     int(getattr(page, "page_number", 0) or index),
-                    int(
-                        getattr(page, "source_page_number", 0)
-                        or getattr(page, "page_number", 0)
-                        or index
-                    ),
+                    int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or index),
                     "\n".join(parts),
                 )
             )
         source_sections: list[dict[str, Any]] = []
         cover_page = next(
-            (
-                (logical_page, source_page)
-                for logical_page, source_page, text in page_texts
-                if "自主查询版" in text
-            ),
+            ((logical_page, source_page) for logical_page, source_page, text in page_texts if "自主查询版" in text),
             None,
         )
         if cover_page is not None:
@@ -1489,11 +1480,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 }
             )
         notes_page = next(
-            (
-                (logical_page, source_page)
-                for logical_page, source_page, text in page_texts
-                if "报告说明" in text
-            ),
+            ((logical_page, source_page) for logical_page, source_page, text in page_texts if "报告说明" in text),
             None,
         )
         if notes_page is not None:

@@ -5,9 +5,15 @@
 
 from __future__ import annotations
 
-from docmirror.plugins.credit_report.enterprise_native import variant as enterprise_native
-from docmirror.plugins.credit_report.personal_brief_native import variant as personal_brief_native
-from docmirror.plugins.credit_report.personal_detail_scanned import variant as personal_detail_scanned
+from docmirror.plugins.credit_report.enterprise_native.variant import (
+    variant as enterprise_native,
+)
+from docmirror.plugins.credit_report.personal_brief_native.variant import (
+    variant as personal_brief_native,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
+    variant as personal_detail_scanned,
+)
 from docmirror.plugins.credit_report.shared.variant import (
     CreditReportVariantAdapter,
     UnknownCreditReportVariant,

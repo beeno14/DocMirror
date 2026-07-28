@@ -136,6 +136,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
     report_subtype = detect_credit_report_subtype(parse_result, full_text)
     content_mode = detect_credit_report_content_mode(parse_result)
     variant = resolve_credit_report_variant(report_subtype, content_mode)
+    variant_input = variant.prepare_extraction(parse_result, full_text)
     if not variant.keep_query_institution:
         domain_facts.pop("query_institution", None)
         field_details.pop("query_institution", None)
@@ -159,7 +160,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
 
     source_domain = _domain_specific(parse_result)
     scanned_business = variant.extract_auxiliary_business(
-        parse_result,
+        variant_input,
         full_text,
         content_mode=content_mode,
     )
@@ -195,13 +196,15 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         existing_collections={
             "credit_accounts": credit_accounts,
             "credit_lines": [],
-            "repayment_liability_records": [],
+            "repayment_liability_records": list(scanned_business.get("repayment_liability_records") or []),
             "repayment_records": repayment_records,
             "overdue_records": [],
             "inquiry_records": list(scanned_business.get("inquiry_records") or []),
-            "public_records": [],
+            "public_records": list(scanned_business.get("public_records") or []),
         },
         existing_summary=dict(scanned_business.get("credit_summary") or {}),
+        variant=variant,
+        variant_input=variant_input,
     )
     dataset_names = variant.dataset_names()
     datasets = {name: rows for name in dataset_names if (rows := _records(name, assembled.get(name)))}
@@ -209,15 +212,19 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         domain_facts["credit_summary"] = dict(assembled["credit_summary"])
     if assembled.get("credit_extraction_audit"):
         domain_facts["credit_extraction_audit"] = dict(assembled["credit_extraction_audit"])
-    section_content = variant.build_section_content(parse_result, full_text)
+    section_content = variant.build_section_content(
+        variant_input,
+        full_text,
+        auxiliary_business=scanned_business,
+    )
     if section_content:
         supplemental_facts = section_content.get("facts")
         if isinstance(supplemental_facts, dict):
             domain_facts.update(supplemental_facts)
         for fact_name in ("non_credit_transaction_summary", "public_record_summary"):
-            value = section_content.get(fact_name)
-            if isinstance(value, dict) and value.get("source_statement"):
-                domain_facts[fact_name] = value
+            section_value = section_content.get(fact_name)
+            if isinstance(section_value, dict) and section_value.get("source_statement"):
+                domain_facts[fact_name] = section_value
         report_notes = list(section_content.get("report_notes") or [])
         if report_notes:
             enrich_credit_report_record_evidence(parse_result, {"report_notes": report_notes})
@@ -272,7 +279,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         domain_facts=domain_facts,
         semantic=variant.semantic_extensions(),
         datasets=datasets,
-        sections=variant.build_sections(parse_result, full_text),
+        sections=variant.build_sections(variant_input, full_text),
         warnings=warnings,
         evidence_ids=evidence_ids,
         confidence=base.confidence,

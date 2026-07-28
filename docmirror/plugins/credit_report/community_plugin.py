@@ -15,8 +15,7 @@ Pipeline role: post-seal domain derivation and Community JSON projection.
 
 Key exports: ``CreditReportPlugin``, ``plugin``.
 
-Dependencies: ``ProjectionData``, ``kv_projection``,
-``kv_community_enrich.enrich_credit_report_output``.
+Dependencies: ``ProjectionData`` and the credit-report projection orchestrator.
 """
 
 from __future__ import annotations

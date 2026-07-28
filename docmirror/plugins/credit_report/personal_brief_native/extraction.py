@@ -58,12 +58,8 @@ def extract_personal_brief_native_business(
             "derived_ever_overdue_account_count": len(overdue),
             "repayment_liability_count": len(liabilities),
             "inquiry_count": len(inquiries),
-            "institution_inquiry_count": sum(
-                item.get("inquiry_type") == "institution" for item in inquiries
-            ),
-            "personal_inquiry_count": sum(
-                item.get("inquiry_type") == "personal" for item in inquiries
-            ),
+            "institution_inquiry_count": sum(item.get("inquiry_type") == "institution" for item in inquiries),
+            "personal_inquiry_count": sum(item.get("inquiry_type") == "personal" for item in inquiries),
             **source_summary,
         },
     }

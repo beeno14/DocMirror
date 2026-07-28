@@ -14,6 +14,14 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from docmirror.plugins.credit_report.reading_order_utils import (
+    ordered_document_nodes as _ordered_nodes,
+)
+from docmirror.plugins.credit_report.reading_order_utils import (
+    valid_bbox as _bbox,
+)
+from docmirror.plugins.credit_report.value_utils import compact_text as _compact
+
 _INSTITUTION_SECTION = "机构查询记录明细"
 _SECTION_END_MARKERS = ("个人查询记录明细", "说明")
 _ROW_START_RE = re.compile(
@@ -38,23 +46,6 @@ _INQUIRY_REASONS = frozenset(
     }
 )
 _COMPACT_INQUIRY_REASONS = frozenset(re.sub(r"\s+", "", reason) for reason in _INQUIRY_REASONS)
-
-
-def _compact(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or ""))
-
-
-def _bbox(value: Any) -> tuple[float, float, float, float] | None:
-    raw = getattr(value, "bbox", None)
-    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
-        return None
-    try:
-        x0, y0, x1, y1 = (float(item) for item in raw)
-    except (TypeError, ValueError):
-        return None
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return x0, y0, x1, y1
 
 
 def _row_match(value: Any) -> re.Match[str] | None:
@@ -89,10 +80,7 @@ def _is_institution_fragment(anchor: Any, reason: Any, candidate: Any) -> bool:
     if anchor_box is None or reason_box is None or candidate_box is None:
         return False
     anchor_page = int(getattr(anchor, "page", 0) or 0)
-    if (
-        int(getattr(reason, "page", 0) or 0) != anchor_page
-        or int(getattr(candidate, "page", 0) or 0) != anchor_page
-    ):
+    if int(getattr(reason, "page", 0) or 0) != anchor_page or int(getattr(candidate, "page", 0) or 0) != anchor_page:
         return False
 
     text = _compact(getattr(candidate, "text", ""))
@@ -119,20 +107,6 @@ def _is_institution_fragment(anchor: Any, reason: Any, candidate: Any) -> bool:
     )
 
 
-def _ordered_nodes(parse_result: Any) -> list[Any]:
-    flow = getattr(parse_result, "document_flow", None)
-    nodes = list(getattr(flow, "nodes", None) or [])
-    reading_flows = list(getattr(flow, "reading_flow", None) or [])
-    if not nodes or not reading_flows:
-        return []
-    node_by_id = {str(getattr(node, "node_id", "") or ""): node for node in nodes}
-    return [
-        node_by_id[str(node_id)]
-        for node_id in list(getattr(reading_flows[0], "node_ids", None) or [])
-        if str(node_id) in node_by_id
-    ]
-
-
 def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, Any]]:
     """Reconstruct logical institution-inquiry rows from the first DFG flow.
 
@@ -143,11 +117,7 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
     if not ordered:
         return []
     section_start = next(
-        (
-            index
-            for index, node in enumerate(ordered)
-            if _INSTITUTION_SECTION in _compact(getattr(node, "text", ""))
-        ),
+        (index for index, node in enumerate(ordered) if _INSTITUTION_SECTION in _compact(getattr(node, "text", ""))),
         -1,
     )
     if section_start < 0:
@@ -211,15 +181,9 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
                 "page": int(getattr(anchor, "page", 0) or 0),
                 "anchor_node_id": str(getattr(anchor, "node_id", "") or ""),
                 "reason_node_id": str(getattr(reason_node, "node_id", "") or ""),
-                "reason_node_ids": [
-                    str(getattr(node, "node_id", "") or "") for node in reason_nodes
-                ],
-                "fragment_node_ids": [
-                    str(getattr(node, "node_id", "") or "") for node in fragments
-                ],
-                "source_node_ids": [
-                    str(getattr(node, "node_id", "") or "") for node in source_nodes
-                ],
+                "reason_node_ids": [str(getattr(node, "node_id", "") or "") for node in reason_nodes],
+                "fragment_node_ids": [str(getattr(node, "node_id", "") or "") for node in fragments],
+                "source_node_ids": [str(getattr(node, "node_id", "") or "") for node in source_nodes],
                 "evidence_ids": list(
                     dict.fromkeys(
                         str(evidence_id)

@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, cast
 
 from docmirror.ocr.structure_project import finalize_partial_record
 from docmirror.plugins.credit_report.field_schema import domain_type_ok
+from docmirror.plugins.credit_report.value_utils import compact_text as _compact_text
 
 _FIELD_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("management_institution", ("管理机构", "发放机构", "经办机构")),
@@ -181,13 +182,16 @@ def _account_from_field_grid(structure: dict[str, Any], *, page: int) -> dict[st
             field_count += 1
             mapped_fields.append("due_date")
 
-    return finalize_partial_record(
-        account,
-        field_count=field_count,
-        expected_fields=list(_COMPLETENESS_FIELDS),
-        mapped_fields=mapped_fields,
-        base_confidence=float(structure.get("confidence") or 0.0),
-        anchor_present=bool(_ANCHOR_RE.search(anchor_text)),
+    return cast(
+        dict[str, Any] | None,
+        finalize_partial_record(
+            account,
+            field_count=field_count,
+            expected_fields=list(_COMPLETENESS_FIELDS),
+            mapped_fields=mapped_fields,
+            base_confidence=float(structure.get("confidence") or 0.0),
+            anchor_present=bool(_ANCHOR_RE.search(anchor_text)),
+        ),
     )
 
 
@@ -248,7 +252,7 @@ def _cell_score_for_label(cell: dict[str, Any], label_text: str) -> float:
         inferred_types=tuple(cell.get("inferred_types") or ()),
         quarantine_reason=cell.get("quarantine_reason"),
     )
-    return score_cell_for_label(proxy, label_text)
+    return float(score_cell_for_label(proxy, label_text))
 
 
 def _flatten_structure_cells(cells: list[Any]) -> list[dict[str, Any]]:
@@ -370,13 +374,16 @@ def _account_from_label_value_graph(structure: dict[str, Any], *, page: int) -> 
         field_count += 1
         mapped_fields.append(field_key)
 
-    return finalize_partial_record(
-        account,
-        field_count=field_count,
-        expected_fields=list(_COMPLETENESS_FIELDS),
-        mapped_fields=mapped_fields,
-        base_confidence=float(structure.get("confidence") or 0.0),
-        anchor_present=bool(_ANCHOR_RE.search(anchor_text)),
+    return cast(
+        dict[str, Any] | None,
+        finalize_partial_record(
+            account,
+            field_count=field_count,
+            expected_fields=list(_COMPLETENESS_FIELDS),
+            mapped_fields=mapped_fields,
+            base_confidence=float(structure.get("confidence") or 0.0),
+            anchor_present=bool(_ANCHOR_RE.search(anchor_text)),
+        ),
     )
 
 
@@ -532,10 +539,6 @@ def _normalize_institution(raw: str) -> str:
     if "蚂" in compact and "商" in compact and "诚" in compact:
         return "重庆市蚂蚁商诚信息技术有限公司"
     return compact
-
-
-def _compact_text(text: Any) -> str:
-    return re.sub(r"\s+", "", str(text or ""))
 
 
 def _chain_text(nodes: list[dict[str, Any]]) -> str:

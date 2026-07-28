@@ -641,7 +641,8 @@ def _quarantined_fields(collections: dict[str, list[dict[str, Any]]]) -> list[di
     for collection, records in collections.items():
         id_key = _COLLECTION_ID_KEYS[collection]
         for record in records:
-            audit = record.get("audit") if isinstance(record.get("audit"), dict) else {}
+            raw_audit = record.get("audit")
+            audit: dict[str, Any] = dict(raw_audit) if isinstance(raw_audit, dict) else {}
             for reason_key in ("quarantined_fields", "type_mismatch"):
                 for field in audit.get(reason_key) or []:
                     out.append(
@@ -719,7 +720,7 @@ def _build_audit(
             )
             if unresolved:
                 issues.append("unresolved_values:repayment_records.status")
-        if records and evidence_coverage < 1.0:
+        if records and evidence_coverage is not None and evidence_coverage < 1.0:
             issues.append(f"missing_evidence:{name}")
     reconciliations: list[dict[str, Any]] = []
     expected_accounts = credit_summary.get("reported_account_count")
@@ -778,11 +779,7 @@ def _build_audit(
         if len(amount_units) == 1 and "" not in amount_units:
             balance_reconciliation["amount_unit"] = next(iter(amount_units))
         if balances_are_comparable:
-            detail_total = sum(
-                Decimal(str(value))
-                for value in detail_balances
-                if value is not None
-            )
+            detail_total = sum(Decimal(str(value)) for value in detail_balances if value is not None)
             reported_total = Decimal(str(reported_balance))
             difference = detail_total - reported_total
             tolerance = Decimal("0.005") * Decimal(len(detail_balances) + 1)
@@ -794,11 +791,7 @@ def _build_audit(
                     "tolerance": _number(tolerance),
                     "matched": within_tolerance,
                     "status": (
-                        "exact"
-                        if difference == 0
-                        else "within_rounding_tolerance"
-                        if within_tolerance
-                        else "mismatch"
+                        "exact" if difference == 0 else "within_rounding_tolerance" if within_tolerance else "mismatch"
                     ),
                 }
             )
@@ -848,12 +841,14 @@ def assemble_credit_report_business(
     content_mode: str,
     existing_collections: dict[str, list[Any]] | None = None,
     existing_summary: dict[str, Any] | None = None,
+    variant: Any | None = None,
+    variant_input: Any | None = None,
 ) -> dict[str, Any]:
     """Assemble subtype candidates into one backward-compatible business view."""
     existing_collections = existing_collections or {}
-    variant = resolve_credit_report_variant(report_subtype, content_mode)
+    variant = variant or resolve_credit_report_variant(report_subtype, content_mode)
     native = variant.extract_native_business(
-        parse_result,
+        parse_result if variant_input is None else variant_input,
         full_text,
         content_mode=content_mode,
     )
@@ -891,7 +886,8 @@ def assemble_credit_report_business(
 
     enrich_credit_report_record_evidence(parse_result, collections)
 
-    native_summary = native.get("credit_summary") if isinstance(native.get("credit_summary"), dict) else {}
+    raw_native_summary = native.get("credit_summary")
+    native_summary: dict[str, Any] = dict(raw_native_summary) if isinstance(raw_native_summary, dict) else {}
     credit_summary = {
         **dict(existing_summary or {}),
         **dict(native_summary),

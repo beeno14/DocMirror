@@ -14,13 +14,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
-_BASE_DATASET_NAMES = (
-    "credit_accounts",
-    "repayment_liability_records",
-    "repayment_records",
-    "overdue_records",
-    "inquiry_records",
-    "public_records",
+from docmirror.plugins.credit_report.contracts import (
+    BASE_DATASET_NAMES,
+    CONTENT_MODES,
+    SCANNED_CONTENT_MODES,
 )
 
 
@@ -36,7 +33,7 @@ class CreditReportVariantAdapter:
 
     def dataset_names(self) -> tuple[str, ...]:
         """Return public dataset order for this variant."""
-        names = list(_BASE_DATASET_NAMES)
+        names = list(BASE_DATASET_NAMES)
         if self.include_credit_lines:
             names.insert(1, "credit_lines")
         return tuple(names)
@@ -44,6 +41,11 @@ class CreditReportVariantAdapter:
     def content_mode_is_expected(self, content_mode: str) -> bool:
         """Report whether routing received the variant's normal source mode."""
         return content_mode in self.expected_content_modes
+
+    def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
+        """Build optional variant-owned indexes once for the current projection."""
+        del full_text
+        return parse_result
 
     def use_generic_credit_accounts(self) -> bool:
         """Return whether shared pre-assembled account candidates are trusted."""
@@ -85,7 +87,7 @@ class CreditReportVariantAdapter:
         content_mode: str,
     ) -> dict[str, Any]:
         """Preserve the existing scanned/mixed auxiliary extraction behavior."""
-        if content_mode not in {"scanned_ocr", "mixed"}:
+        if content_mode not in SCANNED_CONTENT_MODES:
             return {}
         from docmirror.plugins.credit_report.scanned_business import (
             extract_scanned_credit_business,
@@ -93,8 +95,15 @@ class CreditReportVariantAdapter:
 
         return extract_scanned_credit_business(parse_result, full_text)
 
-    def build_section_content(self, parse_result: Any, full_text: str) -> dict[str, Any]:
+    def build_section_content(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        auxiliary_business: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Return variant-only supplemental facts and records."""
+        del auxiliary_business
         return {}
 
     def build_sections(self, parse_result: Any, full_text: str) -> tuple[dict[str, Any], ...]:
@@ -130,7 +139,7 @@ class UnknownCreditReportVariant(CreditReportVariantAdapter):
         super().__init__(
             variant_id="unknown",
             report_subtype="unknown",
-            expected_content_modes=frozenset({"native_text", "scanned_ocr", "mixed", "unknown"}),
+            expected_content_modes=CONTENT_MODES,
             include_credit_lines=True,
         )
 

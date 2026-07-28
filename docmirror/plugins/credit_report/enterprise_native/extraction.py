@@ -10,15 +10,26 @@ physical tables without changing or supplementing ``ParseResult``.
 
 from __future__ import annotations
 
-import hashlib
 import re
-from decimal import Decimal, InvalidOperation
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from docmirror.plugins.credit_report.enterprise_native.continuation import (
     CLOSED_SUMMARY_BODY_CONTRACT,
-    EnterpriseContinuationResolver,
     FACILITY_VALUE_CONTRACT,
+    EnterpriseContinuationResolver,
+    TableFragment,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    compact_text as _compact,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    parse_number as _number,
+)
+from docmirror.plugins.credit_report.value_utils import (
+    stable_record_id as _stable_id,
 )
 
 _ACCOUNT_CATEGORIES = frozenset({"中长期借款", "短期借款", "循环透支", "贴现"})
@@ -32,21 +43,6 @@ _CURRENCY_CODES = {
 }
 
 
-def _compact(value: Any) -> str:
-    return re.sub(r"\s+", "", str(value or ""))
-
-
-def _number(value: Any) -> int | float | None:
-    raw = re.sub(r"[^0-9.-]", "", str(value or "").replace(",", ""))
-    if not raw or raw in {"-", ".", "-."}:
-        return None
-    try:
-        number = Decimal(raw)
-    except InvalidOperation:
-        return None
-    return int(number) if number == number.to_integral_value() else float(number)
-
-
 def _date(value: Any) -> str:
     raw = _compact(value)
     match = re.fullmatch(r"(20\d{2})[-年./](\d{1,2})[-月./](\d{1,2})日?", raw)
@@ -57,11 +53,6 @@ def _date(value: Any) -> str:
 
 def _identifier(value: Any) -> str:
     return re.sub(r"[^0-9A-Z]", "", _compact(value).upper())
-
-
-def _stable_id(prefix: str, *parts: Any) -> str:
-    payload = "|".join(_compact(part).upper() for part in parts)
-    return f"{prefix}:{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _raw_table_rows(table: Any) -> list[list[str]]:
@@ -79,16 +70,22 @@ def _raw_table_rows(table: Any) -> list[list[str]]:
 
 
 def _table_stream(parse_result: Any):
+    if isinstance(parse_result, EnterpriseExtractionContext):
+        for page, table_id, rows in parse_result.table_rows:
+            yield page, table_id, [list(row) for row in rows]
+        return
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
         for table in getattr(page, "tables", None) or []:
-            rows = _raw_table_rows(table)
-            if rows:
-                yield page_number, str(getattr(table, "table_id", "") or ""), rows
+            table_rows = _raw_table_rows(table)
+            if table_rows:
+                yield page_number, str(getattr(table, "table_id", "") or ""), table_rows
 
 
 def _table_headings(parse_result: Any) -> dict[str, str]:
     """Return the closest preceding page heading for each physical table."""
+    if isinstance(parse_result, EnterpriseExtractionContext):
+        return dict(parse_result.table_headings)
     headings: dict[str, str] = {}
     for page in getattr(parse_result, "pages", None) or []:
         text_blocks: list[tuple[float, str]] = []
@@ -111,19 +108,114 @@ def _table_headings(parse_result: Any) -> dict[str, str]:
 
 def _page_texts(parse_result: Any) -> dict[int, str]:
     """Return compact source text by page for enterprise metadata recovery."""
+    if isinstance(parse_result, EnterpriseExtractionContext):
+        return dict(parse_result.page_texts)
     values: dict[int, str] = {}
     for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
-        page_number = int(
-            getattr(page, "source_page_number", 0)
-            or getattr(page, "page_number", 0)
-            or index
-        )
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or index)
         values[page_number] = "\n".join(
             str(getattr(block, "content", "") or "")
             for block in getattr(page, "texts", None) or []
             if getattr(block, "content", None)
         )
     return values
+
+
+@dataclass(frozen=True)
+class EnterpriseExtractionContext:
+    """Immutable indexes reused by every enterprise extractor in one projection."""
+
+    parse_result: Any
+    table_rows: tuple[tuple[int, str, tuple[tuple[str, ...], ...]], ...]
+    page_texts: Mapping[int, str]
+    table_headings: Mapping[str, str]
+    page_flow: tuple[tuple[int, str, Any], ...]
+    continuation_fragments: tuple[TableFragment, ...]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.parse_result, name)
+
+
+def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtractionContext:
+    """Index immutable page/table views once without altering the sealed result."""
+    if isinstance(parse_result, EnterpriseExtractionContext):
+        return parse_result
+
+    table_rows: list[tuple[int, str, tuple[tuple[str, ...], ...]]] = []
+    page_texts: dict[int, str] = {}
+    table_headings: dict[str, str] = {}
+    page_flow: list[tuple[int, str, Any]] = []
+    fragments: list[TableFragment] = []
+
+    def vertical_position(value: Any, fallback: float) -> float:
+        bbox = list(getattr(value, "bbox", None) or [])
+        if len(bbox) >= 2:
+            try:
+                return float(bbox[1])
+            except (TypeError, ValueError):
+                pass
+        return fallback
+
+    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or page_index)
+        blocks = list(getattr(page, "texts", None) or [])
+        page_texts[page_number] = "\n".join(
+            str(getattr(block, "content", "") or "") for block in blocks if getattr(block, "content", None)
+        )
+        positioned_text = [
+            (
+                float((list(getattr(block, "bbox", None) or [0, 0, 0, 0]))[3]),
+                _compact(getattr(block, "content", "")),
+            )
+            for block in blocks
+            if len(list(getattr(block, "bbox", None) or [])) >= 4 and _compact(getattr(block, "content", ""))
+        ]
+        positioned_items: list[tuple[float, int, int, str, Any]] = []
+        for index, block in enumerate(blocks):
+            content = str(getattr(block, "content", "") or "")
+            if content:
+                positioned_items.append((vertical_position(block, float(index)), 0, index, "text", content))
+        for table_index, table in enumerate(getattr(page, "tables", None) or []):
+            rows = _raw_table_rows(table)
+            if not rows:
+                continue
+            table_id = str(getattr(table, "table_id", "") or "")
+            immutable_rows = tuple(tuple(value for value in row) for row in rows)
+            table_rows.append((page_number, table_id, immutable_rows))
+            fragments.append(
+                TableFragment(
+                    index=len(fragments),
+                    page=page_number,
+                    table_id=table_id,
+                    rows=immutable_rows,
+                )
+            )
+            bbox = list(getattr(table, "bbox", None) or [])
+            if table_id and len(bbox) >= 2:
+                preceding = [(bottom, content) for bottom, content in positioned_text if bottom <= float(bbox[1])]
+                if preceding:
+                    table_headings[table_id] = max(preceding, key=lambda item: item[0])[1]
+            positioned_items.append(
+                (
+                    vertical_position(table, 10000.0 + float(table_index)),
+                    1,
+                    table_index,
+                    "table",
+                    (table_id, [list(row) for row in immutable_rows]),
+                )
+            )
+        page_flow.extend(
+            (page_number, kind, value) for _position, _kind_order, _index, kind, value in sorted(positioned_items)
+        )
+
+    return EnterpriseExtractionContext(
+        parse_result=parse_result,
+        table_rows=tuple(table_rows),
+        page_texts=MappingProxyType(page_texts),
+        table_headings=MappingProxyType(table_headings),
+        page_flow=tuple(page_flow),
+        continuation_fragments=tuple(fragments),
+    )
 
 
 def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
@@ -248,19 +340,11 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                     1,
                 )
                 business_type_index = next(
-                    (
-                        index
-                        for index, value in enumerate(cells)
-                        if "业务种类" in value or "业务类型" in value
-                    ),
+                    (index for index, value in enumerate(cells) if "业务种类" in value or "业务类型" in value),
                     2,
                 )
                 open_date_index = next(
-                    (
-                        index
-                        for index, value in enumerate(cells)
-                        if "开立日期" in value or "开户日期" in value
-                    ),
+                    (index for index, value in enumerate(cells) if "开立日期" in value or "开户日期" in value),
                     3,
                 )
                 due_date_index = next(
@@ -272,17 +356,11 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                     5,
                 )
                 amount_index = next(
-                    (
-                        index
-                        for index, value in enumerate(cells)
-                        if "借款金额" in value or "信用额度" in value
-                    ),
+                    (index for index, value in enumerate(cells) if "借款金额" in value or "信用额度" in value),
                     6,
                 )
                 settled_schema = any(
-                    "关闭日期" in cell
-                    for following in rows[row_index + 1 : row_index + 3]
-                    for cell in following
+                    "关闭日期" in cell for following in rows[row_index + 1 : row_index + 3] for cell in following
                 )
                 continue
             if header_seen and _is_primary_account_row(
@@ -346,9 +424,7 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 reported_values = [value for value in overdue_values if value is not None]
                 if len(reported_values) == len(overdue_values):
                     current["current_overdue"] = any(value != 0 for value in reported_values)
-                    current["current_overdue_status"] = (
-                        "overdue" if current["current_overdue"] else "not_overdue"
-                    )
+                    current["current_overdue_status"] = "overdue" if current["current_overdue"] else "not_overdue"
                 elif not reported_values:
                     current.pop("current_overdue", None)
                     current["current_overdue_status"] = "not_reported"
@@ -493,12 +569,7 @@ def _facility_details(parse_result: Any) -> list[dict[str, Any]]:
                 continue
             header = rows[header_index]
             subheader = rows[header_index + 1]
-            if not (
-                header
-                and "授信协议编号" in header[0]
-                and "授信额度" in subheader
-                and "已用额度" in subheader
-            ):
+            if not (header and "授信协议编号" in header[0] and "授信额度" in subheader and "已用额度" in subheader):
                 continue
             detail_index = header_index + 2
             while detail_index + 1 < len(rows):
@@ -534,9 +605,7 @@ def _facility_details(parse_result: Any) -> list[dict[str, Any]]:
                             "total_limit": _number(amounts[2]),
                             "used_limit": _number(amounts[3]),
                             "facility_limit": _number(amounts[4]) if len(amounts) > 4 else None,
-                            "limit_identifier": (
-                                _identifier(amounts[5]) if len(amounts) > 5 else ""
-                            ),
+                            "limit_identifier": (_identifier(amounts[5]) if len(amounts) > 5 else ""),
                             "amount_unit": "CNY_10K",
                             "source": "canonical_enterprise_facility_detail",
                             "source_refs": [
@@ -645,9 +714,7 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
         if not rows:
             continue
         headers = rows[0]
-        if len(rows) >= 2 and all(
-            any(label in header for header in headers) for label in overview_labels
-        ):
+        if len(rows) >= 2 and all(any(label in header for header in headers) for label in overview_labels):
             values = rows[1]
             for index, header in enumerate(headers):
                 field = next((key for label, key in overview_labels.items() if label in header), "")
@@ -659,9 +726,7 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
                     summary[field] = int(number)
                 elif field == "first_repayment_responsibility_year" and value == "--":
                     summary["first_repayment_responsibility_year_status"] = "not_reported"
-        if len(rows) >= 2 and all(
-            any(label in header for header in headers) for label in public_labels
-        ):
+        if len(rows) >= 2 and all(any(label in header for header in headers) for label in public_labels):
             values = rows[1]
             counts: dict[str, int] = {}
             for index, header in enumerate(headers):
@@ -686,18 +751,10 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
                 if "被追偿余额" in value:
                     summary["recovered_debt_balance"] = number
                 elif "关注类余额" in value:
-                    target = (
-                        "credit_attention_balance"
-                        if index < 2
-                        else "guarantee_attention_balance"
-                    )
+                    target = "credit_attention_balance" if index < 2 else "guarantee_attention_balance"
                     summary[target] = number
                 elif "不良类余额" in value:
-                    target = (
-                        "credit_adverse_balance"
-                        if index < 2
-                        else "guarantee_adverse_balance"
-                    )
+                    target = "credit_adverse_balance" if index < 2 else "guarantee_adverse_balance"
                     summary[target] = number
     return summary
 
@@ -724,11 +781,16 @@ def extract_enterprise_summary_datasets(
             and all(marker in signature for marker in ("正常类", "关注类", "不良类", "合计"))
         ):
             subheaders = rows[1]
-            if (
-                len(subheaders) >= 9
-                and subheaders[1:9]
-                == ["账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"]
-            ):
+            if len(subheaders) >= 9 and subheaders[1:9] == [
+                "账户数",
+                "余额",
+                "账户数",
+                "余额",
+                "账户数",
+                "余额",
+                "账户数",
+                "余额",
+            ]:
                 categories = {_compact(row[0]) for row in rows[2:] if row}
                 if categories & {"中长期借款", "短期借款", "循环透支", "贴现"}:
                     transaction_group = "借贷交易"
@@ -745,6 +807,7 @@ def extract_enterprise_summary_datasets(
                         values = [_number(value) for value in row[1:9]]
                         if any(value is None for value in values):
                             continue
+                        numeric_values = [value for value in values if value is not None]
                         category = _compact(row[0])
                         current_rows.append(
                             {
@@ -758,14 +821,14 @@ def extract_enterprise_summary_datasets(
                                 "sequence": len(current_rows) + 1,
                                 "transaction_group": transaction_group,
                                 "business_category": category,
-                                "normal_account_count": int(values[0]),
-                                "normal_balance": values[1],
-                                "attention_account_count": int(values[2]),
-                                "attention_balance": values[3],
-                                "adverse_account_count": int(values[4]),
-                                "adverse_balance": values[5],
-                                "total_account_count": int(values[6]),
-                                "total_balance": values[7],
+                                "normal_account_count": int(numeric_values[0]),
+                                "normal_balance": numeric_values[1],
+                                "attention_account_count": int(numeric_values[2]),
+                                "attention_balance": numeric_values[3],
+                                "adverse_account_count": int(numeric_values[4]),
+                                "adverse_balance": numeric_values[5],
+                                "total_account_count": int(numeric_values[6]),
+                                "total_balance": numeric_values[7],
                                 "currency": "CNY",
                                 "amount_unit": "CNY_10K",
                                 "is_total": category == "合计",
@@ -784,8 +847,7 @@ def extract_enterprise_summary_datasets(
             and "合计" in signature
         ):
             closed_data: list[tuple[int, str, int, list[str]]] = [
-                (page, table_id, row_index, row)
-                for row_index, row in enumerate(rows[1:], start=1)
+                (page, table_id, row_index, row) for row_index, row in enumerate(rows[1:], start=1)
             ]
             if not closed_data:
                 match = resolver.following_row(
@@ -793,14 +855,9 @@ def extract_enterprise_summary_datasets(
                     CLOSED_SUMMARY_BODY_CONTRACT,
                 )
                 if match is not None:
-                    candidate_rows = [
-                        [_compact(value) for value in row]
-                        for row in match.fragment.rows
-                    ]
+                    candidate_rows = [[_compact(value) for value in row] for row in match.fragment.rows]
                     if all(
-                        len(row) == 5
-                        and _compact(row[0])
-                        and all(_number(value) is not None for value in row[1:5])
+                        len(row) == 5 and _compact(row[0]) and all(_number(value) is not None for value in row[1:5])
                         for row in candidate_rows
                     ):
                         closed_data = [
@@ -827,6 +884,7 @@ def extract_enterprise_summary_datasets(
                 counts = [_number(value) for value in row[1:5]]
                 if any(value is None for value in counts):
                     continue
+                numeric_counts = [value for value in counts if value is not None]
                 category = _compact(row[0])
                 closed_rows.append(
                     {
@@ -840,10 +898,10 @@ def extract_enterprise_summary_datasets(
                         "sequence": len(closed_rows) + 1,
                         "transaction_group": transaction_group,
                         "business_category": category,
-                        "normal_account_count": int(counts[0]),
-                        "attention_account_count": int(counts[1]),
-                        "adverse_account_count": int(counts[2]),
-                        "total_account_count": int(counts[3]),
+                        "normal_account_count": int(numeric_counts[0]),
+                        "attention_account_count": int(numeric_counts[1]),
+                        "adverse_account_count": int(numeric_counts[2]),
+                        "total_account_count": int(numeric_counts[3]),
                         "is_total": category == "合计",
                         "source_page": source_page,
                         "source_table_id": source_table_id,
@@ -856,14 +914,9 @@ def extract_enterprise_summary_datasets(
                     }
                 )
             continue
-        responsibility_signature = "".join(
-            value
-            for row in rows[:2]
-            for value in row
-        )
+        responsibility_signature = "".join(value for row in rows[:2] for value in row)
         grouped_responsibility_header = (
-            "被追偿业务" in responsibility_signature
-            and "其他借贷交易" in responsibility_signature
+            "被追偿业务" in responsibility_signature and "其他借贷交易" in responsibility_signature
         )
         flat_responsibility_header = (
             responsibility_signature.count("还款责任金额") >= 2
@@ -894,14 +947,10 @@ def extract_enterprise_summary_datasets(
                         "sequence": len(responsibility_rows) + 1,
                         "responsibility_type": responsibility_type,
                         "recovered_responsibility_amount": values[0],
-                        "recovered_account_count": (
-                            int(values[1]) if values[1] is not None else None
-                        ),
+                        "recovered_account_count": (int(values[1]) if values[1] is not None else None),
                         "recovered_balance": values[2],
                         "other_credit_responsibility_amount": values[3],
-                        "other_credit_account_count": (
-                            int(values[4]) if values[4] is not None else None
-                        ),
+                        "other_credit_account_count": (int(values[4]) if values[4] is not None else None),
                         "other_credit_balance": values[5],
                         "other_credit_attention_balance": values[6],
                         "other_credit_adverse_balance": values[7],
@@ -943,9 +992,7 @@ def extract_enterprise_summary_datasets(
                         "responsibility_type": responsibility_type,
                         "transaction_group": "担保交易",
                         "guarantee_responsibility_amount": values[0],
-                        "guarantee_account_count": (
-                            int(values[1]) if values[1] is not None else None
-                        ),
+                        "guarantee_account_count": (int(values[1]) if values[1] is not None else None),
                         "guarantee_balance": values[2],
                         "guarantee_attention_balance": values[3],
                         "guarantee_adverse_balance": values[4],
@@ -1005,51 +1052,31 @@ def extract_enterprise_repayment_liability_records(
             is_immediate_continuation = bool(
                 pending is not None
                 and (
-                    (
-                        pending.get("_fragment_index") == fragment.index
-                        and pending.get("_row_index") == row_index - 1
-                    )
+                    (pending.get("_fragment_index") == fragment.index and pending.get("_row_index") == row_index - 1)
                     or (
                         pending.get("_fragment_index") == fragment.index - 1
                         and row_index == 0
-                        and page
-                        - int(pending.get("source_page") or page)
-                        in {0, 1}
+                        and page - int(pending.get("source_page") or page) in {0, 1}
                     )
                 )
             )
-            if (
-                pending is not None
-                and is_immediate_continuation
-                and len(row) >= 9
-                and not _compact(row[0])
-            ):
+            if pending is not None and is_immediate_continuation and len(row) >= 9 and not _compact(row[0]):
                 loan_or_credit_amount = _number(row[1])
                 balance = _number(row[2])
                 snapshot_date = _date(row[8])
-                if (
-                    loan_or_credit_amount is not None
-                    and balance is not None
-                    and snapshot_date
-                ):
+                if loan_or_credit_amount is not None and balance is not None and snapshot_date:
                     overdue_value = _number(row[6])
                     pending.update(
                         {
                             "loan_or_credit_amount": loan_or_credit_amount,
                             "balance": balance,
-                            "five_tier_class": (
-                                "" if _compact(row[3]) in {"--", "-", "—"} else _compact(row[3])
-                            ),
+                            "five_tier_class": ("" if _compact(row[3]) in {"--", "-", "—"} else _compact(row[3])),
                             "overdue_total": _number(row[4]),
                             "overdue_principal": _number(row[5]),
                             "overdue_months_or_repayment_status": (
                                 overdue_value
                                 if overdue_value is not None
-                                else (
-                                    ""
-                                    if _compact(row[6]) in {"--", "-", "—"}
-                                    else _compact(row[6])
-                                )
+                                else ("" if _compact(row[6]) in {"--", "-", "—"} else _compact(row[6]))
                             ),
                             "remaining_periods": _number(row[7]),
                             "snapshot_date": snapshot_date,
@@ -1084,16 +1111,12 @@ def extract_enterprise_repayment_liability_records(
                 "account_identifier": account_identifier,
                 "responsibility_type": _compact(row[1]),
                 "contract_number": contract_number,
-                "contract_number_status": (
-                    "reported" if contract_number else "not_reported"
-                ),
+                "contract_number_status": ("reported" if contract_number else "not_reported"),
                 "currency": currency,
                 "amount_unit": "CNY_10K",
                 "responsibility_amount": responsibility_amount,
                 "responsibility_amount_reported": responsibility_amount is not None,
-                "responsibility_amount_status": (
-                    "reported" if responsibility_amount is not None else "not_reported"
-                ),
+                "responsibility_amount_status": ("reported" if responsibility_amount is not None else "not_reported"),
                 "institution": _compact(row[5]),
                 "business_type": _compact(row[6]),
                 "open_date": open_date,
@@ -1117,7 +1140,7 @@ def extract_enterprise_continuation_audit(
     datasets: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Reconcile source contract rows with document-wide logical records."""
-    resolved = datasets or {}
+    resolved = {str(name): list(records) for name, records in (datasets or {}).items()}
     resolver = EnterpriseContinuationResolver(parse_result)
     expected = {
         "current_credit_summary": 0,
@@ -1137,8 +1160,7 @@ def extract_enterprise_continuation_audit(
             and len(rows[0]) >= 9
             and all(marker in signature for marker in ("正常类", "关注类", "不良类", "合计"))
             and len(rows[1]) >= 9
-            and rows[1][1:9]
-            == ["账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"]
+            and rows[1][1:9] == ["账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"]
         ):
             categories = {_compact(row[0]) for row in rows[2:] if row}
             if categories & {
@@ -1154,9 +1176,7 @@ def extract_enterprise_continuation_audit(
                 expected["current_credit_summary"] += sum(
                     1
                     for row in rows[2:]
-                    if len(row) >= 9
-                    and _compact(row[0])
-                    and all(_number(value) is not None for value in row[1:9])
+                    if len(row) >= 9 and _compact(row[0]) and all(_number(value) is not None for value in row[1:9])
                 )
         if (
             "正常类账户数" in signature
@@ -1167,38 +1187,24 @@ def extract_enterprise_continuation_audit(
             body = rows[1:]
             if not body:
                 match = resolver.following_row(fragment, CLOSED_SUMMARY_BODY_CONTRACT)
-                body = (
-                    [[_compact(value) for value in row] for row in match.fragment.rows]
-                    if match is not None
-                    else []
-                )
+                body = [[_compact(value) for value in row] for row in match.fragment.rows] if match is not None else []
             expected["closed_credit_summary"] += sum(
                 1
                 for row in body
-                if len(row) == 5
-                and _compact(row[0])
-                and all(_number(value) is not None for value in row[1:5])
+                if len(row) == 5 and _compact(row[0]) and all(_number(value) is not None for value in row[1:5])
             )
         if (
             len(rows[0]) >= 9
             and "还款责任金额" in first_two
             and "账户数" in first_two
             and "余额" in first_two
-            and (
-                ("被追偿业务" in first_two and "其他借贷交易" in first_two)
-                or first_two.count("还款责任金额") >= 2
-            )
+            and (("被追偿业务" in first_two and "其他借贷交易" in first_two) or first_two.count("还款责任金额") >= 2)
         ):
             start = 2 if len(rows) > 1 and "还款责任金额" in "".join(rows[1]) else 1
             expected["repayment_responsibility_summary"] += sum(
                 1 for row in rows[start:] if len(row) >= 9 and _compact(row[0])
             )
-        elif (
-            len(rows[0]) >= 6
-            and "责任类型" in first_two
-            and "担保交易" in first_two
-            and "还款责任金额" in first_two
-        ):
+        elif len(rows[0]) >= 6 and "责任类型" in first_two and "担保交易" in first_two and "还款责任金额" in first_two:
             start = 2 if len(rows) > 1 and "还款责任金额" in "".join(rows[1]) else 1
             expected["repayment_responsibility_summary"] += sum(
                 1 for row in rows[start:] if len(row) >= 6 and _compact(row[0])
@@ -1239,31 +1245,20 @@ def extract_enterprise_continuation_audit(
     ):
         resolved.update(extract_enterprise_summary_datasets(parse_result))
     if "repayment_liability_records" not in resolved:
-        resolved["repayment_liability_records"] = (
-            extract_enterprise_repayment_liability_records(parse_result)
-        )
+        resolved["repayment_liability_records"] = extract_enterprise_repayment_liability_records(parse_result)
     if "enterprise_attachment_accounts" not in resolved:
         resolved.update(extract_enterprise_attachment_datasets(parse_result))
     actual = {
-        "current_credit_summary": len(
-            resolved.get("enterprise_current_credit_summary") or []
-        ),
-        "closed_credit_summary": len(
-            resolved.get("enterprise_closed_credit_summary") or []
-        ),
-        "repayment_responsibility_summary": len(
-            resolved.get("enterprise_repayment_responsibility_summary") or []
-        ),
-        "repayment_liability": len(
-            resolved.get("repayment_liability_records") or []
-        ),
-        "attachment_account": len(
-            resolved.get("enterprise_attachment_accounts") or []
-        ),
+        "current_credit_summary": len(resolved.get("enterprise_current_credit_summary") or []),
+        "closed_credit_summary": len(resolved.get("enterprise_closed_credit_summary") or []),
+        "repayment_responsibility_summary": len(resolved.get("enterprise_repayment_responsibility_summary") or []),
+        "repayment_liability": len(resolved.get("repayment_liability_records") or []),
+        "attachment_account": len(resolved.get("enterprise_attachment_accounts") or []),
     }
     audits: list[dict[str, Any]] = []
     for sequence, family in enumerate(expected, start=1):
         unresolved = max(0, expected[family] - actual[family])
+        unexpected = max(0, actual[family] - expected[family])
         audits.append(
             {
                 "audit_id": f"enterprise_continuation_audit:{family}",
@@ -1272,11 +1267,8 @@ def extract_enterprise_continuation_audit(
                 "expected_record_count": expected[family],
                 "extracted_record_count": actual[family],
                 "unresolved_record_count": unresolved,
-                "reconciliation_status": (
-                    "complete"
-                    if expected[family] == actual[family]
-                    else "unresolved"
-                ),
+                "unexpected_record_count": unexpected,
+                "reconciliation_status": ("complete" if not unresolved and not unexpected else "unresolved"),
                 "source": "enterprise_continuation_contract_audit",
                 "confidence": 1.0,
             }
@@ -1299,15 +1291,9 @@ def extract_enterprise_capital_summary(parse_result: Any) -> list[dict[str, Any]
         signature = "".join(rows[0])
         if not all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
             continue
-        data_rows = [
-            row
-            for row in rows[1:]
-            if row and not row[0].startswith("信息来源")
-        ]
+        data_rows = [row for row in rows[1:] if row and not row[0].startswith("信息来源")]
         contributor_status = (
-            "no_records"
-            if data_rows and all(_placeholder_row(row) for row in data_rows)
-            else "reported"
+            "no_records" if data_rows and all(_placeholder_row(row) for row in data_rows) else "reported"
         )
         capital_match: re.Match[str] | None = None
         capital_page = page
@@ -1330,9 +1316,7 @@ def extract_enterprise_capital_summary(parse_result: Any) -> list[dict[str, Any]
         record: dict[str, Any] = {
             "sequence": 1,
             "contributor_status": contributor_status,
-            "contributor_count": sum(
-                1 for row in data_rows if not _placeholder_row(row)
-            ),
+            "contributor_count": sum(1 for row in data_rows if not _placeholder_row(row)),
             "source_page": capital_page,
             "source": "canonical_enterprise_capital_table",
             "source_refs": [_source_ref(page, table_id, 0)],
@@ -1403,11 +1387,7 @@ def extract_enterprise_report_metadata_records(
     report_edition = metadata.get("report_edition")
     if report_edition:
         page = next(
-            (
-                page_number
-                for page_number, text in page_texts.items()
-                if "自主查询版" in _compact(text)
-            ),
+            (page_number for page_number, text in page_texts.items() if "自主查询版" in _compact(text)),
             None,
         )
         record: dict[str, Any] = {
@@ -1532,9 +1512,7 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
             continue
         management_header = all(marker in signature for marker in ("职位", "姓名", "证件号码"))
         management_continuation = not management_header and any(
-            len(row) >= 4
-            and row[2] in {"身份证", "护照", "港澳居民来往内地通行证"}
-            and len(_identifier(row[3])) >= 8
+            len(row) >= 4 and row[2] in {"身份证", "护照", "港澳居民来往内地通行证"} and len(_identifier(row[3])) >= 8
             for row in rows
         )
         if management_header or management_continuation:
@@ -1557,9 +1535,8 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                     }
                 )
             continue
-        relationship_headers = (
-            all(marker in signature for marker in ("类型", "名称", "身份标识号码"))
-            or all(marker in signature for marker in ("名称", "身份标识类型", "身份标识号码"))
+        relationship_headers = all(marker in signature for marker in ("类型", "名称", "身份标识号码")) or all(
+            marker in signature for marker in ("名称", "身份标识类型", "身份标识号码")
         )
         if relationship_headers:
             for row_index, row in enumerate(rows[1:], start=1):
@@ -1615,14 +1592,13 @@ def _vertical_position(value: Any, fallback: float) -> float:
     return fallback
 
 
-def _page_flow(parse_result: Any):
+def _page_flow(parse_result: Any) -> Iterator[tuple[int, str, Any]]:
     """Yield page text and tables in visual order, preserving continuations."""
+    if isinstance(parse_result, EnterpriseExtractionContext):
+        yield from parse_result.page_flow
+        return
     for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
-        page_number = int(
-            getattr(page, "source_page_number", 0)
-            or getattr(page, "page_number", 0)
-            or page_index
-        )
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or page_index)
         items: list[tuple[float, int, int, str, Any]] = []
         for index, block in enumerate(getattr(page, "texts", None) or []):
             content = str(getattr(block, "content", "") or "")
@@ -1667,11 +1643,7 @@ def _attachment_label(text: str, label: str) -> str:
 
 def _history_table(rows: list[list[str]]) -> bool:
     signature = "".join(rows[0]) if rows else ""
-    return (
-        "信息报告日期" in signature
-        and "余额" in signature
-        and "余额变化日期" in signature
-    )
+    return "信息报告日期" in signature and "余额" in signature and "余额变化日期" in signature
 
 
 def _history_continuation(rows: list[list[str]]) -> bool:
@@ -1703,18 +1675,13 @@ def _attachment_contexts_and_records(
     resolver = EnterpriseContinuationResolver(parse_result)
     allowed_detail_continuation_tables: set[str] = set()
     for fragment in resolver.fragments:
-        fragment_rows = [
-            [_compact(value) for value in row] for row in fragment.rows
-        ]
+        fragment_rows = [[_compact(value) for value in row] for row in fragment.rows]
         header_index = next(
             (
                 index
                 for index, row in enumerate(fragment_rows)
                 if ("开户日期" in row or "开立日期" in row)
-                and any(
-                    marker in "".join(row)
-                    for marker in ("贴现金额", "借款金额", "信用额度", "金额")
-                )
+                and any(marker in "".join(row) for marker in ("贴现金额", "借款金额", "信用额度", "金额"))
             ),
             -1,
         )
@@ -1722,21 +1689,14 @@ def _attachment_contexts_and_records(
             continue
         header = fragment_rows[header_index]
         open_date_index = next(
-            (
-                index
-                for index, value in enumerate(header)
-                if "开户日期" in value or "开立日期" in value
-            ),
+            (index for index, value in enumerate(header) if "开户日期" in value or "开立日期" in value),
             -1,
         )
         amount_index = next(
             (
                 index
                 for index, value in enumerate(header)
-                if any(
-                    marker in value
-                    for marker in ("贴现金额", "借款金额", "信用额度", "金额")
-                )
+                if any(marker in value for marker in ("贴现金额", "借款金额", "信用额度", "金额"))
             ),
             -1,
         )
@@ -1756,21 +1716,13 @@ def _attachment_contexts_and_records(
         candidate = resolver.fragments[fragment.index + 1]
         if candidate.page - fragment.page not in {0, 1}:
             continue
-        candidate_rows = [
-            [_compact(value) for value in row] for row in candidate.rows
-        ]
+        candidate_rows = [[_compact(value) for value in row] for row in candidate.rows]
         candidate_starts_new_table = any(
             ("开户日期" in row or "开立日期" in row)
-            and any(
-                marker in "".join(row)
-                for marker in ("贴现金额", "借款金额", "信用额度", "金额")
-            )
+            and any(marker in "".join(row) for marker in ("贴现金额", "借款金额", "信用额度", "金额"))
             for row in candidate_rows
         )
-        if (
-            not candidate_starts_new_table
-            and any(valid_detail_row(row) for row in candidate_rows)
-        ):
+        if not candidate_starts_new_table and any(valid_detail_row(row) for row in candidate_rows):
             allowed_detail_continuation_tables.add(candidate.table_id)
 
     def start_context(
@@ -1868,31 +1820,17 @@ def _attachment_contexts_and_records(
                 "report_date": report_date,
                 "balance": _number(primary_values[1]),
                 "balance_change_date": _date(primary_values[2]),
-                "five_tier_class": (
-                    "" if primary_values[3] == "--" else primary_values[3]
-                ),
+                "five_tier_class": ("" if primary_values[3] == "--" else primary_values[3]),
                 "classification_date": _date(primary_values[4]),
                 "overdue_total": _number(primary_values[5]),
                 "overdue_principal": _number(primary_values[6]),
-                "overdue_months": _number(
-                    primary_values[7] if revolving else secondary_values[0]
-                ),
-                "scheduled_repayment_date": _date(
-                    secondary_values[secondary_offset]
-                ),
-                "scheduled_repayment_amount": _number(
-                    secondary_values[secondary_offset + 1]
-                ),
-                "actual_repayment_date": _date(
-                    secondary_values[secondary_offset + 2]
-                ),
-                "actual_repayment_amount": _number(
-                    secondary_values[secondary_offset + 3]
-                ),
+                "overdue_months": _number(primary_values[7] if revolving else secondary_values[0]),
+                "scheduled_repayment_date": _date(secondary_values[secondary_offset]),
+                "scheduled_repayment_amount": _number(secondary_values[secondary_offset + 1]),
+                "actual_repayment_date": _date(secondary_values[secondary_offset + 2]),
+                "actual_repayment_amount": _number(secondary_values[secondary_offset + 3]),
                 "repayment_method": (
-                    ""
-                    if secondary_values[secondary_offset + 4] == "--"
-                    else secondary_values[secondary_offset + 4]
+                    "" if secondary_values[secondary_offset + 4] == "--" else secondary_values[secondary_offset + 4]
                 ),
                 "remaining_periods": (
                     _number(secondary_values[secondary_offset + 5])
@@ -1925,12 +1863,7 @@ def _attachment_contexts_and_records(
             if _date(values[0] if values else ""):
                 pending_history = (values, context, page, table_id, row_index)
                 continue
-            if (
-                pending_history
-                and pending_history[1] is context
-                and values
-                and not values[0]
-            ):
+            if pending_history and pending_history[1] is context and values and not values[0]:
                 primary, owner, first_page, first_table, first_row = pending_history
                 emit_history(
                     primary,
@@ -1957,19 +1890,13 @@ def _attachment_contexts_and_records(
                 index
                 for index, row in enumerate(rows)
                 if any(value in {"开户日期", "开立日期"} for value in row)
-                and any(
-                    marker in value
-                    for value in row
-                    for marker in ("贴现金额", "金额", "借款金额", "信用额度")
-                )
+                and any(marker in value for value in row for marker in ("贴现金额", "金额", "借款金额", "信用额度"))
             ),
             -1,
         )
         if header_index >= 0:
             header = rows[header_index]
-            data_rows = list(
-                enumerate(rows[header_index + 1 :], start=header_index + 1)
-            )
+            data_rows = list(enumerate(rows[header_index + 1 :], start=header_index + 1))
         elif pending_detail_header and pending_detail_header[1] is context:
             header = pending_detail_header[0]
             data_rows = list(enumerate(rows))
@@ -1978,11 +1905,7 @@ def _attachment_contexts_and_records(
 
         def index_of(*markers: str) -> int:
             return next(
-                (
-                    index
-                    for index, value in enumerate(header)
-                    if any(marker in value for marker in markers)
-                ),
+                (index for index, value in enumerate(header) if any(marker in value for marker in markers)),
                 -1,
             )
 
@@ -2037,16 +1960,10 @@ def _attachment_contexts_and_records(
                     "amount": amount,
                     "amount_unit": "CNY_10K",
                     "close_date": _date(value("close_date")),
-                    "five_tier_class": (
-                        "" if value("five_tier_class") == "--" else value("five_tier_class")
-                    ),
+                    "five_tier_class": ("" if value("five_tier_class") == "--" else value("five_tier_class")),
                     "last_repayment_date": _date(value("last_repayment_date")),
-                    "repayment_method": (
-                        "" if value("repayment_method") == "--" else value("repayment_method")
-                    ),
-                    "advance_flag": (
-                        "" if value("advance_flag") == "--" else value("advance_flag")
-                    ),
+                    "repayment_method": ("" if value("repayment_method") == "--" else value("repayment_method")),
+                    "advance_flag": ("" if value("advance_flag") == "--" else value("advance_flag")),
                     "source_page": page,
                     "source_table_id": table_id,
                     "source": "canonical_enterprise_attachment_credit_detail",
@@ -2068,11 +1985,7 @@ def _attachment_contexts_and_records(
         table_id: str,
     ) -> bool:
         header_index = next(
-            (
-                index
-                for index, row in enumerate(rows)
-                if "交易类型" in row and "交易日期" in row
-            ),
+            (index for index, row in enumerate(rows) if "交易类型" in row and "交易日期" in row),
             -1,
         )
         if header_index < 0:
@@ -2093,6 +2006,7 @@ def _attachment_contexts_and_records(
             "transaction_detail": index_of("交易明细信息"),
         }
         for row_index, row in enumerate(rows[header_index + 1 :], start=header_index + 1):
+
             def value(field: str) -> str:
                 index = indexes[field]
                 return _compact(row[index]) if 0 <= index < len(row) else ""
@@ -2122,11 +2036,7 @@ def _attachment_contexts_and_records(
                     "transaction_date": transaction_date,
                     "transaction_amount": _number(value("transaction_amount")),
                     "due_date_change_months": _number(value("due_date_change_months")),
-                    "transaction_detail": (
-                        ""
-                        if value("transaction_detail") == "--"
-                        else value("transaction_detail")
-                    ),
+                    "transaction_detail": ("" if value("transaction_detail") == "--" else value("transaction_detail")),
                     "currency": "CNY",
                     "amount_unit": "CNY_10K",
                     "source_page": page,
@@ -2142,10 +2052,7 @@ def _attachment_contexts_and_records(
     for page, kind, value in _page_flow(parse_result):
         if kind == "text":
             text = _compact(value)
-            if (
-                text == "附件"
-                or re.search(r"附件\d*[:：]?信用记录补充信息", text)
-            ):
+            if text == "附件" or re.search(r"附件\d*[:：]?信用记录补充信息", text):
                 attachment_started = True
             if not attachment_started:
                 continue
@@ -2212,9 +2119,7 @@ def extract_enterprise_attachment_datasets(
 
 def extract_enterprise_supplement_rows(parse_result: Any) -> list[dict[str, Any]]:
     """Return account-bound monthly histories from the full attachment."""
-    return extract_enterprise_attachment_datasets(parse_result)[
-        "enterprise_credit_supplement"
-    ]
+    return extract_enterprise_attachment_datasets(parse_result)["enterprise_credit_supplement"]
 
 
 _PUBLIC_TABLE_TYPES = {
@@ -2294,9 +2199,7 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
     """Project typed public-record tables without cross-section text bleed."""
     records: list[dict[str, Any]] = []
     resolver = EnterpriseContinuationResolver(parse_result)
-    fragment_index_by_table_id = {
-        fragment.table_id: fragment.index for fragment in resolver.fragments
-    }
+    fragment_index_by_table_id = {fragment.table_id: fragment.index for fragment in resolver.fragments}
     for page, table_id, rows in _table_stream(parse_result):
         if not rows:
             continue
@@ -2305,9 +2208,7 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
         if not record_type:
             continue
         structured_table = any(marker in "".join(headers) for marker in _PUBLIC_TABLE_TYPES)
-        key_value_table = not structured_table and any(
-            "：" in cell or ":" in cell for row in rows for cell in row
-        )
+        key_value_table = not structured_table and any("：" in cell or ":" in cell for row in rows for cell in row)
         entries: list[tuple[int, dict[str, Any]]] = []
         if key_value_table:
             details: dict[str, Any] = {}
@@ -2384,21 +2285,17 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             }
             rules = _PUBLIC_CONTINUATION_RULES.get(record_type)
             previous = records[-1] if records else None
-            previous_details = (
-                previous.get("details")
-                if isinstance(previous, dict) and isinstance(previous.get("details"), dict)
-                else {}
+            raw_previous_details = previous.get("details") if isinstance(previous, dict) else None
+            previous_details: dict[str, Any] = (
+                dict(raw_previous_details) if isinstance(raw_previous_details, dict) else {}
             )
             detail_labels = frozenset(str(key) for key in details)
             previous_labels = frozenset(str(key) for key in previous_details)
-            previous_table_id = str(
-                previous.get("source_table_id") if isinstance(previous, dict) else ""
-            )
+            previous_table_id = str(previous.get("source_table_id") if isinstance(previous, dict) else "")
             adjacent_physical_table = (
                 previous_table_id in fragment_index_by_table_id
                 and table_id in fragment_index_by_table_id
-                and fragment_index_by_table_id[table_id]
-                == fragment_index_by_table_id[previous_table_id] + 1
+                and fragment_index_by_table_id[table_id] == fragment_index_by_table_id[previous_table_id] + 1
             )
             guarded_continuation = bool(
                 rules
@@ -2413,9 +2310,7 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             if guarded_continuation:
                 previous = records[-1]
                 previous["details"].update(details)
-                previous["content"] = "；".join(
-                    f"{key}：{value}" for key, value in previous["details"].items()
-                )
+                previous["content"] = "；".join(f"{key}：{value}" for key, value in previous["details"].items())
                 previous["source_refs"].extend(record["source_refs"])
                 previous["source_page_end"] = page
                 previous["source_table_id_end"] = table_id
@@ -2507,27 +2402,20 @@ def refine_enterprise_business(
             public_record_counts[record_type] = public_record_counts.get(record_type, 0) + 1
         summary["public_record_type_counts"] = public_record_counts
     refined["credit_accounts"] = accounts
-    summary["account_population_comparable"] = bool(
-        isinstance(expected, int) and expected == len(canonical_accounts)
-    )
+    summary["account_population_comparable"] = bool(isinstance(expected, int) and expected == len(canonical_accounts))
     attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
     attachment_accounts = attachment_datasets["enterprise_attachment_accounts"]
     attachment_details = attachment_datasets["enterprise_attachment_credit_details"]
     attachment_transactions = attachment_datasets["enterprise_special_transactions"]
     source_display_limited = any(
-        "受篇幅所限" in text and "只展示部分信贷记录" in text
-        for text in _page_texts(parse_result).values()
+        "受篇幅所限" in text and "只展示部分信贷记录" in text for text in _page_texts(parse_result).values()
     )
     summary.update(
         {
             "account_dataset_scope": "main_report_account_cards",
             "account_dataset_scope_note": (
                 "信贷账户数据集对应报告正文展示的账户卡片；"
-                + (
-                    "源报告明确说明受篇幅限制仅展示部分信贷记录。"
-                    if source_display_limited
-                    else ""
-                )
+                + ("源报告明确说明受篇幅限制仅展示部分信贷记录。" if source_display_limited else "")
                 + "附件账户、月度历史、信贷明细及特定交易分别在企业附件数据集中列示。"
             ),
             "source_display_limited": source_display_limited,
@@ -2571,6 +2459,8 @@ def extract_enterprise_native_business(
 
 
 __all__ = [
+    "EnterpriseExtractionContext",
+    "build_enterprise_extraction_context",
     "extract_enterprise_accounts_from_tables",
     "extract_enterprise_credit_lines_from_tables",
     "extract_enterprise_native_business",
