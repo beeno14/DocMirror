@@ -204,6 +204,11 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         if m and _looks_like_holder_name(m.group(1)):
             out["account_holder"] = m.group(1).strip()
 
+    if not out.get("account_holder"):
+        m = re.search(r"客户名称[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,40})(?:\s{2,}|账号|卡号|起始日期|$|\n)", header)
+        if m and _looks_like_holder_name(m.group(1)):
+            out["account_holder"] = m.group(1).strip()
+
     m = re.search(
         r"账户名称[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)(?:\s{2,}|账号|开户行|Bank Name|Account No|借方笔数)",
         header,
@@ -288,9 +293,14 @@ def _previous_line_before_label(lines: list[str], label: str) -> str:
 def _nearby_holder_after_label(header: str) -> str | None:
     lines = [line.strip() for line in header.splitlines() if line.strip()]
     for idx, line in enumerate(lines):
-        if not re.search(r"(户名|账户名称|Account Name)", line, re.I):
+        if not re.search(r"(户名|账户名称|客户名称|客户姓名|Account Name|Customer Name)", line, re.I):
             continue
-        inline = re.sub(r"^.*?(?:户名|账户名称|Account Name)\s*[:：]?", "", line, flags=re.I).strip()
+        inline = re.sub(
+            r"^.*?(?:户名|账户名称|客户名称|客户姓名|Account Name|Customer Name)\s*[:：]?",
+            "",
+            line,
+            flags=re.I,
+        ).strip()
         inline = re.split(r"(?:币种|Currency|账号|开户行|交易)", inline, maxsplit=1)[0].strip()
         if _looks_like_holder_name(inline):
             return inline

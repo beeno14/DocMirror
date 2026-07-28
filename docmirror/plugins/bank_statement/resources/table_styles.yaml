@@ -2,6 +2,16 @@
 version: "1.0"
 
 styles:
+  pingan_monthly_statement:
+    display_name: 平安银行客户存款月结单
+    priority: 120
+    signals:
+      header_contains_all: ["客户存款月结单", "借/贷方发生额", "承前余额"]
+      header_contains_any: ["平安银行", "PINGAN BANK"]
+      min_matched_columns: 5
+    parser_chain:
+      - pingan_monthly_statement
+
   compact_merged_ledger:
     display_name: 紧凑合并列流水
     priority: 90

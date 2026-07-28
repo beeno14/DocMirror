@@ -25,6 +25,10 @@ class ProjectionData(BaseModel):
         default_factory=dict,
         description="Document-type-specific public semantic extensions for Community renderers.",
     )
+    content_markdown_override: str = Field(
+        default="",
+        description="Optional plugin-rendered source-complete Markdown for documents with broken native text layers.",
+    )
     datasets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     sections: tuple[dict[str, Any], ...] = ()
     warnings: tuple[str, ...] = ()

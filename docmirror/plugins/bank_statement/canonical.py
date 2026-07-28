@@ -164,7 +164,11 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
             amount_key = float(norm.get("amount") or 0)
         except (TypeError, ValueError):
             amount_key = norm.get("amount")
-        if sequence:
+        source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
+        source_scope = _source_sequence_scope(source)
+        if sequence and source_scope:
+            key = ("sequence", source_scope, sequence)
+        elif sequence:
             key = ("sequence", sequence)
         elif reference:
             key = ("reference", reference)
@@ -182,6 +186,19 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
     for idx, rec in enumerate(out, start=1):
         rec["row_index"] = idx
     return out
+
+
+def _source_sequence_scope(source: dict[str, Any]) -> tuple[Any, ...]:
+    table_id = str(source.get("table_id") or "").strip()
+    if table_id:
+        return ("table", table_id)
+    page_range = source.get("page_range")
+    if isinstance(page_range, (list, tuple)) and page_range:
+        return ("page_range", tuple(page_range))
+    source_page = source.get("source_page")
+    if source_page not in (None, ""):
+        return ("page", source_page)
+    return ()
 
 
 def _raw_sequence(raw: dict[str, Any]) -> str:

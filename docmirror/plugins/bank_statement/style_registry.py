@@ -40,6 +40,7 @@ from docmirror.plugins.bank_statement.styles import (
     compact_merged,
     grid_standard,
     kv_identity,
+    pingan_monthly,
     signed_amount,
 )
 from docmirror.plugins.bank_statement.text_table_builder import build_tables_from_stacked_bank_text
@@ -56,6 +57,7 @@ _PARSERS = {
     "kv_identity": kv_identity,
     "signed_amount": signed_amount,
     "borderless_ocr": borderless_ocr,
+    "pingan_monthly_statement": pingan_monthly,
 }
 
 _FALLBACK_PARSER_IDS = ("grid_standard", "borderless_ocr", "signed_amount", "compact_merged")
@@ -148,6 +150,9 @@ def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[di
     if parser_id == "borderless_ocr":
         batch = borderless_ocr.extract_transactions(ctx, plugin)
         return batch, lambda raw: borderless_ocr.normalize_record(raw, plugin)
+    if parser_id == "pingan_monthly_statement":
+        batch = pingan_monthly.extract_transactions(ctx, plugin)
+        return batch, lambda raw: pingan_monthly.normalize_record(raw, plugin)
     return [], None
 
 

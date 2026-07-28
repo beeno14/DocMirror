@@ -104,6 +104,19 @@ def test_extract_identity_from_header_when_holder_is_nearby_line():
     assert identity["currency"] == "CNY"
 
 
+def test_extract_identity_from_customer_name_header():
+    text = (
+        "中国建设银行个人活期账户收入交易明细\n"
+        "卡号/账号:6227001863030091717    客户名称：郑云华    起始日期：20240101    结束日期：20241231\n"
+        "序号 摘要 币别 钞汇 交易日期 交易金额 账户余额 交易地点/附言 对方账号与户名\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["account_holder"] == "郑云华"
+    assert identity["account_number"] == "6227001863030091717"
+
+
 def test_extract_masked_card_and_explicit_period_without_crossing_into_first_transaction():
     text = (
         "户名: 测试用户\n"
