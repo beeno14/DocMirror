@@ -35,8 +35,10 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         field="direction",
         enum_map={
             "收入": "income",
+            "转入": "income",
             "收人": "income",
             "支出": "expense",
+            "转出": "expense",
             "支山": "expense",
             "支鼎": "expense",
             "攴出": "expense",
@@ -47,9 +49,21 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "借Dr": "expense",
             "Dr": "expense",
         },
-        aliases=["收支", "方向", "交易方向", "月收/支", "月收支", "借贷", "借/贷", "借贷标志", "Dc Flg"],
+        aliases=[
+            "收支",
+            "方向",
+            "交易方向",
+            "交易类别",
+            "收入/支出",
+            "月收/支",
+            "月收支",
+            "借贷",
+            "借/贷",
+            "借贷标志",
+            "Dc Flg",
+        ],
     ),
-    "摘要": ColumnMapping(field="summary", aliases=["交易摘要", "Description", "Memo"]),
+    "摘要": ColumnMapping(field="summary", aliases=["交易摘要", "备注", "Description", "Memo"]),
     "交易金额": ColumnMapping(
         field="amount",
         unit="CNY",
@@ -62,7 +76,6 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "对方名称",
             "交易对方",
             "Counter party",
-            "备注",
             "Remarks",
             "对方账号与户名",
         ],
@@ -142,7 +155,10 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 r"交易时段\s*[:：]\s*(20\d{2}-\d{2}-\d{2})\s*至\s*(20\d{2}-\d{2}-\d{2})",
             ),
             "total_transactions": ("总条数", r"(?:总笔数|总条数)\s*[:：]\s*(\d+)"),
-            "account_holder": ("户名", r"户名\s*[:：]\s*(.+?)(?=\s+账号\s*[:：])"),
+            "account_holder": (
+                "客户名称",
+                r"(?:户名|客户名称|客户姓名|账户名称)\s*[:：]\s*(.+?)(?=\s+(?:账号|卡号|起始日期|结束日期)\s*[:：])",
+            ),
             "account_number": ("账号", r"账号\s*[:：]\s*([0-9*]+)"),
             "currency": ("币种", r"币种\s*[:：]\s*([^\s]+)"),
         }
@@ -172,13 +188,28 @@ class BankStatementCommunityPlugin(BaseTableParser):
     def derive(self, parse_result, text: str = "") -> ProjectionData:
         """Run the style-aware extractor and return projector-local facts."""
         result = run_bank_statement_extract(parse_result, text, self)
-        summary = self._build_summary(result.records)
+        records = _sanitize_bank_records(result.records)
+        summary = self._build_summary(records)
+        period = summary.get("period", {})
+        period_detail = result.identity_fields.get("query_period")
+        if isinstance(period_detail, dict):
+            period_value = next(
+                (
+                    str(period_detail.get(candidate) or "")
+                    for candidate in ("normalized_value", "value", "raw_value")
+                    if period_detail.get(candidate) not in (None, "")
+                ),
+                "",
+            )
+            period_dates = re.findall(r"20\d{2}-\d{2}-\d{2}", period_value)
+            if len(period_dates) >= 2:
+                period = {"start": period_dates[0], "end": period_dates[1]}
         projection = self._projection_data_from_components(
             identity_fields=result.identity_fields,
-            records=result.records,
+            records=records,
             raw_headers=[],
             summary=summary,
-            period=summary.get("period", {}),
+            period=period,
             extra_domain_facts=result.style_meta.to_properties(),
             warnings=result.warnings,
             confidence=1.0 if result.style_meta.extract_status != "degraded" else 0.5,
@@ -206,7 +237,159 @@ class BankStatementCommunityPlugin(BaseTableParser):
             )
             if identity_values.get(source)
         }
-        return projection.model_copy(update={"entity_fields": entity_fields})
+        return projection.model_copy(
+            update={
+                "entity_fields": entity_fields,
+                "content_markdown_override": _render_bank_statement_content_markdown(
+                    records,
+                    identity_values,
+                    period,
+                ),
+            }
+        )
+
+
+def _render_bank_statement_content_markdown(
+    records: list[dict],
+    identity: dict[str, str],
+    period: str | dict,
+) -> str:
+    """Render a record-complete bank statement Markdown view from canonical plugin facts."""
+    if not records:
+        return ""
+    rows_by_page: dict[int, list[dict]] = {}
+    for record in records:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        page = int(source.get("source_page") or (source.get("page_range") or [1])[0] or 1)
+        rows_by_page.setdefault(page, []).append(record)
+
+    parts = ['<!-- docmirror:markdown-profile version="1.0" -->']
+    page_numbers = sorted(rows_by_page) or [1]
+    for page in page_numbers:
+        parts.append(f'<!-- docmirror:page logical="{page}" source="{page}" -->')
+        if page == page_numbers[0]:
+            parts.extend(_bank_statement_header_lines(identity, period))
+        parts.append(_render_bank_statement_table(rows_by_page.get(page, [])))
+    return "\n\n".join(part for part in parts if part).rstrip() + "\n"
+
+
+def _sanitize_bank_records(records: list[dict]) -> list[dict]:
+    """Remove page furniture accidentally captured in bank transaction fields."""
+    sanitized: list[dict] = []
+    for record in records:
+        copied = {
+            key: dict(value) if key in {"raw", "normalized", "canonical_raw"} and isinstance(value, dict) else value
+            for key, value in dict(record).items()
+        }
+        for pool_name in ("raw", "normalized", "canonical_raw"):
+            pool = copied.get(pool_name)
+            if not isinstance(pool, dict):
+                continue
+            _sanitize_bank_value_pool(pool)
+        sanitized.append(copied)
+    return sanitized
+
+
+def _sanitize_bank_value_pool(pool: dict) -> None:
+    for key, value in list(pool.items()):
+        if not isinstance(value, str):
+            continue
+        key_text = str(key)
+        text = _clean_footer_text(value)
+        if key_text in {"balance", "amount", "amount_cny", "余额", "交易金额"}:
+            text = _clean_money_text(text)
+        pool[key] = text
+
+
+def _clean_money_text(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.match(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text)
+    return match.group(0) if match else text
+
+
+def _bank_statement_header_lines(identity: dict[str, str], period: str | dict) -> list[str]:
+    lines = ["# 银行流水"]
+    labels = [
+        ("银行名称", identity.get("bank_name") or ""),
+        ("开户行/客户行", identity.get("bank_branch") or ""),
+        ("户名", identity.get("account_holder") or ""),
+        ("账号", identity.get("account_number") or ""),
+        ("币种", identity.get("currency") or ""),
+    ]
+    for label, value in labels:
+        if value:
+            lines.append(f"**{label}:** {_markdown_cell(value)}")
+    if isinstance(period, dict):
+        start = str(period.get("start") or "")
+        end = str(period.get("end") or "")
+        if start or end:
+            lines.append(f"**账期:** {_markdown_cell(start)} 至 {_markdown_cell(end)}")
+    elif period:
+        lines.append(f"**账期:** {_markdown_cell(period)}")
+    return lines
+
+
+def _render_bank_statement_table(records: list[dict]) -> str:
+    headers = ["序号", "日期", "收/支", "交易金额", "账户余额", "对方户名", "对方账号", "摘要"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for record in records:
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        values = [
+            _first_value(raw, normalized, "序号", "sequence_no"),
+            _first_value(raw, normalized, "交易日期", "date"),
+            _display_direction(_first_value(raw, normalized, "收/支", "direction")),
+            _display_amount(raw, normalized),
+            _first_value(raw, normalized, "余额", "balance"),
+            _first_value(raw, normalized, "对方户名", "counter_party"),
+            _first_value(raw, normalized, "对方账号", "counter_account"),
+            _clean_footer_text(_first_value(raw, normalized, "摘要", "summary")),
+        ]
+        lines.append("| " + " | ".join(_markdown_cell(value) for value in values) + " |")
+    return "\n".join(lines)
+
+
+def _first_value(raw: dict, normalized: dict, raw_key: str, normalized_key: str) -> object:
+    raw_value = raw.get(raw_key)
+    if raw_value not in (None, ""):
+        return _clean_footer_text(str(raw_value))
+    value = normalized.get(normalized_key)
+    return _clean_footer_text(str(value)) if value not in (None, "") else ""
+
+
+def _display_amount(raw: dict, normalized: dict) -> str:
+    amount = str(raw.get("交易金额") or normalized.get("amount") or "").strip()
+    direction = str(raw.get("收/支") or normalized.get("direction") or "").strip()
+    if not amount:
+        return ""
+    if amount.startswith(("+", "-")):
+        return amount
+    if direction in {"收入", "income"}:
+        return f"+{amount}"
+    if direction in {"支出", "expense"}:
+        return f"-{amount}"
+    return amount
+
+
+def _display_direction(value: object) -> str:
+    text = str(value or "").strip()
+    if text == "income":
+        return "收入"
+    if text == "expense":
+        return "支出"
+    return text
+
+
+def _clean_footer_text(value: str) -> str:
+    text = re.sub(r"(?:当前页|总页数|生成时间)[:：]?.*$", "", str(value or "")).strip()
+    return text
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value or "").replace("|", "\\|").replace("\n", " ").strip()
 
 
 plugin = BankStatementCommunityPlugin()

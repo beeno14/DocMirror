@@ -1713,6 +1713,7 @@ class CommunityBundle:
     classification: dict[str, Any] = field(default_factory=dict)
     domain: dict[str, Any] = field(default_factory=dict)
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    content_markdown_override: str = ""
 
     def semantic_payload(self) -> dict[str, Any]:
         """Build and validate the public semantic source for all renderers."""
@@ -1778,6 +1779,8 @@ class CommunityBundle:
 
     def render_markdown(self) -> str:
         """Render the source-complete reading projection using DMP 1.0."""
+        if self.content_markdown_override.strip():
+            return self.content_markdown_override.rstrip() + "\n"
         markdown = render_markdown(self.result)
         if 'docmirror:nontext type="image" disposition="omitted"' in markdown and not any(
             warning.get("code") == "MARKDOWN_IMAGE_OMITTED" for warning in self.warnings
@@ -2439,6 +2442,7 @@ def project_community_bundle(
             "parser_warnings": parser_warnings,
             "parser_errors": [str(value) for value in errors],
         },
+        content_markdown_override=str(derived.get("content_markdown_override") or ""),
     )
 
 

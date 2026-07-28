@@ -75,7 +75,7 @@ def resolve_extract_status(
     canonical_ratio: float,
 ) -> str:
     """Map CQF ratios to export status (community / finance alignment)."""
-    if coverage_ratio >= 0.80 and canonical_ratio >= 0.80:
+    if coverage_ratio >= 1.0 and canonical_ratio >= 1.0:
         return "success"
     if coverage_ratio < 0.50 or canonical_ratio < 0.50:
         return "degraded"

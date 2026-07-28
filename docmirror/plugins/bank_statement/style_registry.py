@@ -19,12 +19,17 @@ Dependencies: ``bank_statement.styles.*``, ``bank_statement.canonical``.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import replace
 from typing import Any
 
 from docmirror.plugins.bank_statement.canonical import ensure_canonical_normalized, records_from_raw_transactions
 from docmirror.plugins.bank_statement.context import StyleContext
-from docmirror.plugins.bank_statement.evidence_atom_table_recovery import recover_evidence_atom_bank_tables
+from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
+    recover_evidence_atom_bank_tables,
+    recovered_evidence_atom_expected_row_count,
+    recovered_evidence_atom_row_sources,
+)
 from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
     recover_ocr_implicit_ledger_tables,
     recovered_ocr_implicit_row_count,
@@ -129,7 +134,7 @@ def _expected_rows(ctx: StyleContext) -> int:
     return 0
 
 
-def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[dict[str, str]], Any]:
+def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[dict[str, Any]], Any]:
     if parser_id == "compact_merged":
         batch = compact_merged.extract_transactions(ctx.tables)
         if batch:
@@ -144,6 +149,48 @@ def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[di
         batch = borderless_ocr.extract_transactions(ctx, plugin)
         return batch, lambda raw: borderless_ocr.normalize_record(raw, plugin)
     return [], None
+
+
+def _row_value_signature(values: Any) -> tuple[str, ...]:
+    if isinstance(values, dict):
+        source_values = [value for key, value in values.items() if not str(key).startswith("_")]
+    elif isinstance(values, (list, tuple)):
+        source_values = list(values)
+    else:
+        return ()
+    normalized = [re.sub(r"\s+", "", str(value or "")).replace(",", "") for value in source_values]
+    return tuple(sorted(value for value in normalized if value))
+
+
+def _attach_recovered_sources(
+    transactions: list[dict[str, Any]],
+    row_sources: list[dict[str, Any]],
+) -> None:
+    """Attach positioned row provenance without changing the recovered table contract."""
+    if not transactions or not row_sources:
+        return
+    source_queues: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for source in row_sources:
+        signature = _row_value_signature(source.get("row_values") or [])
+        if signature:
+            source_queues.setdefault(signature, []).append(source)
+
+    unmatched: list[int] = []
+    used_source_ids: set[int] = set()
+    for index, transaction in enumerate(transactions):
+        queue = source_queues.get(_row_value_signature(transaction)) or []
+        source = queue.pop(0) if queue else None
+        if source is None:
+            unmatched.append(index)
+            continue
+        used_source_ids.add(id(source))
+        transaction["_source"] = {key: value for key, value in source.items() if key != "row_values"}
+
+    remaining_sources = [source for source in row_sources if id(source) not in used_source_ids]
+    if len(unmatched) != len(remaining_sources):
+        return
+    for index, source in zip(unmatched, remaining_sources):
+        transactions[index]["_source"] = {key: value for key, value in source.items() if key != "row_values"}
 
 
 class BankStyleParserRegistry:
@@ -164,7 +211,7 @@ class BankStyleParserRegistry:
         plugin: Any,
     ) -> tuple[list[dict[str, Any]], dict[str, dict]]:
         identity_fields = plugin._extract_identity(ctx.parse_result)
-        transactions: list[dict[str, str]] = []
+        transactions: list[dict[str, Any]] = []
         normalize_fn = None
 
         for parser_id in detection.parser_chain:
@@ -222,16 +269,30 @@ class BankStyleParserRegistry:
         atom_tables = recover_evidence_atom_bank_tables(ctx.parse_result)
         if atom_tables:
             atom_count = sum(max(len(table) - 1, 0) for table in atom_tables)
-            atom_expected = max(expected, atom_count)
+            atom_expected = max(
+                expected,
+                atom_count,
+                recovered_evidence_atom_expected_row_count(ctx.parse_result),
+            )
             atom_ctx = replace(ctx, tables=atom_tables)
             atom_batch, atom_norm = _run_parser("grid_standard", atom_ctx, plugin)
+            _attach_recovered_sources(
+                atom_batch,
+                recovered_evidence_atom_row_sources(ctx.parse_result),
+            )
             atom_score, atom_coverage = _parser_score(atom_batch, atom_norm, plugin, atom_expected)
+            primary_comparable_score, primary_comparable_coverage = _parser_score(
+                transactions,
+                normalize_fn,
+                plugin,
+                atom_expected,
+            )
             richer_equal_coverage = (
                 len(atom_batch) >= len(transactions)
-                and atom_coverage >= coverage
+                and atom_coverage >= primary_comparable_coverage
                 and _batch_raw_width(atom_batch) > _batch_raw_width(transactions) + 1.0
             )
-            if atom_score > primary_score or richer_equal_coverage:
+            if atom_score > primary_comparable_score or richer_equal_coverage:
                 transactions = atom_batch
                 normalize_fn = atom_norm
                 primary_score = atom_score
@@ -342,13 +403,14 @@ class BankStyleParserRegistry:
 
             normalize_fn = _plugin_normalize
 
-        def _normalize(raw: dict[str, str]) -> dict[str, Any]:
+        def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
             normalized = normalize_fn(raw)
             return ensure_canonical_normalized(normalized, plugin.standard_fields)
 
         records = records_from_raw_transactions(
             transactions,
             normalize_fn=_normalize,
+            canonical_raw_fn=plugin._canonical_raw_values,
             style_id=detection.primary_style,
         )
 

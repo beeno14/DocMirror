@@ -794,7 +794,13 @@ class EvidenceEngine(BaseMiddleware):
             evidence.category
             for evidence in evidence_list
             if evidence.direction == 1
-            if evidence.source in {"document_title", "bank_ledger_structure"}
+            if evidence.source
+            in {
+                "document_title",
+                "document_frame",
+                "cover_frame",
+                "bank_ledger_structure",
+            }
             and evidence.weight >= 0.70
         }
 

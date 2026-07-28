@@ -89,6 +89,29 @@ def test_bank_document_frame_survives_payment_channel_keyword_veto():
     assert evidence_log["document_type"] == "bank_statement"
 
 
+def test_bank_issuer_account_and_headers_outrank_payment_body_keywords():
+    document_text = "\n".join(
+        [
+            "建设银行- 张白华",
+            "卡号/账号:6217001300005799744",
+            "客户名称：张白华",
+            "序号 摘要 币别 钞汇 交易日期 交易金额 账户余额 交易地点/附言 对方账号与户名",
+            "消费 支付宝-天弘基金管理有限公司 财付通-微信支付-拼多多平台商户",
+            "支付宝（中国）网络技术有限公司 扫二维码付款 微信支付",
+            "20220611 -5.88 92.28 105331000000875/支付宝-天弘基金管理有限公司",
+        ]
+    )
+    result = ParseResult(
+        full_text=document_text,
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=document_text)])],
+        entities=DocumentEntities(document_type="unknown"),
+    )
+
+    classified = EvidenceEngine().process(result)
+
+    assert classified.entities.document_type == "bank_statement"
+
+
 def test_weak_bank_terms_do_not_protect_bank_statement():
     engine = EvidenceEngine()
     evidence = engine._text_frame_evidence(

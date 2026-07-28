@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from docmirror.plugins.bank_statement.canonical_quality import audit_cqf
 from docmirror.plugins.bank_statement.extract_pipeline import enrich_identity_fields
 from docmirror.plugins.bank_statement.institution import detect_registered_institution
 from docmirror.plugins.bank_statement.institution_authority import (
@@ -251,6 +252,52 @@ def test_balance_chain_gap_reports_review_only_missing_row_candidate() -> None:
         "action=manual_review:"
         "reason=missing_page_bbox"
     ) in failures
+
+
+def test_balance_chain_skips_known_sequence_gap_and_reports_source_page_gap() -> None:
+    records = [
+        {
+            "normalized": {
+                "sequence_no": "31",
+                "date": "2023-01-07",
+                "amount": 20.0,
+                "direction": "expense",
+                "balance": 80.0,
+            }
+        },
+        {
+            "normalized": {
+                "sequence_no": "109",
+                "date": "2023-01-21",
+                "amount": 10.0,
+                "direction": "expense",
+                "balance": 500.0,
+            }
+        },
+    ]
+    text = "第1页共54页 第2页共54页 第7页共54页 第8页共54页"
+
+    warnings = audit_bank_statement_invariants(records, text)
+
+    assert not any(item.startswith("bank_invariant_failed:balance_chain") for item in warnings)
+    assert (
+        "bank_review:source_page_gap:"
+        "observed=4/54:"
+        "missing_ranges=3-6,9-54:"
+        "action=manual_review"
+    ) in warnings
+
+
+def test_canonical_quality_does_not_mark_partial_rows_success() -> None:
+    records = [
+        {"normalized": {"date": f"2023-01-{index:02d}", "direction": "expense", "amount": 1.0}}
+        for index in range(1, 10)
+    ]
+
+    result = audit_cqf(records, canonical_expected=10)
+
+    assert result.coverage_ratio == 0.9
+    assert result.extract_status == "low_coverage"
 
 
 def test_transaction_channel_is_not_institution() -> None:
