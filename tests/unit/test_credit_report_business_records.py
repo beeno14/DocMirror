@@ -20,11 +20,14 @@ from docmirror.plugins.credit_report.enterprise_native.extraction import (
     extract_enterprise_attachment_datasets,
     extract_enterprise_capital_summary,
     extract_enterprise_credit_lines_from_tables,
+    extract_enterprise_facility_summary,
     extract_enterprise_identity_facts,
+    extract_enterprise_repayment_liability_records,
     extract_enterprise_report_metadata,
     extract_enterprise_report_metadata_records,
     extract_enterprise_report_notes,
     extract_enterprise_summary_datasets,
+    refine_enterprise_business,
 )
 from docmirror.plugins.credit_report.personal_brief_native.extraction import (
     extract_personal_brief_section_content,
@@ -85,6 +88,37 @@ def test_enterprise_facility_detail_emits_every_declared_row_pair() -> None:
     ]
 
 
+def test_enterprise_facility_summary_follows_values_across_page_boundary() -> None:
+    header = _native_table(
+        "facility-summary-header",
+        [
+            ["非循环信用额度", "", "", "循环信用额度", "", ""],
+            ["总额", "已用额度", "剩余可用额度", "总额", "已用额度", "剩余可用额度"],
+        ],
+    )
+    values = _native_table(
+        "facility-summary-values",
+        [["3000", "3000", "0", "4900", "4900", "0"]],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=3, source_page_number=3, tables=[header], texts=[]),
+            SimpleNamespace(page_number=4, source_page_number=4, tables=[values], texts=[]),
+        ]
+    )
+
+    rows = extract_enterprise_facility_summary(result)
+
+    assert [
+        (row["facility_type"], row["total_limit"], row["used_limit"], row["available_limit"])
+        for row in rows
+    ] == [
+        ("non_revolving", 3000, 3000, 0),
+        ("revolving", 4900, 4900, 0),
+    ]
+    assert rows[0]["source_refs"][-1]["table_id"] == "facility-summary-values"
+
+
 def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> None:
     identity = _native_table(
         "identity",
@@ -98,9 +132,20 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
     responsibility = _native_table(
         "responsibility",
         [
+            ["责任类型", "被追偿业务", "", "", "其他借贷交易", "", "", "", ""],
             ["", "还款责任金额", "账户数", "余额", "还款责任金额", "账户数", "余额", "关注类余额", "不良类余额"],
             ["保证人/反担保人", "0", "0", "0", "4055", "3", "2180", "0", "0"],
             ["合计", "0", "0", "0", "4055", "3", "2180", "0", "0"],
+        ],
+    )
+    current = _native_table(
+        "current-guarantee",
+        [
+            ["", "正常类", "", "关注类", "", "不良类", "", "合计", ""],
+            ["", "账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"],
+            ["银行承兑汇票", "1", "2000", "0", "0", "0", "0", "1", "2000"],
+            ["信用证", "0", "0", "0", "0", "0", "0", "2", "4000"],
+            ["合计", "1", "2000", "0", "0", "0", "0", "3", "6000"],
         ],
     )
     closed = _native_table(
@@ -127,7 +172,7 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
                 page_number=3,
                 source_page_number=3,
                 texts=[],
-                tables=[identity],
+                tables=[identity, current],
             ),
             SimpleNamespace(
                 page_number=4,
@@ -161,6 +206,133 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
     assert responsibility_row["other_credit_responsibility_amount"] == 4055
     assert responsibility_row["other_credit_account_count"] == 3
     assert responsibility_row["other_credit_balance"] == 2180
+    current_rows = datasets["enterprise_current_credit_summary"]
+    assert [
+        (row["business_category"], row["normal_account_count"], row["total_account_count"], row["total_balance"])
+        for row in current_rows
+    ] == [
+        ("银行承兑汇票", 1, 1, 2000),
+        ("信用证", 0, 2, 4000),
+        ("合计", 1, 3, 6000),
+    ]
+
+
+def test_enterprise_repayment_liability_detail_merges_page_continuation() -> None:
+    primary = _native_table(
+        "liability-primary",
+        [
+            ["除贴现外的其他业务", "", "", "", "", "共1笔", "", "", "", ""],
+            [
+                "账户编号",
+                "责任类型",
+                "保证合同编号",
+                "币种",
+                "还款责任金额",
+                "授信机构/债权机构",
+                "业务种类",
+                "开立日期/接收日期",
+                "到期日",
+                "币种",
+            ],
+            [
+                "",
+                "借款金额/信用额度",
+                "余额",
+                "五级分类",
+                "逾期总额",
+                "逾期本金",
+                "逾期月数/还款状态",
+                "剩余还款月数",
+                "信息报告日期",
+                "",
+            ],
+            [
+                "D10023330H00029030001124000265200",
+                "保证人/反担保人",
+                "D10023330H0002DB2024111100000171",
+                "人民币元",
+                "2200",
+                "温州银行股份有限公司杭州分行",
+                "流动资金贷款",
+                "2024-12-02",
+                "2025-11-14",
+                "人民币元",
+            ],
+        ],
+    )
+    continuation = _native_table(
+        "liability-continuation",
+        [["", "1100", "1100", "正常", "0", "0", "0", "--", "2025-07-20"]],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=8, source_page_number=8, tables=[primary], texts=[]),
+            SimpleNamespace(page_number=9, source_page_number=9, tables=[continuation], texts=[]),
+        ]
+    )
+
+    rows = extract_enterprise_repayment_liability_records(result)
+
+    assert len(rows) == 1
+    assert rows[0]["account_identifier"] == "D10023330H00029030001124000265200"
+    assert rows[0]["responsibility_amount"] == 2200
+    assert rows[0]["loan_or_credit_amount"] == 1100
+    assert rows[0]["balance"] == 1100
+    assert rows[0]["snapshot_date"] == "2025-07-20"
+    assert rows[0]["source_page"] == 8
+    assert rows[0]["source_page_end"] == 9
+
+
+def test_enterprise_public_overview_and_detail_type_counts_are_both_preserved() -> None:
+    overview = _native_table(
+        "public-overview",
+        [
+            ["非信贷交易账户数", "欠税记录条数", "民事判决记录条数", "强制执行记录条数", "行政处罚记录条数"],
+            ["0", "0", "0", "0", "0"],
+        ],
+    )
+    license_record = _native_table(
+        "license",
+        [
+            ["许可部门", "许可名称", "许可日期"],
+            ["示例机关", "示例许可", "2025-01-02"],
+        ],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=3,
+                tables=[overview],
+                texts=[],
+            ),
+            SimpleNamespace(
+                page_number=10,
+                source_page_number=10,
+                tables=[license_record],
+                texts=[],
+            ),
+        ]
+    )
+
+    refined = refine_enterprise_business(
+        result,
+        {
+            "credit_summary": {},
+            "credit_accounts": [],
+            "credit_lines": [],
+            "public_records": [],
+        },
+    )
+
+    assert refined["credit_summary"]["public_record_counts"] == {
+        "non_credit_accounts": 0,
+        "tax_arrears": 0,
+        "civil_judgments": 0,
+        "enforcements": 0,
+        "administrative_penalties": 0,
+    }
+    assert refined["credit_summary"]["public_record_type_counts"] == {"license": 1}
 
 
 def test_enterprise_attachment_history_binds_to_visual_account_context() -> None:

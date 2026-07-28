@@ -118,3 +118,47 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
+
+
+def test_enterprise_official_public_record_lexicon_is_complete() -> None:
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    dictionary = enterprise.data_dictionary()
+    public_record_layout = enterprise.semantic_extensions()["enhanced_markdown"][
+        "dataset_layouts"
+    ]["public_records"]
+
+    assert dictionary["fields"]["public_record_type_counts"]["map_key_enum"] == "record_type"
+    assert public_record_layout == {
+        "mode": "table",
+        "columns": [
+            "sequence",
+            "record_type",
+            "authority",
+            "category",
+            "start_date",
+            "end_date",
+            "content",
+        ],
+    }
+    assert set(dictionary["enums"]["record_type"]) == {
+        "utility_payment",
+        "tax_arrears",
+        "civil_judgment",
+        "enforcement",
+        "administrative_penalty",
+        "social_security_payment",
+        "license",
+        "certification",
+        "qualification",
+        "award",
+        "export_quality",
+        "inspection_exemption",
+        "regulatory_supervision",
+        "patent",
+        "financing_restriction",
+        "data_provider_statement",
+        "credit_bureau_statement",
+        "subject_statement",
+        "dispute_annotation",
+    }
+    assert all(dictionary["enums"]["record_type"].values())

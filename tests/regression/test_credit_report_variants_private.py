@@ -185,19 +185,31 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "##### 余额与风险" in enhanced
     assert "##### 还款表现" in enhanced
     assert "| 注册资本 | 币种 | 金额单位 | 主要出资人记录数 | 主要出资人信息状态 | 信息来源机构 | 更新日期 |" in enhanced
-    assert "| 100 | CNY | 万元（人民币） | 0 | 无记录 | 深圳前海微众银行股份有限公司 | 2022-10-08 |" in enhanced
+    assert "| 100 | 人民币 | 万元（人民币） | 0 | 无记录 | 深圳前海微众银行股份有限公司 | 2022-10-08 |" in enhanced
     assert "#### 100 · 万元（人民币）" not in enhanced
     assert "**信息来源机构:** 深圳前海微众银行股份有限公司" in enhanced
     assert "**更新日期:** 2022-10-08" in enhanced
     assert "**授信机构:** 梅赛德斯-奔驰汽车金融有限公司" in enhanced
     assert "**管理机构:**" not in enhanced
     assert "**兼容状态（已弃用）:**" not in enhanced
-    assert "**账户状态:** 未结清" in enhanced
-    assert "**剩余还款月数:**" in enhanced
-    assert "**当前逾期报告状态:** 未报告" in enhanced
+    account_table = enhanced.split("### 信贷账户", maxsplit=1)[1].split(
+        "\n### ",
+        maxsplit=1,
+    )[0]
+    assert (
+        "| 组内序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | "
+        "开立日期 | 到期日期 | 信息截至日期 |"
+    ) in account_table
+    assert (
+        "| 1 | 中长期借款 | Y10061000H0001EIP1967714 | "
+        "梅赛德斯-奔驰汽车金融有限公司 | 固定资产贷款 | 未结清 |"
+    ) in account_table
+    assert "| 2 | 短期借款 | JQ20220902XS0M00000460UN |" in account_table
+    assert "| 3 | 循环透支 | D10055840H0001LE20220228XS000007641 |" in account_table
+    assert "当前逾期报告状态" in account_table
+    assert "剩余还款月数" in account_table
+    assert "#### 1. 中长期借款" not in account_table
     assert "| 1 | -- | -- |" not in enhanced
-    assert "#### 1. 中长期借款" in enhanced
-    assert "#### 1 · 中长期借款" not in enhanced
     assert "#### 法定代表人/非法人组织负责人" in enhanced
     assert "法定代表人/非法人组织负责人 · 林岚挺" not in enhanced
     assert "**名称/姓名:** 林岚挺" in enhanced
@@ -231,8 +243,14 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "account_balance_reconciliation_tolerance" not in semantic["domain"]["data_dictionary"]["fields"]
     appendix_position = enhanced.index("## 附录：文档来源与审计信息")
     assert appendix_position > enhanced.index("## 信用记录补充信息")
+    assert "企业提取完整性审计" not in enhanced[:appendix_position]
     assert "审计舍入容差" not in enhanced[:appendix_position]
     audit_appendix = enhanced[appendix_position:]
+    assert "### 企业提取完整性审计" in audit_appendix
+    assert "enterprise extraction audit" not in enhanced.lower()
+    assert [line for line in enhanced.splitlines() if line.startswith("## ")][-1] == (
+        "## 附录：文档来源与审计信息"
+    )
     assert "### 账户余额可比性检查（审计信息）" in audit_appendix
     assert "**源报告账户余额合计:** 65.41" in audit_appendix
     assert "**账户明细余额计算合计:** 65.42" in audit_appendix
@@ -298,8 +316,10 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "enterprise_capital_summary": 1,
         "enterprise_stakeholders": 1,
         "enterprise_relationships": 1,
-        "enterprise_facility_summary": 2,
-        "enterprise_attachment_accounts": 3,
+            "enterprise_facility_summary": 2,
+            "enterprise_current_credit_summary": 4,
+            "enterprise_extraction_audit": 5,
+            "enterprise_attachment_accounts": 3,
         "enterprise_credit_supplement": 34,
     }
 
@@ -429,6 +449,113 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         assert expected in enhanced
 
 
+def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
+    fixture = _DIGITAL_ENTERPRISE_DIR / "安徽华英征信报告20250728.pdf"
+    if not fixture.exists():
+        pytest.skip("audited cross-page digital-enterprise fixture is unavailable")
+    sealed = asyncio.run(
+        perceive_document(
+            fixture,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    enhanced = bundle.render_enhanced_markdown(semantic)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    facts = semantic["domain"]["facts"]
+
+    facilities = [
+        row["normalized"] for row in datasets["enterprise_facility_summary"]["rows"]
+    ]
+    assert [
+        (row["facility_type"], row["total_limit"], row["used_limit"], row["available_limit"])
+        for row in facilities
+    ] == [
+        ("non_revolving", "3000", "3000", "0"),
+        ("revolving", "4900", "4900", "0"),
+    ]
+
+    current = [
+        row["normalized"] for row in datasets["enterprise_current_credit_summary"]["rows"]
+    ]
+    assert len(current) == 6
+    assert {
+        row["business_category"]
+        for row in current
+        if row["transaction_group"] == "借贷交易"
+    } == {"短期借款", "贴现", "合计"}
+    guarantee_rows = {
+        row["business_category"]: row
+        for row in current
+        if row["transaction_group"] == "担保交易"
+    }
+    assert guarantee_rows["银行承兑汇票"]["total_account_count"] == 1
+    assert guarantee_rows["银行承兑汇票"]["total_balance"] == "2000"
+    assert guarantee_rows["信用证"]["normal_account_count"] == 0
+    assert guarantee_rows["信用证"]["total_account_count"] == 2
+    assert guarantee_rows["信用证"]["total_balance"] == "4000"
+    assert guarantee_rows["合计"]["total_account_count"] == 3
+    assert guarantee_rows["合计"]["total_balance"] == "6000"
+
+    responsibility = [
+        row["normalized"]
+        for row in datasets["enterprise_repayment_responsibility_summary"]["rows"]
+        if not row["normalized"]["is_total"]
+    ]
+    assert len(responsibility) == 1
+    assert responsibility[0]["responsibility_type"] == "保证人/反担保人"
+    assert responsibility[0]["other_credit_responsibility_amount"] == "2200"
+    assert responsibility[0]["other_credit_account_count"] == 1
+    assert responsibility[0]["other_credit_balance"] == "1100"
+
+    liabilities = [
+        row["normalized"] for row in datasets["repayment_liability_records"]["rows"]
+    ]
+    assert len(liabilities) == 1
+    assert liabilities[0]["account_identifier"] == "D10023330H00029030001124000265200"
+    assert liabilities[0]["contract_number"] == "D10023330H0002DB2024111100000171"
+    assert liabilities[0]["responsibility_amount"] == "2200"
+    assert liabilities[0]["loan_or_credit_amount"] == "1100"
+    assert liabilities[0]["balance"] == "1100"
+    assert liabilities[0]["five_tier_class"] == "正常"
+    assert liabilities[0]["snapshot_date"] == "2025-07-20"
+    liability_preview = enhanced.split("### 相关还款责任信息\n", maxsplit=1)[1].split(
+        "\n### ",
+        maxsplit=1,
+    )[0]
+    assert "**保证合同编号:** D10023330H0002DB2024111100000171" in liability_preview
+    assert "**还款责任金额:** 2200" in liability_preview
+    assert "**借款金额/信用额度:** 1100" in liability_preview
+    assert "**逾期月数/还款状态:** 0" in liability_preview
+    assert "**信息报告日期:** 2025-07-20" in liability_preview
+
+    summary = facts["credit_summary"]
+    assert summary["public_record_counts"] == {
+        "non_credit_accounts": 0,
+        "tax_arrears": 0,
+        "civil_judgments": 0,
+        "enforcements": 0,
+        "administrative_penalties": 0,
+    }
+    assert summary["public_record_type_counts"] == {
+        "license": 2,
+        "certification": 1,
+    }
+    assert "**许可记录:** 2" in enhanced
+    assert "**认证记录:** 1" in enhanced
+    assert "**license:**" not in enhanced
+    assert "**certification:**" not in enhanced
+    assert "public_record:" not in enhanced
+    assert "pt_3_4" not in enhanced
+
+
 def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_separate() -> None:
     fixture = _FIXTURE_DIR / "企业信用报告（自主查询版）.pdf"
     if not fixture.exists():
@@ -447,6 +574,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     bundle = build_community_bundle(sealed, file_path=str(fixture))
     semantic = bundle.semantic_payload()
     payload = bundle.json_payload(semantic)
+    enhanced = bundle.render_enhanced_markdown(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
     credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
@@ -486,7 +614,56 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert "subject_id" not in facts
     assert datasets["enterprise_profile_fields"]["row_count"] == 9
     assert datasets["enterprise_stakeholders"]["row_count"] == 8
-    assert "enterprise_credit_supplement" not in datasets
+    assert datasets["enterprise_current_credit_summary"]["row_count"] == 11
+    assert datasets["enterprise_closed_credit_summary"]["row_count"] == 11
+    assert datasets["enterprise_repayment_responsibility_summary"]["row_count"] == 8
+    assert datasets["repayment_liability_records"]["row_count"] == 3
+    assert datasets["enterprise_attachment_accounts"]["row_count"] == 12
+    assert datasets["enterprise_credit_supplement"]["row_count"] == 3
+    assert datasets["enterprise_attachment_credit_details"]["row_count"] == 10
+    assert datasets["enterprise_special_transactions"]["row_count"] == 2
+    audit_rows = [
+        row["normalized"]
+        for row in datasets["enterprise_extraction_audit"]["rows"]
+    ]
+    assert all(row["reconciliation_status"] == "complete" for row in audit_rows)
+    assert all(row["unresolved_record_count"] == 0 for row in audit_rows)
+    public_record_tokens = {
+        "utility_payment",
+        "tax_arrears",
+        "civil_judgment",
+        "enforcement",
+        "administrative_penalty",
+        "social_security_payment",
+        "license",
+        "certification",
+        "qualification",
+        "award",
+        "export_quality",
+        "inspection_exemption",
+        "regulatory_supervision",
+        "patent",
+        "financing_restriction",
+        "data_provider_statement",
+        "credit_bureau_statement",
+        "subject_statement",
+        "dispute_annotation",
+    }
+    assert not any(token in enhanced for token in public_record_tokens)
+    public_record_table = enhanced.split("### 公共记录\n", maxsplit=1)[1].split(
+        "\n## ",
+        maxsplit=1,
+    )[0]
+    assert (
+        "| 序号 | 记录类型 | 主管/发布机构 | 记录类别 | 生效/发生日期 | 截止日期 | 记录内容 |"
+        in public_record_table
+    )
+    assert public_record_table.count("\n| ") == len(public_records) + 2
+    assert "| 许可记录 |" in public_record_table
+    assert "| 认证记录 |" in public_record_table
+    assert "#### " not in public_record_table
+    assert "#### 账户 借贷交易" not in enhanced
+    assert "#### 账户 担保交易" not in enhanced
 
 
 @pytest.mark.parametrize("fixture,subtype,public_type", CASES)
@@ -524,6 +701,21 @@ def test_credit_report_subtype_projects_complete_v3(
     assert validate_projection_payload("community", payload).valid
     assert payload["sections"]
     assert any(dataset["row_count"] > 0 for dataset in payload["datasets"])
+    if subtype == "enterprise":
+        enterprise_datasets = {
+            dataset["name"]: dataset for dataset in payload["datasets"]
+        }
+        audit_dataset = enterprise_datasets["enterprise_extraction_audit"]
+        audit_rows = [row["normalized"] for row in audit_dataset["rows"]]
+        assert all(
+            row["expected_record_count"] == row["extracted_record_count"]
+            for row in audit_rows
+        )
+        assert all(
+            row["reconciliation_status"] == "complete"
+            and row["unresolved_record_count"] == 0
+            for row in audit_rows
+        )
     if fixture.name in _DIGITAL_PERSONAL_BRIEF_EXPECTED:
         expected_accounts, expected_liabilities, expected_inquiries, expected_personal, expected_inactive = (
             _DIGITAL_PERSONAL_BRIEF_EXPECTED[fixture.name]

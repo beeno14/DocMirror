@@ -165,6 +165,35 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
     assert validate_projection_payload("community", payload).valid
 
 
+def test_semantic_extension_can_override_dataset_reading_columns() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate(
+            [
+                {
+                    "repayment_id": "rep_1",
+                    "month": "2025-01",
+                    "status": "N",
+                }
+            ]
+        ),
+    )
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "dataset_reading_columns": {
+            "repayment_records": ["status"],
+        }
+    }
+
+    semantic = project_community_bundle(result).semantic_payload()
+    reading_table = next(
+        table
+        for table in semantic["reading"]["tables"]
+        if table["dataset_id"] == "ds_repayment_records"
+    )
+
+    assert reading_table["column_keys"] == ["status"]
+
+
 def test_source_report_count_can_verify_dataset_completeness() -> None:
     candidate = _candidate()
     candidate["data"]["credit_accounts"] = [
@@ -680,6 +709,44 @@ def test_audit_reconciliation_can_render_in_appendix_and_audit_csv_only() -> Non
     assert len(bundle.json_payload(semantic)["datasets"][0]["rows"]) == 1
 
 
+def test_dataset_can_be_deferred_to_final_markdown_appendix() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate(
+            [
+                {
+                    "repayment_id": "rep_1",
+                    "month": "2025-01",
+                    "status": "N",
+                }
+            ]
+        ),
+    )
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "enhanced_markdown": {
+            "dataset_layouts": {
+                "repayment_records": {
+                    "placement": "appendix",
+                    "columns": ["month", "status"],
+                }
+            },
+            "appendix": {"title": "附录：审计信息"},
+        }
+    }
+
+    enhanced = project_community_bundle(
+        result,
+        document_id="doc_deferred_dataset",
+    ).render_enhanced_markdown()
+    body, appendix = enhanced.split("## 附录：审计信息", maxsplit=1)
+
+    assert "2025-01" not in body
+    assert "### 还款记录" in appendix
+    assert "| 月份 | 还款状态 |" in appendix
+    assert "| 2025-01 | N |" in appendix
+    assert enhanced.rstrip().endswith("| 2025-01 | N |")
+
+
 def test_payment_records_use_transaction_business_name() -> None:
     candidate = _candidate([{"normalized": {"amount": "10.00"}, "raw": {"amount": "10.00"}}])
     candidate["data"]["records"] = candidate["data"].pop("repayment_records")
@@ -808,3 +875,47 @@ def test_conservation_gate_rejects_json_or_csv_row_loss() -> None:
     assert any(
         ":csv=" in issue for issue in bundle.conservation_issues(payload=intact_payload, dataset_csvs=truncated_csvs)
     )
+
+
+def test_nested_summary_map_keys_use_parent_enum_lexicon() -> None:
+    candidate = _candidate()
+    candidate["data"]["fields"]["credit_summary"] = {
+        "public_record_type_counts": {
+            "license": 2,
+            "certification": 1,
+            "patent": 3,
+        }
+    }
+    candidate["data"]["data_dictionary"]["fields"]["public_record_type_counts"] = {
+        "label": "公共记录明细类型统计",
+        "type": "object",
+        "map_key_enum": "record_type",
+    }
+    candidate["data"]["data_dictionary"]["enums"] = {
+        "record_type": {
+            "license": "许可记录",
+            "certification": "认证记录",
+            "patent": "专利记录",
+        }
+    }
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+
+    semantic = project_community_bundle(
+        result,
+        document_id="doc_nested_enum",
+    ).semantic_payload()
+    group = next(
+        group
+        for section in semantic["structure"]["sections"]
+        for group in section.get("groups", [])
+        if group["key"] == "public_record_type_counts"
+    )
+
+    assert {item["key"]: item["label"] for item in group["items"]} == {
+        "license": "许可记录",
+        "certification": "认证记录",
+        "patent": "专利记录",
+    }

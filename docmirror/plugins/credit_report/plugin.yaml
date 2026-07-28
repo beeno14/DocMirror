@@ -35,8 +35,10 @@ projection:
     enterprise_stakeholders: 出资人及主要人员
     enterprise_relationships: 关联关系
     enterprise_facility_summary: 授信额度汇总
+    enterprise_current_credit_summary: 当前信贷信息概要
     enterprise_closed_credit_summary: 已结清信贷信息概要
     enterprise_repayment_responsibility_summary: 相关还款责任信息概要
+    enterprise_extraction_audit: 企业提取完整性审计
     enterprise_attachment_accounts: 附件账户及业务清单
     enterprise_credit_supplement: 信用记录补充信息
     enterprise_attachment_credit_details: 附件信贷明细
@@ -77,6 +79,7 @@ projection:
     enterprise_stakeholders: [basic_information]
     enterprise_relationships: [basic_information]
     enterprise_facility_summary: [credit_summary]
+    enterprise_current_credit_summary: [credit_summary]
     enterprise_closed_credit_summary: [credit_summary]
     enterprise_repayment_responsibility_summary: [credit_summary]
     enterprise_attachment_accounts: [credit_supplement]
@@ -212,6 +215,19 @@ projection:
       - used_limit
       - available_limit
       - utilization_rate
+      - currency
+      - amount_unit
+    enterprise_current_credit_summary:
+      - transaction_group
+      - business_category
+      - normal_account_count
+      - normal_balance
+      - attention_account_count
+      - attention_balance
+      - adverse_account_count
+      - adverse_balance
+      - total_account_count
+      - total_balance
       - currency
       - amount_unit
     enterprise_closed_credit_summary:

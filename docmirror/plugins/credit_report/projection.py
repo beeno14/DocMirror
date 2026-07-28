@@ -21,6 +21,7 @@ _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 _DATASET_RECORD_ID_KEYS = {
     "credit_lines": ("record_id", "credit_line_id"),
     "enterprise_facility_summary": ("record_id", "credit_line_id"),
+    "enterprise_current_credit_summary": ("record_id", "current_summary_id"),
     "enterprise_closed_credit_summary": ("record_id", "closed_summary_id"),
     "enterprise_repayment_responsibility_summary": (
         "record_id",

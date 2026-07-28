@@ -797,6 +797,9 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     dataset_layouts = (
         presentation.get("dataset_layouts") if isinstance(presentation.get("dataset_layouts"), dict) else {}
     )
+    deferred_appendix_datasets: list[
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
+    ] = []
     for entry in reading.get("document_flow") or []:
         kind = str(entry.get("kind") or "")
         ref_id = str(entry.get("ref_id") or "")
@@ -864,6 +867,9 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         dataset_layout = dataset_layouts.get(str(dataset.get("name") or ""))
         if not isinstance(dataset_layout, dict):
             dataset_layout = {}
+        if dataset_layout.get("placement") == "appendix":
+            deferred_appendix_datasets.append((dataset, table, dataset_layout))
+            continue
         if not dataset_layout.get("hide_title", False):
             parts.append(f"### {_markdown_text(table.get('title') or dataset.get('label') or ref_id)}")
         column_by_key = {
@@ -993,7 +999,10 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                     dictionary=dictionary,
                     privacy_mode=privacy_mode,
                 )
-                parts.append(f"#### 账户 {shown_group}")
+                group_title_prefix = str(
+                    dataset_layout.get("group_title_prefix", "账户 ")
+                )
+                parts.append(f"#### {group_title_prefix}{shown_group}")
                 first = rows[0]
                 for key in metadata_keys:
                     value = row_value(first, key)
@@ -1045,12 +1054,66 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or section_id)}")
 
     appendix = presentation.get("appendix") if isinstance(presentation.get("appendix"), dict) else {}
-    if appendix:
+    if appendix or deferred_appendix_datasets:
         all_items: dict[str, dict[str, Any]] = {}
         for section in sections.values():
             section_items, _section_groups = section_pools(section)
             all_items.update(section_items)
         appendix_parts: list[str] = []
+        for dataset, table, dataset_layout in deferred_appendix_datasets:
+            column_by_key = {
+                str(column.get("key") or ""): column
+                for column in dataset.get("columns") or []
+                if column.get("key")
+            }
+            configured_keys = (
+                dataset_layout.get("columns")
+                or table.get("column_keys")
+                or []
+            )
+            keys = [
+                str(key)
+                for key in configured_keys
+                if str(key) in column_by_key
+            ]
+            if not keys:
+                continue
+            appendix_parts.append(
+                f"### {_markdown_text(table.get('title') or dataset.get('label') or dataset.get('name'))}"
+            )
+            labels = [
+                _markdown_text(column_by_key[key].get("label") or key)
+                for key in keys
+            ]
+            lines = [
+                "| " + " | ".join(labels) + " |",
+                "| " + " | ".join("---" for _ in keys) + " |",
+            ]
+            for row in dataset.get("rows") or []:
+                if not isinstance(row, dict):
+                    continue
+                normalized = (
+                    row.get("normalized")
+                    if isinstance(row.get("normalized"), dict)
+                    else {}
+                )
+                canonical_raw = (
+                    row.get("canonical_raw")
+                    if isinstance(row.get("canonical_raw"), dict)
+                    else {}
+                )
+                values = [
+                    _markdown_display(
+                        normalized.get(key, canonical_raw.get(key)),
+                        key=key,
+                        descriptor=column_by_key[key],
+                        dictionary=dictionary,
+                        privacy_mode=privacy_mode,
+                    )
+                    for key in keys
+                ]
+                lines.append("| " + " | ".join(values) + " |")
+            appendix_parts.append("\n".join(lines))
         for reference in appendix.get("fields") or []:
             item = configured_item(reference, all_items)
             if item is not None:
@@ -2079,6 +2142,14 @@ def project_community_bundle(
     data = domain_view.get("data") if isinstance(domain_view.get("data"), dict) else {}
     dictionary = data.get("data_dictionary") if isinstance(data.get("data_dictionary"), dict) else {}
     projection = copy.deepcopy(dict(projection_policy or {}))
+    semantic_extensions = (
+        derived.get("semantic") if isinstance(derived.get("semantic"), dict) else {}
+    )
+    dataset_reading_columns = (
+        semantic_extensions.get("dataset_reading_columns")
+        if isinstance(semantic_extensions.get("dataset_reading_columns"), dict)
+        else {}
+    )
     domain = _domain(domain_view, projection)
     page_count = int(domain_document.get("page_count") or len(getattr(result, "pages", []) or []))
     path = Path(file_path) if file_path else None
@@ -2158,6 +2229,27 @@ def project_community_bundle(
                 continue
             if isinstance(value, dict):
                 group = {"key": str(key), "label": _field_label(str(key), dictionary), "items": []}
+                field_descriptors = (
+                    dictionary.get("fields")
+                    if isinstance(dictionary.get("fields"), dict)
+                    else {}
+                )
+                parent_descriptor = (
+                    field_descriptors.get(str(key))
+                    if isinstance(field_descriptors.get(str(key)), dict)
+                    else {}
+                )
+                map_key_enum = str(parent_descriptor.get("map_key_enum") or "")
+                enums = (
+                    dictionary.get("enums")
+                    if isinstance(dictionary.get("enums"), dict)
+                    else {}
+                )
+                map_key_labels = (
+                    enums.get(map_key_enum)
+                    if map_key_enum and isinstance(enums.get(map_key_enum), dict)
+                    else {}
+                )
                 for child_key, child_value in value.items():
                     if child_value in (None, "", [], {}):
                         continue
@@ -2165,7 +2257,10 @@ def project_community_bundle(
                     group["items"].append(
                         {
                             "key": str(child_key),
-                            "label": _field_label(str(child_key), dictionary),
+                            "label": str(
+                                map_key_labels.get(child_key)
+                                or _field_label(str(child_key), dictionary)
+                            ),
                             "value": _json_value(child_value, child_type),
                             "raw": str(_scalar(child_value)),
                             "type": child_type,
@@ -2227,7 +2322,11 @@ def project_community_bundle(
             "columns": _dataset_columns(rows, dictionary, key),
             "completeness": _dataset_completeness(result, key, rows, projection, data),
         }
-        configured_reading_columns = list((projection.get("reading_columns") or {}).get(public_name) or ())
+        configured_reading_columns = list(
+            dataset_reading_columns.get(public_name)
+            or (projection.get("reading_columns") or {}).get(public_name)
+            or ()
+        )
         if configured_reading_columns:
             public["reading_columns"] = [str(value) for value in configured_reading_columns]
         datasets.append(CommunityDataset(public=public, rows=rows))

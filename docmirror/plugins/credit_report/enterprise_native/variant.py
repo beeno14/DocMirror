@@ -44,6 +44,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         from docmirror.plugins.credit_report.enterprise_native.extraction import (
             extract_enterprise_attachment_datasets,
             extract_enterprise_capital_summary,
+            extract_enterprise_continuation_audit,
             extract_enterprise_facility_summary,
             extract_enterprise_identity_facts,
             extract_enterprise_profile_datasets,
@@ -56,6 +57,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         datasets.update(extract_enterprise_report_metadata_records(parse_result, full_text))
         datasets.update(extract_enterprise_summary_datasets(parse_result))
         datasets.update(extract_enterprise_attachment_datasets(parse_result))
+        datasets["enterprise_extraction_audit"] = (
+            extract_enterprise_continuation_audit(
+                parse_result,
+                datasets=datasets,
+            )
+        )
         datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(parse_result)
         datasets["enterprise_facility_summary"] = extract_enterprise_facility_summary(parse_result)
         return {
@@ -156,6 +163,32 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "credit_line_count": {"label": "授信额度记录数", "type": "integer"},
                 "public_record_count": {"label": "公共记录数", "type": "integer"},
                 "public_record_counts": {"label": "各类公共记录数", "type": "object"},
+                "public_record_type_counts": {
+                    "label": "公共记录明细类型统计",
+                    "type": "object",
+                    "map_key_enum": "record_type",
+                },
+                "audit_id": {"label": "完整性审计ID", "type": "string"},
+                "continuation_family": {
+                    "label": "连续记录类型",
+                    "type": "string",
+                },
+                "expected_record_count": {
+                    "label": "源合同记录数",
+                    "type": "integer",
+                },
+                "extracted_record_count": {
+                    "label": "逻辑记录数",
+                    "type": "integer",
+                },
+                "unresolved_record_count": {
+                    "label": "未解析记录数",
+                    "type": "integer",
+                },
+                "reconciliation_status": {
+                    "label": "核对状态",
+                    "type": "string",
+                },
                 "reported_account_balance": {
                     "label": "源表账户余额合计",
                     "type": "money",
@@ -274,6 +307,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "long_id",
                     "sensitive": True,
                 },
+                "contract_number": {
+                    "label": "保证合同编号",
+                    "type": "long_id",
+                    "sensitive": True,
+                },
+                "responsibility_amount": {
+                    "label": "还款责任金额",
+                    "type": "money",
+                },
+                "snapshot_date": {"label": "信息报告日期", "type": "date"},
                 "institution": {"label": "授信机构", "type": "string"},
                 "business_type": {"label": "业务类型", "type": "string"},
                 "business_category": {"label": "业务类别", "type": "string"},
@@ -316,11 +359,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "history_status": {"label": "历史表现", "type": "string"},
                 "closed_summary_id": {"label": "已结清概要ID", "type": "string"},
+                "current_summary_id": {"label": "当前信贷概要ID", "type": "string"},
                 "transaction_group": {"label": "交易分组", "type": "string"},
                 "normal_account_count": {"label": "正常类账户数", "type": "integer"},
+                "normal_balance": {"label": "正常类余额", "type": "money"},
                 "attention_account_count": {"label": "关注类账户数", "type": "integer"},
+                "attention_balance": {"label": "关注类余额", "type": "money"},
                 "adverse_account_count": {"label": "不良类账户数", "type": "integer"},
+                "adverse_balance": {"label": "不良类余额", "type": "money"},
                 "total_account_count": {"label": "账户合计", "type": "integer"},
+                "total_balance": {"label": "余额合计", "type": "money"},
                 "is_total": {"label": "是否合计行", "type": "boolean"},
                 "responsibility_summary_id": {
                     "label": "还款责任概要ID",
@@ -355,6 +403,51 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "other_credit_adverse_balance": {
                     "label": "其他借贷交易不良类余额",
                     "type": "money",
+                },
+                "guarantee_responsibility_amount": {
+                    "label": "担保交易还款责任金额",
+                    "type": "money",
+                },
+                "guarantee_account_count": {
+                    "label": "担保交易账户数",
+                    "type": "integer",
+                },
+                "guarantee_balance": {"label": "担保交易余额", "type": "money"},
+                "guarantee_attention_balance": {
+                    "label": "担保交易关注类余额",
+                    "type": "money",
+                },
+                "guarantee_adverse_balance": {
+                    "label": "担保交易不良类余额",
+                    "type": "money",
+                },
+                "loan_or_credit_amount": {
+                    "label": "借款金额/信用额度",
+                    "type": "money",
+                },
+                "overdue_months_or_repayment_status": {
+                    "label": "逾期月数/还款状态",
+                    "type": "string",
+                },
+                "source_table_id_end": {
+                    "label": "源结束表标识",
+                    "type": "string",
+                },
+                "contract_number_status": {
+                    "label": "保证合同编号报告状态",
+                    "type": "string",
+                },
+                "responsibility_amount_status": {
+                    "label": "还款责任金额报告状态",
+                    "type": "string",
+                },
+                "due_date_status": {
+                    "label": "到期日报告状态",
+                    "type": "string",
+                },
+                "continuation_complete": {
+                    "label": "续行是否完整",
+                    "type": "boolean",
                 },
                 "attachment_account_id": {"label": "附件账户记录ID", "type": "string"},
                 "source_sequence": {"label": "源序号", "type": "integer"},
@@ -424,6 +517,42 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "amount_unit": fields["amount_unit"],
             }
         )
+        repayment_liabilities = dictionary["datasets"].setdefault(
+            "repayment_liability_records",
+            {},
+        )
+        repayment_liabilities["definition"] = (
+            "一行对应企业报告相关还款责任信息明细中的一个账户；"
+            "跨页续表合并为同一行。"
+        )
+        repayment_liability_columns = repayment_liabilities.setdefault("columns", {})
+        for key in (
+            "sequence",
+            "account_identifier",
+            "responsibility_type",
+            "contract_number",
+            "currency",
+            "amount_unit",
+            "responsibility_amount",
+            "institution",
+            "business_type",
+            "open_date",
+            "due_date",
+            "loan_or_credit_amount",
+            "balance",
+            "five_tier_class",
+            "overdue_total",
+            "overdue_principal",
+            "overdue_months_or_repayment_status",
+            "remaining_periods",
+            "snapshot_date",
+            "contract_number_status",
+            "responsibility_amount_status",
+            "due_date_status",
+            "continuation_complete",
+        ):
+            if key in fields:
+                repayment_liability_columns[key] = fields[key]
         dictionary["datasets"]["enterprise_report_metadata"] = {
             "definition": "一行对应企业信用报告封面标示的报告版本。",
             "columns": {
@@ -554,6 +683,30 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
+        dictionary["datasets"]["enterprise_current_credit_summary"] = {
+            "definition": "当前信贷信息概要中的一个业务类别或合计行一行。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "sequence",
+                    "current_summary_id",
+                    "transaction_group",
+                    "business_category",
+                    "normal_account_count",
+                    "normal_balance",
+                    "attention_account_count",
+                    "attention_balance",
+                    "adverse_account_count",
+                    "adverse_balance",
+                    "total_account_count",
+                    "total_balance",
+                    "currency",
+                    "amount_unit",
+                    "is_total",
+                    "source_page",
+                )
+            },
+        }
         dictionary["datasets"]["enterprise_repayment_responsibility_summary"] = {
             "definition": "相关还款责任信息概要中的一种责任类型或合计行一行。",
             "columns": {
@@ -562,6 +715,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "sequence",
                     "responsibility_summary_id",
                     "responsibility_type",
+                    "transaction_group",
                     "recovered_responsibility_amount",
                     "recovered_account_count",
                     "recovered_balance",
@@ -570,6 +724,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "other_credit_balance",
                     "other_credit_attention_balance",
                     "other_credit_adverse_balance",
+                    "guarantee_responsibility_amount",
+                    "guarantee_account_count",
+                    "guarantee_balance",
+                    "guarantee_attention_balance",
+                    "guarantee_adverse_balance",
                     "currency",
                     "amount_unit",
                     "is_total",
@@ -694,22 +853,70 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "civil_judgment": "民事判决",
             "enforcement": "强制执行",
             "administrative_penalty": "行政处罚",
-            "social_security_payment": "社会保障/公积金缴费",
+            "social_security_payment": "住房公积金缴费记录",
             "license": "许可记录",
             "certification": "认证记录",
             "qualification": "资质记录",
             "award": "奖励记录",
-            "export_quality": "出口商品质量记录",
-            "inspection_exemption": "免检记录",
-            "regulatory_supervision": "监管记录",
+            "export_quality": "出入境检验检疫绿色通道信息",
+            "inspection_exemption": "进出口商品免检信息",
+            "regulatory_supervision": "进出口免检分类监管信息",
             "patent": "专利记录",
-            "financing_restriction": "融资约束名录",
+            "financing_restriction": "融资规模控制信息",
             "data_provider_statement": "数据提供机构说明",
             "credit_bureau_statement": "征信中心说明",
             "subject_statement": "信息主体声明",
             "dispute_annotation": "异议标注",
         }
+        dictionary["datasets"]["enterprise_extraction_audit"] = {
+            "definition": (
+                "每行核对一种企业报告连续记录的源合同数量与逻辑记录数量；"
+                "不通过相邻表或列数相同进行推断合并。"
+            ),
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "sequence",
+                    "audit_id",
+                    "continuation_family",
+                    "expected_record_count",
+                    "extracted_record_count",
+                    "unresolved_record_count",
+                    "reconciliation_status",
+                )
+            },
+        }
         enums["amount_unit"] = {"CNY_10K": "万元（人民币）"}
+        enums["currency"] = {
+            "CNY": "人民币",
+            "USD": "美元",
+            "EUR": "欧元",
+            "HKD": "港币",
+        }
+        enums["contract_number_status"] = {
+            "reported": "已报告",
+            "not_reported": "未报告",
+        }
+        enums["responsibility_amount_status"] = {
+            "reported": "已报告",
+            "not_reported": "未报告",
+        }
+        enums["due_date_status"] = {
+            "reported": "已报告",
+            "not_reported": "未报告",
+        }
+        enums["continuation_complete"] = {"true": "是", "false": "否"}
+        enums["continuation_family"] = {
+            "current_credit_summary": "当前信贷信息概要",
+            "closed_credit_summary": "已结清信贷信息概要",
+            "repayment_responsibility_summary": "相关还款责任概要",
+            "repayment_liability": "相关还款责任明细",
+            "attachment_account": "附件账户/业务",
+        }
+        enums["reconciliation_status"] = {
+            "complete": "完整",
+            "unresolved": "存在未解析记录",
+        }
         enums["relationship_type"] = {
             "actual_controller": "实际控制人",
             "related_enterprise": "关联企业",
@@ -785,6 +992,29 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 }
             ]
         }
+        semantic["dataset_reading_columns"] = {
+            "repayment_liability_records": [
+                "sequence",
+                "account_identifier",
+                "responsibility_type",
+                "contract_number",
+                "institution",
+                "business_type",
+                "open_date",
+                "due_date",
+                "responsibility_amount",
+                "loan_or_credit_amount",
+                "balance",
+                "five_tier_class",
+                "overdue_total",
+                "overdue_principal",
+                "overdue_months_or_repayment_status",
+                "remaining_periods",
+                "snapshot_date",
+                "currency",
+                "amount_unit",
+            ],
+        }
         semantic["enhanced_markdown"] = {
             "privacy_mode": "full",
             "show_top_document_metadata": False,
@@ -849,9 +1079,28 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "amount_unit",
                     ],
                 },
+                "enterprise_current_credit_summary": {
+                    "mode": "grouped_table",
+                    "group_by": "transaction_group",
+                    "group_title_prefix": "",
+                    "columns": [
+                        "business_category",
+                        "normal_account_count",
+                        "normal_balance",
+                        "attention_account_count",
+                        "attention_balance",
+                        "adverse_account_count",
+                        "adverse_balance",
+                        "total_account_count",
+                        "total_balance",
+                        "currency",
+                        "amount_unit",
+                    ],
+                },
                 "enterprise_closed_credit_summary": {
                     "mode": "grouped_table",
                     "group_by": "transaction_group",
+                    "group_title_prefix": "",
                     "columns": [
                         "business_category",
                         "normal_account_count",
@@ -871,15 +1120,70 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "other_credit_balance",
                         "other_credit_attention_balance",
                         "other_credit_adverse_balance",
+                        "guarantee_responsibility_amount",
+                        "guarantee_account_count",
+                        "guarantee_balance",
+                        "guarantee_attention_balance",
+                        "guarantee_adverse_balance",
                         "currency",
                         "amount_unit",
                     ],
                 },
-                "credit_accounts": {
+                "enterprise_extraction_audit": {
+                    "placement": "appendix",
+                    "columns": [
+                        "continuation_family",
+                        "expected_record_count",
+                        "extracted_record_count",
+                        "unresolved_record_count",
+                        "reconciliation_status",
+                    ],
+                },
+                "repayment_liability_records": {
                     "mode": "record_cards",
-                    "title_fields": ["sequence", "business_category"],
+                    "title_fields": ["sequence", "responsibility_type"],
                     "title_separator": ". ",
                     "columns": [
+                        "account_identifier",
+                        "contract_number",
+                        "contract_number_status",
+                        "institution",
+                        "business_type",
+                        "open_date",
+                        "due_date",
+                        "due_date_status",
+                        "currency",
+                        "amount_unit",
+                        "responsibility_amount",
+                        "responsibility_amount_status",
+                        "loan_or_credit_amount",
+                        "balance",
+                        "five_tier_class",
+                        "overdue_total",
+                        "overdue_principal",
+                        "overdue_months_or_repayment_status",
+                        "remaining_periods",
+                        "snapshot_date",
+                        "continuation_complete",
+                    ],
+                },
+                "public_records": {
+                    "mode": "table",
+                    "columns": [
+                        "sequence",
+                        "record_type",
+                        "authority",
+                        "category",
+                        "start_date",
+                        "end_date",
+                        "content",
+                    ],
+                },
+                "credit_accounts": {
+                    "mode": "table",
+                    "columns": [
+                        "sequence",
+                        "business_category",
                         "account_identifier",
                         "institution",
                         "business_type",
@@ -1042,6 +1346,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "omit_unlisted": False,
                     "hidden_fields": [
                         "facility_summary",
+                        "source_account_summary_table_id",
+                        "source_account_summary_page",
                     ],
                     "hidden_groups": ["facility_summary"],
                     "groups": [
@@ -1079,6 +1385,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                                 "reported_account_counts",
                                 "reported_account_balances",
                                 "public_record_counts",
+                                "public_record_type_counts",
                             ],
                         },
                         {
