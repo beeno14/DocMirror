@@ -166,12 +166,6 @@ def run_bank_statement_extract(
         plugin,
     )
     identity_fields = enrich_identity_fields(identity_fields, ctx.full_text, parse_result)
-    if detection.primary_style == "pingan_monthly_statement":
-        from docmirror.plugins.bank_statement.styles import pingan_monthly
-
-        pingan_identity = pingan_monthly.extract_identity(ctx)
-        if pingan_identity:
-            identity_fields.update(pingan_identity)
     try:
         evidence_identity = plugin._recover_identity_from_evidence(parse_result)
     except Exception:
@@ -187,13 +181,6 @@ def run_bank_statement_extract(
         blo_meta=blo_meta,
     )
     warnings = collect_extract_warnings(ctx, style_meta)
-    if detection.primary_style == "pingan_monthly_statement":
-        from docmirror.plugins.bank_statement.styles import pingan_monthly
-
-        pingan_warnings = pingan_monthly.recovery_warnings(ctx)
-        if pingan_warnings:
-            style_meta.extract_status = "degraded"
-            warnings.extend(pingan_warnings)
     invariant_failures = audit_bank_statement_invariants(records, ctx.full_text)
     if invariant_failures:
         if any(warning.startswith("bank_invariant_failed:") for warning in invariant_failures):

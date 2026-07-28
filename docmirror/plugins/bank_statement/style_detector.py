@@ -114,13 +114,6 @@ class BankStyleDetector:
         headers = self._collect_headers(ctx.tables)
         joined_headers = "".join(headers)
 
-        if style_id == "pingan_monthly_statement":
-            from docmirror.plugins.bank_statement.styles.pingan_monthly import (
-                looks_like_pingan_monthly_statement,
-            )
-
-            return 0.98 if looks_like_pingan_monthly_statement(ctx) else 0.0
-
         if ctx.reconstruction and ctx.reconstruction.pipe_header_detected:
             if style_id == "signed_amount":
                 return 0.0
