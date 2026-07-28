@@ -132,3 +132,102 @@ def extract_all_tables(
             seen.add(key)
             all_txns.append(txn)
     return all_txns
+
+
+def extract_logical_rows_with_provenance(
+    parse_result: Any,
+    registry: dict[str, Any],
+    *,
+    strict_first_col: bool = False,
+) -> list[dict[str, Any]]:
+    """Extract canonical logical-table rows without discarding source columns or provenance.
+
+    This path is bank-generic: header semantics decide whether a logical table is a
+    ledger, while ``LogicalTable`` and ``TableRow`` carry the physical source.  No
+    institution-specific routing is performed here.
+    """
+    if parse_result is None:
+        return []
+
+    from docmirror.tables.access import get_logical_tables
+
+    transactions: list[dict[str, Any]] = []
+    for table in get_logical_tables(parse_result):
+        headers = [str(value or "").strip() for value in (getattr(table, "headers", []) or [])]
+        source_rows = list(getattr(table, "rows", []) or [])
+        if not source_rows:
+            continue
+
+        row_values = [
+            [str(getattr(cell, "text", "") or "").strip() for cell in (getattr(row, "cells", []) or [])]
+            for row in source_rows
+        ]
+        matrix = ([headers] if headers else []) + row_values
+        header = detect_headers([matrix], registry, prefer_strict=True)
+        if header is None:
+            continue
+
+        raw_headers = header.raw_headers
+        data_start = header.row_index if headers else header.row_index + 1
+        provenance = list(getattr(table, "provenance", []) or [])
+        for row_index, row in enumerate(source_rows):
+            if row_index < data_start:
+                continue
+            values = row_values[row_index]
+            if not row_has_transaction_data(values, strict_first_col=strict_first_col):
+                continue
+            first_cell = values[0] if values else ""
+            if any(marker in first_cell for marker in _SUMMARY_MARKERS):
+                continue
+
+            transaction: dict[str, Any] = {}
+            for col_index, value in enumerate(values):
+                header_name = raw_headers[col_index] if col_index < len(raw_headers) else f"col_{col_index}"
+                header_name = header_name or f"col_{col_index}"
+                transaction[header_name] = value
+
+            row_provenance = provenance[row_index] if row_index < len(provenance) else None
+            source_page = int(
+                (getattr(row_provenance, "source_page", 0) if row_provenance is not None else 0)
+                or getattr(row, "source_page", 0)
+                or 0
+            )
+            source_table_id = str(
+                getattr(row, "source_physical_id", "")
+                or (getattr(row_provenance, "source_table_id", "") if row_provenance is not None else "")
+                or ""
+            )
+            raw_source_index = getattr(row, "source_row_index", -1)
+            row_source_index = int(raw_source_index) if raw_source_index is not None else -1
+            if row_source_index < 0 and row_provenance is not None:
+                row_source_index = int(getattr(row_provenance, "source_row_index", row_index) or 0)
+            if row_source_index < 0:
+                row_source_index = row_index
+
+            cells = list(getattr(row, "cells", []) or [])
+            evidence_ids = list(
+                dict.fromkeys(
+                    str(evidence_id)
+                    for cell in cells
+                    for evidence_id in (getattr(cell, "evidence_ids", []) or [])
+                    if str(evidence_id)
+                )
+            )
+            source_cell_refs: list[dict[str, Any]] = []
+            for ref in [
+                *(getattr(row, "source_cell_refs", []) or []),
+                *(ref for cell in cells for ref in (getattr(cell, "source_cell_refs", []) or [])),
+            ]:
+                if isinstance(ref, dict) and ref not in source_cell_refs:
+                    source_cell_refs.append(dict(ref))
+            transaction["_source"] = {
+                "source": "canonical_table",
+                **({"source_page": source_page, "page_id": f"page:{source_page:04d}"} if source_page > 0 else {}),
+                **({"table_id": source_table_id} if source_table_id else {}),
+                "source_row_index": row_source_index,
+                **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+                **({"source_cell_refs": source_cell_refs} if source_cell_refs else {}),
+            }
+            transactions.append(transaction)
+
+    return transactions

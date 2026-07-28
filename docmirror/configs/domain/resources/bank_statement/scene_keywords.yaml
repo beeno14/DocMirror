@@ -41,6 +41,22 @@ scene_keywords:
         min_matches: 6
         weight: 0.75
         weight_tiers: {8: 0.9}
+      - scope: document
+        source: document_frame
+        required_groups:
+          - [银行, Bank, 农商行, 农信, 信用社, 农村商业银行, 商业银行]
+          - [账号, 账户号, 卡号, Account No]
+        signal_groups:
+          - [户名, 账户名称, 客户名称, Name]
+          - [币种, 币别, Currency, CNY, 人民币]
+          - [交易日期, 记账日期, 交易时间, Date]
+          - [交易金额, 发生额, 借方, 贷方, 收入/支出金额, 收入, 支出, Amount]
+          - [账户余额, 联机余额, 余额, Balance]
+          - [交易对手信息, 对手信息, 对手机构, 对手名称, 对方账号, 对方户名, 对方开户行, Counter Party]
+          - [交易摘要, 摘要代码, 摘要, 备注, 交易地点, 附言]
+        min_matches: 5
+        weight: 0.82
+        weight_tiers: {7: 0.9}
     header_signatures:
       - [交易时间, 金额, 余额, 对方户名, 摘要]
       - [交易日期, 摘要, 存入, 支出, 余额]

@@ -40,6 +40,7 @@ _FOOTER_MARKERS = (
     "总计",
 )
 _COUNT_PATTERNS = (re.compile(r"合计笔数[:：]\s*(?P<count>\d+)"),)
+_SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*共\s*(?P<total>\d+)\s*页")
 _SPLIT_COUNT_PATTERNS = (
     re.compile(r"借方笔数[:：]\s*(?P<debit>\d+).*?贷方笔数[:：]\s*(?P<credit>\d+)", re.S),
     re.compile(r"当前账单借方发生数[:：]\s*(?P<debit>\d+).*?当前账单贷方发生数[:：]\s*(?P<credit>\d+)", re.S),
@@ -109,6 +110,8 @@ def count_expected_rows_from_bank_footer(text: str) -> int:
 def audit_bank_statement_invariants(records: list[dict[str, Any]], text: str) -> list[str]:
     """Hard semantic gates for bank ledger rows against source footer totals."""
     failures: list[str] = []
+    if page_gap_warning := _source_page_gap_warning(text):
+        failures.append(page_gap_warning)
     expected = count_expected_rows_from_bank_footer(text)
     if expected > 0 and len(records) != expected:
         failures.append(f"bank_invariant_failed:row_count:{len(records)}/{expected}")
@@ -149,6 +152,7 @@ def _balance_chain_breaks(rows: list[dict[str, Any]]) -> tuple[int, int]:
     checked = 0
     breaks = 0
     prev_balance: float | None = None
+    prev_sequence: int | None = None
     for row in rows:
         direction = row.get("direction")
         if direction not in ("income", "expense"):
@@ -159,12 +163,15 @@ def _balance_chain_breaks(rows: list[dict[str, Any]]) -> tuple[int, int]:
             continue
         balance_f = _float(balance)
         amount_f = _float(amount)
-        if prev_balance is not None:
+        sequence = _sequence_number(row)
+        sequence_is_contiguous = prev_sequence is None or sequence is None or abs(sequence - prev_sequence) == 1
+        if prev_balance is not None and sequence_is_contiguous:
             checked += 1
             expected_balance = prev_balance + amount_f if direction == "income" else prev_balance - amount_f
             if abs(round(expected_balance - balance_f, 2)) > 0.01:
                 breaks += 1
         prev_balance = balance_f
+        prev_sequence = sequence
     return breaks, checked
 
 
@@ -172,6 +179,7 @@ def _balance_chain_break_review_items(rows: list[dict[str, Any]], *, limit: int 
     items: list[str] = []
     prev_balance: float | None = None
     prev_row: dict[str, Any] | None = None
+    prev_sequence: int | None = None
     for row_index, row in enumerate(rows, start=1):
         direction = row.get("direction")
         if direction not in ("income", "expense"):
@@ -182,7 +190,9 @@ def _balance_chain_break_review_items(rows: list[dict[str, Any]], *, limit: int 
             continue
         balance_f = _float(balance)
         amount_f = _float(amount)
-        if prev_balance is not None:
+        sequence = _sequence_number(row)
+        sequence_is_contiguous = prev_sequence is None or sequence is None or abs(sequence - prev_sequence) == 1
+        if prev_balance is not None and sequence_is_contiguous:
             expected_balance = prev_balance + amount_f if direction == "income" else prev_balance - amount_f
             delta = round(balance_f - expected_balance, 2)
             if abs(delta) > 0.01:
@@ -217,7 +227,46 @@ def _balance_chain_break_review_items(rows: list[dict[str, Any]], *, limit: int 
                     break
         prev_balance = balance_f
         prev_row = row
+        prev_sequence = sequence
     return items
+
+
+def _sequence_number(row: dict[str, Any]) -> int | None:
+    value = row.get("sequence_no")
+    match = re.search(r"\d+", str(value or ""))
+    return int(match.group(0)) if match else None
+
+
+def _source_page_gap_warning(text: str) -> str:
+    matches = list(_SOURCE_PAGE_RE.finditer(text or ""))
+    if len(matches) < 2:
+        return ""
+    observed = {int(match.group("page")) for match in matches}
+    declared_total = max(int(match.group("total")) for match in matches)
+    if declared_total <= 0:
+        return ""
+    missing = [page for page in range(1, declared_total + 1) if page not in observed]
+    if not missing:
+        return ""
+    return (
+        "bank_review:source_page_gap:"
+        f"observed={len(observed)}/{declared_total}:"
+        f"missing_ranges={_compact_ranges(missing)}:"
+        "action=manual_review"
+    )
+
+
+def _compact_ranges(values: list[int]) -> str:
+    ranges: list[str] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
 
 
 def _single_missing_row_candidate(

@@ -28,17 +28,18 @@ def test_audit_cqf_degraded_when_canonical_low():
     assert result.canonical_extracted == 0
 
 
-def test_audit_cqf_success():
+def test_audit_cqf_success_requires_full_coverage():
     records = [
         {"normalized": {"date": "2024-01-01", "direction": "income", "amount": 1.0}}
-        for _ in range(80)
+        for _ in range(100)
     ]
     result = audit_cqf(records, canonical_expected=100)
     assert result.extract_status == "success"
-    assert result.canonical_ratio >= 0.80
+    assert result.canonical_ratio == 1.0
 
 
 def test_resolve_extract_status_thresholds():
-    assert resolve_extract_status(coverage_ratio=0.9, canonical_ratio=0.9) == "success"
+    assert resolve_extract_status(coverage_ratio=1.0, canonical_ratio=1.0) == "success"
+    assert resolve_extract_status(coverage_ratio=0.9, canonical_ratio=0.9) == "low_coverage"
     assert resolve_extract_status(coverage_ratio=0.6, canonical_ratio=0.6) == "low_coverage"
     assert resolve_extract_status(coverage_ratio=0.3, canonical_ratio=0.3) == "degraded"

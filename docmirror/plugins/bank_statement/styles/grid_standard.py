@@ -19,6 +19,7 @@ Dependencies: ``header_resolve``, ``row_extract``, ``institution``, ``standardiz
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from docmirror.plugins._base.standardizer import normalize_amount
@@ -29,7 +30,11 @@ from docmirror.plugins.bank_statement.header_resolve import (
     normalize_header_cell,
 )
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
-from docmirror.plugins.bank_statement.row_extract import extract_all_tables, extract_rows_from_header
+from docmirror.plugins.bank_statement.row_extract import (
+    extract_all_tables,
+    extract_logical_rows_with_provenance,
+    extract_rows_from_header,
+)
 from docmirror.plugins.bank_statement.wide_table_recovery import is_footer_or_total_row
 
 PARSER_ID = "grid_standard"
@@ -37,7 +42,19 @@ STYLE_ID = "grid_standard"
 
 _SPLIT_DEBIT_KEYS = ("支出", "支出金额", "借方发生额", "借方")
 _SPLIT_CREDIT_KEYS = ("收入", "收入金额", "贷方发生额", "贷方")
-_DIRECTION_KEYS = ("收/支", "收支", "方向", "交易方向", "月收/支", "借贷", "借/贷", "借贷标志", "Dc Flg")
+_DIRECTION_KEYS = (
+    "收/支",
+    "收支",
+    "方向",
+    "交易方向",
+    "交易类别",
+    "收入/支出",
+    "月收/支",
+    "借贷",
+    "借/贷",
+    "借贷标志",
+    "Dc Flg",
+)
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
 
 
@@ -162,10 +179,10 @@ def _normalize_monetary_cell(value: str) -> float | None:
 
 
 def _normalize_direction_text(value: str) -> str:
-    text = str(value or "").strip()
-    if any(token in text for token in ("收入", "收人")):
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "").strip()))
+    if any(token in text for token in ("收入", "转入", "收人")):
         return "income"
-    if any(token in text for token in ("支出", "支山", "支鼎", "攴出")):
+    if any(token in text for token in ("支出", "转出", "支山", "支鼎", "攴出")):
         return "expense"
     if "贷" in text or re.search(r"\bCr\b", text, re.IGNORECASE):
         return "income"
@@ -210,8 +227,21 @@ def _extract_split_grid_records(
     return transactions
 
 
-def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, str]]:
+def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]:
     variant = match_institution(ctx.full_text, ctx.institution)
+
+    if (
+        ctx.parse_result is not None
+        and ctx.reconstruction is not None
+        and ctx.reconstruction.source == "canonical_table"
+    ):
+        logical_transactions = extract_logical_rows_with_provenance(
+            ctx.parse_result,
+            plugin.column_registry,
+            strict_first_col=True,
+        )
+        if logical_transactions:
+            return logical_transactions
 
     split_txns: list[dict[str, str]] = []
     for tbl in ctx.tables:

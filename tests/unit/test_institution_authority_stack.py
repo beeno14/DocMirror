@@ -102,3 +102,19 @@ def test_extract_identity_from_header_when_holder_is_nearby_line():
     assert identity["account_holder"] == "曹兴勇"
     assert identity["account_number"] == "6230 **** 3462"
     assert identity["currency"] == "CNY"
+
+
+def test_extract_masked_card_and_explicit_period_without_crossing_into_first_transaction():
+    text = (
+        "户名: 测试用户\n"
+        "账号/卡号: 6230\\*\\*\\*\\*6516\n"
+        "币种: 人民币\n"
+        "起止日期: 2023-01-01至2023-06-30\n"
+        "序号 交易日期 交易金额 账户余额 用途\n"
+        "1 2023-01-01 10.00 90.00 20230101782001954508147\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["account_number"] == "6230****6516"
+    assert identity["query_period"] == "2023-01-01 ~ 2023-06-30"

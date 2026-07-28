@@ -183,7 +183,8 @@ def run_bank_statement_extract(
     warnings = collect_extract_warnings(ctx, style_meta)
     invariant_failures = audit_bank_statement_invariants(records, ctx.full_text)
     if invariant_failures:
-        style_meta.extract_status = "degraded"
+        if any(warning.startswith("bank_invariant_failed:") for warning in invariant_failures):
+            style_meta.extract_status = "degraded"
         warnings.extend(invariant_failures)
     return BankExtractResult(
         ctx=ctx,

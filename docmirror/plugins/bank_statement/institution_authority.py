@@ -223,17 +223,20 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
     if not out.get("account_holder"):
         out["account_holder"] = _nearby_holder_after_label(header)
 
-    m = re.search(r"(?:客户账号|账号)[:：]?\s*([0-9*＊\s]{8,30})", header)
+    m = re.search(
+        r"(?:客户账号|账号(?:\s*/\s*卡号)?)[:：]?[ \t]*([0-9*＊\\ \t]{8,40})",
+        header,
+    )
     if m:
-        out["account_number"] = re.sub(r"\s+", " ", m.group(1)).strip()
+        out["account_number"] = _normalize_account_token(m.group(1))
     else:
-        m = re.search(r"Account No\.?\s+([0-9*＊\s]{8,30})", header, re.I)
+        m = re.search(r"Account No\.?[ \t]+([0-9*＊\\ \t]{8,40})", header, re.I)
         if m:
-            out["account_number"] = re.sub(r"\s+", " ", m.group(1)).strip()
+            out["account_number"] = _normalize_account_token(m.group(1))
     if not out.get("account_number"):
         account = _previous_line_before_label(lines, "账号")
         if account and re.fullmatch(r"[0-9*＊\s]{8,30}", account):
-            out["account_number"] = re.sub(r"\s+", " ", account).strip()
+            out["account_number"] = _normalize_account_token(account)
     if not out.get("account_number"):
         account = _nearby_account_after_label(lines)
         if account:
@@ -301,11 +304,18 @@ def _nearby_account_after_label(lines: list[str]) -> str:
     for idx, line in enumerate(lines):
         if "账号" not in line:
             continue
-        for candidate in lines[idx + 1 : idx + 12]:
+        for candidate in lines[idx + 1 : idx + 5]:
             text = candidate.strip().strip(":：")
+            if any(marker in text for marker in ("序号", "交易日期", "交易金额", "账户余额")):
+                break
             if re.fullmatch(r"[0-9*＊\s]{8,40}", text):
-                return re.sub(r"\s+", " ", text).strip()
+                return _normalize_account_token(text)
     return ""
+
+
+def _normalize_account_token(value: str) -> str:
+    text = str(value or "").replace("\\", "").replace("＊", "*")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _looks_like_holder_name(value: str) -> bool:
@@ -344,7 +354,9 @@ def _extract_year_month_period(header: str) -> str:
 
 def _extract_query_period(header: str) -> str:
     m = re.search(
-        r"查询日期[:：]?\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})\s*(?:至|~|—|-)\s*(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})",
+        r"(?:查询日期|起止日期|起讫日期|日期范围)[:：]?\s*"
+        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})\s*(?:至|~|—|-)\s*"
+        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})",
         header,
     )
     if not m:

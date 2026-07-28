@@ -11,7 +11,11 @@ import pytest
 
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
-from docmirror.plugins.bank_statement.evidence_atom_table_recovery import recover_evidence_atom_bank_tables
+from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
+    recover_evidence_atom_bank_tables,
+    recovered_evidence_atom_expected_row_count,
+    recovered_evidence_atom_row_sources,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -26,7 +30,21 @@ def _atom(atom_id: str, text: str, x0: float, y0: float, x1: float | None = None
 
 
 def _result(atoms: list[dict]) -> SimpleNamespace:
-    return SimpleNamespace(evidence_plane=SimpleNamespace(evidence={"text_atoms": atoms}))
+    page_numbers = sorted({int(str(atom.get("page_id") or "page:0001").rsplit(":", 1)[-1]) for atom in atoms})
+    return SimpleNamespace(
+        evidence_plane=SimpleNamespace(evidence={"text_atoms": atoms}),
+        pages=[SimpleNamespace(page_number=page, width=600, height=850) for page in page_numbers],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+
+def _rotated_90(atom: dict, *, page_id: str) -> dict:
+    x0, y0, x1, y1 = atom["bbox"]
+    return {
+        **atom,
+        "page_id": page_id,
+        "bbox": [600.0 - y1, x0, 600.0 - y0, x1],
+    }
 
 
 def test_recovers_complete_split_debit_credit_rows():
@@ -227,6 +245,113 @@ def test_recovers_staggered_multilingual_borderless_header():
     assert tables[0][2][0:2] == ["2", "2022-08-06"]
 
 
+def test_recovers_mixed_page_orientations_and_preserves_source_geometry():
+    def page_atoms(page_id: str, sequence: str, date: str, amount: str, balance: str, y: float) -> list[dict]:
+        values = [
+            ("序号", 20.0, 50.0),
+            ("交易日期", 60.0, 110.0),
+            ("收入/支出", 120.0, 180.0),
+            ("交易金额", 190.0, 250.0),
+            ("账户余额", 260.0, 320.0),
+            ("对方账号", 330.0, 410.0),
+            ("对方户名", 420.0, 500.0),
+            ("摘要", 510.0, 560.0),
+        ]
+        atoms = [
+            {
+                "id": f"{page_id}:h:{index}",
+                "page_id": page_id,
+                "text": text,
+                "bbox": [x0, 80.0, x1, 90.0],
+            }
+            for index, (text, x0, x1) in enumerate(values)
+        ]
+        row = [
+            (sequence, 20.0, 50.0),
+            (date, 60.0, 110.0),
+            ("支出", 120.0, 180.0),
+            (amount, 190.0, 250.0),
+            (balance, 260.0, 320.0),
+            ("1000050001", 330.0, 410.0),
+            ("测试对手", 420.0, 500.0),
+            ("转账", 510.0, 560.0),
+        ]
+        atoms.extend(
+            {
+                "id": f"{page_id}:r:{index}",
+                "page_id": page_id,
+                "text": text,
+                "bbox": [x0, y, x1, y + 10.0],
+            }
+            for index, (text, x0, x1) in enumerate(row)
+        )
+        atoms.append(
+            {
+                "id": f"{page_id}:footer",
+                "page_id": page_id,
+                "text": "本页合计及打印信息",
+                "bbox": [20.0, y + 25.0, 300.0, y + 35.0],
+            }
+        )
+        return atoms
+
+    page_one = page_atoms("page:0001", "1", "2023-01-01", "10.00", "90.00", 110.0)
+    page_two_horizontal = page_atoms("page:0002", "2", "2023-01-02", "20.00", "70.00", 110.0)
+    page_two = [_rotated_90(atom, page_id="page:0002") for atom in page_two_horizontal]
+    parse_result = _result([*page_one, *page_two])
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert sum(len(table) - 1 for table in tables) == 2
+    assert recovered_evidence_atom_expected_row_count(parse_result) == 2
+    assert [source["source_page"] for source in sources] == [1, 2]
+    assert all(source.get("bbox") and source.get("evidence_ids") for source in sources)
+    assert sources[1]["bbox"][0] > 400.0
+    assert all("本页合计" not in "".join(row) for table in tables for row in table[1:])
+
+
+def test_uses_positioned_page_text_when_evidence_atoms_are_not_promoted():
+    atoms = [
+        _atom("h1", "序号", 20.0, 80.0, 50.0),
+        _atom("h2", "交易日期", 60.0, 80.0, 110.0),
+        _atom("h3", "收入/支出", 120.0, 80.0, 180.0),
+        _atom("h4", "交易金额", 190.0, 80.0, 250.0),
+        _atom("h5", "账户余额", 260.0, 80.0, 320.0),
+        _atom("r1", "1", 20.0, 110.0, 50.0),
+        _atom("r2", "2023-01-01", 60.0, 110.0, 110.0),
+        _atom("r3", "支出", 120.0, 110.0, 180.0),
+        _atom("r4", "10.00", 190.0, 110.0, 250.0),
+        _atom("r5", "90.00", 260.0, 110.0, 320.0),
+    ]
+    page = SimpleNamespace(
+        page_number=1,
+        width=600,
+        height=850,
+        texts=[
+            SimpleNamespace(
+                content=atom["text"],
+                bbox=atom["bbox"],
+                evidence_ids=[atom["id"]],
+            )
+            for atom in atoms
+        ],
+    )
+    parse_result = SimpleNamespace(
+        evidence_plane=SimpleNamespace(evidence={}),
+        pages=[page],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert sum(len(table) - 1 for table in tables) == 1
+    assert recovered_evidence_atom_expected_row_count(parse_result) == 1
+    assert sources[0]["source_page"] == 1
+    assert "r2" in sources[0]["evidence_ids"]
+
+
 def test_dedupe_uses_bank_reference_before_lossy_business_fields():
     base = {"normalized": {"date": "2026-01-02", "amount": 100.0, "balance": 200.0, "counter_party": "甲"}}
     records = [
@@ -238,6 +363,19 @@ def test_dedupe_uses_bank_reference_before_lossy_business_fields():
     deduped = dedupe_transaction_rows(records)
 
     assert len(deduped) == 2
+
+
+def test_dedupe_keeps_same_business_fields_when_sequence_differs():
+    base = {"date": "2026-01-02", "amount": 100.0, "balance": 200.0, "counter_party": "same"}
+    records = [
+        {"normalized": {**base, "sequence_no": "491"}, "raw": {}},
+        {"normalized": {**base, "sequence_no": "638"}, "raw": {}},
+        {"normalized": {**base, "sequence_no": "638"}, "raw": {}},
+    ]
+
+    deduped = dedupe_transaction_rows(records)
+
+    assert [record["normalized"]["sequence_no"] for record in deduped] == ["491", "638"]
 
 
 def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():

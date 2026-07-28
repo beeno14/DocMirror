@@ -35,8 +35,10 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         field="direction",
         enum_map={
             "收入": "income",
+            "转入": "income",
             "收人": "income",
             "支出": "expense",
+            "转出": "expense",
             "支山": "expense",
             "支鼎": "expense",
             "攴出": "expense",
@@ -47,9 +49,21 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "借Dr": "expense",
             "Dr": "expense",
         },
-        aliases=["收支", "方向", "交易方向", "月收/支", "月收支", "借贷", "借/贷", "借贷标志", "Dc Flg"],
+        aliases=[
+            "收支",
+            "方向",
+            "交易方向",
+            "交易类别",
+            "收入/支出",
+            "月收/支",
+            "月收支",
+            "借贷",
+            "借/贷",
+            "借贷标志",
+            "Dc Flg",
+        ],
     ),
-    "摘要": ColumnMapping(field="summary", aliases=["交易摘要", "Description", "Memo"]),
+    "摘要": ColumnMapping(field="summary", aliases=["交易摘要", "备注", "Description", "Memo"]),
     "交易金额": ColumnMapping(
         field="amount",
         unit="CNY",
@@ -62,7 +76,6 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "对方名称",
             "交易对方",
             "Counter party",
-            "备注",
             "Remarks",
             "对方账号与户名",
         ],
@@ -173,12 +186,26 @@ class BankStatementCommunityPlugin(BaseTableParser):
         """Run the style-aware extractor and return projector-local facts."""
         result = run_bank_statement_extract(parse_result, text, self)
         summary = self._build_summary(result.records)
+        period = summary.get("period", {})
+        period_detail = result.identity_fields.get("query_period")
+        if isinstance(period_detail, dict):
+            period_value = next(
+                (
+                    str(period_detail.get(candidate) or "")
+                    for candidate in ("normalized_value", "value", "raw_value")
+                    if period_detail.get(candidate) not in (None, "")
+                ),
+                "",
+            )
+            period_dates = re.findall(r"20\d{2}-\d{2}-\d{2}", period_value)
+            if len(period_dates) >= 2:
+                period = {"start": period_dates[0], "end": period_dates[1]}
         projection = self._projection_data_from_components(
             identity_fields=result.identity_fields,
             records=result.records,
             raw_headers=[],
             summary=summary,
-            period=summary.get("period", {}),
+            period=period,
             extra_domain_facts=result.style_meta.to_properties(),
             warnings=result.warnings,
             confidence=1.0 if result.style_meta.extract_status != "degraded" else 0.5,

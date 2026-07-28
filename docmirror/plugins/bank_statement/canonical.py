@@ -17,6 +17,7 @@ Key exports: ``CANONICAL_FIELDS``, ``StyleMeta``, ``build_style_meta``,
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -152,6 +153,7 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
     for rec in records:
         norm = rec.get("normalized") or {}
         raw = rec.get("raw") if isinstance(rec.get("raw"), dict) else {}
+        sequence = str(norm.get("sequence_no") or _raw_sequence(raw) or "").strip()
         reference = str(norm.get("reference") or _raw_reference(raw) or "").strip()
         balance = norm.get("balance")
         try:
@@ -162,7 +164,9 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
             amount_key = float(norm.get("amount") or 0)
         except (TypeError, ValueError):
             amount_key = norm.get("amount")
-        if reference:
+        if sequence:
+            key = ("sequence", sequence)
+        elif reference:
             key = ("reference", reference)
         else:
             key = (
@@ -180,6 +184,15 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
+def _raw_sequence(raw: dict[str, Any]) -> str:
+    for key, value in raw.items():
+        if any(marker in str(key) for marker in ("序号", "交易序号", "Sequence")):
+            sequence = str(value or "").strip()
+            if re.fullmatch(r"\d{1,8}", sequence):
+                return sequence
+    return ""
+
+
 def _raw_reference(raw: dict[str, Any]) -> str:
     for key, value in raw.items():
         if any(marker in str(key) for marker in ("交易流水号", "流水号", "Reference")):
@@ -188,7 +201,12 @@ def _raw_reference(raw: dict[str, Any]) -> str:
 
 
 def ensure_canonical_normalized(normalized: dict[str, Any], standard_fields: list[str]) -> dict[str, Any]:
+    from docmirror.tables.cell_normalizer import normalize_cell_line_breaks
+
     out = dict(normalized)
+    summary = out.get("summary")
+    if isinstance(summary, str) and summary:
+        out["summary"] = normalize_cell_line_breaks(summary).strip()
     for fld in standard_fields:
         if fld not in out:
             out[fld] = "" if fld not in ("amount", "amount_cny", "balance") else None
@@ -206,10 +224,11 @@ def ensure_canonical_normalized(normalized: dict[str, Any], standard_fields: lis
 
 
 def records_from_raw_transactions(
-    transactions: list[dict[str, str]],
+    transactions: list[dict[str, Any]],
     *,
     normalize_fn,
     style_id: str,
+    canonical_raw_fn=None,
 ) -> list[dict[str, Any]]:
     from docmirror.plugins._base.base_table_parser import public_record_raw
 
@@ -218,11 +237,16 @@ def records_from_raw_transactions(
         raw = dict(raw_txn)
         raw.setdefault("_style_id", style_id)
         normalized = normalize_fn(raw_txn)
-        records.append(
-            {
-                "row_index": idx,
-                "raw": public_record_raw(raw),
-                "normalized": normalized,
-            }
-        )
+        raw_public = public_record_raw(raw)
+        record = {
+            "row_index": idx,
+            "raw": raw_public,
+            "normalized": normalized,
+        }
+        if callable(canonical_raw_fn):
+            record["canonical_raw"] = canonical_raw_fn(raw_public, normalized)
+        source = raw_txn.get("_source")
+        if isinstance(source, dict):
+            record["source"] = dict(source)
+        records.append(record)
     return records
