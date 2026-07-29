@@ -10,9 +10,11 @@ import pytest
 from docmirror.models.entities.parse_result import (
     CellValue,
     LogicalTable,
+    PageContent,
     ParseResult,
     RowProvenance,
     TableRow,
+    TextBlock,
 )
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
@@ -173,6 +175,27 @@ def test_normalize_transaction_category_direction(raw_direction, expected):
     assert norm["direction"] == expected
 
 
+@pytest.mark.parametrize(
+    ("raw_direction", "expected"),
+    [("收入", "income"), ("支出", "expense")],
+)
+def test_normalize_transaction_type_direction_alias(raw_direction, expected):
+    plugin = BankStatementCommunityPlugin()
+    norm = normalize_split_debit_credit(
+        {
+            "交易日期": "2023-08-31",
+            "交易类型": raw_direction,
+            "交易金额": "31.00",
+            "账户余额": "99.79",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["amount"] == 31.0
+    assert norm["direction"] == expected
+
+
 def test_canonical_logical_grid_preserves_generic_row_provenance_and_raw_columns():
     headers = ["交易日期", "交易金额", "交易类别", "账户余额", "对方账号", "对方户名", "备注", "交易机构"]
     raw_rows = [
@@ -250,6 +273,284 @@ def test_canonical_logical_grid_preserves_generic_row_provenance_and_raw_columns
     assert [record["source"]["table_id"] for record in records] == ["pt_1_0", "pt_2_0"]
     assert all(record["source"]["source_cell_refs"] for record in records)
     assert all(record["source"]["evidence_ids"] for record in records)
+
+
+def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
+    headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    raw_rows: list[list[str]] = []
+    table_rows: list[TableRow] = []
+    provenance: list[RowProvenance] = []
+    page_counts = {1: 23, 2: 23, 3: 23, 4: 22}
+    sequence = 1
+    for page_number, count in page_counts.items():
+        for row_index in range(count):
+            amount = "10.00" if sequence % 2 else ""
+            credit = "" if sequence % 2 else "20.00"
+            values = [
+                str(sequence),
+                "2022-06-01",
+                "2022-06-01 10:00:00",
+                "测试",
+                "",
+                amount,
+                credit,
+                f"{1000 + sequence}.00",
+                f"62220000{sequence:04d}",
+                f"测试对手方{sequence}",
+            ]
+            raw_rows.append(values)
+            refs = [
+                {"page": page_number, "table_id": f"pt_{page_number}_0", "row": row_index, "col": col_index}
+                for col_index, _value in enumerate(values)
+            ]
+            cells = [
+                CellValue(text=value, source_cell_refs=[refs[col_index]])
+                for col_index, value in enumerate(values)
+            ]
+            table_rows.append(
+                TableRow(
+                    cells=cells,
+                    source_page=page_number,
+                    source_physical_id=f"pt_{page_number}_0",
+                    source_row_index=row_index,
+                    source_cell_refs=refs,
+                )
+            )
+            provenance.append(
+                RowProvenance(
+                    source_page=page_number,
+                    source_table_id=f"pt_{page_number}_0",
+                    source_row_index=row_index,
+                )
+            )
+            sequence += 1
+
+    logical_table = LogicalTable(
+        table_id="lt_stacked",
+        headers=headers,
+        rows=table_rows,
+        source_physical_ids=[f"pt_{page}_0" for page in page_counts],
+        source_pages=list(page_counts),
+        page_span=(1, 4),
+        row_count=len(table_rows),
+        provenance=provenance,
+    )
+    ctx = StyleContext(
+        tables=[[headers, *raw_rows]],
+        full_text="江苏银行交易明细",
+        institution=None,
+        page_count=4,
+        parse_result=ParseResult(logical_tables=[logical_table]),
+        reconstruction=ReconstructionMeta(source="stacked_text", expected_primary_rows=91),
+    )
+
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+
+    assert len(records) == 91
+    distribution: dict[int, int] = {}
+    for record in records:
+        source = record["source"]
+        source_page = source["source_page"]
+        distribution[source_page] = distribution.get(source_page, 0) + 1
+        assert source["page_range"] == [source_page, source_page]
+        assert source["source_cell_refs"]
+    assert distribution == page_counts
+
+
+def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_are_absent():
+    headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    raw_rows = [
+        ["1", "2022-06-01", "2022-06-01 10:00:00", "往来款", "100.00", "", "900.00", "622200001", "甲公司"],
+        ["2", "2022-06-02", "2022-06-02 10:00:00", "收费", "2.00", "", "898.00", "622200002", "手续费收入"],
+        ["3", "2022-07-01", "2022-07-01 10:00:00", "往来款", "", "200.00", "1098.00", "622200003", "乙公司"],
+        ["4", "2022-08-01", "2022-08-01 10:00:00", "往来款", "50.00", "", "1048.00", "622200004", "丙公司"],
+    ]
+    pages = [
+        PageContent(page_number=1, texts=[TextBlock(content="1 2022-06-01 10:00:00 往来款 100.00 900.00 622200001 甲公司")]),
+        PageContent(page_number=1, texts=[TextBlock(content="2 2022-06-02 10:00:00 收费 2.00 898.00 622200002 手续费收入")]),
+        PageContent(page_number=2, texts=[TextBlock(content="3 2022-07-01 10:00:00 往来款 200.00 1,098.00 622200003 乙公司")]),
+        PageContent(page_number=3, texts=[TextBlock(content="4 2022-08-01 10:00:00 往来款 50.00 1,048.00 622200004 丙公司")]),
+    ]
+    ctx = StyleContext(
+        tables=[[headers, *raw_rows]],
+        full_text="银行交易明细",
+        institution=None,
+        page_count=3,
+        parse_result=ParseResult(pages=pages),
+        reconstruction=ReconstructionMeta(source="stacked_text", expected_primary_rows=4),
+    )
+
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+
+    assert len(records) == 4
+    assert [record["source"]["source_page"] for record in records] == [1, 1, 2, 3]
+    assert [record["source"]["page_range"] for record in records] == [[1, 1], [1, 1], [2, 2], [3, 3]]
+
+
+def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
+    headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    raw_rows = [
+        ["13", "2022-06-13", "2022-06-13 18:19:36", "公共耗能和水电费用", "101.80", "", "54.15", "6232511300395178", "限公司"],
+        ["14", "2022-06-13", "2022-06-13 18:19:36", "收费", "2.00", "", "52.15", "70650107360000033", "入"],
+        ["15", "2022-06-21", "2022-06-21 00:21:02", "结息", "", "53.14", "6226.06", "", ""],
+        ["16", "2022-08-03", "2022-08-03 17:35:14", "tips扣税", "2159.00", "", "1320.91", "70010151830005003", "代收）"],
+    ]
+    source_text = "\n".join(
+        [
+            "序号",
+            "交易日期",
+            "交易时间",
+            "摘要",
+            "借方发生额",
+            "贷方发生额",
+            "余额",
+            "对方账户",
+            "对方户名",
+            "13",
+            "2022-06-13",
+            "18:19:36",
+            "公共耗能和水电费用",
+            "101.80",
+            "54.15",
+            "6232511300395",
+            "178",
+            "镇江大学科技园",
+            "资产经营管理有",
+            "限公司",
+            "14",
+            "2022-06-13",
+            "18:19:36",
+            "收费",
+            "2.00",
+            "52.15",
+            "7065010736000",
+            "0033",
+            "企业电子渠道跨",
+            "行转账手续费收",
+            "入",
+            "15",
+            "2022-06-21",
+            "00:21:02",
+            "结息",
+            "53.14",
+            "6226.06",
+            "null",
+            "16",
+            "2022-08-03",
+            "17:35:14",
+            "tips扣税",
+            "2,159.00",
+            "1,320.91",
+            "7001015183000",
+            "5003",
+            "待报解预算收入",
+            "（财税库银联网",
+            "代收）",
+        ]
+    )
+    page_anchor_text = "\n".join(
+        [
+            "13 2022-06-13 18:19:36 公共耗能和水电费用 101.80 54.15 6232511300395178",
+            "14 2022-06-13 18:19:36 收费 2.00 52.15 70650107360000033",
+            "15 2022-06-21 00:21:02 结息 53.14 6226.06",
+            "16 2022-08-03 17:35:14 tips扣税 2159.00 1320.91 70010151830005003",
+        ]
+    )
+    ctx = StyleContext(
+        tables=[[headers, *raw_rows]],
+        full_text=source_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=page_anchor_text)])]),
+        reconstruction=ReconstructionMeta(source="stacked_text", expected_primary_rows=4),
+    )
+
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+
+    assert len(records) == 4
+    assert records[0]["raw"]["对方户名"] == "镇江大学科技园资产经营管理有限公司"
+    assert records[0]["normalized"]["counter_party"] == "镇江大学科技园资产经营管理有限公司"
+    assert records[1]["normalized"]["counter_party"] == "企业电子渠道跨行转账手续费收入"
+    assert records[2]["normalized"]["counter_party"] == ""
+    assert records[3]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
+
+
+def test_registry_prefers_semantic_text_table_when_canonical_grid_coverage_is_low():
+    bad_headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    bad_rows = [
+        ["1", "2023-06-01", "11:47:14", "往来款", "16,500.00", "17,286.21", "7065018800015", "6836", "镇江一生一世好", ""],
+        ["3", "2023-06-01", "11:48:53", "工资", "514.46", "16,674.25", "6228760805004", "170034", "俞佩", ""],
+    ]
+    full_text = "\n".join(
+        [
+            "借方笔数：2   借方发生总额：611.96   贷方笔数：1   贷方发生总额：16,500.00   合计笔数：3",
+            "序号",
+            "交易日期",
+            "交易时间",
+            "摘要",
+            "凭证种类",
+            "借方发生额",
+            "贷方发生额",
+            "余额",
+            "对方账户",
+            "对方户名",
+            "1",
+            "2023-06-01",
+            "11:47:14",
+            "往来款",
+            "16,500.00",
+            "17,286.21",
+            "7065018800015",
+            "6836",
+            "镇江一生一世好",
+            "游戏有限公司",
+            "2",
+            "2023-06-01",
+            "11:48:53",
+            "工资",
+            "97.50",
+            "17,188.71",
+            "6228760801004",
+            "812493",
+            "杨洁",
+            "3",
+            "2023-06-01",
+            "11:48:53",
+            "工资",
+            "514.46",
+            "16,674.25",
+            "6228760805004",
+            "170034",
+            "俞佩",
+        ]
+    )
+    ctx = StyleContext(
+        tables=[[bad_headers, *bad_rows]],
+        full_text=full_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=full_text)])]),
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=3),
+    )
+
+    records, _identity = BankStyleParserRegistry().run(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 3
+    assert ctx.reconstruction is not None
+    assert ctx.reconstruction.source == "semantic_text_table"
+    assert records[0]["normalized"]["amount"] == 16500.0
+    assert records[0]["normalized"]["balance"] == 17286.21
+    assert records[0]["normalized"]["counter_account"] == "70650188000156836"
+    assert records[0]["normalized"]["counter_party"] == "镇江一生一世好游戏有限公司"
+    assert records[1]["normalized"]["direction"] == "expense"
+    assert records[1]["normalized"]["amount"] == 97.5
 
 
 def test_wide_table_accepts_date_anchored_rows_without_sequence_column():

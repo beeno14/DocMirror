@@ -86,6 +86,76 @@ def test_recover_paragraph_ledger_rows_and_repairs_amount_balance_orientation() 
     ]
 
 
+def test_descending_signed_paragraph_rows_keep_amount_balance_and_summary_columns() -> None:
+    lines = [
+        ("序号交易时间交易金额\n余额\n摘要\n交易对手信息", [30, 100, 560, 120]),
+        ("1\n20220426\n-1,911.00\n0.47\n转账\n招商银行股份有限公司-彭磊-\n6214831213283929", [30, 130, 520, 170]),
+        ("2\n20220426\n-1,500.00\n1,911.47\n转账\n招商银行股份有限公司-彭磊-\n6214831213283929", [30, 171, 520, 211]),
+        ("3\n20220408\n-42.80\n3,411.47\n第三方支付\n杭州兑吧网络科技有限公司-\n4061601", [30, 212, 520, 252]),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 1
+    assert [row[:7] for row in tables[0][1:]] == [
+        ["2022-04-26", "支出", "1911.00", "0.47", "转账", "6214831213283929", "招商银行股份有限公司-彭磊-"],
+        ["2022-04-26", "支出", "1500.00", "1911.47", "转账", "6214831213283929", "招商银行股份有限公司-彭磊-"],
+        ["2022-04-08", "支出", "42.80", "3411.47", "第三方支付", "4061601", "杭州兑吧网络科技有限公司-"],
+    ]
+
+
+def test_multi_row_sequence_date_block_does_not_merge_neighbor_transactions() -> None:
+    lines = [
+        ("序号交易时间交易金额\n余额\n摘要\n交易对手信息", [30, 100, 560, 120]),
+        (
+            "7\n20220402\n-420,000.00\n5,658.41\n转账\n中国银行总行-彭磊-\n6216690800004884536\n"
+            "8\n20220401\n+94.89\n425,658.41\n结息\n"
+            "9\n20220328\n-187.18\n425,563.52\n还信用卡",
+            [30, 130, 520, 210],
+        ),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 1
+    assert [row[:7] for row in tables[0][1:]] == [
+        ["2022-04-02", "支出", "420000.00", "5658.41", "转账", "6216690800004884536", "中国银行总行-彭磊-"],
+        ["2022-04-01", "收入", "94.89", "425658.41", "结息", "", ""],
+        ["2022-03-28", "支出", "187.18", "425563.52", "还信用卡", "", ""],
+    ]
+
+
+def test_signed_amount_orientation_is_not_swapped_to_fit_noisy_neighbor_order() -> None:
+    lines = [
+        ("序号交易时间交易金额\n余额\n摘要\n交易对手信息", [30, 100, 560, 120]),
+        ("招商银行股份有限公司-\n6214832145808973-\n6214832145808973", [390, 121, 520, 145]),
+        ("64\n20210508\n+40,000.00\n59,777.29\n转账", [30, 130, 520, 150]),
+        ("招商银行股份有限公司-\n6214832145808973-\n6214832145808973\n66\n20210501\n+60.10\n59,777.29\n结息", [30, 151, 520, 190]),
+        ("65\n20210508\n-40,000.00\n19,777.29\n转账", [30, 191, 520, 211]),
+        ("67\n20210427\n-4,950.00\n59,717.19\n转账\n长沙银行股份有限公司-刘梦云\n-6214467873120749558", [30, 212, 520, 252]),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    row_20210508_income = next(row for row in tables[0][1:] if row[0] == "2021-05-08" and row[1] == "收入")
+    row_20210508_expense = next(
+        row for row in tables[0][1:] if row[0] == "2021-05-08" and row[1] == "支出" and row[2] == "40000.00"
+    )
+    row_20210501 = next(row for row in tables[0][1:] if row[0] == "2021-05-01")
+    assert row_20210508_income[5:7] == ["6214832145808973", "招商银行股份有限公司-"]
+    assert row_20210508_expense[5:7] == ["6214832145808973", "招商银行股份有限公司-"]
+    assert row_20210501[:5] == ["2021-05-01", "收入", "60.10", "59777.29", "结息"]
+
+
 def test_recover_distributed_signed_amount_ledger_blocks() -> None:
     lines = [
         ("交易日期", [30, 100, 90, 112]),

@@ -48,6 +48,7 @@ _DIRECTION_KEYS = (
     "方向",
     "交易方向",
     "交易类别",
+    "交易类型",
     "收入/支出",
     "月收/支",
     "借贷",
@@ -56,6 +57,8 @@ _DIRECTION_KEYS = (
     "Dc Flg",
 )
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
+_COUNTERPARTY_KEYS = ("对方户名", "对方名称", "交易对方", "交易对手", "counter_party")
+_COUNTER_ACCOUNT_KEYS = ("对方账户", "对方账号", "counter_account")
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
@@ -227,6 +230,672 @@ def _extract_split_grid_records(
     return transactions
 
 
+def _with_internal_row_sources(
+    transactions: list[dict[str, Any]],
+    parse_result: Any | None = None,
+) -> list[dict[str, Any]]:
+    inferred_sources = _infer_row_sources(transactions, parse_result)
+    for transaction in transactions:
+        source = transaction.get("_source")
+        if isinstance(source, dict) and _positive_int(source.get("source_page")) is not None:
+            source_page = _positive_int(source.get("source_page"))
+            source.setdefault("page_range", [source_page, source_page])
+            continue
+        source_page = _internal_source_page(transaction)
+        if source_page is None:
+            inferred = inferred_sources.pop(0) if inferred_sources else None
+            if inferred is not None:
+                transaction["_source"] = inferred
+            continue
+        transaction["_source"] = {
+            "source_page": source_page,
+            "page_range": [source_page, source_page],
+        }
+    return transactions
+
+
+def _finalize_transactions(
+    transactions: list[dict[str, Any]],
+    parse_result: Any | None = None,
+    full_text: str = "",
+) -> list[dict[str, Any]]:
+    sourced = _with_internal_row_sources(transactions, parse_result)
+    _recover_missing_counterparties_from_page_text(sourced, parse_result, full_text)
+    return sourced
+
+
+def _recover_missing_counterparties_from_page_text(
+    transactions: list[dict[str, Any]],
+    parse_result: Any | None,
+    full_text: str = "",
+) -> None:
+    if not transactions:
+        return
+    parse_result = _read_view(parse_result)
+    page_texts = dict(_parse_result_page_texts(parse_result)) if parse_result is not None else {}
+    pdf_page_texts = dict(_pdf_page_texts_from_provenance(parse_result)) if parse_result is not None else {}
+    fallback_text = str(full_text or "")
+    if not page_texts and not pdf_page_texts and not fallback_text:
+        return
+
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for transaction in transactions:
+        page = _transaction_source_page(transaction)
+        if page is not None:
+            by_page.setdefault(page, []).append(transaction)
+
+    for page, page_transactions in by_page.items():
+        candidate_texts = []
+        for candidate_text in (page_texts.get(page, ""), pdf_page_texts.get(page, ""), fallback_text):
+            if candidate_text and candidate_text not in candidate_texts:
+                candidate_texts.append(candidate_text)
+        for page_text in candidate_texts:
+            if not page_text:
+                continue
+            page_index = _compact_text_with_offsets(page_text)
+            locations = _locate_page_transactions(page_index[0], page_transactions)
+            for index, transaction in enumerate(page_transactions):
+                if not _needs_counterparty_recovery(transaction):
+                    continue
+                location = locations[index] if index < len(locations) else {}
+                account_end = _positive_or_zero_int(location.get("account_end")) if location else None
+                if account_end is None:
+                    continue
+                next_start = _next_located_row_start(locations, index, len(page_index[0]))
+                candidate = _slice_original_by_compact(page_text, page_index[1], account_end, next_start)
+                recovered = _clean_recovered_counterparty(candidate)
+                if recovered:
+                    _set_counterparty(transaction, recovered)
+
+
+def _transaction_source_page(transaction: dict[str, Any]) -> int | None:
+    source = transaction.get("_source") if isinstance(transaction.get("_source"), dict) else {}
+    return _positive_int(source.get("source_page")) or _internal_source_page(transaction)
+
+
+def _needs_counterparty_recovery(transaction: dict[str, Any]) -> bool:
+    if not _cell_value(transaction, *_COUNTER_ACCOUNT_KEYS):
+        return False
+    counterparty = _cell_value(transaction, *_COUNTERPARTY_KEYS)
+    return not counterparty or _looks_like_incomplete_counterparty(counterparty)
+
+
+def _looks_like_incomplete_counterparty(value: str) -> bool:
+    compact = _signature_value(value)
+    if compact in {"入", "收", "收入", "出", "支", "限公司", "有限公司", "代收)", "代收）"}:
+        return True
+    if compact.startswith(("限公司", "代收)", "代收）")):
+        return True
+    fee_tail = "电子渠道跨行转账手续费收"
+    if fee_tail in compact and not compact.startswith(("企业电子渠道", "个人电子渠道", "电子渠道")):
+        return True
+    return False
+
+
+def _compact_text_with_offsets(text: str) -> tuple[str, list[int]]:
+    compact_chars: list[str] = []
+    offsets: list[int] = []
+    for index, char in enumerate(str(text or "")):
+        normalized = unicodedata.normalize("NFKC", char)
+        for normalized_char in normalized:
+            if normalized_char.isspace():
+                continue
+            compact_chars.append(normalized_char)
+            offsets.append(index)
+    return "".join(compact_chars), offsets
+
+
+def _locate_page_transactions(
+    compact_text: str,
+    transactions: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    cursor = 0
+    locations: list[dict[str, int]] = []
+    for transaction in transactions:
+        account = _signature_value(_cell_value(transaction, *_COUNTER_ACCOUNT_KEYS))
+        if not account:
+            row_start = _best_row_start_position(compact_text, cursor, transaction)
+            if row_start >= 0:
+                locations.append({"row_start": row_start})
+                cursor = row_start
+            else:
+                locations.append({})
+            continue
+        account_pos = _best_account_position(compact_text, account, cursor, transaction)
+        if account_pos < 0:
+            locations.append({})
+            continue
+        row_start = _infer_transaction_start(compact_text, transaction, account_pos)
+        account_end = account_pos + len(account)
+        locations.append({"row_start": row_start, "account_end": account_end})
+        cursor = account_end
+    return locations
+
+
+def _best_account_position(
+    compact_text: str,
+    account: str,
+    cursor: int,
+    transaction: dict[str, Any],
+) -> int:
+    positions = _find_all_after(compact_text, account, cursor)
+    if not positions:
+        return -1
+    anchors = _transaction_row_start_anchor_groups(transaction)
+    if not anchors:
+        return positions[0]
+
+    best_position = positions[0]
+    best_score = -1
+    for position in positions[:20]:
+        window = compact_text[max(0, position - 260) : position]
+        score = sum(1 for variants in anchors if any(variant and variant in window for variant in variants))
+        if score > best_score:
+            best_position = position
+            best_score = score
+    return best_position
+
+
+def _best_row_start_position(compact_text: str, cursor: int, transaction: dict[str, Any]) -> int:
+    anchors = _transaction_row_start_anchor_groups(transaction)
+    positions: list[int] = []
+    for variants in anchors:
+        for variant in variants:
+            if not variant:
+                continue
+            position = compact_text.find(variant, max(cursor, 0))
+            if position >= 0:
+                positions.append(position)
+    return min(positions) if positions else -1
+
+
+def _find_all_after(text: str, needle: str, start: int) -> list[int]:
+    positions: list[int] = []
+    position = text.find(needle, max(start, 0))
+    while position >= 0:
+        positions.append(position)
+        position = text.find(needle, position + 1)
+    return positions
+
+
+def _transaction_row_start_anchor_groups(transaction: dict[str, Any]) -> list[set[str]]:
+    groups: list[set[str]] = []
+    sequence = _cell_value(transaction, "序号", "sequence_no")
+    if sequence:
+        groups.append({_signature_value(sequence)})
+    date = _cell_value(transaction, "交易日期", "日期", "记账日期", "date")
+    if date:
+        groups.append(_date_anchor_variants(date))
+    timestamp = _cell_value(transaction, "交易时间", "时间", "timestamp")
+    if timestamp:
+        groups.append(_time_anchor_variants(timestamp))
+    summary = _cell_value(transaction, "摘要", "交易摘要", "备注", "summary")
+    if summary:
+        groups.append({_signature_value(summary)})
+    return [group for group in groups if any(group)]
+
+
+def _infer_transaction_start(compact_text: str, transaction: dict[str, Any], account_pos: int) -> int:
+    window_start = max(0, account_pos - 260)
+    candidates: list[int] = []
+    for variants in _transaction_row_start_anchor_groups(transaction):
+        for variant in variants:
+            if not variant:
+                continue
+            position = compact_text.rfind(variant, window_start, account_pos)
+            if position >= 0:
+                candidates.append(position)
+    return min(candidates) if candidates else account_pos
+
+
+def _next_located_row_start(locations: list[dict[str, int]], index: int, fallback: int) -> int:
+    current_end = locations[index].get("account_end", 0) if index < len(locations) else 0
+    for location in locations[index + 1 :]:
+        row_start = location.get("row_start", 0)
+        if row_start > current_end:
+            return row_start
+    return fallback
+
+
+def _slice_original_by_compact(text: str, offsets: list[int], start: int, end: int) -> str:
+    if start >= end or start >= len(offsets):
+        return ""
+    bounded_end = min(end, len(offsets))
+    original_start = offsets[start]
+    original_end = offsets[bounded_end - 1] + 1
+    return text[original_start:original_end]
+
+
+def _clean_recovered_counterparty(value: str) -> str:
+    text = _clean_wrapped_text(value)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[（(])", "", text)
+    text = re.sub(r"(?<=[（(])\s+", "", text)
+    text = re.sub(r"^(?:null|None|无|--|[-:：|]+)+", "", text, flags=re.IGNORECASE).strip()
+    if not text:
+        return ""
+    text = _strip_recovered_counterparty_after_marker(text)
+    text = text.strip(" -:：|")
+    compact = _signature_value(text)
+    if compact in {"入", "收", "出", "支", "限公司", "有限公司", "代收)", "代收）", "null", "None"}:
+        return ""
+    if re.fullmatch(r"(?:入|收|收入|出|支)\d{1,8}", compact):
+        return ""
+    if _looks_like_transaction_fragment(compact):
+        return ""
+    if not re.search(r"[\u4e00-\u9fffA-Za-z]", text):
+        return ""
+    return text
+
+
+def _looks_like_transaction_fragment(compact: str) -> bool:
+    if re.match(r"^\d{1,8}20\d{2}[-/.]?\d{2}[-/.]?\d{2}", compact):
+        return True
+    if re.match(r"^20\d{2}[-/.]?\d{2}[-/.]?\d{2}", compact) and re.search(r"\d+(?:,\d{3})*\.\d{2}", compact):
+        return True
+    return bool(re.match(r"^\d{1,8}20\d{6}", compact) and re.search(r"\d{10,}", compact))
+
+
+def _strip_recovered_counterparty_after_marker(value: str) -> str:
+    compact, _offsets = _compact_text_with_offsets(value)
+    markers = (
+        "序号交易日期",
+        "借方笔数",
+        "贷方笔数",
+        "合计笔数",
+        "打印时间",
+        "CPKYG",
+    )
+    positions = [compact.find(marker) for marker in markers if compact.find(marker) >= 0]
+    if not positions:
+        return value
+    return _prefix_by_compact_length(value, min(positions))
+
+
+def _prefix_by_compact_length(value: str, compact_length: int) -> str:
+    seen = 0
+    chars: list[str] = []
+    for char in value:
+        normalized = unicodedata.normalize("NFKC", char)
+        char_width = len([part for part in normalized if not part.isspace()])
+        if seen + char_width > compact_length:
+            break
+        chars.append(char)
+        seen += char_width
+    return "".join(chars).strip()
+
+
+def _set_counterparty(transaction: dict[str, Any], value: str) -> None:
+    for key in _COUNTERPARTY_KEYS:
+        if key in transaction:
+            transaction[key] = value
+            return
+    transaction["对方户名"] = value
+
+
+def _infer_row_sources(transactions: list[dict[str, Any]], parse_result: Any | None) -> list[dict[str, Any]]:
+    if not transactions or parse_result is None:
+        return []
+    parse_result = _read_view(parse_result)
+    logical_sources = _logical_table_row_sources(parse_result)
+    if not logical_sources:
+        logical_sources = _physical_table_row_sources(parse_result)
+    if len(logical_sources) == len(transactions):
+        return [_public_source(source) for source in logical_sources]
+
+    by_signature: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for source in logical_sources:
+        signature = tuple(source.pop("_signature", ()))
+        if signature:
+            by_signature.setdefault(signature, []).append(source)
+
+    inferred: list[dict[str, Any]] = []
+    for transaction in transactions:
+        candidates = by_signature.get(_transaction_signature(transaction), [])
+        inferred.append(candidates.pop(0) if candidates else {})
+    if len([source for source in inferred if source]) == len(transactions):
+        return [source for source in inferred if source]
+
+    text_sources = _text_page_row_sources(transactions, parse_result)
+    return text_sources if len(text_sources) == len(transactions) else []
+
+
+def _public_source(source: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in source.items() if key != "_signature"}
+
+
+def _logical_table_row_sources(parse_result: Any) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for table in getattr(parse_result, "logical_tables", []) or []:
+        rows = list(getattr(table, "rows", []) or [])
+        provenance = list(getattr(table, "provenance", []) or [])
+        for row_index, row in enumerate(rows):
+            row_source = provenance[row_index] if row_index < len(provenance) else None
+            source_page = _positive_int(
+                getattr(row_source, "source_page", 0) if row_source is not None else 0
+            ) or _positive_int(getattr(row, "source_page", 0))
+            if source_page is None:
+                continue
+            source_table_id = str(
+                getattr(row, "source_physical_id", "")
+                or (getattr(row_source, "source_table_id", "") if row_source is not None else "")
+                or ""
+            )
+            row_source_index = _positive_or_zero_int(getattr(row, "source_row_index", -1))
+            if row_source_index is None and row_source is not None:
+                row_source_index = _positive_or_zero_int(getattr(row_source, "source_row_index", -1))
+            row_source_index = row_source_index if row_source_index is not None else row_index
+            cells = list(getattr(row, "cells", []) or [])
+            source_cell_refs = _row_source_cell_refs(row, cells)
+            evidence_ids = _row_evidence_ids(cells)
+            sources.append(
+                {
+                    "source_page": source_page,
+                    "page_id": f"page:{source_page:04d}",
+                    **({"table_id": source_table_id} if source_table_id else {}),
+                    "source_row_index": row_source_index,
+                    "page_range": [source_page, source_page],
+                    **({"source_cell_refs": source_cell_refs} if source_cell_refs else {}),
+                    **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+                    "_signature": _row_signature([getattr(cell, "text", "") for cell in cells]),
+                }
+            )
+    return sources
+
+
+def _physical_table_row_sources(parse_result: Any) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for page in getattr(parse_result, "pages", []) or []:
+        page_number = _positive_int(getattr(page, "page_number", 0))
+        if page_number is None:
+            continue
+        for table_index, table in enumerate(getattr(page, "tables", []) or []):
+            rows = list(getattr(table, "rows", []) or [])
+            for row_index, row in enumerate(rows):
+                cells = list(getattr(row, "cells", []) or [])
+                if not any(str(getattr(cell, "text", "") or "").strip() for cell in cells):
+                    continue
+                source_cell_refs = _row_source_cell_refs(row, cells)
+                evidence_ids = _row_evidence_ids(cells)
+                sources.append(
+                    {
+                        "source_page": page_number,
+                        "page_id": f"page:{page_number:04d}",
+                        "table_id": str(getattr(table, "table_id", "") or f"pt_{page_number}_{table_index}"),
+                        "source_row_index": _positive_or_zero_int(getattr(row, "source_row_index", -1))
+                        if _positive_or_zero_int(getattr(row, "source_row_index", -1)) is not None
+                        else row_index,
+                        "page_range": [page_number, page_number],
+                        **({"source_cell_refs": source_cell_refs} if source_cell_refs else {}),
+                        **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+                        "_signature": _row_signature([getattr(cell, "text", "") for cell in cells]),
+                    }
+                )
+    return sources
+
+
+def _text_page_row_sources(transactions: list[dict[str, Any]], parse_result: Any) -> list[dict[str, Any]]:
+    page_texts = _parse_result_page_texts(parse_result)
+    if not page_texts:
+        return []
+    page_compact = [(page, _signature_value(text)) for page, text in page_texts]
+    page_counters: dict[int, int] = {}
+    last_page = page_compact[0][0]
+    sources: list[dict[str, Any]] = []
+    for transaction in transactions:
+        anchors = _transaction_page_anchor_groups(transaction)
+        if len(anchors) < 3:
+            return []
+        best_page = 0
+        best_score = -1
+        threshold = min(3, len(anchors))
+        for page, text in page_compact:
+            if page < last_page:
+                continue
+            score = sum(1 for variants in anchors if any(variant and variant in text for variant in variants))
+            if score > best_score:
+                best_page = page
+                best_score = score
+        if best_page <= 0 or best_score < threshold:
+            return []
+        row_index = page_counters.get(best_page, 0)
+        page_counters[best_page] = row_index + 1
+        last_page = best_page
+        sources.append(
+            {
+                "source": "full_text_page_anchor",
+                "source_page": best_page,
+                "page_id": f"page:{best_page:04d}",
+                "source_row_index": row_index,
+                "page_range": [best_page, best_page],
+            }
+        )
+    return sources
+
+
+def _parse_result_page_texts(parse_result: Any) -> list[tuple[int, str]]:
+    parse_result = _read_view(parse_result)
+    page_texts: list[tuple[int, str]] = []
+    for page in getattr(parse_result, "pages", []) or []:
+        page_number = _positive_int(getattr(page, "source_page_number", None)) or _positive_int(
+            getattr(page, "page_number", 0)
+        )
+        if page_number is None:
+            continue
+        parts = [
+            str(getattr(text, "content", "") or "").strip()
+            for text in getattr(page, "texts", []) or []
+            if str(getattr(text, "content", "") or "").strip()
+        ]
+        for table in getattr(page, "tables", []) or []:
+            for row in getattr(table, "rows", []) or []:
+                cells = [str(getattr(cell, "text", "") or "").strip() for cell in getattr(row, "cells", []) or []]
+                if any(cells):
+                    parts.append(" ".join(cells))
+        if parts:
+            page_texts.append((page_number, "\n".join(parts)))
+    return page_texts
+
+
+def _pdf_page_texts_from_provenance(parse_result: Any) -> list[tuple[int, str]]:
+    parse_result = _read_view(parse_result)
+    provenance = getattr(parse_result, "provenance", None)
+    file_path = str(getattr(provenance, "file_path", "") or getattr(parse_result, "file_path", "") or "").strip()
+    if not file_path or not file_path.lower().endswith(".pdf"):
+        return []
+    try:
+        from pathlib import Path
+
+        path = Path(file_path)
+        if not path.exists() or not path.is_file():
+            return []
+        import fitz
+
+        with fitz.open(path) as doc:
+            return [
+                (index + 1, text)
+                for index, page in enumerate(doc)
+                if (text := str(page.get_text("text") or "").strip())
+            ]
+    except Exception:
+        return []
+
+
+def _read_view(parse_result: Any) -> Any:
+    if parse_result is None:
+        return None
+    if getattr(parse_result, "pages", None) is not None or getattr(parse_result, "provenance", None) is not None:
+        return parse_result
+    to_read_view = getattr(parse_result, "to_read_view", None)
+    if callable(to_read_view):
+        try:
+            return to_read_view()
+        except Exception:
+            return parse_result
+    return parse_result
+
+
+def _transaction_page_anchor_groups(transaction: dict[str, Any]) -> list[set[str]]:
+    groups: list[set[str]] = []
+    for key in ("序号", "流水号"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append({_signature_value(value)})
+            break
+    for key in ("交易日期", "日期", "记账日期"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append(_date_anchor_variants(value))
+            break
+    for key in ("交易时间", "时间", "timestamp"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append(_time_anchor_variants(value))
+            break
+    for key in ("借方发生额", "贷方发生额", "交易金额", "金额"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append(_money_anchor_variants(value))
+            break
+    for key in ("余额", "账户余额", "本次余额"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append(_money_anchor_variants(value))
+            break
+    for key in ("对方账户", "对方账号", "counter_account"):
+        value = str(transaction.get(key) or "").strip()
+        if value:
+            groups.append({_signature_value(value)})
+            break
+    return [group for group in groups if any(group)]
+
+
+def _date_anchor_variants(value: str) -> set[str]:
+    compact = _signature_value(value)
+    variants = {compact}
+    match = re.search(r"(20\d{2})[-/.]?(\d{2})[-/.]?(\d{2})", compact)
+    if match:
+        y, m, d = match.groups()
+        variants.update({f"{y}{m}{d}", f"{y}-{m}-{d}", f"{y}/{m}/{d}"})
+    return {_signature_value(variant) for variant in variants if variant}
+
+
+def _time_anchor_variants(value: str) -> set[str]:
+    compact = _signature_value(value)
+    variants = {compact}
+    match = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", value)
+    if match:
+        h, m, s = match.groups()
+        variants.update({f"{h}:{m}:{s}", f"{int(h):02d}:{m}:{s}", f"{int(h):02d}{m}{s}"})
+    return {_signature_value(variant) for variant in variants if variant}
+
+
+def _money_anchor_variants(value: str) -> set[str]:
+    compact = _signature_value(value).lstrip("+-")
+    variants = {compact}
+    amount = normalize_amount(compact)
+    if amount is not None:
+        variants.add(f"{amount:.2f}")
+        variants.add(f"{amount:,.2f}")
+    return {_signature_value(variant).lstrip("+-") for variant in variants if variant}
+
+
+def _row_source_cell_refs(row: Any, cells: list[Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    for ref in [
+        *(getattr(row, "source_cell_refs", []) or []),
+        *(ref for cell in cells for ref in (getattr(cell, "source_cell_refs", []) or [])),
+    ]:
+        if isinstance(ref, dict) and ref not in refs:
+            refs.append(dict(ref))
+    return refs
+
+
+def _row_evidence_ids(cells: list[Any]) -> list[str]:
+    return list(
+        dict.fromkeys(
+            str(evidence_id)
+            for cell in cells
+            for evidence_id in (getattr(cell, "evidence_ids", []) or [])
+            if str(evidence_id)
+        )
+    )
+
+
+def _transaction_signature(transaction: dict[str, Any]) -> tuple[str, ...]:
+    return _row_signature(value for key, value in transaction.items() if not str(key).startswith("_"))
+
+
+def _row_signature(values: Any) -> tuple[str, ...]:
+    return tuple(_signature_value(value) for value in values if _signature_value(value))
+
+
+def _signature_value(value: Any) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _positive_or_zero_int(value: Any) -> int | None:
+    try:
+        number = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _internal_source_page(transaction: dict[str, Any]) -> int | None:
+    for key, value in transaction.items():
+        if str(key).strip() != "_source_page":
+            continue
+        try:
+            page = int(str(value or "").strip())
+        except ValueError:
+            return None
+        return page if page > 0 else None
+    return None
+
+
+def _extract_internal_source_grid_records(
+    tables: list[list[list[str]]],
+    parse_result: Any | None = None,
+    full_text: str = "",
+) -> list[dict[str, Any]]:
+    transactions: list[dict[str, Any]] = []
+    for tbl in tables:
+        if not tbl:
+            continue
+        header_idx = next(
+            (
+                idx
+                for idx, row in enumerate(tbl[:10])
+                if any(str(cell or "").strip() == "_source_page" for cell in row)
+                and any("交易" in str(cell or "") for cell in row)
+            ),
+            -1,
+        )
+        if header_idx < 0:
+            continue
+        raw_headers = [str(cell or "").strip() for cell in tbl[header_idx]]
+        for row in tbl[header_idx + 1 :]:
+            if not row or not any(str(cell or "").strip() for cell in row):
+                continue
+            if is_footer_or_total_row(row):
+                continue
+            txn = {
+                raw_headers[idx] if idx < len(raw_headers) and raw_headers[idx] else f"col_{idx}": str(cell or "").strip()
+                for idx, cell in enumerate(row)
+            }
+            if any(value for key, value in txn.items() if key != "_source_page"):
+                transactions.append(txn)
+    return _finalize_transactions(transactions, parse_result, full_text)
+
+
 def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]:
     variant = match_institution(ctx.full_text, ctx.institution)
 
@@ -234,6 +903,7 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
         ctx.parse_result is not None
         and ctx.reconstruction is not None
         and ctx.reconstruction.source == "canonical_table"
+        and not ctx.prefer_context_tables
     ):
         logical_transactions = extract_logical_rows_with_provenance(
             ctx.parse_result,
@@ -241,7 +911,7 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
             strict_first_col=True,
         )
         if logical_transactions:
-            return logical_transactions
+            return _finalize_transactions(logical_transactions, ctx.parse_result, ctx.full_text)
 
     split_txns: list[dict[str, str]] = []
     for tbl in ctx.tables:
@@ -253,9 +923,12 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
                 split_txns.extend(_extract_split_grid_records([tbl], row_idx, raw_headers))
                 break
     if split_txns:
-        return split_txns
+        return _finalize_transactions(split_txns, ctx.parse_result, ctx.full_text)
 
     tables = normalize_table_headers(ctx.tables, variant=variant)
+    internal_source_batch = _extract_internal_source_grid_records(tables, ctx.parse_result, ctx.full_text)
+    if internal_source_batch:
+        return internal_source_batch
 
     batch = extract_all_tables(
         tables,
@@ -264,16 +937,24 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
         strict_first_col=True,
     )
     if batch:
-        return batch
+        return _finalize_transactions(batch, ctx.parse_result, ctx.full_text)
 
     header = detect_headers(tables, plugin.column_registry, prefer_strict=True)
     if header is None:
         header_row_idx, raw_headers, col_map = plugin._detect_headers(tables)
-        return plugin._extract_records(tables, header_row_idx, raw_headers, col_map)
+        return _finalize_transactions(
+            plugin._extract_records(tables, header_row_idx, raw_headers, col_map),
+            ctx.parse_result,
+            ctx.full_text,
+        )
 
     raw_headers = header.raw_headers
     if has_split_debit_credit_headers([[raw_headers]]):
-        return _extract_split_grid_records(tables, header.row_index, raw_headers)
+        return _finalize_transactions(
+            _extract_split_grid_records(tables, header.row_index, raw_headers),
+            ctx.parse_result,
+            ctx.full_text,
+        )
 
     rows = extract_rows_from_header(
         tables,
@@ -282,10 +963,14 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
         strict_first_col=True,
     )
     if rows:
-        return rows
+        return _finalize_transactions(rows, ctx.parse_result, ctx.full_text)
 
     header_row_idx, raw_headers, col_map = plugin._detect_headers(tables)
-    return plugin._extract_records(tables, header_row_idx, raw_headers, col_map)
+    return _finalize_transactions(
+        plugin._extract_records(tables, header_row_idx, raw_headers, col_map),
+        ctx.parse_result,
+        ctx.full_text,
+    )
 
 
 def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:

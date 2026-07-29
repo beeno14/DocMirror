@@ -299,6 +299,29 @@ def test_personal_account_reconciliation_is_emitted_as_bank_statement():
     assert classified.entities.document_type != "bank_reconciliation"
 
 
+def test_corporate_account_reconciliation_is_emitted_as_bank_reconciliation():
+    text = "\n".join(
+        [
+            "江苏银行对公账户对账单",
+            "账户名称 镇江东翔网络科技有限公司",
+            "账号 70650188000202939",
+            "起始日期 2023-06-01 终止日期 2023-06-13",
+            "借方笔数 11 借方发生总额 23,859.51 贷方笔数 14 贷方发生总额 23,077.85 合计笔数 25",
+            "序号 交易日期 交易时间 摘要 借方发生额 贷方发生额 余额 对方账户 对方户名",
+        ]
+    )
+    result = ParseResult(
+        full_text=text,
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
+        entities=DocumentEntities(document_type="unknown"),
+    )
+
+    classified = EvidenceEngine().process(result)
+
+    assert classified.entities.document_type == "bank_reconciliation"
+    assert classified.entities.domain_specific["canonical_document_type"] == "bank_statement"
+
+
 def test_title_region_prefers_page_geometry_over_reading_order():
     noise = [
         TextBlock(

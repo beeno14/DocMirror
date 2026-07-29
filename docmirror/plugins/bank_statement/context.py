@@ -40,6 +40,7 @@ class StyleContext:
     parse_result: Any = None
     reconstruction: ReconstructionMeta | None = None
     institution_authority: str = ""
+    prefer_context_tables: bool = False
 
 
 def collect_tables_from_parse_result(parse_result: Any) -> list[list[list[str]]]:

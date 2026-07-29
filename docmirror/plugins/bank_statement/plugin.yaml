@@ -12,6 +12,9 @@ projection:
   dataset_types: {transactions: transaction}
   section_type_markers: {交易: transactions}
 
+classification:
+  aliases: [bank_reconciliation]
+
 resources:
   table_styles: resources/table_styles.yaml
   institution_overrides: resources/institution_overrides.yaml

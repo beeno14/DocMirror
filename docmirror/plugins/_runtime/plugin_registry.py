@@ -28,6 +28,50 @@ _BUNDLED_POST_SEAL_DOMAINS = (
 )
 
 
+class _AliasProjector:
+    """Expose one projector under a configured document-type alias."""
+
+    def __init__(self, projector: Any, domain_name: str):
+        self._projector = projector
+        self._domain_name = domain_name
+
+    @property
+    def domain_name(self) -> str:
+        return self._domain_name
+
+    @property
+    def edition(self) -> str:
+        return str(getattr(self._projector, "edition", "") or "")
+
+    @property
+    def requires_license(self) -> bool:
+        return bool(getattr(self._projector, "requires_license", False))
+
+    def project(self, result: Any) -> dict[str, Any] | None:
+        from docmirror.models.sealed import SealedParseResult
+        from docmirror.output.community_bundle import project_community_bundle
+        from docmirror.plugins._base.projector import load_projection_policy
+
+        if not isinstance(result, SealedParseResult):
+            raise TypeError(f"{type(self).__name__}.project expects SealedParseResult")
+        before = result.integrity_fingerprint
+        read_view = result.to_read_view()
+        derived = self._projector.derive(
+            read_view,
+            str(read_view.full_text or read_view.raw_text or ""),
+        )
+        derived = derived.model_copy(update={"document_type": self._domain_name})
+        bundle = project_community_bundle(
+            result,
+            projection_data=derived.model_dump(mode="python"),
+            projection_policy=load_projection_policy(type(self._projector).__module__.rsplit(".", 1)[0]),
+        )
+        bundle.render_markdown()
+        if result.integrity_fingerprint != before or not result.verify_integrity():
+            raise RuntimeError("Post-seal projector changed the sealed snapshot")
+        return bundle.json_payload()
+
+
 class PluginRegistry:
     """Central registry for post-seal projector providers."""
 
@@ -203,11 +247,16 @@ class PluginRegistry:
             provider_config = dict(manifest.get("provider") or {})
             module = importlib.import_module(f"{package}.community_plugin")
             projector = getattr(module, "plugin")
+            projectors = [projector]
+            for alias in manifest.get("classification", {}).get("aliases") or []:
+                alias_name = str(alias or "").strip()
+                if alias_name:
+                    projectors.append(_AliasProjector(projector, alias_name))
             self.register_provider(
                 PluginProvider(
                     provider_id=f"bundled.{domain_name}",
                     version=str(provider_config.get("version") or "community-1"),
-                    projectors=(projector,),
+                    projectors=tuple(projectors),
                     resource_package=package,
                     resources={
                         str(name): str(relative_path)

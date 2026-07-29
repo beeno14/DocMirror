@@ -15,7 +15,19 @@ from docmirror.plugins.bank_statement.header_resolve import normalize_header_cel
 
 logger = logging.getLogger(__name__)
 
-_STANDARD_HEADER = ["交易日期", "收/支", "交易金额", "余额", "摘要", "对方账号", "对方户名", "机构", "柜员", "备注"]
+_STANDARD_HEADER = [
+    "交易日期",
+    "收/支",
+    "交易金额",
+    "余额",
+    "摘要",
+    "对方账号",
+    "对方户名",
+    "机构",
+    "柜员",
+    "备注",
+    "_source_page",
+]
 _DATE_RE = re.compile(r"(?<!\d)(20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2})(?!\d)")
 _DIRECTION_RE = re.compile(r"(收入|收人|支出|支山|支鼎|攴出)")
 _AMOUNT_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\s*\d{2}")
@@ -25,12 +37,28 @@ _CACHE_KEY = "_bank_ocr_implicit_recovery"
 _TEXT_BLOCK_TYPES = {"paragraph", "list", "footer", "unknown", "text"}
 _MIN_DISTRIBUTED_ROWS = 3
 _MIN_DISTRIBUTED_VALID_RATIO = 0.6
+_SWAP_ORIENTATION_PENALTY = 0.02
+_REPAIR_META_PREFIX = "__docmirror_repair_meta__:"
 _PAGE_MARKER_RE = re.compile(r"<!--\s*docmirror:page\b[^>]*-->")
 _OPENING_BALANCE_MARKERS = (
     "上页余额",
     "期初余额",
     "起始余额",
     "opening balance",
+)
+_SUMMARY_KEYWORDS = (
+    "证券转银行",
+    "第三方支付",
+    "还信用卡",
+    "网络付款",
+    "网络收款",
+    "POS消费",
+    "微信转账",
+    "扫二维码",
+    "美团支付",
+    "转账",
+    "结息",
+    "付息",
 )
 
 
@@ -200,7 +228,8 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
         by_page[str(page_ids[0])].append(block)
 
     tables: list[list[list[str]]] = []
-    for _page_id, blocks in sorted(by_page.items()):
+    for page_id, blocks in sorted(by_page.items()):
+        page_no = _page_number_from_id(page_id)
         ordered = sorted(blocks, key=_block_sort_key)
         header_idx = next((idx for idx, block in enumerate(ordered) if _is_paragraph_ledger_header(block)), -1)
         if header_idx < 0:
@@ -208,6 +237,8 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
         if header_idx < 0:
             continue
         rows: list[list[str]] = []
+        pending_counterparty: tuple[str, str] | None = None
+        sequence_counterparties: dict[int, tuple[str, str]] = {}
         prev_balance: float | None = None
         for block in ordered[header_idx + 1 :]:
             if str(block.get("type") or "") not in _TEXT_BLOCK_TYPES:
@@ -215,10 +246,23 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
             text = _clean_cell(block.get("text"))
             if not text or _is_header_or_meta_text(text):
                 continue
+            if not _DATE_RE.search(text):
+                pending_counterparty = _counterparty_hint_from_text(text) or pending_counterparty
+                continue
+            leading_orphan = _leading_orphan_text(text)
+            if leading_orphan:
+                orphan_hint = _counterparty_hint_from_text(leading_orphan)
+                first_sequence = _first_fragment_sequence(text)
+                if orphan_hint and first_sequence is not None and first_sequence > 1:
+                    sequence_counterparties.setdefault(first_sequence - 1, orphan_hint)
             for fragment in _ledger_fragments(text):
                 row = _parse_paragraph_ledger_fragment(fragment, prev_balance=prev_balance)
                 if not row:
                     continue
+                if pending_counterparty and _row_counterparty_missing(row):
+                    _fill_row_counterparty(row, pending_counterparty)
+                    pending_counterparty = None
+                _set_row_source_page(row, page_no)
                 rows.append(row)
                 try:
                     prev_balance = float(row[3])
@@ -227,8 +271,12 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
         if len(rows) < _MIN_DISTRIBUTED_ROWS:
             distributed_rows = _extract_distributed_ledger_rows(ordered, header_idx)
             if distributed_rows:
+                for row in distributed_rows:
+                    _set_row_source_page(row, page_no)
                 rows = distributed_rows
         if rows:
+            _apply_sequence_counterparties(rows, sequence_counterparties)
+            rows = _sort_rows_by_sequence(rows)
             rows = _repair_balance_chain_rows(rows)
             tables.append([_STANDARD_HEADER, *rows])
     return tables
@@ -253,7 +301,7 @@ def _distributed_header_end(ordered: list[dict[str, Any]]) -> int:
             continue
         accumulated.append(text)
         joined = "".join(accumulated)
-        has_date = "交易日期" in joined or "记账日期" in joined
+        has_date = "交易日期" in joined or "交易时间" in joined or "记账日期" in joined
         has_amount = any(
             marker
             in joined
@@ -308,13 +356,27 @@ def _extract_distributed_ledger_rows(
     return rows
 
 
+def _page_number_from_id(page_id: str) -> int:
+    match = re.search(r"(\d+)$", str(page_id or ""))
+    return int(match.group(1)) if match else 1
+
+
 def _date_anchored_fragments(text: str) -> list[str]:
     """Split distributed rows from each date anchor to the next date anchor."""
     matches = list(_DATE_RE.finditer(text))
+    starts = [_date_fragment_start(text, match.start()) for match in matches]
     return [
-        text[match.start() : matches[idx + 1].start() if idx + 1 < len(matches) else len(text)].strip()
+        text[starts[idx] : starts[idx + 1] if idx + 1 < len(starts) else len(text)].strip()
         for idx, match in enumerate(matches)
     ]
+
+
+def _date_fragment_start(text: str, date_start: int) -> int:
+    prefix = text[:date_start]
+    match = re.search(r"(?:^|\s)(\d{1,5})\s+$", prefix)
+    if not match:
+        return date_start
+    return match.start(1)
 
 
 def _block_sort_key(block: dict[str, Any]) -> tuple[float, float]:
@@ -326,7 +388,14 @@ def _block_sort_key(block: dict[str, Any]) -> tuple[float, float]:
 
 def _is_paragraph_ledger_header(block: dict[str, Any]) -> bool:
     text = normalize_header_cell(str(block.get("text") or ""))
-    return "交易日期" in text and ("收/支" in text or "收支" in text) and "交易金额" in text and "账户余额" in text
+    has_date = "交易日期" in text or "交易时间" in text
+    has_direction = "收/支" in text or "收支" in text or _has_signed_amount_header(text)
+    has_balance = "账户余额" in text or "余额" in text
+    return has_date and has_direction and "交易金额" in text and has_balance
+
+
+def _has_signed_amount_header(text: str) -> bool:
+    return "交易金额" in text and "收/支" not in text and "收支" not in text
 
 
 def _is_header_or_meta_text(text: str) -> bool:
@@ -338,6 +407,8 @@ def _is_header_or_meta_text(text: str) -> bool:
 
 def _ledger_fragments(text: str) -> list[str]:
     """Split a text block into date-centered ledger fragments."""
+    if _has_sequence_date_rows(text):
+        return _date_anchored_fragments(text)
     matches = list(_DATE_RE.finditer(text))
     if not matches:
         return []
@@ -352,6 +423,26 @@ def _ledger_fragments(text: str) -> list[str]:
             fragment = f"{match.group(1)} {fragment}"
         fragments.append(fragment)
     return fragments
+
+
+def _leading_orphan_text(text: str) -> str:
+    first_date = _DATE_RE.search(text)
+    if first_date is None:
+        return ""
+    start = _date_fragment_start(text, first_date.start())
+    return _clean_cell(text[:start])
+
+
+def _first_fragment_sequence(text: str) -> int | None:
+    first_date = _DATE_RE.search(text)
+    if first_date is None:
+        return None
+    start = _date_fragment_start(text, first_date.start())
+    return _extract_sequence_no(text[start : first_date.end()])
+
+
+def _has_sequence_date_rows(text: str) -> bool:
+    return bool(re.search(r"(?:^|\s)\d{1,5}\s+20\d{6}(?!\d)", _clean_cell(text)))
 
 
 def _parse_paragraph_ledger_fragment(fragment: str, *, prev_balance: float | None) -> list[str]:
@@ -381,6 +472,10 @@ def _parse_paragraph_ledger_fragment(fragment: str, *, prev_balance: float | Non
         counterparty,
         "",
         "",
+        _repair_metadata(
+            sequence_no=_extract_sequence_no(fragment),
+            signed_amount=_has_signed_amount_token(amounts),
+        ),
         "",
     ]
 
@@ -394,6 +489,15 @@ def _amount_tokens(text: str) -> list[tuple[str, float, int]]:
         except ValueError:
             continue
     return out
+
+
+def _has_signed_amount_token(amounts: list[tuple[str, float, int]]) -> bool:
+    return any(raw.startswith(("+", "-")) for raw, _, _ in amounts)
+
+
+def _extract_sequence_no(fragment: str) -> int | None:
+    match = re.search(r"(?:^|\s)(\d{1,5})\s+20\d{6}(?!\d)", _clean_cell(fragment))
+    return int(match.group(1)) if match else None
 
 
 def _choose_amount_balance(
@@ -441,24 +545,37 @@ def _repair_balance_chain_rows(rows: list[list[str]]) -> list[list[str]]:
         except (TypeError, ValueError):
             candidate_rows.append(candidates)
             continue
-        if abs(amount - balance) > 0.001:
+        if not _repair_meta(row).get("signed_amount") and abs(amount - balance) > 0.001:
             swapped = list(row)
             swapped[2] = f"{balance:.2f}"
             swapped[3] = f"{amount:.2f}"
             candidates.append(swapped)
         candidate_rows.append(candidates)
 
+    forward_rows, forward_cost = _select_balance_chain_candidates(candidate_rows)
+    reverse_rows, reverse_cost = _select_balance_chain_candidates(candidate_rows, reverse=True)
+    if reverse_cost + 0.001 < forward_cost:
+        return reverse_rows
+    return forward_rows
+
+
+def _select_balance_chain_candidates(
+    candidate_rows: list[list[list[str]]],
+    *,
+    reverse: bool = False,
+) -> tuple[list[list[str]], float]:
+    working = list(reversed(candidate_rows)) if reverse else candidate_rows
     # dp[row][candidate] = (cost, previous_candidate_index)
     dp: list[list[tuple[float, int | None]]] = []
-    dp.append([(0.02 * idx, None) for idx, _candidate in enumerate(candidate_rows[0])])
-    for row_idx in range(1, len(candidate_rows)):
+    dp.append([(_SWAP_ORIENTATION_PENALTY * idx, None) for idx, _candidate in enumerate(working[0])])
+    for row_idx in range(1, len(working)):
         current_scores: list[tuple[float, int | None]] = []
-        for cand_idx, candidate in enumerate(candidate_rows[row_idx]):
+        for cand_idx, candidate in enumerate(working[row_idx]):
             best: tuple[float, int | None] | None = None
-            for prev_idx, prev_candidate in enumerate(candidate_rows[row_idx - 1]):
+            for prev_idx, prev_candidate in enumerate(working[row_idx - 1]):
                 prev_cost = dp[row_idx - 1][prev_idx][0]
                 transition_cost = _balance_transition_cost(prev_candidate, candidate)
-                swap_penalty = 0.02 * cand_idx
+                swap_penalty = _SWAP_ORIENTATION_PENALTY * cand_idx
                 score = prev_cost + transition_cost + swap_penalty
                 if best is None or score < best[0]:
                     best = (score, prev_idx)
@@ -466,12 +583,106 @@ def _repair_balance_chain_rows(rows: list[list[str]]) -> list[list[str]]:
         dp.append(current_scores)
 
     last_idx = min(range(len(dp[-1])), key=lambda idx: dp[-1][idx][0])
-    selected = [0 for _ in rows]
+    total_cost = dp[-1][last_idx][0]
+    selected = [0 for _ in working]
     selected[-1] = last_idx
-    for row_idx in range(len(rows) - 1, 0, -1):
+    for row_idx in range(len(working) - 1, 0, -1):
         prev_idx = dp[row_idx][selected[row_idx]][1]
         selected[row_idx - 1] = int(prev_idx or 0)
-    return [candidate_rows[row_idx][selected[row_idx]] for row_idx in range(len(rows))]
+    rows_out = [working[row_idx][selected[row_idx]] for row_idx in range(len(working))]
+    if reverse:
+        rows_out = list(reversed(rows_out))
+    return [_clear_repair_marker(row) for row in rows_out], total_cost
+
+
+def _clear_repair_marker(row: list[str]) -> list[str]:
+    cleaned = list(row)
+    if len(cleaned) > 9 and str(cleaned[9]).startswith(_REPAIR_META_PREFIX):
+        cleaned[9] = ""
+    return cleaned
+
+
+def _sort_rows_by_sequence(rows: list[list[str]]) -> list[list[str]]:
+    keyed: list[tuple[int, int, list[str]]] = []
+    for index, row in enumerate(rows):
+        sequence = _repair_meta(row).get("sequence_no")
+        if sequence is None:
+            continue
+        keyed.append((int(sequence), index, row))
+    if len(keyed) < 3 or len(keyed) / len(rows) < 0.8:
+        return rows
+    if len({sequence for sequence, _, _row in keyed}) < len(keyed) * 0.8:
+        return rows
+    keyed_by_index = {index: row for _sequence, index, row in keyed}
+    sorted_rows = [row for _sequence, _index, row in sorted(keyed, key=lambda item: item[0])]
+    leftovers = [row for index, row in enumerate(rows) if index not in keyed_by_index]
+    return sorted_rows + leftovers
+
+
+def _set_row_source_page(row: list[str], page_no: int) -> None:
+    while len(row) < len(_STANDARD_HEADER):
+        row.append("")
+    row[10] = str(page_no)
+
+
+def _apply_sequence_counterparties(rows: list[list[str]], sequence_counterparties: dict[int, tuple[str, str]]) -> None:
+    if not sequence_counterparties:
+        return
+    for row in rows:
+        sequence = _repair_meta(row).get("sequence_no")
+        if not isinstance(sequence, int):
+            continue
+        hint = sequence_counterparties.get(sequence)
+        if hint and _row_counterparty_missing(row):
+            _fill_row_counterparty(row, hint)
+
+
+def _counterparty_hint_from_text(text: str) -> tuple[str, str] | None:
+    if _DATE_RE.search(text) or not _ACCOUNT_RE.search(text):
+        return None
+    account = _extract_counter_account(text)
+    party = _extract_counterparty_from_fragment(text, account)
+    if not account and not party:
+        return None
+    return account, party
+
+
+def _row_counterparty_missing(row: list[str]) -> bool:
+    return len(row) > 6 and not str(row[5] or "").strip() and not str(row[6] or "").strip()
+
+
+def _fill_row_counterparty(row: list[str], hint: tuple[str, str]) -> None:
+    account, party = hint
+    if account and not str(row[5] or "").strip():
+        row[5] = account
+    if party and not str(row[6] or "").strip():
+        row[6] = party
+
+
+def _repair_metadata(*, sequence_no: int | None, signed_amount: bool) -> str:
+    parts: list[str] = []
+    if sequence_no is not None:
+        parts.append(f"seq={sequence_no}")
+    if signed_amount:
+        parts.append("signed=1")
+    return _REPAIR_META_PREFIX + ";".join(parts) if parts else ""
+
+
+def _repair_meta(row: list[str]) -> dict[str, int | bool]:
+    if len(row) <= 9:
+        return {}
+    text = str(row[9] or "")
+    if not text.startswith(_REPAIR_META_PREFIX):
+        return {}
+    payload = text[len(_REPAIR_META_PREFIX) :]
+    out: dict[str, int | bool] = {}
+    for part in payload.split(";"):
+        key, _, value = part.partition("=")
+        if key == "seq" and value.isdigit():
+            out["sequence_no"] = int(value)
+        elif key == "signed" and value == "1":
+            out["signed_amount"] = True
+    return out
 
 
 def _balance_transition_cost(previous: list[str], current: list[str]) -> float:
@@ -502,7 +713,7 @@ def _extract_counter_account(fragment: str) -> str:
 
 
 def _extract_summary(fragment: str) -> str:
-    for keyword in ("网络付款", "网络收款", "POS消费", "付息", "微信转账", "扫二维码", "美团支付"):
+    for keyword in _SUMMARY_KEYWORDS:
         if keyword in fragment:
             return keyword
     return ""
@@ -512,11 +723,10 @@ def _extract_counterparty_from_fragment(fragment: str, counter_account: str) -> 
     text = fragment
     for value in _DATE_RE.findall(text) + _DIRECTION_RE.findall(text):
         text = text.replace(value, " ")
-    for raw, _, _ in _amount_tokens(text):
-        text = text.replace(raw, " ")
+    text = _remove_amount_tokens(text)
     if counter_account:
         text = text.replace(counter_account, " ")
-    for keyword in ("网络付款", "网络收款", "POS消费", "付息", "微信转账", "扫二维码", "美团支付"):
+    for keyword in _SUMMARY_KEYWORDS:
         text = text.replace(keyword, " ")
     text = re.sub(r"\b(?:00)?98\b|\b(?:NY|YL)\d{4}\b|业务用章|第\s*\d+\s*页", " ", text)
     text = re.sub(r"[A-Za-z0-9&°]+", " ", text)
@@ -524,9 +734,13 @@ def _extract_counterparty_from_fragment(fragment: str, counter_account: str) -> 
     return _clean_counterparty(text)
 
 
+def _remove_amount_tokens(text: str) -> str:
+    return _AMOUNT_TOKEN_RE.sub(" ", text)
+
+
 def _is_implicit_ledger_header(row: list[str]) -> bool:
     joined = "".join(normalize_header_cell(cell) for cell in row)
-    has_date = "交易日期" in joined
+    has_date = "交易日期" in joined or "交易时间" in joined
     has_amount = "交易金额" in joined or "金额" in joined
     has_balance = "账户余额" in joined or "余额" in joined
     has_direction = "收/支" in joined or "收支" in joined or any("收/支" in str(cell) for cell in row)
@@ -537,9 +751,9 @@ def _header_mapping(header: list[str]) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for idx, cell in enumerate(header):
         key = normalize_header_cell(cell)
-        if "交易日期" in key and ("收/支" in cell or "收支" in key):
+        if ("交易日期" in key or "交易时间" in key) and ("收/支" in cell or "收支" in key):
             mapping["combined_date_direction"] = idx
-        elif "交易日期" in key:
+        elif "交易日期" in key or "交易时间" in key:
             mapping["date"] = idx
         elif "收/支" in cell or "收支" in key or key in {"月收/支", "月收支"}:
             mapping["direction"] = idx
@@ -640,6 +854,10 @@ def _clean_counterparty(value: str) -> str:
     text = _clean_cell(value)
     text = re.sub(r"(?:00)?98", "", text)
     text = re.sub(r"\b(?:NY|YL)\d{4}\b", "", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"-{2,}", "-", text)
+    text = re.sub(r"^[\s+\-.,，。'\"`]+", "", text)
+    text = re.sub(r"[\s+.,，。'\"`]+$", "", text)
     return text.strip()
 
 
@@ -777,6 +995,7 @@ def _parse_unpositioned_fragment(fragment: str, *, prev_balance: float | None) -
         _extract_summary(fragment),
         counter_account,
         _extract_counterparty_from_fragment(fragment, counter_account),
+        "",
         "",
         "",
         "",

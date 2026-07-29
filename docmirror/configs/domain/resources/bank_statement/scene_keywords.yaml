@@ -1,7 +1,42 @@
 version: 1
 scene_keywords:
   bank_reconciliation:
-    include: []
+    ambiguity_group: payment_ledger
+    ocr_domain: bank_statement
+    text_signatures:
+      - scope: title
+        source: document_title
+        required_groups:
+          - [对公账户对账单, 企业账户对账单, 单位账户对账单, 明细对账单]
+          - [账号, 账户号, 客户账号]
+        signal_groups:
+          - [银行, Bank, 商业银行]
+          - [账户名称, 户名, 客户名称]
+          - [起始日期, 终止日期, 起止日期, 对账日期]
+          - [借方笔数, 贷方笔数, 借方发生总额, 贷方发生总额, 合计笔数]
+          - [借方发生额, 贷方发生额, 余额]
+          - [对方账户, 对方账号, 对方户名]
+        min_matches: 4
+        weight: 0.96
+      - scope: document
+        source: document_frame
+        required_groups:
+          - [对公账户对账单, 企业账户对账单, 单位账户对账单, 明细对账单]
+          - [账号, 账户号, 客户账号]
+        signal_groups:
+          - [银行, Bank, 商业银行]
+          - [账户名称, 户名, 客户名称]
+          - [起始日期, 终止日期, 起止日期, 对账日期]
+          - [借方笔数, 贷方笔数, 借方发生总额, 贷方发生总额, 合计笔数]
+          - [借方发生额, 贷方发生额, 余额]
+          - [对方账户, 对方账号, 对方户名]
+        min_matches: 5
+        weight: 0.92
+    include:
+      - 对公账户对账单
+      - 企业账户对账单
+      - 单位账户对账单
+      - 明细对账单
   bank_statement:
     ambiguity_group: payment_ledger
     ocr_domain: bank_statement

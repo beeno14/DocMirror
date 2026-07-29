@@ -74,6 +74,7 @@ class EvidenceEngine(BaseMiddleware):
             classification_text = f"{cover_text}\n{classification_text}"
         all_evidence.extend(self._keyword_evidence(classification_text))
         all_evidence.extend(self._text_frame_evidence(classification_text, cover_text, title_text))
+        all_evidence.extend(self._bank_reconciliation_title_evidence(classification_text, title_text))
         all_evidence.extend(self._bank_ledger_structure_evidence(result, title_text))
         all_evidence.extend(self._header_evidence(result.all_tables()))
         all_evidence.extend(self._user_hint_evidence(result))
@@ -93,8 +94,6 @@ class EvidenceEngine(BaseMiddleware):
         )
 
         # Phase 3: Apply verdict
-        if verdict == "bank_reconciliation" and not forced_hint:
-            verdict = "bank_statement"
         doc_type = verdict if confidence >= 0.3 else "generic"
         if forced_hint:
             doc_type = forced_hint
@@ -442,6 +441,39 @@ class EvidenceEngine(BaseMiddleware):
                     f"titleless continuation ledger rows={len(candidate_rows)} "
                     f"account_rows={account_rows} bank_rows={bank_rows}"
                 ),
+            )
+        ]
+
+    def _bank_reconciliation_title_evidence(self, document_text: str, title_text: str) -> list[Evidence]:
+        """Detect enterprise/corporate bank reconciliation statements as a specific bank ledger subtype."""
+        compact_title = self._normalized_match_text(title_text)
+        compact_doc = self._normalized_match_text(document_text[:4000])
+        compact = f"{compact_title}\n{compact_doc}"
+        if "个人账户对账单" in compact:
+            return []
+        title_markers = (
+            "对公账户对账单",
+            "企业账户对账单",
+            "单位账户对账单",
+            "明细对账单",
+        )
+        if not any(marker in compact for marker in title_markers):
+            return []
+        if not any(marker in compact for marker in ("账号", "账户号", "客户账号")):
+            return []
+        total_markers = ("借方笔数", "贷方笔数", "借方发生总额", "贷方发生总额", "合计笔数")
+        table_markers = ("借方发生额", "贷方发生额", "对方账户", "对方账号", "对方户名")
+        if sum(1 for marker in total_markers if marker in compact) < 2 and sum(
+            1 for marker in table_markers if marker in compact
+        ) < 3:
+            return []
+        return [
+            Evidence(
+                source="document_title",
+                category="bank_reconciliation",
+                weight=1.0,
+                direction=1,
+                detail="enterprise bank reconciliation title with account and debit/credit controls",
             )
         ]
 
@@ -820,7 +852,9 @@ class EvidenceEngine(BaseMiddleware):
         if not scores:
             return "generic", 0.0, [ev.to_dict() for ev in evidence_list]
 
-        if identity_confirmed:
+        if "bank_reconciliation" in identity_confirmed:
+            scores = {category: score for category, score in scores.items() if category == "bank_reconciliation"}
+        elif identity_confirmed:
             scores = {category: score for category, score in scores.items() if category in identity_confirmed}
         sorted_scores = sorted(scores.items(), key=lambda item: -item[1])
 

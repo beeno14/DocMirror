@@ -193,6 +193,23 @@ def _attach_recovered_sources(
         transactions[index]["_source"] = {key: value for key, value in source.items() if key != "row_values"}
 
 
+def _semantic_text_table_candidates(full_text: str) -> list[list[list[str]]]:
+    """Return generic text-reconstructed ledger table candidates."""
+    candidates: list[list[list[str]]] = []
+    seen: set[tuple[tuple[str, ...], ...]] = set()
+    for tables in (
+        _solve_split_debit_credit_tables(full_text),
+        build_tables_from_stacked_bank_text(full_text),
+    ):
+        for table in tables:
+            signature = tuple(tuple(cell.strip() for cell in row) for row in table)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            candidates.append(table)
+    return candidates
+
+
 class BankStyleParserRegistry:
     """Execute parser_chain and produce v2.0 records."""
 
@@ -239,11 +256,9 @@ class BankStyleParserRegistry:
             normalize_fn = compact_merged.normalize_record
 
         if not transactions:
-            stacked_tables = _solve_split_debit_credit_tables(ctx.full_text) or build_tables_from_stacked_bank_text(
-                ctx.full_text
-            )
+            stacked_tables = _semantic_text_table_candidates(ctx.full_text)
             if stacked_tables:
-                stacked_ctx = replace(ctx, tables=stacked_tables)
+                stacked_ctx = replace(ctx, tables=stacked_tables, prefer_context_tables=True)
                 transactions = grid_standard.extract_transactions(stacked_ctx, plugin)
                 if transactions:
 
@@ -266,6 +281,38 @@ class BankStyleParserRegistry:
         expected = _expected_rows(ctx)
         primary_parser = (detection.parser_chain or ["grid_standard"])[-1]
         primary_score, coverage = _parser_score(transactions, normalize_fn, plugin, expected)
+        if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
+            for semantic_table in _semantic_text_table_candidates(ctx.full_text):
+                semantic_tables = [semantic_table]
+                semantic_expected = max(expected, sum(max(len(table) - 1, 0) for table in semantic_tables))
+                semantic_ctx = replace(ctx, tables=semantic_tables, prefer_context_tables=True)
+                semantic_batch, semantic_norm = _run_parser("grid_standard", semantic_ctx, plugin)
+                semantic_score, semantic_coverage = _parser_score(
+                    semantic_batch,
+                    semantic_norm,
+                    plugin,
+                    semantic_expected,
+                )
+                if semantic_score > primary_score or (
+                    semantic_coverage >= coverage and len(semantic_batch) > len(transactions)
+                ):
+                    transactions = semantic_batch
+                    normalize_fn = semantic_norm
+                    primary_score = semantic_score
+                    coverage = semantic_coverage
+                    expected = semantic_expected
+                    if ctx.reconstruction is not None:
+                        ctx.reconstruction = replace(
+                            ctx.reconstruction,
+                            source="semantic_text_table",
+                            expected_primary_rows=semantic_expected,
+                            pipe_parse_failed=False,
+                        )
+                    logger.info(
+                        "[BankStyleRegistry] semantic text table recovery rows=%d score=%.2f",
+                        len(semantic_batch),
+                        semantic_score,
+                    )
         atom_tables = recover_evidence_atom_bank_tables(ctx.parse_result)
         if atom_tables:
             atom_count = sum(max(len(table) - 1, 0) for table in atom_tables)
