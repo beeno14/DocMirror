@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 
 from docmirror.models.entities.parse_result import (
     CellValue,
@@ -324,6 +325,81 @@ def test_dataset_bundle_has_one_wide_row_per_record_and_cell_audit() -> None:
     assert len(audit_rows) == 24
     assert {row["dataset_id"] for row in audit_rows} == {"ds_repayment_records"}
     assert "subject_name" not in {row["field_key"] for row in audit_rows}
+
+
+def test_enterprise_audit_resolves_field_evidence_from_structural_table_refs() -> None:
+    candidate = _candidate(
+        [
+            {
+                "normalized": {"month": "2025-01", "status": "N", "sequence": 1},
+                "raw": {"month": "2025-01", "status": "N", "sequence": 1},
+                "source": {
+                    "source_refs": [
+                        {
+                            "source": "canonical_physical_table",
+                            "page": 4,
+                            "table_id": "pt_4_2",
+                            "row": 0,
+                        }
+                    ],
+                    "confidence": 1.0,
+                },
+            }
+        ]
+    )
+    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"]["sequence"] = {
+        "label": "序号",
+        "type": "integer",
+    }
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    bundle = project_community_bundle(result, document_id="doc_test")
+    semantic = bundle.semantic_payload()
+    semantic["classification"]["document_type"] = "enterprise_credit_report"
+    semantic["structure"]["source_tables"] = [
+        {
+            "id": "pt_4_2",
+            "page": 4,
+            "order": 1,
+            "headers": ["月份", "状态"],
+            "rows": [["2025-01", "N"]],
+            "row_models": [
+                {
+                    "source_row_index": 0,
+                    "cells": [
+                        {
+                            "text": "2025-01",
+                            "col_index": 0,
+                            "bbox": [10, 20, 40, 30],
+                            "evidence_ids": ["ev:0004:text:000001"],
+                        },
+                        {
+                            "text": "N",
+                            "col_index": 1,
+                            "bbox": [40, 20, 60, 30],
+                            "evidence_ids": ["ev:0004:text:000002"],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+    audit_rows = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
+
+    month = next(row for row in audit_rows if row["field_key"] == "month")
+    status = next(row for row in audit_rows if row["field_key"] == "status")
+    sequence = next(row for row in audit_rows if row["field_key"] == "sequence")
+    assert month["evidence_ref"] == '["ev:0004:text:000001"]'
+    assert month["bbox"] == "[10.0,20.0,40.0,30.0]"
+    assert status["evidence_ref"] == '["ev:0004:text:000002"]'
+    assert status["bbox"] == "[40.0,20.0,60.0,30.0]"
+    assert json.loads(sequence["evidence_ref"]) == [
+        "ev:0004:text:000001",
+        "ev:0004:text:000002",
+    ]
+    assert sequence["bbox"] == "[10.0,20.0,60.0,30.0]"
 
 
 def test_dataset_and_audit_csv_use_nested_source_page_range() -> None:

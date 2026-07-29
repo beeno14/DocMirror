@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import io
 import json
 import re
 from pathlib import Path
@@ -820,6 +821,11 @@ def test_credit_report_subtype_projects_complete_v3(
         enterprise_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
         audit_dataset = enterprise_datasets["enterprise_extraction_audit"]
         audit_rows = [row["normalized"] for row in audit_dataset["rows"]]
+        audit_cells = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
+        enterprise_audit_cells = [row for row in audit_cells if not row["dataset_id"].startswith("_audit")]
+        assert enterprise_audit_cells
+        assert all(row["evidence_ref"] for row in enterprise_audit_cells)
+        assert all(json.loads(row["evidence_ref"]) for row in enterprise_audit_cells)
         assert all(row["expected_record_count"] == row["extracted_record_count"] for row in audit_rows)
         assert all(
             row["reconciliation_status"] == "complete" and row["unresolved_record_count"] == 0 for row in audit_rows
