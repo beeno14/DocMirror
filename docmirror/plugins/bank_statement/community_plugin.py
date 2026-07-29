@@ -27,6 +27,7 @@ from docmirror.plugins._base.base_table_parser import BaseTableParser
 from docmirror.plugins._base.column_registry import ColumnMapping
 from docmirror.plugins._base.projector import ProjectionData
 from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
+from docmirror.plugins.bank_statement.wide_table_recovery import count_expected_rows_from_bank_footer
 
 BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
     "序号": ColumnMapping(field="sequence_no", aliases=["No.", "序列号"]),
@@ -76,15 +77,20 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         field="counter_party",
         aliases=[
             "对方名称",
+            "对手名称",
             "交易对方",
             "Counter party",
+            "Counterparty Name",
             "Remarks",
             "对方账号与户名",
         ],
     ),
     "对方账号": ColumnMapping(field="counter_account", aliases=["对方账户", "Counter account"]),
     "对方行号": ColumnMapping(field="counter_bank_code", aliases=["对方银行行号"]),
-    "对方行名": ColumnMapping(field="counter_bank_name", aliases=["对方开户行", "对方银行名称"]),
+    "对方行名": ColumnMapping(
+        field="counter_bank_name",
+        aliases=["对方开户行", "对方银行名称", "对手机构", "Counterparty Institution"],
+    ),
     "交易渠道": ColumnMapping(field="channel", aliases=["渠道", "交易方式"]),
     "用途": ColumnMapping(field="purpose", aliases=["交易用途"]),
 }
@@ -159,10 +165,19 @@ class BankStatementCommunityPlugin(BaseTableParser):
             "total_transactions": ("总条数", r"(?:总笔数|总条数)\s*[:：]\s*(\d+)"),
             "account_holder": (
                 "客户名称",
-                r"(?:户名|客户名称|客户姓名|账户名称)\s*[:：]\s*(.+?)(?=\s+(?:账号|卡号|起始日期|结束日期)\s*[:：])",
+                r"(?:户名|客户名称|客户姓名|账户名称)\s*[:：]\s*(.+?)"
+                r"(?=\s+(?:开户机构|开户行|账号|卡号|币种|起始日期|终止日期|结束日期|交易日期)\s*[:：])",
             ),
-            "account_number": ("账号", r"账号\s*[:：]\s*([0-9*]+)"),
+            "account_number": (
+                "账号",
+                r"(?<!贷款)(?<!对方)(?:客户)?账\s*号\s*[:：]\s*([0-9*]+)",
+            ),
             "currency": ("币种", r"币种\s*[:：]\s*([^\s]+)"),
+            "bank_name": (
+                "开户行",
+                r"开户行\s*(?:The Bank(?:\s+of Account Opening)?)?\s*"
+                r"([\u4e00-\u9fa5]{2,30}银行[\u4e00-\u9fa5]{0,30}?)(?=\s+(?:客户号|Customer Number|账号|Account Number))",
+            ),
         }
         recovered: dict[str, dict[str, object]] = {}
         for field_name, (label, pattern) in patterns.items():
@@ -172,8 +187,60 @@ class BankStatementCommunityPlugin(BaseTableParser):
             value = " 至 ".join(match.groups()) if field_name == "query_period" else match.group(1).strip()
             if value:
                 recovered[field_name] = self._evidence_identity_detail(field_name, label, value, page_id=page_id)
+
+        def _right_nearby_value(label_text: str, predicate) -> dict[str, Any] | None:
+            labels = [atom for atom in atoms if label_text in str(atom.get("text") or "")]
+            candidates: list[tuple[float, dict[str, Any]]] = []
+            for label_atom in labels:
+                label_bbox = label_atom["bbox"]
+                for candidate in atoms:
+                    candidate_text = str(candidate.get("text") or "").strip()
+                    candidate_bbox = candidate["bbox"]
+                    if not predicate(candidate_text):
+                        continue
+                    if float(candidate_bbox[0]) <= float(label_bbox[2]):
+                        continue
+                    y_distance = abs(float(candidate_bbox[1]) - float(label_bbox[1]))
+                    if y_distance > 15.0:
+                        continue
+                    x_distance = float(candidate_bbox[0]) - float(label_bbox[2])
+                    candidates.append((y_distance + x_distance / 1000.0, candidate))
+            return min(candidates, key=lambda item: item[0])[1] if candidates else None
+
+        bank_atom = _right_nearby_value(
+            "开户行",
+            lambda value: "银行" in value and len(value) <= 40,
+        )
+        if bank_atom is not None:
+            recovered["bank_name"] = self._evidence_identity_detail(
+                "bank_name",
+                "开户行",
+                str(bank_atom.get("text") or "").strip(),
+                page_id=page_id,
+                evidence_ids=[str(bank_atom.get("id") or "")],
+            )
+        count_atom = _right_nearby_value(
+            "汇总交易笔数",
+            lambda value: bool(re.fullmatch(r"\d+\s*笔", value)),
+        )
+        if count_atom is not None:
+            count_value = re.sub(r"\D", "", str(count_atom.get("text") or ""))
+            recovered["total_transactions"] = self._evidence_identity_detail(
+                "total_transactions",
+                "汇总交易笔数",
+                count_value,
+                page_id=page_id,
+                evidence_ids=[str(count_atom.get("id") or "")],
+            )
         title_atom = next(
-            (atom for atom in atoms if "账户交易明细表" in str(atom.get("text") or "")),
+            (
+                atom
+                for atom in atoms
+                if any(
+                    marker in str(atom.get("text") or "")
+                    for marker in ("账户交易明细表", "电子对账单", "对公账户对账单", "企业账户对账单")
+                )
+            ),
             None,
         )
         if title_atom is not None:
@@ -206,13 +273,30 @@ class BankStatementCommunityPlugin(BaseTableParser):
             period_dates = re.findall(r"20\d{2}-\d{2}-\d{2}", period_value)
             if len(period_dates) >= 2:
                 period = {"start": period_dates[0], "end": period_dates[1]}
+        extra_domain_facts = result.style_meta.to_properties()
+        source_reported_count = count_expected_rows_from_bank_footer(result.ctx.full_text)
+        if source_reported_count <= 0:
+            total_detail = result.identity_fields.get("total_transactions")
+            if isinstance(total_detail, dict):
+                total_value = next(
+                    (
+                        str(total_detail.get(candidate) or "")
+                        for candidate in ("normalized_value", "value", "raw_value")
+                        if total_detail.get(candidate) not in (None, "")
+                    ),
+                    "",
+                )
+                match = re.search(r"\d+", total_value)
+                source_reported_count = int(match.group()) if match else 0
+        if source_reported_count > 0:
+            extra_domain_facts["source_reported_transaction_count"] = source_reported_count
         projection = self._projection_data_from_components(
             identity_fields=result.identity_fields,
             records=records,
             raw_headers=[],
             summary=summary,
             period=period,
-            extra_domain_facts=result.style_meta.to_properties(),
+            extra_domain_facts=extra_domain_facts,
             warnings=result.warnings,
             confidence=1.0 if result.style_meta.extract_status != "degraded" else 0.5,
         )
@@ -247,6 +331,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
                     identity_values,
                     period,
                     text,
+                    document_type=str(getattr(parse_result.entities, "document_type", "") or ""),
                 ),
             }
         )
@@ -257,10 +342,15 @@ def _render_bank_statement_content_markdown(
     identity: dict[str, str],
     period: str | dict,
     source_text: str = "",
+    *,
+    document_type: str = "bank_statement",
 ) -> str:
     """Render a record-complete bank statement Markdown view from canonical plugin facts."""
     if not records:
         return ""
+    identity = dict(identity)
+    if document_type == "bank_reconciliation" and not identity.get("statement_title"):
+        identity["statement_title"] = "银行对账单"
     rows_by_page: dict[int, list[dict]] = {}
     for record in records:
         source = record.get("source") if isinstance(record.get("source"), dict) else {}
@@ -275,6 +365,11 @@ def _render_bank_statement_content_markdown(
         page_records = rows_by_page.get(page, [])
         if raw_headers:
             header_lines = _raw_statement_header_lines(identity, period, source_text)
+            statement_title = str(identity.get("statement_title") or "").strip()
+            if page == page_numbers[0] and statement_title and not any(
+                statement_title in line for line in header_lines
+            ):
+                header_lines.insert(0, statement_title)
             if header_lines:
                 parts.append("  \n".join(header_lines))
             parts.append(_render_raw_statement_table(page_records, raw_headers))
@@ -503,7 +598,8 @@ def _clean_money_text(value: str) -> str:
 
 
 def _bank_statement_header_lines(identity: dict[str, str], period: str | dict) -> list[str]:
-    lines = ["# 银行流水"]
+    statement_title = str(identity.get("statement_title") or "").strip()
+    lines = [f"# {_markdown_cell(statement_title)}" if statement_title else "# 银行流水"]
     labels = [
         ("银行名称", identity.get("bank_name") or ""),
         ("开户行/客户行", identity.get("bank_branch") or ""),
@@ -681,7 +777,7 @@ def _raw_statement_header_lines(identity: dict[str, str], period: str | dict, so
     if source_lines:
         return source_lines
 
-    title = _source_statement_title(source_text)
+    title = _source_statement_title(source_text) or str(identity.get("statement_title") or "").strip()
     holder, branch = _holder_and_branch(identity)
     lines = [title] if title else []
     print_date = _source_label_value(source_text, "打印日期") or identity.get("print_date") or ""
@@ -892,7 +988,7 @@ def _render_bank_statement_table(records: list[dict]) -> str:
             _display_amount(raw, normalized),
             _first_value(raw, normalized, "余额", "balance"),
             _first_value(raw, normalized, "对方户名", "counter_party"),
-            _first_value(raw, normalized, "对方账号", "counter_account"),
+            _record_counter_account(record),
             _clean_footer_text(_first_value(raw, normalized, "摘要", "summary")),
         ]
         lines.append("| " + " | ".join(_markdown_cell(value) for value in values) + " |")

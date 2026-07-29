@@ -213,6 +213,35 @@ def test_ccb_header_totals_and_query_period_are_supported() -> None:
     assert identity["query_period"] == "2023-10-01 ~ 2023-12-31"
 
 
+def test_bank_header_total_record_count_is_an_independent_expected_count() -> None:
+    text = "打印日期：2026-02-24 交易时段：2025-01-01 至 2025-12-31 总条数：38"
+
+    assert count_expected_rows_from_bank_footer(text) == 38
+
+
+def test_corporate_detail_header_identity_and_split_footer_counts_are_bounded() -> None:
+    text = """
+    对公客户账户明细
+    账    号: 5106010120010001125
+    币    种: 人民币
+    客户名称: 重庆正大华日软件有限公司
+    开户机构: 510601
+    起始日期: 20250101
+    终止日期: 20251231
+    交易日期 交易发生金额 账户余额 对方账号 对方户名 摘要 备注
+    20250121 -15069.44 1993153.47 5101010179730017689 重庆正大华日软件有限公司 归还本息
+    贷款账号: 5101010179730017689
+    借方合计笔数：65笔
+    贷方合计笔数：12笔
+    """.strip()
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["account_holder"] == "重庆正大华日软件有限公司"
+    assert identity["account_number"] == "5106010120010001125"
+    assert count_expected_rows_from_bank_footer(text) == 77
+
+
 def test_reverse_order_balance_chain_passes_when_totals_close() -> None:
     text = "收入总金额： 100.00 收入总笔数： 1 支出总金额： 20.00 支出总笔数： 1"
     records = [
@@ -307,6 +336,39 @@ def test_transaction_channel_is_not_institution() -> None:
     )
 
     assert resolve_institution_from_context(parse_result, "网上银行 网银结算") == ("中国建设银行", "filename.token")
+
+
+def test_bilingual_electronic_statement_identity_after_leading_table() -> None:
+    text = "\n".join(
+        [
+            "|交易日期|发生额|账户余额|",
+            *("|2025/01/01|1.00|9.00|" for _ in range(80)),
+            "客户名称 Customer Name 重庆某某信用管理有限公司",
+            "账户名称 Account Name 重庆某某信用管理有限公司",
+            "账号 Account Number 83010078801500000000",
+            "账单统计日期 Start Time & End Time 2025/01/01 - 2025/12/31",
+            "开户行 The Bank of Account Opening 浦发银行重庆分行营业部",
+        ]
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity == {
+        "account_holder": "重庆某某信用管理有限公司",
+        "account_number": "83010078801500000000",
+        "query_period": "2025-01-01 ~ 2025-12-31",
+        "bank_name": "浦发银行重庆分行营业部",
+    }
+
+
+def test_header_opening_bank_outranks_transaction_body_organization() -> None:
+    parse_result = SimpleNamespace(
+        entities=SimpleNamespace(organization="重庆农村商业银行", domain_specific={}),
+        file_path="/tmp/statement.pdf",
+    )
+    text = "开户行 The Bank of Account Opening 浦发银行重庆分行营业部\n重庆农村商业银行"
+
+    assert resolve_institution_from_context(parse_result, text) == ("浦发银行重庆分行营业部", "header.kv")
 
 
 def test_institution_registry_is_owned_by_bank_plugin() -> None:

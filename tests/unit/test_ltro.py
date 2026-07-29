@@ -49,6 +49,64 @@ def test_canonical_timestamp_header_is_a_valid_date_anchor():
     assert meta.source == "canonical_table"
 
 
+def test_canonical_split_amount_headers_with_units_are_usable() -> None:
+    mirror = [
+        [
+            [
+                "序号",
+                "交易日期",
+                "支出（元）",
+                "收入（元）",
+                "账户余额（元）",
+                "对方账号",
+                "对方户名",
+            ],
+            [
+                "1",
+                "2025-01-24\n16:38:19",
+                "200000.00",
+                "",
+                "2369231.13",
+                "830100788013000002\n20",
+                "重庆中链农科技有限公司",
+            ],
+        ]
+    ]
+
+    tables, meta = reconstruct_tables(mirror, "")
+
+    assert tables == mirror
+    assert meta.source == "canonical_table"
+    assert meta.expected_primary_rows == 1
+
+
+def test_canonical_stacked_debit_credit_headers_are_usable() -> None:
+    mirror = [
+        [
+            [
+                "交易日期\nTransaction Date",
+                "交易流水号\nTeller's Serial Number",
+                "发生额\nTransaction Amount",
+                "",
+                "账户余额\nAccount Balance",
+                "交易对手信息\nCounterparty Information",
+                "",
+                "摘要代码\nAbstract Code",
+                "备注\nDescription",
+            ],
+            ["", "", "借方\nDebit", "贷方\nCredit", "", "对手机构", "对手名称", "", ""],
+            ["2025/01/02", "0001", "50.00", "", "100.00", "浦发银行", "甲公司", "S1", "付款"],
+            ["2025/01/03", "0002", "", "75.00", "175.00", "浦发银行", "乙公司", "S2", "收款"],
+        ]
+    ]
+
+    tables, meta = reconstruct_tables(mirror, "")
+
+    assert tables == mirror
+    assert meta.source == "canonical_table"
+    assert meta.expected_primary_rows == 2
+
+
 def test_richer_pipe_table_wins_over_sparse_canonical_table():
     mirror = [[["交易日期", "交易金额", "余额"], ["2024-01-01", "1.00", "9.00"]]]
     row2 = BOC_ROW1.replace("| 1  |", "| 2  |").replace("43627150", "43627151")
@@ -118,6 +176,36 @@ def test_mirror_table_expected_uses_mirror_ssot_not_raw_max():
     assert tables == mirror
     assert meta.expected_primary_rows == 47
     assert meta.expected_primary_rows < 127
+
+
+def test_source_reported_count_overrides_stale_mirror_expected_rows() -> None:
+    from docmirror.models.entities.parse_result import ParseResult, ParserInfo
+
+    mirror = [
+        [
+            ["交易日期", "支出（元）", "收入（元）", "账户余额（元）"],
+            ["2025-01-01", "10.00", "", "90.00"],
+            ["2025-01-02", "", "20.00", "110.00"],
+        ]
+    ]
+    parse_result = ParseResult(
+        parser_info=ParserInfo(
+            structure={
+                "ltqg_enabled": True,
+                "ltqg_expected_data_rows": 1,
+            }
+        )
+    )
+
+    _, meta = reconstruct_tables(
+        mirror,
+        "总条数：2",
+        parse_result=parse_result,
+        structure_spe=parse_result.parser_info.structure,
+    )
+
+    assert meta.source == "canonical_table"
+    assert meta.expected_primary_rows == 2
 
 
 def test_mirror_table_raw_max_without_parse_result():

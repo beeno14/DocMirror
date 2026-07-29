@@ -48,6 +48,18 @@ class _AliasProjector:
         return bool(getattr(self._projector, "requires_license", False))
 
     def project(self, result: Any) -> dict[str, Any] | None:
+        bundle = self.project_bundle(result)
+        return bundle.json_payload() if bundle is not None else None
+
+    def project_bundle(
+        self,
+        result: Any,
+        *,
+        file_path: str = "",
+        file_id: str = "001",
+        document_id: str = "",
+    ) -> Any:
+        """Build an alias bundle without dropping plugin Markdown or dataset metadata."""
         from docmirror.models.sealed import SealedParseResult
         from docmirror.output.community_bundle import project_community_bundle
         from docmirror.plugins._base.projector import load_projection_policy
@@ -63,13 +75,16 @@ class _AliasProjector:
         derived = derived.model_copy(update={"document_type": self._domain_name})
         bundle = project_community_bundle(
             result,
+            file_path=file_path,
+            file_id=file_id,
+            document_id=document_id,
             projection_data=derived.model_dump(mode="python"),
             projection_policy=load_projection_policy(type(self._projector).__module__.rsplit(".", 1)[0]),
         )
         bundle.render_markdown()
         if result.integrity_fingerprint != before or not result.verify_integrity():
             raise RuntimeError("Post-seal projector changed the sealed snapshot")
-        return bundle.json_payload()
+        return bundle
 
 
 class PluginRegistry:

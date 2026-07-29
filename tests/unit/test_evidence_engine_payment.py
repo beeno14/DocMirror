@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from docmirror.layout.scene.evidence_engine import EvidenceEngine
 from docmirror.models.entities.parse_result import (
+    CanonicalEvidencePlane,
     CellValue,
     DocumentEntities,
     PageContent,
@@ -16,6 +17,7 @@ from docmirror.models.entities.parse_result import (
     TextBlock,
     TextLevel,
 )
+from docmirror.models.mirror.vnext import EvidenceAtom, EvidenceStore
 
 
 def _alipay_header_table() -> TableBlock:
@@ -314,6 +316,75 @@ def test_corporate_account_reconciliation_is_emitted_as_bank_reconciliation():
         full_text=text,
         pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
         entities=DocumentEntities(document_type="unknown"),
+    )
+
+    classified = EvidenceEngine().process(result)
+
+    assert classified.entities.document_type == "bank_reconciliation"
+    assert classified.entities.domain_specific["canonical_document_type"] == "bank_statement"
+
+
+def test_corporate_electronic_statement_controls_are_bank_reconciliation_without_native_title_text():
+    text = "\n".join(
+        [
+            "版面占位字符" * 900,
+            "客户名称 Customer Name 重庆某某信用管理有限公司",
+            "账户名称 Account Name 重庆某某信用管理有限公司",
+            "账号 Account Number 83010078801500000000",
+            "账单统计日期 Start Time & End Time 2025/01/01-2025/12/31",
+            "汇总交易笔数 Total number of transactions 174笔",
+            "借方发生总额 The Total Debit Amount 1,047,323.06",
+            "贷方发生总额 The Total Credit Amount 1,063,069.78",
+            "交易日期 Transaction Date 发生额 Transaction Amount 账户余额 Account Balance",
+            "借方 Debit 贷方 Credit 交易对手信息 Counterparty Information",
+        ]
+    )
+    result = ParseResult(
+        full_text=text,
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
+        entities=DocumentEntities(document_type="unknown"),
+    )
+
+    classified = EvidenceEngine().process(result)
+
+    assert classified.entities.document_type == "bank_reconciliation"
+    assert classified.entities.domain_specific["canonical_document_type"] == "bank_statement"
+
+
+def test_visible_electronic_statement_title_from_evidence_atoms_sets_reconciliation_alias():
+    text = "\n".join(
+        [
+            "客户名称 Customer Name 重庆某某信用管理有限公司",
+            "账号 Account Number 83010078801500000000",
+            "交易日期 Transaction Date 发生额 Transaction Amount 账户余额 Account Balance",
+        ]
+    )
+    result = ParseResult(
+        full_text=text,
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
+        entities=DocumentEntities(document_type="unknown"),
+        evidence_plane=CanonicalEvidencePlane(
+            evidence=EvidenceStore(
+                text_atoms=[
+                    EvidenceAtom(
+                        id="ev:0001:text:000001",
+                        kind="text_token",
+                        source_kind="pdf_native",
+                        page_id="page:0001",
+                        text="上海浦东发展银行电子对账单",
+                        bbox=[10.0, 10.0, 300.0, 30.0],
+                    ),
+                    EvidenceAtom(
+                        id="ev:0001:text:000002",
+                        kind="text_token",
+                        source_kind="pdf_native",
+                        page_id="page:0001",
+                        text="汇总交易笔数 174 借方发生总额 1,047,323.06 贷方发生总额 1,063,069.78",
+                        bbox=[10.0, 40.0, 500.0, 60.0],
+                    ),
+                ]
+            )
+        ),
     )
 
     classified = EvidenceEngine().process(result)

@@ -34,6 +34,7 @@ from docmirror.plugins.bank_statement.row_extract import (
     extract_all_tables,
     extract_logical_rows_with_provenance,
     extract_rows_from_header,
+    row_has_transaction_data,
 )
 from docmirror.plugins.bank_statement.wide_table_recovery import is_footer_or_total_row
 
@@ -918,6 +919,8 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
         if not tbl:
             continue
         for row_idx, row in enumerate(tbl[:15]):
+            if row_has_transaction_data(row, strict_first_col=False):
+                continue
             raw_headers = [str(c or "").strip() for c in row]
             if has_split_debit_credit_headers([[raw_headers]]):
                 split_txns.extend(_extract_split_grid_records([tbl], row_idx, raw_headers))

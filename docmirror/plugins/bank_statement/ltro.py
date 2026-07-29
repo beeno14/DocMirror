@@ -80,6 +80,11 @@ def reconstruct_tables(
             parse_result=parse_result,
             structure_spe=structure_spe,
         )
+        from docmirror.plugins.bank_statement.wide_table_recovery import count_expected_rows_from_bank_footer
+
+        source_reported = count_expected_rows_from_bank_footer(full_text)
+        if source_reported > 0:
+            expected = source_reported
         return canonical_tables, ReconstructionMeta(
             source="canonical_table",
             expected_primary_rows=expected,
@@ -144,7 +149,10 @@ def reconstruct_tables(
 def _usable_bank_ledger_row_count(canonical_tables: list[list[list[str]]]) -> int:
     """Return transaction-like row count in semantically usable bank tables."""
     from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY
-    from docmirror.plugins.bank_statement.header_resolve import detect_headers
+    from docmirror.plugins.bank_statement.header_resolve import (
+        detect_headers,
+        has_split_debit_credit_headers,
+    )
     from docmirror.plugins.bank_statement.row_extract import count_transaction_data_rows
 
     count = 0
@@ -155,7 +163,8 @@ def _usable_bank_ledger_row_count(canonical_tables: list[list[list[str]]]) -> in
         if header is None:
             continue
         fields = set(header.col_map)
-        if not ({"amount", "balance"}.issubset(fields) and fields.intersection({"date", "timestamp"})):
+        has_amount = "amount" in fields or has_split_debit_credit_headers([table])
+        if not (has_amount and "balance" in fields and fields.intersection({"date", "timestamp"})):
             continue
         count += count_transaction_data_rows([table], header)
     return count
@@ -175,5 +184,11 @@ def _canonical_table_expected_rows(
         if expected > 0:
             return expected
     if canonical_tables:
+        from docmirror.plugins.bank_statement.header_resolve import has_split_debit_credit_headers
+
+        if has_split_debit_credit_headers(canonical_tables):
+            usable_rows = _usable_bank_ledger_row_count(canonical_tables)
+            if usable_rows > 0:
+                return usable_rows
         return max((max(len(tbl) - 1, 0) for tbl in canonical_tables if tbl), default=0)
     return 0

@@ -25,8 +25,13 @@ from docmirror.plugins.bank_statement.institution import detect_registered_insti
 if TYPE_CHECKING:
     from docmirror.plugins.bank_statement.context import StyleContext
 
-_HEADER_LIMIT = 2000
+_HEADER_LIMIT = 4000
 _HEADER_BANK_PATTERNS = (
+    re.compile(
+        r"开户行(?:\s+The Bank(?:\s+of Account Opening)?)?[:：]?\s*"
+        r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|账单统计日期|起始日期|From\(|\n|$)",
+        re.I,
+    ),
     re.compile(r"开户机构[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|年份|月份|账号|户名|\n)"),
     re.compile(r"开户行\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,40}?)(?:\s{2,}|起始日期|From\(|\n)"),
     re.compile(r"开户行[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|账号|户名|\n)"),
@@ -71,6 +76,16 @@ def _header_text(full_text: str) -> str:
     text = full_text or ""
     if not text:
         return ""
+    identity_anchors = (
+        "客户名称 Customer Name",
+        "账户名称 Account Name",
+        "账号 Account Number",
+        "账单统计日期 Start Time",
+    )
+    anchor_positions = [text.find(anchor) for anchor in identity_anchors if text.find(anchor) >= 0]
+    if anchor_positions:
+        start = max(min(anchor_positions) - 300, 0)
+        return text[start : start + _HEADER_LIMIT]
     ledger_start = text.find("|序号|")
     if ledger_start < 0:
         ledger_start = text.find("|No.")
@@ -104,15 +119,15 @@ def _filename_bank_token(file_path: str | None) -> str | None:
 
 def resolve_institution_from_context(parse_result: Any, full_text: str) -> tuple[str | None, str]:
     """Resolve institution for StyleContext (IAS v2 stack)."""
+    header_bank = _header_bank_name(full_text)
+    if header_bank:
+        return header_bank, "header.kv"
+
     entities = getattr(parse_result, "entities", None)
     if entities is not None:
         org = getattr(entities, "organization", None)
         if org and _looks_like_institution(str(org)):
             return str(org), "entities.organization"
-
-    header_bank = _header_bank_name(full_text)
-    if header_bank:
-        return header_bank, "header.kv"
 
     file_path = getattr(parse_result, "file_path", None) if parse_result is not None else None
     filename_bank = _filename_bank_token(str(file_path) if file_path else None)
@@ -193,7 +208,8 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
     lines = [line.strip() for line in header.splitlines() if line.strip()]
 
     m = re.search(
-        r"(?<!账)户名[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,80}?)(?:\s{2,}|币种|交易|明细|账号|开户|$|\n)",
+        r"(?<![账客方])户名[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,80}?)"
+        r"(?:\s{2,}|币种|交易|明细|账号|开户|$|\n)",
         header,
     )
     if m and _looks_like_holder_name(m.group(1)):
@@ -205,13 +221,20 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
             out["account_holder"] = m.group(1).strip()
 
     if not out.get("account_holder"):
-        m = re.search(r"客户名称[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,40})(?:\s{2,}|账号|卡号|起始日期|$|\n)", header)
+        m = re.search(
+            r"客户名称(?:\s*Customer\s+Name)?[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,40}?)"
+            r"(?:\s{2,}|账号|卡号|币种|开户机构|开户行|起始日期|终止日期|交易|$|\n)",
+            header,
+            re.I,
+        )
         if m and _looks_like_holder_name(m.group(1)):
             out["account_holder"] = m.group(1).strip()
 
     m = re.search(
-        r"账户名称[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)(?:\s{2,}|账号|开户行|Bank Name|Account No|借方笔数)",
+        r"账户名称(?:\s*Account\s+Name)?[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)"
+        r"(?:\s{2,}|账号|开户行|Bank Name|Account No|借方笔数)",
         header,
+        re.I,
     )
     if m and not out.get("account_holder"):
         out["account_holder"] = m.group(1).strip()
@@ -229,8 +252,10 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         out["account_holder"] = _nearby_holder_after_label(header)
 
     m = re.search(
-        r"(?:客户账号|账号(?:\s*/\s*卡号)?)[:：]?[ \t]*([0-9*＊\\ \t]{8,40})",
+        r"(?<!贷款)(?<!对方)(?:客户)?账\s*号(?:\s*Account\s+Number)?"
+        r"(?:\s*/\s*卡号)?[:：]?[ \t]*([0-9*＊\\ \t]{8,40})",
         header,
+        re.I,
     )
     if m:
         out["account_number"] = _normalize_account_token(m.group(1))
@@ -364,10 +389,11 @@ def _extract_year_month_period(header: str) -> str:
 
 def _extract_query_period(header: str) -> str:
     m = re.search(
-        r"(?:查询日期|起止日期|起讫日期|日期范围)[:：]?\s*"
+        r"(?:查询日期|起止日期|起讫日期|日期范围|账单统计日期(?:\s*Start Time\s*&\s*End Time)?)[:：]?\s*"
         r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})\s*(?:至|~|—|-)\s*"
         r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})",
         header,
+        re.I,
     )
     if not m:
         return ""

@@ -137,6 +137,9 @@ def test_bundled_alias_projector_preserves_document_type_and_reuses_plugin() -> 
     assert payload is not None
     assert payload["document"]["type"] == "bank_reconciliation"
     assert payload["datasets"][0]["row_count"] == 2
+    bundle = projector.project_bundle(sealed)
+    assert "对账单" in bundle.render_markdown()
+    assert sealed.verify_integrity()
 
 
 @pytest.mark.parametrize(

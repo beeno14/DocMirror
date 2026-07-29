@@ -11,6 +11,11 @@ projection:
   dataset_labels: {transactions: 交易流水}
   dataset_types: {transactions: transaction}
   section_type_markers: {交易: transactions}
+  completeness:
+    records:
+      basis: domain_fact_count
+      count_key: source_reported_transaction_count
+      public_basis: source_footer_transaction_count
 
 classification:
   aliases: [bank_reconciliation]

@@ -147,13 +147,14 @@ def detect_headers(
             min_columns=STRICT_MIN_COLUMNS,
         )
         if strict is not None:
-            return strict
-    return best_header_match(
+            return _merge_stacked_header_row(tables, strict, registry)
+    relaxed = best_header_match(
         tables,
         registry,
         max_rows=RELAXED_LOOKAHEAD,
         min_columns=RELAXED_MIN_COLUMNS,
     )
+    return _merge_stacked_header_row(tables, relaxed, registry) if relaxed is not None else None
 
 
 def registry_strict_header_match_count(
@@ -227,3 +228,44 @@ def has_split_debit_credit_headers(tables: list[list[list[str]]]) -> bool:
             if has_income and has_expense:
                 return True
     return False
+
+
+def _merge_stacked_header_row(
+    tables: list[list[list[str]]],
+    header: HeaderMatch,
+    registry: dict[str, Any],
+) -> HeaderMatch:
+    """Merge a parent header with an immediately following debit/credit subheader.
+
+    Corporate electronic statements commonly put ``Transaction Amount`` and
+    ``Counterparty Information`` in the first header row, then ``Debit/Credit``
+    and the counterparty subcolumns in the next row. Keeping the physical column
+    positions while combining both labels lets the existing split-column parser
+    retain every semantic column.
+    """
+    table = tables[header.table_index]
+    next_index = header.row_index + 1
+    if next_index >= len(table):
+        return header
+    child_row = [str(cell or "").strip() for cell in table[next_index]]
+    if not has_split_debit_credit_headers([[child_row]]):
+        return header
+
+    width = max(len(header.raw_headers), len(child_row))
+    merged_headers: list[str] = []
+    for column_index in range(width):
+        parent = header.raw_headers[column_index] if column_index < len(header.raw_headers) else ""
+        child = child_row[column_index] if column_index < len(child_row) else ""
+        if parent and child:
+            merged_headers.append(f"{parent}\n{child}")
+        else:
+            merged_headers.append(parent or child)
+
+    matched = _match_row(merged_headers, registry, min_columns=RELAXED_MIN_COLUMNS)
+    return HeaderMatch(
+        table_index=header.table_index,
+        row_index=header.row_index,
+        raw_headers=merged_headers,
+        col_map=matched[1] if matched is not None else header.col_map,
+        mode=header.mode,
+    )

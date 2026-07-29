@@ -17,7 +17,7 @@ from docmirror.models.entities.parse_result import (
     TextBlock,
 )
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
-from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
 from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
@@ -273,6 +273,144 @@ def test_canonical_logical_grid_preserves_generic_row_provenance_and_raw_columns
     assert [record["source"]["table_id"] for record in records] == ["pt_1_0", "pt_2_0"]
     assert all(record["source"]["source_cell_refs"] for record in records)
     assert all(record["source"]["evidence_ids"] for record in records)
+
+
+def test_canonical_split_unit_grid_preserves_wrapped_counter_accounts() -> None:
+    headers = [
+        "序号",
+        "交易日期",
+        "交易流水号",
+        "支出（元）",
+        "收入（元）",
+        "账户余额（元）",
+        "对方账号",
+        "对方户名",
+        "摘要",
+    ]
+    raw_rows = [
+        [
+            "1",
+            "2025-01-24\n16:38:19",
+            "004010100551005",
+            "200000.00",
+            "",
+            "2369231.13",
+            "830100788013000002\n20",
+            "重庆中链农科技有限公司",
+            "企业网银-跨行转账（实时）",
+        ],
+        [
+            "2",
+            "2025-03-10\n12:02:13",
+            "004010100245394",
+            "100.00",
+            "",
+            "9481.13",
+            "120023710020000001\n988",
+            "重庆数宜信信用管理有限公司",
+            "企业网银-跨行转账（实时）",
+        ],
+    ]
+    rows = [
+        TableRow(
+            cells=[CellValue(text=value) for value in values],
+            source_page=1,
+            source_physical_id="pt_1_0",
+            source_row_index=row_index,
+        )
+        for row_index, values in enumerate(raw_rows)
+    ]
+    parse_result = ParseResult(
+        logical_tables=[
+            LogicalTable(
+                table_id="lt_transactions",
+                headers=headers,
+                rows=rows,
+                source_physical_ids=["pt_1_0"],
+                source_pages=[1],
+                page_span=(1, 1),
+                row_count=2,
+            )
+        ]
+    )
+
+    ctx = build_style_context(parse_result, "银行账户交易明细")
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert ctx.reconstruction is not None
+    assert ctx.reconstruction.source == "canonical_table"
+    assert len(records) == 2
+    assert [record["normalized"]["counter_account"] for record in records] == [
+        "83010078801300000220",
+        "120023710020000001988",
+    ]
+    assert [record["normalized"]["counter_party"] for record in records] == [
+        "重庆中链农科技有限公司",
+        "重庆数宜信信用管理有限公司",
+    ]
+
+
+def test_canonical_stacked_bilingual_headers_preserve_debit_credit_and_counterparty() -> None:
+    headers = [
+        "交易日期\nTransaction Date",
+        "交易流水号\nTeller's Serial Number",
+        "发生额\nTransaction Amount",
+        "",
+        "账户余额\nAccount Balance",
+        "交易对手信息\nCounterparty Information",
+        "",
+        "摘要代码\nAbstract Code",
+        "备注\nDescription",
+    ]
+    raw_rows = [
+        ["", "", "借方\nDebit", "贷方\nCredit", "", "对手机构", "对手名称", "", ""],
+        ["2025/01/02", "0001", "50.00", "", "100.00", "浦发银行重庆分行", "甲公司", "S1", "付款"],
+        ["2025/01/03", "0002", "", "75.00", "175.00", "招商银行重庆分行", "乙公司", "S2", "收款"],
+    ]
+    rows = [
+        TableRow(
+            cells=[CellValue(text=value) for value in values],
+            source_page=1,
+            source_physical_id="pt_1_0",
+            source_row_index=row_index,
+        )
+        for row_index, values in enumerate(raw_rows)
+    ]
+    parse_result = ParseResult(
+        logical_tables=[
+            LogicalTable(
+                table_id="lt_transactions",
+                headers=headers,
+                rows=rows,
+                source_physical_ids=["pt_1_0"],
+                source_pages=[1],
+                page_span=(1, 1),
+                row_count=2,
+            )
+        ]
+    )
+
+    ctx = build_style_context(parse_result, "企业电子对账单")
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert ctx.reconstruction is not None
+    assert ctx.reconstruction.source == "canonical_table"
+    assert len(records) == 2
+    assert [record["normalized"]["direction"] for record in records] == ["expense", "income"]
+    assert [record["normalized"]["amount"] for record in records] == [50.0, 75.0]
+    assert [record["normalized"]["balance"] for record in records] == [100.0, 175.0]
+    assert [record["normalized"]["counter_party"] for record in records] == ["甲公司", "乙公司"]
+    assert [record["source"]["source_page"] for record in records] == [1, 1]
 
 
 def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():

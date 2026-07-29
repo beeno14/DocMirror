@@ -74,7 +74,13 @@ class EvidenceEngine(BaseMiddleware):
             classification_text = f"{cover_text}\n{classification_text}"
         all_evidence.extend(self._keyword_evidence(classification_text))
         all_evidence.extend(self._text_frame_evidence(classification_text, cover_text, title_text))
-        all_evidence.extend(self._bank_reconciliation_title_evidence(classification_text, title_text))
+        all_evidence.extend(
+            self._bank_reconciliation_title_evidence(
+                classification_text,
+                title_text,
+                self._first_page_evidence_text(result),
+            )
+        )
         all_evidence.extend(self._bank_ledger_structure_evidence(result, title_text))
         all_evidence.extend(self._header_evidence(result.all_tables()))
         all_evidence.extend(self._user_hint_evidence(result))
@@ -229,6 +235,22 @@ class EvidenceEngine(BaseMiddleware):
         """Normalize compatibility glyphs and layout whitespace for exact matching."""
         normalized = unicodedata.normalize("NFKC", str(value or ""))
         return re.sub(r"\s+", "", normalized).casefold()
+
+    @staticmethod
+    def _first_page_evidence_text(result: ParseResult) -> str:
+        """Read page-one source text atoms when reading-order text omits a visible title."""
+        plane = getattr(result, "evidence_plane", None)
+        store = getattr(plane, "evidence", None)
+        atoms = list(getattr(store, "text_atoms", []) or [])
+        parts: list[str] = []
+        for atom in atoms:
+            page_id = str(getattr(atom, "page_id", "") or "")
+            if page_id not in ("page:0001", "1"):
+                continue
+            value = str(getattr(atom, "text", "") or "").strip()
+            if value:
+                parts.append(value)
+        return "\n".join(parts)[:20000]
 
     def _extractor_scene_hint(self, result: ParseResult) -> tuple[str | None, float]:
         """Extractor/EPO scene hint attached during Mirror extraction."""
@@ -444,36 +466,76 @@ class EvidenceEngine(BaseMiddleware):
             )
         ]
 
-    def _bank_reconciliation_title_evidence(self, document_text: str, title_text: str) -> list[Evidence]:
+    def _bank_reconciliation_title_evidence(
+        self,
+        document_text: str,
+        title_text: str,
+        evidence_text: str = "",
+    ) -> list[Evidence]:
         """Detect enterprise/corporate bank reconciliation statements as a specific bank ledger subtype."""
         compact_title = self._normalized_match_text(title_text)
-        compact_doc = self._normalized_match_text(document_text[:4000])
-        compact = f"{compact_title}\n{compact_doc}"
-        if "个人账户对账单" in compact:
+        # The first physical table may precede the page-one identity and control
+        # blocks in reading order. Keep the scan bounded to the cover page while
+        # allowing a full ledger table plus its reconciliation controls.
+        compact_doc = self._normalized_match_text(document_text[:12000])
+        compact_evidence = self._normalized_match_text(evidence_text)
+        compact = f"{compact_title}\n{compact_doc}\n{compact_evidence}"
+        if "个人账户对账单" in compact or "personalaccountstatement" in compact:
             return []
         title_markers = (
             "对公账户对账单",
             "企业账户对账单",
             "单位账户对账单",
             "明细对账单",
+            "电子对账单",
+            "electronicstatement",
         )
-        if not any(marker in compact for marker in title_markers):
+        has_explicit_title = any(marker in compact for marker in title_markers)
+        has_account = any(
+            marker in compact
+            for marker in ("账号", "账户号", "客户账号", "accountnumber", "customeraccountnumber")
+        )
+        if not has_account:
             return []
-        if not any(marker in compact for marker in ("账号", "账户号", "客户账号")):
-            return []
-        total_markers = ("借方笔数", "贷方笔数", "借方发生总额", "贷方发生总额", "合计笔数")
-        table_markers = ("借方发生额", "贷方发生额", "对方账户", "对方账号", "对方户名")
-        if sum(1 for marker in total_markers if marker in compact) < 2 and sum(
-            1 for marker in table_markers if marker in compact
-        ) < 3:
+
+        transaction_count_markers = ("合计笔数", "汇总交易笔数", "totalnumberoftransactions")
+        debit_total_markers = ("借方发生总额", "借方总额", "totaldebitamount")
+        credit_total_markers = ("贷方发生总额", "贷方总额", "totalcreditamount")
+        table_groups = (
+            ("借方发生额", "借方debit", "debitamount"),
+            ("贷方发生额", "贷方credit", "creditamount"),
+            ("账户余额", "accountbalance"),
+            ("交易对手信息", "counterpartyinformation", "对方账户", "对方户名"),
+        )
+        control_count = sum(
+            (
+                any(marker in compact for marker in transaction_count_markers),
+                any(marker in compact for marker in debit_total_markers),
+                any(marker in compact for marker in credit_total_markers),
+            )
+        )
+        table_count = sum(any(marker in compact for marker in group) for group in table_groups)
+        has_corporate_identity = (
+            any(marker in compact for marker in ("客户名称", "账户名称", "customername", "accountname"))
+            and any(marker in compact for marker in ("有限公司", "股份公司", "企业", "company", "corporation"))
+        )
+
+        if has_explicit_title:
+            if control_count < 2 and table_count < 3:
+                return []
+        elif not (has_corporate_identity and control_count == 3 and table_count >= 3):
             return []
         return [
             Evidence(
-                source="document_title",
+                source="document_title" if has_explicit_title else "document_control_frame",
                 category="bank_reconciliation",
                 weight=1.0,
                 direction=1,
-                detail="enterprise bank reconciliation title with account and debit/credit controls",
+                detail=(
+                    "enterprise bank reconciliation title with account and debit/credit controls"
+                    if has_explicit_title
+                    else "corporate electronic statement frame with transaction count and debit/credit controls"
+                ),
             )
         ]
 

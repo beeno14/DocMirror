@@ -140,7 +140,12 @@ def _build_grid(lines: list[list[_Cell]]) -> list[list[str]]:
     return grid
 
 
-def _to_table(grid: list[list[str]]) -> TableBlock | None:
+def _to_table(
+    grid: list[list[str]],
+    *,
+    page: int = 1,
+    table_id: str = "geo_table_0",
+) -> TableBlock | None:
     if not grid or len(grid) < 2:
         return None
     nc = max(len(r) for r in grid)
@@ -151,15 +156,22 @@ def _to_table(grid: list[list[str]]) -> TableBlock | None:
     )
     headers = norm[0] if has_num else []
     rows_raw = norm[1:] if has_num else norm
-    rows = [TableRow(cells=[CellValue(text=str(c)) for c in r]) for r in rows_raw]
+    rows = [
+        TableRow(
+            cells=[CellValue(text=str(c)) for c in row],
+            source_page=page,
+            source_row_index=row_index,
+        )
+        for row_index, row in enumerate(rows_raw)
+    ]
     return TableBlock(
-        table_id="geo_table_0",
+        table_id=table_id,
         headers=headers,
         rows=rows,
-        page=1,
+        page=page,
         confidence=0.85,
         extraction_layer="geometric_reconstructor",
-        metadata={"source": "geometric_reconstructor"},
+        metadata={"source": "geometric_reconstructor", "source_page": page},
     )
 
 
@@ -185,12 +197,25 @@ class GeometricReconstructor(BaseMiddleware):
             return True
         return False
 
-    def _extract_tokens_from_bundles(self, result: ParseResult) -> list[_Cell]:
+    def _extract_tokens_from_bundles(
+        self,
+        result: ParseResult,
+        *,
+        page_number: int,
+    ) -> list[_Cell]:
         """Extract token-level cells from page evidence bundles (GA1.0-01)."""
         ds = result.entities.domain_specific or {}
         bundles = ds.get("_page_evidence_bundles") or []
         cells: list[_Cell] = []
         for bundle in bundles:
+            try:
+                bundle_page = int(bundle.get("page") or 0)
+            except (TypeError, ValueError):
+                bundle_page = 0
+            if bundle_page > 0 and bundle_page != page_number:
+                continue
+            if bundle_page <= 0 and len(result.pages) > 1:
+                continue
             for token_dict in bundle.get("tokens") or []:
                 cell = self._token_to_cell(token_dict)
                 if cell is not None:
@@ -221,36 +246,48 @@ class GeometricReconstructor(BaseMiddleware):
         if self.should_skip(result):
             return result
 
-        # GA1.0-01 change 3: Try token-level evidence first
-        cells = self._extract_tokens_from_bundles(result)
-        if not cells or len(cells) < MIN_BLOCKS:
-            # Fall back to line-level texts
-            cells = [
-                _Cell(text=t.content, x0=t.bbox[0], y0=t.bbox[1], x1=t.bbox[2], y1=t.bbox[3])
-                for p in result.pages
-                for t in p.texts
-                if t.bbox and len(t.bbox) == 4 and t.content.strip()
-            ]
-        # (if both sources fail, cells remains empty and we return early below)
-        if len(cells) < MIN_BLOCKS:
-            return result
+        reconstructed = 0
+        for page_index, page in enumerate(result.pages):
+            page_number = int(page.page_number or page.source_page_number or page_index + 1)
+            cells = self._extract_tokens_from_bundles(result, page_number=page_number)
+            if len(cells) < MIN_BLOCKS:
+                cells = [
+                    _Cell(text=text.content, x0=text.bbox[0], y0=text.bbox[1], x1=text.bbox[2], y1=text.bbox[3])
+                    for text in page.texts
+                    if text.bbox and len(text.bbox) == 4 and text.content.strip()
+                ]
+            if len(cells) < MIN_BLOCKS:
+                continue
 
-        grid = _build_grid(_cluster_y(cells))
-        if len(grid) < MIN_ROWS:
-            return result
+            grid = _build_grid(_cluster_y(cells))
+            if len(grid) < MIN_ROWS:
+                continue
 
-        table = _to_table(grid)
-        if table is None:
-            return result
+            table = _to_table(
+                grid,
+                page=page_number,
+                table_id=f"geo_table_{page_index}",
+            )
+            if table is None:
+                continue
 
-        result.pages[0].tables.append(table)
-        result.record_mutation(
-            "GeometricReconstructor",
-            target_block_id="pages",
-            field_changed="pages",
-            old_value=[],
-            new_value=f"{len(grid)}r x {len(grid[0])}c",
-            reason="geometric_reconstructor",
-        )
-        logger.info(f"[GeometricReconstructor] {len(grid)}r x {len(grid[0])}c from {len(cells)} blocks")
+            page.tables.append(table)
+            reconstructed += 1
+            result.record_mutation(
+                "GeometricReconstructor",
+                target_block_id=table.table_id,
+                field_changed=f"pages[{page_index}].tables",
+                old_value=[],
+                new_value=f"{len(grid)}r x {len(grid[0])}c",
+                reason=f"geometric_reconstructor:page={page_number}",
+            )
+            logger.info(
+                "[GeometricReconstructor] page=%d %dr x %dc from %d blocks",
+                page_number,
+                len(grid),
+                len(grid[0]),
+                len(cells),
+            )
+        if reconstructed:
+            logger.info("[GeometricReconstructor] reconstructed %d page-local table(s)", reconstructed)
         return result

@@ -166,19 +166,23 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
             amount_key = norm.get("amount")
         source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
         source_scope = _source_sequence_scope(source)
+        business_key = (
+            str(norm.get("date") or ""),
+            str(norm.get("direction") or ""),
+            amount_key,
+            balance_key,
+            str(norm.get("counter_party") or ""),
+            str(norm.get("counter_account") or ""),
+            str(norm.get("summary") or ""),
+        )
         if sequence and source_scope:
-            key = ("sequence", source_scope, sequence)
+            key = ("sequence", source_scope, sequence, business_key)
         elif sequence:
-            key = ("sequence", sequence)
+            key = ("sequence", sequence, business_key)
         elif reference:
-            key = ("reference", reference)
+            key = ("reference", reference, business_key)
         else:
-            key = (
-                str(norm.get("date") or ""),
-                amount_key,
-                balance_key,
-                str(norm.get("counter_party") or ""),
-            )
+            key = business_key
         if key in seen:
             continue
         seen.add(key)

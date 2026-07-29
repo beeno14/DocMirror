@@ -86,6 +86,85 @@ def test_bank_statement_content_markdown_is_record_complete_and_generic() -> Non
     assert "35001677107*****5957/顺***融竹木有限公司" in markdown
 
 
+def test_bank_statement_summary_markdown_compacts_wrapped_numeric_counter_account() -> None:
+    records = [
+        {
+            "raw": {
+                "交易日期": "2025-01-24",
+                "支出金额": "200000.00",
+                "余额": "2369231.13",
+                "对方账号": "830100788013000002\n20",
+                "对方户名": "重庆中链农科技有限公司",
+                "摘要": "跨行转账",
+            },
+            "normalized": {
+                "date": "2025-01-24",
+                "direction": "expense",
+                "amount": 200000.0,
+                "balance": 2369231.13,
+                "counter_account": "83010078801300000220",
+                "counter_party": "重庆中链农科技有限公司",
+                "summary": "跨行转账",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+
+    markdown = _render_bank_statement_content_markdown(records, {}, {})
+
+    assert "83010078801300000220" in markdown
+    assert "830100788013000002 20" not in markdown
+
+
+def test_bank_reconciliation_markdown_uses_recovered_source_title() -> None:
+    records = [
+        {
+            "raw": {"交易日期": "2025/01/01", "借方发生额": "1.00", "账户余额": "9.00"},
+            "normalized": {
+                "date": "2025-01-01",
+                "direction": "expense",
+                "amount": 1.0,
+                "balance": 9.0,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {"statement_title": "上海浦东发展银行电子对账单"},
+        {"start": "2025-01-01", "end": "2025-12-31"},
+    )
+
+    assert "# 上海浦东发展银行电子对账单" in markdown
+    assert "# 银行流水" not in markdown
+
+
+def test_bank_reconciliation_markdown_uses_alias_title_when_source_title_is_unavailable() -> None:
+    records = [
+        {
+            "raw": {"交易日期": "2025/01/01", "借方发生额": "1.00", "账户余额": "9.00"},
+            "normalized": {
+                "date": "2025-01-01",
+                "direction": "expense",
+                "amount": 1.0,
+                "balance": 9.0,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {},
+        {},
+        document_type="bank_reconciliation",
+    )
+
+    assert "# 银行对账单" in markdown
+    assert "# 银行流水" not in markdown
+
+
 def test_bank_statement_markdown_prefers_source_reading_table_when_raw_headers_are_complete() -> None:
     records = [
         {

@@ -171,7 +171,9 @@ def run_bank_statement_extract(
     except Exception:
         evidence_identity = {}
     if evidence_identity:
-        identity_fields.update(evidence_identity)
+        for field_name, detail in evidence_identity.items():
+            if field_name not in identity_fields or field_name == "bank_name":
+                identity_fields[field_name] = detail
     style_meta = build_style_meta(
         detection,
         reconstruction=ctx.reconstruction,

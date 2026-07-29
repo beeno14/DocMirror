@@ -31,7 +31,7 @@ _STANDARD_HEADER = [
 _DATE_RE = re.compile(r"(?<!\d)(20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2})(?!\d)")
 _DIRECTION_RE = re.compile(r"(收入|收人|支出|支山|支鼎|攴出)")
 _AMOUNT_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\s*\d{2}")
-_ACCOUNT_RE = re.compile(r"\b\d{7,24}\b")
+_ACCOUNT_RE = re.compile(r"(?<!\d)\d{7,24}(?!\d)")
 _NOISE_RE = re.compile(r"第\s*\d+\s*页|业务用章|交易机构|产品说明|账号序号|起始日期|终止日期")
 _CACHE_KEY = "_bank_ocr_implicit_recovery"
 _TEXT_BLOCK_TYPES = {"paragraph", "list", "footer", "unknown", "text"}
@@ -47,6 +47,16 @@ _OPENING_BALANCE_MARKERS = (
     "opening balance",
 )
 _SUMMARY_KEYWORDS = (
+    "网银转账",
+    "跨行转账",
+    "实时汇款",
+    "短信通费",
+    "归还本息",
+    "账户费",
+    "手续费",
+    "活期结息",
+    "发放贷款",
+    "贷款受让",
     "证券转银行",
     "第三方支付",
     "还信用卡",
@@ -59,6 +69,35 @@ _SUMMARY_KEYWORDS = (
     "转账",
     "结息",
     "付息",
+)
+_COUNTERPARTY_STOP_MARKERS = (
+    *_SUMMARY_KEYWORDS,
+    "普通汇兑",
+    "业务功能描述",
+    "贷款还息",
+    "用途:",
+    "用途：",
+    "附言:",
+    "附言：",
+    "备注:",
+    "备注：",
+)
+_CONCATENATED_SUMMARY_MARKERS = (
+    "网银转账",
+    "跨行转账",
+    "实时汇款",
+    "短信通费",
+    "归还本息",
+    "账户费",
+    "活期结息",
+    "发放贷款",
+    "贷款受让",
+)
+_AMOUNT_HEADER_MARKERS = (
+    "交易金额",
+    "交易发生金额",
+    "发生金额",
+    "发生额",
 )
 
 
@@ -140,8 +179,10 @@ def _canonical_payload(parse_result: Any) -> dict[str, Any]:
     from docmirror.plugins._runtime.evidence_access import evidence_payload
 
     blocks: list[dict[str, Any]] = []
+    local_lines_by_page = _local_structure_lines_by_page(parse_result)
     for page in getattr(parse_result, "pages", []) or []:
-        page_id = f"page:{int(getattr(page, 'page_number', 1) or 1):04d}"
+        page_no = int(getattr(page, "page_number", 1) or 1)
+        page_id = f"page:{page_no:04d}"
         for table in getattr(page, "tables", []) or []:
             cells: list[dict[str, Any]] = []
             for col, text in enumerate(getattr(table, "headers", []) or []):
@@ -157,18 +198,54 @@ def _canonical_payload(parse_result: Any) -> dict[str, Any]:
                         "content": {"grid": {"cells": cells}},
                     }
                 )
-        for text in getattr(page, "texts", []) or []:
-            content = str(getattr(text, "content", "") or "").strip()
-            if content:
+        local_lines = local_lines_by_page.get(page_no) or []
+        if local_lines:
+            for line in local_lines:
                 blocks.append(
                     {
                         "type": "paragraph",
                         "page_ids": [page_id],
-                        "bbox": getattr(text, "bbox", None),
-                        "text": content,
+                        "bbox": line.get("bbox"),
+                        "text": str(line.get("text") or line.get("content") or "").strip(),
                     }
                 )
+        else:
+            for text in getattr(page, "texts", []) or []:
+                content = str(getattr(text, "content", "") or "").strip()
+                if content:
+                    blocks.append(
+                        {
+                            "type": "paragraph",
+                            "page_ids": [page_id],
+                            "bbox": getattr(text, "bbox", None),
+                            "text": content,
+                        }
+                    )
     return {"blocks": blocks, "evidence": evidence_payload(parse_result)}
+
+
+def _local_structure_lines_by_page(parse_result: Any) -> dict[int, list[dict[str, Any]]]:
+    """Return positioned OCR line evidence keyed by its actual source page."""
+    domain_specific = _domain_specific(parse_result) or {}
+    by_page: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for bundle in domain_specific.get("_page_evidence_bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        local = bundle.get("local_structure_evidence")
+        if not isinstance(local, dict):
+            continue
+        for line in local.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            text = str(line.get("text") or line.get("content") or "").strip()
+            bbox = line.get("bbox")
+            try:
+                page_no = int(line.get("page") or local.get("page") or bundle.get("page") or 0)
+            except (TypeError, ValueError):
+                continue
+            if page_no > 0 and text and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                by_page[page_no].append(line)
+    return dict(by_page)
 
 
 def _extract_canonical_tables(payload: dict[str, Any]) -> list[list[list[str]]]:
@@ -236,6 +313,7 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
             header_idx = _distributed_header_end(ordered)
         if header_idx < 0:
             continue
+        counterparty_before_account = _counterparty_precedes_account(ordered[: header_idx + 1])
         rows: list[list[str]] = []
         pending_counterparty: tuple[str, str] | None = None
         sequence_counterparties: dict[int, tuple[str, str]] = {}
@@ -256,7 +334,11 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
                 if orphan_hint and first_sequence is not None and first_sequence > 1:
                     sequence_counterparties.setdefault(first_sequence - 1, orphan_hint)
             for fragment in _ledger_fragments(text):
-                row = _parse_paragraph_ledger_fragment(fragment, prev_balance=prev_balance)
+                row = _parse_paragraph_ledger_fragment(
+                    fragment,
+                    prev_balance=prev_balance,
+                    counterparty_before_account=counterparty_before_account,
+                )
                 if not row:
                     continue
                 if pending_counterparty and _row_counterparty_missing(row):
@@ -269,7 +351,11 @@ def _extract_paragraph_ledger_tables(payload: dict[str, Any]) -> list[list[list[
                 except ValueError:
                     prev_balance = None
         if len(rows) < _MIN_DISTRIBUTED_ROWS:
-            distributed_rows = _extract_distributed_ledger_rows(ordered, header_idx)
+            distributed_rows = _extract_distributed_ledger_rows(
+                ordered,
+                header_idx,
+                counterparty_before_account=counterparty_before_account,
+            )
             if distributed_rows:
                 for row in distributed_rows:
                     _set_row_source_page(row, page_no)
@@ -301,13 +387,11 @@ def _distributed_header_end(ordered: list[dict[str, Any]]) -> int:
             continue
         accumulated.append(text)
         joined = "".join(accumulated)
-        has_date = "交易日期" in joined or "交易时间" in joined or "记账日期" in joined
+        has_date = _has_ledger_date_header(joined)
         has_amount = any(
-            marker
-            in joined
+            marker in joined
             for marker in (
-                "交易金额",
-                "发生额",
+                *_AMOUNT_HEADER_MARKERS,
                 "收入金额",
                 "支出金额",
                 "借方/贷方金额",
@@ -321,9 +405,23 @@ def _distributed_header_end(ordered: list[dict[str, Any]]) -> int:
     return -1
 
 
+def _has_ledger_date_header(text: str) -> bool:
+    """Return whether text contains an explicit or OCR-split transaction-date header."""
+    compact = re.sub(r"\s+", "", text)
+    if any(marker in compact for marker in ("交易日期", "交易时间", "记账日期")):
+        return True
+    # Narrow scanned columns are commonly OCR'd as two stacked fragments:
+    # ``交易日 借贷标`` / ``期 志``.  Keep the fuzzy rule anchored to
+    # ``交易`` and the trailing ``期`` so unrelated ``起止日期`` metadata
+    # cannot satisfy the ledger-header gate.
+    return bool(re.search(r"交易[日曰口][^0-9]{0,8}期", compact))
+
+
 def _extract_distributed_ledger_rows(
     ordered: list[dict[str, Any]],
     header_idx: int,
+    *,
+    counterparty_before_account: bool = False,
 ) -> list[list[str]]:
     """Parse rows whose fields are spread across positioned text blocks."""
     values: list[str] = []
@@ -341,7 +439,11 @@ def _extract_distributed_ledger_rows(
     rows: list[list[str]] = []
     prev_balance: float | None = None
     for fragment in fragments:
-        row = _parse_paragraph_ledger_fragment(fragment, prev_balance=prev_balance)
+        row = _parse_paragraph_ledger_fragment(
+            fragment,
+            prev_balance=prev_balance,
+            counterparty_before_account=counterparty_before_account,
+        )
         if not row:
             continue
         rows.append(row)
@@ -363,7 +465,7 @@ def _page_number_from_id(page_id: str) -> int:
 
 def _date_anchored_fragments(text: str) -> list[str]:
     """Split distributed rows from each date anchor to the next date anchor."""
-    matches = list(_DATE_RE.finditer(text))
+    matches = _transaction_date_matches(text)
     starts = [_date_fragment_start(text, match.start()) for match in matches]
     return [
         text[starts[idx] : starts[idx + 1] if idx + 1 < len(starts) else len(text)].strip()
@@ -391,16 +493,20 @@ def _is_paragraph_ledger_header(block: dict[str, Any]) -> bool:
     has_date = "交易日期" in text or "交易时间" in text
     has_direction = "收/支" in text or "收支" in text or _has_signed_amount_header(text)
     has_balance = "账户余额" in text or "余额" in text
-    return has_date and has_direction and "交易金额" in text and has_balance
+    return has_date and has_direction and _has_amount_header(text) and has_balance
 
 
 def _has_signed_amount_header(text: str) -> bool:
-    return "交易金额" in text and "收/支" not in text and "收支" not in text
+    return _has_amount_header(text) and "收/支" not in text and "收支" not in text
+
+
+def _has_amount_header(text: str) -> bool:
+    return any(marker in text for marker in _AMOUNT_HEADER_MARKERS)
 
 
 def _is_header_or_meta_text(text: str) -> bool:
     normalized = normalize_header_cell(text)
-    if "交易日期" in normalized and "交易金额" in normalized:
+    if "交易日期" in normalized and _has_amount_header(normalized):
         return True
     return bool(_NOISE_RE.search(text) and not _DATE_RE.search(text))
 
@@ -409,7 +515,7 @@ def _ledger_fragments(text: str) -> list[str]:
     """Split a text block into date-centered ledger fragments."""
     if _has_sequence_date_rows(text):
         return _date_anchored_fragments(text)
-    matches = list(_DATE_RE.finditer(text))
+    matches = _transaction_date_matches(text)
     if not matches:
         return []
     fragments: list[str] = []
@@ -423,6 +529,22 @@ def _ledger_fragments(text: str) -> list[str]:
             fragment = f"{match.group(1)} {fragment}"
         fragments.append(fragment)
     return fragments
+
+
+def _transaction_date_matches(text: str) -> list[re.Match[str]]:
+    """Return row-date anchors while excluding dates inside narrative periods."""
+    matches: list[re.Match[str]] = []
+    for match in _DATE_RE.finditer(text):
+        before = text[max(0, match.start() - 24) : match.start()]
+        after = text[match.end() : match.end() + 4]
+        compact_before = re.sub(r"\s+", "", before)
+        compact_after = re.sub(r"\s+", "", after)
+        if compact_before.endswith("至") or compact_after.startswith("至"):
+            continue
+        if any(marker in compact_before for marker in ("所属时间", "计息期间", "利息期间", "起止日期", "账期")):
+            continue
+        matches.append(match)
+    return matches
 
 
 def _leading_orphan_text(text: str) -> str:
@@ -445,10 +567,25 @@ def _has_sequence_date_rows(text: str) -> bool:
     return bool(re.search(r"(?:^|\s)\d{1,5}\s+20\d{6}(?!\d)", _clean_cell(text)))
 
 
-def _parse_paragraph_ledger_fragment(fragment: str, *, prev_balance: float | None) -> list[str]:
-    date_raw, direction_raw = _split_date_direction(fragment)
+def _counterparty_precedes_account(header_blocks: list[dict[str, Any]]) -> bool:
+    """Return whether the visible source header orders name before account and summary."""
+    header = "".join(normalize_header_cell(str(block.get("text") or "")) for block in header_blocks)
+    party_pos = header.rfind("对方户名")
+    account_positions = [header.rfind(marker) for marker in ("对方账号", "对方账户")]
+    account_pos = max(account_positions)
+    summary_pos = header.rfind("摘要")
+    return party_pos >= 0 and account_pos > party_pos and summary_pos > account_pos
+
+
+def _parse_paragraph_ledger_fragment(
+    fragment: str,
+    *,
+    prev_balance: float | None,
+    counterparty_before_account: bool = False,
+) -> list[str]:
+    date_raw, _direction_raw = _split_date_direction(fragment)
     date = _normalize_date(date_raw)
-    direction = _normalize_direction(direction_raw or fragment)
+    direction = _normalize_direction(fragment)
     if not date or not direction:
         return []
 
@@ -460,8 +597,14 @@ def _parse_paragraph_ledger_fragment(fragment: str, *, prev_balance: float | Non
         return []
 
     counter_account = _extract_counter_account(fragment)
-    summary = _extract_summary(fragment)
-    counterparty = _extract_counterparty_from_fragment(fragment, counter_account)
+    ordered_fields = (
+        _extract_name_account_summary_order(fragment, counter_account) if counterparty_before_account else None
+    )
+    if ordered_fields is not None:
+        counterparty, summary = ordered_fields
+    else:
+        summary = _extract_summary(fragment)
+        counterparty = _extract_counterparty_from_fragment(fragment, counter_account)
     return [
         date,
         direction,
@@ -478,6 +621,22 @@ def _parse_paragraph_ledger_fragment(fragment: str, *, prev_balance: float | Non
         ),
         "",
     ]
+
+
+def _extract_name_account_summary_order(fragment: str, counter_account: str) -> tuple[str, str] | None:
+    """Extract fields for headers ordered as counterparty name, account, then summary."""
+    if not counter_account:
+        return None
+    account_start = fragment.find(counter_account)
+    if account_start < 0:
+        return None
+    amount_matches = list(_AMOUNT_TOKEN_RE.finditer(fragment[:account_start]))
+    if len(amount_matches) < 2:
+        return None
+    party = _clean_counterparty(fragment[amount_matches[1].end() : account_start])
+    summary = _clean_cell(fragment[account_start + len(counter_account) :])
+    summary = re.sub(r"^(?:摘要|用途)\s*[:：]?\s*", "", summary).strip()
+    return party, summary
 
 
 def _amount_tokens(text: str) -> list[tuple[str, float, int]]:
@@ -704,9 +863,12 @@ def _balance_transition_cost(previous: list[str], current: list[str]) -> float:
 
 
 def _extract_counter_account(fragment: str) -> str:
+    amount_spans = [match.span() for match in _AMOUNT_TOKEN_RE.finditer(fragment)]
     for match in _ACCOUNT_RE.finditer(fragment):
         token = match.group(0)
         if _DATE_RE.fullmatch(token):
+            continue
+        if any(start <= match.start() and match.end() <= end for start, end in amount_spans):
             continue
         return token
     return ""
@@ -720,14 +882,49 @@ def _extract_summary(fragment: str) -> str:
 
 
 def _extract_counterparty_from_fragment(fragment: str, counter_account: str) -> str:
-    text = fragment
-    for value in _DATE_RE.findall(text) + _DIRECTION_RE.findall(text):
+    if not counter_account:
+        return ""
+    account_position = fragment.find(counter_account)
+    if account_position < 0:
+        return ""
+    account_end = account_position + len(counter_account)
+    marker_pattern = (
+        r"(?<!\S)(?:" + "|".join(re.escape(marker) for marker in _COUNTERPARTY_STOP_MARKERS) + r")(?=\s|;|$)"
+    )
+    marker_matches = list(re.finditer(marker_pattern, fragment))
+    marker_before = next(
+        (match for match in reversed(marker_matches) if match.end() <= account_position),
+        None,
+    )
+    marker_after = next(
+        (match for match in marker_matches if match.start() >= account_end),
+        None,
+    )
+    marker_after_position = marker_after.start() if marker_after is not None else None
+    suffix = fragment[account_end:]
+    if marker_after_position is None:
+        concatenated_positions = [
+            (position, marker) for marker in _CONCATENATED_SUMMARY_MARKERS if (position := suffix.find(marker)) >= 0
+        ]
+        if concatenated_positions:
+            position, _marker = min(concatenated_positions, key=lambda item: item[0])
+            marker_after_position = account_end + position
+    if marker_after_position is not None:
+        text = fragment[account_end:marker_after_position]
+    elif marker_before is not None:
+        text = fragment[marker_before.end() : account_position]
+    else:
+        prefix = fragment[:account_position]
+        suffix = fragment[account_end:]
+        text = suffix if re.search(r"[\u4e00-\u9fff]", suffix) else prefix
+    narrative_stop = re.search(r"\s+(?:普通汇兑|业务功能描述|贷款还息|用途|附言|备注)\s*[:：]", text)
+    if narrative_stop is not None:
+        text = text[: narrative_stop.start()]
+    for value in _DATE_RE.findall(text):
         text = text.replace(value, " ")
     text = _remove_amount_tokens(text)
     if counter_account:
         text = text.replace(counter_account, " ")
-    for keyword in _SUMMARY_KEYWORDS:
-        text = text.replace(keyword, " ")
     text = re.sub(r"\b(?:00)?98\b|\b(?:NY|YL)\d{4}\b|业务用章|第\s*\d+\s*页", " ", text)
     text = re.sub(r"[A-Za-z0-9&°]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -831,15 +1028,30 @@ def _normalize_date(value: str) -> str:
 
 def _normalize_direction(value: str) -> str:
     text = _clean_cell(value)
-    if any(token in text for token in ("收入", "收人")):
-        return "收入"
-    if any(token in text for token in ("支出", "支山", "支鼎", "攴出")):
-        return "支出"
+    date_match = _DATE_RE.search(text)
     signed_amount = _AMOUNT_TOKEN_RE.search(text)
+    direction_zone_start = date_match.end() if date_match is not None else 0
+    direction_zone_end = signed_amount.start() if signed_amount is not None else len(text)
+    direction_zone = text[direction_zone_start:direction_zone_end]
+    debit_credit = ""
+    if "借" in direction_zone:
+        debit_credit = "借"
+    elif "贷" in direction_zone:
+        debit_credit = "贷"
+
+    if debit_credit:
+        is_negative = bool(signed_amount and signed_amount.group(0).startswith("-"))
+        if debit_credit == "借":
+            return "收入" if is_negative else "支出"
+        return "支出" if is_negative else "收入"
     if signed_amount and signed_amount.group(0).startswith("-"):
         return "支出"
     if signed_amount and signed_amount.group(0).startswith("+"):
         return "收入"
+    if any(token in text for token in ("收入", "收人")):
+        return "收入"
+    if any(token in text for token in ("支出", "支山", "支鼎", "攴出")):
+        return "支出"
     return ""
 
 
@@ -856,6 +1068,7 @@ def _clean_counterparty(value: str) -> str:
     text = re.sub(r"\b(?:NY|YL)\d{4}\b", "", text)
     text = re.sub(r"\s*-\s*", "-", text)
     text = re.sub(r"-{2,}", "-", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff）)])\s+(?=[\u4e00-\u9fff（(])", "", text)
     text = re.sub(r"^[\s+\-.,，。'\"`]+", "", text)
     text = re.sub(r"[\s+.,，。'\"`]+$", "", text)
     return text.strip()
@@ -901,7 +1114,7 @@ def _recover_from_text(full_text: str) -> list[list[list[str]]]:
 
 def _date_suffix_fragments(text: str) -> list[str]:
     """Split OCR text where the transaction date may trail the other row fields."""
-    matches = list(_DATE_RE.finditer(text))
+    matches = _transaction_date_matches(text)
     if not matches:
         return []
     fragments: list[str] = []
@@ -952,13 +1165,8 @@ def _parse_unpositioned_fragment(fragment: str, *, prev_balance: float | None) -
         return []
 
     explicit_direction = _normalize_direction(fragment)
-    marker_directions = [
-        _amount_marker_direction(fragment, token[2], token[0])
-        for token in amounts
-    ]
-    debit_amount_indexes = {
-        idx for idx, direction in enumerate(marker_directions) if direction == "支出"
-    }
+    marker_directions = [_amount_marker_direction(fragment, token[2], token[0]) for token in amounts]
+    debit_amount_indexes = {idx for idx, direction in enumerate(marker_directions) if direction == "支出"}
     candidates: list[tuple[float, str, float, float]] = []
     for amount_idx, amount_token in enumerate(amounts):
         if debit_amount_indexes and amount_idx not in debit_amount_indexes:
@@ -967,7 +1175,9 @@ def _parse_unpositioned_fragment(fragment: str, *, prev_balance: float | None) -
         if amount <= 0:
             continue
         marker_direction = marker_directions[amount_idx]
-        directions = [explicit_direction or marker_direction] if explicit_direction or marker_direction else ["收入", "支出"]
+        directions = (
+            [explicit_direction or marker_direction] if explicit_direction or marker_direction else ["收入", "支出"]
+        )
         for balance_idx, balance_token in enumerate(amounts):
             if balance_idx == amount_idx:
                 continue

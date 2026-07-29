@@ -9,6 +9,9 @@ dist/
 build/
 .eggs/
 
+## index
+AGENTS.md/
+
 ## Environment
 .env
 .venv/

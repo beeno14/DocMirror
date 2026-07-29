@@ -208,3 +208,37 @@ class TestProcess:
         g = GeometricReconstructor()
         result = g.process(r)
         assert len(result.pages[0].tables) == 0
+
+    def test_reconstructs_each_page_without_cross_page_coordinate_overlay(self):
+        """Identical coordinates on different pages must produce page-local tables."""
+
+        def page_blocks(page: int) -> list[TextBlock]:
+            values = [
+                ["交易日期", "交易发生金额", "账户余额", "对方账号"],
+                [f"2025010{page}", f"{page}00.00", f"{page}000.00", f"account-{page}"],
+            ]
+            return [
+                TextBlock(
+                    content=value,
+                    bbox=[col * 150, 100 + row * 50, col * 150 + 120, 100 + row * 50 + 30],
+                )
+                for row, values_row in enumerate(values)
+                for col, value in enumerate(values_row)
+            ]
+
+        result = GeometricReconstructor().process(
+            ParseResult(
+                pages=[
+                    PageContent(page_number=1, texts=page_blocks(1)),
+                    PageContent(page_number=2, texts=page_blocks(2)),
+                ]
+            )
+        )
+
+        assert [len(page.tables) for page in result.pages] == [1, 1]
+        assert result.pages[0].tables[0].page == 1
+        assert result.pages[1].tables[0].page == 2
+        assert result.pages[0].tables[0].rows[0].source_page == 1
+        assert result.pages[1].tables[0].rows[0].source_page == 2
+        assert result.pages[0].tables[0].rows[0].cells[0].text == "20250101"
+        assert result.pages[1].tables[0].rows[0].cells[0].text == "20250102"

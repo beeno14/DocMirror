@@ -39,9 +39,16 @@ _FOOTER_MARKERS = (
     "小计",
     "总计",
 )
-_COUNT_PATTERNS = (re.compile(r"合计笔数[:：]\s*(?P<count>\d+)"),)
+_COUNT_PATTERNS = (
+    re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),
+)
 _SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*共\s*(?P<total>\d+)\s*页")
 _SPLIT_COUNT_PATTERNS = (
+    re.compile(
+        r"借方合计笔数[:：]\s*(?P<debit>\d+)\s*笔?.*?"
+        r"贷方合计笔数[:：]\s*(?P<credit>\d+)\s*笔?",
+        re.S,
+    ),
     re.compile(r"借方笔数[:：]\s*(?P<debit>\d+).*?贷方笔数[:：]\s*(?P<credit>\d+)", re.S),
     re.compile(r"当前账单借方发生数[:：]\s*(?P<debit>\d+).*?当前账单贷方发生数[:：]\s*(?P<credit>\d+)", re.S),
     re.compile(r"本月累计借方发生数[:：]\s*(?P<debit>\d+).*?本月累计贷方发生数[:：]\s*(?P<credit>\d+)", re.S),
@@ -98,12 +105,12 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
 def count_expected_rows_from_bank_footer(text: str) -> int:
     """Read expected transaction count from bank-statement footer/header totals."""
     source = text or ""
-    for pat in _COUNT_PATTERNS:
-        if m := pat.search(source):
-            return _safe_count(m.group("count"))
     for pat in _SPLIT_COUNT_PATTERNS:
         if m := pat.search(source):
             return _safe_count(int(m.group("debit")) + int(m.group("credit")))
+    for pat in _COUNT_PATTERNS:
+        if m := pat.search(source):
+            return _safe_count(m.group("count"))
     return 0
 
 

@@ -365,6 +365,37 @@ def test_dedupe_uses_bank_reference_before_lossy_business_fields():
     assert len(deduped) == 2
 
 
+def test_dedupe_preserves_distinct_rows_that_share_a_bank_reference():
+    records = [
+        {
+            "normalized": {
+                "date": "2026-01-02",
+                "direction": "expense",
+                "amount": 100.0,
+                "balance": 900.0,
+                "counter_party": "甲",
+                "summary": "付款",
+            },
+            "raw": {"交易流水号": "REF001"},
+        },
+        {
+            "normalized": {
+                "date": "2026-01-02",
+                "direction": "expense",
+                "amount": 0.9,
+                "balance": 899.1,
+                "counter_party": "",
+                "summary": "手续费",
+            },
+            "raw": {"交易流水号": "REF001"},
+        },
+    ]
+
+    deduped = dedupe_transaction_rows(records)
+
+    assert len(deduped) == 2
+
+
 def test_dedupe_keeps_same_business_fields_when_sequence_differs():
     base = {"date": "2026-01-02", "amount": 100.0, "balance": 200.0, "counter_party": "same"}
     records = [
@@ -381,12 +412,15 @@ def test_dedupe_keeps_same_business_fields_when_sequence_differs():
 def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
     atoms = [
         _atom("title", "测试银行账户交易明细表", 200.0, 10.0, 400.0),
+        _atom("bank_label", "开户行", 10.0, 20.0, 50.0),
+        _atom("bank_value", "浦发银行重庆分行营业部", 80.0, 18.0, 220.0),
         _atom("print", "打印日期：2026-07-18", 10.0, 30.0, 150.0),
         _atom("period", "交易时段：2026-01-01 至 2026-06-30", 10.0, 45.0, 260.0),
         _atom("holder", "户名：测试用户", 10.0, 60.0, 100.0),
         _atom("account", "账号：1234567890", 110.0, 60.0, 230.0),
         _atom("currency", "币种：人民币", 240.0, 60.0, 320.0),
-        _atom("total", "总条数：38", 10.0, 220.0, 80.0),
+        _atom("total_label", "汇总交易笔数", 10.0, 220.0, 80.0),
+        _atom("total_value", "38笔", 110.0, 225.0, 140.0),
     ]
 
     fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
@@ -396,3 +430,19 @@ def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
     assert fields["query_period"]["normalized_value"] == "2026-01-01 至 2026-06-30"
     assert fields["total_transactions"]["normalized_value"] == "38"
     assert fields["account_number"]["normalized_value"] == "1234567890"
+    assert fields["bank_name"]["normalized_value"] == "浦发银行重庆分行营业部"
+
+
+def test_evidence_identity_stops_at_branch_and_ignores_transaction_loan_account():
+    atoms = [
+        _atom("title", "对公客户账户明细", 200.0, 10.0, 400.0),
+        _atom("holder", "客户名称：重庆正大华日软件有限公司", 10.0, 40.0, 220.0),
+        _atom("branch", "开户机构：510601", 230.0, 40.0, 340.0),
+        _atom("account", "账    号：5106010120010001125", 10.0, 60.0, 230.0),
+        _atom("loan", "贷款账号：5101010179730017689", 10.0, 160.0, 230.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["account_holder"]["normalized_value"] == "重庆正大华日软件有限公司"
+    assert fields["account_number"]["normalized_value"] == "5106010120010001125"

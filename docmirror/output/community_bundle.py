@@ -560,6 +560,18 @@ def _dataset_completeness(
                 "basis": "source_sequence_ledger",
             }
     policy = (projection.get("completeness") or {}).get(key) or {}
+    if policy.get("basis") == "domain_fact_count":
+        count_key = str(policy.get("count_key") or "")
+        count_value = data.get(count_key)
+        if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
+            expected = int(count_value)
+            return {
+                "expected_row_count": expected,
+                "emitted_row_count": emitted,
+                "omitted_row_count": max(0, expected - emitted),
+                "verified": expected == emitted,
+                "basis": str(policy.get("public_basis") or "domain_fact_count"),
+            }
     if policy.get("basis") == "physical_marker_rows":
         markers = {re.sub(r"\s+", "", str(value)) for value in policy.get("first_column_values") or []}
         expected = _physical_marker_row_count(result, markers)

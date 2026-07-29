@@ -36,7 +36,18 @@ def _table_result(rows: list[list[str]]) -> ParseResult:
 def test_recover_ocr_implicit_table_keeps_valid_rows_with_page_noise() -> None:
     parse_result = _table_result(
         [
-            ["交易日期", "月收/支", "交易金额", "账户余额", "摘要", "对方账号", "对方户名凭证序号", "机构", "柜员", "备注信息"],
+            [
+                "交易日期",
+                "月收/支",
+                "交易金额",
+                "账户余额",
+                "摘要",
+                "对方账号",
+                "对方户名凭证序号",
+                "机构",
+                "柜员",
+                "备注信息",
+            ],
             ["20221008", "支出", "4.00", "1256.57", "POS消费", "第3页", "Q", "OB8B9E", "ORD95E", "D02"],
             ["20221009", "支山", "4.00", "1252.57", "POS消费", "", "", "", "", ""],
         ]
@@ -136,9 +147,15 @@ def test_signed_amount_orientation_is_not_swapped_to_fit_noisy_neighbor_order() 
         ("序号交易时间交易金额\n余额\n摘要\n交易对手信息", [30, 100, 560, 120]),
         ("招商银行股份有限公司-\n6214832145808973-\n6214832145808973", [390, 121, 520, 145]),
         ("64\n20210508\n+40,000.00\n59,777.29\n转账", [30, 130, 520, 150]),
-        ("招商银行股份有限公司-\n6214832145808973-\n6214832145808973\n66\n20210501\n+60.10\n59,777.29\n结息", [30, 151, 520, 190]),
+        (
+            "招商银行股份有限公司-\n6214832145808973-\n6214832145808973\n66\n20210501\n+60.10\n59,777.29\n结息",
+            [30, 151, 520, 190],
+        ),
         ("65\n20210508\n-40,000.00\n19,777.29\n转账", [30, 191, 520, 211]),
-        ("67\n20210427\n-4,950.00\n59,717.19\n转账\n长沙银行股份有限公司-刘梦云\n-6214467873120749558", [30, 212, 520, 252]),
+        (
+            "67\n20210427\n-4,950.00\n59,717.19\n转账\n长沙银行股份有限公司-刘梦云\n-6214467873120749558",
+            [30, 212, 520, 252],
+        ),
     ]
     parse_result = ParseResult(
         pages=[PageContent(page_number=1, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
@@ -231,6 +248,94 @@ def test_recover_distributed_explicit_direction_ledger_blocks() -> None:
     assert len(tables[0]) == 4
 
 
+def test_recover_all_pages_with_stacked_ocr_header_and_debit_credit_markers() -> None:
+    pages: list[PageContent] = []
+    for page_no in range(1, 6):
+        month = f"{page_no:02d}"
+        header_prefix = "交易口 借贷标" if page_no == 1 else "交易日 借贷标"
+        lines = [
+            ("某银行公司账户交易明细清单", [200, 10, 400, 24]),
+            ("起止日期:2024/01/01-2024/12/31", [20, 40, 250, 54]),
+            (header_prefix, [20, 62, 85, 75]),
+            ("期 志 交易金额 余额 对方户名 对方账号 摘要", [20, 73, 500, 88]),
+            (
+                f"2024{month}01 借 100.00 900.00 待报解预算收入 6222000000000001 划缴税款",
+                [20, 96, 520, 112],
+            ),
+            (
+                f"2024{month}02 贷 50.00 950.00 付款单位 6222000000000002 汇款汇入",
+                [20, 112, 520, 128],
+            ),
+            (
+                f"2024{month}03 借 -10.00 960.00 付款单位 6222000000000003 冲正",
+                [20, 128, 520, 144],
+            ),
+        ]
+        pages.append(
+            PageContent(
+                page_number=page_no,
+                texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines],
+            )
+        )
+    parse_result = ParseResult(pages=pages)
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 5
+    assert sum(len(table) - 1 for table in tables) == 15
+    assert [[row[1] for row in table[1:]] for table in tables] == [["支出", "收入", "收入"]] * 5
+    assert [[row[10] for row in table[1:]] for table in tables] == [[str(page_no)] * 3 for page_no in range(1, 6)]
+    assert tables[0][1][4:7] == ["划缴税款", "6222000000000001", "待报解预算收入"]
+
+
+def test_scanned_ledger_prefers_positioned_ocr_lines_over_scattered_tokens() -> None:
+    bundles = []
+    for page_no in (1, 2):
+        line_texts = [
+            "某银行公司账户交易明细清单",
+            "交易口 借贷标",
+            "期 志 交易金额 余额 对方户名 对方账号 摘要",
+            f"20240{page_no}01 借 100.00 900.00 付款单位 6222000000000001 转账",
+            f"20240{page_no}02 贷 50.00 950.00 付款单位 6222000000000002 汇入",
+            f"20240{page_no}03 借 20.00 930.00 付款单位 6222000000000003 手续费",
+        ]
+        bundles.append(
+            {
+                "local_structure_evidence": {
+                    "page": page_no,
+                    "lines": [
+                        {
+                            "page": page_no,
+                            "text": text,
+                            "bbox": [20, 20 + index * 16, 520, 32 + index * 16],
+                        }
+                        for index, text in enumerate(line_texts)
+                    ],
+                }
+            }
+        )
+    parse_result = ParseResult(
+        pages=[
+            PageContent(
+                page_number=page_no,
+                texts=[
+                    TextBlock(content="交易口", bbox=[20, 60, 50, 72]),
+                    TextBlock(content="20240101", bbox=[20, 100, 80, 112]),
+                    TextBlock(content="100.00", bbox=[100, 100, 150, 112]),
+                ],
+            )
+            for page_no in (1, 2)
+        ],
+        entities=DocumentEntities(domain_specific={"_page_evidence_bundles": bundles}),
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 2
+    assert [len(table) - 1 for table in tables] == [3, 3]
+    assert [[row[10] for row in table[1:]] for table in tables] == [["1"] * 3, ["2"] * 3]
+
+
 def test_distributed_ledger_requires_at_least_three_valid_rows() -> None:
     lines = [
         ("交易日期", [30, 100, 90, 112]),
@@ -266,6 +371,79 @@ def test_complete_paragraph_header_keeps_two_existing_rows() -> None:
     assert len(tables[0]) == 3
 
 
+def test_recover_native_corporate_detail_with_transaction_occurrence_amount_header() -> None:
+    lines = [
+        ("交易日期\n交易发生金额\n账户余额\n对方账号\n对方户名\n摘要\n备注", [30, 100, 520, 118]),
+        (
+            "20250102\n-2000000.00\n1458306.91\n650987227500015\n"
+            "重庆正大软件（集团）\n有限公司\n网银转账\n用途:往来结算款;",
+            [30, 130, 520, 150],
+        ),
+        (
+            "20250102\n-2.00\n1458304.91\n5106010150380000027\n企网汇划手续费收入\n手续费\n用途:往来结算款;",
+            [30, 151, 520, 171],
+        ),
+        (
+            "20250102\n+2900000.00\n4358304.91\n650987227500015\n"
+            "重庆正大软件（集团）\n有限公司\n跨行转账\n附言:往来款;",
+            [30, 172, 520, 192],
+        ),
+        (
+            "20250321\n+383.76\n32111.68\n5106010131210000841\n"
+            "应付单位活期存款利息活期结息\n对公活期自动结息;利息:383.76;结息积数:138154517.00;"
+            "利率:0.1000000;所属时间:20241221至20250321;",
+            [30, 193, 520, 213],
+        ),
+        (
+            "20250414\n-20000.00\n732076.68\n"
+            "641301106013000859983重庆正大华日软件有限公司银川分公司\n"
+            "实时汇款\n用途:往来结算款;",
+            [30, 214, 520, 234],
+        ),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=3, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 1
+    assert [row[:4] for row in tables[0][1:]] == [
+        ["2025-01-02", "支出", "2000000.00", "1458306.91"],
+        ["2025-01-02", "支出", "2.00", "1458304.91"],
+        ["2025-01-02", "收入", "2900000.00", "4358304.91"],
+        ["2025-03-21", "收入", "383.76", "32111.68"],
+        ["2025-04-14", "支出", "20000.00", "732076.68"],
+    ]
+    assert [row[5] for row in tables[0][1:]] == [
+        "650987227500015",
+        "5106010150380000027",
+        "650987227500015",
+        "5106010131210000841",
+        "641301106013000859983",
+    ]
+    assert [row[6] for row in tables[0][1:]] == [
+        "重庆正大软件（集团）有限公司",
+        "企网汇划手续费收入",
+        "重庆正大软件（集团）有限公司",
+        "应付单位活期存款利息",
+        "重庆正大华日软件有限公司银川分公司",
+    ]
+    assert all(row[10] == "3" for row in tables[0][1:])
+
+    ctx = StyleContext(
+        tables=tables,
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        prefer_context_tables=True,
+    )
+    raw_records = grid_standard.extract_transactions(ctx, BankStatementCommunityPlugin())
+    assert len(raw_records) == 5
+    assert raw_records[1]["对方账号与户名"] == "企网汇划手续费收入"
+
+
 def test_recover_borderless_page_emitted_as_one_ocr_text_block() -> None:
     full_text = """
 上页余额: 1000.00
@@ -278,9 +456,7 @@ def test_recover_borderless_page_emitted_as_one_ocr_text_block() -> None:
 50.00贷 950.00 网银来账 W0001-202401020002 20240102
 20.00借 930.00 手续费 W0001-202401030003 20240103
 """
-    parse_result = ParseResult(
-        pages=[PageContent(page_number=1, texts=[TextBlock(content=full_text)])]
-    )
+    parse_result = ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=full_text)])])
 
     tables = recover_ocr_implicit_ledger_tables(parse_result, full_text)
 
@@ -304,9 +480,7 @@ def test_borderless_debit_marker_distinguishes_amount_from_leading_balance() -> 
 405010.00贷 45000.00借 转账 W0001-202401020002 20240102
 357010.00贷 48000.00借 转账 W0001-202401030003 20240103
 """
-    parse_result = ParseResult(
-        pages=[PageContent(page_number=1, texts=[TextBlock(content=full_text)])]
-    )
+    parse_result = ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=full_text)])])
 
     tables = recover_ocr_implicit_ledger_tables(parse_result, full_text)
 

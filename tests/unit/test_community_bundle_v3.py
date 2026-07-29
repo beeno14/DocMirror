@@ -222,6 +222,36 @@ def test_source_report_count_can_verify_dataset_completeness() -> None:
     assert payload["warnings"] == []
 
 
+def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None:
+    result = ParseResult(entities=DocumentEntities(document_type="bank_statement"))
+    _PROJECTIONS[id(result)] = {
+        "projector_id": "bank_statement",
+        "document_type": "bank_statement",
+        "domain_facts": {
+            "source_reported_transaction_count": 2,
+        },
+        "datasets": {
+            "records": [
+                {"record_id": "transactions:r000001", "normalized": {"date": "2025-01-01"}},
+                {"record_id": "transactions:r000002", "normalized": {"date": "2025-01-02"}},
+            ]
+        },
+    }
+
+    payload = project_community_bundle(result, document_id="doc_bank_verified").json_payload()
+    dataset = next(item for item in payload["datasets"] if item["name"] == "transactions")
+
+    assert dataset["status"] == "complete"
+    assert dataset["completeness"] == {
+        "expected_row_count": 2,
+        "emitted_row_count": 2,
+        "omitted_row_count": 0,
+        "verified": True,
+        "basis": "source_footer_transaction_count",
+    }
+    assert payload["warnings"] == []
+
+
 def test_semantic_schema_allows_document_type_specific_extensions() -> None:
     result = _with_projection(
         ParseResult(entities=DocumentEntities(document_type="credit_report")),
