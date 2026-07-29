@@ -137,6 +137,12 @@ class RapidOCREngine:
                     feature="RapidOCR execution provider detection",
                     extra="ocr",
                 )
+                cudnn_spec = find_spec("nvidia.cudnn")
+                if os.name == "nt" and cudnn_spec and cudnn_spec.submodule_search_locations:
+                    cudnn_bin = os.path.join(next(iter(cudnn_spec.submodule_search_locations)), "bin")
+                    os.environ["PATH"] = f"{cudnn_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+                if preload_dlls := getattr(onnxruntime, "preload_dlls", None):
+                    preload_dlls(directory="")
                 providers = onnxruntime.get_available_providers()
                 if "CUDAExecutionProvider" in providers:
                     use_cuda = True
@@ -162,7 +168,7 @@ class RapidOCREngine:
             }
 
             if use_cuda:
-                self._engine = RapidOCR(use_cuda=True, **tuning_kwargs)
+                self._engine = RapidOCR(det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True, **tuning_kwargs)
             else:
                 self._engine = RapidOCR(**tuning_kwargs)
             logger.info("RapidOCR model loaded with Extreme CPU Tuning.")
