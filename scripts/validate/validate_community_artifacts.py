@@ -134,6 +134,19 @@ def _companion_path(root: Path, relative: Any, label: str, issues: list[str]) ->
     return candidate
 
 
+def _has_usable_audit_evidence(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return True
+    if isinstance(parsed, list):
+        return any(str(item or "").strip() for item in parsed)
+    return parsed not in (None, "", {}, [])
+
+
 def validate_community_artifacts(community_path: str | Path) -> list[str]:
     """Return all violations across Community JSON, Markdown, wide CSVs and audit CSV."""
     path = Path(community_path).resolve()
@@ -236,6 +249,7 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
     dataset_ids: set[str] = set()
     dataset_record_ids: dict[str, set[str]] = {}
     expected_audited_ids: dict[str, set[str]] = {}
+    expected_audited_fields: dict[str, set[tuple[str, str]]] = {}
     dataset_row_counts: dict[str, int] = {}
     dataset_column_keys: dict[str, set[str]] = {}
     for index, dataset in enumerate(datasets):
@@ -265,6 +279,12 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
 
         record_ids: list[str] = []
         audited_ids: set[str] = set()
+        audited_fields: set[tuple[str, str]] = set()
+        column_keys = {
+            str(column.get("key") or "")
+            for column in dataset.get("columns") or []
+            if isinstance(column, dict) and column.get("key")
+        }
         for row_index, row in enumerate(rows):
             if not isinstance(row, dict):
                 issues.append(f"{dataset_id}.rows[{row_index}]: must be an object")
@@ -280,18 +300,21 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
                 if not isinstance(row.get(block), dict):
                     issues.append(f"{dataset_id}.rows[{row_index}].{block}: must be an object")
             normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
             if any(value not in (None, "", [], {}) for value in normalized.values()) and record_id:
                 audited_ids.add(record_id)
+            for field_key in column_keys:
+                value = normalized.get(field_key, canonical_raw.get(field_key))
+                raw_value = canonical_raw.get(field_key, value)
+                if record_id and (value not in (None, "", [], {}) or raw_value not in (None, "", [], {})):
+                    audited_fields.add((record_id, field_key))
         if len(record_ids) != len(set(record_ids)):
             issues.append(f"{dataset_id}: duplicate record_id")
         dataset_record_ids[dataset_id] = set(record_ids)
         expected_audited_ids[dataset_id] = audited_ids
+        expected_audited_fields[dataset_id] = audited_fields
         dataset_row_counts[dataset_id] = len(rows)
-        dataset_column_keys[dataset_id] = {
-            str(column.get("key") or "")
-            for column in dataset.get("columns") or []
-            if isinstance(column, dict) and column.get("key")
-        }
+        dataset_column_keys[dataset_id] = column_keys
 
         csv_path = _companion_path(root, dataset.get("csv"), f"{dataset_id}.csv", issues)
         if csv_path is None:
@@ -391,11 +414,15 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         if audit_columns != _AUDIT_COLUMNS:
             issues.append(f"audit: columns={sorted(audit_columns)}")
         seen_audited_ids: dict[str, set[str]] = {dataset_id: set() for dataset_id in dataset_ids}
+        seen_audited_fields: dict[str, set[tuple[str, str]]] = {dataset_id: set() for dataset_id in dataset_ids}
+        classification = semantic.get("classification") if isinstance(semantic.get("classification"), dict) else {}
+        require_enterprise_evidence = str(classification.get("document_type") or "") == "enterprise_credit_report"
         for row_index, row in enumerate(audit_rows):
             dataset_id = str(row.get("dataset_id") or "")
             record_id = str(row.get("record_id") or "")
+            field_key = str(row.get("field_key") or "")
             if dataset_id in _RESERVED_AUDIT_DATASET_IDS:
-                if not record_id or not str(row.get("field_key") or ""):
+                if not record_id or not field_key:
                     issues.append(f"audit[{row_index}]: incomplete reserved audit row")
                 continue
             if dataset_id not in dataset_record_ids:
@@ -404,10 +431,21 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
             if record_id not in dataset_record_ids[dataset_id]:
                 issues.append(f"audit[{row_index}]: unknown record_id={record_id}")
             seen_audited_ids[dataset_id].add(record_id)
+            seen_audited_fields[dataset_id].add((record_id, field_key))
+            if require_enterprise_evidence and not _has_usable_audit_evidence(row.get("evidence_ref")):
+                issues.append(
+                    f"audit[{row_index}]: enterprise field missing evidence_ref "
+                    f"dataset={dataset_id} record={record_id} field={field_key}"
+                )
         for dataset_id, expected_ids in expected_audited_ids.items():
             missing_ids = expected_ids - seen_audited_ids.get(dataset_id, set())
             if missing_ids:
                 issues.append(f"{dataset_id}: {len(missing_ids)} records missing from audit CSV")
+        if require_enterprise_evidence:
+            for dataset_id, expected_fields in expected_audited_fields.items():
+                missing_fields = expected_fields - seen_audited_fields.get(dataset_id, set())
+                if missing_fields:
+                    issues.append(f"{dataset_id}: {len(missing_fields)} enterprise fields missing from audit CSV")
 
     return issues
 

@@ -1899,6 +1899,18 @@ class CommunityBundle:
         writer.writeheader()
         semantic_payload = semantic or self.semantic_payload()
         structure = semantic_payload.get("structure") if isinstance(semantic_payload.get("structure"), dict) else {}
+        classification = (
+            semantic_payload.get("classification") if isinstance(semantic_payload.get("classification"), dict) else {}
+        )
+        source_tables = (
+            {
+                str(table["id"]): table
+                for table in structure.get("source_tables") or []
+                if isinstance(table, dict) and table.get("id")
+            }
+            if str(classification.get("document_type") or "") == "enterprise_credit_report"
+            else {}
+        )
         sections_by_id = {
             str(section["id"]): section
             for section in (structure.get("sections") or [])
@@ -1929,7 +1941,13 @@ class CommunityBundle:
                     )
                     safe_value, value_escaped = _csv_safe_with_flag(_json_value(value, value_type), value_type)
                     safe_raw, raw_escaped = _csv_safe_with_flag(_scalar(raw_value), value_type)
-                    field_evidence = _field_evidence(value, source, page_range)
+                    field_evidence = _field_evidence(
+                        value,
+                        source,
+                        page_range,
+                        raw_value=raw_value,
+                        source_tables=source_tables,
+                    )
                     writer.writerow(
                         {
                             "dataset_id": public.get("id", ""),
@@ -2011,7 +2029,127 @@ def _canonical_record_id(row: Any, dataset_id: str, row_index: int) -> str:
     return f"{prefix}:r{row_index:06d}"
 
 
-def _field_evidence(value: Any, row: Any, fallback_page_range: list[int]) -> dict[str, Any]:
+def _audit_match_key(value: Any) -> str:
+    """Return a conservative comparison key for source-table cell matching."""
+    scalar = _scalar(value)
+    if scalar in (None, ""):
+        return ""
+    return re.sub(r"[\s,，]+", "", str(scalar)).casefold()
+
+
+def _source_table_row(table: dict[str, Any], row_index: Any) -> dict[str, Any] | None:
+    try:
+        expected = int(row_index)
+    except (TypeError, ValueError):
+        return None
+    rows = [row for row in table.get("row_models") or [] if isinstance(row, dict)]
+    for row in rows:
+        try:
+            source_index = int(row.get("source_row_index"))
+        except (TypeError, ValueError):
+            continue
+        if source_index == expected:
+            return row
+    return rows[expected] if 0 <= expected < len(rows) else None
+
+
+def _bbox_union(cells: list[dict[str, Any]]) -> list[float] | None:
+    boxes: list[list[float]] = []
+    for cell in cells:
+        bbox = cell.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            boxes.append([float(value) for value in bbox])
+        except (TypeError, ValueError):
+            continue
+    if not boxes:
+        return None
+    return [
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    ]
+
+
+def _source_ref_token(ref: dict[str, Any]) -> str:
+    """Serialize an existing structural source reference as stable audit evidence."""
+    preferred = ("source", "page", "table_id", "row", "col", "node_id")
+    keys = [key for key in preferred if ref.get(key) not in (None, "")]
+    keys.extend(
+        key
+        for key in sorted(ref)
+        if key not in preferred and ref.get(key) not in (None, "") and not isinstance(ref.get(key), (dict, list))
+    )
+    return "source-ref:" + "|".join(f"{key}={ref[key]}" for key in keys)
+
+
+def _structural_field_evidence(
+    value: Any,
+    raw_value: Any,
+    row_source: dict[str, Any],
+    source_tables: dict[str, dict[str, Any]],
+) -> tuple[list[str], list[float] | None, bool]:
+    refs = [
+        ref
+        for key in ("source_cell_refs", "source_refs")
+        for ref in (row_source.get(key) or [])
+        if isinstance(ref, dict)
+    ]
+    if not refs:
+        return [], None, False
+
+    match_keys = {key for key in (_audit_match_key(value), _audit_match_key(raw_value)) if key}
+    all_cells: list[dict[str, Any]] = []
+    matched_cells: list[dict[str, Any]] = []
+    for ref in refs:
+        table = source_tables.get(str(ref.get("table_id") or ""))
+        if table is None:
+            continue
+        row = _source_table_row(table, ref.get("row"))
+        if row is None:
+            continue
+        cells = [cell for cell in row.get("cells") or [] if isinstance(cell, dict)]
+        if ref.get("col") not in (None, ""):
+            try:
+                column = int(ref["col"])
+            except (TypeError, ValueError):
+                column = -1
+            column_cells: list[dict[str, Any]] = []
+            for cell in cells:
+                try:
+                    cell_column = int(cell.get("col_index", -1))
+                except (TypeError, ValueError):
+                    continue
+                if cell_column == column:
+                    column_cells.append(cell)
+            cells = column_cells
+        all_cells.extend(cells)
+        matched_cells.extend(cell for cell in cells if _audit_match_key(cell.get("text")) in match_keys)
+
+    selected_cells = matched_cells or all_cells
+    evidence_ids = list(
+        dict.fromkeys(
+            str(evidence_id)
+            for cell in selected_cells
+            for evidence_id in (cell.get("evidence_ids") or cell.get("token_ids") or [])
+            if evidence_id
+        )
+    )
+    if not evidence_ids:
+        evidence_ids = list(dict.fromkeys(token for ref in refs if (token := _source_ref_token(ref))))
+    return evidence_ids, _bbox_union(selected_cells), bool(matched_cells)
+
+
+def _field_evidence(
+    value: Any,
+    row: Any,
+    fallback_page_range: list[int],
+    *,
+    raw_value: Any = None,
+    source_tables: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     row_source = row if isinstance(row, dict) else {}
     page_range = _page_range(source, _page_range(row_source, fallback_page_range))
@@ -2024,6 +2162,17 @@ def _field_evidence(value: Any, row: Any, fallback_page_range: list[int]) -> dic
         or row_source.get("source_fact_ids")
         or ""
     )
+    if source_tables:
+        structural_evidence, structural_bbox, exact_match = _structural_field_evidence(
+            value,
+            raw_value,
+            row_source,
+            source_tables,
+        )
+        if structural_evidence and (exact_match or not evidence):
+            evidence = structural_evidence
+        if structural_bbox and (exact_match or not bbox):
+            bbox = structural_bbox
     return {
         "page_start": page_range[0] if page_range else "",
         "page_end": page_range[-1] if page_range else "",

@@ -191,6 +191,48 @@ def test_validator_detects_audit_record_loss(tmp_path: Path) -> None:
     assert "ds_transactions: 1 records missing from audit CSV" in issues
 
 
+def test_validator_requires_evidence_for_enterprise_audit_fields(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "enterprise_evidence_loss")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    semantic_path = community_path.parent / payload["files"]["semantic_json"]
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    semantic["classification"]["document_type"] = "enterprise_credit_report"
+    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
+    audit_path = community_path.parent / payload["files"]["dataset_audit_csv"]
+    with audit_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    rows[0]["evidence_ref"] = "[]"
+    with audit_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any("enterprise field missing evidence_ref" in issue for issue in issues)
+
+
+def test_validator_requires_every_enterprise_field_in_audit_csv(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "enterprise_field_loss")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    semantic_path = community_path.parent / payload["files"]["semantic_json"]
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    semantic["classification"]["document_type"] = "enterprise_credit_report"
+    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
+    audit_path = community_path.parent / payload["files"]["dataset_audit_csv"]
+    with audit_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    kept = [row for row in rows if not (row["record_id"] == "txn:001" and row["field_key"] == "amount")]
+    with audit_path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(kept)
+
+    issues = validate_community_artifacts(community_path)
+
+    assert "ds_transactions: 1 enterprise fields missing from audit CSV" in issues
+
+
 def test_validator_accepts_reserved_reconciliation_audit_rows(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "reconciliation_audit")
     payload = json.loads(community_path.read_text(encoding="utf-8"))
