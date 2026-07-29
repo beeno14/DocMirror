@@ -13,7 +13,22 @@ from docmirror.plugins.credit_report.contracts import (
     CONTENT_MODE_NATIVE,
     CONTENT_MODE_SCANNED,
 )
+from docmirror.plugins.credit_report.currency_codes import CURRENCY_CODE_BY_ALIAS
 from docmirror.plugins.credit_report.value_utils import compact_text as _compact
+
+_INSTITUTION_INQUIRY_SECTION = "机构查询记录明细"
+_PERSONAL_INQUIRY_SECTION = "个人查询记录明细"
+_INQUIRY_SECTION_END = "说明"
+_INQUIRY_ROW_RE = re.compile(
+    r"^(?P<sequence>\d{1,4})(?P<date>20\d{2}年\d{1,2}月\d{1,2}日)"
+)
+_PERSONAL_ACCOUNT_SOURCES = frozenset(
+    {
+        "personal_brief_narrative",
+        "personal_brief_account_narrative",
+    }
+)
+_PERSONAL_INQUIRY_SOURCE = "personal_brief_inquiry_ledger"
 
 
 def _date_anchors(value: Any) -> list[str]:
@@ -82,6 +97,23 @@ def _node_payloads(parse_result: Any) -> tuple[list[dict[str, Any]], dict[str, d
     return payloads, by_id
 
 
+def _ordered_node_payloads(
+    parse_result: Any,
+    nodes: list[dict[str, Any]],
+    nodes_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    graph = getattr(parse_result, "document_flow", None)
+    reading_flows = list(getattr(graph, "reading_flow", None) or [])
+    if not reading_flows:
+        return nodes
+    ordered = [
+        nodes_by_id[str(node_id)]
+        for node_id in (getattr(reading_flows[0], "node_ids", None) or [])
+        if str(node_id) in nodes_by_id
+    ]
+    return ordered or nodes
+
+
 def _referenced_node_ids(refs: list[Any]) -> list[str]:
     ids: list[str] = []
     for ref in refs:
@@ -91,20 +123,260 @@ def _referenced_node_ids(refs: list[Any]) -> list[str]:
     return list(dict.fromkeys(ids))
 
 
+def _record_values(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = record.get("normalized")
+    return {**record, **(normalized if isinstance(normalized, dict) else {})}
+
+
+def _semantic_text(value: Any) -> str:
+    return _compact(value).replace("(", "（").replace(")", "）")
+
+
+def _subsequence_coverage(needle: str, haystack: str) -> int:
+    if not needle:
+        return 0
+    position = 0
+    for character in haystack:
+        if position < len(needle) and character == needle[position]:
+            position += 1
+    return position
+
+
+def _claims_covered(claims: list[str], nodes: list[dict[str, Any]]) -> bool:
+    text = "".join(_semantic_text(node["text"]) for node in nodes)
+    return all(_subsequence_coverage(claim, text) == len(claim) for claim in claims if claim)
+
+
+def _minimal_claim_nodes(
+    anchor: dict[str, Any],
+    tail: list[dict[str, Any]],
+    claims: list[str],
+) -> list[dict[str, Any]]:
+    selected = [anchor]
+    current_text = _semantic_text(anchor["text"])
+    current_score = sum(_subsequence_coverage(claim, current_text) for claim in claims)
+    for node in tail:
+        candidate_text = current_text + _semantic_text(node["text"])
+        candidate_score = sum(_subsequence_coverage(claim, candidate_text) for claim in claims)
+        if candidate_score > current_score:
+            selected.append(node)
+            current_text = candidate_text
+            current_score = candidate_score
+    return selected if _claims_covered(claims, selected) else []
+
+
+def _inquiry_section_rows(
+    nodes: list[dict[str, Any]],
+    inquiry_type: str,
+) -> list[list[dict[str, Any]]]:
+    start_marker = _PERSONAL_INQUIRY_SECTION if inquiry_type == "personal" else _INSTITUTION_INQUIRY_SECTION
+    end_markers = (
+        (_INQUIRY_SECTION_END,)
+        if inquiry_type == "personal"
+        else (_PERSONAL_INQUIRY_SECTION, _INQUIRY_SECTION_END)
+    )
+    section_start = next(
+        (index for index, node in enumerate(nodes) if start_marker in _semantic_text(node["text"])),
+        -1,
+    )
+    if section_start < 0:
+        return []
+    section_end = next(
+        (
+            index
+            for index, node in enumerate(nodes[section_start + 1 :], start=section_start + 1)
+            if any(_semantic_text(node["text"]).startswith(marker) for marker in end_markers)
+        ),
+        len(nodes),
+    )
+    starts = [
+        index
+        for index in range(section_start + 1, section_end)
+        if _INQUIRY_ROW_RE.match(_semantic_text(nodes[index]["text"]))
+    ]
+    return [
+        nodes[start : starts[index + 1] if index + 1 < len(starts) else section_end]
+        for index, start in enumerate(starts)
+    ]
+
+
+def _personal_inquiry_evidence(
+    record: dict[str, Any],
+    nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    values = _record_values(record)
+    inquiry_type = str(values.get("inquiry_type") or "")
+    if inquiry_type not in {"institution", "personal"}:
+        return []
+    sequence = values.get("sequence")
+    date_anchors = _date_anchors(values.get("inquiry_date"))
+    institution = _semantic_text(values.get("institution"))
+    reason = _semantic_text(values.get("source_reason") or values.get("reason"))
+    if sequence in (None, "") or not date_anchors or not institution or not reason:
+        return []
+
+    for row in _inquiry_section_rows(nodes, inquiry_type):
+        anchor_text = _semantic_text(row[0]["text"])
+        if not any(anchor_text.startswith(f"{sequence}{date_anchor}") for date_anchor in date_anchors):
+            continue
+        chosen = _minimal_claim_nodes(row[0], row[1:], [institution, reason])
+        if chosen:
+            return chosen
+    return []
+
+
+def _number_anchor(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace(",", "").replace("，", "")
+    return text[:-2] if text.endswith(".0") else text
+
+
+def _account_currency_anchors(code: Any) -> tuple[str, ...]:
+    normalized = str(code or "").upper()
+    aliases = [alias for alias, target in CURRENCY_CODE_BY_ALIAS.items() if target == normalized]
+    return tuple(dict.fromkeys([*(f"{alias}账户" for alias in aliases), normalized]))
+
+
+def _account_candidate_matches(record: dict[str, Any], nodes: list[dict[str, Any]]) -> bool:
+    values = _record_values(record)
+    text = _semantic_text("".join(node["text"] for node in nodes))
+    numeric_text = text.replace(",", "").replace("，", "")
+    date_anchors = _date_anchors(values.get("open_date"))
+    institution = _semantic_text(values.get("institution") or values.get("management_institution"))
+    if not date_anchors or not any(anchor in text for anchor in date_anchors):
+        return False
+    if institution and institution not in text:
+        return False
+    if "发放的" not in text and "贷款授信" not in text:
+        return False
+
+    currency = str(values.get("currency") or "").upper()
+    account_type = str(values.get("account_type") or "")
+    if currency and (currency != "CNY" or account_type == "credit_card"):
+        currency_anchors = _account_currency_anchors(currency)
+        if not currency_anchors or not any(anchor in text for anchor in currency_anchors):
+            return False
+    card_tail = _semantic_text(values.get("card_tail"))
+    if card_tail and card_tail not in text:
+        return False
+    primary_amount = next(
+        (
+            _number_anchor(values.get(key))
+            for key in ("credit_limit", "loan_amount")
+            if values.get(key) not in (None, "")
+        ),
+        "",
+    )
+    if primary_amount and primary_amount not in numeric_text:
+        return False
+    return True
+
+
+def _record_pages(refs: list[dict[str, Any]]) -> set[int]:
+    return {
+        int(ref.get("page") or ref.get("logical_page") or 0)
+        for ref in refs
+        if int(ref.get("page") or ref.get("logical_page") or 0) > 0
+    }
+
+
+def _personal_account_evidence(
+    record: dict[str, Any],
+    refs: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    pages = _record_pages(refs)
+    candidates = [node for node in nodes if not pages or node["page"] in pages]
+    matches = [[node] for node in candidates if _account_candidate_matches(record, [node])]
+    if matches:
+        return matches[0]
+
+    for width in range(2, 7):
+        for index in range(0, len(candidates) - width + 1):
+            window = candidates[index : index + width]
+            if window[-1]["page"] - window[0]["page"] > 1:
+                continue
+            if _account_candidate_matches(record, window):
+                return window
+    if pages:
+        return _personal_account_evidence(record, [], nodes)
+    return []
+
+
+def _is_authoritative_personal_record(collection: str, record: dict[str, Any]) -> bool:
+    source = str(record.get("source") or "")
+    return (
+        collection in {"credit_accounts", "overdue_records"}
+        and source in _PERSONAL_ACCOUNT_SOURCES
+    ) or (collection == "inquiry_records" and source == _PERSONAL_INQUIRY_SOURCE)
+
+
+def _attach_record_evidence(
+    record: dict[str, Any],
+    refs: list[dict[str, Any]],
+    chosen: list[dict[str, Any]],
+) -> list[str]:
+    if not chosen:
+        record["source_refs"] = refs
+        return []
+    target = refs[0]
+    target.pop("node_id", None)
+    target["node_ids"] = [node["node_id"] for node in chosen]
+    if len(chosen) == 1:
+        target["node_id"] = chosen[0]["node_id"]
+    if chosen[0]["bbox"]:
+        target["bbox"] = chosen[0]["bbox"]
+    evidence_ids = list(
+        dict.fromkeys(
+            [
+                *(str(value) for value in (record.get("evidence_ids") or []) if value),
+                *(value for node in chosen for value in node["evidence_ids"]),
+            ]
+        )
+    )
+    if evidence_ids:
+        target["evidence_ids"] = evidence_ids
+        record["evidence_ids"] = evidence_ids
+    record["source_refs"] = refs
+    return evidence_ids
+
+
 def enrich_credit_report_record_evidence(
     parse_result: Any,
     collections: dict[str, list[dict[str, Any]]],
 ) -> tuple[str, ...]:
     """Attach canonical source nodes, bboxes, and atom IDs to plugin records."""
     nodes, nodes_by_id = _node_payloads(parse_result)
+    ordered_nodes = _ordered_node_payloads(parse_result, nodes, nodes_by_id)
     all_evidence_ids: list[str] = []
-    for records in collections.values():
+    personal_accounts: dict[str, list[dict[str, Any]]] = {}
+    for collection, records in collections.items():
         for record in records:
             refs = [dict(ref) for ref in (record.get("source_refs") or []) if isinstance(ref, dict)]
             if not refs:
                 refs = [{"source": str(record.get("source") or "credit_business_projection")}]
                 if record.get("page"):
                     refs[0]["page"] = record["page"]
+            if _is_authoritative_personal_record(collection, record):
+                if collection == "inquiry_records":
+                    chosen = _personal_inquiry_evidence(record, ordered_nodes)
+                elif collection == "overdue_records":
+                    account_id = str(_record_values(record).get("account_id") or "")
+                    chosen = personal_accounts.get(account_id, [])
+                    if not chosen:
+                        chosen = _personal_account_evidence(record, refs, ordered_nodes)
+                    overdue_id = str(_record_values(record).get("overdue_id") or "")
+                    if overdue_id:
+                        record["record_id"] = overdue_id
+                else:
+                    chosen = _personal_account_evidence(record, refs, ordered_nodes)
+                    account_id = str(_record_values(record).get("account_id") or "")
+                    if account_id and chosen:
+                        personal_accounts[account_id] = chosen
+                all_evidence_ids.extend(_attach_record_evidence(record, refs, chosen))
+                continue
             referenced_ids = _referenced_node_ids(refs)
             chosen = [nodes_by_id[node_id] for node_id in referenced_ids if node_id in nodes_by_id]
             if not chosen:
