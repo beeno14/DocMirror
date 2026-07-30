@@ -698,9 +698,18 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     payload = bundle.json_payload(semantic)
     enhanced = bundle.render_enhanced_markdown(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
     accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
     credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
-    public_records = [row["normalized"] for row in datasets["public_records"]["rows"]]
+    typed_public_datasets = {
+        name: dataset
+        for name, dataset in semantic_datasets.items()
+        if name.startswith("enterprise_public_") and name.endswith("_records")
+    }
+    dataset_names = [dataset["name"] for dataset in payload["datasets"]]
+    public_section = next(
+        section for section in payload["sections"] if section["type"] == "public_records"
+    )
     facts = semantic["domain"]["facts"]
 
     assert len(accounts) == 9
@@ -715,19 +724,82 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         credit_lines[0]["facility_limit"],
     ) == ("500", "100", "400")
     assert credit_lines[0]["limit_identifier"] == "N101W1100H0051239548"
+    assert set(payload) == {
+        "schema",
+        "document",
+        "sections",
+        "datasets",
+        "reading",
+        "files",
+        "warnings",
+    }
+    assert "public_records" not in semantic
+    assert "public_records" not in datasets
+    assert dataset_names == [
+        name
+        for name in semantic["domain"]["extensions"]["dataset_document_order"]
+        if name in datasets
+    ]
+    assert dataset_names.index("enterprise_current_credit_summary") < dataset_names.index(
+        "enterprise_facility_summary"
+    ) < dataset_names.index("enterprise_closed_credit_summary")
+    assert dataset_names.index("enterprise_profile_fields") < dataset_names.index(
+        "enterprise_capital_summary"
+    ) < dataset_names.index("enterprise_stakeholders") < dataset_names.index(
+        "enterprise_relationships"
+    )
+    credit_detail_order = [
+        name
+        for name in (
+            "credit_accounts",
+            "enterprise_displayed_credit_summary",
+            "credit_lines",
+        )
+        if name in datasets
+    ]
+    assert [name for name in dataset_names if name in credit_detail_order] == credit_detail_order
+    assert dataset_names[-1] == "enterprise_extraction_audit"
     assert {
-        "tax_arrears",
-        "civil_judgment",
-        "enforcement",
-        "administrative_penalty",
-        "license",
-        "certification",
-        "qualification",
-        "patent",
-        "subject_statement",
-        "dispute_annotation",
-    } <= {record["record_type"] for record in public_records}
-    assert len(public_records) == 20
+        f"enterprise_public_{record_type}_records"
+        for record_type in (
+            "tax_arrears",
+            "civil_judgment",
+            "enforcement",
+            "administrative_penalty",
+            "license",
+            "certification",
+            "qualification",
+            "patent",
+            "subject_statement",
+            "dispute_annotation",
+        )
+    } <= set(typed_public_datasets)
+    assert sum(dataset["row_count"] for dataset in typed_public_datasets.values()) == 20
+    assert typed_public_datasets["enterprise_public_license_records"]["label"] == "行政许可记录"
+    assert typed_public_datasets["enterprise_public_certification_records"]["label"] == "认证记录"
+    assert all(
+        dataset["section_id"] == public_section["id"]
+        for dataset in typed_public_datasets.values()
+    )
+    assert {
+        dataset["id"] for dataset in typed_public_datasets.values()
+    } <= set(public_section["dataset_refs"])
+    assert public_section["items"] == []
+    assert public_section["groups"] == []
+    assert set(public_section["dataset_refs"]) == {
+        dataset["id"] for dataset in typed_public_datasets.values()
+    }
+    assert all(
+        "content" not in row["normalized"]
+        for dataset in typed_public_datasets.values()
+        for row in dataset["rows"]
+    )
+    assert all(
+        set(row["normalized"])
+        <= {column["key"] for column in dataset["columns"]}
+        for dataset in typed_public_datasets.values()
+        for row in dataset["rows"]
+    )
     assert facts["credit_summary"]["reported_account_count"] == 28
     assert facts["credit_summary"]["account_population_comparable"] is False
     assert datasets["credit_accounts"]["completeness"]["basis"] == "emitted_records_only"
@@ -744,6 +816,24 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert datasets["enterprise_credit_supplement"]["row_count"] == 3
     assert datasets["enterprise_attachment_credit_details"]["row_count"] == 10
     assert datasets["enterprise_special_transactions"]["row_count"] == 2
+    assert {
+        column["key"]
+        for column in semantic_datasets["enterprise_public_license_records"]["columns"]
+    } == {
+        "sequence",
+        "public_record_id",
+        "licensing_authority",
+        "license_type",
+        "license_date",
+        "license_expiry_date",
+        "license_content",
+        "source_page",
+        "source_table_id",
+    }
+    assert not any(
+        column["key"].startswith("license_")
+        for column in semantic_datasets["enterprise_public_certification_records"]["columns"]
+    )
     audit_rows = [row["normalized"] for row in datasets["enterprise_extraction_audit"]["rows"]]
     assert all(row["reconciliation_status"] == "complete" for row in audit_rows)
     assert all(row["unresolved_record_count"] == 0 for row in audit_rows)
@@ -769,15 +859,17 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         "dispute_annotation",
     }
     assert not any(token in enhanced for token in public_record_tokens)
-    public_record_table = enhanced.split("### 公共记录\n", maxsplit=1)[1].split(
-        "\n## ",
-        maxsplit=1,
-    )[0]
-    assert "| 序号 | 记录类型 | 主管/发布机构 | 记录类别 | 生效/发生日期 | 截止日期 | 记录内容 |" in public_record_table
-    assert public_record_table.count("\n| ") == len(public_records) + 2
-    assert "| 许可记录 |" in public_record_table
-    assert "| 认证记录 |" in public_record_table
-    assert "#### " not in public_record_table
+    public_heading = f"## {public_section['title']}\n"
+    assert public_heading in enhanced
+    before_public, public_and_after = enhanced.split(public_heading, maxsplit=1)
+    public_preview = public_and_after.split("\n## ", maxsplit=1)[0]
+    assert "### 行政许可记录" not in before_public
+    assert "### 认证记录" not in before_public
+    assert "### 行政许可记录" in public_preview
+    assert "### 认证记录" in public_preview
+    assert "| 序号 | 记录类型 | 记录内容 |" not in enhanced
+    assert "| 序号 | 许可部门 | 许可类型 | 许可日期 | 截止日期 | 许可内容 |" in enhanced
+    assert "| 序号 | 认证部门 | 认证类型 | 认证日期 | 截止日期 | 认证内容 |" in enhanced
     assert "#### 账户 借贷交易" not in enhanced
     assert "#### 账户 担保交易" not in enhanced
 

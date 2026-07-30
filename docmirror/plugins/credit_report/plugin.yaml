@@ -46,6 +46,25 @@ projection:
     enterprise_credit_supplement: 信用记录补充信息
     enterprise_attachment_credit_details: 附件信贷明细
     enterprise_special_transactions: 特定交易提示
+    enterprise_public_utility_payment_records: 公用事业缴费记录
+    enterprise_public_tax_arrears_records: 欠税记录
+    enterprise_public_civil_judgment_records: 民事判决记录
+    enterprise_public_enforcement_records: 强制执行记录
+    enterprise_public_administrative_penalty_records: 行政处罚记录
+    enterprise_public_social_security_payment_records: 社会保障及住房公积金缴费记录
+    enterprise_public_license_records: 行政许可记录
+    enterprise_public_certification_records: 认证记录
+    enterprise_public_qualification_records: 资质认定记录
+    enterprise_public_award_records: 行政奖励记录
+    enterprise_public_export_quality_records: 出口商品质量记录
+    enterprise_public_inspection_exemption_records: 免验商品记录
+    enterprise_public_regulatory_supervision_records: 监管记录
+    enterprise_public_patent_records: 专利记录
+    enterprise_public_financing_restriction_records: 融资限制记录
+    enterprise_public_data_provider_statement_records: 数据提供机构说明
+    enterprise_public_credit_bureau_statement_records: 征信中心说明
+    enterprise_public_subject_statement_records: 信息主体声明
+    enterprise_public_dispute_annotation_records: 异议标注
   summary_facts:
     credit_summary: credit_summary
     non_credit_transaction_summary: non_credit_transactions
@@ -94,6 +113,25 @@ projection:
     enterprise_credit_supplement: [credit_supplement]
     enterprise_attachment_credit_details: [credit_supplement]
     enterprise_special_transactions: [credit_supplement]
+    enterprise_public_utility_payment_records: [public_records]
+    enterprise_public_tax_arrears_records: [public_records]
+    enterprise_public_civil_judgment_records: [public_records]
+    enterprise_public_enforcement_records: [public_records]
+    enterprise_public_administrative_penalty_records: [public_records]
+    enterprise_public_social_security_payment_records: [public_records]
+    enterprise_public_license_records: [public_records]
+    enterprise_public_certification_records: [public_records]
+    enterprise_public_qualification_records: [public_records]
+    enterprise_public_award_records: [public_records]
+    enterprise_public_export_quality_records: [public_records]
+    enterprise_public_inspection_exemption_records: [public_records]
+    enterprise_public_regulatory_supervision_records: [public_records]
+    enterprise_public_patent_records: [public_records]
+    enterprise_public_financing_restriction_records: [public_records]
+    enterprise_public_data_provider_statement_records: [public_records]
+    enterprise_public_credit_bureau_statement_records: [public_records]
+    enterprise_public_subject_statement_records: [public_records]
+    enterprise_public_dispute_annotation_records: [public_records]
   section_type_markers:
     信息概要: credit_summary
     基本信息: basic_information

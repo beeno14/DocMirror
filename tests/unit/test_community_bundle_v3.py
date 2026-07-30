@@ -18,7 +18,13 @@ from docmirror.models.entities.parse_result import (
 )
 from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.models.sealed import seal_parse_result
-from docmirror.output.community_bundle import project_community_bundle as _project_community_bundle
+from docmirror.output.community_bundle import (
+    _dataset_section_id,
+    render_community_reading_markdown,
+)
+from docmirror.output.community_bundle import (
+    project_community_bundle as _project_community_bundle,
+)
 from docmirror.plugins._base.projector import load_projection_policy
 
 _PROJECTIONS: dict[int, dict] = {}
@@ -164,6 +170,113 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
     assert payload["reading"]["profile"] == "community"
     assert payload["reading"]["tables"][0]["dataset_id"] == payload["datasets"][0]["id"]
     assert validate_projection_payload("community", payload).valid
+    duplicated_payload = dict(payload)
+    duplicated_payload["public_records"] = {}
+    assert not validate_projection_payload("community", duplicated_payload).valid
+    duplicated_semantic = dict(semantic)
+    duplicated_semantic["public_records"] = {}
+    assert not validate_projection_payload(
+        "community_semantic",
+        duplicated_semantic,
+    ).valid
+
+
+def test_dataset_section_fallback_uses_first_source_page() -> None:
+    sections = [
+        {"id": "sec_report", "type": "report_metadata", "page_range": [1, 1]},
+        {"id": "sec_public", "type": "public_records", "page_range": [6, 6]},
+        {"id": "sec_supplement", "type": "credit_supplement", "page_range": [8, 8]},
+    ]
+    data = {
+        "enterprise_public_unconfigured_records": [
+            {"source_page": 7},
+            {"source_page": 6},
+        ]
+    }
+
+    assert (
+        _dataset_section_id(
+            data,
+            "enterprise_public_unconfigured_records",
+            sections,
+            {},
+        )
+        == "sec_public"
+    )
+
+
+def test_dataset_document_order_is_applied_only_when_configured() -> None:
+    candidate = _candidate()
+    candidate["data"]["first_records"] = [{"value": "first"}]
+    candidate["data"]["second_records"] = [{"value": "second"}]
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "dataset_document_order": ["second_records", "first_records"],
+    }
+
+    payload = project_community_bundle(result).json_payload()
+
+    assert [dataset["name"] for dataset in payload["datasets"]] == [
+        "second_records",
+        "first_records",
+    ]
+
+
+def test_enhanced_markdown_omits_sections_without_renderable_content() -> None:
+    payload = {
+        "schema": {"name": "docmirror.community"},
+        "document": {"id": "doc_empty_section", "title": "测试报告", "type": "generic"},
+        "domain": {
+            "extensions": {
+                "enhanced_markdown": {
+                    "suppress_empty_sections": True,
+                }
+            }
+        },
+        "sections": [
+            {
+                "id": "sec_empty",
+                "title": "空章节",
+                "type": "empty",
+                "items": [],
+                "groups": [],
+                "dataset_refs": [],
+            },
+            {
+                "id": "sec_data",
+                "title": "有内容章节",
+                "type": "details",
+                "items": [
+                    {
+                        "key": "status",
+                        "label": "状态",
+                        "value": "正常",
+                        "type": "string",
+                    }
+                ],
+                "groups": [],
+                "dataset_refs": [],
+            },
+        ],
+        "datasets": [],
+        "reading": {
+            "document_flow": [
+                {"order": 1, "kind": "document", "ref_id": "doc_empty_section"},
+                {"order": 2, "kind": "section", "ref_id": "sec_empty"},
+                {"order": 3, "kind": "section", "ref_id": "sec_data"},
+            ],
+            "tables": [],
+        },
+    }
+
+    enhanced = render_community_reading_markdown(payload)
+
+    assert "## 空章节" not in enhanced
+    assert "## 有内容章节" in enhanced
+    assert "**状态:** 正常" in enhanced
 
 
 def test_semantic_extension_can_override_dataset_reading_columns() -> None:

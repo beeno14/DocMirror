@@ -149,6 +149,37 @@ def test_validator_detects_reading_model_dataset_divergence(tmp_path: Path) -> N
     assert any("reading.document_flow: missing datasets=" in issue for issue in issues)
 
 
+def test_validator_rejects_misrouted_english_enterprise_public_dataset(
+    tmp_path: Path,
+) -> None:
+    community_path = _write_bundle(tmp_path, "enterprise_public_routing")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    dataset = payload["datasets"][0]
+    dataset["name"] = "enterprise_public_license_records"
+    dataset["label"] = "enterprise public license records"
+    dataset["rows"][0]["normalized"]["content"] = "duplicated generic content"
+    payload["reading"]["tables"][0]["section_id"] = "sec_wrong"
+    payload["public_records"] = {"license_records": []}
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any(
+        "enterprise public dataset must belong to a public_records section" in issue
+        for issue in issues
+    )
+    assert any(
+        "enterprise public dataset label must be Chinese" in issue
+        for issue in issues
+    )
+    assert any(
+        "reading table section_id=sec_wrong" in issue
+        for issue in issues
+    )
+    assert any("generic public-record keys=['content']" in issue for issue in issues)
+    assert any("community: top-level blocks=" in issue for issue in issues)
+
+
 def test_validator_detects_semantic_dataset_divergence(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "semantic_dataset_divergence")
     payload = json.loads(community_path.read_text(encoding="utf-8"))

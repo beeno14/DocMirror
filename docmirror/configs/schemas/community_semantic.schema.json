@@ -5,6 +5,7 @@
   "description": "Public post-seal semantic document consumed by Community renderers.",
   "type": "object",
   "additionalProperties": true,
+  "not": {"required": ["public_records"]},
   "required": [
     "schema",
     "source",

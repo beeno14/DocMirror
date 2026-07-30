@@ -13,6 +13,8 @@ from docmirror.plugins.credit_report.enterprise_native.extraction import (
     extract_enterprise_accounts_from_tables,
     extract_enterprise_attachment_datasets,
     extract_enterprise_continuation_audit,
+    extract_enterprise_public_record_datasets,
+    extract_enterprise_public_records_from_tables,
 )
 
 
@@ -298,6 +300,64 @@ def test_enterprise_accounts_keep_short_ids_and_append_settled_page_suffix() -> 
     assert [record["loan_amount"] for record in accounts] == [490, 200, 31]
 
 
+def test_enterprise_account_recovers_header_only_page_then_shifted_settled_rows() -> None:
+    result = _result(
+        (
+            5,
+            [
+                _table(
+                    "settled_header_only",
+                    [
+                        ["短期借款", "已结清 共1笔", "", "", "", "", ""],
+                        [
+                            "账户编号",
+                            "授信机构",
+                            "业务种类",
+                            "开立日期",
+                            "到期日",
+                            "币种",
+                            "借款金额",
+                        ],
+                    ],
+                )
+            ],
+        ),
+        (
+            6,
+            [
+                _table(
+                    "settled_shifted_body",
+                    [
+                        ["", "关闭日期", "五级分类", "最后一次还款日期", "", "最后一次还款形式", "", "历史表现"],
+                        [
+                            "B10611000H00011811138121928001",
+                            "中信银行",
+                            "流动资金贷款",
+                            "2024-08-10",
+                            "2025-08-09",
+                            "",
+                            "人民币元",
+                            "1000",
+                        ],
+                        ["", "2025-08-09", "正常", "2025-08-09", "", "正常还款", "", "见附件"],
+                    ],
+                )
+            ],
+        ),
+    )
+
+    accounts = extract_enterprise_accounts_from_tables(result)
+
+    assert len(accounts) == 1
+    assert accounts[0]["account_identifier"] == "B10611000H00011811138121928001"
+    assert accounts[0]["account_status"] == "settled"
+    assert accounts[0]["loan_amount"] == 1000
+    assert accounts[0]["currency"] == "CNY"
+    assert accounts[0]["close_date"] == "2025-08-09"
+    assert accounts[0]["five_tier_class"] == "正常"
+    assert [ref["page"] for ref in accounts[0]["source_refs"]] == [5, 6, 6]
+
+
 def test_enterprise_account_maps_issuance_form_and_validates_legacy_dates() -> None:
     result = _result(
         (
@@ -575,6 +635,244 @@ def test_attachment_detail_pairs_double_headers_with_double_data_rows() -> None:
     assert not_reported["credit_agreement_identifier"] == ""
     assert not_reported["credit_agreement_status"] == "not_reported"
     assert not_reported["snapshot_date"] == "2025-05-13"
+
+
+def test_attachment_detail_keeps_schema_across_headerless_final_page() -> None:
+    result = _flow_result(
+        (
+            12,
+            [
+                _text("附件", 0),
+                _text("银行承兑汇票和信用证的信贷明细", 10),
+                _text("2.已结清业务", 20),
+            ],
+            [
+                _table(
+                    "settled_acceptance_header_and_body",
+                    [
+                        ["账户编号", "开立日期", "到期日", "币种", "金额", "关闭日期", "垫款标志"],
+                        [
+                            "B11115840H0001B24010140000001",
+                            "2024-01-01",
+                            "2024-06-01",
+                            "人民币元",
+                            "100",
+                            "2024-06-01",
+                            "否",
+                        ],
+                        [
+                            "B11115840H0001B24010240000002",
+                            "2024-01-02",
+                            "2024-06-02",
+                            "人民币元",
+                            "200",
+                            "2024-06-02",
+                            "否",
+                        ],
+                    ],
+                )
+            ],
+        ),
+        (
+            13,
+            [],
+            [
+                _table(
+                    "settled_acceptance_headerless_body",
+                    [
+                        [
+                            "B11115840H0001B24010340000003",
+                            "2024-01-03",
+                            "2024-06-03",
+                            "人民币元",
+                            "300",
+                            "2024-06-03",
+                            "否",
+                        ]
+                    ],
+                )
+            ],
+        ),
+    )
+
+    datasets = extract_enterprise_attachment_datasets(result)
+    details = datasets["enterprise_attachment_credit_details"]
+
+    assert [record["account_identifier"] for record in details] == [
+        "B11115840H0001B24010140000001",
+        "B11115840H0001B24010240000002",
+        "B11115840H0001B24010340000003",
+    ]
+    assert [record["source_page"] for record in details] == [12, 12, 13]
+    assert all(record["account_status"] == "settled" for record in details)
+
+
+def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
+    result = _result(
+        (
+            6,
+            [
+                _table(
+                    "housing_fund",
+                    [
+                        [
+                            "统计年月：2021-06",
+                            "初缴年月：2021-02",
+                            "职工人数：3",
+                            "缴费基数（元）：9,040",
+                            "最近一次缴费日期：2021-06-28",
+                            "缴至年月：2021-06",
+                            "缴费状态：正常缴费",
+                            "累计欠费金额（元）：0",
+                        ]
+                    ],
+                ),
+                _table(
+                    "license",
+                    [
+                        ["许可部门", "许可类型", "许可日期", "截止日期", "许可内容"],
+                        ["南京市行政审批局", "登记", "2024-01-11", "2099-12-31", "登字"],
+                    ],
+                ),
+            ],
+        )
+    )
+
+    housing, license_record = extract_enterprise_public_records_from_tables(result)
+
+    assert housing["record_type"] == "social_security_payment"
+    assert housing["statistics_month"] == "2021-06"
+    assert housing["employee_count"] == 3
+    assert housing["contribution_base"] == 9040
+    assert housing["last_contribution_date"] == "2021-06-28"
+    assert housing["cumulative_arrears"] == 0
+    assert housing["attributes"]["payment_status"] == "正常缴费"
+    assert housing["details"]["初缴年月"] == "2021-02"
+    assert license_record["licensing_authority"] == "南京市行政审批局"
+    assert license_record["license_date"] == "2024-01-11"
+    assert license_record["license_content"] == "登字"
+
+
+def test_public_records_are_projected_as_lossless_source_chart_datasets() -> None:
+    result = _result(
+        (
+            6,
+            [
+                _table(
+                    "housing_fund",
+                    [
+                        [
+                            "统计年月：2021-06",
+                            "初缴年月：2021-02",
+                            "职工人数：3",
+                            "缴费基数（元）：9,040",
+                            "最近一次缴费日期：2021-06-28",
+                            "缴至年月：2021-06",
+                            "缴费状态：正常缴费",
+                            "累计欠费金额（元）：0",
+                        ]
+                    ],
+                ),
+                _table(
+                    "license",
+                    [
+                        ["许可部门", "许可类型", "许可日期", "截止日期", "许可内容"],
+                        ["南京市行政审批局", "登记", "2024-01-11", "2099-12-31", "登字"],
+                    ],
+                ),
+            ],
+        ),
+        (
+            7,
+            [
+                _table(
+                    "certification",
+                    [
+                        ["认证部门", "认证类型", "认证日期", "截止日期", "认证内容"],
+                        ["国家税务总局", "纳税信用A级纳税人", "--", "2030-12-31", "2024年度"],
+                    ],
+                )
+            ],
+        ),
+    )
+
+    datasets = extract_enterprise_public_record_datasets(result)
+
+    assert list(datasets) == [
+        "enterprise_public_social_security_payment_records",
+        "enterprise_public_license_records",
+        "enterprise_public_certification_records",
+    ]
+    assert datasets["enterprise_public_social_security_payment_records"][0][
+        "contribution_base"
+    ] == 9040
+    license_record = datasets["enterprise_public_license_records"][0]
+    assert set(license_record) == {
+        "public_record_id",
+        "sequence",
+        "licensing_authority",
+        "license_type",
+        "license_date",
+        "license_expiry_date",
+        "license_content",
+        "source_page",
+        "source_table_id",
+        "source",
+        "source_refs",
+        "confidence",
+    }
+    assert license_record["licensing_authority"] == "南京市行政审批局"
+    assert license_record["license_type"] == "登记"
+    assert license_record["license_date"] == "2024-01-11"
+    assert license_record["license_expiry_date"] == "2099-12-31"
+    assert license_record["license_content"] == "登字"
+    assert datasets["enterprise_public_certification_records"][0][
+        "certification_date"
+    ] == "--"
+
+
+def test_attachment_detail_audit_reconciles_reported_settled_business_count() -> None:
+    result = _result((1, []))
+    datasets = {
+        "enterprise_current_credit_summary": [],
+        "enterprise_closed_credit_summary": [
+            {
+                "transaction_group": "银行承兑汇票和信用证",
+                "business_category": "银行承兑汇票",
+                "total_account_count": 3,
+                "is_total": False,
+            }
+        ],
+        "enterprise_repayment_responsibility_summary": [],
+        "repayment_liability_records": [],
+        "enterprise_attachment_accounts": [
+            {
+                "attachment_record_type": "business",
+                "account_status": "settled",
+                "business_category": "银行承兑汇票和信用证",
+            }
+        ],
+        "enterprise_attachment_credit_details": [
+            {
+                "account_status": "settled",
+                "business_category": "银行承兑汇票和信用证",
+            },
+            {
+                "account_status": "settled",
+                "business_category": "银行承兑汇票和信用证",
+            },
+        ],
+    }
+
+    audits = extract_enterprise_continuation_audit(result, datasets=datasets)
+    detail_audit = next(
+        row for row in audits if row["continuation_family"] == "attachment_credit_detail"
+    )
+
+    assert detail_audit["expected_record_count"] == 3
+    assert detail_audit["extracted_record_count"] == 2
+    assert detail_audit["unresolved_record_count"] == 1
+    assert detail_audit["reconciliation_status"] == "unresolved"
 
 
 def test_continuation_audit_distinguishes_unexpected_records_without_mutating_input() -> None:

@@ -481,6 +481,31 @@ def _dataset_section_id(
             for section in sections:
                 if marker in str(section.get("type") or ""):
                     return str(section["id"])
+        source_pages = (
+            sorted(
+                {
+                    page
+                    for row in (data.get(key) or [])
+                    if isinstance(row, dict)
+                    for page in _page_range(row, [])
+                }
+            )
+            if key.startswith("enterprise_public_")
+            else []
+        )
+        if source_pages:
+            anchor_page = source_pages[0]
+            preceding_sections: list[tuple[int, int, dict[str, Any]]] = []
+            for index, section in enumerate(sections):
+                page_range = section.get("page_range") or []
+                try:
+                    start_page = int(page_range[0])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if start_page <= anchor_page:
+                    preceding_sections.append((start_page, index, section))
+            if preceding_sections:
+                return str(max(preceding_sections, key=lambda item: (item[0], item[1]))[2]["id"])
         return str(sections[0]["id"])
     return ""
 
@@ -802,10 +827,27 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             item = items.get(str(spec["fallback"]))
         return item
 
+    def section_has_renderable_content(
+        section: dict[str, Any],
+        layout: dict[str, Any] | None,
+    ) -> bool:
+        if section.get("items") or section.get("groups") or section.get("dataset_refs"):
+            return True
+        if not isinstance(layout, dict):
+            return False
+        return any(
+            document_item(spec) is not None
+            for group_spec in layout.get("groups") or []
+            if isinstance(group_spec, dict)
+            for spec in group_spec.get("document_fields") or []
+            if isinstance(spec, dict)
+        )
+
     rendered_sections: set[str] = set()
     section_layouts = (
         presentation.get("section_layouts") if isinstance(presentation.get("section_layouts"), dict) else {}
     )
+    suppress_empty_sections = bool(presentation.get("suppress_empty_sections", False))
     dataset_layouts = (
         presentation.get("dataset_layouts") if isinstance(presentation.get("dataset_layouts"), dict) else {}
     )
@@ -820,8 +862,12 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             if section is None:
                 continue
             rendered_sections.add(ref_id)
-            parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or ref_id)}")
             layout = section_layouts.get(str(section.get("type") or ""))
+            if suppress_empty_sections and not section_has_renderable_content(
+                section, layout if isinstance(layout, dict) else None
+            ):
+                continue
+            parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or ref_id)}")
             if isinstance(layout, dict):
                 items, groups = section_pools(section)
                 rendered_item_keys: set[str] = {
@@ -1063,7 +1109,11 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
 
     for section_id, section in sections.items():
         if section_id not in rendered_sections:
-            parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or section_id)}")
+            layout = section_layouts.get(str(section.get("type") or ""))
+            if not suppress_empty_sections or section_has_renderable_content(
+                section, layout if isinstance(layout, dict) else None
+            ):
+                parts.append(f"## {_markdown_text(section.get('title') or section.get('type') or section_id)}")
 
     appendix = presentation.get("appendix") if isinstance(presentation.get("appendix"), dict) else {}
     if appendix or deferred_appendix_datasets:
@@ -2457,6 +2507,32 @@ def project_community_bundle(
             continue
         if all(isinstance(item, dict) for item in value):
             dataset_candidates.append((str(key), value))
+    configured_dataset_order = semantic_extensions.get("dataset_document_order")
+    if isinstance(configured_dataset_order, list):
+        dataset_rank = {
+            str(name): index
+            for index, name in enumerate(configured_dataset_order)
+            if str(name)
+        }
+        fallback_rank = len(dataset_rank)
+        dataset_candidates = [
+            candidate
+            for _original_index, candidate in sorted(
+                enumerate(dataset_candidates),
+                key=lambda item: (
+                    dataset_rank.get(
+                        str(
+                            (projection.get("dataset_aliases") or {}).get(
+                                item[1][0]
+                            )
+                            or item[1][0]
+                        ),
+                        fallback_rank,
+                    ),
+                    item[0],
+                ),
+            )
+        ]
     datasets: list[CommunityDataset] = []
     csv_paths: set[str] = set()
     for key, rows in dataset_candidates:

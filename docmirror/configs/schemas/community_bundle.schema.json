@@ -121,9 +121,22 @@
         "title": {"type": "string"},
         "type": {"type": "string", "minLength": 1},
         "page_range": {"$ref": "#/$defs/pageRange"},
-        "items": {"type": "array", "items": {"$ref": "#/$defs/item"}},
-        "groups": {"type": "array", "items": {"$ref": "#/$defs/group"}},
-        "dataset_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        "items": {
+          "type": "array",
+          "description": "Scalar section facts only; dataset rows must not be embedded here.",
+          "items": {"$ref": "#/$defs/item"}
+        },
+        "groups": {
+          "type": "array",
+          "description": "Grouped section facts only; dataset rows must not be embedded here.",
+          "items": {"$ref": "#/$defs/group"}
+        },
+        "dataset_refs": {
+          "type": "array",
+          "description": "References to canonical records stored in the top-level datasets array.",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
       }
     },
       "column": {
@@ -191,7 +204,7 @@
         "completeness": {"$ref": "#/$defs/completeness"},
         "rows": {
           "type": "array",
-          "description": "Complete structured records for self-contained JSON API consumers.",
+          "description": "The sole canonical storage for this dataset's complete structured records.",
           "items": {"$ref": "#/$defs/record"}
         }
       }

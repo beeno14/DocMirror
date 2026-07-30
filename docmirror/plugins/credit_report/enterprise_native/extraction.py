@@ -301,6 +301,75 @@ def _is_primary_account_row(
     )
 
 
+def _primary_account_field_indexes(
+    row: list[str],
+    *,
+    institution_index: int,
+    business_type_index: int,
+    open_date_index: int,
+    due_date_index: int,
+    currency_index: int,
+    amount_index: int,
+) -> dict[str, int] | None:
+    """Resolve one primary account row even when a page break shifts columns.
+
+    Some settled-account cards end a page after the primary header and resume
+    with a secondary header whose spacer columns alter the physical row width.
+    Prefer the declared header positions, then recover the date/currency/amount
+    positions semantically without weakening the account-card guards.
+    """
+
+    preferred = {
+        "institution": institution_index,
+        "business_type": business_type_index,
+        "open_date": open_date_index,
+        "due_date": due_date_index,
+        "currency": currency_index,
+        "amount": amount_index,
+    }
+    if _is_primary_account_row(
+        row,
+        open_date_index=open_date_index,
+        due_date_index=due_date_index,
+        amount_index=amount_index,
+    ):
+        return preferred
+
+    if len(_identifier(row[0] if row else "")) < _MIN_ENTERPRISE_ACCOUNT_IDENTIFIER_LENGTH:
+        return None
+    date_indexes = [index for index, value in enumerate(row) if _date(value)]
+    if len(date_indexes) < 2:
+        return None
+    detected_currency_index = next(
+        (
+            index
+            for index, value in enumerate(row)
+            if _compact(value) in _CURRENCY_CODES
+        ),
+        -1,
+    )
+    if detected_currency_index < 0:
+        return None
+    detected_amount_index = next(
+        (
+            index
+            for index in range(detected_currency_index + 1, len(row))
+            if _number(row[index]) is not None
+        ),
+        -1,
+    )
+    if detected_amount_index < 0:
+        return None
+    return {
+        "institution": institution_index,
+        "business_type": business_type_index,
+        "open_date": date_indexes[0],
+        "due_date": date_indexes[1],
+        "currency": detected_currency_index,
+        "amount": detected_amount_index,
+    }
+
+
 def _is_account_detail_row(row: list[str]) -> bool:
     return bool(len(row) >= 4 and _number(row[2]) is not None and row[3] in _FIVE_TIER_CLASSES)
 
@@ -356,7 +425,14 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
     currency_index = 5
     amount_index = 6
     issuance_form_index = -1
+    header_page = 0
+    header_table_id = ""
+    header_row_index = 0
     resolver = EnterpriseContinuationResolver(parse_result)
+    fragment_by_table_id = {fragment.table_id: fragment for fragment in resolver.fragments}
+    active_fragment_index = -1
+    active_fragment_page = 0
+    account_status_hint = ""
     settled_continuation_rows: set[tuple[str, int]] = set()
     for fragment in resolver.fragments:
         match = resolver.following_row(
@@ -367,6 +443,17 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
             settled_continuation_rows.add((match.fragment.table_id, match.row_index))
 
     for page, table_id, rows in _table_stream(parse_result):
+        fragment = fragment_by_table_id.get(table_id)
+        fragment_index = fragment.index if fragment is not None else -1
+
+        def follows_active_fragment() -> bool:
+            if active_fragment_index < 0 or fragment_index < 0:
+                return True
+            return (
+                fragment_index in {active_fragment_index, active_fragment_index + 1}
+                and 0 <= page - active_fragment_page <= 1
+            )
+
         for row_index, row in enumerate(rows):
             cells = [*row, *([""] * max(0, 8 - len(row)))]
             first = cells[0]
@@ -376,11 +463,20 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 category = first
                 header_seen = False
                 settled_schema = False
+                signature = "".join(cells)
+                account_status_hint = (
+                    "settled" if "已结清" in signature else "active" if "未结清" in signature else ""
+                )
+                active_fragment_index = fragment_index
+                active_fragment_page = page
                 continue
             if _is_account_header(cells):
                 _finalize_account(current, accounts)
                 current = None
                 header_seen = True
+                header_page = page
+                header_table_id = table_id
+                header_row_index = row_index
                 amount_field = "credit_limit" if any("信用额度" in cell for cell in cells) else "loan_amount"
                 institution_index = next(
                     (index for index, value in enumerate(cells) if "授信机构" in value),
@@ -413,41 +509,82 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 settled_schema = any(
                     "关闭日期" in cell for following in rows[row_index + 1 : row_index + 3] for cell in following
                 )
+                if account_status_hint == "settled":
+                    settled_schema = True
+                active_fragment_index = fragment_index
+                active_fragment_page = page
                 continue
-            if header_seen and _is_primary_account_row(
-                cells,
-                open_date_index=open_date_index,
-                due_date_index=due_date_index,
-                amount_index=amount_index,
+            if (
+                header_seen
+                and follows_active_fragment()
+                and any("关闭日期" in cell for cell in cells)
+                and any("五级分类" in cell for cell in cells)
             ):
+                settled_schema = True
+                account_status_hint = "settled"
+                active_fragment_index = fragment_index
+                active_fragment_page = page
+                continue
+            primary_indexes = (
+                _primary_account_field_indexes(
+                    cells,
+                    institution_index=institution_index,
+                    business_type_index=business_type_index,
+                    open_date_index=open_date_index,
+                    due_date_index=due_date_index,
+                    currency_index=currency_index,
+                    amount_index=amount_index,
+                )
+                if header_seen and follows_active_fragment()
+                else None
+            )
+            if primary_indexes is not None:
+                resolved_institution_index = primary_indexes["institution"]
+                resolved_business_type_index = primary_indexes["business_type"]
+                resolved_open_date_index = primary_indexes["open_date"]
+                resolved_due_date_index = primary_indexes["due_date"]
+                resolved_currency_index = primary_indexes["currency"]
+                resolved_amount_index = primary_indexes["amount"]
                 _finalize_account(current, accounts)
                 identifier = _identifier(first)
+                source_refs = [_source_ref(page, table_id, row_index)]
+                header_ref = _source_ref(header_page, header_table_id, header_row_index)
+                if header_table_id and header_ref not in source_refs:
+                    source_refs.insert(0, header_ref)
                 current = {
                     "account_id": f"credit_account:{identifier}",
                     "account_identifier": identifier,
                     "account_type": "enterprise_credit",
                     "business_category": category,
-                    "management_institution": _compact(cells[institution_index]),
-                    "business_type": _compact(cells[business_type_index]),
-                    "open_date": _date(cells[open_date_index]),
-                    "due_date": _date(cells[due_date_index]),
+                    "management_institution": _compact(cells[resolved_institution_index]),
+                    "business_type": _compact(cells[resolved_business_type_index]),
+                    "open_date": _date(cells[resolved_open_date_index]),
+                    "due_date": _date(cells[resolved_due_date_index]),
                     "currency": _CURRENCY_CODES.get(
-                        _compact(cells[currency_index]),
-                        _compact(cells[currency_index]),
+                        _compact(cells[resolved_currency_index]),
+                        _compact(cells[resolved_currency_index]),
                     ),
-                    amount_field: _number(cells[amount_index]),
+                    amount_field: _number(cells[resolved_amount_index]),
                     "amount_unit": "CNY_10K",
-                    "account_status": "settled" if settled_schema else "active",
+                    "account_status": account_status_hint or ("settled" if settled_schema else "active"),
                     "source": "canonical_enterprise_account_card",
-                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "source_refs": source_refs,
                     "confidence": 1.0,
                 }
                 if 0 <= issuance_form_index < len(cells):
                     issuance_form = _compact(cells[issuance_form_index])
                     if issuance_form not in {"", "--", "-", "—"}:
                         current["issuance_form"] = issuance_form
+                active_fragment_index = fragment_index
+                active_fragment_page = page
                 continue
-            if current and settled_schema and len(cells) >= 8 and _date(cells[1]):
+            if (
+                current
+                and current.get("account_status") == "settled"
+                and follows_active_fragment()
+                and len(cells) >= 8
+                and _date(cells[1])
+            ):
                 _append_account_identifier_suffix(
                     current,
                     first,
@@ -468,6 +605,8 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 _append_ref(current, page, table_id, row_index)
                 _finalize_account(current, accounts)
                 current = None
+                active_fragment_index = fragment_index
+                active_fragment_page = page
                 continue
             if current and _is_account_detail_row(cells):
                 _append_account_identifier_suffix(
@@ -1454,8 +1593,13 @@ def extract_enterprise_continuation_audit(
         resolved.update(extract_enterprise_summary_datasets(parse_result))
     if "repayment_liability_records" not in resolved:
         resolved["repayment_liability_records"] = extract_enterprise_repayment_liability_records(parse_result)
-    if "enterprise_attachment_accounts" not in resolved:
-        resolved.update(extract_enterprise_attachment_datasets(parse_result))
+    if (
+        "enterprise_attachment_accounts" not in resolved
+        or "enterprise_attachment_credit_details" not in resolved
+    ):
+        attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
+        for name, records in attachment_datasets.items():
+            resolved.setdefault(name, records)
     actual = {
         "current_credit_summary": len(resolved.get("enterprise_current_credit_summary") or []),
         "closed_credit_summary": len(resolved.get("enterprise_closed_credit_summary") or []),
@@ -1481,6 +1625,63 @@ def extract_enterprise_continuation_audit(
                 "confidence": 1.0,
             }
         )
+    page_text_values = tuple(_page_texts(parse_result).values())
+    detail_population_not_comparable = any(
+        ("受篇幅所限" in text and "只展示部分信贷记录" in text)
+        or "展示样式" in text
+        for text in page_text_values
+    )
+    if not detail_population_not_comparable:
+        closed_summaries = list(resolved.get("enterprise_closed_credit_summary") or [])
+        attachment_contexts = list(resolved.get("enterprise_attachment_accounts") or [])
+        attachment_details = list(resolved.get("enterprise_attachment_credit_details") or [])
+        settled_business_categories = sorted(
+            {
+                str(context.get("business_category") or "")
+                for context in attachment_contexts
+                if context.get("attachment_record_type") == "business"
+                and context.get("account_status") == "settled"
+                and context.get("business_category")
+            }
+        )
+        for business_category in settled_business_categories:
+            expected_count = sum(
+                int(record.get("total_account_count") or 0)
+                for record in closed_summaries
+                if not record.get("is_total")
+                and record.get("transaction_group") == business_category
+            )
+            if expected_count <= 0:
+                continue
+            extracted_count = sum(
+                1
+                for record in attachment_details
+                if record.get("account_status") == "settled"
+                and record.get("business_category") == business_category
+            )
+            unresolved = max(0, expected_count - extracted_count)
+            unexpected = max(0, extracted_count - expected_count)
+            audits.append(
+                {
+                    "audit_id": (
+                        "enterprise_continuation_audit:"
+                        f"attachment_credit_detail:{business_category}:settled"
+                    ),
+                    "sequence": len(audits) + 1,
+                    "continuation_family": "attachment_credit_detail",
+                    "business_category": business_category,
+                    "account_status": "settled",
+                    "expected_record_count": expected_count,
+                    "extracted_record_count": extracted_count,
+                    "unresolved_record_count": unresolved,
+                    "unexpected_record_count": unexpected,
+                    "reconciliation_status": (
+                        "complete" if not unresolved and not unexpected else "unresolved"
+                    ),
+                    "source": "enterprise_continuation_contract_audit",
+                    "confidence": 1.0,
+                }
+            )
     return audits
 
 
@@ -1914,21 +2115,23 @@ def _attachment_contexts_and_records(
                 and _number(row[amount_index]) is not None
             )
 
-        if any(valid_detail_row(row) for row in fragment_rows[header_index + 1 :]):
-            continue
-        if fragment.index + 1 >= len(resolver.fragments):
-            continue
-        candidate = resolver.fragments[fragment.index + 1]
-        if candidate.page - fragment.page not in {0, 1}:
-            continue
-        candidate_rows = [[_compact(value) for value in row] for row in candidate.rows]
-        candidate_starts_new_table = any(
-            ("开户日期" in row or "开立日期" in row)
-            and any(marker in "".join(row) for marker in ("贴现金额", "借款金额", "信用额度", "金额"))
-            for row in candidate_rows
-        )
-        if not candidate_starts_new_table and any(valid_detail_row(row) for row in candidate_rows):
+        previous = fragment
+        candidate_index = fragment.index + 1
+        while candidate_index < len(resolver.fragments):
+            candidate = resolver.fragments[candidate_index]
+            if candidate.page - previous.page not in {0, 1}:
+                break
+            candidate_rows = [[_compact(value) for value in row] for row in candidate.rows]
+            candidate_starts_new_table = any(
+                ("开户日期" in row or "开立日期" in row)
+                and any(marker in "".join(row) for marker in ("贴现金额", "借款金额", "信用额度", "金额"))
+                for row in candidate_rows
+            )
+            if candidate_starts_new_table or not any(valid_detail_row(row) for row in candidate_rows):
+                break
             allowed_detail_continuation_tables.add(candidate.table_id)
+            previous = candidate
+            candidate_index += 1
 
     def start_context(
         *,
@@ -2088,6 +2291,8 @@ def _attachment_contexts_and_records(
         context: dict[str, Any],
         page: int,
         table_id: str,
+        *,
+        allow_headerless: bool = False,
     ) -> bool:
         nonlocal pending_detail_header
         header_markers = (
@@ -2136,7 +2341,7 @@ def _attachment_contexts_and_records(
                 header_band.append(rows[data_start])
                 data_start += 1
             data_rows = list(enumerate(rows[data_start:], start=data_start))
-        elif pending_detail_header and pending_detail_header[1] is context:
+        elif allow_headerless and pending_detail_header and pending_detail_header[1] is context:
             header_band = [list(row) for row in pending_detail_header[0]]
             data_start = 0
             while data_start < len(rows) and is_header_row(rows[data_start]):
@@ -2188,8 +2393,17 @@ def _attachment_contexts_and_records(
                 return False
             open_date_column = open_date_location[1]
             amount_column = amount_location[1]
+            identifier_location = locations["account_identifier"]
+            identifier_valid = True
+            if identifier_location is not None:
+                identifier_column = identifier_location[1]
+                identifier_valid = (
+                    identifier_column < len(row)
+                    and len(_identifier(row[identifier_column])) >= _MIN_ENTERPRISE_ACCOUNT_IDENTIFIER_LENGTH
+                )
             return bool(
-                open_date_column < len(row)
+                identifier_valid
+                and open_date_column < len(row)
                 and amount_column < len(row)
                 and _date(row[open_date_column])
                 and _number(row[amount_column]) is not None
@@ -2314,9 +2528,7 @@ def _attachment_contexts_and_records(
                 }
             )
             emitted += 1
-        if emitted:
-            pending_detail_header = None
-        elif header_index >= 0:
+        if emitted or header_index >= 0:
             pending_detail_header = (header_band, context)
         return True
 
@@ -2434,7 +2646,13 @@ def _attachment_contexts_and_records(
             and pending_detail_header[1] is current
             and table_id in allowed_detail_continuation_tables
         ):
-            if consume_credit_details(rows, current, page, table_id):
+            if consume_credit_details(
+                rows,
+                current,
+                page,
+                table_id,
+                allow_headerless=True,
+            ):
                 continue
         if _history_table(rows) or table_id in allowed_history_continuation_tables:
             consume_history(rows, current, page, table_id)
@@ -2498,6 +2716,307 @@ _PUBLIC_CONTINUATION_RULES = {
         "continuation": frozenset({"案件状态", "结案方式", "已执行标的", "已执行标的金额（元）"}),
     },
 }
+
+_PUBLIC_ATTRIBUTE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "utility_payment": {
+        "utility_provider": ("公用事业单位名称",),
+        "utility_type": ("业务类型", "公用事业类型"),
+        "utility_account_identifier": ("账户编号", "用户编号"),
+        "arrears_amount": ("欠费金额（元）", "欠费金额"),
+        "statistics_date": ("统计日期",),
+    },
+    "tax_arrears": {
+        "tax_authority": ("主管税务机关",),
+        "tax_arrears_amount": ("欠税总额（元）", "欠税总额"),
+        "tax_arrears_statistics_date": ("欠税统计日期",),
+    },
+    "civil_judgment": {
+        "filing_court": ("立案法院",),
+        "filing_date": ("立案日期",),
+        "cause_of_action": ("案由",),
+        "litigation_position": ("诉讼地位",),
+        "case_number": ("案号",),
+        "trial_procedure": ("审判程序",),
+        "claim_subject": ("诉讼标的",),
+        "claim_amount": ("诉讼标的金额（元）", "诉讼标的金额"),
+        "closure_method": ("结案方式",),
+        "judgment_effective_date": ("判决/调解生效日期",),
+        "judgment_result": ("判决/调解结果",),
+    },
+    "enforcement": {
+        "enforcement_court": ("执行法院",),
+        "enforcement_filing_date": ("立案日期",),
+        "enforcement_cause": ("执行案由",),
+        "enforcement_case_number": ("案号",),
+        "requested_enforcement_subject": ("申请执行标的",),
+        "requested_enforcement_amount": ("申请执行标的金额（元）", "申请执行标的金额"),
+        "case_status": ("案件状态",),
+        "enforcement_closure_method": ("结案方式",),
+        "executed_subject": ("已执行标的",),
+        "executed_amount": ("已执行标的金额（元）", "已执行标的金额"),
+    },
+    "administrative_penalty": {
+        "penalty_authority": ("处罚机构",),
+        "penalty_decision_number": ("处罚决定书文号",),
+        "violation": ("违法行为",),
+        "penalty_date": ("处罚日期",),
+        "penalty_decision": ("处罚决定",),
+        "penalty_amount": ("处罚金额（元）", "处罚金额"),
+        "penalty_execution_status": ("处罚执行情况",),
+        "administrative_review_result": ("行政复议结果",),
+    },
+    "social_security_payment": {
+        "statistics_month": ("统计年月", "统计月份"),
+        "initial_contribution_month": ("初缴年月",),
+        "employee_count": ("职工人数",),
+        "contribution_base": ("缴费基数（元）", "缴存基数（元）", "缴存基数"),
+        "last_contribution_date": ("最近一次缴费日期", "最近一次缴存日期"),
+        "paid_through_month": ("缴至年月",),
+        "payment_status": ("缴费状态", "缴存状态"),
+        "cumulative_arrears": ("累计欠费金额（元）", "累计欠缴金额（元）", "累计欠缴金额"),
+    },
+    "license": {
+        "licensing_authority": ("许可部门", "许可机关"),
+        "license_type": ("许可类型",),
+        "license_date": ("许可日期",),
+        "license_expiry_date": ("截止日期", "有效截止日期"),
+        "license_content": ("许可内容",),
+    },
+    "certification": {
+        "certification_authority": ("认证部门", "认证机关"),
+        "certification_type": ("认证类型",),
+        "certification_date": ("认证日期",),
+        "certification_expiry_date": ("截止日期", "有效截止日期"),
+        "certification_content": ("认证内容",),
+    },
+    "qualification": {
+        "qualification_authority": ("认定部门", "认定机关"),
+        "qualification_type": ("资质类型", "认定类型"),
+        "qualification_approval_date": ("批准日期", "认定日期"),
+        "qualification_expiry_date": ("截止日期", "有效截止日期"),
+        "qualification_content": ("资质内容", "认定内容"),
+    },
+    "award": {
+        "award_authority": ("奖励部门", "授予部门"),
+        "award_name": ("奖励名称",),
+        "award_date": ("授予日期", "奖励日期"),
+        "award_expiry_date": ("截止日期", "有效截止日期"),
+        "award_fact": ("奖励事实", "奖励内容"),
+    },
+    "export_quality": {
+        "approval_authority": ("批准部门",),
+        "export_product_name": ("出口商品名称",),
+        "effective_date": ("生效日期",),
+        "expiry_date": ("截止日期",),
+    },
+    "inspection_exemption": {
+        "approval_authority": ("批准部门",),
+        "inspection_exempt_product_name": ("免验商品名称",),
+        "inspection_exemption_number": ("免验号",),
+        "expiry_date": ("截止日期",),
+    },
+    "regulatory_supervision": {
+        "regulatory_authority": ("监管部门",),
+        "direct_supervising_bureau": ("管辖直属局",),
+        "supervision_level": ("监管级别",),
+        "effective_date": ("生效日期",),
+        "expiry_date": ("截止日期",),
+    },
+    "patent": {
+        "patent_name": ("专利名称",),
+        "patent_type": ("专利类型",),
+        "application_number": ("申请号",),
+        "application_date": ("申请日期",),
+        "authorization_date": ("授权日期",),
+        "patent_status": ("专利状态",),
+    },
+    "financing_restriction": {
+        "restriction_catalog": ("所属名录",),
+        "restriction_reason": ("列入原因", "控制原因"),
+        "restriction_date": ("添加日期", "列入日期"),
+        "restriction_status": ("状态",),
+    },
+    "data_provider_statement": {
+        "statement_content": ("数据提供机构说明",),
+    },
+    "credit_bureau_statement": {
+        "statement_content": ("征信中心说明",),
+    },
+    "subject_statement": {
+        "statement_content": ("信息主体声明",),
+    },
+    "dispute_annotation": {
+        "annotation_content": ("异议标注",),
+    },
+}
+
+_PUBLIC_DATE_ATTRIBUTE_FIELDS = frozenset(
+    {
+        "statistics_date",
+        "tax_arrears_statistics_date",
+        "filing_date",
+        "judgment_effective_date",
+        "enforcement_filing_date",
+        "penalty_date",
+        "last_contribution_date",
+        "license_date",
+        "license_expiry_date",
+        "certification_date",
+        "certification_expiry_date",
+        "qualification_approval_date",
+        "qualification_expiry_date",
+        "award_date",
+        "award_expiry_date",
+        "effective_date",
+        "expiry_date",
+        "application_date",
+        "authorization_date",
+        "restriction_date",
+    }
+)
+_PUBLIC_INTEGER_ATTRIBUTE_FIELDS = frozenset({"employee_count"})
+_PUBLIC_NUMBER_ATTRIBUTE_FIELDS = frozenset(
+    {
+        "arrears_amount",
+        "tax_arrears_amount",
+        "claim_amount",
+        "requested_enforcement_amount",
+        "executed_amount",
+        "penalty_amount",
+        "contribution_base",
+        "cumulative_arrears",
+    }
+)
+
+_PUBLIC_RECORD_TYPE_LABELS = {
+    "utility_payment": "公用事业缴费记录",
+    "tax_arrears": "欠税记录",
+    "civil_judgment": "民事判决记录",
+    "enforcement": "强制执行记录",
+    "administrative_penalty": "行政处罚记录",
+    "social_security_payment": "社会保障及住房公积金缴费记录",
+    "license": "行政许可记录",
+    "certification": "认证记录",
+    "qualification": "资质认定记录",
+    "award": "行政奖励记录",
+    "export_quality": "出口商品质量记录",
+    "inspection_exemption": "免验商品记录",
+    "regulatory_supervision": "监管记录",
+    "patent": "专利记录",
+    "financing_restriction": "融资限制记录",
+    "data_provider_statement": "数据提供机构说明",
+    "credit_bureau_statement": "征信中心说明",
+    "subject_statement": "信息主体声明",
+    "dispute_annotation": "异议标注",
+}
+
+
+def enterprise_public_record_dataset_specs() -> dict[str, dict[str, Any]]:
+    """Return lossless, chart-grained dataset schemas for public records."""
+
+    specs: dict[str, dict[str, Any]] = {}
+    for record_type, field_map in _PUBLIC_ATTRIBUTE_FIELDS.items():
+        dataset_id = f"enterprise_public_{record_type}_records"
+        columns: dict[str, dict[str, str]] = {}
+        for field, labels in field_map.items():
+            if field in _PUBLIC_INTEGER_ATTRIBUTE_FIELDS:
+                field_type = "integer"
+            elif field in _PUBLIC_NUMBER_ATTRIBUTE_FIELDS:
+                field_type = "money"
+            elif field in _PUBLIC_DATE_ATTRIBUTE_FIELDS:
+                # Public-record charts use placeholders such as "--".  These
+                # source cells are intentionally strings so the normalized JSON
+                # remains lossless while valid dates retain ISO text.
+                field_type = "string"
+            else:
+                field_type = "string"
+            columns[field] = {"label": labels[0], "type": field_type}
+        label = _PUBLIC_RECORD_TYPE_LABELS.get(record_type, record_type)
+        specs[record_type] = {
+            "dataset_id": dataset_id,
+            "label": label,
+            "definition": f"{label}源表中的一行。",
+            "columns": columns,
+        }
+    return specs
+
+
+def _public_attributes(record_type: str, details: dict[str, Any]) -> dict[str, Any]:
+    """Return stable, type-specific JSON fields for one public record."""
+
+    field_map = _PUBLIC_ATTRIBUTE_FIELDS.get(record_type, {})
+    normalized_details = {_compact(key): value for key, value in details.items()}
+    attributes: dict[str, Any] = {}
+    for field, labels in field_map.items():
+        raw = next(
+            (
+                normalized_details[label]
+                for label in labels
+                if label in normalized_details
+            ),
+            None,
+        )
+        if raw in (None, ""):
+            continue
+        if field in _PUBLIC_DATE_ATTRIBUTE_FIELDS:
+            value: Any = _date(raw) or _compact(raw)
+        elif field in _PUBLIC_INTEGER_ATTRIBUTE_FIELDS:
+            number = _number(raw)
+            value = int(number) if number is not None else None
+        elif field in _PUBLIC_NUMBER_ATTRIBUTE_FIELDS:
+            value = _number(raw)
+        else:
+            value = _compact(raw)
+        if value not in (None, ""):
+            attributes[field] = value
+    return attributes
+
+
+def project_enterprise_public_record_datasets(
+    records: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Expose public records only as typed, business-grained chart tables."""
+
+    datasets: dict[str, list[dict[str, Any]]] = {}
+    specs = enterprise_public_record_dataset_specs()
+    for record in records:
+        record_type = str(record.get("record_type") or "")
+        spec = specs.get(record_type)
+        if not spec:
+            continue
+        dataset_id = str(spec["dataset_id"])
+        typed_records = datasets.setdefault(dataset_id, [])
+        attributes = record.get("attributes")
+        if not isinstance(attributes, dict):
+            attributes = _public_attributes(
+                record_type,
+                record.get("details") if isinstance(record.get("details"), dict) else {},
+            )
+        typed_record: dict[str, Any] = {
+            "public_record_id": record.get("public_record_id"),
+            "sequence": len(typed_records) + 1,
+        }
+        for field in spec["columns"]:
+            if field in attributes:
+                typed_record[field] = attributes[field]
+        if record.get("page") is not None:
+            typed_record["source_page"] = record["page"]
+        if record.get("source_table_id"):
+            typed_record["source_table_id"] = record["source_table_id"]
+        for key in ("source", "source_refs", "confidence"):
+            if key in record:
+                typed_record[key] = record[key]
+        typed_records.append(typed_record)
+    return datasets
+
+
+def extract_enterprise_public_record_datasets(
+    parse_result: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Extract public records and expose each source chart as its own dataset."""
+
+    records = extract_enterprise_public_records_from_tables(parse_result)
+    return project_enterprise_public_record_datasets(records)
 
 
 def _public_type(headers: list[str], rows: list[list[str]]) -> str:
@@ -2573,6 +3092,7 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
                 if details:
                     entries.append((row_index, details))
         for row_index, details in entries:
+            attributes = _public_attributes(record_type, details)
             authority = next(
                 (
                     value
@@ -2619,6 +3139,8 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
                 "end_date": _public_date(details, "截止日期", "有效截止日期"),
                 "content": content,
                 "details": details,
+                "attributes": attributes,
+                **attributes,
                 "page": page,
                 "source_table_id": table_id,
                 "source": "canonical_enterprise_public_record_table",
@@ -2652,6 +3174,9 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             if guarded_continuation:
                 previous = records[-1]
                 previous["details"].update(details)
+                merged_attributes = _public_attributes(record_type, previous["details"])
+                previous["attributes"] = merged_attributes
+                previous.update(merged_attributes)
                 previous["content"] = "；".join(f"{key}：{value}" for key, value in previous["details"].items())
                 previous["source_refs"].extend(record["source_refs"])
                 previous["source_page_end"] = page

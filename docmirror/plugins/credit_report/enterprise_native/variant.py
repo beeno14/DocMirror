@@ -7,6 +7,51 @@ from typing import Any
 
 from docmirror.plugins.credit_report.shared.variant import CreditReportVariantAdapter
 
+_ENTERPRISE_DOCUMENT_DATASET_ORDER = (
+    "enterprise_report_metadata",
+    "report_notes",
+    "enterprise_exchange_rates",
+    "enterprise_current_credit_summary",
+    "enterprise_facility_summary",
+    "enterprise_closed_credit_summary",
+    "enterprise_repayment_responsibility_summary",
+    "enterprise_profile_fields",
+    "enterprise_capital_summary",
+    "enterprise_stakeholders",
+    "enterprise_relationships",
+    "credit_accounts",
+    "enterprise_displayed_credit_summary",
+    "credit_lines",
+    "repayment_liability_records",
+    "repayment_records",
+    "overdue_records",
+    "enterprise_public_utility_payment_records",
+    "enterprise_public_tax_arrears_records",
+    "enterprise_public_civil_judgment_records",
+    "enterprise_public_enforcement_records",
+    "enterprise_public_administrative_penalty_records",
+    "enterprise_public_social_security_payment_records",
+    "enterprise_public_license_records",
+    "enterprise_public_certification_records",
+    "enterprise_public_qualification_records",
+    "enterprise_public_award_records",
+    "enterprise_public_export_quality_records",
+    "enterprise_public_inspection_exemption_records",
+    "enterprise_public_regulatory_supervision_records",
+    "enterprise_public_patent_records",
+    "enterprise_public_financing_restriction_records",
+    "enterprise_public_data_provider_statement_records",
+    "enterprise_public_credit_bureau_statement_records",
+    "enterprise_public_subject_statement_records",
+    "enterprise_public_dispute_annotation_records",
+    "inquiry_records",
+    "enterprise_attachment_accounts",
+    "enterprise_credit_supplement",
+    "enterprise_attachment_credit_details",
+    "enterprise_special_transactions",
+    "enterprise_extraction_audit",
+)
+
 
 class EnterpriseNativeVariant(CreditReportVariantAdapter):
     """Keep enterprise extraction behind a dedicated variant boundary."""
@@ -22,6 +67,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
     def use_generic_credit_accounts(self) -> bool:
         """Enterprise stacked cards replace generic row-shaped candidates."""
         return False
+
+    def dataset_names(self) -> tuple[str, ...]:
+        """Publish public records through typed business tables, not content rows."""
+        return tuple(name for name in super().dataset_names() if name != "public_records")
 
     def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
         """Build reusable enterprise page and table indexes once."""
@@ -64,12 +113,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             extract_enterprise_facility_summary,
             extract_enterprise_identity_facts,
             extract_enterprise_profile_datasets,
+            extract_enterprise_public_record_datasets,
             extract_enterprise_report_metadata_records,
             extract_enterprise_report_notes,
             extract_enterprise_summary_datasets,
         )
 
         datasets = extract_enterprise_profile_datasets(parse_result)
+        public_record_datasets = extract_enterprise_public_record_datasets(parse_result)
+        if public_record_datasets:
+            # The public API is the set of typed business tables.
+            datasets.update(public_record_datasets)
         datasets.update(extract_enterprise_report_metadata_records(parse_result, full_text))
         datasets.update(extract_enterprise_summary_datasets(parse_result))
         datasets.update(extract_enterprise_attachment_datasets(parse_result))
@@ -293,6 +347,26 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "start_date": {"label": "生效/发生日期", "type": "date"},
                 "end_date": {"label": "截止日期", "type": "date"},
                 "content": {"label": "记录内容", "type": "string"},
+                "details": {"label": "源字段明细", "type": "object"},
+                "attributes": {"label": "类型化属性", "type": "object"},
+                "statistics_month": {"label": "统计年月", "type": "string"},
+                "initial_contribution_month": {"label": "初缴年月", "type": "string"},
+                "employee_count": {"label": "职工人数", "type": "integer"},
+                "contribution_base": {"label": "缴费/缴存基数", "type": "money"},
+                "last_contribution_date": {"label": "最近一次缴费/缴存日期", "type": "date"},
+                "paid_through_month": {"label": "缴至年月", "type": "string"},
+                "payment_status": {"label": "缴费/缴存状态", "type": "string"},
+                "cumulative_arrears": {"label": "累计欠费/欠缴金额", "type": "money"},
+                "licensing_authority": {"label": "许可部门", "type": "string"},
+                "license_type": {"label": "许可类型", "type": "string"},
+                "license_date": {"label": "许可日期", "type": "date"},
+                "license_expiry_date": {"label": "许可截止日期", "type": "date"},
+                "license_content": {"label": "许可内容", "type": "string"},
+                "certification_authority": {"label": "认证部门", "type": "string"},
+                "certification_type": {"label": "认证类型", "type": "string"},
+                "certification_date": {"label": "认证日期", "type": "date"},
+                "certification_expiry_date": {"label": "认证截止日期", "type": "date"},
+                "certification_content": {"label": "认证内容", "type": "string"},
                 "source_page": {"label": "源页码", "type": "integer"},
                 "source_page_end": {"label": "源结束页码", "type": "integer"},
                 "contributor_source_page": {
@@ -673,22 +747,23 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 if key in fields
             },
         }
-        dictionary["datasets"]["public_records"] = {
-            "definition": "企业报告公共记录及声明、异议部分中的一项源记录一行。",
-            "columns": {
-                key: fields[key]
-                for key in (
-                    "sequence",
-                    "public_record_id",
-                    "record_type",
-                    "authority",
-                    "category",
-                    "start_date",
-                    "end_date",
-                    "content",
-                )
-            },
-        }
+        dictionary["datasets"].pop("public_records", None)
+        from docmirror.plugins.credit_report.enterprise_native.extraction import (
+            enterprise_public_record_dataset_specs,
+        )
+
+        for spec in enterprise_public_record_dataset_specs().values():
+            typed_columns = {
+                "sequence": fields["sequence"],
+                "public_record_id": fields["public_record_id"],
+                **spec["columns"],
+                "source_page": fields["source_page"],
+                "source_table_id": fields["source_table_id"],
+            }
+            dictionary["datasets"][spec["dataset_id"]] = {
+                "definition": spec["definition"],
+                "columns": typed_columns,
+            }
         dictionary["datasets"]["enterprise_closed_credit_summary"] = {
             "definition": "已结清信贷信息概要中的一个业务类别或合计行一行。",
             "columns": {
@@ -948,6 +1023,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "sequence",
                     "audit_id",
                     "continuation_family",
+                    "business_category",
+                    "account_status",
                     "expected_record_count",
                     "extracted_record_count",
                     "unresolved_record_count",
@@ -991,6 +1068,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "repayment_responsibility_summary": "相关还款责任概要",
             "repayment_liability": "相关还款责任明细",
             "attachment_account": "附件账户/业务",
+            "attachment_credit_detail": "附件信贷明细",
         }
         enums["reconciliation_status"] = {
             "complete": "完整",
@@ -1048,6 +1126,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
     def semantic_extensions(self) -> dict[str, Any]:
         """Use an enterprise reading layout with only business-facing facts."""
         semantic = super().semantic_extensions()
+        semantic["dataset_document_order"] = list(
+            _ENTERPRISE_DOCUMENT_DATASET_ORDER
+        )
         policy = semantic.setdefault("presentation_policy", {})
         policy["classification"] = "sensitive_enterprise_credit_data"
         policy["enhanced_markdown_display"] = "full"
@@ -1119,6 +1200,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         semantic["enhanced_markdown"] = {
             "privacy_mode": "full",
             "show_top_document_metadata": False,
+            "suppress_empty_sections": True,
             "dataset_layouts": {
                 "enterprise_report_metadata": {
                     "hide_title": True,
@@ -1287,18 +1369,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "remaining_periods",
                         "snapshot_date",
                         "continuation_complete",
-                    ],
-                },
-                "public_records": {
-                    "mode": "table",
-                    "columns": [
-                        "sequence",
-                        "record_type",
-                        "authority",
-                        "category",
-                        "start_date",
-                        "end_date",
-                        "content",
                     ],
                 },
                 "credit_accounts": {
@@ -1572,6 +1642,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 ],
             },
         }
+        from docmirror.plugins.credit_report.enterprise_native.extraction import (
+            enterprise_public_record_dataset_specs,
+        )
+
+        dataset_layouts = semantic["enhanced_markdown"]["dataset_layouts"]
+        for spec in enterprise_public_record_dataset_specs().values():
+            dataset_layouts[spec["dataset_id"]] = {
+                "mode": "table",
+                "columns": ["sequence", *spec["columns"]],
+            }
         return semantic
 
     def build_sections(self, parse_result: Any, full_text: str) -> tuple[dict[str, Any], ...]:

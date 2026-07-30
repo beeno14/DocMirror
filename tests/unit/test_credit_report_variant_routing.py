@@ -118,28 +118,54 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
+    assert "dataset_document_order" not in personal_semantic
+    enterprise_order = enterprise_semantic["dataset_document_order"]
+    assert enterprise_order.index("enterprise_report_metadata") < enterprise_order.index(
+        "report_notes"
+    )
+    assert enterprise_order.index("enterprise_current_credit_summary") < enterprise_order.index(
+        "enterprise_facility_summary"
+    ) < enterprise_order.index("enterprise_closed_credit_summary")
+    assert enterprise_order.index("enterprise_profile_fields") < enterprise_order.index(
+        "enterprise_capital_summary"
+    ) < enterprise_order.index("enterprise_stakeholders")
+    assert enterprise_order.index("credit_accounts") < enterprise_order.index(
+        "enterprise_displayed_credit_summary"
+    ) < enterprise_order.index("credit_lines")
+    assert enterprise_order[-1] == "enterprise_extraction_audit"
 
 
 def test_enterprise_official_public_record_lexicon_is_complete() -> None:
     enterprise = resolve_credit_report_variant("enterprise", "native_text")
     dictionary = enterprise.data_dictionary()
-    public_record_layout = enterprise.semantic_extensions()["enhanced_markdown"][
-        "dataset_layouts"
-    ]["public_records"]
+    dataset_layouts = enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"]
 
     assert dictionary["fields"]["public_record_type_counts"]["map_key_enum"] == "record_type"
-    assert public_record_layout == {
-        "mode": "table",
-        "columns": [
-            "sequence",
-            "record_type",
-            "authority",
-            "category",
-            "start_date",
-            "end_date",
-            "content",
-        ],
-    }
+    assert "public_records" not in dictionary["datasets"]
+    assert "public_records" not in dataset_layouts
+    assert list(
+        dictionary["datasets"]["enterprise_public_license_records"]["columns"]
+    ) == [
+        "sequence",
+        "public_record_id",
+        "licensing_authority",
+        "license_type",
+        "license_date",
+        "license_expiry_date",
+        "license_content",
+        "source_page",
+        "source_table_id",
+    ]
+    assert enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"][
+        "enterprise_public_certification_records"
+    ]["columns"] == [
+        "sequence",
+        "certification_authority",
+        "certification_type",
+        "certification_date",
+        "certification_expiry_date",
+        "certification_content",
+    ]
     assert set(dictionary["enums"]["record_type"]) == {
         "utility_payment",
         "tax_arrears",

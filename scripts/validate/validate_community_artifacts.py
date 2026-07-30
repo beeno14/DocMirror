@@ -358,7 +358,128 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
     section_ids = {
         str(section.get("id") or "") for section in sections if isinstance(section, dict) and section.get("id")
     }
+    sections_by_id = {
+        str(section.get("id") or ""): section
+        for section in sections
+        if isinstance(section, dict) and section.get("id")
+    }
     document = payload.get("document") if isinstance(payload.get("document"), dict) else {}
+    is_enterprise_credit_report = (
+        str(document.get("type") or "") == "enterprise_credit_report"
+    )
+    public_dataset_ids: set[str] = set()
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
+        dataset_name = str(dataset.get("name") or "")
+        if not dataset_name.startswith("enterprise_public_"):
+            continue
+        dataset_id = str(dataset.get("id") or "")
+        public_dataset_ids.add(dataset_id)
+        section_id = str(dataset.get("section_id") or "")
+        section = sections_by_id.get(section_id)
+        if not isinstance(section, dict) or str(section.get("type") or "") != "public_records":
+            issues.append(
+                f"{dataset_id}: enterprise public dataset must belong to a public_records section"
+            )
+        elif dataset_id not in {str(ref) for ref in section.get("dataset_refs") or []}:
+            issues.append(
+                f"{dataset_id}: missing from public_records section dataset_refs"
+            )
+        reading_table = next(
+            (
+                table
+                for table in reading_tables
+                if isinstance(table, dict)
+                and str(table.get("dataset_id") or "") == dataset_id
+            ),
+            None,
+        )
+        if isinstance(reading_table, dict) and str(
+            reading_table.get("section_id") or ""
+        ) != section_id:
+            issues.append(
+                f"{dataset_id}: reading table section_id={reading_table.get('section_id')}, "
+                f"dataset section_id={section_id}"
+            )
+        label = str(dataset.get("label") or "")
+        if not re.search(r"[\u3400-\u9fff]", label):
+            issues.append(
+                f"{dataset_id}: enterprise public dataset label must be Chinese, got {label!r}"
+            )
+        column_keys = {
+            str(column.get("key") or "")
+            for column in dataset.get("columns") or []
+            if isinstance(column, dict) and column.get("key")
+        }
+        for row_index, row in enumerate(dataset.get("rows") or []):
+            if not isinstance(row, dict):
+                continue
+            normalized = (
+                row.get("normalized")
+                if isinstance(row.get("normalized"), dict)
+                else {}
+            )
+            generic_keys = set(normalized) & {
+                "attributes",
+                "content",
+                "details",
+                "record_type",
+            }
+            if generic_keys:
+                issues.append(
+                    f"{dataset_id}.rows[{row_index}]: generic public-record keys="
+                    f"{sorted(generic_keys)}"
+                )
+            unknown_keys = set(normalized) - column_keys
+            if unknown_keys:
+                issues.append(
+                    f"{dataset_id}.rows[{row_index}]: normalized keys missing from "
+                    f"dataset columns={sorted(unknown_keys)}"
+                )
+    if is_enterprise_credit_report:
+        semantic_domain = (
+            semantic.get("domain") if isinstance(semantic.get("domain"), dict) else {}
+        )
+        semantic_extensions = (
+            semantic_domain.get("extensions")
+            if isinstance(semantic_domain.get("extensions"), dict)
+            else {}
+        )
+        configured_order = semantic_extensions.get("dataset_document_order")
+        if isinstance(configured_order, list):
+            actual_names = [
+                str(dataset.get("name") or "")
+                for dataset in datasets
+                if isinstance(dataset, dict)
+            ]
+            expected_names = [
+                str(name)
+                for name in configured_order
+                if str(name) in actual_names
+            ]
+            expected_names.extend(
+                name for name in actual_names if name not in expected_names
+            )
+            if actual_names != expected_names:
+                issues.append(
+                    "datasets: enterprise datasets do not follow source document order"
+                )
+        for section in sections:
+            if not isinstance(section, dict) or str(section.get("type") or "") != "public_records":
+                continue
+            section_id = str(section.get("id") or "")
+            if section.get("items") or section.get("groups"):
+                issues.append(
+                    f"{section_id}: public_records section must contain references only"
+                )
+            foreign_refs = {
+                str(ref) for ref in section.get("dataset_refs") or []
+            } - public_dataset_ids
+            if foreign_refs:
+                issues.append(
+                    f"{section_id}: non-public dataset_refs={sorted(foreign_refs)}"
+                )
     document_id = str(document.get("id") or "")
     flow = reading.get("document_flow") if isinstance(reading.get("document_flow"), list) else []
     flow_orders: list[int] = []
