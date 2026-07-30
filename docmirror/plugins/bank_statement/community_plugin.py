@@ -397,6 +397,7 @@ def _sanitize_bank_records(records: list[dict]) -> list[dict]:
             if not isinstance(pool, dict):
                 continue
             _sanitize_bank_value_pool(pool)
+        _repair_split_amount_canonical_raw(copied)
         sanitized.append(copied)
     counterparty_aliases = _stable_counterparty_aliases(sanitized)
     for record in sanitized:
@@ -415,6 +416,35 @@ def _sanitize_bank_value_pool(pool: dict) -> None:
         if key_text in {"counter_party", "对方户名", "对方名称", "交易对手"}:
             text = _clean_counterparty_text(text)
         pool[key] = text
+
+
+def _repair_split_amount_canonical_raw(record: dict) -> None:
+    canonical_raw = record.get("canonical_raw")
+    raw = record.get("raw")
+    normalized = record.get("normalized")
+    if not isinstance(canonical_raw, dict) or not isinstance(raw, dict) or not isinstance(normalized, dict):
+        return
+    if canonical_raw.get("amount") not in (None, ""):
+        return
+
+    direction = str(normalized.get("direction") or "")
+    if direction not in {"income", "expense"}:
+        return
+    keys = (
+        ("收入", "收入金额", "贷方发生额", "贷方", "转入金额")
+        if direction == "income"
+        else ("支出", "支出金额", "借方发生额", "借方", "转出金额")
+    )
+    for key in keys:
+        value = raw.get(key)
+        if value in (None, ""):
+            continue
+        cleaned = _clean_money_text(str(value))
+        if cleaned:
+            canonical_raw["amount"] = cleaned
+            if "amount_cny" in canonical_raw:
+                canonical_raw["amount_cny"] = cleaned
+            return
 
 
 def _stable_counterparty_aliases(records: list[dict]) -> dict[str, str]:
@@ -592,7 +622,7 @@ def _is_fee_residue_counterparty(value: str, summary: str) -> bool:
 
 
 def _clean_money_text(value: str) -> str:
-    text = str(value or "").strip()
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).strip()
     match = re.match(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text)
     return match.group(0) if match else text
 

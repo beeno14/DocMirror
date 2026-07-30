@@ -94,6 +94,7 @@ def build_style_meta(
         expected = getattr(reconstruction, "expected_primary_rows", 0) or 0
         source = getattr(reconstruction, "source", "") or ""
         pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
+    stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
 
     from docmirror.plugins.bank_statement.canonical_quality import (
         audit_cqf,
@@ -101,6 +102,8 @@ def build_style_meta(
     )
 
     canonical_expected = canonical_expected_from_parse_result(parse_result)
+    if canonical_expected > 0 and stitched_continuation_rows > 0:
+        canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
     if source in ("stacked_text", "native_wide_table", "ocr_implicit_table") and record_count > 0:
         expected = record_count
     elif canonical_expected > 0:
