@@ -116,6 +116,115 @@ def test_bank_statement_summary_markdown_compacts_wrapped_numeric_counter_accoun
     assert "830100788013000002 20" not in markdown
 
 
+def test_source_first_markdown_fills_split_header_values_and_keeps_footer_outside_table() -> None:
+    records = [
+        {
+            "raw": {
+                "序号": "1",
+                "交易日期": "20250710",
+                "贷方发生额": "30,000.00",
+                "余额": "36,989.93",
+                "摘要": "往来款",
+            },
+            "normalized": {
+                "date": "2025-07-10",
+                "direction": "income",
+                "amount": 30000.0,
+                "balance": 36989.93,
+                "summary": "往来款",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    source_text = "\n".join(
+        [
+            "641301106013000859983",
+            "测试软件有限公司银川分公司",
+            "2025",
+            "人民币",
+            "某银行分行明细对账单",
+            "账号：",
+            "开户机构：某银行开发区支行",
+            "户名：",
+            "年份：",
+            "币种：",
+            "序号 会计日期 交易日期 借方发生额 贷方发生额 余额 摘要",
+            "当前账单借方发生数：10 当前账单贷方发生数：1",
+            "本月累计借方发生额：28,314.48 本月累计贷方发生额：30,000.00",
+            "出单截至日期：2025-07-31",
+        ]
+    )
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {
+            "account_holder": "测试软件有限公司银川分公司",
+            "account_number": "641301106013000859983",
+            "bank_name": "某银行开发区支行",
+            "currency": "CNY",
+        },
+        {"start": "2025-07-01", "end": "2025-07-31"},
+        source_text,
+        document_type="bank_reconciliation",
+        source_pages={1: source_text},
+    )
+
+    assert "账号：641301106013000859983" in markdown
+    assert "户名：测试软件有限公司银川分公司" in markdown
+    assert "币种：CNY" in markdown
+    assert "账期：20250701 至 20250731" in markdown
+    assert markdown.count("| 1 |") == 1
+    assert "当前账单借方发生数：10 当前账单贷方发生数：1" in markdown
+    assert "出单截至日期：2025-07-31" in markdown
+    assert not any("当前账单" in line for line in markdown.splitlines() if line.startswith("| "))
+
+
+def test_source_first_markdown_prefers_page_local_reconstructed_footer() -> None:
+    records = [
+        {
+            "raw": {
+                "序号": "1",
+                "交易日期": "20250710",
+                "贷方发生额": "30,000.00",
+                "余额": "36,989.93",
+            },
+            "normalized": {
+                "date": "2025-07-10",
+                "direction": "income",
+                "amount": 30000.0,
+                "balance": 36989.93,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    native_text = "某银行明细对账单\n序号 交易日期 借方发生额 贷方发生额 余额"
+    page_text = "\n".join(
+        [
+            native_text,
+            "开户机构：某银行开发区支行 页码：本月第1份-第1页",
+            "当前账单借方发生数：10 当前账单贷方发生数：1",
+            "本月累计借方发生额：28,314.48 本月累计贷方发生额：30,000.00",
+            "1 20250710 30,000.00 36,989.93 往来款",
+            "出单截至日期：2025-07-31",
+        ]
+    )
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {},
+        {},
+        native_text,
+        document_type="bank_reconciliation",
+        source_pages={1: page_text},
+    )
+
+    assert "当前账单借方发生数：10 当前账单贷方发生数：1" in markdown
+    assert "本月累计借方发生额：28,314.48 本月累计贷方发生额：30,000.00" in markdown
+    assert "出单截至日期：2025-07-31" in markdown
+    assert markdown.count("1 20250710 30,000.00 36,989.93 往来款") == 0
+    assert "页码：本月第1份-第1页" not in markdown
+
+
 def test_bank_reconciliation_markdown_uses_recovered_source_title() -> None:
     records = [
         {
@@ -337,7 +446,9 @@ def test_bank_statement_markdown_uses_source_headers_when_raw_headers_are_partia
     )
 
     assert "| 交易⽇期 |" not in markdown
-    assert "| 交易日期 | 交易时间 | 交易摘要 | 交易金额 | 本次余额 | 对手信息 | 日志号 | 交易渠道 | 交易附言 |" in markdown
+    assert (
+        "| 交易日期 | 交易时间 | 交易摘要 | 交易金额 | 本次余额 | 对手信息 | 日志号 | 交易渠道 | 交易附言 |" in markdown
+    )
     assert "| 20230622 |  | 微信⽀付 | -500.00 | 10705.87 | 243300133 | 457272650 | 电⼦商务 |  |" in markdown
     assert "截至打印时间下方无其他明细内容，交易明细截止2023年08月30日16时00分" in markdown
     assert "@中国农业银⾏  \n第 3 页，共 3页" in markdown
@@ -397,7 +508,10 @@ def test_bank_statement_markdown_infers_generic_raw_headers_and_transaction_type
     )
 
     assert "| 序号 | 摘要/附言 | 币别 | 交易日期 | 交易类型 | 交易金额 | 账户余额 | 对方账号 | 对方户名 |" in markdown
-    assert "| 1 | 协议付款 | 人民币 | 20230831 | 支出 | 31.00 | 99.79 | 215500690 | 支付宝（中国）网络技术有限公司 |" in markdown
+    assert (
+        "| 1 | 协议付款 | 人民币 | 20230831 | 支出 | 31.00 | 99.79 | 215500690 | 支付宝（中国）网络技术有限公司 |"
+        in markdown
+    )
     assert "| 2 | 工资 | 人民币 | 20230830 | 收入 | 296.00 | 299.69 | 70070188000077841 |  |" in markdown
 
 
@@ -523,8 +637,16 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
         },
         {
             "raw": {"摘要": "公共耗能和水电费用", "对方账户": "6232511300395178", "对方户名": "限公司"},
-            "canonical_raw": {"summary": "公共耗能和水电费用", "counter_account": "6232511300395178", "counter_party": "限公司"},
-            "normalized": {"summary": "公共耗能和水电费用", "counter_account": "6232511300395178", "counter_party": "限公司"},
+            "canonical_raw": {
+                "summary": "公共耗能和水电费用",
+                "counter_account": "6232511300395178",
+                "counter_party": "限公司",
+            },
+            "normalized": {
+                "summary": "公共耗能和水电费用",
+                "counter_account": "6232511300395178",
+                "counter_party": "限公司",
+            },
         },
         {
             "raw": {"摘要": "tips扣税", "对方账户": "70010151830005003", "对方户名": "代收）"},
@@ -545,7 +667,11 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
             },
         },
         {
-            "raw": {"摘要": "tips扣税", "对方账户": "70010151830005003", "对方户名": "待报解预算收入（财税库银联网代收）"},
+            "raw": {
+                "摘要": "tips扣税",
+                "对方账户": "70010151830005003",
+                "对方户名": "待报解预算收入（财税库银联网代收）",
+            },
             "canonical_raw": {
                 "summary": "tips扣税",
                 "counter_account": "70010151830005003",

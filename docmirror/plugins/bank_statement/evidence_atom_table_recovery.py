@@ -20,6 +20,14 @@ _GEOMETRY_FOOTER_MARKERS = (
     "本页合计",
     "本页支出",
     "本页收入",
+    "总收入笔数",
+    "总收入金额",
+    "总支出笔数",
+    "总支出金额",
+    "当前账单借方发生数",
+    "当前账单贷方发生数",
+    "本月累计借方发生数",
+    "本月累计贷方发生数",
     "借方发生额汇总",
     "贷方发生额汇总",
     "回单编号",
@@ -52,7 +60,10 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
         _store_recovery_cache(parse_result, [], [], 0)
         return []
     all_atoms = [atom for atoms in atoms_by_page.values() for atom in atoms]
-    geometry_fallback, geometry_sources, geometry_expected = _recover_geometry_bank_tables(atoms_by_page)
+    geometry_fallback, geometry_sources, geometry_expected = _recover_geometry_bank_tables(
+        parse_result,
+        atoms_by_page,
+    )
 
     header_names = (
         "序号",
@@ -121,8 +132,7 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
                 footer_starts = [
                     float(atom["bbox"][1])
                     for atom in atoms
-                    if float(atom["bbox"][1]) > row_y
-                    and _is_geometry_footer_text(str(atom.get("text") or ""))
+                    if float(atom["bbox"][1]) > row_y and _is_geometry_footer_text(str(atom.get("text") or ""))
                 ]
                 row_end = min(footer_starts, default=float("inf"))
             row_atoms = [atom for atom in atoms if row_y - 0.5 <= _y_center(atom) < row_end - 0.5]
@@ -174,6 +184,7 @@ def recovered_evidence_atom_expected_row_count(parse_result: Any) -> int:
 
 
 def _recover_geometry_bank_tables(
+    parse_result: Any,
     atoms_by_page: dict[str, list[dict[str, Any]]],
 ) -> tuple[list[list[list[str]]], list[dict[str, Any]], int]:
     """Rebuild borderless bank grids from header and row geometry."""
@@ -189,6 +200,12 @@ def _recover_geometry_bank_tables(
         header_cells = [str(atom.get("text") or "").strip() for atom in header_atoms]
         centers = [_x_center(atom) for atom in header_atoms]
         bounds = [float("-inf"), *((left + right) / 2 for left, right in zip(centers, centers[1:])), float("inf")]
+        horizontal_rules = _page_horizontal_rules(
+            parse_result,
+            page_id,
+            atoms,
+            header_atoms,
+        )
         date_idx = col_map.get("date", col_map.get("timestamp"))
         if date_idx is None:
             continue
@@ -198,8 +215,7 @@ def _recover_geometry_bank_tables(
             (
                 _y_center(atom)
                 for atom in atoms
-                if float(atom["bbox"][1]) > header_bottom
-                and _is_geometry_footer_text(str(atom.get("text") or ""))
+                if float(atom["bbox"][1]) > header_bottom and _is_geometry_footer_text(str(atom.get("text") or ""))
             ),
             default=float("inf"),
         )
@@ -219,22 +235,31 @@ def _recover_geometry_bank_tables(
         row_atom_groups: list[list[dict[str, Any]]] = []
         for idx, anchor in enumerate(date_anchors):
             anchor_y = _y_center(anchor)
-            previous_y = _y_center(date_anchors[idx - 1]) if idx > 0 else header_bottom
             next_y = _y_center(date_anchors[idx + 1]) if idx + 1 < len(date_anchors) else float("inf")
             footer_limit: float | None = None
             if next_y == float("inf"):
                 footer_starts = [
                     _y_center(atom)
                     for atom in atoms
-                    if float(atom["bbox"][1]) > anchor_y
-                    and _is_geometry_footer_text(str(atom.get("text") or ""))
+                    if float(atom["bbox"][1]) > anchor_y and _is_geometry_footer_text(str(atom.get("text") or ""))
                 ]
                 footer_limit = min(footer_starts, default=float("inf"))
-            row_top = (previous_y + anchor_y) / 2
-            if next_y != float("inf"):
-                row_bottom = (anchor_y + next_y) / 2
+            previous_rule = max((rule for rule in horizontal_rules if rule < anchor_y), default=None)
+            next_rule = min((rule for rule in horizontal_rules if rule > anchor_y), default=None)
+            if previous_rule is not None and next_rule is not None:
+                # Native ledger rules are the strongest boundary evidence:
+                # wrapped cells may begin above the date baseline or end well
+                # below it, but cannot cross a full-width separator.
+                row_top = previous_rule + 0.5
+                row_bottom = next_rule - 0.5
             else:
-                row_bottom = footer_limit if footer_limit is not None else float("inf")
+                # Without vector rules, assign text to the closest preceding
+                # date anchor and stop at the next date/footer.
+                row_top = header_bottom if idx == 0 else anchor_y - 0.5
+                if next_y != float("inf"):
+                    row_bottom = next_y - 0.5
+                else:
+                    row_bottom = footer_limit if footer_limit is not None else float("inf")
             row_atoms = [
                 atom
                 for atom in atoms
@@ -259,12 +284,80 @@ def _recover_geometry_bank_tables(
                 row_atom_groups.append(row_atoms)
         if rows:
             _repair_geometry_rows(rows, col_map)
-            row_sources.extend(
-                _row_source(page_id, row_atoms, row)
-                for row_atoms, row in zip(row_atom_groups, rows)
-            )
+            row_sources.extend(_row_source(page_id, row_atoms, row) for row_atoms, row in zip(row_atom_groups, rows))
             tables.append([header_cells, *rows])
     return tables, row_sources, expected_rows
+
+
+def _page_horizontal_rules(
+    parse_result: Any,
+    page_id: str,
+    text_atoms: list[dict[str, Any]],
+    header_atoms: list[dict[str, Any]],
+) -> list[float]:
+    """Return full-width native horizontal rules aligned with a ledger header."""
+    from docmirror.plugins._runtime.evidence_access import evidence_payload
+
+    payload = evidence_payload(parse_result)
+    vector_atoms = [
+        atom
+        for atom in payload.get("vector_atoms") or []
+        if isinstance(atom, dict)
+        and str(atom.get("page_id") or "") == page_id
+        and isinstance(atom.get("bbox"), list)
+        and len(atom["bbox"]) >= 4
+    ]
+    if not vector_atoms:
+        return []
+
+    rotation = int(text_atoms[0].get("_geometry_rotation") or 0) if text_atoms else 0
+    page_number = int(page_id.rsplit(":", 1)[-1])
+    page = next(
+        (
+            item
+            for item in getattr(parse_result, "pages", []) or []
+            if int(getattr(item, "page_number", 0) or 0) == page_number
+        ),
+        None,
+    )
+    width = float(getattr(page, "width", 0) or 0)
+    height = float(getattr(page, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return []
+
+    rotated = [_rotated_atom(atom, rotation, width, height) for atom in vector_atoms]
+    horizontal = [
+        atom
+        for atom in rotated
+        if abs(float(atom["bbox"][3]) - float(atom["bbox"][1])) <= 1.0
+        and abs(float(atom["bbox"][2]) - float(atom["bbox"][0])) >= 8.0
+    ]
+    if not horizontal:
+        return []
+
+    header_left = min(float(atom["bbox"][0]) for atom in header_atoms)
+    header_right = max(float(atom["bbox"][2]) for atom in header_atoms)
+    required_span = max((header_right - header_left) * 0.75, 1.0)
+    groups: list[list[dict[str, Any]]] = []
+    for atom in sorted(horizontal, key=lambda item: float(item["bbox"][1])):
+        y = float(atom["bbox"][1])
+        if not groups:
+            groups.append([atom])
+            continue
+        baseline = sum(float(item["bbox"][1]) for item in groups[-1]) / len(groups[-1])
+        if abs(y - baseline) <= 1.0:
+            groups[-1].append(atom)
+        else:
+            groups.append([atom])
+
+    rules: list[float] = []
+    for group in groups:
+        left = min(float(atom["bbox"][0]) for atom in group)
+        right = max(float(atom["bbox"][2]) for atom in group)
+        if right - left < required_span:
+            continue
+        rules.append(sum(float(atom["bbox"][1]) for atom in group) / len(group))
+    return rules
 
 
 def _normalize_page_orientations(
@@ -543,7 +636,9 @@ def _geometry_header(
             expanded_valid = {"amount", "balance"}.issubset(expanded_fields) and bool(
                 expanded_fields.intersection({"date", "timestamp"})
             )
-            best = (expanded, expanded_map) if expanded_valid and len(expanded_map) >= len(col_map) else (ordered, col_map)
+            best = (
+                (expanded, expanded_map) if expanded_valid and len(expanded_map) >= len(col_map) else (ordered, col_map)
+            )
     return best
 
 
@@ -553,11 +648,7 @@ def _expand_staggered_header(
 ) -> list[dict[str, Any]]:
     """Merge lower labels from multi-tier headers without pulling in English rows."""
     baseline = sum(float(atom["bbox"][1]) for atom in header_atoms) / len(header_atoms)
-    band = [
-        atom
-        for atom in atoms
-        if baseline - 4.0 <= float(atom["bbox"][1]) <= baseline + 6.0
-    ]
+    band = [atom for atom in atoms if baseline - 4.0 <= float(atom["bbox"][1]) <= baseline + 6.0]
     return sorted(band, key=lambda atom: float(atom["bbox"][0]))
 
 
@@ -585,7 +676,7 @@ def _geometry_row_is_transaction(row: list[str]) -> bool:
 
 def _is_geometry_footer_text(text: str) -> bool:
     return any(marker in text for marker in _GEOMETRY_FOOTER_MARKERS) or bool(
-        re.search(r"第\s*\d+\s*页\s*共\s*\d+\s*页", text)
+        re.search(r"第\s*\d+\s*页\s*(?:[/／-]\s*)?共\s*\d+\s*页", text)
     )
 
 
@@ -595,9 +686,7 @@ def _repair_geometry_rows(rows: list[list[str]], col_map: dict[str, int]) -> Non
     amount_idx = col_map.get("amount")
     balance_idx = col_map.get("balance")
     summary_indexes = [
-        index
-        for key in ("summary", "purpose", "counter_party")
-        if (index := col_map.get(key)) is not None
+        index for key in ("summary", "purpose", "counter_party") if (index := col_map.get(key)) is not None
     ]
 
     for row in rows:

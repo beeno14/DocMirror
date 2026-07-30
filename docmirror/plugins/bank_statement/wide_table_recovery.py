@@ -33,16 +33,18 @@ _FOOTER_MARKERS = (
     "本月累计贷方发生数",
     "本月累计借方发生额",
     "本月累计贷方发生额",
+    "总收入笔数",
+    "总收入金额",
+    "总支出笔数",
+    "总支出金额",
     "出单截至日期",
     "以下此页无正文",
     "合计",
     "小计",
     "总计",
 )
-_COUNT_PATTERNS = (
-    re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),
-)
-_SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*共\s*(?P<total>\d+)\s*页")
+_COUNT_PATTERNS = (re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),)
+_SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*(?:[/／-]\s*)?共\s*(?P<total>\d+)\s*页")
 _SPLIT_COUNT_PATTERNS = (
     re.compile(
         r"借方合计笔数[:：]\s*(?P<debit>\d+)\s*笔?.*?"
@@ -54,6 +56,16 @@ _SPLIT_COUNT_PATTERNS = (
     re.compile(r"本月累计借方发生数[:：]\s*(?P<debit>\d+).*?本月累计贷方发生数[:：]\s*(?P<credit>\d+)", re.S),
     re.compile(r"支出总笔数[:：]\s*(?P<debit>\d+).*?收入总笔数[:：]\s*(?P<credit>\d+)", re.S),
     re.compile(r"收入总笔数[:：]\s*(?P<credit>\d+).*?支出总笔数[:：]\s*(?P<debit>\d+)", re.S),
+    re.compile(
+        r"总收入笔数\s*[:：]?\s*(?P<credit>\d+).*?"
+        r"总支出笔数\s*[:：]?\s*(?P<debit>\d+)",
+        re.S,
+    ),
+    re.compile(
+        r"总支出笔数\s*[:：]?\s*(?P<debit>\d+).*?"
+        r"总收入笔数\s*[:：]?\s*(?P<credit>\d+)",
+        re.S,
+    ),
 )
 _DEBIT_TOTAL_PATTERNS = (
     re.compile(r"借方发生总额[:：]\s*(?P<value>[\d,]+\.\d{2})"),

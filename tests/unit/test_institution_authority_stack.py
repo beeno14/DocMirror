@@ -131,3 +131,42 @@ def test_extract_masked_card_and_explicit_period_without_crossing_into_first_tra
 
     assert identity["account_number"] == "6230****6516"
     assert identity["query_period"] == "2023-01-01 ~ 2023-06-30"
+
+
+def test_header_identity_rejects_carry_forward_as_holder():
+    text = "\n".join(
+        [
+            "641301106013000859983",
+            "测试软件有限公司银川分公司",
+            "2025",
+            "人民币",
+            "某银行分行明细对账单",
+            "账号：",
+            "开户机构：某银行开发区支行",
+            "户名：",
+            "年份：",
+            "币种：",
+            "承前",
+            "贷方发生额",
+        ]
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity.get("account_holder") != "承前"
+
+
+def test_horizontal_header_supports_hyphenated_account_and_chinese_dates():
+    text = (
+        "账户明细\n"
+        "账号:31-080201040015288 户名:测试农业科技有限公司币种:人民币 "
+        "起止日期: 2025年11月01日 - 2025年12月31日\n"
+        "交易时间 收入金额 支出金额 账户余额 对方账号 对方户名 对方开户行 摘要"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["account_number"] == "31-080201040015288"
+    assert identity["account_holder"] == "测试农业科技有限公司"
+    assert identity["currency"] == "CNY"
+    assert identity["query_period"] == "2025-11-01 ~ 2025-12-31"

@@ -48,10 +48,12 @@ def test_normalize_table_headers_ccb_alias():
 
 def test_split_debit_credit_style_detection():
     ctx = StyleContext(
-        tables=[[
-            ["交易日期", "摘要", "收入", "支出", "余额"],
-            ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
-        ]],
+        tables=[
+            [
+                ["交易日期", "摘要", "收入", "支出", "余额"],
+                ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
+            ]
+        ],
         full_text="中国工商银行 个人客户交易明细",
         institution=None,
         page_count=1,
@@ -62,12 +64,14 @@ def test_split_debit_credit_style_detection():
 
 def test_style_registry_icbc_split_columns():
     ctx = StyleContext(
-        tables=[[
-            ["交易日期", "摘要", "收入", "支出", "余额"],
-            ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
-            ["2024-01-02", "转账支出", "0.00", "200.00", "7800.00"],
-            ["2024-01-03", "消费", "0.00", "50.00", "7750.00"],
-        ]],
+        tables=[
+            [
+                ["交易日期", "摘要", "收入", "支出", "余额"],
+                ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
+                ["2024-01-02", "转账支出", "0.00", "200.00", "7800.00"],
+                ["2024-01-03", "消费", "0.00", "50.00", "7750.00"],
+            ]
+        ],
         full_text="中国工商银行\n个人客户交易明细\n户名：张三",
         institution=None,
         page_count=1,
@@ -96,6 +100,23 @@ def test_normalize_split_debit_credit_direct():
     assert norm is not None
     assert norm["amount"] == 200.0
     assert norm["direction"] == "expense"
+
+
+def test_normalize_transaction_location_as_channel_alias():
+    plugin = BankStatementCommunityPlugin()
+    norm = normalize_split_debit_credit(
+        {
+            "交易日期": "2025-07-10",
+            "贷方发生额": "30,000.00",
+            "借方发生额": "",
+            "余额": "36,989.93",
+            "交易地点": "支付平台",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["channel"] == "支付平台"
 
 
 def test_normalize_merged_balance_and_timestamp_split_columns():
@@ -456,7 +477,18 @@ def test_split_grid_reads_bilingual_counterparty_and_repairs_canonical_raw_amoun
 
 
 def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
-    headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    headers = [
+        "序号",
+        "交易日期",
+        "交易时间",
+        "摘要",
+        "凭证种类",
+        "借方发生额",
+        "贷方发生额",
+        "余额",
+        "对方账户",
+        "对方户名",
+    ]
     raw_rows: list[list[str]] = []
     table_rows: list[TableRow] = []
     provenance: list[RowProvenance] = []
@@ -484,8 +516,7 @@ def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
                 for col_index, _value in enumerate(values)
             ]
             cells = [
-                CellValue(text=value, source_cell_refs=[refs[col_index]])
-                for col_index, value in enumerate(values)
+                CellValue(text=value, source_cell_refs=[refs[col_index]]) for col_index, value in enumerate(values)
             ]
             table_rows.append(
                 TableRow(
@@ -547,10 +578,18 @@ def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_ar
         ["4", "2022-08-01", "2022-08-01 10:00:00", "往来款", "50.00", "", "1048.00", "622200004", "丙公司"],
     ]
     pages = [
-        PageContent(page_number=1, texts=[TextBlock(content="1 2022-06-01 10:00:00 往来款 100.00 900.00 622200001 甲公司")]),
-        PageContent(page_number=1, texts=[TextBlock(content="2 2022-06-02 10:00:00 收费 2.00 898.00 622200002 手续费收入")]),
-        PageContent(page_number=2, texts=[TextBlock(content="3 2022-07-01 10:00:00 往来款 200.00 1,098.00 622200003 乙公司")]),
-        PageContent(page_number=3, texts=[TextBlock(content="4 2022-08-01 10:00:00 往来款 50.00 1,048.00 622200004 丙公司")]),
+        PageContent(
+            page_number=1, texts=[TextBlock(content="1 2022-06-01 10:00:00 往来款 100.00 900.00 622200001 甲公司")]
+        ),
+        PageContent(
+            page_number=1, texts=[TextBlock(content="2 2022-06-02 10:00:00 收费 2.00 898.00 622200002 手续费收入")]
+        ),
+        PageContent(
+            page_number=2, texts=[TextBlock(content="3 2022-07-01 10:00:00 往来款 200.00 1,098.00 622200003 乙公司")]
+        ),
+        PageContent(
+            page_number=3, texts=[TextBlock(content="4 2022-08-01 10:00:00 往来款 50.00 1,048.00 622200004 丙公司")]
+        ),
     ]
     ctx = StyleContext(
         tables=[[headers, *raw_rows]],
@@ -572,10 +611,30 @@ def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_ar
 def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
     headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
     raw_rows = [
-        ["13", "2022-06-13", "2022-06-13 18:19:36", "公共耗能和水电费用", "101.80", "", "54.15", "6232511300395178", "限公司"],
+        [
+            "13",
+            "2022-06-13",
+            "2022-06-13 18:19:36",
+            "公共耗能和水电费用",
+            "101.80",
+            "",
+            "54.15",
+            "6232511300395178",
+            "限公司",
+        ],
         ["14", "2022-06-13", "2022-06-13 18:19:36", "收费", "2.00", "", "52.15", "70650107360000033", "入"],
         ["15", "2022-06-21", "2022-06-21 00:21:02", "结息", "", "53.14", "6226.06", "", ""],
-        ["16", "2022-08-03", "2022-08-03 17:35:14", "tips扣税", "2159.00", "", "1320.91", "70010151830005003", "代收）"],
+        [
+            "16",
+            "2022-08-03",
+            "2022-08-03 17:35:14",
+            "tips扣税",
+            "2159.00",
+            "",
+            "1320.91",
+            "70010151830005003",
+            "代收）",
+        ],
     ]
     source_text = "\n".join(
         [
@@ -690,9 +749,7 @@ def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
         full_text=column_ordered_text,
         institution=None,
         page_count=1,
-        parse_result=ParseResult(
-            pages=[PageContent(page_number=1, texts=[TextBlock(content=column_ordered_text)])]
-        ),
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=column_ordered_text)])]),
         reconstruction=ReconstructionMeta(source="canonical_evidence_table", expected_primary_rows=2),
     )
 
@@ -707,9 +764,31 @@ def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
 
 
 def test_registry_prefers_semantic_text_table_when_canonical_grid_coverage_is_low():
-    bad_headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    bad_headers = [
+        "序号",
+        "交易日期",
+        "交易时间",
+        "摘要",
+        "凭证种类",
+        "借方发生额",
+        "贷方发生额",
+        "余额",
+        "对方账户",
+        "对方户名",
+    ]
     bad_rows = [
-        ["1", "2023-06-01", "11:47:14", "往来款", "16,500.00", "17,286.21", "7065018800015", "6836", "镇江一生一世好", ""],
+        [
+            "1",
+            "2023-06-01",
+            "11:47:14",
+            "往来款",
+            "16,500.00",
+            "17,286.21",
+            "7065018800015",
+            "6836",
+            "镇江一生一世好",
+            "",
+        ],
         ["3", "2023-06-01", "11:48:53", "工资", "514.46", "16,674.25", "6228760805004", "170034", "俞佩", ""],
     ]
     full_text = "\n".join(

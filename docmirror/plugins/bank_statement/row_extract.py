@@ -214,7 +214,7 @@ def _looks_like_repeated_header_fragment(values: list[str], headers: list[str]) 
         compact_header = _compact_layout_text(headers[index]).lower()
         if not compact_value or re.search(r"\d", compact_value):
             continue
-        if compact_value == compact_header or compact_value in compact_header:
+        if compact_value == compact_header or compact_value in compact_header or compact_header in compact_value:
             paired_matches += 1
     if paired_matches >= 2:
         return True
