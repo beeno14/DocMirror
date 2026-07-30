@@ -165,6 +165,56 @@ def test_bank_reconciliation_markdown_uses_alias_title_when_source_title_is_unav
     assert "# 银行流水" not in markdown
 
 
+def test_bank_reconciliation_markdown_preserves_non_transaction_remarks_page() -> None:
+    records = [
+        {
+            "raw": {"交易日期": "2025/12/31", "借方发生额": "0.90", "账户余额": "24,175.16"},
+            "normalized": {
+                "date": "2025-12-31",
+                "direction": "expense",
+                "amount": 0.9,
+                "balance": 24175.16,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    source_pages = {
+        1: "上海浦东发展银行电子对账单\nDate | 交易流水号 | 发生额 | 账户余额",
+        2: "\n".join(
+            [
+                "第2页,共2页",
+                "提示 Remarks:",
+                "1、请及时核实可能发生的财务差错。",
+                "2、交易日期为银行记账日期。",
+                "2026/02/24",
+                "2VU4LBSCQ0LN8UT",
+                "账单生成日期 Statement Generation Date",
+            ]
+        ),
+    }
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {
+            "statement_title": "上海浦东发展银行电子对账单",
+            "account_holder": "测试有限公司",
+            "account_number": "001234",
+        },
+        {"start": "2025-01-01", "end": "2025-12-31"},
+        source_pages[1],
+        document_type="bank_reconciliation",
+        source_pages=source_pages,
+    )
+
+    assert markdown.count("docmirror:page") == 2
+    assert '<!-- docmirror:page logical="2" source="2" -->' in markdown
+    assert "提示 Remarks:" in markdown
+    assert "1、请及时核实可能发生的财务差错。" in markdown
+    assert "账单生成日期 Statement Generation Date 2026/02/24" in markdown
+    assert "2VU4LBSCQ0LN8UT" not in markdown
+    assert "Date | 交易流水号 | 发生额 | 账户余额" not in markdown
+
+
 def test_bank_statement_markdown_prefers_source_reading_table_when_raw_headers_are_complete() -> None:
     records = [
         {
@@ -553,3 +603,23 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
     assert sanitized[8]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
     assert sanitized[9]["normalized"]["counter_party"] == ""
     assert sanitized[9]["raw"]["对方户名"] == ""
+
+
+def test_bank_statement_counterparty_pollution_allows_one_long_identifier_only() -> None:
+    records = [
+        {
+            "raw": {"对方户名": "供应商统一代码 123456789012345678"},
+            "canonical_raw": {"counter_party": "供应商统一代码 123456789012345678"},
+            "normalized": {"counter_party": "供应商统一代码 123456789012345678"},
+        },
+        {
+            "raw": {"对方户名": "供应商 12345678 87654321"},
+            "canonical_raw": {"counter_party": "供应商 12345678 87654321"},
+            "normalized": {"counter_party": "供应商 12345678 87654321"},
+        },
+    ]
+
+    sanitized = _sanitize_bank_records(records)
+
+    assert sanitized[0]["normalized"]["counter_party"] == "供应商统一代码 123456789012345678"
+    assert sanitized[1]["normalized"]["counter_party"] == ""

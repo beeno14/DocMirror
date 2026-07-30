@@ -418,6 +418,42 @@ def test_canonical_stacked_bilingual_headers_preserve_debit_credit_and_counterpa
     assert [record["normalized"]["counter_party"] for record in records] == ["甲公司", "乙公司"]
     assert [record["source"]["source_page"] for record in records] == [1, 1]
 
+    sanitized = _sanitize_bank_records(records)
+    assert [record["canonical_raw"]["amount"] for record in sanitized] == ["50.00", "75.00"]
+
+
+def test_split_grid_reads_bilingual_counterparty_and_repairs_canonical_raw_amount() -> None:
+    raw = {
+        "交易日期\nTransaction Date": "2025-01-02",
+        "发生额\nTransaction Amount\n借方\nDebit": "88.20",
+        "发生额\nTransaction Amount\n贷方\nCredit": "",
+        "余额\nBalance": "911.80",
+        "交易对手信息\nCounterparty Information\n对手机构\nCounterparty\nInstitution": "测试银行科技支行",
+        "对手名称\nCounterparty Name": "测试供应链有限公司",
+        "备注\nDescription": "采购付款",
+    }
+    normalized = normalize_split_debit_credit(raw, BankStatementCommunityPlugin())
+    assert normalized is not None
+
+    records = _sanitize_bank_records(
+        [
+            {
+                "raw": raw,
+                "normalized": normalized,
+                "canonical_raw": {"amount": "", "amount_cny": "", "counter_party": ""},
+            }
+        ]
+    )
+
+    assert normalized["direction"] == "expense"
+    assert normalized["amount"] == 88.2
+    assert normalized["counter_party"] == "测试供应链有限公司"
+    assert normalized["counter_bank_name"] == "测试银行科技支行"
+    assert records[0]["canonical_raw"]["amount"] == "88.20"
+    assert records[0]["canonical_raw"]["amount_cny"] == "88.20"
+    assert records[0]["canonical_raw"]["counter_party"] == "测试供应链有限公司"
+    assert records[0]["canonical_raw"]["counter_bank_name"] == "测试银行科技支行"
+
 
 def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
     headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
@@ -809,6 +845,7 @@ def _sourced_bank_row(values: list[str], *, page: int, row_index: int) -> TableR
 def _cross_page_bank_parse_result(
     *,
     valid_page_two_row: bool = False,
+    repeated_header_fragment: bool = False,
     fragment_page: int = 2,
     fragment_row_index: int = 0,
 ) -> ParseResult:
@@ -838,6 +875,19 @@ def _cross_page_bank_parse_result(
             "转户",
         ]
         if valid_page_two_row
+        else [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "借方\nDebit",
+            "贷方\nCredit",
+            "",
+            "对手名称\nCounterparty Name",
+            "备注\nDescription",
+        ]
+        if repeated_header_fragment
         else [
             "",
             "06-28\n19:50:16",
@@ -951,6 +1001,20 @@ def test_cross_page_stitch_does_not_merge_valid_page_two_transaction():
     assert result.records[0]["normalized"]["date"] == "2023-06-28"
     assert result.records[0]["normalized"]["amount"] == 500.0
     assert "source_refs" not in result.records[0]["source"]
+
+
+def test_cross_page_stitch_does_not_merge_repeated_page_header():
+    result = run_bank_statement_extract(
+        _cross_page_bank_parse_result(repeated_header_fragment=True),
+        "上饶银行账户交易明细",
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0]["normalized"]["sequence_no"] == "14"
+    assert result.records[0]["source"]["page_range"] == [2, 2]
+    assert result.ctx.reconstruction is not None
+    assert result.ctx.reconstruction.stitched_continuation_rows == 0
 
 
 @pytest.mark.parametrize(

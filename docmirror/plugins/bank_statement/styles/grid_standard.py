@@ -59,7 +59,15 @@ _DIRECTION_KEYS = (
     "Dc Flg",
 )
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
-_COUNTERPARTY_KEYS = ("对方户名", "对方名称", "交易对方", "交易对手", "counter_party")
+_COUNTERPARTY_KEYS = (
+    "对方户名",
+    "对方名称",
+    "对手名称",
+    "交易对方",
+    "交易对手",
+    "Counterparty Name",
+    "counter_party",
+)
 _COUNTER_ACCOUNT_KEYS = ("对方账户", "对方账号", "counter_account")
 _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
     "序号交易日期",
@@ -88,6 +96,51 @@ def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
     return ""
 
 
+def _registry_field_keys(plugin: Any, canonical_header: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    """Return stable field aliases from the plugin registry plus parser fallbacks."""
+    registry = getattr(plugin, "column_registry", None)
+    mapping = registry.get(canonical_header) if isinstance(registry, dict) else None
+    aliases = getattr(mapping, "aliases", ()) or ()
+    return tuple(dict.fromkeys((canonical_header, *aliases, *fallback)))
+
+
+def _explicit_source_column_value(raw_txn: dict[str, str], aliases: tuple[str, ...]) -> str:
+    def compact(value: Any) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).lower()
+
+    compact_aliases = {compact(alias) for alias in aliases}
+    for raw_header, value in raw_txn.items():
+        compact_header = compact(raw_header)
+        header_parts = {
+            compact(part)
+            for part in str(raw_header or "").splitlines()
+            if compact(part)
+        }
+        if compact_header in compact_aliases or compact_aliases.intersection(header_parts):
+            return str(value or "").strip()
+    return ""
+
+
+def _normalize_source_counterparty_columns(
+    raw_txn: dict[str, str],
+    normalized: dict[str, Any],
+) -> None:
+    """Prefer explicit source party/institution columns over fuzzy base matches."""
+    counter_party = _explicit_source_column_value(
+        raw_txn,
+        ("对方户名", "对方名称", "对手名称", "交易对方", "Counterparty Name", "对方账号与户名"),
+    )
+    if counter_party:
+        normalized["counter_party"] = _clean_wrapped_text(counter_party)
+
+    counter_bank = _explicit_source_column_value(
+        raw_txn,
+        ("对方行名", "对手机构", "对方开户行", "对方银行名称", "Counterparty Institution"),
+    )
+    if counter_bank:
+        normalized["counter_bank_name"] = _clean_wrapped_text(counter_bank)
+
+
 def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
     """Parse separate debit/credit columns into amount + direction."""
     directed = _normalize_direction_amount(raw_txn, plugin)
@@ -107,6 +160,7 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     if normalized.get("counter_party"):
         normalized["counter_party"] = _clean_wrapped_text(str(normalized.get("counter_party") or ""))
     if normalized.get("counter_account"):
@@ -121,10 +175,9 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
     if not str(normalized.get("counter_party", "") or "").strip():
         cp = _cell_value(
             raw_txn,
-            "备注",
-            "对方户名",
+            *_registry_field_keys(plugin, "对方户名", _COUNTERPARTY_KEYS),
             "对方账号与户名",
-            "交易对方",
+            "备注",
             "Remarks",
         )
         if cp:
@@ -151,6 +204,7 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
     normalized["direction"] = direction
@@ -185,6 +239,7 @@ def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
     normalized["direction"] = direction
@@ -1060,9 +1115,12 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
             amount, direction = parse_signed_amount(str(value))
             if amount is not None:
                 normalized = plugin._normalize(raw_txn)
+                _normalize_source_counterparty_columns(raw_txn, normalized)
                 normalized["amount"] = amount
                 normalized["amount_cny"] = amount
                 normalized["direction"] = direction
                 return _normalize_wrapped_temporal_fields(normalized, raw_txn)
 
-    return _normalize_wrapped_temporal_fields(plugin._normalize(raw_txn), raw_txn)
+    normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
+    return _normalize_wrapped_temporal_fields(normalized, raw_txn)

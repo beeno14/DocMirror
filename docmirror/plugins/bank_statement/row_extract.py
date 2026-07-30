@@ -204,6 +204,39 @@ def _starts_at_page_top(fragment: dict[str, Any]) -> bool:
         return False
 
 
+def _looks_like_repeated_header_fragment(values: list[str], headers: list[str]) -> bool:
+    """Return whether a page-top row repeats child/header labels rather than data."""
+    paired_matches = 0
+    for index, value in enumerate(values):
+        if index >= len(headers):
+            break
+        compact_value = _compact_layout_text(value).lower()
+        compact_header = _compact_layout_text(headers[index]).lower()
+        if not compact_value or re.search(r"\d", compact_value):
+            continue
+        if compact_value == compact_header or compact_value in compact_header:
+            paired_matches += 1
+    if paired_matches >= 2:
+        return True
+
+    header_markers = (
+        "借方",
+        "贷方",
+        "debit",
+        "credit",
+        "对手名称",
+        "counterpartyname",
+        "对手机构",
+        "counterpartyinstitution",
+    )
+    marker_cells = sum(
+        any(marker in _compact_layout_text(value).lower() for marker in header_markers)
+        for value in values
+        if str(value or "").strip()
+    )
+    return marker_cells >= 2
+
+
 def _is_cross_page_continuation(
     previous: dict[str, Any],
     current: dict[str, Any],
@@ -222,6 +255,8 @@ def _is_cross_page_continuation(
     if len(previous_values) != len(current_values) or not any(str(value or "").strip() for value in current_values):
         return False
     if any(marker in "".join(str(value or "") for value in current_values) for marker in _SUMMARY_MARKERS):
+        return False
+    if _looks_like_repeated_header_fragment(current_values, headers):
         return False
 
     sequence_indexes = _header_indexes(headers, _SEQUENCE_HEADER_MARKERS)
