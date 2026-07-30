@@ -317,7 +317,6 @@ class BankStyleParserRegistry:
         if atom_tables:
             atom_count = sum(max(len(table) - 1, 0) for table in atom_tables)
             atom_expected = max(
-                expected,
                 atom_count,
                 recovered_evidence_atom_expected_row_count(ctx.parse_result),
             )

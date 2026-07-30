@@ -16,6 +16,7 @@ Key exports: ``BankExtractResult``, ``run_bank_statement_extract``,
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -28,7 +29,10 @@ from docmirror.plugins.bank_statement.institution_authority import (
 )
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
-from docmirror.plugins.bank_statement.wide_table_recovery import audit_bank_statement_invariants
+from docmirror.plugins.bank_statement.wide_table_recovery import (
+    audit_bank_statement_invariants,
+    count_expected_rows_from_bank_footer,
+)
 
 
 @dataclass
@@ -172,8 +176,35 @@ def run_bank_statement_extract(
         evidence_identity = {}
     if evidence_identity:
         for field_name, detail in evidence_identity.items():
-            if field_name not in identity_fields or field_name == "bank_name":
+            current = identity_fields.get(field_name)
+            current_source = str(current.get("source") or "") if isinstance(current, dict) else ""
+            evidence_preferred = field_name in {
+                "account_holder",
+                "account_number",
+                "query_period",
+                "currency",
+                "total_transactions",
+            }
+            if (
+                field_name not in identity_fields
+                or field_name == "bank_name"
+                or (evidence_preferred and current_source in {"header.kv", "bank_statement.default"})
+            ):
                 identity_fields[field_name] = detail
+    source_reported_count = count_expected_rows_from_bank_footer(ctx.full_text)
+    total_detail = identity_fields.get("total_transactions")
+    if isinstance(total_detail, dict):
+        total_value = next(
+            (
+                str(total_detail.get(candidate) or "")
+                for candidate in ("normalized_value", "value", "raw_value")
+                if total_detail.get(candidate) not in (None, "")
+            ),
+            "",
+        )
+        match = re.search(r"\d+", total_value)
+        if match:
+            source_reported_count = int(match.group())
     style_meta = build_style_meta(
         detection,
         reconstruction=ctx.reconstruction,
@@ -181,6 +212,7 @@ def run_bank_statement_extract(
         parse_result=parse_result,
         records=records,
         blo_meta=blo_meta,
+        source_reported_count=source_reported_count,
     )
     warnings = collect_extract_warnings(ctx, style_meta)
     invariant_failures = audit_bank_statement_invariants(records, ctx.full_text)

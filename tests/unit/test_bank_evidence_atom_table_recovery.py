@@ -29,10 +29,15 @@ def _atom(atom_id: str, text: str, x0: float, y0: float, x1: float | None = None
     }
 
 
-def _result(atoms: list[dict]) -> SimpleNamespace:
+def _result(atoms: list[dict], vector_atoms: list[dict] | None = None) -> SimpleNamespace:
     page_numbers = sorted({int(str(atom.get("page_id") or "page:0001").rsplit(":", 1)[-1]) for atom in atoms})
     return SimpleNamespace(
-        evidence_plane=SimpleNamespace(evidence={"text_atoms": atoms}),
+        evidence_plane=SimpleNamespace(
+            evidence={
+                "text_atoms": atoms,
+                "vector_atoms": list(vector_atoms or []),
+            }
+        ),
         pages=[SimpleNamespace(page_number=page, width=600, height=850) for page in page_numbers],
         entities=SimpleNamespace(domain_specific={}),
     )
@@ -431,6 +436,112 @@ def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
     assert fields["total_transactions"]["normalized_value"] == "38"
     assert fields["account_number"]["normalized_value"] == "1234567890"
     assert fields["bank_name"]["normalized_value"] == "浦发银行重庆分行营业部"
+
+
+def test_evidence_identity_recovers_split_header_values_and_directional_totals():
+    atoms = [
+        _atom("title", "交通银行某分行明细对账单", 180.0, 20.0, 390.0),
+        _atom("account_label", "账号：", 20.0, 50.0, 55.0),
+        _atom("account", "641301106013000859983", 60.0, 50.0, 180.0),
+        _atom("holder_label", "户名：", 220.0, 50.0, 255.0),
+        _atom("holder", "测试软件有限公司银川分公司", 260.0, 50.0, 430.0),
+        _atom("year_label", "年份：", 20.0, 65.0, 55.0),
+        _atom("year", "2025", 60.0, 65.0, 90.0),
+        _atom("month_label", "月份：", 120.0, 65.0, 155.0),
+        _atom("month", "07", 160.0, 65.0, 180.0),
+        _atom("currency_label", "币种：", 220.0, 65.0, 255.0),
+        _atom("currency", "人民币", 260.0, 65.0, 300.0),
+        _atom("carry", "承前", 20.0, 100.0, 50.0),
+        _atom("debit_label", "当前账单借方发生数：", 20.0, 220.0, 145.0),
+        _atom("debit", "10", 150.0, 220.0, 170.0),
+        _atom("credit", "当前账单贷方发生数：1", 300.0, 220.0, 450.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["account_holder"]["normalized_value"] == "测试软件有限公司银川分公司"
+    assert fields["account_number"]["normalized_value"] == "641301106013000859983"
+    assert fields["currency"]["raw_value"] == "人民币"
+    assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["query_period"]["normalized_value"] == "2025-07-01 至 2025-07-31"
+    assert fields["total_transactions"]["normalized_value"] == "11"
+
+
+def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():
+    atoms = [
+        _atom("title", "账户明细", 250.0, 20.0, 340.0),
+        _atom("account", "账号:31-080201040015288", 20.0, 45.0, 170.0),
+        _atom("identity", "户名:测试农业科技有限公司币种:人民币", 190.0, 45.0, 430.0),
+        _atom("period_label", "起止日期:", 450.0, 45.0, 510.0),
+        _atom("period_start", "2025年11月01日", 520.0, 45.0, 610.0),
+        _atom("period_sep", "-", 615.0, 45.0, 620.0),
+        _atom("period_end", "2025年12月31日", 625.0, 45.0, 715.0),
+        _atom("income_count", "总收入笔数", 20.0, 220.0, 90.0),
+        _atom("income_value", "2", 95.0, 220.0, 105.0),
+        _atom("expense_count", "总支出笔数", 220.0, 220.0, 290.0),
+        _atom("expense_value", "2", 295.0, 220.0, 305.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["account_number"]["normalized_value"] == "31-080201040015288"
+    assert fields["account_holder"]["normalized_value"] == "测试农业科技有限公司"
+    assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["query_period"]["normalized_value"] == "2025-11-01 至 2025-12-31"
+    assert fields["total_transactions"]["normalized_value"] == "4"
+
+
+def test_geometry_recovery_keeps_wrapped_cells_with_preceding_date_and_stops_at_footer():
+    atoms = [
+        _atom("h1", "交易时间", 20.0, 80.0, 80.0),
+        _atom("h2", "收入金额", 100.0, 80.0, 160.0),
+        _atom("h3", "支出金额", 180.0, 80.0, 240.0),
+        _atom("h4", "账户余额", 260.0, 80.0, 320.0),
+        _atom("h5", "对方账号", 340.0, 80.0, 400.0),
+        _atom("h6", "对方户名", 420.0, 80.0, 480.0),
+        _atom("h7", "对方开户行", 500.0, 80.0, 575.0),
+        _atom("h8", "摘要", 600.0, 80.0, 640.0),
+        _atom("d1", "2025-11-24", 20.0, 110.0, 80.0),
+        _atom("t1", "00:46:17", 20.0, 120.0, 70.0),
+        _atom("e1", "100.00", 180.0, 110.0, 235.0),
+        _atom("b1", "110.97", 260.0, 110.0, 315.0),
+        _atom("a1", "31080243CNYFC0445", 340.0, 110.0, 400.0),
+        _atom("p1", "测试银行股份有限公司", 420.0, 110.0, 480.0),
+        _atom("bn1a", "测试银行股份有限公司", 500.0, 110.0, 575.0),
+        _atom("bn1b", "重庆九龙坡二", 500.0, 125.0, 560.0),
+        _atom("bn1c", "郎支行", 500.0, 145.0, 535.0),
+        _atom("s1", "批量扣费", 600.0, 110.0, 640.0),
+        _atom("d2", "2025-12-21", 20.0, 160.0, 80.0),
+        _atom("t2", "01:10:43", 20.0, 170.0, 70.0),
+        _atom("i2", "0.03", 100.0, 160.0, 150.0),
+        _atom("b2", "111.00", 260.0, 160.0, 315.0),
+        _atom("bn2", "第二银行", 500.0, 152.0, 550.0),
+        _atom("s2", "批量结息", 600.0, 160.0, 640.0),
+        _atom("income_count", "总收入笔数", 20.0, 205.0, 90.0),
+        _atom("income_value", "1", 100.0, 205.0, 110.0),
+        _atom("income_total", "总收入金额", 180.0, 205.0, 250.0),
+        _atom("income_amount", "0.03", 260.0, 205.0, 300.0),
+        _atom("page", "第1页/共1页", 280.0, 400.0, 350.0),
+    ]
+
+    vector_atoms = [
+        {
+            "id": f"rule-{index}",
+            "page_id": "page:0001",
+            "bbox": [0.0, y, 650.0, y],
+        }
+        for index, y in enumerate((95.0, 150.0, 200.0), start=1)
+    ]
+    parse_result = _result(atoms, vector_atoms)
+    tables = recover_evidence_atom_bank_tables(parse_result)
+
+    assert len(tables) == 1
+    assert len(tables[0]) == 3
+    assert tables[0][1][6] == "测试银行股份有限公司重庆九龙坡二郎支行"
+    assert tables[0][2][5:7] == ["", "第二银行"]
+    assert all("总收入" not in "".join(row) for row in tables[0][1:])
+    assert all("第1页" not in "".join(row) for row in tables[0][1:])
+    assert recovered_evidence_atom_expected_row_count(parse_result) == 2
 
 
 def test_evidence_identity_stops_at_branch_and_ignores_transaction_loan_account():

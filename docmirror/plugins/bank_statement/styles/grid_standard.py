@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import replace
 from typing import Any
 
-from docmirror.plugins._base.standardizer import normalize_amount
+from docmirror.plugins._base.standardizer import normalize_amount, normalize_timestamp
 from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.header_resolve import (
     detect_headers,
@@ -58,8 +59,32 @@ _DIRECTION_KEYS = (
     "Dc Flg",
 )
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
-_COUNTERPARTY_KEYS = ("对方户名", "对方名称", "交易对方", "交易对手", "counter_party")
+_COUNTERPARTY_KEYS = (
+    "对方户名",
+    "对方名称",
+    "对手名称",
+    "交易对方",
+    "交易对手",
+    "Counterparty Name",
+    "counter_party",
+)
 _COUNTER_ACCOUNT_KEYS = ("对方账户", "对方账号", "counter_account")
+_COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
+    "序号交易日期",
+    "对方账号",
+    "对方账户",
+    "对方户名",
+    "清单支出算术合计",
+    "清单收入算术合计",
+    "打印渠道",
+    "打印机构",
+    "打印柜员",
+    "打印时间",
+    "本页支出算术合计",
+    "本页收入算术合计",
+    "交易提示",
+    "CPKYG",
+)
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
@@ -69,6 +94,51 @@ def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
             if key == needle or needle in key or norm_key == normalize_header_cell(needle):
                 return str(value or "").strip()
     return ""
+
+
+def _registry_field_keys(plugin: Any, canonical_header: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
+    """Return stable field aliases from the plugin registry plus parser fallbacks."""
+    registry = getattr(plugin, "column_registry", None)
+    mapping = registry.get(canonical_header) if isinstance(registry, dict) else None
+    aliases = getattr(mapping, "aliases", ()) or ()
+    return tuple(dict.fromkeys((canonical_header, *aliases, *fallback)))
+
+
+def _explicit_source_column_value(raw_txn: dict[str, str], aliases: tuple[str, ...]) -> str:
+    def compact(value: Any) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).lower()
+
+    compact_aliases = {compact(alias) for alias in aliases}
+    for raw_header, value in raw_txn.items():
+        compact_header = compact(raw_header)
+        header_parts = {
+            compact(part)
+            for part in str(raw_header or "").splitlines()
+            if compact(part)
+        }
+        if compact_header in compact_aliases or compact_aliases.intersection(header_parts):
+            return str(value or "").strip()
+    return ""
+
+
+def _normalize_source_counterparty_columns(
+    raw_txn: dict[str, str],
+    normalized: dict[str, Any],
+) -> None:
+    """Prefer explicit source party/institution columns over fuzzy base matches."""
+    counter_party = _explicit_source_column_value(
+        raw_txn,
+        ("对方户名", "对方名称", "对手名称", "交易对方", "Counterparty Name", "对方账号与户名"),
+    )
+    if counter_party:
+        normalized["counter_party"] = _clean_wrapped_text(counter_party)
+
+    counter_bank = _explicit_source_column_value(
+        raw_txn,
+        ("对方行名", "对手机构", "对方开户行", "对方银行名称", "Counterparty Institution"),
+    )
+    if counter_bank:
+        normalized["counter_bank_name"] = _clean_wrapped_text(counter_bank)
 
 
 def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
@@ -90,6 +160,7 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     if normalized.get("counter_party"):
         normalized["counter_party"] = _clean_wrapped_text(str(normalized.get("counter_party") or ""))
     if normalized.get("counter_account"):
@@ -104,10 +175,9 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
     if not str(normalized.get("counter_party", "") or "").strip():
         cp = _cell_value(
             raw_txn,
-            "备注",
-            "对方户名",
+            *_registry_field_keys(plugin, "对方户名", _COUNTERPARTY_KEYS),
             "对方账号与户名",
-            "交易对方",
+            "备注",
             "Remarks",
         )
         if cp:
@@ -134,6 +204,7 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
     normalized["direction"] = direction
@@ -168,6 +239,7 @@ def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -
         return None
 
     normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
     normalized["direction"] = direction
@@ -178,7 +250,8 @@ def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -
 
 
 def _normalize_monetary_cell(value: str) -> float | None:
-    match = _MONEY_PREFIX_RE.search(str(value or "").strip())
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).strip()
+    match = _MONEY_PREFIX_RE.search(compact)
     return normalize_amount(match.group(1)) if match else None
 
 
@@ -222,12 +295,17 @@ def _extract_split_grid_records(
             first_cell = str(row[0] or "").strip()
             if any(kw in first_cell for kw in ("合计", "小计", "本页", "总计")) or is_footer_or_total_row(row):
                 continue
+            if not row_has_transaction_data(row, strict_first_col=False):
+                continue
             txn: dict[str, str] = {}
             for idx, cell in enumerate(row):
                 header = raw_headers[idx] if idx < len(raw_headers) else f"col_{idx}"
                 txn[header] = str(cell or "").strip()
-            if any(txn.values()):
-                transactions.append(txn)
+            income = _normalize_monetary_cell(_cell_value(txn, *_SPLIT_CREDIT_KEYS))
+            expense = _normalize_monetary_cell(_cell_value(txn, *_SPLIT_DEBIT_KEYS))
+            if float(income or 0) <= 0 and float(expense or 0) <= 0:
+                continue
+            transactions.append(txn)
     return transactions
 
 
@@ -305,7 +383,7 @@ def _recover_missing_counterparties_from_page_text(
                 next_start = _next_located_row_start(locations, index, len(page_index[0]))
                 candidate = _slice_original_by_compact(page_text, page_index[1], account_end, next_start)
                 recovered = _clean_recovered_counterparty(candidate)
-                if recovered:
+                if recovered and _is_safe_recovered_counterparty(recovered):
                     _set_counterparty(transaction, recovered)
 
 
@@ -498,18 +576,25 @@ def _looks_like_transaction_fragment(compact: str) -> bool:
 
 def _strip_recovered_counterparty_after_marker(value: str) -> str:
     compact, _offsets = _compact_text_with_offsets(value)
-    markers = (
-        "序号交易日期",
-        "借方笔数",
-        "贷方笔数",
-        "合计笔数",
-        "打印时间",
-        "CPKYG",
-    )
+    markers = (*_COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS, "借方笔数", "贷方笔数", "合计笔数")
     positions = [compact.find(marker) for marker in markers if compact.find(marker) >= 0]
     if not positions:
         return value
     return _prefix_by_compact_length(value, min(positions))
+
+
+def _is_safe_recovered_counterparty(value: str) -> bool:
+    compact = _signature_value(value)
+    if not compact or len(compact) > 120:
+        return False
+    if any(marker in compact for marker in _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS):
+        return False
+    if len(re.findall(r"(?<!\d)\d{8,}(?!\d)", compact)) > 1:
+        return False
+    if re.fullmatch(r"[\d*＊,./:：-]{8,}", compact):
+        return False
+    repeated_channels = sum(compact.count(marker) for marker in ("WL财付通", "WL支付宝", "微信转账"))
+    return repeated_channels <= 2
 
 
 def _prefix_by_compact_length(value: str, compact_length: int) -> str:
@@ -903,15 +988,23 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
     if (
         ctx.parse_result is not None
         and ctx.reconstruction is not None
-        and ctx.reconstruction.source == "canonical_table"
+        and ctx.reconstruction.source in {"canonical_table", "none"}
         and not ctx.prefer_context_tables
     ):
+        logical_stats: dict[str, int] = {}
         logical_transactions = extract_logical_rows_with_provenance(
             ctx.parse_result,
             plugin.column_registry,
             strict_first_col=True,
+            stats=logical_stats,
         )
         if logical_transactions:
+            stitched_count = int(logical_stats.get("stitched_continuation_rows") or 0)
+            if stitched_count > 0:
+                ctx.reconstruction = replace(
+                    ctx.reconstruction,
+                    stitched_continuation_rows=stitched_count,
+                )
             return _finalize_transactions(logical_transactions, ctx.parse_result, ctx.full_text)
 
     split_txns: list[dict[str, str]] = []
@@ -976,29 +1069,44 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
     )
 
 
+def _normalize_wrapped_temporal_fields(
+    normalized: dict[str, Any],
+    raw_txn: dict[str, str],
+) -> dict[str, Any]:
+    out = dict(normalized)
+    date_value = _cell_value(raw_txn, "交易日期", "记账日", "记账日期", "日期", "Date")
+    timestamp_value = _cell_value(raw_txn, "交易时间", "时间", "Time")
+    timestamp_compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", timestamp_value))
+    date_compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", date_value))
+
+    temporal_candidate = timestamp_compact
+    if timestamp_compact and not re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", timestamp_compact):
+        temporal_candidate = f"{date_compact}{timestamp_compact}" if date_compact else ""
+    elif not temporal_candidate:
+        temporal_candidate = date_compact
+
+    if temporal_candidate:
+        parsed = normalize_timestamp(temporal_candidate)
+        if re.match(r"^\d{4}-\d{2}-\d{2}", parsed):
+            out["date"] = parsed[:10]
+            if ":" in temporal_candidate:
+                out["timestamp"] = parsed
+
+    balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
+    if balance is not None:
+        out["balance"] = float(balance)
+    return out
+
+
 def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
     if raw_txn.get("_compact") == "1":
         from docmirror.plugins.bank_statement.styles.compact_merged import normalize_record as compact_norm
 
-        return compact_norm(raw_txn)
+        return _normalize_wrapped_temporal_fields(compact_norm(raw_txn), raw_txn)
 
     split = normalize_split_debit_credit(raw_txn, plugin)
     if split is not None:
-        from docmirror.plugins._base.standardizer import normalize_timestamp
-
-        if not split.get("date"):
-            date_keys = ("交易日期", "记账日", "记账日期", "日期", "交易时间")
-            for key in date_keys:
-                norm_key = normalize_header_cell(key)
-                for raw_key, raw_val in raw_txn.items():
-                    if not str(raw_val or "").strip():
-                        continue
-                    if normalize_header_cell(raw_key) == norm_key or key in raw_key:
-                        split["date"] = normalize_timestamp(str(raw_val))[:10]
-                        break
-                if split.get("date"):
-                    break
-        return split
+        return _normalize_wrapped_temporal_fields(split, raw_txn)
 
     from docmirror.plugins.bank_statement.styles.signed_amount import parse_signed_amount
 
@@ -1007,9 +1115,12 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
             amount, direction = parse_signed_amount(str(value))
             if amount is not None:
                 normalized = plugin._normalize(raw_txn)
+                _normalize_source_counterparty_columns(raw_txn, normalized)
                 normalized["amount"] = amount
                 normalized["amount_cny"] = amount
                 normalized["direction"] = direction
-                return normalized
+                return _normalize_wrapped_temporal_fields(normalized, raw_txn)
 
-    return plugin._normalize(raw_txn)
+    normalized = plugin._normalize(raw_txn)
+    _normalize_source_counterparty_columns(raw_txn, normalized)
+    return _normalize_wrapped_temporal_fields(normalized, raw_txn)

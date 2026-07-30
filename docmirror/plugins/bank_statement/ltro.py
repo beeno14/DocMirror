@@ -42,6 +42,7 @@ SourceKind = Literal[
 class ReconstructionMeta:
     source: SourceKind
     expected_primary_rows: int = 0
+    stitched_continuation_rows: int = 0
     pipe_header_detected: bool = False
     pipe_parse_failed: bool = False
     pages_scanned: int = 0
