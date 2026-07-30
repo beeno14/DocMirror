@@ -24,6 +24,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 _FIXTURE_DIR = Path("tests/fixtures-private/credit_report")
 _DIGITAL_PERSONAL_BRIEF_DIR = _FIXTURE_DIR / "Digital Personal Brief"
 _DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
+_KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
 
 _DIGITAL_PERSONAL_BRIEF_EXPECTED = {
     "人行征信报告-2025-04-14.pdf": (18, 0, 82, 10, 1),
@@ -67,6 +68,44 @@ CASES = [
     ],
     *_cases("*_企业征信*.pdf", "enterprise", "enterprise_credit_report"),
 ]
+
+
+def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
+    if not _KUNMING_YUXUAN_FIXTURE.exists():
+        pytest.skip("昆明煜萱 digital-enterprise regression fixture is unavailable")
+
+    sealed = asyncio.run(
+        perceive_document(
+            _KUNMING_YUXUAN_FIXTURE,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(_KUNMING_YUXUAN_FIXTURE))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+
+    assert semantic["domain"]["facts"]["institution_credit_code"] == "G1053011404727700K"
+    assert semantic["domain"]["data_dictionary"]["fields"]["institution_credit_code"] == {
+        "label": "机构信用代码",
+        "type": "string",
+        "format": "long_id",
+        "sensitive": True,
+    }
+    identity_section = next(section for section in payload["sections"] if section["title"] == "身份标识")
+    identity_item = next(item for item in identity_section["items"] if item["key"] == "institution_credit_code")
+    assert identity_item == {
+        "key": "institution_credit_code",
+        "label": "机构信用代码",
+        "value": "G1053011404727700K",
+        "raw": "G1053011404727700K",
+        "type": "string",
+        "sensitive": True,
+    }
 
 
 def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: Path) -> None:

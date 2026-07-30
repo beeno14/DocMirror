@@ -107,6 +107,13 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     assert "marital_status" in personal_dictionary["fields"]
     assert "id_number" not in enterprise_dictionary["fields"]
     assert "marital_status" not in enterprise_dictionary["fields"]
+    assert "institution_credit_code" not in personal_dictionary["fields"]
+    assert enterprise_dictionary["fields"]["institution_credit_code"] == {
+        "label": "机构信用代码",
+        "type": "string",
+        "format": "long_id",
+        "sensitive": True,
+    }
     assert "个人简版" in personal_dictionary["datasets"]["credit_accounts"]["definition"]
     assert "个人简版" not in enterprise_dictionary["datasets"]["credit_accounts"]["definition"]
     assert personal_semantic["presentation_policy"]["classification"] == (

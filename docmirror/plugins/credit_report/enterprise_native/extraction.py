@@ -173,6 +173,16 @@ def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtracti
                 pass
         return fallback
 
+    def normalized_bbox(value: Any) -> tuple[float, float, float, float] | None:
+        raw_bbox = list(getattr(value, "bbox", None) or [])
+        if len(raw_bbox) < 4:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(item) for item in raw_bbox[:4])
+        except (TypeError, ValueError):
+            return None
+        return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+
     for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
         page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or page_index)
         blocks = list(getattr(page, "texts", None) or [])
@@ -205,6 +215,11 @@ def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtracti
                     page=page_number,
                     table_id=table_id,
                     rows=immutable_rows,
+                    bbox=normalized_bbox(table),
+                    page_width=float(getattr(page, "width", 0) or 0),
+                    page_height=float(getattr(page, "height", 0) or 0),
+                    first_on_page=table_index == 0,
+                    last_on_page=table_index == len(list(getattr(page, "tables", None) or [])) - 1,
                 )
             )
             bbox = list(getattr(table, "bbox", None) or [])
@@ -341,21 +356,13 @@ def _primary_account_field_indexes(
     if len(date_indexes) < 2:
         return None
     detected_currency_index = next(
-        (
-            index
-            for index, value in enumerate(row)
-            if _compact(value) in _CURRENCY_CODES
-        ),
+        (index for index, value in enumerate(row) if _compact(value) in _CURRENCY_CODES),
         -1,
     )
     if detected_currency_index < 0:
         return None
     detected_amount_index = next(
-        (
-            index
-            for index in range(detected_currency_index + 1, len(row))
-            if _number(row[index]) is not None
-        ),
+        (index for index in range(detected_currency_index + 1, len(row)) if _number(row[index]) is not None),
         -1,
     )
     if detected_amount_index < 0:
@@ -464,9 +471,7 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 header_seen = False
                 settled_schema = False
                 signature = "".join(cells)
-                account_status_hint = (
-                    "settled" if "已结清" in signature else "active" if "未结清" in signature else ""
-                )
+                account_status_hint = "settled" if "已结清" in signature else "active" if "未结清" in signature else ""
                 active_fragment_index = fragment_index
                 active_fragment_page = page
                 continue
@@ -876,6 +881,7 @@ _IDENTITY_LABELS = {
     "中征码": "zhongzheng_code",
     "统一社会信用代码": "unified_social_credit_code",
     "组织机构代码": "organization_code",
+    "机构信用代码": "institution_credit_code",
     "工商注册号": "business_registration_number",
     "纳税人识别号（国税）": "national_tax_id",
     "纳税人识别号（地税）": "local_tax_id",
@@ -998,12 +1004,7 @@ def extract_enterprise_summary_datasets(
             title_signature = "".join(value for row in title_rows for value in row)
             group_count_match = re.search(r"共(\d+)笔", title_signature)
             summary_title = next(
-                (
-                    value
-                    for row in title_rows
-                    for value in row
-                    if value and not re.fullmatch(r"共\d+笔", value)
-                ),
+                (value for row in title_rows for value in row if value and not re.fullmatch(r"共\d+笔", value)),
                 "",
             )
             if group_count_match and summary_title:
@@ -1052,11 +1053,7 @@ def extract_enterprise_summary_datasets(
                 emitted = 0
                 for row_index, row in enumerate(rows[displayed_header_index + 1 :], start=displayed_header_index + 1):
                     account_count_index = displayed_indexes["source_account_count"]
-                    account_count = (
-                        _number(row[account_count_index])
-                        if 0 <= account_count_index < len(row)
-                        else None
-                    )
+                    account_count = _number(row[account_count_index]) if 0 <= account_count_index < len(row) else None
                     institution_index = displayed_indexes["institution"]
                     business_type_index = displayed_indexes["business_type"]
                     five_tier_index = displayed_indexes["five_tier_class"]
@@ -1075,9 +1072,7 @@ def extract_enterprise_summary_datasets(
                         index = displayed_indexes[field]
                         return _compact(row[index]) if 0 <= index < len(row) else ""
 
-                    source_reported_amount = (
-                        _number(row[amount_index]) if 0 <= amount_index < len(row) else None
-                    )
+                    source_reported_amount = _number(row[amount_index]) if 0 <= amount_index < len(row) else None
                     displayed_rows.append(
                         {
                             "displayed_summary_id": _stable_id(
@@ -1380,6 +1375,17 @@ def extract_enterprise_repayment_liability_records(
         pending = None
 
     resolver = EnterpriseContinuationResolver(parse_result)
+
+    def continuation_row_shape(row: list[str]) -> bool:
+        values = [_compact(value) for value in row]
+        return bool(
+            len(values) >= 9
+            and not values[0]
+            and _number(values[1]) is not None
+            and _number(values[2]) is not None
+            and _date(values[8])
+        )
+
     for fragment in resolver.fragments:
         page = fragment.page
         table_id = fragment.table_id
@@ -1401,9 +1407,15 @@ def extract_enterprise_repayment_liability_records(
                 and (
                     (pending.get("_fragment_index") == fragment.index and pending.get("_row_index") == row_index - 1)
                     or (
-                        pending.get("_fragment_index") == fragment.index - 1
+                        pending.get("_fragment_index") is not None
                         and row_index == 0
-                        and page - int(pending.get("source_page") or page) in {0, 1}
+                        and resolver.table_continues(
+                            resolver.fragments[int(pending["_fragment_index"])],
+                            fragment,
+                            candidate_row_index=row_index,
+                            candidate_validator=continuation_row_shape,
+                            context="repayment_liability_detail",
+                        )
                     )
                 )
             )
@@ -1593,10 +1605,7 @@ def extract_enterprise_continuation_audit(
         resolved.update(extract_enterprise_summary_datasets(parse_result))
     if "repayment_liability_records" not in resolved:
         resolved["repayment_liability_records"] = extract_enterprise_repayment_liability_records(parse_result)
-    if (
-        "enterprise_attachment_accounts" not in resolved
-        or "enterprise_attachment_credit_details" not in resolved
-    ):
+    if "enterprise_attachment_accounts" not in resolved or "enterprise_attachment_credit_details" not in resolved:
         attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
         for name, records in attachment_datasets.items():
             resolved.setdefault(name, records)
@@ -1627,9 +1636,7 @@ def extract_enterprise_continuation_audit(
         )
     page_text_values = tuple(_page_texts(parse_result).values())
     detail_population_not_comparable = any(
-        ("受篇幅所限" in text and "只展示部分信贷记录" in text)
-        or "展示样式" in text
-        for text in page_text_values
+        ("受篇幅所限" in text and "只展示部分信贷记录" in text) or "展示样式" in text for text in page_text_values
     )
     if not detail_population_not_comparable:
         closed_summaries = list(resolved.get("enterprise_closed_credit_summary") or [])
@@ -1648,25 +1655,20 @@ def extract_enterprise_continuation_audit(
             expected_count = sum(
                 int(record.get("total_account_count") or 0)
                 for record in closed_summaries
-                if not record.get("is_total")
-                and record.get("transaction_group") == business_category
+                if not record.get("is_total") and record.get("transaction_group") == business_category
             )
             if expected_count <= 0:
                 continue
             extracted_count = sum(
                 1
                 for record in attachment_details
-                if record.get("account_status") == "settled"
-                and record.get("business_category") == business_category
+                if record.get("account_status") == "settled" and record.get("business_category") == business_category
             )
             unresolved = max(0, expected_count - extracted_count)
             unexpected = max(0, extracted_count - expected_count)
             audits.append(
                 {
-                    "audit_id": (
-                        "enterprise_continuation_audit:"
-                        f"attachment_credit_detail:{business_category}:settled"
-                    ),
+                    "audit_id": (f"enterprise_continuation_audit:attachment_credit_detail:{business_category}:settled"),
                     "sequence": len(audits) + 1,
                     "continuation_family": "attachment_credit_detail",
                     "business_category": business_category,
@@ -1675,9 +1677,7 @@ def extract_enterprise_continuation_audit(
                     "extracted_record_count": extracted_count,
                     "unresolved_record_count": unresolved,
                     "unexpected_record_count": unexpected,
-                    "reconciliation_status": (
-                        "complete" if not unresolved and not unexpected else "unresolved"
-                    ),
+                    "reconciliation_status": ("complete" if not unresolved and not unexpected else "unresolved"),
                     "source": "enterprise_continuation_contract_audit",
                     "confidence": 1.0,
                 }
@@ -2115,12 +2115,11 @@ def _attachment_contexts_and_records(
                 and _number(row[amount_index]) is not None
             )
 
-        previous = fragment
-        candidate_index = fragment.index + 1
-        while candidate_index < len(resolver.fragments):
-            candidate = resolver.fragments[candidate_index]
-            if candidate.page - previous.page not in {0, 1}:
-                break
+        for candidate in resolver.following_fragments(
+            fragment,
+            candidate_validator=valid_detail_row,
+            context="attachment_credit_detail",
+        ):
             candidate_rows = [[_compact(value) for value in row] for row in candidate.rows]
             candidate_starts_new_table = any(
                 ("开户日期" in row or "开立日期" in row)
@@ -2130,8 +2129,6 @@ def _attachment_contexts_and_records(
             if candidate_starts_new_table or not any(valid_detail_row(row) for row in candidate_rows):
                 break
             allowed_detail_continuation_tables.add(candidate.table_id)
-            previous = candidate
-            candidate_index += 1
 
     def start_context(
         *,
@@ -2949,11 +2946,7 @@ def _public_attributes(record_type: str, details: dict[str, Any]) -> dict[str, A
     attributes: dict[str, Any] = {}
     for field, labels in field_map.items():
         raw = next(
-            (
-                normalized_details[label]
-                for label in labels
-                if label in normalized_details
-            ),
+            (normalized_details[label] for label in labels if label in normalized_details),
             None,
         )
         if raw in (None, ""):
@@ -3060,7 +3053,7 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
     """Project typed public-record tables without cross-section text bleed."""
     records: list[dict[str, Any]] = []
     resolver = EnterpriseContinuationResolver(parse_result)
-    fragment_index_by_table_id = {fragment.table_id: fragment.index for fragment in resolver.fragments}
+    fragment_by_table_id = {fragment.table_id: fragment for fragment in resolver.fragments}
     for page, table_id, rows in _table_stream(parse_result):
         if not rows:
             continue
@@ -3156,17 +3149,27 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             detail_labels = frozenset(str(key) for key in details)
             previous_labels = frozenset(str(key) for key in previous_details)
             previous_table_id = str(previous.get("source_table_id") if isinstance(previous, dict) else "")
-            adjacent_physical_table = (
-                previous_table_id in fragment_index_by_table_id
-                and table_id in fragment_index_by_table_id
-                and fragment_index_by_table_id[table_id] == fragment_index_by_table_id[previous_table_id] + 1
+            scored_continuation = bool(
+                previous_table_id in fragment_by_table_id
+                and table_id in fragment_by_table_id
+                and resolver.table_continues(
+                    fragment_by_table_id[previous_table_id],
+                    fragment_by_table_id[table_id],
+                    candidate_row_index=row_index,
+                    candidate_validator=lambda _row: bool(
+                        rules
+                        and previous_labels & rules["start"]
+                        and not detail_labels & rules["start"]
+                        and detail_labels & rules["continuation"]
+                    ),
+                    context=f"public_record:{record_type}",
+                )
             )
             guarded_continuation = bool(
                 rules
                 and previous
                 and previous.get("record_type") == record_type
-                and page - int(previous.get("page") or page) in {0, 1}
-                and adjacent_physical_table
+                and scored_continuation
                 and previous_labels & rules["start"]
                 and not detail_labels & rules["start"]
                 and detail_labels & rules["continuation"]

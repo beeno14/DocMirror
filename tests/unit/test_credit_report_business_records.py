@@ -126,6 +126,7 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
             ["企业名称", "示例企业"],
             ["中征码", "123456789"],
             ["统一社会信用代码", "913100001234567890"],
+            ["机构信用代码", "G1031000123456789X"],
             ["工商注册号", "913100001234567890"],
         ],
     )
@@ -189,9 +190,9 @@ def test_enterprise_identity_capital_and_page_four_summaries_are_preserved() -> 
         ]
     )
 
-    assert extract_enterprise_identity_facts(result)["business_registration_number"] == (
-        "913100001234567890"
-    )
+    identity_facts = extract_enterprise_identity_facts(result)
+    assert identity_facts["institution_credit_code"] == "G1031000123456789X"
+    assert identity_facts["business_registration_number"] == "913100001234567890"
     capital_rows = extract_enterprise_capital_summary(result)
     assert capital_rows[0]["registered_capital_amount"] == 6000
     assert capital_rows[0]["source_page"] == 4

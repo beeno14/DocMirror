@@ -134,6 +134,214 @@ def test_same_column_count_does_not_authorize_unrelated_table_merge() -> None:
             "reason": "new_header",
         }
     ]
+    decision = resolver.decision_rows()[-1]
+    assert decision["selected"] == "new_table"
+    assert {item["kind"] for item in decision["hypotheses"]} == {
+        "same_table",
+        "new_table",
+        "new_section",
+    }
+
+
+def test_scored_boundaries_chain_a_table_across_three_pages() -> None:
+    pages = [
+        SimpleNamespace(
+            page_number=1,
+            source_page_number=1,
+            width=600,
+            height=800,
+            texts=[],
+            tables=[
+                _table(
+                    "table_page_1",
+                    [
+                        ["账户编号", "开立日期", "到期日", "币种", "金额"],
+                        ["A123456789012", "2025-01-01", "2025-06-01", "人民币元", "100"],
+                    ],
+                    bbox=[20, 500, 580, 790],
+                )
+            ],
+        ),
+        SimpleNamespace(
+            page_number=2,
+            source_page_number=2,
+            width=600,
+            height=800,
+            texts=[],
+            tables=[
+                _table(
+                    "table_page_2",
+                    [["A123456789013", "2025-01-02", "2025-06-02", "人民币元", "200"]],
+                    bbox=[20, 20, 580, 790],
+                )
+            ],
+        ),
+        SimpleNamespace(
+            page_number=3,
+            source_page_number=3,
+            width=600,
+            height=800,
+            texts=[],
+            tables=[
+                _table(
+                    "table_page_3",
+                    [["A123456789014", "2025-01-03", "2025-06-03", "人民币元", "300"]],
+                    bbox=[20, 20, 580, 400],
+                )
+            ],
+        ),
+    ]
+    resolver = EnterpriseContinuationResolver(SimpleNamespace(pages=pages))
+
+    assert [fragment.table_id for fragment in resolver.following_fragments(resolver.fragments[0])] == [
+        "table_page_2",
+        "table_page_3",
+    ]
+    assert [decision.selected for decision in resolver.boundary_decisions] == [
+        "same_table",
+        "same_table",
+    ]
+    assert all(decision.accepted for decision in resolver.boundary_decisions)
+    spanning = [entity for entity in resolver.logical_entities if len(entity.pages) == 3]
+    assert len(spanning) == 1
+    assert spanning[0].unit_ids == (
+        "table:table_page_1",
+        "table:table_page_2",
+        "table:table_page_3",
+    )
+
+
+def test_fragment_validator_scores_rows_below_a_split_header() -> None:
+    result = _result(
+        (
+            1,
+            [
+                _table(
+                    "detail_header",
+                    [
+                        ["账户编号", "开立日期", "金额"],
+                        ["A123456789012", "2025-01-01", "100"],
+                    ],
+                )
+            ],
+        ),
+        (
+            2,
+            [
+                _table(
+                    "split_header_and_body",
+                    [
+                        ["账户明细", "", ""],
+                        ["A123456789013", "2025-01-02", "200"],
+                    ],
+                )
+            ],
+        ),
+    )
+    resolver = EnterpriseContinuationResolver(result)
+
+    matches = resolver.following_fragments(
+        resolver.fragments[0],
+        candidate_validator=lambda row: len(row) == 3 and row[1].startswith("2025-"),
+        context="split_header",
+    )
+
+    assert [fragment.table_id for fragment in matches] == ["split_header_and_body"]
+
+
+def test_single_row_validator_cannot_be_outvoted_by_geometry() -> None:
+    pages = [
+        SimpleNamespace(
+            page_number=1,
+            source_page_number=1,
+            width=600,
+            height=800,
+            texts=[],
+            tables=[
+                _table(
+                    "history_header",
+                    [["信息报告日期", "余额", "余额变化日期"]],
+                    bbox=[20, 500, 580, 790],
+                )
+            ],
+        ),
+        SimpleNamespace(
+            page_number=2,
+            source_page_number=2,
+            width=600,
+            height=800,
+            texts=[],
+            tables=[
+                _table(
+                    "different_record",
+                    [["账户编号", "授信机构", "业务种类"]],
+                    bbox=[20, 20, 580, 790],
+                )
+            ],
+        ),
+    ]
+    resolver = EnterpriseContinuationResolver(SimpleNamespace(pages=pages))
+
+    assert (
+        resolver.table_continues(
+            resolver.fragments[0],
+            resolver.fragments[1],
+            candidate_validator=lambda row: row[0].startswith("2025-"),
+            context="history_row",
+        )
+        is False
+    )
+
+
+def test_scored_text_boundary_distinguishes_continuation_from_new_section() -> None:
+    continuing = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                width=600,
+                height=800,
+                tables=[],
+                texts=[_text("本段文字尚未结束并在下一页", 760)],
+            ),
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=2,
+                width=600,
+                height=800,
+                tables=[],
+                texts=[_text("继续说明相关事项。", 20)],
+            ),
+        ]
+    )
+    new_section = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                width=600,
+                height=800,
+                tables=[],
+                texts=[_text("上一节已经结束。", 760)],
+            ),
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=2,
+                width=600,
+                height=800,
+                tables=[],
+                texts=[_text("公共记录明细", 20)],
+            ),
+        ]
+    )
+
+    continuation_decision = EnterpriseContinuationResolver(continuing).boundary_decisions[0]
+    section_decision = EnterpriseContinuationResolver(new_section).boundary_decisions[0]
+
+    assert continuation_decision.selected == "same_body_text"
+    assert continuation_decision.accepted is True
+    assert section_decision.selected == "new_section"
+    assert section_decision.accepted is False
 
 
 def test_nonadjacent_and_distant_tables_are_never_skipped_into_a_merge() -> None:
@@ -803,9 +1011,7 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
         "enterprise_public_license_records",
         "enterprise_public_certification_records",
     ]
-    assert datasets["enterprise_public_social_security_payment_records"][0][
-        "contribution_base"
-    ] == 9040
+    assert datasets["enterprise_public_social_security_payment_records"][0]["contribution_base"] == 9040
     license_record = datasets["enterprise_public_license_records"][0]
     assert set(license_record) == {
         "public_record_id",
@@ -826,9 +1032,7 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
     assert license_record["license_date"] == "2024-01-11"
     assert license_record["license_expiry_date"] == "2099-12-31"
     assert license_record["license_content"] == "登字"
-    assert datasets["enterprise_public_certification_records"][0][
-        "certification_date"
-    ] == "--"
+    assert datasets["enterprise_public_certification_records"][0]["certification_date"] == "--"
 
 
 def test_attachment_detail_audit_reconciles_reported_settled_business_count() -> None:
@@ -865,9 +1069,7 @@ def test_attachment_detail_audit_reconciles_reported_settled_business_count() ->
     }
 
     audits = extract_enterprise_continuation_audit(result, datasets=datasets)
-    detail_audit = next(
-        row for row in audits if row["continuation_family"] == "attachment_credit_detail"
-    )
+    detail_audit = next(row for row in audits if row["continuation_family"] == "attachment_credit_detail")
 
     assert detail_audit["expected_record_count"] == 3
     assert detail_audit["extracted_record_count"] == 2

@@ -179,6 +179,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "format": "long_id",
             "sensitive": True,
         }
+        fields["institution_credit_code"] = {
+            "label": "机构信用代码",
+            "type": "string",
+            "format": "long_id",
+            "sensitive": True,
+        }
         fields["national_tax_id"] = {
             "label": "纳税人识别号（国税）",
             "type": "string",
