@@ -65,7 +65,7 @@ def test_bank_statement_content_markdown_is_record_complete_and_generic() -> Non
     ]
 
     markdown = _render_bank_statement_content_markdown(
-        records,
+        _sanitize_bank_records(records),
         {"account_holder": "郑云华", "account_number": "6227001863030091717", "currency": "CNY"},
         {"start": "2024-01-02", "end": "2024-12-31"},
     )
@@ -74,12 +74,12 @@ def test_bank_statement_content_markdown_is_record_complete_and_generic() -> Non
         line for line in markdown.splitlines() if line.startswith("| ") and line.split("|", 3)[1].strip().isdigit()
     ]
     assert len(business_rows) == 2
-    assert "| 序号 |" not in markdown
-    assert "| 日期 | 收/支 | 交易金额 | 账户余额 | 对方户名 | 对方账号 | 摘要 |" in markdown
-    assert business_rows[0].startswith("| 20240102 |")
+    assert "| 序号 | 摘要 | 交易日期 | 交易金额 | 余额 | 对方户名 |" in markdown
+    assert "| 日期 | 收/支 |" not in markdown
+    assert business_rows[0].startswith("| 1 | 往来款 | 20240102 |")
     assert markdown.count("docmirror:page") == 2
-    assert "## 第 1 页" in markdown
-    assert "## 第 29 页" in markdown
+    assert "## 第 1 页" not in markdown
+    assert "## 第 29 页" not in markdown
     assert "郑云华" in markdown
     assert "生成时间" not in markdown
     assert "总页数" not in markdown
@@ -346,11 +346,40 @@ def test_bank_statement_markdown_infers_generic_raw_headers_and_transaction_type
         {"start": "2022-09-09", "end": "2023-08-31"},
     )
 
-    assert "| 序号 |" not in markdown
-    assert "| 币别 |" not in markdown
-    assert "| 交易日期 | 交易类型 | 交易金额 | 账户余额 | 对方账号 | 对方户名 | 摘要/附言 |" in markdown
-    assert "| 20230831 | 支出 | 31.00 | 99.79 | 215500690 | 支付宝（中国）网络技术有限公司 | 协议付款 |" in markdown
-    assert "| 20230830 | 收入 | 296.00 | 299.69 | 70070188000077841 |  | 工资 |" in markdown
+    assert "| 序号 | 摘要/附言 | 币别 | 交易日期 | 交易类型 | 交易金额 | 账户余额 | 对方账号 | 对方户名 |" in markdown
+    assert "| 1 | 协议付款 | 人民币 | 20230831 | 支出 | 31.00 | 99.79 | 215500690 | 支付宝（中国）网络技术有限公司 |" in markdown
+    assert "| 2 | 工资 | 人民币 | 20230830 | 收入 | 296.00 | 299.69 | 70070188000077841 |  |" in markdown
+
+
+def test_bank_statement_markdown_preserves_unusual_source_columns_and_order() -> None:
+    records = [
+        {
+            "raw": {
+                "记账日期": "2025-01-02",
+                "起息日": "2025-01-03",
+                "凭证号": "V0007",
+                "借方发生额": "88.20",
+                "贷方发生额": "",
+                "余额": "911.80",
+                "用途": "采购款",
+                "附言": "合同A-17",
+            },
+            "normalized": {
+                "date": "2025-01-02",
+                "direction": "expense",
+                "amount": 88.2,
+                "balance": 911.8,
+                "summary": "采购款",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+
+    markdown = _render_bank_statement_content_markdown(records, {}, {})
+
+    assert "| 记账日期 | 起息日 | 凭证号 | 借方发生额 | 贷方发生额 | 余额 | 用途 | 附言 |" in markdown
+    assert "| 2025-01-02 | 2025-01-03 | V0007 | 88.20 |  | 911.80 | 采购款 | 合同A-17 |" in markdown
+    assert "| 日期 | 收/支 |" not in markdown
 
 
 def test_bank_statement_record_sanitizer_removes_footer_and_money_noise() -> None:
@@ -478,6 +507,35 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
                 "counter_party": "待报解预算收入（财税库银联网代收）",
             },
         },
+        {
+            "raw": {
+                "摘要": "转出",
+                "对方账户": "1000050001",
+                "对方户名": (
+                    "1000107101 1000050001 清单支出算术合计:19,756,586.06 "
+                    "打印渠道:远程视频柜员机 WL财付通微信转账:微信转账 "
+                    "WL财付通微信转账:微信转账 对方户名张祝祥陈元友"
+                ),
+            },
+            "canonical_raw": {
+                "summary": "转出",
+                "counter_account": "1000050001",
+                "counter_party": (
+                    "1000107101 1000050001 清单支出算术合计:19,756,586.06 "
+                    "打印渠道:远程视频柜员机 WL财付通微信转账:微信转账 "
+                    "WL财付通微信转账:微信转账 对方户名张祝祥陈元友"
+                ),
+            },
+            "normalized": {
+                "summary": "转出",
+                "counter_account": "1000050001",
+                "counter_party": (
+                    "1000107101 1000050001 清单支出算术合计:19,756,586.06 "
+                    "打印渠道:远程视频柜员机 WL财付通微信转账:微信转账 "
+                    "WL财付通微信转账:微信转账 对方户名张祝祥陈元友"
+                ),
+            },
+        },
     ]
 
     sanitized = _sanitize_bank_records(records)
@@ -493,3 +551,5 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
     assert sanitized[6]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
     assert sanitized[7]["normalized"]["counter_party"] == "企业电子渠道跨行转账手续费收入"
     assert sanitized[8]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
+    assert sanitized[9]["normalized"]["counter_party"] == ""
+    assert sanitized[9]["raw"]["对方户名"] == ""

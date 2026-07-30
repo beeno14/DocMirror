@@ -61,6 +61,22 @@ _DIRECTION_KEYS = (
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
 _COUNTERPARTY_KEYS = ("对方户名", "对方名称", "交易对方", "交易对手", "counter_party")
 _COUNTER_ACCOUNT_KEYS = ("对方账户", "对方账号", "counter_account")
+_COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
+    "序号交易日期",
+    "对方账号",
+    "对方账户",
+    "对方户名",
+    "清单支出算术合计",
+    "清单收入算术合计",
+    "打印渠道",
+    "打印机构",
+    "打印柜员",
+    "打印时间",
+    "本页支出算术合计",
+    "本页收入算术合计",
+    "交易提示",
+    "CPKYG",
+)
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
@@ -312,7 +328,7 @@ def _recover_missing_counterparties_from_page_text(
                 next_start = _next_located_row_start(locations, index, len(page_index[0]))
                 candidate = _slice_original_by_compact(page_text, page_index[1], account_end, next_start)
                 recovered = _clean_recovered_counterparty(candidate)
-                if recovered:
+                if recovered and _is_safe_recovered_counterparty(recovered):
                     _set_counterparty(transaction, recovered)
 
 
@@ -505,18 +521,25 @@ def _looks_like_transaction_fragment(compact: str) -> bool:
 
 def _strip_recovered_counterparty_after_marker(value: str) -> str:
     compact, _offsets = _compact_text_with_offsets(value)
-    markers = (
-        "序号交易日期",
-        "借方笔数",
-        "贷方笔数",
-        "合计笔数",
-        "打印时间",
-        "CPKYG",
-    )
+    markers = (*_COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS, "借方笔数", "贷方笔数", "合计笔数")
     positions = [compact.find(marker) for marker in markers if compact.find(marker) >= 0]
     if not positions:
         return value
     return _prefix_by_compact_length(value, min(positions))
+
+
+def _is_safe_recovered_counterparty(value: str) -> bool:
+    compact = _signature_value(value)
+    if not compact or len(compact) > 120:
+        return False
+    if any(marker in compact for marker in _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS):
+        return False
+    if len(re.findall(r"(?<!\d)\d{8,}(?!\d)", compact)) > 1:
+        return False
+    if re.fullmatch(r"[\d*＊,./:：-]{8,}", compact):
+        return False
+    repeated_channels = sum(compact.count(marker) for marker in ("WL财付通", "WL支付宝", "微信转账"))
+    return repeated_channels <= 2
 
 
 def _prefix_by_compact_length(value: str, compact_length: int) -> str:

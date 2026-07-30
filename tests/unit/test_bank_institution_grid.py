@@ -21,7 +21,7 @@ from docmirror.models.entities.parse_result import (
     TextBlock,
 )
 from docmirror.models.sealed import seal_parse_result
-from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
+from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
 from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
 from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
@@ -622,6 +622,54 @@ def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
     assert records[3]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
 
 
+def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
+    headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    raw_rows = [
+        ["159", "2023-01-27", "", "转出", "20,000.00", "", "73,155.95", "1000050001", "限公司"],
+        ["160", "2023-01-27", "", "转出", "50,000.00", "", "23,155.95", "215500690", "WL支付宝"],
+    ]
+    column_ordered_text = "\n".join(
+        [
+            "159",
+            "160",
+            "2023-01-27",
+            "2023-01-27",
+            "20,000.00",
+            "50,000.00",
+            "73,155.95",
+            "23,155.95",
+            "1000050001",
+            "215500690",
+            "清单支出算术合计:19,756,586.06",
+            "打印渠道:远程视频柜员机",
+            "打印机构:907072604",
+            "WL财付通微信转账:微信转账",
+            "WL财付通微信转账:微信转账",
+            "WL支付宝",
+            "对方户名张祝祥陈元友",
+        ]
+    )
+    ctx = StyleContext(
+        tables=[[headers, *raw_rows]],
+        full_text=column_ordered_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(
+            pages=[PageContent(page_number=1, texts=[TextBlock(content=column_ordered_text)])]
+        ),
+        reconstruction=ReconstructionMeta(source="canonical_evidence_table", expected_primary_rows=2),
+    )
+
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+    records = _sanitize_bank_records(records)
+
+    assert len(records) == 2
+    assert records[0]["normalized"]["counter_party"] == ""
+    assert "清单支出算术合计" not in records[0]["raw"]["对方户名"]
+    assert records[1]["normalized"]["counter_party"] == "WL支付宝"
+
+
 def test_registry_prefers_semantic_text_table_when_canonical_grid_coverage_is_low():
     bad_headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
     bad_rows = [
@@ -989,11 +1037,14 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     assert first_audit["balance"]["value"] == "1006296.3"
     assert first_audit["balance"]["raw"] == "1006296.3"
     assert first_audit["date"]["value"] == "2023-06-28"
+    assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in markdown
     first_markdown_row = (
-        "| 2023-06-28 | 收入 | +1000000.0 | 1006296.3 | 江西昌荣供应链有限公司 | 727279800000011760 | 超网-贷记 转入 |"
+        "| 13 | 2023-06-2819:50:16 | 1112052 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        " | 1000000 | 1006296.3 | 超网-贷记转入 | 转户 |"
     )
     second_markdown_row = (
-        "| 2023-06-28 | 支出 | -780000.0 | 6296.3 | 江西昌荣供应链有限公司 | 727279800000011760 | 超网-贷记 转出 |"
+        "| 14 | 2023-06-2811:24:57 | 1069557 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        "780000 |  | 6296.3 | 超网-贷记转出 | 转户 |"
     )
     assert first_markdown_row in markdown
     assert second_markdown_row in markdown
