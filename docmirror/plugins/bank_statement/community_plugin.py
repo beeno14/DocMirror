@@ -274,6 +274,19 @@ class BankStatementCommunityPlugin(BaseTableParser):
             if len(period_dates) >= 2:
                 period = {"start": period_dates[0], "end": period_dates[1]}
         extra_domain_facts = result.style_meta.to_properties()
+        bank_detail = result.identity_fields.get("bank_name")
+        if isinstance(bank_detail, dict):
+            bank_value = next(
+                (
+                    str(bank_detail.get(candidate) or "")
+                    for candidate in ("normalized_value", "value", "raw_value")
+                    if bank_detail.get(candidate) not in (None, "")
+                ),
+                "",
+            )
+            if bank_value:
+                extra_domain_facts["institution_hint"] = bank_value
+                extra_domain_facts["institution_authority"] = "identity.bank_name"
         source_reported_count = count_expected_rows_from_bank_footer(result.ctx.full_text)
         if source_reported_count <= 0:
             total_detail = result.identity_fields.get("total_transactions")
@@ -332,6 +345,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
                     period,
                     text,
                     document_type=str(getattr(parse_result.entities, "document_type", "") or ""),
+                    source_pages=_parse_result_source_pages(parse_result),
                 ),
             }
         )
@@ -344,6 +358,7 @@ def _render_bank_statement_content_markdown(
     source_text: str = "",
     *,
     document_type: str = "bank_statement",
+    source_pages: dict[int, str] | None = None,
 ) -> str:
     """Render a record-complete bank statement Markdown view from canonical plugin facts."""
     if not records:
@@ -358,13 +373,15 @@ def _render_bank_statement_content_markdown(
         rows_by_page.setdefault(page, []).append(record)
 
     parts = ['<!-- docmirror:markdown-profile version="1.0" -->']
-    page_numbers = sorted(rows_by_page) or [1]
+    source_pages = source_pages or {}
+    page_numbers = sorted(set(rows_by_page) | set(source_pages)) or [1]
     raw_headers = _raw_statement_table_headers(records, source_text)
     for page in page_numbers:
         parts.append(f'<!-- docmirror:page logical="{page}" source="{page}" -->')
         page_records = rows_by_page.get(page, [])
         if raw_headers:
-            header_lines = _raw_statement_header_lines(identity, period, source_text)
+            page_source_text = source_pages.get(page, "")
+            header_lines = _raw_statement_header_lines(identity, period, page_source_text or source_text)
             statement_title = str(identity.get("statement_title") or "").strip()
             if page == page_numbers[0] and statement_title and not any(
                 statement_title in line for line in header_lines
@@ -373,7 +390,11 @@ def _render_bank_statement_content_markdown(
             if header_lines:
                 parts.append("  \n".join(header_lines))
             parts.append(_render_raw_statement_table(page_records, raw_headers))
-            after_table_lines = _raw_statement_after_table_lines(source_text, page)
+            after_table_lines = (
+                _source_statement_note_lines(page_source_text)
+                if not page_records
+                else _raw_statement_after_table_lines(source_text, page)
+            )
             if after_table_lines:
                 parts.append("  \n".join(after_table_lines))
         else:
@@ -382,6 +403,28 @@ def _render_bank_statement_content_markdown(
                 parts.extend(_bank_statement_header_lines(identity, period))
             parts.append(_render_bank_statement_table(page_records))
     return "\n\n".join(part for part in parts if part).rstrip() + "\n"
+
+
+def _parse_result_source_pages(parse_result) -> dict[int, str]:
+    """Collect page-local source text for faithful non-transaction page rendering."""
+    page_texts: dict[int, str] = {}
+    for page in getattr(parse_result, "pages", []) or []:
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+        if page_number <= 0:
+            continue
+        parts = [
+            str(getattr(block, "content", "") or "").strip()
+            for block in getattr(page, "texts", []) or []
+            if str(getattr(block, "content", "") or "").strip()
+        ]
+        for table in getattr(page, "tables", []) or []:
+            for row in getattr(table, "rows", []) or []:
+                cells = [str(getattr(cell, "text", "") or "").strip() for cell in getattr(row, "cells", []) or []]
+                if any(cells):
+                    parts.append(" ".join(cells))
+        if parts:
+            page_texts[page_number] = "\n".join(parts)
+    return page_texts
 
 
 def _sanitize_bank_records(records: list[dict]) -> list[dict]:
@@ -397,6 +440,8 @@ def _sanitize_bank_records(records: list[dict]) -> list[dict]:
             if not isinstance(pool, dict):
                 continue
             _sanitize_bank_value_pool(pool)
+        _repair_split_amount_canonical_raw(copied)
+        _repair_counterparty_canonical_raw(copied)
         sanitized.append(copied)
     counterparty_aliases = _stable_counterparty_aliases(sanitized)
     for record in sanitized:
@@ -415,6 +460,66 @@ def _sanitize_bank_value_pool(pool: dict) -> None:
         if key_text in {"counter_party", "对方户名", "对方名称", "交易对手"}:
             text = _clean_counterparty_text(text)
         pool[key] = text
+
+
+def _repair_split_amount_canonical_raw(record: dict) -> None:
+    canonical_raw = record.get("canonical_raw")
+    raw = record.get("raw")
+    normalized = record.get("normalized")
+    if not isinstance(canonical_raw, dict) or not isinstance(raw, dict) or not isinstance(normalized, dict):
+        return
+    if canonical_raw.get("amount") not in (None, ""):
+        return
+
+    direction = str(normalized.get("direction") or "")
+    if direction not in {"income", "expense"}:
+        return
+    keys = (
+        ("收入", "收入金额", "贷方发生额", "贷方", "转入金额")
+        if direction == "income"
+        else ("支出", "支出金额", "借方发生额", "借方", "转出金额")
+    )
+    for value in _raw_values_matching_headers(raw, keys):
+        cleaned = _clean_money_text(value)
+        if cleaned:
+            canonical_raw["amount"] = cleaned
+            if "amount_cny" in canonical_raw:
+                canonical_raw["amount_cny"] = cleaned
+            return
+
+
+def _raw_values_matching_headers(raw: dict, aliases: tuple[str, ...]) -> list[str]:
+    """Read values from exact or stacked bilingual source headers."""
+    values: list[str] = []
+    for alias in aliases:
+        compact_alias = _compat_compact(alias)
+        for raw_header, value in raw.items():
+            if value in (None, ""):
+                continue
+            header_text = str(raw_header)
+            compact_header = _compat_compact(header_text)
+            header_parts = {_compat_compact(part) for part in header_text.splitlines()}
+            if compact_header == compact_alias or compact_alias in header_parts:
+                values.append(str(value))
+    return values
+
+
+def _repair_counterparty_canonical_raw(record: dict) -> None:
+    """Preserve explicit stacked source party and institution values for audit."""
+    canonical_raw = record.get("canonical_raw")
+    raw = record.get("raw")
+    if not isinstance(canonical_raw, dict) or not isinstance(raw, dict):
+        return
+    explicit_headers = {
+        "对方户名": ("对方户名", "对方名称", "对手名称", "交易对方", "Counterparty Name", "对方账号与户名"),
+        "对方行名": ("对方行名", "对手机构", "对方开户行", "对方银行名称", "Counterparty Institution"),
+    }
+    for canonical_header, aliases in explicit_headers.items():
+        mapping = BANK_COLUMN_REGISTRY[canonical_header]
+        values = _raw_values_matching_headers(raw, aliases)
+        value = next((item for item in values if item.strip()), "")
+        if value:
+            canonical_raw[mapping.field] = _clean_counterparty_text(value)
 
 
 def _stable_counterparty_aliases(records: list[dict]) -> dict[str, str]:
@@ -454,10 +559,11 @@ def _sanitize_record_counterparty(record: dict, aliases: dict[str, str]) -> None
             if not isinstance(value, str):
                 continue
             cleaned = _clean_counterparty_text(value)
-            if alias and (
-                not cleaned or _looks_like_counterparty_residue(cleaned) or _looks_like_counterparty_residue(value)
-            ):
+            polluted = _looks_like_counterparty_pollution(value) or _looks_like_counterparty_pollution(cleaned)
+            if alias and (not cleaned or polluted or _looks_like_counterparty_residue(cleaned)):
                 cleaned = alias
+            elif polluted:
+                cleaned = ""
             elif alias and cleaned.startswith(alias) and len(cleaned) > len(alias) + 1:
                 cleaned = alias
             if _is_fee_residue_counterparty(cleaned, summary):
@@ -525,10 +631,25 @@ def _clean_counterparty_text(value: str) -> str:
 
 def _strip_counterparty_header_fragment(value: str) -> str:
     compact = _compat_compact(value)
-    marker = "序号交易日期"
-    if marker not in compact:
+    markers = (
+        "序号交易日期",
+        "对方账号",
+        "对方账户",
+        "对方户名",
+        "清单支出算术合计",
+        "清单收入算术合计",
+        "打印渠道",
+        "打印机构",
+        "打印柜员",
+        "打印时间",
+        "本页支出算术合计",
+        "本页收入算术合计",
+        "交易提示",
+    )
+    positions = [compact.find(marker) for marker in markers if compact.find(marker) >= 0]
+    if not positions:
         return value
-    prefix_len = compact.index(marker)
+    prefix_len = min(positions)
     if prefix_len <= 0:
         return ""
     return _prefix_by_compact_length(value, prefix_len)
@@ -568,11 +689,18 @@ def _prefix_by_compact_length(value: str, compact_length: int) -> str:
 
 
 def _looks_like_counterparty_pollution(value: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
     compact = _compat_compact(value)
+    long_number_count = len(re.findall(r"(?<!\d)\d{8,}(?!\d)", normalized))
     return (
         not compact
         or compact in {"入", "收", "出", "支", "限公司", "有限公司", "代收)", "代收）"}
         or "序号交易日期" in compact
+        # One long identifier can be a legitimate party suffix; two usually mean
+        # that an adjacent account or transaction row leaked into the name cell.
+        or long_number_count > 1
+        or bool(re.fullmatch(r"[\d*＊,./:：-]{8,}", compact))
+        or sum(compact.count(marker) for marker in ("WL财付通", "WL支付宝", "微信转账")) > 2
     )
 
 
@@ -592,7 +720,7 @@ def _is_fee_residue_counterparty(value: str, summary: str) -> bool:
 
 
 def _clean_money_text(value: str) -> str:
-    text = str(value or "").strip()
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).strip()
     match = re.match(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?", text)
     return match.group(0) if match else text
 
@@ -626,7 +754,9 @@ _SOURCE_TABLE_HEADER_LAYOUTS = [
 ]
 _RAW_REQUIRED_HEADERS = {"交易日期", "交易金额", "账户余额"}
 _SOURCE_REQUIRED_HEADERS = {"交易日期", "交易金额"}
-_RAW_TABLE_EXCLUDED_HEADERS = {"序号", "币别", "币种", "货币"}
+_RAW_TABLE_EXCLUDED_HEADERS = {"_style_id", "_source_page"}
+# Vocabulary used only to detect source table header lines. Raw Markdown columns
+# deliberately retain the insertion order of the source record.
 _GENERIC_RAW_HEADER_ORDER = (
     ("交易日期", "日期", "记账日期", "记账日"),
     ("交易时间", "时间"),
@@ -654,6 +784,18 @@ _RAW_DIRECTION_KEYS = (
     "借/贷",
     "借贷标志",
     "Dc Flg",
+)
+_RAW_SPLIT_DIRECTION_KEYS = (
+    "收入",
+    "收入金额",
+    "贷方发生额",
+    "贷方",
+    "转入金额",
+    "支出",
+    "支出金额",
+    "借方发生额",
+    "借方",
+    "转出金额",
 )
 _HEADER_VALUE_KEYS = {
     "交易日期": (("交易日期", "日期"), ("date",)),
@@ -688,7 +830,8 @@ def _raw_statement_table_headers(records: list[dict], source_text: str = "") -> 
     supporting_rows = 0
     for record in records[:20]:
         raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
-        if _raw_record_has_ledger_shape(raw):
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        if _raw_record_has_ledger_shape(raw, normalized):
             supporting_rows += 1
     if supporting_rows:
         known_headers = _known_raw_source_headers(records)
@@ -698,11 +841,14 @@ def _raw_statement_table_headers(records: list[dict], source_text: str = "") -> 
     return []
 
 
-def _raw_record_has_ledger_shape(raw: dict) -> bool:
+def _raw_record_has_ledger_shape(raw: dict, normalized: dict | None = None) -> bool:
     if not raw:
         return False
-    has_required = all(_source_header_value(raw, {}, header) for header in _RAW_REQUIRED_HEADERS)
+    normalized = normalized or {}
+    has_required = all(_source_header_value(raw, normalized, header) for header in _RAW_REQUIRED_HEADERS)
     has_direction = any(raw.get(key) not in (None, "") for key in _RAW_DIRECTION_KEYS)
+    has_direction = has_direction or any(raw.get(key) not in (None, "") for key in _RAW_SPLIT_DIRECTION_KEYS)
+    has_direction = has_direction or normalized.get("direction") in {"income", "expense"}
     return has_required and has_direction
 
 
@@ -710,20 +856,15 @@ def _generic_raw_statement_headers(records: list[dict]) -> list[str]:
     present_headers: list[str] = []
     for record in records[:20]:
         raw = _record_raw(record)
-        if not _raw_record_has_ledger_shape(raw):
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        if not _raw_record_has_ledger_shape(raw, normalized):
             continue
-        for key, value in raw.items():
-            if key in _RAW_TABLE_EXCLUDED_HEADERS or value in (None, ""):
+        for key in raw:
+            if key in _RAW_TABLE_EXCLUDED_HEADERS or str(key).startswith("_"):
                 continue
             if key not in present_headers:
                 present_headers.append(key)
-    ordered: list[str] = []
-    for candidates in _GENERIC_RAW_HEADER_ORDER:
-        header = _first_present_header(present_headers, candidates)
-        if header and header not in ordered:
-            ordered.append(header)
-    ordered.extend(header for header in present_headers if header not in ordered)
-    return ordered
+    return present_headers
 
 
 def _known_raw_source_headers(records: list[dict]) -> list[str]:
@@ -774,12 +915,14 @@ def _records_support_source_headers(records: list[dict], headers: list[str]) -> 
 
 def _raw_statement_header_lines(identity: dict[str, str], period: str | dict, source_text: str) -> list[str]:
     source_lines = _source_statement_header_block(source_text)
-    if source_lines:
+    source_identity = _compat_compact(" ".join(source_lines))
+    if source_lines and any(marker in source_identity for marker in ("客户名称", "账户名称", "账号", "账单统计日期")):
         return source_lines
 
-    title = _source_statement_title(source_text) or str(identity.get("statement_title") or "").strip()
+    source_title = _source_statement_title(source_text)
+    identity_title = str(identity.get("statement_title") or "").strip()
     holder, branch = _holder_and_branch(identity)
-    lines = [title] if title else []
+    lines = [source_title] if source_title else ([f"# {identity_title}"] if identity_title else [])
     print_date = _source_label_value(source_text, "打印日期") or identity.get("print_date") or ""
     account_number = identity.get("account_number") or _source_label_value(source_text, "卡/账号") or ""
     if print_date:
@@ -807,6 +950,8 @@ def _source_statement_header_block(source_text: str) -> list[str]:
             candidate = next_line.strip()
             if not candidate:
                 continue
+            if candidate.count("|") >= 3:
+                break
             if _looks_like_source_table_header(candidate) or _looks_like_transaction_line(candidate):
                 break
             if _is_footer_line(candidate):
@@ -814,6 +959,39 @@ def _source_statement_header_block(source_text: str) -> list[str]:
             out.append(candidate)
         return out
     return []
+
+
+def _source_statement_note_lines(page_text: str) -> list[str]:
+    """Return source remarks from a page that contains no business transactions."""
+    lines = [line.strip() for line in str(page_text or "").splitlines() if line.strip()]
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if "提示" in line and ("Remarks" in line or _compat_compact(line).startswith("提示"))
+    ]
+    if not starts:
+        return []
+    # Page text can contain both native text blocks and reconstructed table text.
+    # The final occurrence is normally the complete table-backed remarks block.
+    start = starts[-1]
+
+    generation_label = next((line for line in lines if "Statement Generation Date" in line or "账单生成日期" in line), "")
+    source_dates = re.findall(r"20\d{2}[/.-]\d{2}[/.-]\d{2}", str(page_text or ""))
+    generation_date = source_dates[-1] if source_dates else ""
+    out: list[str] = []
+    for line in lines[start:]:
+        compact = _compat_compact(line)
+        if re.fullmatch(r"_+", compact) or re.fullmatch(r"[_A-Z0-9]{8,}", compact):
+            continue
+        if "Statement Generation Date" in line or "账单生成日期" in line:
+            continue
+        if generation_date and line == generation_date:
+            continue
+        line = re.sub(r"(?<=/company)[ _]+e[ _]+bank(?=/)", "_e_bank", line)
+        out.append(line.replace("_", r"\_"))
+    if generation_label:
+        out.append(f"{generation_label} {generation_date}".strip())
+    return out
 
 
 def _holder_and_branch(identity: dict[str, str]) -> tuple[str, str]:
@@ -911,7 +1089,11 @@ def _source_header_value(raw: dict, normalized: dict, header: str) -> object:
 
 def _looks_like_source_table_header(text: str) -> bool:
     compact = _compat_compact(text)
-    return any(sum(_compat_compact(header) in compact for header in headers) >= 4 for headers in _SOURCE_TABLE_HEADER_LAYOUTS)
+    if any(sum(_compat_compact(header) in compact for header in headers) >= 4 for headers in _SOURCE_TABLE_HEADER_LAYOUTS):
+        return True
+    generic_headers = {header for group in _GENERIC_RAW_HEADER_ORDER for header in group}
+    generic_headers.update({"序号", "流水号", "收入", "支出", "附言"})
+    return sum(_compat_compact(header) in compact for header in generic_headers) >= 4
 
 
 def _looks_like_transaction_line(text: str) -> bool:
@@ -920,7 +1102,11 @@ def _looks_like_transaction_line(text: str) -> bool:
 
 def _is_statement_title_line(text: str) -> bool:
     compact = _compat_compact(text)
-    return bool(compact) and any(marker in compact for marker in ("交易流水", "交易明细", "对账单", "明细清单"))
+    if not compact or len(compact) > 60 or re.match(r"^\d+[、.．]", str(text or "").strip()):
+        return False
+    if "对账单" in compact or any(marker in compact for marker in ("交易明细", "明细清单")):
+        return True
+    return "交易流水" in compact and any(marker in compact for marker in ("银行", "账户", "个人", "企业"))
 
 
 def _is_statement_note_line(text: str) -> bool:

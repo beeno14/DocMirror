@@ -10,7 +10,8 @@ build/
 .eggs/
 
 ## index
-AGENTS.md/
+AGENTS.md
+CLAUDE.md
 
 ## Environment
 .env

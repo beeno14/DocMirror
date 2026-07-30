@@ -5,10 +5,14 @@
 
 from __future__ import annotations
 
+import csv
+import io
+
 import pytest
 
 from docmirror.models.entities.parse_result import (
     CellValue,
+    DocumentEntities,
     LogicalTable,
     PageContent,
     ParseResult,
@@ -16,13 +20,15 @@ from docmirror.models.entities.parse_result import (
     TableRow,
     TextBlock,
 )
-from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
+from docmirror.models.sealed import seal_parse_result
+from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
 from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
+from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
 from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
-from docmirror.plugins.bank_statement.styles.grid_standard import normalize_split_debit_credit
+from docmirror.plugins.bank_statement.styles.grid_standard import normalize_record, normalize_split_debit_credit
 from docmirror.plugins.bank_statement.wide_table_recovery import _select_wide_bank_table, is_wide_bank_header
 
 
@@ -42,10 +48,12 @@ def test_normalize_table_headers_ccb_alias():
 
 def test_split_debit_credit_style_detection():
     ctx = StyleContext(
-        tables=[[
-            ["交易日期", "摘要", "收入", "支出", "余额"],
-            ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
-        ]],
+        tables=[
+            [
+                ["交易日期", "摘要", "收入", "支出", "余额"],
+                ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
+            ]
+        ],
         full_text="中国工商银行 个人客户交易明细",
         institution=None,
         page_count=1,
@@ -56,12 +64,14 @@ def test_split_debit_credit_style_detection():
 
 def test_style_registry_icbc_split_columns():
     ctx = StyleContext(
-        tables=[[
-            ["交易日期", "摘要", "收入", "支出", "余额"],
-            ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
-            ["2024-01-02", "转账支出", "0.00", "200.00", "7800.00"],
-            ["2024-01-03", "消费", "0.00", "50.00", "7750.00"],
-        ]],
+        tables=[
+            [
+                ["交易日期", "摘要", "收入", "支出", "余额"],
+                ["2024-01-01", "工资入账", "5000.00", "0.00", "8000.00"],
+                ["2024-01-02", "转账支出", "0.00", "200.00", "7800.00"],
+                ["2024-01-03", "消费", "0.00", "50.00", "7750.00"],
+            ]
+        ],
         full_text="中国工商银行\n个人客户交易明细\n户名：张三",
         institution=None,
         page_count=1,
@@ -90,6 +100,23 @@ def test_normalize_split_debit_credit_direct():
     assert norm is not None
     assert norm["amount"] == 200.0
     assert norm["direction"] == "expense"
+
+
+def test_normalize_transaction_location_as_channel_alias():
+    plugin = BankStatementCommunityPlugin()
+    norm = normalize_split_debit_credit(
+        {
+            "交易日期": "2025-07-10",
+            "贷方发生额": "30,000.00",
+            "借方发生额": "",
+            "余额": "36,989.93",
+            "交易地点": "支付平台",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["channel"] == "支付平台"
 
 
 def test_normalize_merged_balance_and_timestamp_split_columns():
@@ -412,9 +439,56 @@ def test_canonical_stacked_bilingual_headers_preserve_debit_credit_and_counterpa
     assert [record["normalized"]["counter_party"] for record in records] == ["甲公司", "乙公司"]
     assert [record["source"]["source_page"] for record in records] == [1, 1]
 
+    sanitized = _sanitize_bank_records(records)
+    assert [record["canonical_raw"]["amount"] for record in sanitized] == ["50.00", "75.00"]
+
+
+def test_split_grid_reads_bilingual_counterparty_and_repairs_canonical_raw_amount() -> None:
+    raw = {
+        "交易日期\nTransaction Date": "2025-01-02",
+        "发生额\nTransaction Amount\n借方\nDebit": "88.20",
+        "发生额\nTransaction Amount\n贷方\nCredit": "",
+        "余额\nBalance": "911.80",
+        "交易对手信息\nCounterparty Information\n对手机构\nCounterparty\nInstitution": "测试银行科技支行",
+        "对手名称\nCounterparty Name": "测试供应链有限公司",
+        "备注\nDescription": "采购付款",
+    }
+    normalized = normalize_split_debit_credit(raw, BankStatementCommunityPlugin())
+    assert normalized is not None
+
+    records = _sanitize_bank_records(
+        [
+            {
+                "raw": raw,
+                "normalized": normalized,
+                "canonical_raw": {"amount": "", "amount_cny": "", "counter_party": ""},
+            }
+        ]
+    )
+
+    assert normalized["direction"] == "expense"
+    assert normalized["amount"] == 88.2
+    assert normalized["counter_party"] == "测试供应链有限公司"
+    assert normalized["counter_bank_name"] == "测试银行科技支行"
+    assert records[0]["canonical_raw"]["amount"] == "88.20"
+    assert records[0]["canonical_raw"]["amount_cny"] == "88.20"
+    assert records[0]["canonical_raw"]["counter_party"] == "测试供应链有限公司"
+    assert records[0]["canonical_raw"]["counter_bank_name"] == "测试银行科技支行"
+
 
 def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
-    headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    headers = [
+        "序号",
+        "交易日期",
+        "交易时间",
+        "摘要",
+        "凭证种类",
+        "借方发生额",
+        "贷方发生额",
+        "余额",
+        "对方账户",
+        "对方户名",
+    ]
     raw_rows: list[list[str]] = []
     table_rows: list[TableRow] = []
     provenance: list[RowProvenance] = []
@@ -442,8 +516,7 @@ def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
                 for col_index, _value in enumerate(values)
             ]
             cells = [
-                CellValue(text=value, source_cell_refs=[refs[col_index]])
-                for col_index, value in enumerate(values)
+                CellValue(text=value, source_cell_refs=[refs[col_index]]) for col_index, value in enumerate(values)
             ]
             table_rows.append(
                 TableRow(
@@ -505,10 +578,18 @@ def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_ar
         ["4", "2022-08-01", "2022-08-01 10:00:00", "往来款", "50.00", "", "1048.00", "622200004", "丙公司"],
     ]
     pages = [
-        PageContent(page_number=1, texts=[TextBlock(content="1 2022-06-01 10:00:00 往来款 100.00 900.00 622200001 甲公司")]),
-        PageContent(page_number=1, texts=[TextBlock(content="2 2022-06-02 10:00:00 收费 2.00 898.00 622200002 手续费收入")]),
-        PageContent(page_number=2, texts=[TextBlock(content="3 2022-07-01 10:00:00 往来款 200.00 1,098.00 622200003 乙公司")]),
-        PageContent(page_number=3, texts=[TextBlock(content="4 2022-08-01 10:00:00 往来款 50.00 1,048.00 622200004 丙公司")]),
+        PageContent(
+            page_number=1, texts=[TextBlock(content="1 2022-06-01 10:00:00 往来款 100.00 900.00 622200001 甲公司")]
+        ),
+        PageContent(
+            page_number=1, texts=[TextBlock(content="2 2022-06-02 10:00:00 收费 2.00 898.00 622200002 手续费收入")]
+        ),
+        PageContent(
+            page_number=2, texts=[TextBlock(content="3 2022-07-01 10:00:00 往来款 200.00 1,098.00 622200003 乙公司")]
+        ),
+        PageContent(
+            page_number=3, texts=[TextBlock(content="4 2022-08-01 10:00:00 往来款 50.00 1,048.00 622200004 丙公司")]
+        ),
     ]
     ctx = StyleContext(
         tables=[[headers, *raw_rows]],
@@ -530,10 +611,30 @@ def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_ar
 def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
     headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
     raw_rows = [
-        ["13", "2022-06-13", "2022-06-13 18:19:36", "公共耗能和水电费用", "101.80", "", "54.15", "6232511300395178", "限公司"],
+        [
+            "13",
+            "2022-06-13",
+            "2022-06-13 18:19:36",
+            "公共耗能和水电费用",
+            "101.80",
+            "",
+            "54.15",
+            "6232511300395178",
+            "限公司",
+        ],
         ["14", "2022-06-13", "2022-06-13 18:19:36", "收费", "2.00", "", "52.15", "70650107360000033", "入"],
         ["15", "2022-06-21", "2022-06-21 00:21:02", "结息", "", "53.14", "6226.06", "", ""],
-        ["16", "2022-08-03", "2022-08-03 17:35:14", "tips扣税", "2159.00", "", "1320.91", "70010151830005003", "代收）"],
+        [
+            "16",
+            "2022-08-03",
+            "2022-08-03 17:35:14",
+            "tips扣税",
+            "2159.00",
+            "",
+            "1320.91",
+            "70010151830005003",
+            "代收）",
+        ],
     ]
     source_text = "\n".join(
         [
@@ -616,10 +717,78 @@ def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
     assert records[3]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
 
 
+def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
+    headers = ["序号", "交易日期", "交易时间", "摘要", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    raw_rows = [
+        ["159", "2023-01-27", "", "转出", "20,000.00", "", "73,155.95", "1000050001", "限公司"],
+        ["160", "2023-01-27", "", "转出", "50,000.00", "", "23,155.95", "215500690", "WL支付宝"],
+    ]
+    column_ordered_text = "\n".join(
+        [
+            "159",
+            "160",
+            "2023-01-27",
+            "2023-01-27",
+            "20,000.00",
+            "50,000.00",
+            "73,155.95",
+            "23,155.95",
+            "1000050001",
+            "215500690",
+            "清单支出算术合计:19,756,586.06",
+            "打印渠道:远程视频柜员机",
+            "打印机构:907072604",
+            "WL财付通微信转账:微信转账",
+            "WL财付通微信转账:微信转账",
+            "WL支付宝",
+            "对方户名张祝祥陈元友",
+        ]
+    )
+    ctx = StyleContext(
+        tables=[[headers, *raw_rows]],
+        full_text=column_ordered_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=column_ordered_text)])]),
+        reconstruction=ReconstructionMeta(source="canonical_evidence_table", expected_primary_rows=2),
+    )
+
+    detection = BankStyleDetector().detect(ctx)
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+    records = _sanitize_bank_records(records)
+
+    assert len(records) == 2
+    assert records[0]["normalized"]["counter_party"] == ""
+    assert "清单支出算术合计" not in records[0]["raw"]["对方户名"]
+    assert records[1]["normalized"]["counter_party"] == "WL支付宝"
+
+
 def test_registry_prefers_semantic_text_table_when_canonical_grid_coverage_is_low():
-    bad_headers = ["序号", "交易日期", "交易时间", "摘要", "凭证种类", "借方发生额", "贷方发生额", "余额", "对方账户", "对方户名"]
+    bad_headers = [
+        "序号",
+        "交易日期",
+        "交易时间",
+        "摘要",
+        "凭证种类",
+        "借方发生额",
+        "贷方发生额",
+        "余额",
+        "对方账户",
+        "对方户名",
+    ]
     bad_rows = [
-        ["1", "2023-06-01", "11:47:14", "往来款", "16,500.00", "17,286.21", "7065018800015", "6836", "镇江一生一世好", ""],
+        [
+            "1",
+            "2023-06-01",
+            "11:47:14",
+            "往来款",
+            "16,500.00",
+            "17,286.21",
+            "7065018800015",
+            "6836",
+            "镇江一生一世好",
+            "",
+        ],
         ["3", "2023-06-01", "11:48:53", "工资", "514.46", "16,674.25", "6228760805004", "170034", "俞佩", ""],
     ]
     full_text = "\n".join(
@@ -709,3 +878,317 @@ def test_wide_table_accepts_direction_embedded_amount_header():
     ]
     assert is_wide_bank_header(table[0]) is True
     assert len(_select_wide_bank_table(table)) == 3
+
+
+_SHANGRAO_HEADERS = [
+    "序号",
+    "交易时间",
+    "流水号",
+    "对方账号",
+    "对方户名",
+    "支出",
+    "收入",
+    "账户余额",
+    "摘要",
+    "附言",
+]
+
+
+def _sourced_bank_row(values: list[str], *, page: int, row_index: int) -> TableRow:
+    refs = [
+        {
+            "page": page,
+            "table_id": f"pt_{page}_0",
+            "row": row_index,
+            "raw_row": row_index + 1,
+            "col": col_index,
+        }
+        for col_index, _value in enumerate(values)
+    ]
+    return TableRow(
+        cells=[
+            CellValue(
+                text=value,
+                evidence_ids=[f"ev:{page:04d}:text:{row_index:06d}:{col_index:02d}"],
+                source_cell_refs=[refs[col_index]],
+            )
+            for col_index, value in enumerate(values)
+        ],
+        source_page=page,
+        source_physical_id=f"pt_{page}_0",
+        source_row_index=row_index,
+        source_cell_refs=refs,
+    )
+
+
+def _cross_page_bank_parse_result(
+    *,
+    valid_page_two_row: bool = False,
+    repeated_header_fragment: bool = False,
+    fragment_page: int = 2,
+    fragment_row_index: int = 0,
+) -> ParseResult:
+    page_one_values = [
+        "13",
+        "2023-",
+        "1112052",
+        "7272798",
+        "江西昌荣",
+        "",
+        "1000000",
+        "1006296.",
+        "超网-贷记",
+        "转户",
+    ]
+    page_two_values = (
+        [
+            "",
+            "2023-\n06-28\n18:00:00",
+            "",
+            "7272798\n0000001\n1760",
+            "江西昌荣\n供应链有限公司",
+            "",
+            "500",
+            "1006796.\n3",
+            "超网-贷记\n转入",
+            "转户",
+        ]
+        if valid_page_two_row
+        else [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "借方\nDebit",
+            "贷方\nCredit",
+            "",
+            "对手名称\nCounterparty Name",
+            "备注\nDescription",
+        ]
+        if repeated_header_fragment
+        else [
+            "",
+            "06-28\n19:50:16",
+            "",
+            "0000001\n1760",
+            "供应链有\n限公司",
+            "",
+            "",
+            "3",
+            "转入",
+            "",
+        ]
+    )
+    final_values = [
+        "14",
+        "2023-\n06-28\n11:24:57",
+        "1069557",
+        "7272798\n0000001\n1760",
+        "江西昌荣\n供应链有\n限公司",
+        "780000",
+        "",
+        "6296.3",
+        "超网-贷记\n转出",
+        "转户",
+    ]
+    rows = [
+        _sourced_bank_row(page_one_values, page=1, row_index=12),
+        _sourced_bank_row(page_two_values, page=fragment_page, row_index=fragment_row_index),
+        _sourced_bank_row(final_values, page=2, row_index=1),
+    ]
+    provenance = [
+        RowProvenance(source_page=1, source_table_id="pt_1_0", source_row_index=12),
+        RowProvenance(
+            source_page=fragment_page,
+            source_table_id=f"pt_{fragment_page}_0",
+            source_row_index=fragment_row_index,
+            is_continuation=True,
+        ),
+        RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=1, is_continuation=True),
+    ]
+    return ParseResult(
+        pages=[
+            PageContent(page_number=1, texts=[TextBlock(content="上饶银行账户交易明细")]),
+            PageContent(page_number=2),
+        ],
+        entities=DocumentEntities(document_type="bank_statement"),
+        logical_tables=[
+            LogicalTable(
+                table_id="lt_0",
+                headers=_SHANGRAO_HEADERS,
+                rows=rows,
+                row_count=len(rows),
+                source_pages=[1, 2],
+                source_physical_ids=["pt_1_0", "pt_2_0"],
+                page_span=(1, 2),
+                provenance=provenance,
+                quality_passed=True,
+                data_row_estimate=len(rows),
+            )
+        ],
+    )
+
+
+def test_cross_page_split_grid_stitches_one_business_record_with_two_page_sources():
+    result = run_bank_statement_extract(
+        _cross_page_bank_parse_result(),
+        "上饶银行账户交易明细",
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(result.records) == 2
+    first, second = result.records
+    expected = {
+        "sequence_no": "13",
+        "date": "2023-06-28",
+        "timestamp": "2023-06-28T19:50:16",
+        "reference": "1112052",
+        "counter_account": "727279800000011760",
+        "counter_party": "江西昌荣供应链有限公司",
+        "direction": "income",
+        "amount": 1000000.0,
+        "balance": 1006296.3,
+        "summary": "超网-贷记转入",
+    }
+    assert {key: first["normalized"][key] for key in expected} == expected
+    assert first["source"]["source_page"] == 1
+    assert first["source"]["page_range"] == [1, 2]
+    assert {ref["page"] for ref in first["source"]["source_cell_refs"]} == {1, 2}
+    assert len(first["source"]["source_refs"]) == 2
+    assert second["normalized"]["sequence_no"] == "14"
+    assert second["normalized"]["date"] == "2023-06-28"
+    assert second["source"]["page_range"] == [2, 2]
+    assert result.ctx.reconstruction is not None
+    assert result.ctx.reconstruction.stitched_continuation_rows == 1
+    assert result.style_meta.expected_primary_rows == 2
+    assert result.style_meta.extracted_rows == 2
+    assert result.style_meta.canonical_expected == 2
+    assert result.style_meta.canonical_extracted == 2
+
+
+def test_cross_page_stitch_does_not_merge_valid_page_two_transaction():
+    result = run_bank_statement_extract(
+        _cross_page_bank_parse_result(valid_page_two_row=True),
+        "上饶银行账户交易明细",
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(result.records) == 2
+    assert result.ctx.reconstruction is not None
+    assert result.ctx.reconstruction.stitched_continuation_rows == 0
+    assert result.records[0]["normalized"]["date"] == "2023-06-28"
+    assert result.records[0]["normalized"]["amount"] == 500.0
+    assert "source_refs" not in result.records[0]["source"]
+
+
+def test_cross_page_stitch_does_not_merge_repeated_page_header():
+    result = run_bank_statement_extract(
+        _cross_page_bank_parse_result(repeated_header_fragment=True),
+        "上饶银行账户交易明细",
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0]["normalized"]["sequence_no"] == "14"
+    assert result.records[0]["source"]["page_range"] == [2, 2]
+    assert result.ctx.reconstruction is not None
+    assert result.ctx.reconstruction.stitched_continuation_rows == 0
+
+
+@pytest.mark.parametrize(
+    ("fragment_page", "fragment_row_index"),
+    [(1, 13), (2, 3)],
+)
+def test_cross_page_stitch_requires_next_page_top(fragment_page: int, fragment_row_index: int):
+    result = run_bank_statement_extract(
+        _cross_page_bank_parse_result(
+            fragment_page=fragment_page,
+            fragment_row_index=fragment_row_index,
+        ),
+        "上饶银行账户交易明细",
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(result.records) == 1
+    assert result.records[0]["normalized"]["sequence_no"] == "14"
+    assert result.ctx.reconstruction is not None
+    assert result.ctx.reconstruction.stitched_continuation_rows == 0
+
+
+def test_grid_normalization_removes_layout_wraps_only_in_typed_fields():
+    normalized = normalize_record(
+        {
+            "序号": "474",
+            "交易时间": "2023-\n01-03\n19:07:12",
+            "流水号": "1408124",
+            "对方账号": "7270991\n0000001\n7378",
+            "对方户名": "九江冠泽\n建材贸易\n有限公司",
+            "支出": "1000000\n0",
+            "收入": "",
+            "账户余额": "610082.5\n2",
+            "摘要": "超网-贷记\n转出",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["date"] == "2023-01-03"
+    assert normalized["timestamp"] == "2023-01-03T19:07:12"
+    assert normalized["amount"] == 10000000.0
+    assert normalized["balance"] == 610082.52
+    assert normalized["counter_account"] == "727099100000017378"
+    assert normalized["counter_party"] == "九江冠泽建材贸易有限公司"
+
+
+def test_cross_page_records_stay_consistent_across_community_artifacts():
+    bundle = BankStatementCommunityPlugin().project_bundle(
+        seal_parse_result(_cross_page_bank_parse_result()),
+        file_id="001",
+        document_id="doc_cross_page_bank",
+    )
+
+    assert bundle is not None
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    dataset = payload["datasets"][0]
+    json_rows = dataset["rows"]
+    csv_text = bundle.render_dataset_csvs(semantic)[dataset["csv"]]
+    csv_rows = list(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))))
+    audit_rows = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
+    markdown = bundle.render_markdown()
+
+    record_ids = [row["record_id"] for row in json_rows]
+    assert dataset["row_count"] == len(json_rows) == len(csv_rows) == 2
+    assert record_ids == ["records:r000001", "records:r000002"]
+    assert [row["record_id"] for row in csv_rows] == record_ids
+    assert {row["record_id"] for row in audit_rows} == set(record_ids)
+    assert bundle.conservation_issues(payload=payload, dataset_csvs={dataset["csv"]: csv_text}) == []
+
+    first_json = json_rows[0]
+    first_csv = csv_rows[0]
+    first_audit = {row["field_key"]: row for row in audit_rows if row["record_id"] == record_ids[0]}
+    assert first_json["normalized"]["date"] == "2023-06-28"
+    assert first_json["normalized"]["amount"] == "1000000.0"
+    assert first_json["normalized"]["balance"] == "1006296.3"
+    assert first_json["source"]["page_range"] == [1, 2]
+    assert first_csv["date"] == "2023-06-28"
+    assert first_csv["amount"] == "1000000.0"
+    assert first_csv["balance"] == "1006296.3"
+    assert (first_csv["_page_start"], first_csv["_page_end"]) == ("1", "2")
+    assert first_audit["amount"]["value"] == "1000000.0"
+    assert first_audit["amount"]["raw"] == "1000000"
+    assert first_audit["balance"]["value"] == "1006296.3"
+    assert first_audit["balance"]["raw"] == "1006296.3"
+    assert first_audit["date"]["value"] == "2023-06-28"
+    assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in markdown
+    first_markdown_row = (
+        "| 13 | 2023-06-2819:50:16 | 1112052 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        " | 1000000 | 1006296.3 | 超网-贷记转入 | 转户 |"
+    )
+    second_markdown_row = (
+        "| 14 | 2023-06-2811:24:57 | 1069557 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        "780000 |  | 6296.3 | 超网-贷记转出 | 转户 |"
+    )
+    assert first_markdown_row in markdown
+    assert second_markdown_row in markdown
+    assert markdown.index(first_markdown_row) < markdown.index(second_markdown_row)

@@ -28,13 +28,16 @@ if TYPE_CHECKING:
 _HEADER_LIMIT = 4000
 _HEADER_BANK_PATTERNS = (
     re.compile(
-        r"开户行(?:\s+The Bank(?:\s+of Account Opening)?)?[:：]?\s*"
+        r"(?<!对方)开户行(?:\s+The Bank(?:\s+of Account Opening)?)?[:：]?\s*"
         r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|账单统计日期|起始日期|From\(|\n|$)",
         re.I,
     ),
     re.compile(r"开户机构[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|年份|月份|账号|户名|\n)"),
-    re.compile(r"开户行\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,40}?)(?:\s{2,}|起始日期|From\(|\n)"),
-    re.compile(r"开户行[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|账号|户名|\n)"),
+    re.compile(r"(?<!对方)开户行\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,40}?)(?:\s{2,}|起始日期|From\(|\n)"),
+    re.compile(
+        r"(?<!对方)开户行[:：]?\s*"
+        r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|账号|户名|\n)"
+    ),
     re.compile(r"Bank Name\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|From\(|\n)", re.I),
 )
 _IDENTITY_SKIP_KEYWORDS = (
@@ -59,6 +62,13 @@ _IDENTITY_SKIP_KEYWORDS = (
     "对方",
     "借方",
     "贷方",
+    "承前",
+    "承后",
+    "合计",
+    "小计",
+    "总计",
+    "发生数",
+    "发生额",
 )
 _NON_INSTITUTION_TOKENS = (
     "网上银行",
@@ -209,7 +219,7 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
 
     m = re.search(
         r"(?<![账客方])户名[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,80}?)"
-        r"(?:\s{2,}|币种|交易|明细|账号|开户|$|\n)",
+        r"(?:\s{2,}|币种|年份|月份|交易|明细|账号|开户|$|\n)",
         header,
     )
     if m and _looks_like_holder_name(m.group(1)):
@@ -253,7 +263,7 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
 
     m = re.search(
         r"(?<!贷款)(?<!对方)(?:客户)?账\s*号(?:\s*Account\s+Number)?"
-        r"(?:\s*/\s*卡号)?[:：]?[ \t]*([0-9*＊\\ \t]{8,40})",
+        r"(?:\s*/\s*卡号)?[:：]?[ \t]*([0-9*＊\\ \t-]{8,40})",
         header,
         re.I,
     )
@@ -388,10 +398,10 @@ def _extract_year_month_period(header: str) -> str:
 
 
 def _extract_query_period(header: str) -> str:
+    date_token = r"(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8}|\d{4}年\d{1,2}月\d{1,2}日)"
     m = re.search(
         r"(?:查询日期|起止日期|起讫日期|日期范围|账单统计日期(?:\s*Start Time\s*&\s*End Time)?)[:：]?\s*"
-        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})\s*(?:至|~|—|-)\s*"
-        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8})",
+        rf"({date_token})\s*(?:至|~|—|-)\s*({date_token})",
         header,
         re.I,
     )
@@ -404,6 +414,9 @@ def _extract_query_period(header: str) -> str:
 
 def _normalize_date_token(value: str) -> str:
     text = str(value or "").replace("/", "-").strip()
+    chinese = re.fullmatch(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if chinese:
+        return f"{int(chinese.group(1)):04d}-{int(chinese.group(2)):02d}-{int(chinese.group(3)):02d}"
     if re.fullmatch(r"\d{8}", text):
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)

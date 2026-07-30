@@ -62,6 +62,35 @@ def test_build_style_meta_uses_mirror_expected_rows():
     assert abs(meta.coverage_ratio - (40 / 47)) < 0.001
 
 
+def test_build_style_meta_prefers_independent_source_count_over_weak_mirror_estimate():
+    pr = _parse_result_with_ltqg(12)
+    records = [
+        {
+            "normalized": {
+                "date": "2025-07-01",
+                "direction": "income",
+                "amount": 1.0,
+                "balance": 1.0,
+            }
+        }
+        for _ in range(11)
+    ]
+
+    meta = build_style_meta(
+        _detection(),
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=12),
+        record_count=11,
+        parse_result=pr,
+        records=records,
+        source_reported_count=11,
+    )
+
+    assert meta.expected_primary_rows == 11
+    assert meta.canonical_expected == 11
+    assert meta.coverage_ratio == 1.0
+    assert meta.extract_status == "success"
+
+
 def test_style_registry_expected_rows_from_parse_result():
     pr = _parse_result_with_ltqg(47)
     ctx = StyleContext(

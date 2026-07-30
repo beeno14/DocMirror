@@ -86,6 +86,7 @@ def build_style_meta(
     parse_result: Any = None,
     records: list[dict[str, Any]] | None = None,
     blo_meta: Any = None,
+    source_reported_count: int = 0,
 ) -> StyleMeta:
     expected = 0
     source = ""
@@ -94,6 +95,7 @@ def build_style_meta(
         expected = getattr(reconstruction, "expected_primary_rows", 0) or 0
         source = getattr(reconstruction, "source", "") or ""
         pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
+    stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
 
     from docmirror.plugins.bank_statement.canonical_quality import (
         audit_cqf,
@@ -101,8 +103,16 @@ def build_style_meta(
     )
 
     canonical_expected = canonical_expected_from_parse_result(parse_result)
-    if source in ("stacked_text", "native_wide_table", "ocr_implicit_table") and record_count > 0:
+    if canonical_expected > 0 and stitched_continuation_rows > 0:
+        canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
+    if source_reported_count > 0:
+        expected = int(source_reported_count)
+    elif source in ("stacked_text", "native_wide_table", "ocr_implicit_table") and record_count > 0:
         expected = record_count
+    elif source == "canonical_evidence_table" and expected > 0:
+        # Positioned date anchors are independent of weak logical-table row
+        # estimates and must remain the denominator for this recovery branch.
+        pass
     elif canonical_expected > 0:
         expected = canonical_expected
     elif parse_result is not None and source in ("canonical_table", ""):
