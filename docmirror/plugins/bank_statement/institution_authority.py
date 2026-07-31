@@ -20,6 +20,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text
 from docmirror.plugins.bank_statement.institution import detect_registered_institution, match_institution
 
 if TYPE_CHECKING:
@@ -83,7 +84,7 @@ _NON_INSTITUTION_TOKENS = (
 
 
 def _header_text(full_text: str) -> str:
-    text = full_text or ""
+    text = normalize_bank_matching_text(full_text or "")
     if not text:
         return ""
     identity_anchors = (
@@ -262,7 +263,7 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         out["account_holder"] = _nearby_holder_after_label(header)
 
     m = re.search(
-        r"(?<!贷款)(?<!对方)(?:客户)?账\s*号(?:\s*Account\s+Number)?"
+        r"(?<!贷款)(?<!对方)(?:客户)?(?:账号|账户|账\s*号|账\s*户)(?:\s*Account\s+Number)?"
         r"(?:\s*/\s*卡号)?[:：]?[ \t]*([0-9*＊\\ \t-]{8,40})",
         header,
         re.I,

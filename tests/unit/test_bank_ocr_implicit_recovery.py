@@ -371,6 +371,39 @@ def test_complete_paragraph_header_keeps_two_existing_rows() -> None:
     assert len(tables[0]) == 3
 
 
+def test_complete_paragraph_header_accepts_plain_date_and_signed_amount_column() -> None:
+    lines = [
+        (
+            "序号 日期 借/贷方发生额 余额 对方户名 对方账户 传票号 摘要",
+            [30, 100, 760, 118],
+        ),
+        (
+            "1 20230309 -4,819.00 401,143.31 杨光 6226192013864418 备用金",
+            [30, 130, 760, 145],
+        ),
+        (
+            "2 20230309 -13,300.00 387,843.31 谢林华 6226192011784154 备用金",
+            [30, 146, 760, 161],
+        ),
+        (
+            "3 20230310 +18,400.00 406,243.31 梁远述 6228480460934190410 往来款",
+            [30, 162, 760, 177],
+        ),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1, texts=[TextBlock(content=text, bbox=bbox) for text, bbox in lines])]
+    )
+
+    tables = recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert len(tables) == 1
+    assert [row[:7] for row in tables[0][1:]] == [
+        ["2023-03-09", "支出", "4819.00", "401143.31", "备用金", "6226192013864418", "杨光"],
+        ["2023-03-09", "支出", "13300.00", "387843.31", "备用金", "6226192011784154", "谢林华"],
+        ["2023-03-10", "收入", "18400.00", "406243.31", "往来款", "6228480460934190410", "梁远述"],
+    ]
+
+
 def test_recover_native_corporate_detail_with_transaction_occurrence_amount_header() -> None:
     lines = [
         ("交易日期\n交易发生金额\n账户余额\n对方账号\n对方户名\n摘要\n备注", [30, 100, 520, 118]),

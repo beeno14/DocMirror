@@ -526,12 +526,36 @@ class BaseTableParser(CommunityProjector, ABC):
         from docmirror.plugins._runtime.evidence_access import text_atoms
 
         atoms = text_atoms(parse_result)
+        parser_info = getattr(parse_result, "parser_info", None)
+        options = getattr(parser_info, "options", None)
+        selected_source_pages = {
+            int(page) for page in ((options or {}).get("selected_source_pages") or []) if str(page).isdigit()
+        }
+        rejected_source_pages = {
+            int(page) for page in ((options or {}).get("native_text_ocr_fallback_pages") or []) if str(page).isdigit()
+        }
+        evidence_plane = getattr(parse_result, "evidence_plane", None)
+        evidence_pages = list(getattr(evidence_plane, "pages", None) or [])
+        page_number_by_id = {
+            str(getattr(page, "page_id", "") or ""): int(getattr(page, "page_number", 0) or 0)
+            for page in evidence_pages
+            if str(getattr(page, "page_id", "") or "")
+        }
+        native_source_kinds = {"pdf_native", "pdf_native_pypdf", "parse_result_text"}
 
         grouped: dict[str, list[dict[str, Any]]] = {}
         for atom in atoms:
             if not isinstance(atom, dict):
                 continue
             page_id = str(atom.get("page_id") or "")
+            page_number = page_number_by_id.get(page_id)
+            if page_number is None:
+                match = re.fullmatch(r"page:(\d+)", page_id)
+                page_number = int(match.group(1)) if match else 0
+            if selected_source_pages and page_number not in selected_source_pages:
+                continue
+            if page_number in rejected_source_pages and str(atom.get("source_kind") or "") in native_source_kinds:
+                continue
             text = str(atom.get("text") or "").strip()
             bbox = atom.get("bbox")
             if not page_id or not text or not isinstance(bbox, list) or len(bbox) < 4:

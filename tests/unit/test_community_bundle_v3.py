@@ -470,7 +470,7 @@ def test_dataset_bundle_has_one_wide_row_per_record_and_cell_audit() -> None:
     assert "subject_name" not in {row["field_key"] for row in audit_rows}
 
 
-def test_enterprise_audit_resolves_field_evidence_from_structural_table_refs() -> None:
+def test_audit_resolves_field_evidence_from_structural_table_refs_for_all_domains() -> None:
     candidate = _candidate(
         [
             {
@@ -500,7 +500,7 @@ def test_enterprise_audit_resolves_field_evidence_from_structural_table_refs() -
     )
     bundle = project_community_bundle(result, document_id="doc_test")
     semantic = bundle.semantic_payload()
-    semantic["classification"]["document_type"] = "enterprise_credit_report"
+    semantic["classification"]["document_type"] = "bank_statement"
     semantic["structure"]["source_tables"] = [
         {
             "id": "pt_4_2",
@@ -536,6 +536,7 @@ def test_enterprise_audit_resolves_field_evidence_from_structural_table_refs() -
     sequence = next(row for row in audit_rows if row["field_key"] == "sequence")
     assert month["evidence_ref"] == '["ev:0004:text:000001"]'
     assert month["bbox"] == "[10.0,20.0,40.0,30.0]"
+    assert month["confidence"] == "1.0"
     assert status["evidence_ref"] == '["ev:0004:text:000002"]'
     assert status["bbox"] == "[40.0,20.0,60.0,30.0]"
     assert json.loads(sequence["evidence_ref"]) == [

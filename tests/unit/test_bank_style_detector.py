@@ -60,3 +60,22 @@ def test_detector_institution_hint():
     )
     result = BankStyleDetector().detect(ctx)
     assert result.institution_hint == "银座银行"
+
+
+def test_detector_ignores_income_word_in_transaction_body_for_signed_amount_style():
+    table = [
+        ["交易日期", "对方户名", "交易摘要", "发生额", "余额"],
+        ["2024-03-11 22:27:09", "北京微播视界科技有限公司", "汇款", "-45.00", "15214.50"],
+        ["2024-03-12 12:05:32", "短信提醒服务费收入", "收费", "5.27", "15219.77"],
+    ]
+    ctx = StyleContext(
+        tables=[table],
+        full_text="湖北农商银行个人交易流水",
+        institution="湖北农商银行",
+        page_count=1,
+    )
+
+    result = BankStyleDetector().detect(ctx)
+
+    assert result.primary_style == "signed_amount"
+    assert result.parser_chain == ["signed_amount"]

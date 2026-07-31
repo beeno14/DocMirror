@@ -144,7 +144,51 @@ def test_vertical_header_identity_overrides_weak_transaction_summary_identity() 
 
     assert fields["account_holder"]["normalized_value"] == "镇江一生一世好游戏有限公司"
     assert fields["account_number"]["normalized_value"] == "70650188000156836"
+    assert "currency" not in fields
+
+
+def test_currency_is_recovered_from_an_explicit_source_table_column() -> None:
+    currency_cell = SimpleNamespace(
+        text="CNY",
+        source_cell_refs=[{"page": 1, "table_id": "pt_1_0", "row": 0, "col": 1}],
+        evidence_ids=["ev:currency"],
+    )
+    parse_result = SimpleNamespace(
+        entities=None,
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                tables=[
+                    SimpleNamespace(
+                        table_id="pt_1_0",
+                        headers=["交易日期", "币种"],
+                        rows=[
+                            SimpleNamespace(
+                                cells=[SimpleNamespace(text="2024-01-01"), currency_cell],
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+    )
+    fields = enrich_identity_fields(
+        {
+            "bank_name": {
+                "raw_name": "bank_name",
+                "raw_value": "测试银行",
+                "normalized_value": "测试银行",
+                "data_type": "string",
+            }
+        },
+        "",
+        parse_result,
+    )
+
     assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["currency"]["source"] == "source_table.currency"
+    assert fields["currency"]["evidence_ids"] == ["ev:currency"]
 
 
 def test_horizontal_header_identity_for_wide_bank_statement() -> None:
@@ -219,6 +263,19 @@ def test_bank_header_total_record_count_is_an_independent_expected_count() -> No
     assert count_expected_rows_from_bank_footer(text) == 38
 
 
+def test_page_footer_transaction_counts_are_summed_across_pages() -> None:
+    text = "\n".join(
+        [
+            "第1页 共4页 本页交易笔数: 28",
+            "第2页 共4页 本页交易笔数: 28",
+            "第3页 共4页 本页交易笔数: 28",
+            "第4页 共4页 本页交易笔数: 25",
+        ]
+    )
+
+    assert count_expected_rows_from_bank_footer(text) == 109
+
+
 def test_corporate_detail_header_identity_and_split_footer_counts_are_bounded() -> None:
     text = """
     对公客户账户明细
@@ -250,6 +307,20 @@ def test_reverse_order_balance_chain_passes_when_totals_close() -> None:
     ]
 
     assert audit_bank_statement_invariants(records, text) == []
+
+
+def test_reconciliation_direction_counts_are_checked_independently() -> None:
+    text = "借方笔数：2 借方发生总额：20.00 贷方笔数：1 贷方发生总额：100.00 合计笔数：3"
+    records = [
+        {"normalized": {"date": "2023-01-01", "amount": 20.0, "direction": "expense"}},
+        {"normalized": {"date": "2023-01-02", "amount": 100.0, "direction": "income"}},
+    ]
+
+    failures = audit_bank_statement_invariants(records, text)
+
+    assert "bank_invariant_failed:row_count:2/3" in failures
+    assert "bank_invariant_failed:debit_count:1/2" in failures
+    assert "bank_invariant_failed:credit_count:1/1" not in failures
 
 
 def test_balance_chain_gap_reports_review_only_missing_row_candidate() -> None:
@@ -309,12 +380,7 @@ def test_balance_chain_skips_known_sequence_gap_and_reports_source_page_gap() ->
     warnings = audit_bank_statement_invariants(records, text)
 
     assert not any(item.startswith("bank_invariant_failed:balance_chain") for item in warnings)
-    assert (
-        "bank_review:source_page_gap:"
-        "observed=4/54:"
-        "missing_ranges=3-6,9-54:"
-        "action=manual_review"
-    ) in warnings
+    assert ("bank_review:source_page_gap:observed=4/54:missing_ranges=3-6,9-54:action=manual_review") in warnings
 
 
 def test_canonical_quality_does_not_mark_partial_rows_success() -> None:

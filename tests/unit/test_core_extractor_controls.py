@@ -121,6 +121,66 @@ def test_vnext_extractor_force_ocr_runs_even_with_native_text(monkeypatch):
     assert result.parser_info.options["ocr_mode"] == "force"
 
 
+def test_vnext_extractor_auto_ocr_replaces_suspicious_native_glyph_mapping(monkeypatch):
+    import docmirror.evidence.plane as evidence_plane_module
+
+    plane = _fake_plane()
+    suspicious = [
+        "客户存款月结单",
+        "户名：" + "上" * 12,
+        "客户行：" + "平" * 8,
+        *("对方户名：" + char * 6 for char in ("备", "往", "咨", "梅", "国", "宋")),
+        "温馨提示：单位应与开户银行定期进行对账并及时核对财务信息",
+    ]
+    plane.evidence.text_atoms = [
+        SimpleNamespace(
+            id=f"atom:suspicious:{index}",
+            page_id="page:0002",
+            text=text,
+            bbox=[0, index * 10, 200, index * 10 + 8],
+        )
+        for index, text in enumerate(suspicious)
+    ]
+
+    class FakeEvidencePlaneBuilder:
+        def build(self, _path):
+            return plane
+
+    def fake_ocr(_file_path, _page_index, page_number, *, start_order=0):
+        return [_ocr_block("户名：上海炫酷广告有限公司", page_number)]
+
+    monkeypatch.setattr(evidence_plane_module, "EvidencePlaneBuilder", FakeEvidencePlaneBuilder)
+    monkeypatch.setattr(extractor_module, "_ocr_blocks_for_pdf_page", fake_ocr)
+
+    policy = normalize_parse_policy(pages="2", ocr="auto")
+    result = asyncio.run(CoreExtractor().extract_parse_result(Path("sample.pdf"), options={"parse_policy": policy}))
+
+    assert "上海炫酷广告有限公司" in result.full_text
+    assert "上上上上" not in result.full_text
+    assert result.pages[0].page_mode == "scanned_ocr"
+    assert result.parser_info.options["native_text_ocr_fallback_pages"] == [2]
+    assert "native_text_glyph_mapping_suspected" in result.parser_info.warnings
+
+
+def test_native_glyph_mapping_detector_ignores_isolated_legitimate_repetition():
+    normal_atoms = [
+        SimpleNamespace(text="人人都应及时核对账户信息，感谢您的支持"),
+        SimpleNamespace(text="哈哈哈只是一个孤立示例，其余内容没有异常重复"),
+        SimpleNamespace(text="上海炫酷广告有限公司向供应商支付广告服务费用"),
+    ] * 4
+    suspicious_atoms = [
+        SimpleNamespace(text="户名：" + "上" * 12),
+        SimpleNamespace(text="客户行：" + "平" * 8),
+        SimpleNamespace(text="对方户名：" + "备" * 7),
+        SimpleNamespace(text="摘要：" + "往" * 7),
+        SimpleNamespace(text="银行流水交易信息与账户余额核对说明"),
+    ] * 3
+
+    assert extractor_module._has_suspicious_native_glyph_mapping(normal_atoms) is False
+    assert extractor_module._has_suspicious_native_glyph_mapping(suspicious_atoms) is True
+    assert extractor_module._should_ocr_page("off", suspicious_atoms) is False
+
+
 def test_vnext_extractor_suppresses_text_owned_by_scanned_table(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 

@@ -30,6 +30,7 @@ import yaml
 from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.header_resolve import has_split_debit_credit_headers
 from docmirror.plugins.bank_statement.institution_authority import resolve_institution_hint
+from docmirror.plugins.bank_statement.row_extract import row_has_transaction_data
 from docmirror.plugins.bank_statement.styles.compact_merged import table_has_compact_ledger
 
 _CONFIG_PATH = files(__package__).joinpath("resources").joinpath("table_styles.yaml")
@@ -208,6 +209,8 @@ class BankStyleDetector:
         headers: list[str] = []
         for tbl in tables:
             for row in tbl[:12]:
+                if row_has_transaction_data(row):
+                    break
                 for cell in row:
                     text = str(cell or "").strip()
                     if text and text not in headers:

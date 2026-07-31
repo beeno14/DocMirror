@@ -17,6 +17,7 @@ from docmirror.models.entities.parse_result import (
     PageContent,
     ParseResult,
     RowProvenance,
+    TableBlock,
     TableRow,
     TextBlock,
 )
@@ -83,6 +84,63 @@ def test_style_registry_icbc_split_columns():
     directions = {r["normalized"].get("direction") for r in records}
     assert "income" in directions
     assert "expense" in directions
+
+
+def test_recovery_candidate_is_consumed_instead_of_reopening_sparse_logical_table():
+    """A selected generic recovery table must not be replaced by the original narrow logical table."""
+    sparse = LogicalTable(
+        table_id="lt_sparse",
+        headers=["交易日期", "交易金额", "余额"],
+        rows=[TableRow(cells=[CellValue(text="2024-01-01"), CellValue(text="+10.00"), CellValue(text="10.00")])],
+        row_count=1,
+        data_row_estimate=1,
+        quality_passed=True,
+    )
+    physical_values = [
+        ["2024-01-01", "+10.00", "10.00", "甲公司"],
+        ["2024-01-02", "-2.00", "8.00", "乙公司"],
+        ["2024-01-03", "+3.00", "11.00", "丙公司"],
+    ]
+    parse_result = ParseResult(
+        pages=[
+            PageContent(
+                page_number=1,
+                tables=[
+                    TableBlock(
+                        table_id="pt_1_0",
+                        headers=["交易日期", "交易金额", "余额", "对方户名"],
+                        rows=[
+                            TableRow(
+                                cells=[CellValue(text=value) for value in row],
+                                source_page=1,
+                                source_physical_id="pt_1_0",
+                                source_row_index=index,
+                            )
+                            for index, row in enumerate(physical_values)
+                        ],
+                    )
+                ],
+            )
+        ],
+        logical_tables=[sparse],
+    )
+
+    ctx = StyleContext(
+        tables=[[sparse.headers, *[[cell.text for cell in row.cells] for row in sparse.rows]]],
+        full_text="某银行交易明细 总笔数：3",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=1),
+    )
+    records, _ = BankStyleParserRegistry().run(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 3
+    assert [record["normalized"]["direction"] for record in records] == ["income", "expense", "income"]
 
 
 def test_normalize_split_debit_credit_direct():
@@ -763,6 +821,30 @@ def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
     assert records[1]["normalized"]["counter_party"] == "WL支付宝"
 
 
+def test_signed_grid_keeps_source_null_interest_counterparty_empty():
+    headers = ["交易日期", "对方户名", "对方账号/卡号", "交易摘要", "发生额", "余额", "币种"]
+    row = ["2024-06-20\n20:59:30", "", "0000000000000", "结存款息", "4.37", "17486.33", "CNY"]
+    source_text = "2024-06-20 20:59:30 0000000000000 结存款息 4.37 17486.33 CNY"
+    ctx = StyleContext(
+        tables=[[headers, row]],
+        full_text=source_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=source_text)])]),
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=1),
+    )
+
+    records, _identity = BankStyleParserRegistry().run(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 1
+    assert records[0]["raw"]["对方户名"] == ""
+    assert records[0]["normalized"]["counter_party"] == ""
+
+
 def test_registry_prefers_semantic_text_table_when_canonical_grid_coverage_is_low():
     bad_headers = [
         "序号",
@@ -1182,11 +1264,11 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     assert first_audit["date"]["value"] == "2023-06-28"
     assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in markdown
     first_markdown_row = (
-        "| 13 | 2023-06-2819:50:16 | 1112052 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        "| 13 | 2023-06-28 19:50:16 | 1112052 | 727279800000011760 | 江西昌荣供应链有限公司 | "
         " | 1000000 | 1006296.3 | 超网-贷记转入 | 转户 |"
     )
     second_markdown_row = (
-        "| 14 | 2023-06-2811:24:57 | 1069557 | 727279800000011760 | 江西昌荣供应链有限公司 | "
+        "| 14 | 2023-06-28 11:24:57 | 1069557 | 727279800000011760 | 江西昌荣供应链有限公司 | "
         "780000 |  | 6296.3 | 超网-贷记转出 | 转户 |"
     )
     assert first_markdown_row in markdown

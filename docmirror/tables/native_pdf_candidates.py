@@ -10,6 +10,7 @@ field names are inferred here.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -24,6 +25,7 @@ def extract_pymupdf_table_candidates(
     normalize_bbox: Callable[[list[float]], list[float]],
     text_atoms: Sequence[Any],
     vector_atoms: Sequence[Any],
+    prefer_owned_text: bool = False,
 ) -> list[dict[str, Any]]:
     """Return physical table candidates with exact native cell geometry.
 
@@ -95,6 +97,8 @@ def extract_pymupdf_table_candidates(
         return []
 
     _assign_text_ownership(candidates, text_atoms)
+    if prefer_owned_text:
+        _replace_native_text_with_owned_atoms(candidates, text_atoms)
     _attach_vector_evidence(candidates, vector_atoms)
     return candidates
 
@@ -198,6 +202,74 @@ def _assign_text_ownership(candidates: list[dict[str, Any]], text_atoms: Sequenc
             row_index, col_index = cell
             owner["geometry"]["cell_token_ids"][row_index][col_index].append(token_id)
             owner["geometry"]["cell_evidence_ids"][row_index][col_index].append(token_id)
+
+
+def _replace_native_text_with_owned_atoms(candidates: list[dict[str, Any]], text_atoms: Sequence[Any]) -> None:
+    """Rebuild cell text from accepted atoms while retaining native geometry."""
+    atoms_by_id = {str(getattr(atom, "id", "") or ""): atom for atom in text_atoms}
+    for candidate in candidates:
+        token_matrix = candidate["geometry"]["cell_token_ids"]
+        rows = [
+            [_owned_cell_text(token_ids, atoms_by_id) for token_ids in row]
+            for row in token_matrix
+        ]
+        candidate["rows"] = rows
+        candidate["preserve_headers"] = _looks_like_header(
+            rows,
+            max((len(row) for row in rows), default=0),
+        )
+        candidate["geometry"]["text_source"] = "owned_non_watermark_atoms"
+        candidate["watermark_filtered_text"] = True
+
+
+def _owned_cell_text(token_ids: list[str], atoms_by_id: dict[str, Any]) -> str:
+    atoms = [atoms_by_id[token_id] for token_id in token_ids if token_id in atoms_by_id]
+    if not atoms:
+        return ""
+    line_groups: dict[tuple[int, int], list[Any]] = {}
+    for atom in atoms:
+        metadata = dict(getattr(atom, "metadata", None) or {})
+        line_key = (int(metadata.get("block_no", 0) or 0), int(metadata.get("line_no", 0) or 0))
+        line_groups.setdefault(line_key, []).append(atom)
+
+    ordered_lines = sorted(
+        line_groups.values(),
+        key=lambda line: min(
+            (
+                float(getattr(atom, "bbox", [0.0, 0.0, 0.0, 0.0])[1]),
+                float(getattr(atom, "bbox", [0.0, 0.0, 0.0, 0.0])[0]),
+            )
+            for atom in line
+        ),
+    )
+    rendered_lines: list[str] = []
+    for line in ordered_lines:
+        ordered = sorted(
+            line,
+            key=lambda atom: (
+                int((getattr(atom, "metadata", None) or {}).get("word_no", 0) or 0),
+                float(getattr(atom, "bbox", [0.0, 0.0, 0.0, 0.0])[0]),
+            ),
+        )
+        rendered_lines.append(_join_owned_words([str(getattr(atom, "text", "") or "") for atom in ordered]))
+    return "\n".join(line for line in rendered_lines if line)
+
+
+def _join_owned_words(words: list[str]) -> str:
+    out = ""
+    for word in (word.strip() for word in words):
+        if not word:
+            continue
+        if not out:
+            out = word
+            continue
+        if re.search(r"[\u3400-\u9fff]$", out) and re.match(r"^[\u3400-\u9fff]", word):
+            out += word
+        elif word[0] in ",.;:!?，。；：！？)]}、" or out[-1] in "([{":
+            out += word
+        else:
+            out += f" {word}"
+    return out
 
 
 def _attach_vector_evidence(candidates: list[dict[str, Any]], vector_atoms: Sequence[Any]) -> None:
