@@ -336,6 +336,13 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         fields["query_institution"] = {"label": "查询机构", "type": "string"}
         fields.update(
             {
+                "report_number": {
+                    "label": "报告编号",
+                    "type": "long_id",
+                    "sensitive": True,
+                },
+                "projected_account_count": {"label": "投影账户数", "type": "integer"},
+                "page": {"label": "页码", "type": "integer"},
                 "enterprise_identity_id": {"label": "企业报告身份记录ID", "type": "string"},
                 "enterprise_name": {"label": "企业名称", "type": "string"},
                 "report_time": {"label": "报告时间", "type": "datetime"},
@@ -572,9 +579,19 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "row_text": {"label": "源表行内容", "type": "string"},
                 "credit_line_id": {"label": "授信记录ID", "type": "string"},
                 "facility_type": {"label": "授信类型", "type": "string"},
+                "account_state": {"label": "账户开闭状态", "type": "string"},
+                "activation_state": {"label": "激活状态", "type": "string"},
+                "current_overdue": {"label": "当前是否逾期", "type": "boolean"},
+                "payoff_state": {"label": "结清状态", "type": "string"},
                 "total_limit": {"label": "总额度", "type": "money"},
+                "total_limit_status": {"label": "总额度报告状态", "type": "string"},
                 "used_limit": {"label": "已用额度", "type": "money"},
+                "used_limit_status": {"label": "已用额度报告状态", "type": "string"},
                 "available_limit": {"label": "剩余可用额度", "type": "money"},
+                "available_limit_status": {
+                    "label": "剩余可用额度报告状态",
+                    "type": "string",
+                },
                 "currency": {"label": "币种", "type": "string"},
                 "utilization_rate": {
                     "label": "额度使用率",
@@ -784,6 +801,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "sequence",
             "account_id",
             "account_type",
+            "account_state",
+            "activation_state",
             "business_category",
             "account_identifier",
             "institution",
@@ -814,6 +833,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "guarantee_type",
             "five_tier_class",
             "current_overdue_amount",
+            "current_overdue",
             "overdue_principal",
             "current_overdue_periods",
             "current_overdue_status",
@@ -824,6 +844,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "special_transaction",
             "credit_agreement_identifier",
             "history_status",
+            "payoff_state",
         ):
             account_columns[key] = fields[key]
         credit_lines = dictionary["datasets"].setdefault("credit_lines", {})
@@ -833,6 +854,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         line_columns.update(
             {
                 "institution": fields["institution"],
+                "credit_line_id": fields["credit_line_id"],
+                "facility_type": fields["facility_type"],
+                "account_state": fields["account_state"],
                 "account_identifier": {
                     "label": "授信协议编号",
                     "type": "long_id",
@@ -850,8 +874,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "snapshot_date": {"label": "信息截至日期", "type": "date"},
                 "maturity_date": fields["maturity_date"],
                 "total_limit": fields["total_limit"],
+                "total_limit_status": fields["total_limit_status"],
                 "used_limit": fields["used_limit"],
+                "used_limit_status": fields["used_limit_status"],
                 "available_limit": fields["available_limit"],
+                "available_limit_status": fields["available_limit_status"],
+                "payoff_state": fields["payoff_state"],
                 "facility_limit": {"label": "授信限额", "type": "money"},
                 "limit_identifier": {
                     "label": "授信限额编号",
@@ -921,6 +949,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "enterprise_identity_id",
                     "sequence",
                     "report_edition",
+                    "exchange_rate_usd_cny",
+                    "exchange_rate_effective_period",
                     "enterprise_name",
                     "subject_name",
                     "zhongzheng_code",
@@ -961,6 +991,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "credit_institution_count",
                     "active_credit_institution_count",
                     "first_repayment_responsibility_year",
+                    "first_repayment_responsibility_year_status",
                     "credit_balance",
                     "credit_attention_balance",
                     "credit_adverse_balance",
@@ -1098,6 +1129,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "identity_type",
                     "identity_number",
                     "ownership_percentage",
+                    "page",
                     "source_institution",
                     "update_date",
                 )
@@ -1485,6 +1517,24 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "USD": "美元",
             "EUR": "欧元",
             "HKD": "港币",
+        }
+        enums["account_state"] = {
+            "open": "未关闭",
+            "closed": "已关闭",
+            "unknown": "未知",
+        }
+        enums["activation_state"] = {
+            "active": "已激活",
+            "inactive": "未激活",
+            "not_applicable": "不适用",
+            "not_reported": "未报告",
+        }
+        enums["current_overdue"] = {"true": "是", "false": "否"}
+        enums["payoff_state"] = {
+            "outstanding": "未结清",
+            "settled": "已结清",
+            "not_applicable": "不适用",
+            "unknown": "未知",
         }
         enums["contract_number_status"] = {
             "reported": "已报告",
