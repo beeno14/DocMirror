@@ -22,6 +22,15 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
             keep_query_institution=False,
         )
 
+    def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
+        """Build the read-only Personal Brief entity index once."""
+        del full_text
+        from docmirror.plugins.credit_report.personal_brief_native.context import (
+            build_personal_brief_extraction_context,
+        )
+
+        return build_personal_brief_extraction_context(parse_result)
+
     def build_section_content(
         self,
         parse_result: Any,

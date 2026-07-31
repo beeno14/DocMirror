@@ -80,12 +80,17 @@ def extract_personal_brief_section_content(
     )
 
     blocks: list[tuple[int, str]] = []
-    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
-        page_number = int(getattr(page, "page_number", 0) or page_index)
-        for block in getattr(page, "texts", None) or []:
-            content = str(getattr(block, "content", "") or "").strip()
-            if content:
-                blocks.append((page_number, content))
+    entity_context = getattr(parse_result, "entity_context", None)
+    ordered_text_blocks = getattr(entity_context, "ordered_text_blocks", None)
+    if getattr(entity_context, "report_family", "") == "personal_brief" and callable(ordered_text_blocks):
+        blocks.extend(ordered_text_blocks())
+    else:
+        for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+            page_number = int(getattr(page, "page_number", 0) or page_index)
+            for block in getattr(page, "texts", None) or []:
+                content = str(getattr(block, "content", "") or "").strip()
+                if content:
+                    blocks.append((page_number, content))
 
     def statement_after(heading: str) -> tuple[int, str]:
         for index, (page, content) in enumerate(blocks):

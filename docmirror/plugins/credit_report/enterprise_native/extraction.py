@@ -25,6 +25,10 @@ from docmirror.plugins.credit_report.enterprise_native.continuation import (
     EnterpriseContinuationResolver,
     TableFragment,
 )
+from docmirror.plugins.credit_report.shared.entity_decoder import (
+    CreditReportEntityContext,
+    decode_credit_report_entities,
+)
 from docmirror.plugins.credit_report.value_utils import (
     compact_text as _compact,
 )
@@ -148,6 +152,7 @@ class EnterpriseExtractionContext:
     table_headings: Mapping[str, str]
     page_flow: tuple[tuple[int, str, Any], ...]
     continuation_fragments: tuple[TableFragment, ...]
+    entity_context: CreditReportEntityContext
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.parse_result, name)
@@ -158,20 +163,14 @@ def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtracti
     if isinstance(parse_result, EnterpriseExtractionContext):
         return parse_result
 
+    entity_context = decode_credit_report_entities(
+        parse_result,
+        report_family="enterprise",
+    )
     table_rows: list[tuple[int, str, tuple[tuple[str, ...], ...]]] = []
     page_texts: dict[int, str] = {}
     table_headings: dict[str, str] = {}
-    page_flow: list[tuple[int, str, Any]] = []
     fragments: list[TableFragment] = []
-
-    def vertical_position(value: Any, fallback: float) -> float:
-        bbox = list(getattr(value, "bbox", None) or [])
-        if len(bbox) >= 2:
-            try:
-                return float(bbox[1])
-            except (TypeError, ValueError):
-                pass
-        return fallback
 
     def normalized_bbox(value: Any) -> tuple[float, float, float, float] | None:
         raw_bbox = list(getattr(value, "bbox", None) or [])
@@ -197,11 +196,6 @@ def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtracti
             for block in blocks
             if len(list(getattr(block, "bbox", None) or [])) >= 4 and _compact(getattr(block, "content", ""))
         ]
-        positioned_items: list[tuple[float, int, int, str, Any]] = []
-        for index, block in enumerate(blocks):
-            content = str(getattr(block, "content", "") or "")
-            if content:
-                positioned_items.append((vertical_position(block, float(index)), 0, index, "text", content))
         for table_index, table in enumerate(getattr(page, "tables", None) or []):
             rows = _raw_table_rows(table)
             if not rows:
@@ -227,26 +221,14 @@ def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtracti
                 preceding = [(bottom, content) for bottom, content in positioned_text if bottom <= float(bbox[1])]
                 if preceding:
                     table_headings[table_id] = max(preceding, key=lambda item: item[0])[1]
-            positioned_items.append(
-                (
-                    vertical_position(table, 10000.0 + float(table_index)),
-                    1,
-                    table_index,
-                    "table",
-                    (table_id, [list(row) for row in immutable_rows]),
-                )
-            )
-        page_flow.extend(
-            (page_number, kind, value) for _position, _kind_order, _index, kind, value in sorted(positioned_items)
-        )
-
     return EnterpriseExtractionContext(
         parse_result=parse_result,
         table_rows=tuple(table_rows),
         page_texts=MappingProxyType(page_texts),
         table_headings=MappingProxyType(table_headings),
-        page_flow=tuple(page_flow),
+        page_flow=entity_context.ordered_page_flow(),
         continuation_fragments=tuple(fragments),
+        entity_context=entity_context,
     )
 
 

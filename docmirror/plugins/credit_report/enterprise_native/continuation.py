@@ -16,6 +16,15 @@ from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Callable, Iterable, Literal
 
+from docmirror.plugins.credit_report.shared.entity_decoder import (
+    CreditReportEntityContext,
+    CreditReportUnit,
+    EntityTransitionDecision,
+    TransitionAction,
+    decode_credit_report_entities,
+    score_credit_report_transition,
+)
+
 Row = list[str]
 RowPredicate = Callable[[Row], bool]
 
@@ -168,6 +177,15 @@ class EnterpriseContinuationResolver:
         else:
             self.fragments = self._build_table_fragments(parse_result)
         source_result = getattr(parse_result, "parse_result", parse_result)
+        prebuilt_entity_context = getattr(parse_result, "entity_context", None)
+        self.entity_context: CreditReportEntityContext = (
+            prebuilt_entity_context
+            if isinstance(prebuilt_entity_context, CreditReportEntityContext)
+            else decode_credit_report_entities(
+                source_result,
+                report_family="enterprise",
+            )
+        )
         self._units = self._build_boundary_units(source_result)
         self._score_document_boundaries()
 
@@ -272,29 +290,24 @@ class EnterpriseContinuationResolver:
         return self._logical_entities
 
     def _score_document_boundaries(self) -> None:
-        by_page: dict[int, list[BoundaryUnit]] = {}
-        for unit in self._units:
-            by_page.setdefault(unit.page, []).append(unit)
-        decisions: list[PageBoundaryDecision] = []
-        ordered_pages = sorted(by_page)
-        for page, next_page in zip(ordered_pages, ordered_pages[1:]):
-            if next_page - page != 1:
-                continue
-            left = by_page[page][-1]
-            right = by_page[next_page][0]
-            if left.kind == "table" and right.kind == "table":
-                left_fragment = self._fragment_for_id(left.table_id)
-                right_fragment = self._fragment_for_id(right.table_id)
-                if left_fragment is None or right_fragment is None:
-                    continue
-                decision = self.decide_table_boundary(left_fragment, right_fragment)
-            elif left.kind == "text" and right.kind == "text":
-                decision = _score_text_boundary(left, right, self.acceptance_threshold)
-            else:
-                decision = _score_mixed_boundary(left, right)
-            decisions.append(decision)
-        self._document_boundary_decisions = tuple(decisions)
-        self._logical_entities = _entities_from_boundary_graph(self._units, decisions)
+        decisions = tuple(_shared_page_decision(decision) for decision in self.entity_context.page_boundary_decisions)
+        decision_by_pair = {(decision.left_id, decision.right_id): decision for decision in decisions}
+        self._document_boundary_decisions = decisions
+        self._logical_entities = tuple(
+            LogicalPageEntity(
+                entity_id=entity.entity_id,
+                kind=entity.kind,
+                unit_ids=entity.unit_ids,
+                pages=entity.pages,
+                confidence=entity.confidence,
+                boundary_decisions=tuple(
+                    decision_by_pair[(left, right)]
+                    for left, right in zip(entity.unit_ids, entity.unit_ids[1:])
+                    if (left, right) in decision_by_pair
+                ),
+            )
+            for entity in self.entity_context.entities
+        )
 
     def _fragment_for_id(self, table_id: str) -> TableFragment | None:
         return next((fragment for fragment in self.fragments if fragment.table_id == table_id), None)
@@ -321,16 +334,65 @@ class EnterpriseContinuationResolver:
         cached = self._decision_cache.get(cache_key)
         if cached is not None:
             return cached
-        decision = _score_table_boundary(
-            source,
+        left_id = self.entity_context.table_unit_id(source.table_id)
+        right_id = self.entity_context.table_unit_id(candidate.table_id)
+        shared = self.entity_context.decision_between(left_id, right_id)
+        semantic_match = _candidate_semantic_match(
             candidate,
-            threshold=self.acceptance_threshold,
             contract=contract,
             candidate_row_index=candidate_row_index,
             candidate_validator=candidate_validator,
             candidate_validator_scope=candidate_validator_scope,
-            context=context_name,
         )
+        if shared is not None:
+            decision = _shared_page_decision(shared, context=context_name)
+            if semantic_match is True and candidate.index == source.index + 1:
+                decision = _with_semantic_table_match(decision)
+        elif self.entity_context.same_table_entity(source.table_id, candidate.table_id):
+            decision = PageBoundaryDecision(
+                left_id=left_id or f"table:{source.table_id or source.index}",
+                right_id=right_id or f"table:{candidate.table_id or candidate.index}",
+                from_page=source.page,
+                to_page=candidate.page,
+                hypotheses=(
+                    BoundaryHypothesis(
+                        kind="same_table",
+                        score=0.75,
+                        signals=("shared_open_entity_membership",),
+                    ),
+                    BoundaryHypothesis(kind="new_table", score=0.20),
+                    BoundaryHypothesis(kind="new_section", score=0.05),
+                ),
+                selected="same_table",
+                confidence=0.75,
+                accepted=True,
+                context=context_name,
+            )
+        else:
+            decision = _shared_page_decision(
+                score_credit_report_transition(
+                    (_fragment_entity_unit(source),),
+                    _fragment_entity_unit(candidate),
+                    report_family="enterprise",
+                ),
+                context=context_name,
+            )
+            if semantic_match is True and candidate.index == source.index + 1:
+                decision = _with_semantic_table_match(decision)
+        if candidate.page - source.page not in {0, 1} or candidate.index != source.index + 1:
+            semantic_match = False
+        if semantic_match is False and decision.accepted:
+            decision = PageBoundaryDecision(
+                left_id=decision.left_id,
+                right_id=decision.right_id,
+                from_page=decision.from_page,
+                to_page=decision.to_page,
+                hypotheses=decision.hypotheses,
+                selected="new_table",
+                confidence=decision.confidence,
+                accepted=False,
+                context=decision.context,
+            )
         self._decision_cache[cache_key] = decision
         return decision
 
@@ -697,6 +759,116 @@ def _ranked_hypotheses(
         for kind, (score, signals) in values.items()
     ]
     return tuple(sorted(hypotheses, key=lambda item: (-item.score, item.kind)))
+
+
+_SHARED_ACTION_KIND: dict[TransitionAction, BoundaryKind] = {
+    "same_table": "same_table",
+    "different_table": "new_table",
+    "table_to_text_related": "table_related_text",
+    "table_to_text_unrelated": "table_unrelated_text",
+    "text_to_table_related": "table_related_text",
+    "text_to_table_unrelated": "table_unrelated_text",
+    "same_text_section": "same_body_text",
+    "different_text_section": "new_body_text",
+    "new_section": "new_section",
+}
+
+
+def _shared_page_decision(
+    decision: EntityTransitionDecision,
+    *,
+    context: str = "",
+) -> PageBoundaryDecision:
+    compatible = [
+        hypothesis for hypothesis in decision.hypotheses if "incompatible_content_types" not in hypothesis.signals
+    ]
+    hypotheses = tuple(
+        BoundaryHypothesis(
+            kind=_SHARED_ACTION_KIND[hypothesis.action],
+            score=hypothesis.score,
+            signals=hypothesis.signals,
+        )
+        for hypothesis in compatible
+    )
+    selected = _SHARED_ACTION_KIND[decision.selected]
+    return PageBoundaryDecision(
+        left_id=decision.left_unit_id,
+        right_id=decision.right_unit_id,
+        from_page=decision.from_page,
+        to_page=decision.to_page,
+        hypotheses=hypotheses,
+        selected=selected,
+        confidence=decision.confidence,
+        accepted=decision.continues_entity,
+        context=context or "shared_entity_decoder",
+    )
+
+
+def _candidate_semantic_match(
+    candidate: TableFragment,
+    *,
+    contract: ContinuationContract | None,
+    candidate_row_index: int,
+    candidate_validator: RowPredicate | None,
+    candidate_validator_scope: Literal["row", "fragment"],
+) -> bool | None:
+    validator = candidate_validator or (contract.row_predicate if contract is not None else None)
+    candidate_row = list(candidate.rows[candidate_row_index]) if 0 <= candidate_row_index < len(candidate.rows) else []
+    if contract is not None and candidate_row:
+        if len(candidate_row) not in contract.expected_columns:
+            return False
+        signature = "".join(candidate_row)
+        if any(marker in signature for marker in contract.forbidden_markers):
+            return False
+    if validator is None:
+        return None
+    rows = (
+        [list(row) for row in candidate.rows]
+        if candidate_validator_scope == "fragment"
+        else ([candidate_row] if candidate_row else [])
+    )
+    return any(validator(row) for row in rows)
+
+
+def _with_semantic_table_match(decision: PageBoundaryDecision) -> PageBoundaryDecision:
+    """Re-rank a shared transition when a business row contract also matches."""
+    values: dict[BoundaryKind, tuple[float, list[str]]] = {}
+    for hypothesis in decision.hypotheses:
+        score = hypothesis.score + (0.45 if hypothesis.kind == "same_table" else 0.0)
+        signals = list(hypothesis.signals)
+        if hypothesis.kind == "same_table":
+            signals.append("semantic_row_shape_matches")
+        values[hypothesis.kind] = (score, signals)
+    hypotheses = _ranked_hypotheses(values)
+    selected = hypotheses[0]
+    return PageBoundaryDecision(
+        left_id=decision.left_id,
+        right_id=decision.right_id,
+        from_page=decision.from_page,
+        to_page=decision.to_page,
+        hypotheses=hypotheses,
+        selected=selected.kind,
+        confidence=selected.score,
+        accepted=selected.kind == "same_table",
+        context=decision.context,
+    )
+
+
+def _fragment_entity_unit(fragment: TableFragment) -> CreditReportUnit:
+    """Adapt the public fragment API to the shared entity scorer."""
+    return CreditReportUnit(
+        unit_id=f"table:{fragment.table_id or fragment.index}",
+        page=fragment.page,
+        order=fragment.index,
+        source_index=fragment.index,
+        kind="table",
+        text="\n".join(" | ".join(row) for row in fragment.rows),
+        bbox=fragment.bbox,
+        page_width=fragment.page_width,
+        page_height=fragment.page_height,
+        table_id=fragment.table_id,
+        rows=fragment.rows,
+    )
 
 
 def _score_table_boundary(
