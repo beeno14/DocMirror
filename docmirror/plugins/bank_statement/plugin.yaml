@@ -14,8 +14,8 @@ projection:
   completeness:
     records:
       basis: domain_fact_count
-      count_key: source_reported_transaction_count
-      public_basis: source_footer_transaction_count
+      count_key: expected_primary_rows
+      public_basis: bank_expected_primary_rows
 
 classification:
   aliases: [bank_reconciliation]

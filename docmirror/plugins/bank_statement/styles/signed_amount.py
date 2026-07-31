@@ -22,6 +22,7 @@ from typing import Any
 
 from docmirror.plugins._base.standardizer import normalize_amount
 from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.header_resolve import normalize_header_cell
 from docmirror.plugins.bank_statement.styles import grid_standard
 
 PARSER_ID = "signed_amount"
@@ -34,8 +35,10 @@ _SPLIT_HEADER_NEEDLES = ("收入", "支出", "借方发生额", "贷方发生额
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
     for key, value in raw_txn.items():
+        normalized_key = normalize_header_cell(key)
         for needle in needles:
-            if key == needle or needle in key:
+            normalized_needle = normalize_header_cell(needle)
+            if normalized_key == normalized_needle or normalized_needle in normalized_key:
                 return str(value or "").strip()
     return ""
 
@@ -58,7 +61,7 @@ def parse_signed_amount(text: str) -> tuple[float | None, str]:
 
 
 def table_has_signed_amount_cells(tables: list[list[list[str]]]) -> bool:
-    """True when amount column cells use explicit +/- prefixes (not split debit/credit)."""
+    """True when one amount column contains enough sign evidence for direction."""
     for tbl in tables:
         if not tbl:
             continue
@@ -66,7 +69,7 @@ def table_has_signed_amount_cells(tables: list[list[list[str]]]) -> bool:
         amount_col = -1
         for i, row in enumerate(tbl[:10]):
             for j, cell in enumerate(row):
-                text = str(cell or "").strip()
+                text = normalize_header_cell(cell)
                 if any(n in text for n in _AMOUNT_HEADER_NEEDLES):
                     # Distinguish merged columns (收入/支出金额) from true split columns.
                     # Merged columns contain both income and expense keywords in one cell;
@@ -100,7 +103,10 @@ def table_has_signed_amount_cells(tables: list[list[list[str]]]) -> bool:
             checked_rows += 1
             if _SIGNED_PREFIX_RE.match(cell):
                 signed_rows += 1
-        if checked_rows >= 2 and signed_rows == checked_rows:
+        # Many bank ledgers omit the plus sign for credits while retaining a
+        # minus sign for debits. One explicit sign makes unsigned positives
+        # unambiguous only when the source has a single amount column.
+        if checked_rows >= 2 and signed_rows >= 1:
             return True
     return False
 
@@ -112,7 +118,7 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, str]]
 def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
     amount_text = _cell_value(raw_txn, *_AMOUNT_HEADER_NEEDLES)
     parsed_amount, direction = parse_signed_amount(amount_text)
-    normalized = plugin._normalize(raw_txn)
+    normalized = grid_standard.normalize_record(raw_txn, plugin)
     if parsed_amount is not None:
         normalized["amount"] = parsed_amount
         normalized["amount_cny"] = parsed_amount

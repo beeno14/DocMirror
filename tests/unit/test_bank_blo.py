@@ -38,11 +38,51 @@ def test_dedupe_transaction_rows():
     assert out[0]["row_index"] == 1
 
 
+def test_dedupe_keeps_identical_business_rows_from_different_source_pages():
+    records = [
+        {
+            "row_index": 1,
+            "normalized": {
+                "date": "2024-01-01",
+                "direction": "expense",
+                "amount": 1.0,
+                "balance": 2.0,
+                "counter_party": "a",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1], "source_row_index": 8},
+        },
+        {
+            "row_index": 2,
+            "normalized": {
+                "date": "2024-01-01",
+                "direction": "expense",
+                "amount": 1.0,
+                "balance": 2.0,
+                "counter_party": "a",
+            },
+            "source": {"source_page": 2, "page_range": [2, 2], "source_row_index": 8},
+        },
+    ]
+
+    out = dedupe_transaction_rows(records)
+
+    assert len(out) == 2
+    assert [record["source"]["source_page"] for record in out] == [1, 2]
+
+
 def test_blo_skips_failed_ltqg_table():
     good = LogicalTable(
         headers=["交易日期", "摘要", "收入", "支出", "余额"],
         rows=[
-            TableRow(cells=[CellValue(text="2024-01-01"), CellValue(text="x"), CellValue(text="0"), CellValue(text="1"), CellValue(text="9")]),
+            TableRow(
+                cells=[
+                    CellValue(text="2024-01-01"),
+                    CellValue(text="x"),
+                    CellValue(text="0"),
+                    CellValue(text="1"),
+                    CellValue(text="9"),
+                ]
+            ),
         ],
         row_count=1,
         logical_id="lt_good",

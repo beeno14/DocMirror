@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY
 from docmirror.plugins.bank_statement.header_resolve import (
+    align_bank_ledger_row,
     detect_headers,
     normalize_header_cell,
     registry_strict_header_match_count,
@@ -49,3 +50,19 @@ def test_unicode_header_normalization():
     assert header is not None
     assert header.mode == "strict"
     assert len(header.col_map) >= 3
+
+
+def test_align_bank_ledger_row_restores_omitted_optional_time_cell():
+    headers = ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额", "对手信息", "交易渠道", "附言"]
+    shifted = ["20220904", "短信费", "-2.00", "102.47", "345601940050307", "短信费", "", ""]
+
+    assert align_bank_ledger_row(headers, shifted) == [
+        "20220904",
+        "",
+        "短信费",
+        "-2.00",
+        "102.47",
+        "345601940050307",
+        "短信费",
+        "",
+    ]

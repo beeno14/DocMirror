@@ -44,6 +44,7 @@ _FOOTER_MARKERS = (
     "总计",
 )
 _COUNT_PATTERNS = (re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),)
+_PAGE_COUNT_PATTERN = re.compile(r"本页交易笔数\s*[:：]\s*(?P<count>\d+)")
 _SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*(?:[/／-]\s*)?共\s*(?P<total>\d+)\s*页")
 _SPLIT_COUNT_PATTERNS = (
     re.compile(
@@ -71,11 +72,13 @@ _DEBIT_TOTAL_PATTERNS = (
     re.compile(r"借方发生总额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
     re.compile(r"本月累计借方发生额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
     re.compile(r"支出总金额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
+    re.compile(r"本页支出合计\s*[:：]\s*(?P<value>[\d,]+\.\d{1,2})"),
 )
 _CREDIT_TOTAL_PATTERNS = (
     re.compile(r"贷方发生总额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
     re.compile(r"本月累计贷方发生额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
     re.compile(r"收入总金额[:：]\s*(?P<value>[\d,]+\.\d{2})"),
+    re.compile(r"本页收入合计\s*[:：]\s*(?P<value>[\d,]+\.\d{1,2})"),
 )
 
 
@@ -123,6 +126,9 @@ def count_expected_rows_from_bank_footer(text: str) -> int:
     for pat in _COUNT_PATTERNS:
         if m := pat.search(source):
             return _safe_count(m.group("count"))
+    page_counts = [_safe_count(match.group("count")) for match in _PAGE_COUNT_PATTERN.finditer(source)]
+    if page_counts and all(page_counts):
+        return _safe_count(sum(page_counts))
     return 0
 
 
@@ -138,6 +144,13 @@ def audit_bank_statement_invariants(records: list[dict[str, Any]], text: str) ->
     normalized = [rec.get("normalized") or {} for rec in records]
     debit_rows = [row for row in normalized if row.get("direction") == "expense"]
     credit_rows = [row for row in normalized if row.get("direction") == "income"]
+    reported_counts = _reported_direction_counts(text)
+    if reported_counts is not None:
+        expected_debit, expected_credit = reported_counts
+        if len(debit_rows) != expected_debit:
+            failures.append(f"bank_invariant_failed:debit_count:{len(debit_rows)}/{expected_debit}")
+        if len(credit_rows) != expected_credit:
+            failures.append(f"bank_invariant_failed:credit_count:{len(credit_rows)}/{expected_credit}")
     debit_total = _footer_amount(text, _DEBIT_TOTAL_PATTERNS)
     credit_total = _footer_amount(text, _CREDIT_TOTAL_PATTERNS)
     if debit_total is not None:
@@ -154,6 +167,15 @@ def audit_bank_statement_invariants(records: list[dict[str, Any]], text: str) ->
         failures.append(f"bank_invariant_failed:balance_chain:{breaks}/{checked}")
         failures.extend(_balance_chain_break_review_items(normalized, limit=3))
     return failures
+
+
+def _reported_direction_counts(text: str) -> tuple[int, int] | None:
+    source = text or ""
+    for pattern in _SPLIT_COUNT_PATTERNS:
+        match = pattern.search(source)
+        if match:
+            return int(match.group("debit")), int(match.group("credit"))
+    return None
 
 
 def _best_balance_chain_breaks(rows: list[dict[str, Any]]) -> tuple[int, int]:
@@ -547,8 +569,9 @@ def _clean_native_cell(value: Any) -> str:
 
 def _footer_amount(text: str, patterns: tuple[re.Pattern[str], ...]) -> float | None:
     for pat in patterns:
-        if m := pat.search(text or ""):
-            return _float(m.group("value"))
+        matches = list(pat.finditer(text or ""))
+        if matches:
+            return round(sum(_float(match.group("value")) for match in matches), 2)
     return None
 
 

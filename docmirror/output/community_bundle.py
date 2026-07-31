@@ -1949,18 +1949,11 @@ class CommunityBundle:
         writer.writeheader()
         semantic_payload = semantic or self.semantic_payload()
         structure = semantic_payload.get("structure") if isinstance(semantic_payload.get("structure"), dict) else {}
-        classification = (
-            semantic_payload.get("classification") if isinstance(semantic_payload.get("classification"), dict) else {}
-        )
-        source_tables = (
-            {
-                str(table["id"]): table
-                for table in structure.get("source_tables") or []
-                if isinstance(table, dict) and table.get("id")
-            }
-            if str(classification.get("document_type") or "") == "enterprise_credit_report"
-            else {}
-        )
+        source_tables = {
+            str(table["id"]): table
+            for table in structure.get("source_tables") or []
+            if isinstance(table, dict) and table.get("id")
+        }
         sections_by_id = {
             str(section["id"]): section
             for section in (structure.get("sections") or [])
@@ -2140,7 +2133,7 @@ def _structural_field_evidence(
     raw_value: Any,
     row_source: dict[str, Any],
     source_tables: dict[str, dict[str, Any]],
-) -> tuple[list[str], list[float] | None, bool]:
+) -> tuple[list[str], list[float] | None, float | None, bool]:
     refs = [
         ref
         for key in ("source_cell_refs", "source_refs")
@@ -2148,7 +2141,7 @@ def _structural_field_evidence(
         if isinstance(ref, dict)
     ]
     if not refs:
-        return [], None, False
+        return [], None, None, False
 
     match_keys = {key for key in (_audit_match_key(value), _audit_match_key(raw_value)) if key}
     all_cells: list[dict[str, Any]] = []
@@ -2189,7 +2182,16 @@ def _structural_field_evidence(
     )
     if not evidence_ids:
         evidence_ids = list(dict.fromkeys(token for ref in refs if (token := _source_ref_token(ref))))
-    return evidence_ids, _bbox_union(selected_cells), bool(matched_cells)
+    confidences: list[float] = []
+    for cell in selected_cells:
+        if cell.get("confidence") in (None, ""):
+            continue
+        try:
+            confidences.append(float(cell["confidence"]))
+        except (TypeError, ValueError):
+            continue
+    confidence = min(confidences) if confidences else None
+    return evidence_ids, _bbox_union(selected_cells), confidence, bool(matched_cells)
 
 
 def _field_evidence(
@@ -2213,7 +2215,7 @@ def _field_evidence(
         or ""
     )
     if source_tables:
-        structural_evidence, structural_bbox, exact_match = _structural_field_evidence(
+        structural_evidence, structural_bbox, structural_confidence, exact_match = _structural_field_evidence(
             value,
             raw_value,
             row_source,
@@ -2223,6 +2225,8 @@ def _field_evidence(
             evidence = structural_evidence
         if structural_bbox and (exact_match or not bbox):
             bbox = structural_bbox
+        if structural_confidence is not None and confidence in (None, ""):
+            confidence = structural_confidence
     return {
         "page_start": page_range[0] if page_range else "",
         "page_end": page_range[-1] if page_range else "",

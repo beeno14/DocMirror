@@ -221,6 +221,46 @@ def test_source_first_markdown_prefers_page_local_reconstructed_footer() -> None
     assert "当前账单借方发生数：10 当前账单贷方发生数：1" in markdown
     assert "本月累计借方发生额：28,314.48 本月累计贷方发生额：30,000.00" in markdown
     assert "出单截至日期：2025-07-31" in markdown
+
+
+def test_source_first_markdown_preserves_inline_page_totals_footer() -> None:
+    records = [
+        {
+            "raw": {
+                "交易日期": "2024-03-11 22:27:09",
+                "发生额": "-45.00",
+                "余额": "15214.50",
+            },
+            "normalized": {
+                "date": "2024-03-11",
+                "timestamp": "2024-03-11T22:27:09",
+                "direction": "expense",
+                "amount": 45.0,
+                "balance": 15214.5,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    footer = "第1页共4页本页支出合计 : 17546.22 本页收入合计: 17639.64 本页交易笔数: 28"
+    page_text = "\n".join(
+        [
+            "湖北农商银行个人交易流水",
+            "交易日期 对方户名 对方账号/卡号 交易摘要 发生额 余额 币种",
+            "2024-03-11 22:27:09 汇款 -45.00 15214.50 CNY",
+            footer,
+        ]
+    )
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {"account_holder": "测试客户", "account_number": "6224000000000000"},
+        {"start": "2024-03-10", "end": "2025-03-08"},
+        page_text,
+        source_pages={1: page_text},
+    )
+
+    assert footer in markdown
+    assert f"| {footer} |" not in markdown
     assert markdown.count("1 20250710 30,000.00 36,989.93 往来款") == 0
     assert "页码：本月第1份-第1页" not in markdown
 

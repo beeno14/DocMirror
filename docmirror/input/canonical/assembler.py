@@ -76,6 +76,8 @@ def assemble_parse_result(
                     "ocr_correction_locale",
                     "ocr_correction_pack_ids",
                     "ocr_corrections",
+                    "native_text_ocr_fallback_pages",
+                    "native_text_ocr_failed_pages",
                     "evidence_counts",
                     "native_table_candidate_count",
                 )

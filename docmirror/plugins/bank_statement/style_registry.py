@@ -24,7 +24,12 @@ from dataclasses import replace
 from typing import Any
 
 from docmirror.plugins.bank_statement.canonical import ensure_canonical_normalized, records_from_raw_transactions
-from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.canonical_quality import (
+    canonical_expected_from_parse_result,
+    is_canonical_row,
+    physical_transaction_row_estimate,
+)
+from docmirror.plugins.bank_statement.context import StyleContext, collect_physical_tables_from_parse_result
 from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     recover_evidence_atom_bank_tables,
     recovered_evidence_atom_expected_row_count,
@@ -66,7 +71,7 @@ _COVERAGE_THRESHOLD = 0.80
 def _field_completeness(records: list[dict[str, Any]], sample: int = 8) -> float:
     if not records:
         return 0.0
-    fields = ("date", "amount", "balance")
+    fields = ("date", "amount", "direction", "balance")
     scores = []
     for rec in records[:sample]:
         norm = rec.get("normalized") or {}
@@ -82,7 +87,14 @@ def _batch_field_completeness(
     if not transactions:
         return 0.0
     nf = normalize_fn or plugin._normalize
-    fields = ("date", "amount", "balance")
+    balance_expected = any(
+        any(
+            "余额" in grid_standard.normalize_header_cell(str(key)) or "balance" in str(key).lower()
+            for key in transaction
+        )
+        for transaction in transactions[:8]
+    )
+    fields = ("date", "amount", "direction", *(("balance",) if balance_expected else ()))
     scores = []
     for txn in transactions[:8]:
         norm = ensure_canonical_normalized(nf(txn), plugin.standard_fields)
@@ -101,6 +113,21 @@ def _batch_raw_width(transactions: list[dict[str, str]], sample: int = 8) -> flo
     return sum(widths) / len(widths)
 
 
+def _batch_source_coverage(transactions: list[dict[str, Any]]) -> float:
+    if not transactions:
+        return 0.0
+    sourced = 0
+    for transaction in transactions:
+        source = transaction.get("_source")
+        if not isinstance(source, dict):
+            continue
+        source_page = source.get("source_page")
+        page_range = source.get("page_range")
+        if source_page not in (None, "", 0) and isinstance(page_range, (list, tuple)) and page_range:
+            sourced += 1
+    return sourced / len(transactions)
+
+
 def _parser_score(
     transactions: list[dict[str, str]],
     normalize_fn: Any,
@@ -109,10 +136,17 @@ def _parser_score(
 ) -> tuple[float, float]:
     if not transactions:
         return 0.0, 0.0
-    expected = max(expected_rows, 1)
-    coverage = min(len(transactions) / expected, 1.0)
+    nf = normalize_fn or plugin._normalize
+    canonical_count = sum(
+        is_canonical_row(ensure_canonical_normalized(nf(transaction), plugin.standard_fields))
+        for transaction in transactions
+    )
+    expected = max(expected_rows if expected_rows > 0 else len(transactions), 1)
+    coverage = min(canonical_count / expected, 1.0)
     completeness = _batch_field_completeness(transactions, normalize_fn, plugin)
-    score = 0.6 * coverage + 0.4 * completeness
+    source_coverage = _batch_source_coverage(transactions)
+    raw_width = min(_batch_raw_width(transactions) / 8.0, 1.0)
+    score = 0.60 * coverage + 0.20 * completeness + 0.15 * source_coverage + 0.05 * raw_width
     return score, coverage
 
 
@@ -120,18 +154,22 @@ def _expected_rows(ctx: StyleContext) -> int:
     footer_expected = count_expected_rows_from_bank_footer(ctx.full_text)
     if footer_expected > 0:
         return footer_expected
+    canonical_expected = canonical_expected_from_parse_result(ctx.parse_result)
     ocr_expected = recovered_ocr_implicit_row_count(ctx.parse_result)
-    if ocr_expected > 0:
-        return ocr_expected
+    if canonical_expected > 0 or ocr_expected > 0:
+        return max(canonical_expected, ocr_expected)
+    candidates: list[int] = []
     if ctx.parse_result is not None:
         from docmirror.evidence.spe_consumer import mirror_expected_primary_rows, read_structure_spe
 
-        expected = mirror_expected_primary_rows(ctx.parse_result, read_structure_spe(ctx.parse_result))
-        if expected > 0:
-            return expected
-    if ctx.reconstruction and ctx.reconstruction.expected_primary_rows > 0:
-        return ctx.reconstruction.expected_primary_rows
-    return 0
+        candidates.append(mirror_expected_primary_rows(ctx.parse_result, read_structure_spe(ctx.parse_result)))
+    if (
+        ctx.reconstruction
+        and ctx.reconstruction.source in {"canonical_table", "canonical_evidence_table"}
+        and ctx.reconstruction.expected_primary_rows > 0
+    ):
+        candidates.append(ctx.reconstruction.expected_primary_rows)
+    return max((int(candidate) for candidate in candidates if int(candidate or 0) > 0), default=0)
 
 
 def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[dict[str, Any]], Any]:
@@ -230,6 +268,7 @@ class BankStyleParserRegistry:
         identity_fields = plugin._extract_identity(ctx.parse_result)
         transactions: list[dict[str, Any]] = []
         normalize_fn = None
+        expected = _expected_rows(ctx)
 
         for parser_id in detection.parser_chain:
             module = _PARSERS.get(parser_id)
@@ -270,7 +309,7 @@ class BankStyleParserRegistry:
                         ctx.reconstruction = replace(
                             ctx.reconstruction,
                             source="stacked_text",
-                            expected_primary_rows=len(transactions),
+                            expected_primary_rows=expected,
                             pipe_parse_failed=False,
                         )
                     logger.info(
@@ -278,9 +317,40 @@ class BankStyleParserRegistry:
                         len(transactions),
                     )
 
-        expected = _expected_rows(ctx)
         primary_parser = (detection.parser_chain or ["grid_standard"])[-1]
         primary_score, coverage = _parser_score(transactions, normalize_fn, plugin, expected)
+        physical_tables = collect_physical_tables_from_parse_result(ctx.parse_result)
+        physical_expected = physical_transaction_row_estimate(ctx.parse_result)
+        if physical_tables and physical_expected > 0:
+            physical_ctx = replace(ctx, tables=physical_tables, prefer_context_tables=True)
+            physical_batch, physical_norm = _run_parser("grid_standard", physical_ctx, plugin)
+            candidate_expected = max(expected, physical_expected)
+            physical_score, physical_coverage = _parser_score(
+                physical_batch,
+                physical_norm,
+                plugin,
+                candidate_expected,
+            )
+            if physical_score > primary_score or (
+                physical_coverage >= coverage and len(physical_batch) > len(transactions)
+            ):
+                transactions = physical_batch
+                normalize_fn = physical_norm
+                primary_score = physical_score
+                coverage = physical_coverage
+                expected = candidate_expected
+                if ctx.reconstruction is not None:
+                    ctx.reconstruction = replace(
+                        ctx.reconstruction,
+                        source="canonical_physical_tables",
+                        expected_primary_rows=candidate_expected,
+                        pipe_parse_failed=False,
+                    )
+                logger.info(
+                    "[BankStyleRegistry] canonical physical table recovery rows=%d score=%.2f",
+                    len(physical_batch),
+                    physical_score,
+                )
         if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
             for semantic_table in _semantic_text_table_candidates(ctx.full_text):
                 semantic_tables = [semantic_table]
@@ -320,7 +390,7 @@ class BankStyleParserRegistry:
                 atom_count,
                 recovered_evidence_atom_expected_row_count(ctx.parse_result),
             )
-            atom_ctx = replace(ctx, tables=atom_tables)
+            atom_ctx = replace(ctx, tables=atom_tables, prefer_context_tables=True)
             atom_batch, atom_norm = _run_parser("grid_standard", atom_ctx, plugin)
             _attach_recovered_sources(
                 atom_batch,
@@ -359,7 +429,7 @@ class BankStyleParserRegistry:
         if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
             wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text)
             if wide_tables:
-                wide_ctx = replace(ctx, tables=wide_tables)
+                wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
                 wide_batch, wide_norm = _run_parser("grid_standard", wide_ctx, plugin)
                 wide_score, wide_coverage = _parser_score(wide_batch, wide_norm, plugin, expected)
                 if wide_score > primary_score:
@@ -371,7 +441,7 @@ class BankStyleParserRegistry:
                         ctx.reconstruction = replace(
                             ctx.reconstruction,
                             source="native_wide_table",
-                            expected_primary_rows=expected or len(wide_batch),
+                            expected_primary_rows=expected,
                             pipe_parse_failed=False,
                         )
                     logger.info(
@@ -385,7 +455,7 @@ class BankStyleParserRegistry:
             if ocr_tables:
                 recovered_count = sum(max(len(table) - 1, 0) for table in ocr_tables)
                 ocr_expected = max(expected, recovered_count)
-                ocr_ctx = replace(ctx, tables=ocr_tables)
+                ocr_ctx = replace(ctx, tables=ocr_tables, prefer_context_tables=True)
                 ocr_batch, ocr_norm = _run_parser("grid_standard", ocr_ctx, plugin)
                 ocr_score, ocr_coverage = _parser_score(ocr_batch, ocr_norm, plugin, ocr_expected)
                 if ocr_score > primary_score:
@@ -398,7 +468,7 @@ class BankStyleParserRegistry:
                         ctx.reconstruction = replace(
                             ctx.reconstruction,
                             source="ocr_implicit_table",
-                            expected_primary_rows=expected or len(ocr_batch),
+                            expected_primary_rows=expected,
                             pipe_parse_failed=False,
                         )
                     logger.info(
@@ -459,6 +529,7 @@ class BankStyleParserRegistry:
             canonical_raw_fn=plugin._canonical_raw_values,
             style_id=detection.primary_style,
         )
+        grid_standard.refine_missing_directions_from_balance_chain(records)
 
         if "compact_merged" in detection.parser_chain or detection.primary_style == "compact_merged_ledger":
             compact_merged.refine_directions_from_balance_chain(records)

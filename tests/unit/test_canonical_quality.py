@@ -14,8 +14,11 @@ from docmirror.plugins.bank_statement.canonical_quality import (
 
 def test_is_canonical_row_requires_directional_amount():
     assert is_canonical_row({"date": "2024-01-01", "direction": "income", "amount": 10.0})
+    assert is_canonical_row({"date": "2024-01-01", "direction": "income", "amount": 0.0})
     assert not is_canonical_row({"date": "2024-01-01", "direction": "other", "amount": 10.0})
     assert not is_canonical_row({"direction": "income", "amount": 10.0})
+    assert not is_canonical_row({"date": "2024-01-01", "direction": "income", "amount": None})
+    assert not is_canonical_row({"date": "2024-01-01", "direction": "income", "amount": ""})
 
 
 def test_audit_cqf_degraded_when_canonical_low():
@@ -29,10 +32,7 @@ def test_audit_cqf_degraded_when_canonical_low():
 
 
 def test_audit_cqf_success_requires_full_coverage():
-    records = [
-        {"normalized": {"date": "2024-01-01", "direction": "income", "amount": 1.0}}
-        for _ in range(100)
-    ]
+    records = [{"normalized": {"date": "2024-01-01", "direction": "income", "amount": 1.0}} for _ in range(100)]
     result = audit_cqf(records, canonical_expected=100)
     assert result.extract_status == "success"
     assert result.canonical_ratio == 1.0

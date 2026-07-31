@@ -22,6 +22,7 @@ Downstream: ``input.canonical.assembler`` and the canonical middleware pipeline.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -90,12 +91,42 @@ def _selected_page_indices(plane: Any, parse_policy: Any) -> set[int]:
     return set(selected or range(total))
 
 
-def _should_ocr_page(ocr_mode: str, page_atoms: list[Any]) -> bool:
+_RE_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_RE_REPEATED_CJK_RUN = re.compile(r"([\u3400-\u4dbf\u4e00-\u9fff])\1{2,}")
+
+
+def _has_suspicious_native_glyph_mapping(page_atoms: list[Any]) -> bool:
+    """Detect native PDF text whose CJK glyph map collapsed into repeated characters."""
+    texts = [str(getattr(atom, "text", "") or "") for atom in page_atoms]
+    total_cjk = sum(len(_RE_CJK.findall(text)) for text in texts)
+    if total_cjk < 80:
+        return False
+
+    repeated_chars = 0
+    repeated_atoms = 0
+    for text in texts:
+        matches = list(_RE_REPEATED_CJK_RUN.finditer(text))
+        if not matches:
+            continue
+        repeated_atoms += 1
+        repeated_chars += sum(len(match.group(0)) for match in matches)
+
+    return repeated_atoms >= 4 and repeated_chars >= 24 and repeated_chars / total_cjk >= 0.12
+
+
+def _should_ocr_page(
+    ocr_mode: str,
+    page_atoms: list[Any],
+    *,
+    native_text_suspicious: bool | None = None,
+) -> bool:
     if ocr_mode == "off":
         return False
     if ocr_mode == "force":
         return True
-    return not page_atoms
+    if native_text_suspicious is None:
+        native_text_suspicious = _has_suspicious_native_glyph_mapping(page_atoms)
+    return not page_atoms or native_text_suspicious
 
 
 def _ocr_blocks_for_pdf_page(
@@ -1028,6 +1059,15 @@ class CoreExtractor:
         )
         pages: list[PageLayout] = []
         page_evidence_bundles: list[dict[str, Any]] = []
+        selected_page_ids = {page.page_id for page in plane.pages if page.page_index in selected_indices}
+        selected_native_atoms = [
+            atom
+            for atom in plane.evidence.text_atoms
+            if atom.page_id in selected_page_ids and str(atom.text or "").strip()
+        ]
+        document_native_text_suspicious = _has_suspicious_native_glyph_mapping(selected_native_atoms)
+        native_text_ocr_fallback_pages: list[int] = []
+        native_text_ocr_failed_pages: list[int] = []
         for page in plane.pages:
             if page.page_index not in selected_indices:
                 continue
@@ -1049,7 +1089,14 @@ class CoreExtractor:
                     )
                 )
             blocks = _canonical_reading_order(blocks)
-            if _should_ocr_page(ocr_mode, page_atoms):
+            page_native_text_suspicious = bool(page_atoms) and (
+                document_native_text_suspicious or _has_suspicious_native_glyph_mapping(page_atoms)
+            )
+            if _should_ocr_page(
+                ocr_mode,
+                page_atoms,
+                native_text_suspicious=page_native_text_suspicious,
+            ):
                 ocr_pages = await asyncio.to_thread(
                     _ocr_logical_pages_for_pdf_page,
                     file_path,
@@ -1073,7 +1120,18 @@ class CoreExtractor:
                             locale=correction_locale,
                             pack_ids=correction_pack_ids,
                         )
-                        if blocks and len(ocr_pages) == 1:
+                        if page_native_text_suspicious:
+                            page_blocks = [
+                                replace(
+                                    block,
+                                    attrs={
+                                        **dict(block.attrs or {}),
+                                        "native_text_fallback_reason": "suspicious_glyph_mapping",
+                                    },
+                                )
+                                for block in page_blocks
+                            ]
+                        elif blocks and len(ocr_pages) == 1:
                             page_blocks = blocks + [
                                 replace(block, reading_order=len(blocks) + block.reading_order) for block in page_blocks
                             ]
@@ -1101,7 +1159,11 @@ class CoreExtractor:
                                 page_image=ocr_page.image,
                             )
                         )
+                    if page_native_text_suspicious:
+                        native_text_ocr_fallback_pages.append(source_page_number)
                     continue
+                if page_native_text_suspicious:
+                    native_text_ocr_failed_pages.append(source_page_number)
 
             identity_matrix = rotation_matrix(float(page.width or 0.0), float(page.height or 0.0), 0)
             transform = _logical_page_transform(
@@ -1155,6 +1217,10 @@ class CoreExtractor:
             1 for candidate in native_candidates if int(candidate.get("page_number") or 0) in selected_source_pages
         )
         warnings = ["low_ocr_confidence"] if has_scanned and overall_confidence < 0.8 else []
+        if native_text_ocr_fallback_pages:
+            warnings.append("native_text_glyph_mapping_suspected")
+        if native_text_ocr_failed_pages:
+            warnings.append("native_text_glyph_mapping_suspected_ocr_failed")
         if selected_candidate_count > 0 and table_count == 0:
             warnings.append("native_table_evidence_not_reconstructed")
         extraction_method = "hybrid" if has_scanned and has_native else ("ocr" if has_scanned else "digital")
@@ -1185,6 +1251,8 @@ class CoreExtractor:
             "ocr_correction_country": correction_country,
             "ocr_correction_locale": correction_locale,
             "ocr_correction_pack_ids": list(correction_pack_ids),
+            "native_text_ocr_fallback_pages": native_text_ocr_fallback_pages,
+            "native_text_ocr_failed_pages": native_text_ocr_failed_pages,
             "page_split_mode": page_split_mode,
             "page_split_rotation": preferred_spread_rotation,
             "source_page_count": len(plane.pages),
