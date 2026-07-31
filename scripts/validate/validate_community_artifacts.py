@@ -372,7 +372,10 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         if not isinstance(dataset, dict):
             continue
         dataset_name = str(dataset.get("name") or "")
-        if not dataset_name.startswith("enterprise_public_"):
+        if not (
+            dataset_name.startswith("enterprise_public_")
+            and dataset_name.endswith("_records")
+        ):
             continue
         dataset_id = str(dataset.get("id") or "")
         public_dataset_ids.add(dataset_id)

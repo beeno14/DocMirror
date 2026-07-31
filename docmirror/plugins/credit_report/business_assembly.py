@@ -40,6 +40,7 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("account_type", ("account_type",)),
         ("institution", ("management_institution", "institution")),
         ("business_type", ("business_type",)),
+        ("credit_card_type", ("credit_card_type",)),
         ("business_category", ("business_category",)),
         ("account_identifier", ("account_identifier",)),
         ("card_tail", ("card_tail",)),
@@ -55,9 +56,22 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("repayment_periods", ("repayment_periods",)),
         ("open_date", ("open_date",)),
         ("due_date", ("due_date",)),
+        ("contract_maturity_date", ("contract_maturity_date", "due_date")),
+        ("credit_line_expiry_date", ("credit_line_expiry_date",)),
+        ("credit_line_validity_type", ("credit_line_validity_type",)),
         ("close_date", ("close_date",)),
+        ("transfer_out_date", ("transfer_out_date",)),
+        ("termination_event_date", ("termination_event_date",)),
+        ("termination_event_type", ("termination_event_type",)),
+        ("account_lifecycle_state", ("account_lifecycle_state",)),
+        ("card_activation_state", ("card_activation_state",)),
+        ("credit_quality_status", ("credit_quality_status",)),
         ("currency", ("currency",)),
+        ("account_currency", ("account_currency", "currency")),
+        ("reporting_amount_currency", ("reporting_amount_currency",)),
         ("amount_unit", ("amount_unit",)),
+        ("reporting_amount_unit", ("reporting_amount_unit", "amount_unit")),
+        ("reporting_amount_precision", ("reporting_amount_precision",)),
         ("credit_limit", ("credit_limit",)),
         ("loan_amount", ("loan_amount",)),
         ("balance", ("balance",)),
@@ -94,6 +108,8 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("revolving_flag", ("revolving_flag",)),
         ("effective_date", ("effective_date",)),
         ("due_date", ("due_date",)),
+        ("validity_type", ("validity_type",)),
+        ("expiry_date", ("expiry_date",)),
         ("snapshot_date", ("snapshot_date",)),
         ("total_limit", ("total_limit",)),
         ("used_limit", ("used_limit",)),
@@ -101,7 +117,10 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("facility_limit", ("facility_limit",)),
         ("limit_identifier", ("limit_identifier",)),
         ("currency", ("currency",)),
+        ("account_currency", ("account_currency", "currency")),
+        ("reporting_amount_currency", ("reporting_amount_currency",)),
         ("amount_unit", ("amount_unit",)),
+        ("reporting_amount_unit", ("reporting_amount_unit", "amount_unit")),
         ("status", ("account_status", "status")),
     ),
     "repayment_liability_records": (
@@ -116,6 +135,8 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("related_party_id_number", ("related_party_id_number",)),
         ("institution", ("management_institution", "institution")),
         ("business_type", ("business_type",)),
+        ("underlying_business_type", ("underlying_business_type", "business_type")),
+        ("snapshot_balance_business_type", ("snapshot_balance_business_type",)),
         ("responsibility_type", ("responsibility_type",)),
         ("responsibility_amount", ("responsibility_amount",)),
         ("responsibility_amount_reported", ("responsibility_amount_reported",)),
@@ -136,7 +157,9 @@ _NORMALIZED_FIELDS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("remaining_periods", ("remaining_periods",)),
         ("continuation_complete", ("continuation_complete",)),
         ("currency", ("currency",)),
+        ("reporting_amount_currency", ("reporting_amount_currency", "currency")),
         ("amount_unit", ("amount_unit",)),
+        ("reporting_amount_unit", ("reporting_amount_unit", "amount_unit")),
     ),
     "repayment_records": (
         ("repayment_id", ("repayment_id",)),
@@ -196,7 +219,12 @@ _DATE_FIELDS = frozenset(
         "open_date",
         "effective_date",
         "due_date",
+        "contract_maturity_date",
+        "credit_line_expiry_date",
+        "expiry_date",
         "close_date",
+        "transfer_out_date",
+        "termination_event_date",
         "snapshot_date",
         "liability_date",
         "last_repayment_date",
@@ -235,6 +263,7 @@ _NUMBER_FIELDS = frozenset(
         "overdue_principal_91_180",
         "overdue_principal_over_180",
         "sequence",
+        "reporting_amount_precision",
         "year",
         "month",
     }
@@ -511,23 +540,38 @@ def _normalize_record(collection: str, record: dict[str, Any], index: int) -> di
     if collection == "credit_accounts":
         account_type = str(normalized.get("account_type") or "")
         status = str(normalized.get("status") or "").lower()
+        lifecycle = str(normalized.get("account_lifecycle_state") or "")
         normalized["account_state"] = (
-            "open" if status in {"active", "inactive"} else "closed" if status in {"closed", "settled"} else "unknown"
+            "open"
+            if lifecycle == "open" or (not lifecycle and status in {"active", "inactive"})
+            else "closed"
+            if lifecycle in {"closed", "settled", "transferred_out"}
+            or (not lifecycle and status in {"closed", "settled", "transferred_out"})
+            else "unknown"
         )
-        normalized["activation_state"] = (
-            "active"
-            if account_type == "credit_card" and status == "active"
-            else "inactive"
-            if account_type == "credit_card" and status == "inactive"
-            else "not_applicable"
-        )
+        card_activation_state = str(normalized.get("card_activation_state") or "")
+        if not card_activation_state:
+            card_activation_state = (
+                "not_activated"
+                if account_type == "credit_card" and status == "inactive"
+                else "not_reported"
+                if account_type == "credit_card"
+                else "not_applicable"
+            )
+            normalized["card_activation_state"] = card_activation_state
+        normalized["activation_state"] = {
+            "activated": "active",
+            "not_activated": "inactive",
+            "not_reported": "not_reported",
+            "not_applicable": "not_applicable",
+        }.get(card_activation_state, "not_reported")
         normalized["payoff_state"] = (
             "not_applicable"
             if account_type == "credit_card"
             else "settled"
-            if status in {"closed", "settled"}
+            if lifecycle == "settled" or (not lifecycle and status == "settled")
             else "outstanding"
-            if status == "active"
+            if lifecycle == "open" or (not lifecycle and status == "active")
             else "unknown"
         )
         for field in ("credit_limit", "used_amount", "loan_amount", "balance"):

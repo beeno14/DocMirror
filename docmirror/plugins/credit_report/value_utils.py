@@ -21,7 +21,8 @@ def linear_text(value: Any) -> str:
 
 
 def parse_number(value: Any) -> int | float | None:
-    raw = re.sub(r"[^0-9.-]", "", str(value or "").replace(",", ""))
+    source = "" if value is None else str(value)
+    raw = re.sub(r"[^0-9.-]", "", source.replace(",", ""))
     if not raw or raw in {"-", ".", "-."}:
         return None
     try:

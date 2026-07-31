@@ -1817,6 +1817,327 @@ def extract_enterprise_report_metadata_records(
     return datasets
 
 
+def extract_enterprise_report_identity_records(
+    parse_result: Any,
+    full_text: str = "",
+) -> list[dict[str, Any]]:
+    """Copy cover and identity-table business identifiers into one dataset."""
+    page_texts = _page_texts(parse_result)
+    text = full_text or "\n".join(page_texts.values())
+    compact = _compact(text)
+    identity = dict(extract_enterprise_identity_facts(parse_result))
+    metadata = extract_enterprise_report_metadata(parse_result, text)
+    query_match = re.search(
+        r"查询机构[:：]?(.+?)(?=报告时间[:：]?|$)",
+        compact,
+    )
+    report_time_match = re.search(
+        r"报告时间[:：]?((?:19|20)\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})",
+        compact,
+    )
+    cover_name_match = re.search(
+        r"企业名称[:：]?(.+?)(?=中征码[:：]?)",
+        compact,
+    )
+    if cover_name_match and not identity.get("subject_name"):
+        identity["subject_name"] = _compact(cover_name_match.group(1))
+    if query_match:
+        identity["query_institution"] = _compact(query_match.group(1))
+    if report_time_match:
+        identity["report_time"] = report_time_match.group(1)
+    identity.update(metadata)
+    if not identity:
+        return []
+    identity["enterprise_name"] = identity.get("subject_name")
+    identity["sequence"] = 1
+    identity["enterprise_identity_id"] = _stable_id(
+        "enterprise_report_identity",
+        identity.get("subject_name"),
+        identity.get("unified_social_credit_code"),
+        identity.get("report_time"),
+    )
+    source_pages = [
+        page
+        for page, value in page_texts.items()
+        if any(marker in _compact(value) for marker in ("企业名称", "身份标识", "报告时间"))
+    ]
+    if source_pages:
+        identity["source_page"] = min(source_pages)
+        identity["source_page_end"] = max(source_pages)
+        identity["source_refs"] = [
+            {"source": "enterprise_cover_or_identity", "page": page}
+            for page in sorted(set(source_pages))
+        ]
+    identity["source"] = "enterprise_report_identity"
+    identity["confidence"] = 1.0
+    return [identity]
+
+
+def extract_enterprise_overview_datasets(
+    parse_result: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return report-level dispute, credit overview, recovery, and overdue rows."""
+    datasets: dict[str, list[dict[str, Any]]] = {}
+    page_texts = _page_texts(parse_result)
+    overview = extract_enterprise_overview(parse_result)
+    if overview:
+        public_record_counts = overview.pop("public_record_counts", None)
+        record = {
+            "enterprise_credit_overview_id": _stable_id(
+                "enterprise_credit_overview",
+                overview.get("first_credit_year"),
+                overview.get("credit_balance"),
+                overview.get("guarantee_balance"),
+            ),
+            "sequence": 1,
+            **overview,
+            "currency": "CNY",
+            "source_page": 3,
+            "source": "enterprise_information_overview",
+            "source_refs": [{"source": "enterprise_information_overview", "page": 3}],
+            "confidence": 1.0,
+        }
+        datasets["enterprise_credit_overview"] = [record]
+        if isinstance(public_record_counts, dict):
+            count_type_aliases = {
+                "civil_judgments": "civil_judgment",
+                "enforcements": "enforcement",
+                "administrative_penalties": "administrative_penalty",
+            }
+            datasets["enterprise_public_record_counts"] = [
+                {
+                    "enterprise_public_record_count_id": _stable_id(
+                        "enterprise_public_record_count",
+                        record_type,
+                    ),
+                    "sequence": index,
+                    "record_type": count_type_aliases.get(record_type, record_type),
+                    "record_count": int(count),
+                    "source_page": 3,
+                    "source": "enterprise_information_overview",
+                    "source_refs": [
+                        {"source": "enterprise_information_overview", "page": 3}
+                    ],
+                    "confidence": 1.0,
+                }
+                for index, (record_type, count) in enumerate(
+                    public_record_counts.items(),
+                    start=1,
+                )
+            ]
+
+    for page, text in page_texts.items():
+        match = re.search(
+            r"提出了\s*(\d+)\s*笔异议且正在处理中",
+            _compact(text),
+        )
+        if not match:
+            continue
+        count = int(match.group(1))
+        datasets["enterprise_dispute_overview"] = [
+            {
+                "enterprise_dispute_overview_id": _stable_id(
+                    "enterprise_dispute_overview",
+                    page,
+                    count,
+                ),
+                "sequence": 1,
+                "in_progress_dispute_count": count,
+                "dispute_status": "in_progress",
+                "source_page": page,
+                "source": "enterprise_dispute_notice",
+                "source_refs": [{"source": "enterprise_dispute_notice", "page": page}],
+                "confidence": 1.0,
+            }
+        ]
+        break
+
+    recovery_rows: list[dict[str, Any]] = []
+    overdue_rows: list[dict[str, Any]] = []
+    for page, table_id, rows in _table_stream(parse_result):
+        if len(rows) < 3:
+            continue
+        title_index = next(
+            (
+                index
+                for index, row in enumerate(rows)
+                if "由资产管理公司处置的债务" in "".join(row)
+                and "垫款" in "".join(row)
+                and "逾期" in "".join(row)
+            ),
+            -1,
+        )
+        if title_index < 0 or title_index + 2 >= len(rows):
+            continue
+        values = rows[title_index + 2]
+        if len(values) < 9:
+            continue
+        source_ref = _source_ref(page, table_id, title_index + 2)
+        for recovery_type, offset, activity_field in (
+            ("asset_management_disposed_debt", 0, "latest_disposal_date"),
+            ("advance", 3, "latest_repayment_date"),
+        ):
+            account_count = _number(values[offset])
+            amount = _number(values[offset + 1])
+            activity_date = _date(values[offset + 2])
+            if account_count is None and amount is None and not activity_date:
+                continue
+            row = {
+                "enterprise_recovery_summary_id": _stable_id(
+                    "enterprise_recovery_summary",
+                    "active",
+                    recovery_type,
+                    page,
+                ),
+                "sequence": len(recovery_rows) + 1,
+                "settlement_status": "active",
+                "recovery_type": recovery_type,
+                "account_count": int(account_count) if account_count is not None else None,
+                "balance": amount,
+                "currency": "CNY",
+                "amount_unit": "CNY_10K",
+                activity_field: activity_date or None,
+                "source_page": page,
+                "source_table_id": table_id,
+                "source": "enterprise_recovery_summary",
+                "source_refs": [source_ref],
+                "confidence": 1.0,
+            }
+            recovery_rows.append(row)
+        overdue_rows.append(
+            {
+                "enterprise_overdue_summary_id": _stable_id(
+                    "enterprise_overdue_summary",
+                    page,
+                    table_id,
+                ),
+                "sequence": 1,
+                "overdue_principal": _number(values[6]),
+                "overdue_interest_and_other": _number(values[7]),
+                "overdue_total": _number(values[8]),
+                "currency": "CNY",
+                "amount_unit": "CNY_10K",
+                "source_page": page,
+                "source_table_id": table_id,
+                "source": "enterprise_overdue_summary",
+                "source_refs": [source_ref],
+                "confidence": 1.0,
+            }
+        )
+        break
+    if recovery_rows:
+        datasets["enterprise_recovery_summary"] = recovery_rows
+    if overdue_rows:
+        datasets["enterprise_overdue_summary"] = overdue_rows
+    return datasets
+
+
+def extract_enterprise_interest_arrears(
+    parse_result: Any,
+) -> list[dict[str, Any]]:
+    """Return one row per source 欠息 record."""
+    records: list[dict[str, Any]] = []
+    headings = _table_headings(parse_result)
+    for page, table_id, rows in _table_stream(parse_result):
+        heading = _compact(headings.get(table_id))
+        for row_index, row in enumerate(rows):
+            if len(row) < 6:
+                continue
+            arrears_type = _compact(row[1])
+            currency = _CURRENCY_CODES.get(_compact(row[2]))
+            balance = _number(row[3])
+            balance_change_date = _date(row[4])
+            snapshot_date = _date(row[5])
+            if (
+                not currency
+                or balance is None
+                or not balance_change_date
+                or not snapshot_date
+                or (arrears_type not in {"表内", "表外"} and "欠息" not in heading)
+            ):
+                continue
+            institution = _compact(row[0])
+            records.append(
+                {
+                    "interest_arrears_id": _stable_id(
+                        "enterprise_interest_arrears",
+                        institution,
+                        arrears_type,
+                        snapshot_date,
+                    ),
+                    "sequence": len(records) + 1,
+                    "institution": institution,
+                    "arrears_type": arrears_type,
+                    "currency": currency,
+                    "amount_unit": "CNY_10K",
+                    "arrears_balance": balance,
+                    "balance_change_date": balance_change_date,
+                    "snapshot_date": snapshot_date,
+                    "source_page": page,
+                    "source_table_id": table_id,
+                    "source": "enterprise_interest_arrears",
+                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "confidence": 1.0,
+                }
+            )
+    return records
+
+
+def extract_enterprise_non_credit_history_datasets(
+    parse_result: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return monthly utility and housing-fund attachment histories."""
+    datasets: dict[str, list[dict[str, Any]]] = {}
+    page_texts = _page_texts(parse_result)
+    for page, table_id, rows in _table_stream(parse_result):
+        page_text = _compact(page_texts.get(page))
+        history_type = (
+            "housing_fund"
+            if "住房公积金历史缴费记录明细" in page_text
+            else "utility"
+            if "公用事业历史缴费记录明细" in page_text
+            else ""
+        )
+        if not history_type:
+            continue
+        records = datasets.setdefault(
+            (
+                "enterprise_housing_fund_history"
+                if history_type == "housing_fund"
+                else "enterprise_utility_payment_history"
+            ),
+            [],
+        )
+        for row_index, row in enumerate(rows):
+            if len(row) < 5 or not re.fullmatch(r"(?:19|20)\d{2}-\d{2}", _compact(row[0])):
+                continue
+            statistics_month = _compact(row[0])
+            records.append(
+                {
+                    f"{history_type}_history_id": _stable_id(
+                        f"enterprise_{history_type}_history",
+                        statistics_month,
+                        page,
+                        row_index,
+                    ),
+                    "sequence": len(records) + 1,
+                    "statistics_month": statistics_month,
+                    "payment_status": _compact(row[1]),
+                    "amount_due": _number(row[2]),
+                    "amount_paid": _number(row[3]),
+                    "cumulative_arrears": _number(row[4]),
+                    "currency": "CNY",
+                    "amount_unit": "CNY_1",
+                    "source_page": page,
+                    "source_table_id": table_id,
+                    "source": f"enterprise_{history_type}_history",
+                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "confidence": 1.0,
+                }
+            )
+    return {name: rows for name, rows in datasets.items() if rows}
+
+
 def extract_enterprise_report_notes(parse_result: Any) -> list[dict[str, Any]]:
     """Transcribe numbered enterprise report notes from their source page."""
     for page, page_text in _page_texts(parse_result).items():
@@ -2701,8 +3022,10 @@ _PUBLIC_ATTRIBUTE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
         "utility_provider": ("公用事业单位名称",),
         "utility_type": ("业务类型", "公用事业类型"),
         "utility_account_identifier": ("账户编号", "用户编号"),
-        "arrears_amount": ("欠费金额（元）", "欠费金额"),
-        "statistics_date": ("统计日期",),
+        "payment_status": ("缴费状态",),
+        "cumulative_arrears": ("累计欠费金额（元）", "累计欠费金额", "累计欠费"),
+        "statistics_month": ("统计年月",),
+        "history_status": ("查看过去24个月缴费情况", "查看过去 24 个月缴费情况"),
     },
     "tax_arrears": {
         "tax_authority": ("主管税务机关",),
@@ -2803,29 +3126,32 @@ _PUBLIC_ATTRIBUTE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "patent": {
         "patent_name": ("专利名称",),
-        "patent_type": ("专利类型",),
-        "application_number": ("申请号",),
+        "patent_number": ("专利号",),
         "application_date": ("申请日期",),
-        "authorization_date": ("授权日期",),
-        "patent_status": ("专利状态",),
+        "grant_date": ("授予日期", "授权日期"),
+        "validity_years": ("专利有效期（单位：年）", "专利有效期"),
     },
     "financing_restriction": {
-        "restriction_catalog": ("所属名录",),
-        "restriction_reason": ("列入原因", "控制原因"),
-        "restriction_date": ("添加日期", "列入日期"),
-        "restriction_status": ("状态",),
+        "catalog": ("所属名录",),
+        "control_type": ("融资控制类型",),
+        "year": ("年度",),
+        "scale": ("规模",),
     },
     "data_provider_statement": {
         "statement_content": ("数据提供机构说明",),
+        "added_date": ("添加日期",),
     },
     "credit_bureau_statement": {
         "statement_content": ("征信中心说明",),
+        "added_date": ("添加日期",),
     },
     "subject_statement": {
         "statement_content": ("信息主体声明",),
+        "added_date": ("添加日期",),
     },
     "dispute_annotation": {
         "annotation_content": ("异议标注",),
+        "added_date": ("添加日期",),
     },
 }
 
@@ -2849,14 +3175,13 @@ _PUBLIC_DATE_ATTRIBUTE_FIELDS = frozenset(
         "effective_date",
         "expiry_date",
         "application_date",
-        "authorization_date",
-        "restriction_date",
+        "grant_date",
+        "added_date",
     }
 )
-_PUBLIC_INTEGER_ATTRIBUTE_FIELDS = frozenset({"employee_count"})
+_PUBLIC_INTEGER_ATTRIBUTE_FIELDS = frozenset({"employee_count", "validity_years", "year"})
 _PUBLIC_NUMBER_ATTRIBUTE_FIELDS = frozenset(
     {
-        "arrears_amount",
         "tax_arrears_amount",
         "claim_amount",
         "requested_enforcement_amount",
@@ -3260,14 +3585,31 @@ def refine_enterprise_business(
     attachment_details = attachment_datasets["enterprise_attachment_credit_details"]
     attachment_transactions = attachment_datasets["enterprise_special_transactions"]
     source_display_limited = any(
-        "受篇幅所限" in text and "只展示部分信贷记录" in text for text in _page_texts(parse_result).values()
+        (
+            "受篇幅所限" in compact_text
+            and any(
+                marker in compact_text
+                for marker in ("只展示部分信贷记录", "仅展示部分信贷记录")
+            )
+        )
+        or (
+            "仅展示一定期限范围内" in compact_text
+            and "已结清信贷信息" in compact_text
+            and any(
+                marker in compact_text
+                for marker in ("非信贷信息", "公共信息")
+            )
+        )
+        for compact_text in (
+            _compact(text) for text in _page_texts(parse_result).values()
+        )
     )
     summary.update(
         {
             "account_dataset_scope": "main_report_account_cards",
             "account_dataset_scope_note": (
                 "信贷账户数据集对应报告正文展示的账户卡片；"
-                + ("源报告明确说明受篇幅限制仅展示部分信贷记录。" if source_display_limited else "")
+                + ("源报告明确说明信息展示范围受限。" if source_display_limited else "")
                 + "附件账户、月度历史、信贷明细及特定交易分别在企业附件数据集中列示。"
             ),
             "source_display_limited": source_display_limited,
@@ -3297,16 +3639,195 @@ def refine_enterprise_business(
     return refined
 
 
+def _enterprise_text_fallback(full_text: str, parse_result: Any) -> dict[str, Any]:
+    """Extract text-only enterprise records without entering the personal pipeline."""
+    text = str(full_text or "")
+    compact = re.sub(r"\s+", "", text)
+    summary: dict[str, Any] = {}
+    overview_match = re.search(
+        r"首次有相关还款责任的年份\s*(\d{4})\s+(\d+)\s+(\d+)\s+(\d{4})",
+        text,
+    )
+    if overview_match:
+        summary.update(
+            {
+                "first_credit_year": int(overview_match.group(1)),
+                "credit_institution_count": int(overview_match.group(2)),
+                "active_credit_institution_count": int(overview_match.group(3)),
+                "first_repayment_responsibility_year": int(overview_match.group(4)),
+            }
+        )
+    balance_match = re.search(
+        r"借贷交易担保交易余额([0-9,.]+)余额([0-9,.]+)其中[：:]?被追偿余额([0-9,.]+)",
+        compact,
+    )
+    if balance_match:
+        summary.update(
+            {
+                "credit_balance": _number(balance_match.group(1)),
+                "guarantee_balance": _number(balance_match.group(2)),
+                "recovered_debt_balance": _number(balance_match.group(3)),
+            }
+        )
+
+    page_texts = _page_texts(parse_result)
+
+    def source_page(value: str) -> int | None:
+        needle = _compact(value)
+        return next(
+            (page for page, page_text in page_texts.items() if needle and needle in _compact(page_text)),
+            None,
+        )
+
+    accounts: list[dict[str, Any]] = []
+    account_matches = list(
+        re.finditer(r"未结清账户编号[：:]\s*([0-9A-Z]{6,})", text, flags=re.IGNORECASE)
+    )
+    for index, match in enumerate(account_matches):
+        end = account_matches[index + 1].start() if index + 1 < len(account_matches) else len(text)
+        segment = text[match.end() : end]
+        account_identifier = _identifier(match.group(1))
+        institution_match = re.search(r"授信机构[：:]\s*([^\r\n]+)", segment)
+        business_match = re.search(r"业务种类[：:]\s*([^\r\n]+)", segment)
+        page = source_page(account_identifier)
+        accounts.append(
+            {
+                "account_id": _stable_id("enterprise_credit_account", account_identifier),
+                "account_identifier": account_identifier,
+                "account_status": "active",
+                "status": "active",
+                "institution": _compact(institution_match.group(1)) if institution_match else "",
+                "business_type": _compact(business_match.group(1)) if business_match else "",
+                "source_page": page,
+                "source": "enterprise_native_text_fallback",
+                "source_refs": (
+                    [{"source": "native_text_enterprise_account", "page": page}]
+                    if page is not None
+                    else []
+                ),
+                "confidence": 0.95,
+            }
+        )
+
+    public_records: list[dict[str, Any]] = []
+    public_match = re.search(
+        r"公共记录明细(.*?)(?:附件\s*\d*[：:]|信用记录补充信息|\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    public_text = public_match.group(1) if public_match else ""
+    date_token = r"(?:19|20)\d{2}-\d{2}-\d{2}"
+
+    def append_public_record(
+        *,
+        record_type: str,
+        authority: str,
+        category: str,
+        start_date: str,
+        end_date: str,
+        content: str,
+    ) -> None:
+        page = source_page(authority)
+        public_records.append(
+            {
+                "public_record_id": _stable_id(
+                    "enterprise_public_record",
+                    record_type,
+                    authority,
+                    start_date,
+                    end_date,
+                    content,
+                ),
+                "record_type": record_type,
+                "authority": authority,
+                "category": category,
+                "start_date": "" if start_date == "--" else start_date,
+                "end_date": "" if end_date == "--" else end_date,
+                "content": content,
+                "source_page": page,
+                "source": "enterprise_native_text_fallback",
+                "source_refs": (
+                    [{"source": "native_text_enterprise_public_record", "page": page}]
+                    if page is not None
+                    else []
+                ),
+                "confidence": 0.9,
+            }
+        )
+
+    license_match = re.search(
+        r"许可部门.*?许可内容(.*?)(?=认证部门|资质部门|\Z)",
+        public_text,
+        flags=re.DOTALL,
+    )
+    if license_match:
+        license_body = re.sub(r"\s+", "", license_match.group(1))
+        license_pattern = re.compile(
+            rf"(?P<authority>.+?)(?P<category>普通)(?P<start>{date_token})"
+            rf"(?P<end>{date_token})(?P<content>.+?)(?=(?:.+?普通{date_token})|\Z)"
+        )
+        for match in license_pattern.finditer(license_body):
+            authority = re.sub(
+                r"^.*?许可(?=[^许可]*(?:省|市|县|区))",
+                "",
+                match.group("authority"),
+            )
+            append_public_record(
+                record_type="license",
+                authority=authority,
+                category=match.group("category"),
+                start_date=match.group("start"),
+                end_date=match.group("end"),
+                content=match.group("content"),
+            )
+
+    certification_match = re.search(
+        r"认证部门.*?认证内容(.*?)(?=资质部门|附件\s*\d*[：:]|\Z)",
+        public_text,
+        flags=re.DOTALL,
+    )
+    if certification_match:
+        certification_body = re.sub(r"\s+", "", certification_match.group(1))
+        certification_pattern = re.compile(
+            rf"(?P<authority>.+?)(?P<category>纳税信用A(?:级)?纳税人)"
+            rf"(?P<start>{date_token}|--)(?P<end>{date_token}|--)"
+            rf"(?P<content>.+?)(?=(?:.+?纳税信用A(?:级)?纳税人(?:{date_token}|--))|\Z)"
+        )
+        for match in certification_pattern.finditer(certification_body):
+            append_public_record(
+                record_type="certification",
+                authority=match.group("authority"),
+                category=match.group("category"),
+                start_date=match.group("start"),
+                end_date=match.group("end"),
+                content=match.group("content"),
+            )
+
+    if public_records:
+        summary["public_record_count"] = len(public_records)
+        counts: dict[str, int] = {}
+        for record in public_records:
+            record_type = str(record["record_type"])
+            counts[record_type] = counts.get(record_type, 0) + 1
+        summary["public_record_type_counts"] = counts
+    return {
+        "credit_accounts": accounts,
+        "credit_lines": [],
+        "repayment_liability_records": [],
+        "repayment_records": [],
+        "overdue_records": [],
+        "inquiry_records": [],
+        "public_records": public_records,
+        "credit_summary": summary,
+    }
+
+
 def extract_enterprise_native_business(
     parse_result: Any,
     full_text: str,
 ) -> dict[str, Any]:
     """Transform a ParseResult into enterprise-native business candidates."""
-    from docmirror.plugins.credit_report.business_records import (
-        extract_enterprise_native_candidates,
-    )
-
-    candidates = extract_enterprise_native_candidates(parse_result, full_text)
+    candidates = _enterprise_text_fallback(full_text, parse_result)
     return refine_enterprise_business(parse_result, candidates)
 
 
@@ -3318,7 +3839,10 @@ __all__ = [
     "extract_enterprise_native_business",
     "extract_enterprise_facility_summary",
     "extract_enterprise_identity_facts",
+    "extract_enterprise_interest_arrears",
+    "extract_enterprise_non_credit_history_datasets",
     "extract_enterprise_overview",
+    "extract_enterprise_overview_datasets",
     "extract_enterprise_capital_summary",
     "extract_enterprise_continuation_audit",
     "extract_enterprise_profile_datasets",
@@ -3327,6 +3851,7 @@ __all__ = [
     "extract_enterprise_repayment_liability_records",
     "extract_enterprise_report_metadata",
     "extract_enterprise_report_metadata_records",
+    "extract_enterprise_report_identity_records",
     "extract_enterprise_report_notes",
     "extract_enterprise_supplement_rows",
     "refine_enterprise_business",

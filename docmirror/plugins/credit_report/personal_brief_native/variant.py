@@ -61,6 +61,26 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
 
         return extract_personal_brief_native_business(parse_result, full_text)
 
+    def data_dictionary(self) -> dict[str, Any]:
+        """Return the personal-brief-owned public data dictionary."""
+        from docmirror.plugins.credit_report.personal_brief_native.schema import (
+            personal_brief_data_dictionary,
+        )
+
+        return personal_brief_data_dictionary()
+
+    def semantic_extensions(self) -> dict[str, Any]:
+        """Return personal document-order and rendering policy."""
+        from docmirror.plugins.credit_report.personal_brief_native.schema import (
+            personal_brief_semantic_extensions,
+        )
+
+        return personal_brief_semantic_extensions()
+
+    def strip_supplemental_node_bindings(self) -> bool:
+        """Personal supplemental views copy source rows into several datasets."""
+        return True
+
     def build_reading_projection(
         self,
         parse_result: Any,

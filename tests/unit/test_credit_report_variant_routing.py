@@ -125,11 +125,21 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
-    assert "dataset_document_order" not in personal_semantic
+    assert personal_semantic["dataset_document_order"][:5] == [
+        "personal_report_metadata",
+        "report_notes",
+        "identity_documents",
+        "personal_credit_summary_records",
+        "asset_disposition_records",
+    ]
+    assert personal_semantic["dataset_document_order"][-1] == "inquiry_records"
     enterprise_order = enterprise_semantic["dataset_document_order"]
-    assert enterprise_order.index("enterprise_report_metadata") < enterprise_order.index(
-        "report_notes"
-    )
+    assert enterprise_order[:4] == [
+        "enterprise_report_metadata",
+        "report_notes",
+        "enterprise_exchange_rates",
+        "enterprise_report_identity",
+    ]
     assert enterprise_order.index("enterprise_current_credit_summary") < enterprise_order.index(
         "enterprise_facility_summary"
     ) < enterprise_order.index("enterprise_closed_credit_summary")
@@ -140,6 +150,10 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "enterprise_displayed_credit_summary"
     ) < enterprise_order.index("credit_lines")
     assert enterprise_order[-1] == "enterprise_extraction_audit"
+    assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
+    assert enterprise_dictionary["version"] == "2.0.0"
+    assert "identity_documents" not in enterprise_dictionary["datasets"]
+    assert "enterprise_credit_accounts" in enterprise_dictionary["datasets"]
 
 
 def test_enterprise_official_public_record_lexicon_is_complete() -> None:
@@ -174,6 +188,7 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
         "certification_content",
     ]
     assert set(dictionary["enums"]["record_type"]) == {
+        "non_credit_accounts",
         "utility_payment",
         "tax_arrears",
         "civil_judgment",

@@ -99,6 +99,7 @@ _INTERNAL_RECORD_KEYS = frozenset(
         "source_refs",
         "source_cell_refs",
         "source_fact_ids",
+        "source_anchor",
         "evidence_ids",
         "confidence",
         "review",

@@ -3,6 +3,7 @@
 
 """Orchestration adapter for native-text enterprise credit reports."""
 
+from copy import deepcopy
 from typing import Any
 
 from docmirror.plugins.credit_report.shared.variant import CreditReportVariantAdapter
@@ -11,18 +12,32 @@ _ENTERPRISE_DOCUMENT_DATASET_ORDER = (
     "enterprise_report_metadata",
     "report_notes",
     "enterprise_exchange_rates",
+    "enterprise_report_identity",
+    "enterprise_dispute_overview",
+    "enterprise_credit_overview",
+    "enterprise_public_record_counts",
+    "enterprise_recovery_summary",
+    "enterprise_overdue_summary",
     "enterprise_current_credit_summary",
     "enterprise_facility_summary",
-    "enterprise_closed_credit_summary",
     "enterprise_repayment_responsibility_summary",
+    "enterprise_closed_credit_summary",
+    "enterprise_profile",
     "enterprise_profile_fields",
     "enterprise_capital_summary",
+    "enterprise_contributors",
+    "enterprise_key_personnel",
     "enterprise_stakeholders",
     "enterprise_relationships",
+    "enterprise_credit_accounts",
     "credit_accounts",
+    "enterprise_interest_arrears",
     "enterprise_displayed_credit_summary",
+    "enterprise_credit_facilities",
     "credit_lines",
+    "enterprise_repayment_responsibility_accounts",
     "repayment_liability_records",
+    "enterprise_repayment_responsibility_groups",
     "repayment_records",
     "overdue_records",
     "enterprise_public_utility_payment_records",
@@ -49,6 +64,8 @@ _ENTERPRISE_DOCUMENT_DATASET_ORDER = (
     "enterprise_credit_supplement",
     "enterprise_attachment_credit_details",
     "enterprise_special_transactions",
+    "enterprise_utility_payment_history",
+    "enterprise_housing_fund_history",
     "enterprise_extraction_audit",
 )
 
@@ -71,6 +88,19 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
     def dataset_names(self) -> tuple[str, ...]:
         """Publish public records through typed business tables, not content rows."""
         return tuple(name for name in super().dataset_names() if name != "public_records")
+
+    def business_dataset_copies(
+        self,
+        assembled: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Publish enterprise-owned canonical names beside compatibility views."""
+        return {
+            "enterprise_credit_accounts": list(assembled.get("credit_accounts") or []),
+            "enterprise_credit_facilities": list(assembled.get("credit_lines") or []),
+            "enterprise_repayment_responsibility_accounts": list(
+                assembled.get("repayment_liability_records") or []
+            ),
+        }
 
     def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
         """Build reusable enterprise page and table indexes once."""
@@ -97,6 +127,31 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
 
         return extract_enterprise_native_business(parse_result, full_text)
 
+    def assemble_business(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        content_mode: str,
+        existing_collections: dict[str, list[Any]] | None,
+        existing_summary: dict[str, Any] | None,
+        variant_input: Any,
+    ) -> dict[str, Any]:
+        """Assemble enterprise business records without personal normalizers."""
+        from docmirror.plugins.credit_report.enterprise_native.pipeline import (
+            assemble_enterprise_business,
+        )
+
+        return assemble_enterprise_business(
+            parse_result,
+            full_text,
+            content_mode=content_mode,
+            existing_collections=existing_collections,
+            existing_summary=existing_summary,
+            variant=self,
+            variant_input=variant_input,
+        )
+
     def build_section_content(
         self,
         parse_result: Any,
@@ -112,8 +167,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             extract_enterprise_continuation_audit,
             extract_enterprise_facility_summary,
             extract_enterprise_identity_facts,
+            extract_enterprise_interest_arrears,
+            extract_enterprise_non_credit_history_datasets,
+            extract_enterprise_overview_datasets,
             extract_enterprise_profile_datasets,
             extract_enterprise_public_record_datasets,
+            extract_enterprise_report_identity_records,
             extract_enterprise_report_metadata_records,
             extract_enterprise_report_notes,
             extract_enterprise_summary_datasets,
@@ -125,14 +184,81 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             # The public API is the set of typed business tables.
             datasets.update(public_record_datasets)
         datasets.update(extract_enterprise_report_metadata_records(parse_result, full_text))
+        datasets["enterprise_report_identity"] = extract_enterprise_report_identity_records(
+            parse_result,
+            full_text,
+        )
+        datasets.update(extract_enterprise_overview_datasets(parse_result))
         datasets.update(extract_enterprise_summary_datasets(parse_result))
+        datasets["enterprise_interest_arrears"] = extract_enterprise_interest_arrears(
+            parse_result
+        )
         datasets.update(extract_enterprise_attachment_datasets(parse_result))
+        datasets.update(extract_enterprise_non_credit_history_datasets(parse_result))
         datasets["enterprise_extraction_audit"] = extract_enterprise_continuation_audit(
             parse_result,
             datasets=datasets,
         )
         datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(parse_result)
         datasets["enterprise_facility_summary"] = extract_enterprise_facility_summary(parse_result)
+        profile_rows = list(datasets.get("enterprise_profile_fields") or [])
+        if profile_rows:
+            profile_field_names = {
+                "经济类型": "economic_type",
+                "组织机构类型": "organization_type",
+                "企业规模": "enterprise_scale",
+                "所属行业": "industry",
+                "成立年份": "establishment_year",
+                "登记证书有效截止日期": "registration_certificate_valid_through",
+                "登记地址": "registered_address",
+                "办公/经营地址": "operating_address",
+                "存续状态": "operating_status",
+            }
+            profile_record: dict[str, Any] = {
+                "enterprise_profile_id": "enterprise_profile:r000001",
+                "sequence": 1,
+                "source": "enterprise_profile_fields",
+                "source_refs": [],
+                "confidence": 1.0,
+            }
+            for row in profile_rows:
+                field = profile_field_names.get(str(row.get("field") or ""))
+                if not field:
+                    continue
+                value: Any = row.get("value")
+                if field == "establishment_year":
+                    try:
+                        value = int(str(value))
+                    except (TypeError, ValueError):
+                        pass
+                profile_record[field] = value
+                profile_record["source_refs"].extend(row.get("source_refs") or [])
+            datasets["enterprise_profile"] = [profile_record]
+        stakeholders = list(datasets.get("enterprise_stakeholders") or [])
+        datasets["enterprise_contributors"] = [
+            {**row, "sequence": index}
+            for index, row in enumerate(
+                (
+                    row
+                    for row in stakeholders
+                    if "股东" in str(row.get("role") or "")
+                    or row.get("ownership_percentage") not in (None, "")
+                ),
+                start=1,
+            )
+        ]
+        datasets["enterprise_key_personnel"] = [
+            {**row, "sequence": index}
+            for index, row in enumerate(
+                (
+                    row
+                    for row in stakeholders
+                    if "股东" not in str(row.get("role") or "")
+                    and row.get("ownership_percentage") in (None, "")
+                ),
+                start=1,
+            )
+        ]
         return {
             "facts": extract_enterprise_identity_facts(parse_result),
             "report_notes": extract_enterprise_report_notes(parse_result),
@@ -155,8 +281,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             entity_fields.pop(field_name, None)
 
     def data_dictionary(self) -> dict[str, Any]:
-        """Use enterprise labels without changing personal-report semantics."""
-        dictionary = super().data_dictionary()
+        """Return an enterprise-owned dictionary with no personal inheritance."""
+        from docmirror.plugins.credit_report.enterprise_native.schema import (
+            enterprise_credit_report_data_dictionary,
+        )
+
+        dictionary = enterprise_credit_report_data_dictionary()
         fields = dictionary.setdefault("fields", {})
         for field_name in ("subject_id", "id_number", "id_type", "marital_status"):
             fields.pop(field_name, None)
@@ -206,6 +336,60 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         fields["query_institution"] = {"label": "查询机构", "type": "string"}
         fields.update(
             {
+                "enterprise_identity_id": {"label": "企业报告身份记录ID", "type": "string"},
+                "enterprise_name": {"label": "企业名称", "type": "string"},
+                "report_time": {"label": "报告时间", "type": "datetime"},
+                "source_page_end": {"label": "源结束页码", "type": "integer"},
+                "enterprise_dispute_overview_id": {"label": "异议概要ID", "type": "string"},
+                "in_progress_dispute_count": {"label": "处理中异议笔数", "type": "integer"},
+                "dispute_status": {"label": "异议状态", "type": "string"},
+                "enterprise_credit_overview_id": {"label": "信用概要ID", "type": "string"},
+                "enterprise_public_record_count_id": {
+                    "label": "公共记录计数ID",
+                    "type": "string",
+                },
+                "record_count": {"label": "记录条数", "type": "integer"},
+                "enterprise_recovery_summary_id": {"label": "被追偿概要ID", "type": "string"},
+                "recovery_type": {"label": "被追偿业务类型", "type": "string"},
+                "account_count": {"label": "账户数", "type": "integer"},
+                "latest_disposal_date": {"label": "最近一次处置日期", "type": "date"},
+                "latest_repayment_date": {"label": "最近一次还款日期", "type": "date"},
+                "enterprise_overdue_summary_id": {"label": "逾期概要ID", "type": "string"},
+                "overdue_interest_and_other": {"label": "逾期利息及其他", "type": "money"},
+                "enterprise_profile_id": {"label": "企业基本信息ID", "type": "string"},
+                "economic_type": {"label": "经济类型", "type": "string"},
+                "organization_type": {"label": "组织机构类型", "type": "string"},
+                "enterprise_scale": {"label": "企业规模", "type": "string"},
+                "industry": {"label": "所属行业", "type": "string"},
+                "establishment_year": {"label": "成立年份", "type": "integer"},
+                "registration_certificate_valid_through": {
+                    "label": "登记证书有效截止日期",
+                    "type": "date",
+                },
+                "registered_address": {"label": "登记地址", "type": "string"},
+                "operating_address": {"label": "办公/经营地址", "type": "string"},
+                "operating_status": {"label": "存续状态", "type": "string"},
+                "interest_arrears_id": {"label": "欠息记录ID", "type": "string"},
+                "arrears_type": {"label": "欠息类型", "type": "string"},
+                "arrears_balance": {"label": "欠息余额", "type": "money"},
+                "balance_change_date": {"label": "余额变化日期", "type": "date"},
+                "amount_due": {"label": "本月应缴金额", "type": "money"},
+                "amount_paid": {"label": "本月实缴金额", "type": "money"},
+                "account_type": {"label": "账户类型", "type": "string"},
+                "maturity_date": {
+                    "label": "到期日期",
+                    "type": "date",
+                    "definition": "合同或授信协议的到期日；不是许可或证书有效期。",
+                },
+                "credit_limit": {"label": "信用额度", "type": "money"},
+                "loan_amount": {"label": "借款金额", "type": "money"},
+                "discount_amount": {"label": "贴现金额", "type": "money"},
+                "guarantee_amount": {"label": "担保金额", "type": "money"},
+                "risk_exposure_amount": {"label": "风险敞口", "type": "money"},
+                "deposit_ratio": {"label": "保证金比例", "type": "percentage"},
+                "credit_limit_status": {"label": "信用额度报告状态", "type": "string"},
+                "loan_amount_status": {"label": "借款金额报告状态", "type": "string"},
+                "balance_status": {"label": "余额报告状态", "type": "string"},
                 "credit_balance": {"label": "借贷交易余额", "type": "money"},
                 "guarantee_balance": {"label": "担保交易余额", "type": "money"},
                 "recovered_debt_balance": {"label": "被追偿余额", "type": "money"},
@@ -303,8 +487,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "text",
                 },
                 "source_display_limited": {
-                    "label": "源报告是否声明仅展示部分信贷记录",
+                    "label": "源报告是否声明信息展示范围受限",
                     "type": "boolean",
+                    "definition": (
+                        "包括受篇幅限制仅展示部分信贷记录，或仅展示一定期限范围内的"
+                        "已结清信贷、非信贷和公共信息。"
+                    ),
                 },
                 "attachment_account_count": {
                     "label": "附件账户/业务数",
@@ -374,7 +562,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "certification_expiry_date": {"label": "认证截止日期", "type": "date"},
                 "certification_content": {"label": "认证内容", "type": "string"},
                 "source_page": {"label": "源页码", "type": "integer"},
-                "source_page_end": {"label": "源结束页码", "type": "integer"},
                 "contributor_source_page": {
                     "label": "主要出资人表源页码",
                     "type": "integer",
@@ -414,16 +601,20 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "label": "还款责任金额",
                     "type": "money",
                 },
-                "snapshot_date": {"label": "信息报告日期", "type": "date"},
+                "snapshot_date": {"label": "信息截至日期", "type": "date"},
                 "institution": {"label": "授信机构", "type": "string"},
                 "business_type": {"label": "业务类型", "type": "string"},
                 "business_category": {"label": "业务类别", "type": "string"},
                 "report_date": {"label": "信息报告日期", "type": "date"},
                 "open_date": {"label": "开立日期", "type": "date"},
-                "due_date": {"label": "到期日", "type": "date"},
+                "due_date": {
+                    "label": "原始兼容到期日",
+                    "type": "date",
+                    "deprecated": True,
+                    "canonical_field": "maturity_date",
+                },
                 "close_date": {"label": "关闭日期", "type": "date"},
                 "balance": {"label": "余额", "type": "money"},
-                "balance_change_date": {"label": "余额变化日期", "type": "date"},
                 "five_tier_class": {"label": "五级分类", "type": "string"},
                 "five_tier_class_source": {
                     "label": "五级分类来源",
@@ -431,7 +622,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "classification_date": {"label": "五级分类认定日期", "type": "date"},
                 "overdue_total": {"label": "逾期总额", "type": "money"},
-                "overdue_principal": {"label": "逾期本金", "type": "money"},
+                "overdue_principal": {
+                    "label": "逾期本金",
+                    "type": "money",
+                    "definition": "源报告明确展示0时保留0；仅未报告时为空。",
+                },
                 "overdue_months": {"label": "逾期月数", "type": "integer"},
                 "scheduled_repayment_date": {"label": "最近约定还款日期", "type": "date"},
                 "scheduled_repayment_amount": {"label": "最近应还总额", "type": "money"},
@@ -446,11 +641,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "issuance_form": {"label": "发放形式", "type": "string"},
                 "guarantee_type": {"label": "担保方式", "type": "string"},
                 "counter_guarantee_type": {"label": "反担保方式", "type": "string"},
-                "deposit_ratio": {"label": "保证金比例", "type": "percentage"},
-                "risk_exposure_amount": {"label": "风险敞口", "type": "money"},
                 "status": {"label": "账户状态", "type": "string"},
-                "current_overdue_amount": {"label": "当前逾期总额", "type": "money"},
-                "current_overdue_periods": {"label": "当前逾期月数", "type": "integer"},
+                "current_overdue_amount": {
+                    "label": "当前逾期总额",
+                    "type": "money",
+                    "definition": "源报告明确展示0时保留0；仅未报告时为空。",
+                },
+                "current_overdue_periods": {
+                    "label": "当前逾期月数",
+                    "type": "integer",
+                    "definition": "源报告明确展示0时保留0；仅未报告时为空。",
+                },
                 "current_overdue_status": {
                     "label": "当前逾期报告状态",
                     "type": "string",
@@ -579,8 +780,34 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         credit_accounts["definition"] = "一行对应企业报告信贷记录明细中的一个当前或已结清账户卡片。"
         credit_accounts["aggregation"] = "金额必须按币种和金额单位分组；不得与授信额度或概要合计相加。"
         account_columns = credit_accounts.setdefault("columns", {})
-        account_columns["institution"] = fields["institution"]
-        account_columns["status"] = fields["status"]
+        for key in (
+            "sequence",
+            "account_id",
+            "account_type",
+            "business_category",
+            "account_identifier",
+            "institution",
+            "business_type",
+            "status",
+            "open_date",
+            "due_date",
+            "maturity_date",
+            "close_date",
+            "snapshot_date",
+            "currency",
+            "amount_unit",
+            "loan_amount",
+            "credit_limit",
+            "discount_amount",
+            "guarantee_amount",
+            "balance",
+            "risk_exposure_amount",
+            "deposit_ratio",
+            "credit_limit_status",
+            "loan_amount_status",
+            "balance_status",
+        ):
+            account_columns[key] = fields[key]
         for key in (
             "business_category",
             "issuance_form",
@@ -614,8 +841,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "facility_product": {"label": "授信额度类型", "type": "string"},
                 "revolving_flag": {"label": "额度循环标志", "type": "boolean"},
                 "effective_date": {"label": "生效日期", "type": "date"},
-                "due_date": {"label": "到期日", "type": "date"},
-                "snapshot_date": {"label": "信息报告日期", "type": "date"},
+                "due_date": {
+                    "label": "原始兼容到期日",
+                    "type": "date",
+                    "deprecated": True,
+                    "canonical_field": "maturity_date",
+                },
+                "snapshot_date": {"label": "信息截至日期", "type": "date"},
+                "maturity_date": fields["maturity_date"],
+                "total_limit": fields["total_limit"],
+                "used_limit": fields["used_limit"],
+                "available_limit": fields["available_limit"],
                 "facility_limit": {"label": "授信限额", "type": "money"},
                 "limit_identifier": {
                     "label": "授信限额编号",
@@ -624,6 +860,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "display": "masked",
                 },
                 "amount_unit": fields["amount_unit"],
+                "currency": fields["currency"],
             }
         )
         repayment_liabilities = dictionary["datasets"].setdefault(
@@ -676,6 +913,117 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "source_page": fields["source_page"],
             },
         }
+        dictionary["datasets"]["enterprise_report_identity"] = {
+            "definition": "一行对应企业报告封面及身份标识表中的同一报告主体。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_identity_id",
+                    "sequence",
+                    "report_edition",
+                    "enterprise_name",
+                    "subject_name",
+                    "zhongzheng_code",
+                    "unified_social_credit_code",
+                    "organization_code",
+                    "institution_credit_code",
+                    "national_tax_id",
+                    "local_tax_id",
+                    "business_registration_number",
+                    "query_institution",
+                    "report_time",
+                    "source_page",
+                    "source_page_end",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_dispute_overview"] = {
+            "definition": "一行对应报告身份标识后的异议提示概要。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_dispute_overview_id",
+                    "sequence",
+                    "in_progress_dispute_count",
+                    "dispute_status",
+                    "source_page",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_credit_overview"] = {
+            "definition": "一行对应信息概要中的企业整体信用概览。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_credit_overview_id",
+                    "sequence",
+                    "first_credit_year",
+                    "credit_institution_count",
+                    "active_credit_institution_count",
+                    "first_repayment_responsibility_year",
+                    "credit_balance",
+                    "credit_attention_balance",
+                    "credit_adverse_balance",
+                    "guarantee_balance",
+                    "guarantee_attention_balance",
+                    "guarantee_adverse_balance",
+                    "recovered_debt_balance",
+                    "currency",
+                    "amount_unit",
+                    "source_page",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_public_record_counts"] = {
+            "definition": "信息概要中一个公共或非信贷记录类型的报告条数一行。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_public_record_count_id",
+                    "sequence",
+                    "record_type",
+                    "record_count",
+                    "source_page",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_recovery_summary"] = {
+            "definition": "一行对应信息概要中的一种被追偿业务及其结清状态。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_recovery_summary_id",
+                    "sequence",
+                    "settlement_status",
+                    "recovery_type",
+                    "account_count",
+                    "balance",
+                    "latest_disposal_date",
+                    "latest_repayment_date",
+                    "currency",
+                    "amount_unit",
+                    "source_page",
+                    "source_table_id",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_overdue_summary"] = {
+            "definition": "一行对应信息概要列示的逾期本金、利息及其他和总额。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_overdue_summary_id",
+                    "sequence",
+                    "overdue_principal",
+                    "overdue_interest_and_other",
+                    "overdue_total",
+                    "currency",
+                    "amount_unit",
+                    "source_page",
+                    "source_table_id",
+                )
+            },
+        }
         dictionary["datasets"]["enterprise_facility_summary"] = {
             "definition": "一行对应信息概要中的一个授信额度类别，金额单位为人民币万元。",
             "columns": {
@@ -697,6 +1045,25 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "definition": "企业基本信息源表中的一个字段一行。",
             "columns": {
                 key: fields[key] for key in ("sequence", "field", "value", "source_institution") if key in fields
+            },
+        }
+        dictionary["datasets"]["enterprise_profile"] = {
+            "definition": "一行对应一个企业基本信息快照；字段来源另保留在长表中。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "enterprise_profile_id",
+                    "sequence",
+                    "economic_type",
+                    "organization_type",
+                    "enterprise_scale",
+                    "industry",
+                    "establishment_year",
+                    "registration_certificate_valid_through",
+                    "registered_address",
+                    "operating_address",
+                    "operating_status",
+                )
             },
         }
         dictionary["datasets"]["enterprise_capital_summary"] = {
@@ -736,6 +1103,18 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
                 if key in fields
             },
+        }
+        dictionary["datasets"]["enterprise_contributors"] = {
+            "definition": "注册资本及主要出资人表中的一个出资方一行。",
+            "columns": deepcopy(
+                dictionary["datasets"]["enterprise_stakeholders"]["columns"]
+            ),
+        }
+        dictionary["datasets"]["enterprise_key_personnel"] = {
+            "definition": "主要组成人员表中的一个职位/人员一行。",
+            "columns": deepcopy(
+                dictionary["datasets"]["enterprise_stakeholders"]["columns"]
+            ),
         }
         dictionary["datasets"]["enterprise_relationships"] = {
             "definition": "企业关联关系表中的一个关系一行。",
@@ -992,6 +1371,66 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
+        dictionary["datasets"]["enterprise_interest_arrears"] = {
+            "definition": "未结清信贷欠息表中的一个机构欠息记录一行。",
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "interest_arrears_id",
+                    "sequence",
+                    "institution",
+                    "arrears_type",
+                    "currency",
+                    "amount_unit",
+                    "arrears_balance",
+                    "balance_change_date",
+                    "snapshot_date",
+                    "source_page",
+                    "source_table_id",
+                )
+            },
+        }
+        history_columns = {
+            key: fields[key]
+            for key in (
+                "sequence",
+                "statistics_month",
+                "payment_status",
+                "amount_due",
+                "amount_paid",
+                "cumulative_arrears",
+                "currency",
+                "amount_unit",
+                "source_page",
+                "source_table_id",
+            )
+        }
+        dictionary["datasets"]["enterprise_utility_payment_history"] = {
+            "definition": "附件中一个公用事业统计月份的缴费记录一行。",
+            "columns": deepcopy(history_columns),
+        }
+        dictionary["datasets"]["enterprise_housing_fund_history"] = {
+            "definition": "附件中一个住房公积金统计月份的缴费记录一行。",
+            "columns": deepcopy(history_columns),
+        }
+        dictionary["datasets"]["enterprise_credit_accounts"] = deepcopy(
+            dictionary["datasets"]["credit_accounts"]
+        )
+        dictionary["datasets"]["enterprise_credit_accounts"]["definition"] = (
+            "企业专用规范账户表；credit_accounts 为兼容副本。"
+        )
+        dictionary["datasets"]["enterprise_credit_facilities"] = deepcopy(
+            dictionary["datasets"]["credit_lines"]
+        )
+        dictionary["datasets"]["enterprise_credit_facilities"]["definition"] = (
+            "企业专用授信协议表；credit_lines 为兼容副本。"
+        )
+        dictionary["datasets"]["enterprise_repayment_responsibility_accounts"] = deepcopy(
+            dictionary["datasets"]["repayment_liability_records"]
+        )
+        dictionary["datasets"]["enterprise_repayment_responsibility_accounts"][
+            "definition"
+        ] = "企业专用相关还款责任账户表；repayment_liability_records 为兼容副本。"
         enums = dictionary.setdefault("enums", {})
         enums.setdefault("account_type", {})["enterprise_credit"] = "企业信贷账户"
         enums["facility_type"] = {
@@ -999,6 +1438,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "revolving": "循环信用额度",
         }
         enums["record_type"] = {
+            "non_credit_accounts": "非信贷交易账户",
             "utility_payment": "公用事业缴费",
             "tax_arrears": "欠税记录",
             "civil_judgment": "民事判决",
@@ -1131,7 +1571,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
 
     def semantic_extensions(self) -> dict[str, Any]:
         """Use an enterprise reading layout with only business-facing facts."""
-        semantic = super().semantic_extensions()
+        from docmirror.plugins.credit_report.enterprise_native.schema import (
+            enterprise_credit_report_semantic_extensions,
+        )
+
+        semantic = enterprise_credit_report_semantic_extensions()
         semantic["dataset_document_order"] = list(
             _ENTERPRISE_DOCUMENT_DATASET_ORDER
         )
@@ -1189,7 +1633,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "institution",
                 "business_type",
                 "open_date",
-                "due_date",
+                "maturity_date",
                 "responsibility_amount",
                 "loan_or_credit_amount",
                 "balance",
@@ -1360,7 +1804,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "institution",
                         "business_type",
                         "open_date",
-                        "due_date",
+                        "maturity_date",
                         "due_date_status",
                         "currency",
                         "amount_unit",
@@ -1387,7 +1831,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "business_type",
                         "status",
                         "open_date",
-                        "due_date",
+                        "maturity_date",
                         "snapshot_date",
                         "currency",
                         "amount_unit",
@@ -1419,7 +1863,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "institution",
                         "revolving_flag",
                         "effective_date",
-                        "due_date",
+                        "maturity_date",
                         "snapshot_date",
                         "total_limit",
                         "used_limit",

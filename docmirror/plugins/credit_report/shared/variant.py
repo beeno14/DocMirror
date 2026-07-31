@@ -38,6 +38,14 @@ class CreditReportVariantAdapter:
             names.insert(1, "credit_lines")
         return tuple(names)
 
+    def business_dataset_copies(
+        self,
+        assembled: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return variant-owned canonical copies of compatibility datasets."""
+        del assembled
+        return {}
+
     def content_mode_is_expected(self, content_mode: str) -> bool:
         """Report whether routing received the variant's normal source mode."""
         return content_mode in self.expected_content_modes
@@ -60,6 +68,32 @@ class CreditReportVariantAdapter:
     ) -> dict[str, Any]:
         """Extract native business records owned by this document variant."""
         return {}
+
+    def assemble_business(
+        self,
+        parse_result: Any,
+        full_text: str,
+        *,
+        content_mode: str,
+        existing_collections: dict[str, list[Any]] | None,
+        existing_summary: dict[str, Any] | None,
+        variant_input: Any,
+    ) -> dict[str, Any]:
+        """Assemble this variant's business records behind the routing seam."""
+        from docmirror.plugins.credit_report.business_assembly import (
+            assemble_credit_report_business,
+        )
+
+        return assemble_credit_report_business(
+            parse_result,
+            full_text,
+            report_subtype=self.report_subtype,
+            content_mode=content_mode,
+            existing_collections=existing_collections,
+            existing_summary=existing_summary,
+            variant=self,
+            variant_input=variant_input,
+        )
 
     def refine_domain_facts(
         self,
@@ -121,6 +155,10 @@ class CreditReportVariantAdapter:
         )
 
         return credit_report_semantic_extensions(report_subtype=self.report_subtype)
+
+    def strip_supplemental_node_bindings(self) -> bool:
+        """Return whether copied supplemental rows relinquish section ownership."""
+        return False
 
     def build_reading_projection(
         self,

@@ -25,8 +25,33 @@ projection:
     inquiry_records: 查询记录
     public_records: 公共记录
     report_notes: 说明
+    identity_documents: 身份证件
+    personal_report_metadata: 个人简版报告信息
+    personal_credit_summary_records: 个人简版信息概要
+    asset_disposition_records: 资产处置信息
+    guarantor_compensation_records: 垫款及保证人代偿信息
+    postpaid_records: 后付费记录
+    tax_arrears_records: 欠税记录
+    civil_judgment_records: 民事判决记录
+    enforcement_records: 强制执行记录
+    administrative_penalty_records: 行政处罚记录
     enterprise_report_metadata: 报告信息
     enterprise_exchange_rates: 汇率信息
+    enterprise_report_identity: 企业报告身份与查询信息
+    enterprise_dispute_overview: 异议处理概要
+    enterprise_credit_overview: 企业信用概要
+    enterprise_public_record_counts: 公共及非信贷记录条数
+    enterprise_recovery_summary: 被追偿业务概要
+    enterprise_overdue_summary: 逾期金额概要
+    enterprise_profile: 企业基本信息规范记录
+    enterprise_contributors: 主要出资人
+    enterprise_key_personnel: 主要人员
+    enterprise_credit_accounts: 企业信贷账户
+    enterprise_interest_arrears: 欠息记录
+    enterprise_credit_facilities: 企业授信额度
+    enterprise_repayment_responsibility_accounts: 企业相关还款责任账户
+    enterprise_utility_payment_history: 公用事业历史缴费明细
+    enterprise_housing_fund_history: 住房公积金历史缴费明细
     residence_records: 居住信息
     employment_records: 职业信息
     statements: 信息主体声明
@@ -94,12 +119,37 @@ projection:
     public_records: [public_records]
     inquiry_records: [inquiries]
     report_notes: [notes]
+    identity_documents: [identity]
+    personal_report_metadata: [report_metadata]
+    personal_credit_summary_records: [credit_summary]
+    asset_disposition_records: [credit_details]
+    guarantor_compensation_records: [credit_details]
+    postpaid_records: [non_credit_transactions]
+    tax_arrears_records: [public_records]
+    civil_judgment_records: [public_records]
+    enforcement_records: [public_records]
+    administrative_penalty_records: [public_records]
     residence_records: [basic_information]
     employment_records: [basic_information]
     statements: [notes]
     annotations: [notes]
     enterprise_report_metadata: [report_metadata]
     enterprise_exchange_rates: [notes]
+    enterprise_report_identity: [identity]
+    enterprise_dispute_overview: [credit_summary]
+    enterprise_credit_overview: [credit_summary]
+    enterprise_public_record_counts: [credit_summary]
+    enterprise_recovery_summary: [credit_summary]
+    enterprise_overdue_summary: [credit_summary]
+    enterprise_profile: [basic_information]
+    enterprise_contributors: [basic_information]
+    enterprise_key_personnel: [basic_information]
+    enterprise_credit_accounts: [credit_details]
+    enterprise_interest_arrears: [credit_details]
+    enterprise_credit_facilities: [credit_details]
+    enterprise_repayment_responsibility_accounts: [credit_details]
+    enterprise_utility_payment_history: [credit_supplement]
+    enterprise_housing_fund_history: [credit_supplement]
     enterprise_profile_fields: [basic_information]
     enterprise_capital_summary: [basic_information]
     enterprise_stakeholders: [basic_information]
@@ -150,14 +200,24 @@ projection:
       - account_type
       - institution
       - business_type
+      - credit_card_type
       - account_identifier
       - card_tail
       - open_date
       - snapshot_date
       - due_date
+      - contract_maturity_date
+      - credit_line_expiry_date
+      - credit_line_validity_type
       - close_date
+      - transfer_out_date
+      - termination_event_date
+      - termination_event_type
       - currency
+      - account_currency
+      - reporting_amount_currency
       - amount_unit
+      - reporting_amount_unit
       - credit_limit
       - credit_limit_status
       - used_amount
@@ -168,8 +228,11 @@ projection:
       - balance_status
       - issuance_form
       - account_state
+      - account_lifecycle_state
+      - card_activation_state
       - activation_state
       - payoff_state
+      - credit_quality_status
     credit_lines:
       - credit_line_id
       - account_id
@@ -235,6 +298,89 @@ projection:
     report_notes:
       - sequence
       - content
+    identity_documents:
+      - sequence
+      - holder_name
+      - document_type
+      - document_number
+      - is_primary
+    personal_report_metadata:
+      - report_number
+      - report_time
+      - subject_name
+      - primary_id_type
+      - primary_id_number
+      - reporting_currency
+      - reporting_amount_unit
+      - reporting_amount_precision
+    personal_credit_summary_records:
+      - sequence
+      - summary_scope
+      - metric
+      - business_category
+      - value
+      - reporting_status
+    asset_disposition_records:
+      - sequence
+      - disposition_date
+      - asset_management_company
+      - received_debt_amount
+      - snapshot_date
+      - balance
+      - last_repayment_date
+    guarantor_compensation_records:
+      - sequence
+      - compensation_start_date
+      - guarantor
+      - cumulative_compensation_amount
+      - settlement_date
+      - settlement_state
+    postpaid_records:
+      - sequence
+      - institution
+      - business_type
+      - billing_month
+      - service_start_date
+      - payment_status
+      - current_arrears_amount
+    tax_arrears_records:
+      - sequence
+      - tax_authority
+      - statistics_date
+      - arrears_amount
+      - taxpayer_identifier
+    civil_judgment_records:
+      - sequence
+      - filing_court
+      - case_number
+      - cause
+      - filing_date
+      - closure_method
+      - claim_subject
+      - claim_amount
+      - judgment_effective_date
+    enforcement_records:
+      - sequence
+      - court
+      - case_number
+      - cause
+      - filing_date
+      - case_status
+      - closure_method
+      - closure_date
+      - requested_subject
+      - requested_amount
+      - executed_subject
+      - executed_amount
+    administrative_penalty_records:
+      - sequence
+      - authority
+      - document_number
+      - penalty_content
+      - penalty_amount
+      - effective_date
+      - end_date
+      - administrative_review_result
     enterprise_report_metadata:
       - report_edition
     enterprise_exchange_rates:
@@ -411,4 +557,14 @@ projection_outputs:
     - overdue_records
     - inquiry_records
     - public_records
+    - identity_documents
+    - personal_report_metadata
+    - personal_credit_summary_records
+    - asset_disposition_records
+    - guarantor_compensation_records
+    - postpaid_records
+    - tax_arrears_records
+    - civil_judgment_records
+    - enforcement_records
+    - administrative_penalty_records
   domain_fact_prefix: credit_report

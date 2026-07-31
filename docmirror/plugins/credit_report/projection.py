@@ -19,6 +19,34 @@ _DEFAULT_RECORD_ID_KEYS = (
 )
 _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 _DATASET_RECORD_ID_KEYS = {
+    "enterprise_credit_accounts": ("record_id", "account_id"),
+    "enterprise_credit_facilities": ("record_id", "credit_line_id"),
+    "enterprise_repayment_responsibility_accounts": (
+        "record_id",
+        "liability_id",
+    ),
+    "enterprise_report_identity": ("record_id", "enterprise_identity_id"),
+    "enterprise_dispute_overview": (
+        "record_id",
+        "enterprise_dispute_overview_id",
+    ),
+    "enterprise_credit_overview": (
+        "record_id",
+        "enterprise_credit_overview_id",
+    ),
+    "enterprise_public_record_counts": (
+        "record_id",
+        "enterprise_public_record_count_id",
+    ),
+    "enterprise_recovery_summary": (
+        "record_id",
+        "enterprise_recovery_summary_id",
+    ),
+    "enterprise_overdue_summary": (
+        "record_id",
+        "enterprise_overdue_summary_id",
+    ),
+    "enterprise_interest_arrears": ("record_id", "interest_arrears_id"),
     "credit_lines": ("record_id", "credit_line_id"),
     "enterprise_facility_summary": ("record_id", "credit_line_id"),
     "enterprise_current_credit_summary": ("record_id", "current_summary_id"),
@@ -31,6 +59,16 @@ _DATASET_RECORD_ID_KEYS = {
     "enterprise_credit_supplement": ("record_id", "supplement_id"),
     "enterprise_attachment_credit_details": ("record_id", "attachment_detail_id"),
     "enterprise_special_transactions": ("record_id", "special_transaction_id"),
+    "identity_documents": ("record_id", "identity_document_id"),
+    "personal_report_metadata": ("record_id", "personal_report_metadata_id"),
+    "personal_credit_summary_records": ("record_id", "credit_summary_record_id"),
+    "asset_disposition_records": ("record_id", "asset_disposition_id"),
+    "guarantor_compensation_records": ("record_id", "guarantor_compensation_id"),
+    "postpaid_records": ("record_id", "postpaid_record_id"),
+    "tax_arrears_records": ("record_id", "tax_arrears_id"),
+    "civil_judgment_records": ("record_id", "civil_judgment_id"),
+    "enforcement_records": ("record_id", "enforcement_record_id"),
+    "administrative_penalty_records": ("record_id", "administrative_penalty_id"),
 }
 
 
@@ -95,7 +133,6 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         _recover_credit_subject_identity,
     )
     from docmirror.plugins._base.kv_projection import extract_kv_projection
-    from docmirror.plugins.credit_report.business_assembly import assemble_credit_report_business
     from docmirror.plugins.credit_report.report_profile import (
         detect_credit_report_content_mode,
         detect_credit_report_subtype,
@@ -188,10 +225,9 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         credit_accounts,
         micro_grid_structures_from_domain_specific(source_domain),
     )
-    assembled = assemble_credit_report_business(
+    assembled = variant.assemble_business(
         parse_result,
         full_text,
-        report_subtype=report_subtype,
         content_mode=content_mode,
         existing_collections={
             "credit_accounts": credit_accounts,
@@ -203,11 +239,14 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
             "public_records": list(scanned_business.get("public_records") or []),
         },
         existing_summary=dict(scanned_business.get("credit_summary") or {}),
-        variant=variant,
         variant_input=variant_input,
     )
     dataset_names = variant.dataset_names()
     datasets = {name: rows for name in dataset_names if (rows := _records(name, assembled.get(name)))}
+    for name, values in variant.business_dataset_copies(assembled).items():
+        rows = _records(name, values)
+        if rows:
+            datasets[name] = rows
     if assembled.get("credit_summary"):
         domain_facts["credit_summary"] = dict(assembled["credit_summary"])
     if assembled.get("credit_extraction_audit"):
@@ -236,6 +275,16 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
                 if not typed_records:
                     continue
                 enrich_credit_report_record_evidence(parse_result, {str(dataset_name): typed_records})
+                # Supplemental personal-brief datasets often copy the same
+                # source header/table into several business views. Retain
+                # page, bbox, table and atom evidence, but do not make those
+                # copies compete for semantic section ownership.
+                if variant.strip_supplemental_node_bindings():
+                    for record in typed_records:
+                        for ref in record.get("source_refs") or []:
+                            if isinstance(ref, dict):
+                                ref.pop("node_id", None)
+                                ref.pop("node_ids", None)
                 datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
     domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(

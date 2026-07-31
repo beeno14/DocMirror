@@ -29,8 +29,8 @@ from docmirror.plugins.credit_report.value_utils import (
     stable_record_id as _stable_id,
 )
 
-_DATE_CN_RE = re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日")
-_ACCOUNT_DATE_PATTERN = r"20\d{2}年\s*\d{1,2}月\s*\d{1,2}日"
+_DATE_CN_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_ACCOUNT_DATE_PATTERN = r"20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
 _ACCOUNT_START_RE = re.compile(
     rf"{_ACCOUNT_DATE_PATTERN}"
     rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,100}}?(?:发放的|为(?=.{{0,30}}贷款授信)))"
@@ -49,11 +49,14 @@ _INQUIRY_REASONS = tuple(
             "本人查询（自助查询机）",
             "本人查询(自助查询机)",
             "担保资格审查",
+            "保前审查",
             "资信审查",
             "融资审批",
             "信用卡审批",
             "贷款审批",
             "贷后管理",
+            "本人查询（临柜）",
+            "本人查询(临柜)",
         },
         key=len,
         reverse=True,
@@ -72,7 +75,7 @@ def _iso_date(value: str) -> str:
 
 
 def _iso_month(value: str) -> str:
-    match = re.search(r"(20\d{2})年\s*(\d{1,2})月", str(value or ""))
+    match = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", str(value or ""))
     if not match:
         return ""
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
@@ -122,7 +125,12 @@ def _reported_count(value: str) -> int | None:
     return int(number) if isinstance(number, int | float) else None
 
 
-def _personal_brief_summary_from_canonical_tables(parse_result: Any) -> dict[str, Any]:
+def _personal_brief_summary_from_canonical_tables(
+    parse_result: Any,
+    fallback_text: str = "",
+    *,
+    expected_account_count: int | None = None,
+) -> dict[str, Any]:
     """Read source-defined personal-brief counts without changing ``--`` to zero."""
     row_names = {
         "账户数": "source_account_counts",
@@ -150,7 +158,7 @@ def _personal_brief_summary_from_canonical_tables(parse_result: Any) -> dict[str
             account_counts = extracted.get("source_account_counts", {})
             overdue = extracted.get("source_overdue_account_counts", {})
             over_90 = extracted.get("source_over_90_days_account_counts", {})
-            return {
+            summary = {
                 **extracted,
                 "source_account_count": (
                     sum(value for value in account_counts.values() if value is not None)
@@ -177,7 +185,120 @@ def _personal_brief_summary_from_canonical_tables(parse_result: Any) -> dict[str
                 "source_summary_table_id": str(getattr(table, "table_id", "") or ""),
                 "source_summary_page": page_number,
             }
-    return {}
+            for candidate in getattr(page, "tables", None) or []:
+                raw_rows = (getattr(candidate, "metadata", None) or {}).get("raw_rows") or []
+                for row in raw_rows:
+                    cells = [_compact(cell) for cell in row]
+                    if cells[:1] == ["账户数"] and len(cells) >= 3:
+                        headers = [_compact(value) for value in (getattr(candidate, "headers", None) or [])]
+                        if "资产处置信息" in headers and "垫款信息" in headers:
+                            summary["source_asset_disposition_count"] = _reported_count(cells[1])
+                            summary["source_guarantor_compensation_count"] = _reported_count(cells[2])
+                    if cells[:1] == ["相关还款责任账户数"] and len(cells) >= 3:
+                        summary["source_personal_liability_count"] = _reported_count(cells[1])
+                        summary["source_enterprise_liability_count"] = _reported_count(cells[2])
+            if (
+                expected_account_count is None
+                or summary.get("source_account_count") == expected_account_count
+            ):
+                return summary
+    text = _linear(fallback_text)
+    if not text:
+        entity_context = getattr(parse_result, "entity_context", None)
+        ordered_text_blocks = getattr(entity_context, "ordered_text_blocks", None)
+        if callable(ordered_text_blocks):
+            text = _linear(
+                "\n".join(
+                    str(content or "")
+                    for _page, content in ordered_text_blocks()
+                    if str(content or "").strip()
+                )
+            )
+    row_candidates: dict[str, list[tuple[int, dict[str, int | None]]]] = {}
+    for source_label, row_key in row_names.items():
+        for match in re.finditer(re.escape(source_label), text):
+            values_match = re.match(
+                r"\s*(--|\d+)\s+(--|\d+)\s+(--|\d+)\s+(--|\d+)(?=\s|$)",
+                text[match.end() :],
+            )
+            if not values_match:
+                continue
+            values = {
+                name: _reported_count(value)
+                for name, value in zip(column_names, values_match.groups(), strict=True)
+            }
+            row_candidates.setdefault(row_key, []).append((match.start(), values))
+    account_candidates = row_candidates.get("source_account_counts") or []
+    if expected_account_count is not None:
+        matching_accounts = [
+            candidate
+            for candidate in account_candidates
+            if sum(value for value in candidate[1].values() if value is not None)
+            == expected_account_count
+        ]
+        if matching_accounts:
+            account_candidates = matching_accounts
+    if not account_candidates:
+        return {}
+    account_position, account_counts = account_candidates[0]
+    if (
+        expected_account_count is not None
+        and sum(value for value in account_counts.values() if value is not None)
+        != expected_account_count
+    ):
+        return {}
+    extracted: dict[str, Any] = {"source_account_counts": account_counts}
+    for row_key, candidates in row_candidates.items():
+        if row_key == "source_account_counts" or not candidates:
+            continue
+        _position, values = min(candidates, key=lambda candidate: abs(candidate[0] - account_position))
+        extracted[row_key] = values
+    if "source_unclosed_account_counts" not in extracted:
+        return {}
+    unclosed = extracted["source_unclosed_account_counts"]
+    account_counts = extracted.get("source_account_counts", {})
+    overdue = extracted.get("source_overdue_account_counts", {})
+    over_90 = extracted.get("source_over_90_days_account_counts", {})
+    page_texts = _page_texts(parse_result)
+    return {
+        **extracted,
+        "source_account_count": (
+            sum(value for value in account_counts.values() if value is not None)
+            if any(value is not None for value in account_counts.values())
+            else None
+        ),
+        "source_unclosed_account_count": sum(value for value in unclosed.values() if value is not None),
+        "source_overdue_account_count": (
+            sum(value for value in overdue.values() if value is not None)
+            if any(value is not None for value in overdue.values())
+            else None
+        ),
+        "source_overdue_account_count_status": (
+            "reported" if any(value is not None for value in overdue.values()) else "not_reported"
+        ),
+        "source_over_90_days_account_count": (
+            sum(value for value in over_90.values() if value is not None)
+            if any(value is not None for value in over_90.values())
+            else None
+        ),
+        "source_over_90_days_account_count_status": (
+            "reported" if any(value is not None for value in over_90.values()) else "not_reported"
+        ),
+        "source_summary_table_id": "",
+        "source_summary_page": _source_page(page_texts, "未结清/未销户账户数") or 1,
+        "source_summary_extraction_method": "ordered_text_fallback",
+    }
+
+
+def _personal_brief_text(parse_result: Any, full_text: str) -> str:
+    """Prefer the variant's geometry-aware reading order over serializer text."""
+    entity_context = getattr(parse_result, "entity_context", None)
+    ordered_text_blocks = getattr(entity_context, "ordered_text_blocks", None)
+    if callable(ordered_text_blocks):
+        ordered = [content for _page, content in ordered_text_blocks() if str(content or "").strip()]
+        if ordered:
+            return _linear("\n".join(ordered))
+    return _linear(full_text)
 
 
 def extract_native_credit_business(
@@ -216,6 +337,12 @@ def _personal_brief_credit_lines(accounts: list[dict[str, Any]]) -> list[dict[st
                 "total_limit": account.get("credit_limit"),
                 "used_limit": account.get("balance"),
                 "currency": account.get("currency") or "CNY",
+                "account_currency": account.get("account_currency") or account.get("currency") or "CNY",
+                "reporting_amount_currency": account.get("reporting_amount_currency") or "CNY",
+                "amount_unit": account.get("amount_unit") or "yuan",
+                "reporting_amount_unit": account.get("reporting_amount_unit") or "yuan",
+                "validity_type": account.get("credit_line_validity_type"),
+                "expiry_date": account.get("credit_line_expiry_date"),
                 "account_status": account.get("account_status"),
                 "source": "personal_brief_narrative",
                 "source_refs": list(account.get("source_refs") or []),
@@ -314,25 +441,61 @@ def _personal_brief_account_from_chunk(
     card_tail_match = re.search(r"卡片尾号[:：]?(\d{3,8})", compact_body)
     card_tail = card_tail_match.group(1) if card_tail_match else ""
     page = _source_page(page_texts, chunk[:120])
+    is_card = account_type == "credit_card"
+    card_activation_state = (
+        "not_activated"
+        if is_card and "尚未激活" in compact_body
+        else "activated"
+        if is_card and "已激活" in compact_body
+        else "not_reported"
+        if is_card
+        else "not_applicable"
+    )
+    account_status = (
+        "closed"
+        if "销户" in compact_body
+        else "settled"
+        if "已结清" in compact_body
+        else "transferred_out"
+        if "已转出" in compact_body
+        else "inactive"
+        if card_activation_state == "not_activated"
+        else "active"
+    )
+    lifecycle_state = (
+        "closed"
+        if account_status == "closed"
+        else "settled"
+        if account_status == "settled"
+        else "transferred_out"
+        if account_status == "transferred_out"
+        else "open"
+    )
     account: dict[str, Any] = {
         "account_type": account_type,
         "management_institution": institution,
         "business_type": business_type,
         "open_date": open_date,
+        # ``currency`` remains as a compatibility alias for the account's
+        # denomination. Personal Brief monetary values are reported in CNY.
         "currency": currency,
-        "account_status": (
-            "closed"
-            if "销户" in compact_body
-            else "settled"
-            if "已结清" in compact_body
-            else "inactive"
-            if "尚未激活" in compact_body
-            else "active"
-        ),
+        "account_currency": currency,
+        "reporting_amount_currency": "CNY",
+        "amount_unit": "yuan",
+        "reporting_amount_unit": "yuan",
+        "reporting_amount_precision": 0,
+        "account_status": account_status,
+        "account_lifecycle_state": lifecycle_state,
+        "card_activation_state": card_activation_state,
+        "credit_quality_status": "bad_debt" if "呆账" in compact_body else "not_reported",
         "source": "personal_brief_narrative",
         "source_refs": _source_refs(page, "native_text_narrative"),
         "confidence": 0.94,
     }
+    if is_card:
+        account["credit_card_type"] = (
+            "quasi_credit_card" if business_type == "准贷记卡" else "credit_card"
+        )
     if card_tail:
         account["card_tail"] = card_tail
 
@@ -350,13 +513,27 @@ def _personal_brief_account_from_chunk(
 
     due_match = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)到期", compact_chunk)
     if due_match:
-        account["due_date"] = _iso_date(due_match.group(1))
+        maturity_date = _iso_date(due_match.group(1))
+        account["due_date"] = maturity_date
+        account["contract_maturity_date"] = maturity_date
     close_match = re.search(r"(20\d{2}年\d{1,2}月)(?:已结清|销户)", compact_chunk)
     if close_match:
         account["close_date"] = _iso_month(close_match.group(1))
+        account["termination_event_date"] = account["close_date"]
+        account["termination_event_type"] = (
+            "account_closed" if account_status == "closed" else "debt_settled"
+        )
+    transfer_match = re.search(r"(20\d{2}年\d{1,2}月)已转出", compact_chunk)
+    if transfer_match:
+        account["transfer_out_date"] = _iso_month(transfer_match.group(1))
+        account["termination_event_date"] = account["transfer_out_date"]
+        account["termination_event_type"] = "transferred_out"
     validity_match = re.search(r"额度有效期至(20\d{2}年\d{1,2}月\d{1,2}日)", compact_chunk)
-    if validity_match and "due_date" not in account:
-        account["due_date"] = _iso_date(validity_match.group(1))
+    if validity_match:
+        account["credit_line_validity_type"] = "fixed_term"
+        account["credit_line_expiry_date"] = _iso_date(validity_match.group(1))
+    elif "额度长期有效" in compact_chunk:
+        account["credit_line_validity_type"] = "perpetual"
     as_of_match = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)", compact_chunk)
     if as_of_match:
         account["information_as_of"] = _iso_date(as_of_match.group(1)) or _iso_month(as_of_match.group(1))
@@ -388,7 +565,9 @@ def _personal_brief_account_from_chunk(
         business_type,
         currency,
         card_tail,
-        account.get("due_date"),
+        account.get("contract_maturity_date"),
+        account.get("credit_line_expiry_date"),
+        account.get("credit_line_validity_type"),
         account.get("credit_limit"),
         account.get("loan_amount"),
     )
@@ -447,6 +626,10 @@ def _personal_brief_repayment_liabilities(
             continue
         remainder = compact[core.end() :]
         snapshot = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)，", remainder)
+        snapshot_business = re.search(
+            r"截至20\d{2}年\d{1,2}月(?:\d{1,2}日)?，(.+?)余额",
+            remainder,
+        )
         balance = re.search(r"余额([\d,.]+)(?:（?人民币元）?)?", remainder)
         liability_date = _iso_date(core.group(1))
         party_name = core.group(2)
@@ -476,10 +659,17 @@ def _personal_brief_repayment_liabilities(
             "related_party_id_number": party_id_number,
             "management_institution": institution,
             "business_type": business_type,
+            "underlying_business_type": business_type,
+            "snapshot_balance_business_type": (
+                snapshot_business.group(1) if snapshot_business else business_type
+            ),
             "responsibility_type": responsibility_type,
             "responsibility_amount": _number(amount_text),
             "responsibility_amount_reported": amount_text != "--",
             "currency": "CNY",
+            "reporting_amount_currency": "CNY",
+            "amount_unit": "yuan",
+            "reporting_amount_unit": "yuan",
             "source": "personal_brief_repayment_liability",
             "source_refs": _source_refs(page, "native_text_narrative"),
             "confidence": 0.94,
@@ -502,7 +692,12 @@ def _personal_brief_inquiries(
     if "机构查询记录明细" not in text:
         return []
     institution_start = text.index("机构查询记录明细")
-    personal_start = text.find("个人查询记录明细", institution_start)
+    personal_starts = [
+        position
+        for heading in ("本人查询记录明细", "个人查询记录明细")
+        if (position := text.find(heading, institution_start)) >= 0
+    ]
+    personal_start = min(personal_starts) if personal_starts else -1
     institution_text = text[institution_start : personal_start if personal_start >= 0 else len(text)]
     personal_text = text[personal_start:] if personal_start >= 0 else ""
     institution_records = _merge_reconstructed_personal_brief_institution_inquiries(
@@ -596,7 +791,12 @@ def _personal_brief_inquiry_rows(
     inquiry_type: str,
     page_texts: list[tuple[int, str, str]],
 ) -> list[dict[str, Any]]:
-    matches = list(re.finditer(r"(?<!\d)(\d{1,4})\s+(20\d{2}年\s*\d{1,2}月\s*\d{1,2}日)\s+", section))
+    matches = list(
+        re.finditer(
+            r"(?<!\d)(\d{1,4})\s+(20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s+",
+            section,
+        )
+    )
     out: list[dict[str, Any]] = []
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(section)

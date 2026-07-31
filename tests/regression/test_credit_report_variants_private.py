@@ -25,6 +25,7 @@ _FIXTURE_DIR = Path("tests/fixtures-private/credit_report")
 _DIGITAL_PERSONAL_BRIEF_DIR = _FIXTURE_DIR / "Digital Personal Brief"
 _DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
 _KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
+_PERSONAL_BRIEF_DISPLAY_SAMPLE = _FIXTURE_DIR / "个人信用报告（本人简版）展示样本.pdf"
 
 _DIGITAL_PERSONAL_BRIEF_EXPECTED = {
     "人行征信报告-2025-04-14.pdf": (18, 0, 82, 10, 1),
@@ -106,6 +107,89 @@ def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
         "type": "string",
         "sensitive": True,
     }
+
+
+def test_personal_brief_display_sample_projects_complete_business_schema() -> None:
+    if not _PERSONAL_BRIEF_DISPLAY_SAMPLE.exists():
+        pytest.skip("personal-brief display sample is unavailable")
+    sealed = asyncio.run(
+        perceive_document(
+            _PERSONAL_BRIEF_DISPLAY_SAMPLE,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(_PERSONAL_BRIEF_DISPLAY_SAMPLE))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    expected_counts = {
+        "credit_accounts": 15,
+        "repayment_liability_records": 4,
+        "overdue_records": 8,
+        "inquiry_records": 12,
+        "identity_documents": 2,
+        "personal_report_metadata": 1,
+        "personal_credit_summary_records": 20,
+        "asset_disposition_records": 1,
+        "guarantor_compensation_records": 1,
+        "postpaid_records": 3,
+        "tax_arrears_records": 1,
+        "civil_judgment_records": 2,
+        "enforcement_records": 2,
+        "administrative_penalty_records": 1,
+        "public_records": 6,
+        "report_notes": 5,
+    }
+    assert {name: datasets[name]["row_count"] for name in expected_counts} == expected_counts
+    assert validate_projection_payload("community_semantic", semantic).valid
+    assert validate_projection_payload("community", payload).valid
+
+    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
+    credit_line = next(account for account in accounts if account["account_type"] == "credit_line")
+    transferred = next(account for account in accounts if account["account_lifecycle_state"] == "transferred_out")
+    bad_debt = next(account for account in accounts if account["credit_quality_status"] == "bad_debt")
+    unactivated = next(account for account in accounts if account["card_activation_state"] == "not_activated")
+    quasi_card = next(account for account in accounts if account.get("credit_card_type") == "quasi_credit_card")
+    assert credit_line["credit_line_validity_type"] == "perpetual"
+    assert credit_line.get("credit_line_expiry_date") is None
+    assert credit_line.get("due_date") is None
+    assert transferred["termination_event_type"] == "transferred_out"
+    assert transferred["transfer_out_date"] == "2023-11"
+    assert bad_debt["business_type"] == "贷记卡"
+    assert unactivated["account_currency"] == "USD"
+    assert unactivated["reporting_amount_currency"] == "CNY"
+    assert quasi_card["business_type"] == "准贷记卡"
+    assert all(account["reporting_amount_currency"] == "CNY" for account in accounts)
+
+    summary = semantic["domain"]["facts"]["credit_summary"]
+    assert summary["source_account_count"] == summary["account_count"] == 15
+    assert summary["source_unclosed_account_count"] == summary["unclosed_account_count"] == 9
+    assert summary["source_personal_liability_count"] == 2
+    assert summary["source_enterprise_liability_count"] == 2
+    assert summary["activated_credit_card_account_count"] == 0
+    assert summary["inactive_credit_card_account_count"] == 1
+    assert summary["closed_credit_card_account_count"] == 1
+    assert summary["settled_account_count"] == 4
+    assert summary["transferred_out_account_count"] == 1
+
+    inquiries = [row["normalized"] for row in datasets["inquiry_records"]["rows"]]
+    assert sum(row["inquiry_type"] == "institution" for row in inquiries) == 9
+    assert sum(row["inquiry_type"] == "personal" for row in inquiries) == 3
+    identities = [row["normalized"] for row in datasets["identity_documents"]["rows"]]
+    assert [(row["document_type"], row["is_primary"]) for row in identities] == [
+        ("身份证", True),
+        ("护照", False),
+    ]
+    postpaid = [row["normalized"] for row in datasets["postpaid_records"]["rows"]]
+    assert [row["current_arrears_amount"] for row in postpaid] == ["500", "200", "0"]
+    penalties = [row["normalized"] for row in datasets["administrative_penalty_records"]["rows"]]
+    assert penalties[0]["effective_date"] == "2021-08"
+    assert penalties[0]["end_date"] == "2024-07"
 
 
 def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: Path) -> None:
@@ -238,7 +322,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         maxsplit=1,
     )[0]
     assert (
-        "| 组内序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | 开立日期 | 到期日期 | 信息截至日期 |"
+        "| 序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | 开立日期 | 到期日期 | 信息截至日期 |"
     ) in account_table
     assert (
         "| 1 | 中长期借款 | Y10061000H0001EIP1967714 | 梅赛德斯-奔驰汽车金融有限公司 | 固定资产贷款 | 未结清 |"
@@ -338,13 +422,20 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "credit_accounts": 3,
         "credit_lines": 1,
         "report_notes": 20,
-        "enterprise_profile_fields": 9,
-        "enterprise_report_metadata": 1,
-        "enterprise_exchange_rates": 1,
-        "enterprise_capital_summary": 1,
-        "enterprise_stakeholders": 1,
-        "enterprise_relationships": 1,
-        "enterprise_facility_summary": 2,
+            "enterprise_profile_fields": 9,
+            "enterprise_report_metadata": 1,
+            "enterprise_exchange_rates": 1,
+            "enterprise_report_identity": 1,
+            "enterprise_credit_overview": 1,
+            "enterprise_public_record_counts": 5,
+            "enterprise_profile": 1,
+            "enterprise_capital_summary": 1,
+            "enterprise_key_personnel": 1,
+            "enterprise_stakeholders": 1,
+            "enterprise_relationships": 1,
+            "enterprise_credit_accounts": 3,
+            "enterprise_credit_facilities": 1,
+            "enterprise_facility_summary": 2,
         "enterprise_current_credit_summary": 4,
         "enterprise_extraction_audit": 5,
         "enterprise_attachment_accounts": 3,
@@ -695,7 +786,7 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert "**还款责任金额:** 2200" in liability_preview
     assert "**借款金额/信用额度:** 1100" in liability_preview
     assert "**逾期月数/还款状态:** 0" in liability_preview
-    assert "**信息报告日期:** 2025-07-20" in liability_preview
+    assert "**信息截至日期:** 2025-07-20" in liability_preview
 
     summary = facts["credit_summary"]
     assert summary["public_record_counts"] == {
@@ -738,6 +829,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     enhanced = bundle.render_enhanced_markdown(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    data_dictionary = semantic["domain"]["data_dictionary"]
     accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
     credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
     typed_public_datasets = {
@@ -751,6 +843,10 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     )
     facts = semantic["domain"]["facts"]
 
+    assert data_dictionary["schema_id"] == "enterprise_credit_report"
+    assert data_dictionary["version"] == "2.0.0"
+    assert "identity_documents" not in data_dictionary["datasets"]
+    assert "enterprise_credit_accounts" in data_dictionary["datasets"]
     assert len(accounts) == 9
     assert sum(account["status"] == "settled" for account in accounts) == 6
     assert accounts[0]["balance"] == "50"
@@ -847,6 +943,80 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert "subject_id" not in facts
     assert datasets["enterprise_profile_fields"]["row_count"] == 9
     assert datasets["enterprise_stakeholders"]["row_count"] == 8
+    assert datasets["enterprise_report_identity"]["row_count"] == 1
+    report_identity = datasets["enterprise_report_identity"]["rows"][0]["normalized"]
+    assert report_identity["enterprise_name"] == "北京报告样本有限责任公司"
+    assert report_identity["report_edition"] == "independent_query"
+    assert report_identity["report_time"] == "2015-11-01T10:05:15"
+    assert report_identity["unified_social_credit_code"] == "91110102183797313J"
+    assert report_identity["organization_code"] == "18379731-3"
+    assert report_identity["zhongzheng_code"] == "4103090000069511"
+    assert report_identity["query_institution"] == "中国某某银行北京分行"
+    assert datasets["enterprise_dispute_overview"]["rows"][0]["normalized"][
+        "in_progress_dispute_count"
+    ] == 3
+    assert datasets["enterprise_public_record_counts"]["row_count"] == 5
+    recovery_rows = [
+        row["normalized"] for row in datasets["enterprise_recovery_summary"]["rows"]
+    ]
+    assert [
+        (row["recovery_type"], row["account_count"], row["balance"])
+        for row in recovery_rows
+    ] == [
+        ("asset_management_disposed_debt", 5, "63"),
+        ("advance", 4, "67.6"),
+    ]
+    overdue_summary = datasets["enterprise_overdue_summary"]["rows"][0]["normalized"]
+    assert (
+        overdue_summary["overdue_principal"],
+        overdue_summary["overdue_interest_and_other"],
+        overdue_summary["overdue_total"],
+    ) == ("155", "14.86", "169.86")
+    assert datasets["enterprise_profile"]["row_count"] == 1
+    assert datasets["enterprise_contributors"]["row_count"] == 2
+    assert datasets["enterprise_key_personnel"]["row_count"] == 6
+    assert datasets["enterprise_credit_accounts"]["row_count"] == 9
+    assert datasets["enterprise_credit_facilities"]["row_count"] == 1
+    assert datasets["enterprise_repayment_responsibility_accounts"]["row_count"] == 3
+    assert [
+        row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]
+    ] == accounts
+    assert [
+        row["normalized"] for row in datasets["enterprise_credit_facilities"]["rows"]
+    ] == credit_lines
+    assert [
+        row["normalized"]
+        for row in datasets["enterprise_repayment_responsibility_accounts"]["rows"]
+    ] == [
+        row["normalized"] for row in datasets["repayment_liability_records"]["rows"]
+    ]
+    assert datasets["enterprise_interest_arrears"]["row_count"] == 2
+    assert datasets["enterprise_public_utility_payment_records"]["rows"][0]["normalized"][
+        "cumulative_arrears"
+    ] == "0.3"
+    patent = datasets["enterprise_public_patent_records"]["rows"][0]["normalized"]
+    assert (
+        patent["patent_number"],
+        patent["application_date"],
+        patent["grant_date"],
+        patent["validity_years"],
+    ) == ("专20140088", "2014-03-01", "2014-10-01", 10)
+    financing_rows = [
+        row["normalized"]
+        for row in datasets["enterprise_public_financing_restriction_records"]["rows"]
+    ]
+    assert [
+        (row["catalog"], row["control_type"], row["year"], row["scale"])
+        for row in financing_rows
+    ] == [
+        ("土地储备机构名录", "年度可融资规模", 2016, "待定"),
+        ("土地储备机构名录", "--", 2015, "1500"),
+    ]
+    assert datasets["enterprise_public_data_provider_statement_records"]["rows"][0][
+        "normalized"
+    ]["added_date"] == "2013-10-18"
+    assert datasets["enterprise_utility_payment_history"]["row_count"] == 2
+    assert datasets["enterprise_housing_fund_history"]["row_count"] == 2
     assert datasets["enterprise_current_credit_summary"]["row_count"] == 11
     assert datasets["enterprise_closed_credit_summary"]["row_count"] == 11
     assert datasets["enterprise_repayment_responsibility_summary"]["row_count"] == 8
@@ -948,6 +1118,10 @@ def test_credit_report_subtype_projects_complete_v3(
     assert validate_projection_payload("community", payload).valid
     assert payload["sections"]
     assert any(dataset["row_count"] > 0 for dataset in payload["datasets"])
+    dataset_names = [dataset["name"] for dataset in payload["datasets"]]
+    document_order = semantic["domain"]["extensions"].get("dataset_document_order")
+    if document_order:
+        assert dataset_names == [name for name in document_order if name in dataset_names]
     if subtype == "enterprise":
         enterprise_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
         audit_dataset = enterprise_datasets["enterprise_extraction_audit"]

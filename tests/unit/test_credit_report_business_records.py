@@ -648,8 +648,13 @@ def test_personal_brief_extracts_narrative_accounts_and_inquiry_ledger() -> None
     assert personal_inquiry["query_channel"] == "互联网个人信用信息服务平台"
     assert business["credit_summary"]["institution_inquiry_count"] == 2
     assert business["credit_summary"]["personal_inquiry_count"] == 1
-    assert business["credit_summary"]["activated_credit_card_account_count"] == 1
+    assert business["credit_summary"]["activated_credit_card_account_count"] == 0
     assert business["credit_summary"]["inactive_credit_card_account_count"] == 0
+    assert business["credit_accounts"][0]["card_activation_state"] == "not_reported"
+    assert business["credit_accounts"][1]["contract_maturity_date"] == "2026-02-03"
+    assert business["credit_accounts"][2]["credit_line_expiry_date"] == "2027-03-04"
+    assert "due_date" not in business["credit_accounts"][2]
+    assert business["credit_accounts"][2]["reporting_amount_currency"] == "CNY"
 
 
 def test_personal_brief_keeps_indistinguishable_masked_accounts() -> None:
