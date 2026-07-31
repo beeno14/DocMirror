@@ -736,6 +736,8 @@ class EvidencePlaneBuilder:
             for page_index, page in enumerate(doc):
                 page_number = page_index + 1
                 page_id = _page_id(page_number)
+                watermark_line_keys = _pymupdf_watermark_line_keys(page)
+                suppressed_watermark_words = 0
                 rect = page.rect
                 rotation = _normalized_rotation(getattr(page, "rotation", 0))
                 page_w = float(rect.width)
@@ -764,6 +766,9 @@ class EvidencePlaneBuilder:
 
                 for word in page.get_text("words") or []:
                     x0, y0, x1, y1, text, block_no, line_no, word_no = word[:8]
+                    if (int(block_no), int(line_no)) in watermark_line_keys:
+                        suppressed_watermark_words += 1
+                        continue
                     source_bbox = [float(x0), float(y0), float(x1), float(y1)]
                     bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation)
                     atom = _text_atom(
@@ -844,8 +849,18 @@ class EvidencePlaneBuilder:
                     normalize_bbox=lambda value: _normalize_bbox(value, page_w, page_h, rotation),
                     text_atoms=evidence.text_atoms[page_text_start:],
                     vector_atoms=evidence.vector_atoms[page_vector_start:],
+                    prefer_owned_text=bool(watermark_line_keys),
                 )
                 table_candidates.extend(page_candidates)
+                if suppressed_watermark_words:
+                    diagnostics.append(
+                        {
+                            "severity": "info",
+                            "message": "suppressed translucent PDF watermark text",
+                            "page_number": page_number,
+                            "word_count": suppressed_watermark_words,
+                        }
+                    )
 
                 if not page_record.evidence_ids:
                     page_record.content_mode = "unknown"
@@ -1027,6 +1042,57 @@ class EvidencePlaneBuilder:
             content_mode="native_text",
             diagnostics=diagnostics,
         )
+
+
+def _pymupdf_watermark_line_keys(page: Any) -> set[tuple[int, int]]:
+    """Return native PDF text lines that are visually styled as watermarks.
+
+    PyMuPDF's ``find_tables().extract()`` includes translucent diagonal text in
+    cell values. Word tuples do not expose opacity or writing direction, so
+    inspect the matching dictionary lines before creating canonical atoms.
+    The thresholds intentionally cover only very faint text, or rotated text
+    that is also translucent; opaque rotated labels remain source evidence.
+    """
+    try:
+        blocks = (page.get_text("dict") or {}).get("blocks") or []
+    except Exception:
+        return set()
+
+    keys: set[tuple[int, int]] = set()
+    text_block_index = -1
+    for block in blocks:
+        if not isinstance(block, dict) or int(block.get("type", 0) or 0) != 0:
+            continue
+        # ``get_text("words")`` numbers only text blocks, while the dictionary
+        # block number also counts images. Use the text-block ordinal so the
+        # style metadata is matched to the correct word tuple.
+        text_block_index += 1
+        for line_index, line in enumerate(block.get("lines") or []):
+            if not isinstance(line, dict):
+                continue
+            spans = [span for span in line.get("spans") or [] if isinstance(span, dict) and span.get("text")]
+            if not spans:
+                continue
+            alphas = [_pymupdf_span_alpha(span) for span in spans]
+            direction = line.get("dir") or (1.0, 0.0)
+            try:
+                rotated = abs(float(direction[1])) > 0.05
+            except (IndexError, TypeError, ValueError):
+                rotated = False
+            if max(alphas) <= 96 or (rotated and max(alphas) < 230):
+                keys.add((text_block_index, line_index))
+    return keys
+
+
+def _pymupdf_span_alpha(span: dict[str, Any]) -> int:
+    value = span.get("alpha", 255)
+    try:
+        alpha = float(value)
+    except (TypeError, ValueError):
+        return 255
+    if 0.0 <= alpha <= 1.0:
+        alpha *= 255.0
+    return max(0, min(255, int(round(alpha))))
 
 
 def _evidence_plane_from_text_units(

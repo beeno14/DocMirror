@@ -62,6 +62,7 @@ _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d
 _COUNTERPARTY_KEYS = (
     "对方户名",
     "对方名称",
+    "对手信息",
     "对手名称",
     "交易对方",
     "交易对手",
@@ -91,7 +92,8 @@ def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
     for key, value in raw_txn.items():
         norm_key = normalize_header_cell(key)
         for needle in needles:
-            if key == needle or needle in key or norm_key == normalize_header_cell(needle):
+            norm_needle = normalize_header_cell(needle)
+            if norm_key == norm_needle or norm_needle in norm_key:
                 return str(value or "").strip()
     return ""
 
@@ -111,11 +113,7 @@ def _explicit_source_column_value(raw_txn: dict[str, str], aliases: tuple[str, .
     compact_aliases = {compact(alias) for alias in aliases}
     for raw_header, value in raw_txn.items():
         compact_header = compact(raw_header)
-        header_parts = {
-            compact(part)
-            for part in str(raw_header or "").splitlines()
-            if compact(part)
-        }
+        header_parts = {compact(part) for part in str(raw_header or "").splitlines() if compact(part)}
         if compact_header in compact_aliases or compact_aliases.intersection(header_parts):
             return str(value or "").strip()
     return ""
@@ -128,7 +126,15 @@ def _normalize_source_counterparty_columns(
     """Prefer explicit source party/institution columns over fuzzy base matches."""
     counter_party = _explicit_source_column_value(
         raw_txn,
-        ("对方户名", "对方名称", "对手名称", "交易对方", "Counterparty Name", "对方账号与户名"),
+        (
+            "对方户名",
+            "对方名称",
+            "对手信息",
+            "对手名称",
+            "交易对方",
+            "Counterparty Name",
+            "对方账号与户名",
+        ),
     )
     if counter_party:
         normalized["counter_party"] = _clean_wrapped_text(counter_party)
@@ -150,13 +156,18 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
     if embedded is not None:
         return embedded
 
-    income = _normalize_monetary_cell(_cell_value(raw_txn, *_SPLIT_CREDIT_KEYS))
-    expense = _normalize_monetary_cell(_cell_value(raw_txn, *_SPLIT_DEBIT_KEYS))
+    income_raw = _cell_value(raw_txn, *_SPLIT_CREDIT_KEYS)
+    expense_raw = _cell_value(raw_txn, *_SPLIT_DEBIT_KEYS)
+    income = _normalize_monetary_cell(income_raw)
+    expense = _normalize_monetary_cell(expense_raw)
     if income is None and expense is None:
         return None
+
+    income_present = bool(income_raw.strip()) and income is not None
+    expense_present = bool(expense_raw.strip()) and expense is not None
     income = float(income or 0)
     expense = float(expense or 0)
-    if income <= 0 and expense <= 0:
+    if income_present and expense_present and income == 0 and expense == 0:
         return None
 
     normalized = plugin._normalize(raw_txn)
@@ -183,21 +194,23 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
         if cp:
             normalized["counter_party"] = _clean_wrapped_text(cp)
 
-    if income > 0:
+    if income_present and (income > 0 or not expense_present):
         normalized["amount"] = income
         normalized["amount_cny"] = income
         normalized["direction"] = "income"
-    else:
+    elif expense_present:
         normalized["amount"] = expense
         normalized["amount_cny"] = expense
         normalized["direction"] = "expense"
+    else:
+        return None
     return normalized
 
 
 def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
     direction_raw = _cell_value(raw_txn, *_DIRECTION_KEYS)
     amount = _normalize_monetary_cell(_cell_value(raw_txn, "交易金额", "金额", "发生额", "Amount"))
-    if not direction_raw or amount is None or float(amount or 0) <= 0:
+    if not direction_raw or amount is None:
         return None
     direction = _normalize_direction_text(direction_raw)
     if direction not in ("income", "expense"):
@@ -221,7 +234,7 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
 def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
     value = _cell_value(raw_txn, "交易金额", "金额", "发生额", "Amount")
     amount = _normalize_monetary_cell(value)
-    if amount is None or float(amount) <= 0:
+    if amount is None:
         return None
     match = _MONEY_PREFIX_RE.search(str(value or "").strip())
     suffix = str(value or "")[match.end() :] if match else ""
@@ -329,6 +342,12 @@ def _with_internal_row_sources(
         transaction["_source"] = {
             "source_page": source_page,
             "page_range": [source_page, source_page],
+            **({"table_id": table_id} if (table_id := _internal_source_value(transaction, "_source_table_id")) else {}),
+            **(
+                {"source_row_index": int(row_index)}
+                if (row_index := _internal_source_value(transaction, "_source_row_index")).isdigit()
+                else {}
+            ),
         }
     return transactions
 
@@ -383,7 +402,11 @@ def _recover_missing_counterparties_from_page_text(
                 next_start = _next_located_row_start(locations, index, len(page_index[0]))
                 candidate = _slice_original_by_compact(page_text, page_index[1], account_end, next_start)
                 recovered = _clean_recovered_counterparty(candidate)
-                if recovered and _is_safe_recovered_counterparty(recovered):
+                if (
+                    recovered
+                    and not _recovered_counterparty_repeats_transaction_fields(recovered, transaction)
+                    and _is_safe_recovered_counterparty(recovered)
+                ):
                     _set_counterparty(transaction, recovered)
 
 
@@ -595,6 +618,24 @@ def _is_safe_recovered_counterparty(value: str) -> bool:
         return False
     repeated_channels = sum(compact.count(marker) for marker in ("WL财付通", "WL支付宝", "微信转账"))
     return repeated_channels <= 2
+
+
+def _recovered_counterparty_repeats_transaction_fields(
+    value: str,
+    transaction: dict[str, Any],
+) -> bool:
+    """Reject a source-null counterparty slice made from later row columns."""
+    compact = _signature_value(value)
+    summary = _signature_value(_cell_value(transaction, "交易摘要", "摘要", "备注", "用途"))
+    if not summary or not compact.startswith(summary):
+        return False
+    if compact == summary:
+        return True
+    monetary_values = (
+        _cell_value(transaction, "交易金额", "金额", "发生额", *_SPLIT_DEBIT_KEYS, *_SPLIT_CREDIT_KEYS),
+        _cell_value(transaction, "余额", "账户余额", "本次余额", "账面余额"),
+    )
+    return any(_signature_value(value) in compact for value in monetary_values if value)
 
 
 def _prefix_by_compact_length(value: str, compact_length: int) -> str:
@@ -936,15 +977,18 @@ def _positive_or_zero_int(value: Any) -> int | None:
 
 
 def _internal_source_page(transaction: dict[str, Any]) -> int | None:
+    try:
+        page = int(_internal_source_value(transaction, "_source_page"))
+    except ValueError:
+        return None
+    return page if page > 0 else None
+
+
+def _internal_source_value(transaction: dict[str, Any], field_name: str) -> str:
     for key, value in transaction.items():
-        if str(key).strip() != "_source_page":
-            continue
-        try:
-            page = int(str(value or "").strip())
-        except ValueError:
-            return None
-        return page if page > 0 else None
-    return None
+        if str(key).strip() == field_name:
+            return str(value or "").strip()
+    return ""
 
 
 def _extract_internal_source_grid_records(
@@ -974,7 +1018,9 @@ def _extract_internal_source_grid_records(
             if is_footer_or_total_row(row):
                 continue
             txn = {
-                raw_headers[idx] if idx < len(raw_headers) and raw_headers[idx] else f"col_{idx}": str(cell or "").strip()
+                raw_headers[idx] if idx < len(raw_headers) and raw_headers[idx] else f"col_{idx}": str(
+                    cell or ""
+                ).strip()
                 for idx, cell in enumerate(row)
             }
             if any(value for key, value in txn.items() if key != "_source_page"):
@@ -1111,7 +1157,8 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
     from docmirror.plugins.bank_statement.styles.signed_amount import parse_signed_amount
 
     for key, value in raw_txn.items():
-        if any(n in key for n in ("金额", "发生", "Amount")) and str(value).strip().startswith(("+", "-")):
+        normalized_key = normalize_header_cell(key)
+        if any(n in normalized_key for n in ("金额", "发生", "Amount")) and str(value).strip().startswith(("+", "-")):
             amount, direction = parse_signed_amount(str(value))
             if amount is not None:
                 normalized = plugin._normalize(raw_txn)
@@ -1124,3 +1171,46 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
     normalized = plugin._normalize(raw_txn)
     _normalize_source_counterparty_columns(raw_txn, normalized)
     return _normalize_wrapped_temporal_fields(normalized, raw_txn)
+
+
+def refine_missing_directions_from_balance_chain(records: list[dict[str, Any]]) -> None:
+    """Infer only missing directions from adjacent balances in either row order."""
+    for index, record in enumerate(records):
+        normalized = record.get("normalized") or {}
+        if normalized.get("direction") in {"income", "expense"}:
+            continue
+        amount = _safe_float(normalized.get("amount"))
+        balance = _safe_float(normalized.get("balance"))
+        if amount is None or amount <= 0 or balance is None:
+            continue
+
+        candidates: set[str] = set()
+        if index > 0:
+            previous_balance = _safe_float((records[index - 1].get("normalized") or {}).get("balance"))
+            inferred = _direction_from_balance(previous_balance, amount, balance)
+            if inferred:
+                candidates.add(inferred)
+        if index + 1 < len(records):
+            next_balance = _safe_float((records[index + 1].get("normalized") or {}).get("balance"))
+            inferred = _direction_from_balance(next_balance, amount, balance)
+            if inferred:
+                candidates.add(inferred)
+        if len(candidates) == 1:
+            normalized["direction"] = candidates.pop()
+
+
+def _direction_from_balance(previous_balance: float | None, amount: float, balance: float) -> str:
+    if previous_balance is None:
+        return ""
+    if abs(previous_balance + amount - balance) <= 0.01:
+        return "income"
+    if abs(previous_balance - amount - balance) <= 0.01:
+        return "expense"
+    return ""
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None

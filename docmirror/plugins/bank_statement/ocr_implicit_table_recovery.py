@@ -410,6 +410,8 @@ def _has_ledger_date_header(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
     if any(marker in compact for marker in ("交易日期", "交易时间", "记账日期")):
         return True
+    if compact == "日期" or re.search(r"(?:^|序号)日期(?=(?:借/?贷|收/?支|发生额|交易金额|余额))", compact):
+        return True
     # Narrow scanned columns are commonly OCR'd as two stacked fragments:
     # ``交易日 借贷标`` / ``期 志``.  Keep the fuzzy rule anchored to
     # ``交易`` and the trailing ``期`` so unrelated ``起止日期`` metadata
@@ -490,7 +492,7 @@ def _block_sort_key(block: dict[str, Any]) -> tuple[float, float]:
 
 def _is_paragraph_ledger_header(block: dict[str, Any]) -> bool:
     text = normalize_header_cell(str(block.get("text") or ""))
-    has_date = "交易日期" in text or "交易时间" in text
+    has_date = _has_ledger_date_header(text)
     has_direction = "收/支" in text or "收支" in text or _has_signed_amount_header(text)
     has_balance = "账户余额" in text or "余额" in text
     return has_date and has_direction and _has_amount_header(text) and has_balance

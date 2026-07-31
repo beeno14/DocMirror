@@ -88,14 +88,28 @@ def build_style_meta(
     blo_meta: Any = None,
     source_reported_count: int = 0,
 ) -> StyleMeta:
-    expected = 0
+    expected_candidates: list[int] = []
     source = ""
     pipe_failed = False
+    stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
     if reconstruction is not None:
-        expected = getattr(reconstruction, "expected_primary_rows", 0) or 0
+        reconstruction_expected = int(getattr(reconstruction, "expected_primary_rows", 0) or 0)
+        if stitched_continuation_rows > 0:
+            reconstruction_expected = max(0, reconstruction_expected - stitched_continuation_rows)
         source = getattr(reconstruction, "source", "") or ""
         pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
-    stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
+        if (
+            source
+            in {
+                "canonical_table",
+                "canonical_physical_tables",
+                "canonical_evidence_table",
+                "native_wide_table",
+                "ocr_implicit_table",
+            }
+            and reconstruction_expected > 0
+        ):
+            expected_candidates.append(reconstruction_expected)
 
     from docmirror.plugins.bank_statement.canonical_quality import (
         audit_cqf,
@@ -107,20 +121,10 @@ def build_style_meta(
         canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
     if source_reported_count > 0:
         expected = int(source_reported_count)
-    elif source in ("stacked_text", "native_wide_table", "ocr_implicit_table") and record_count > 0:
-        expected = record_count
-    elif source == "canonical_evidence_table" and expected > 0:
-        # Positioned date anchors are independent of weak logical-table row
-        # estimates and must remain the denominator for this recovery branch.
-        pass
     elif canonical_expected > 0:
         expected = canonical_expected
-    elif parse_result is not None and source in ("canonical_table", ""):
-        from docmirror.evidence.spe_consumer import mirror_expected_primary_rows
-
-        mirror_expected = mirror_expected_primary_rows(parse_result)
-        if mirror_expected > 0:
-            expected = mirror_expected
+    else:
+        expected = max(expected_candidates, default=0)
 
     cqf = audit_cqf(records or [], canonical_expected=expected)
     coverage = cqf.coverage_ratio
@@ -191,8 +195,10 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
             key = ("sequence", sequence, business_key)
         elif reference:
             key = ("reference", reference, business_key)
+        elif source_scope:
+            key = ("business", source_scope, business_key)
         else:
-            key = business_key
+            key = ("business", business_key)
         if key in seen:
             continue
         seen.add(key)
@@ -203,16 +209,14 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _source_sequence_scope(source: dict[str, Any]) -> tuple[Any, ...]:
-    table_id = str(source.get("table_id") or "").strip()
-    if table_id:
-        return ("table", table_id)
-    page_range = source.get("page_range")
-    if isinstance(page_range, (list, tuple)) and page_range:
-        return ("page_range", tuple(page_range))
     source_page = source.get("source_page")
-    if source_page not in (None, ""):
-        return ("page", source_page)
-    return ()
+    page_range = source.get("page_range")
+    table_id = str(source.get("table_id") or "").strip()
+    row_index = source.get("source_row_index")
+    if source_page in (None, "") and not page_range and not table_id and row_index in (None, ""):
+        return ()
+    normalized_range = tuple(page_range) if isinstance(page_range, (list, tuple)) else ()
+    return ("source", source_page, normalized_range, table_id, row_index)
 
 
 def _raw_sequence(raw: dict[str, Any]) -> str:
@@ -241,8 +245,6 @@ def ensure_canonical_normalized(normalized: dict[str, Any], standard_fields: lis
     for fld in standard_fields:
         if fld not in out:
             out[fld] = "" if fld not in ("amount", "amount_cny", "balance") else None
-    if out.get("amount") is None:
-        out["amount"] = 0.0
     if out.get("amount_cny") is None:
         out["amount_cny"] = out.get("amount")
     if "direction" not in out:

@@ -58,6 +58,20 @@ STRICT_MIN_COLUMNS = 3
 RELAXED_MIN_COLUMNS = 2
 STRICT_LOOKAHEAD = 8
 RELAXED_LOOKAHEAD = 15
+_BANK_MATCH_TRANSLATION = str.maketrans(
+    {
+        "戶": "户",
+        "⼈": "人",
+        "⺠": "民",
+        "⾏": "行",
+        "⽌": "止",
+        "⽇": "日",
+        "⾦": "金",
+        "⼿": "手",
+    }
+)
+_TIME_VALUE_RE = re.compile(r"^(?:\d{6}|\d{1,2}:\d{2}(?::\d{2})?)$")
+_MONEY_VALUE_RE = re.compile(r"^[+-]?(?:[¥￥$])?\d[\d,]*\.\d{1,2}$")
 
 
 @dataclass(frozen=True)
@@ -71,7 +85,7 @@ class HeaderMatch:
 
 @lru_cache(maxsize=2048)
 def normalize_header_cell(text: str) -> str:
-    cell = unicodedata.normalize("NFKC", str(text or "").strip())
+    cell = normalize_bank_matching_text(text).strip()
     if not cell:
         return cell
     profile = get_bank_layout_profile()
@@ -79,6 +93,43 @@ def normalize_header_cell(text: str) -> str:
     cell = _OCR_HEADER_ALIASES.get(cell, cell)
     cell = _PROFILE_TO_REGISTRY.get(cell, cell)
     return re.sub(r"[\s\n\r\t\u3000]", "", cell).replace("\u00a0", "")
+
+
+def normalize_bank_matching_text(text: str) -> str:
+    """Normalize compatibility glyphs for matching without changing source facts."""
+    return unicodedata.normalize("NFKC", str(text or "")).translate(_BANK_MATCH_TRANSLATION)
+
+
+def align_bank_ledger_row(headers: list[str], values: list[str]) -> list[str]:
+    """Restore one omitted optional time cell using only shared ledger semantics."""
+    if not headers or not values:
+        return list(values)
+    normalized_headers = [re.sub(r"\s+", "", normalize_bank_matching_text(header)) for header in headers]
+    time_index = next(
+        (index for index, header in enumerate(normalized_headers) if header in {"交易时间", "时间", "Time"}),
+        -1,
+    )
+    amount_index = next(
+        (
+            index
+            for index, header in enumerate(normalized_headers)
+            if any(marker in header for marker in ("交易金额", "发生额", "收入金额", "支出金额"))
+        ),
+        -1,
+    )
+    if time_index <= 0 or amount_index <= time_index or amount_index >= len(values):
+        return list(values)
+
+    time_value = re.sub(r"\s+", "", normalize_bank_matching_text(values[time_index]))
+    displaced_amount = re.sub(r"\s+", "", normalize_bank_matching_text(values[amount_index - 1]))
+    current_amount = re.sub(r"\s+", "", normalize_bank_matching_text(values[amount_index]))
+    if _TIME_VALUE_RE.fullmatch(time_value):
+        return list(values)
+    if not _MONEY_VALUE_RE.fullmatch(displaced_amount) or not _MONEY_VALUE_RE.fullmatch(current_amount):
+        return list(values)
+
+    aligned = [*values[:time_index], "", *values[time_index:]]
+    return aligned[: len(headers)]
 
 
 def canonical_key_for_field(field_name: str, registry: dict[str, Any]) -> str:

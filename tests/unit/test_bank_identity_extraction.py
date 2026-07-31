@@ -34,3 +34,20 @@ def test_enrich_identity_maps_subject_id_to_account_number():
     fields = enrich_identity_fields({}, "", pr, institution="中国农业银行")
     assert fields["bank_name"]["normalized_value"] == "中国农业银行"
     assert fields["account_number"]["normalized_value"] == "03-869900040010370"
+
+
+def test_header_identity_normalizes_cjk_compatibility_glyphs_before_matching():
+    fields = enrich_identity_fields(
+        {},
+        (
+            "中国农业银⾏账⼾活期交易明细清单\n"
+            "⼾名：测试用户  账⼾：6230****6516  币种：⼈⺠币\n"
+            "起⽌⽇期：20220808 至 20220908\n"
+            "交易⽇期 交易⾦额 账户余额"
+        ),
+    )
+
+    assert fields["account_holder"]["normalized_value"] == "测试用户"
+    assert fields["account_number"]["normalized_value"] == "6230****6516"
+    assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["query_period"]["normalized_value"] == "2022-08-08 ~ 2022-09-08"

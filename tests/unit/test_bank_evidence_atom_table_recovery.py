@@ -438,6 +438,41 @@ def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
     assert fields["bank_name"]["normalized_value"] == "浦发银行重庆分行营业部"
 
 
+def test_evidence_identity_ignores_native_atoms_rejected_by_ocr_fallback():
+    atoms = [
+        _atom("holder", "户名：上上上上上上", 10.0, 60.0, 120.0),
+        _atom("account", "账号：1234567890", 130.0, 60.0, 240.0),
+    ]
+    for atom in atoms:
+        atom["source_kind"] = "pdf_native"
+    result = _result(atoms)
+    result.parser_info = SimpleNamespace(options={"native_text_ocr_fallback_pages": [1]})
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(result)
+
+    assert fields == {}
+
+
+def test_evidence_identity_stays_within_selected_source_pages():
+    atoms = [
+        _atom("selected_holder", "户名：测试科技有限公司 账号：1234567890", 10.0, 60.0, 240.0),
+        {
+            **_atom("unselected_holder", "户名：错误公司 验证码：", 10.0, 60.0, 240.0),
+            "page_id": "page:0002",
+        },
+    ]
+    result = _result(atoms)
+    result.evidence_plane.pages = [
+        SimpleNamespace(page_id="page:0001", page_number=1),
+        SimpleNamespace(page_id="page:0002", page_number=2),
+    ]
+    result.parser_info = SimpleNamespace(options={"selected_source_pages": [1]})
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(result)
+
+    assert fields["account_holder"]["normalized_value"] == "测试科技有限公司"
+
+
 def test_evidence_identity_recovers_split_header_values_and_directional_totals():
     atoms = [
         _atom("title", "交通银行某分行明细对账单", 180.0, 20.0, 390.0),
@@ -489,6 +524,15 @@ def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["query_period"]["normalized_value"] == "2025-11-01 至 2025-12-31"
     assert fields["total_transactions"]["normalized_value"] == "4"
+
+
+def test_evidence_identity_normalizes_compatibility_currency_without_changing_raw_value():
+    atoms = [_atom("currency", "币种：⼈⺠币", 20.0, 45.0, 120.0)]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["currency"]["raw_value"] == "⼈⺠币"
+    assert fields["currency"]["normalized_value"] == "CNY"
 
 
 def test_geometry_recovery_keeps_wrapped_cells_with_preceding_date_and_stops_at_footer():
