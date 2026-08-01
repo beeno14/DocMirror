@@ -69,6 +69,9 @@ _DATASET_RECORD_ID_KEYS = {
     "civil_judgment_records": ("record_id", "civil_judgment_id"),
     "enforcement_records": ("record_id", "enforcement_record_id"),
     "administrative_penalty_records": ("record_id", "administrative_penalty_id"),
+    "overdue_records": ("record_id", "overdue_id"),
+    "recovery_records": ("record_id", "recovery_record_id"),
+    "personal_detail_source_rows": ("record_id", "source_table_row_id"),
 }
 
 

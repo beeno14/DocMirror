@@ -259,6 +259,48 @@ def test_generic_community_envelope_conforms():
     assert {item["key"] for item in items} == {"name", "id_number"}
 
 
+def test_missing_community_plugin_writes_generic_json_markdown_and_csv(tmp_path):
+    result = ParseResult(
+        status=ResultStatus.SUCCESS,
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="Future report")],
+                tables=[
+                    TableBlock(
+                        headers=["date", "amount"],
+                        rows=[
+                            TableRow(
+                                cells=[
+                                    CellValue(text="2026-01-01"),
+                                    CellValue(text="42.50"),
+                                ]
+                            )
+                        ],
+                    )
+                ],
+            )
+        ],
+        entities=DocumentEntities(document_type="future_domain"),
+    )
+
+    _task_id, written = write_outputs(
+        result,
+        tmp_path,
+        task_id="future_domain_fallback",
+        include_mirror=False,
+        include_manifest=False,
+    )
+
+    community = json.loads(written["community"].read_text(encoding="utf-8"))
+    assert community["schema"]["support_level"] == "generic"
+    assert any(warning["code"] == "COMMUNITY_PARSE_RESULT_FALLBACK" for warning in community["warnings"])
+    assert written["content"].read_text(encoding="utf-8").strip()
+    assert written["enhanced_reading"].read_text(encoding="utf-8").strip()
+    assert (written["datasets"] / "records.csv").is_file()
+    assert (written["datasets"] / "_audit_cells.csv").is_file()
+
+
 def test_mirror_only_envelope_for_enterprise_only_type():
     from docmirror.server.output_builder import build_community_projection
 

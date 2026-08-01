@@ -198,6 +198,8 @@
         "row_count": {"type": "integer", "minimum": 0},
         "grain": {"type": "string", "minLength": 1},
         "primary_key": {"const": "record_id"},
+        "storage_role": {"const": "canonical"},
+        "record_path": {"const": "rows"},
         "schema_version": {"const": "1.0"},
         "status": {"enum": ["complete", "empty", "partial", "failed"]},
         "columns": {"type": "array", "items": {"$ref": "#/$defs/column"}},

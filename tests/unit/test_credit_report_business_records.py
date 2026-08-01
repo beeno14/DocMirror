@@ -1364,3 +1364,23 @@ def test_derive_overdue_records_from_scanned_account_and_repayment_month() -> No
     assert records[0]["overdue_amount"] == 1200
     assert records[1]["period_scope"] == "month"
     assert records[1]["overdue_level"] == 2
+
+
+def test_derive_overdue_records_respects_quasi_credit_card_status_legend() -> None:
+    records = derive_overdue_records(
+        [
+            {
+                "normalized": {
+                    "account_id": "quasi-card-1",
+                    "account_type": "quasi_credit_card",
+                }
+            }
+        ],
+        [
+            {"account_id": "quasi-card-1", "year": 2025, "month": 1, "status": "1"},
+            {"account_id": "quasi-card-1", "year": 2025, "month": 2, "status": "2"},
+            {"account_id": "quasi-card-1", "year": 2025, "month": 3, "status": "3"},
+        ],
+    )
+
+    assert [(record["month"], record["overdue_level"]) for record in records] == [(3, 3)]

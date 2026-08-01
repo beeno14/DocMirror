@@ -883,7 +883,7 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
     current_type = ""
     detail_ended = False
     for page in _evidence_pages(parse_result):
-        for line in page["lines"]:
+        for line_index, line in enumerate(page["lines"]):
             text = str(line.get("text") or line.get("content") or "")
             compact = re.sub(r"\s+", "", text)
             if any(marker in compact for marker in ("授信协议信息", "查询记录")) and current_type:
@@ -898,6 +898,7 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
                     "page": page["page"],
                     "source_page": page["source_page"],
                     "account_type_context": "" if detail_ended else current_type,
+                    "_page_line_index": line_index,
                 }
             )
 
@@ -909,6 +910,7 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
         starts.append(index)
 
     accounts: list[dict[str, Any]] = []
+    continuation_check = getattr(parse_result, "allows_scanned_line_transition", None)
     for position, start in enumerate(starts):
         anchor = flattened[start]
         account_type = str(anchor["account_type_context"])
@@ -916,6 +918,23 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
         end = next_start
         for index in range(start + 1, next_start):
             if flattened[index].get("account_type_context") != account_type:
+                end = index
+                break
+            previous = flattened[index - 1]
+            candidate = flattened[index]
+            if (
+                callable(continuation_check)
+                and int(previous.get("page") or 0) != int(candidate.get("page") or 0)
+                and continuation_check(
+                    int(previous.get("page") or 0),
+                    previous,
+                    int(previous.get("_page_line_index") or 0),
+                    int(candidate.get("page") or 0),
+                    candidate,
+                    int(candidate.get("_page_line_index") or 0),
+                )
+                is False
+            ):
                 end = index
                 break
         detail_lines = flattened[start:end]

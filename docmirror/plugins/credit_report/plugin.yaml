@@ -54,6 +54,13 @@ projection:
     enterprise_housing_fund_history: 住房公积金历史缴费明细
     residence_records: 居住信息
     employment_records: 职业信息
+    mobile_phone_records: 手机号码历史
+    spouse_records: 配偶信息
+    recovery_records: 被追偿信息
+    postpaid_payment_history: 后付费月度缴费记录
+    personal_detail_account_events: 账户补充事件
+    personal_detail_summary_records: 信息概要表
+    personal_detail_summary_cells: 信息概要单元格
     statements: 信息主体声明
     annotations: 异议标注
     repayment_liability_records: 相关还款责任信息
@@ -110,6 +117,102 @@ projection:
     - mirror_ltqg_skipped_tables
     - mirror_quarantined_logical_count
     - mirror_quarantined_physical_count
+    - personal_detail_expected_personal_report_metadata_count
+    - personal_detail_expected_identity_documents_count
+    - personal_detail_expected_mobile_phone_records_count
+    - personal_detail_expected_spouse_records_count
+    - personal_detail_expected_residence_records_count
+    - personal_detail_expected_employment_records_count
+    - personal_detail_expected_recovery_records_count
+    - personal_detail_expected_credit_lines_count
+    - personal_detail_expected_repayment_liability_records_count
+    - personal_detail_expected_repayment_records_count
+    - personal_detail_expected_overdue_records_count
+    - personal_detail_expected_postpaid_records_count
+    - personal_detail_expected_postpaid_payment_history_count
+    - personal_detail_expected_personal_detail_account_events_count
+    - personal_detail_expected_personal_detail_summary_records_count
+    - personal_detail_expected_personal_detail_summary_cells_count
+    - personal_detail_expected_public_records_count
+    - personal_detail_expected_statements_count
+    - personal_detail_expected_annotations_count
+  completeness:
+    personal_report_metadata:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_personal_report_metadata_count
+      public_basis: personal_detail_source_header_count
+    identity_documents:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_identity_documents_count
+      public_basis: personal_detail_source_header_count
+    mobile_phone_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_mobile_phone_records_count
+      public_basis: personal_detail_source_sequence_count
+    spouse_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_spouse_records_count
+      public_basis: personal_detail_source_structure_count
+    residence_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_residence_records_count
+      public_basis: personal_detail_source_sequence_count
+    employment_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_employment_records_count
+      public_basis: personal_detail_source_sequence_count
+    recovery_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_recovery_records_count
+      public_basis: personal_detail_source_sequence_count
+    credit_lines:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_credit_lines_count
+      public_basis: personal_detail_source_structure_count
+    repayment_liability_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_repayment_liability_records_count
+      public_basis: personal_detail_source_sequence_count
+    repayment_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_repayment_records_count
+      public_basis: personal_detail_repayment_grid_cell_count
+    overdue_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_overdue_records_count
+      public_basis: personal_detail_derived_overdue_count
+    postpaid_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_postpaid_records_count
+      public_basis: personal_detail_source_sequence_count
+    postpaid_payment_history:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_postpaid_payment_history_count
+      public_basis: personal_detail_repayment_grid_cell_count
+    personal_detail_account_events:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_personal_detail_account_events_count
+      public_basis: personal_detail_source_event_count
+    personal_detail_summary_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_personal_detail_summary_records_count
+      public_basis: personal_detail_source_table_count
+    personal_detail_summary_cells:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_personal_detail_summary_cells_count
+      public_basis: personal_detail_source_cell_count
+    public_records:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_public_records_count
+      public_basis: personal_detail_source_sequence_count
+    statements:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_statements_count
+      public_basis: personal_detail_source_marker_count
+    annotations:
+      basis: domain_fact_count
+      count_key: personal_detail_expected_annotations_count
+      public_basis: personal_detail_source_marker_count
   section_markers:
     credit_accounts: [credit_details]
     credit_lines: [credit_details]
@@ -131,6 +234,13 @@ projection:
     administrative_penalty_records: [public_records]
     residence_records: [basic_information]
     employment_records: [basic_information]
+    mobile_phone_records: [basic_information]
+    spouse_records: [basic_information]
+    recovery_records: [credit_details]
+    postpaid_payment_history: [non_credit_transactions]
+    personal_detail_account_events: [credit_details]
+    personal_detail_summary_records: [credit_summary]
+    personal_detail_summary_cells: [credit_summary]
     statements: [notes]
     annotations: [notes]
     enterprise_report_metadata: [report_metadata]
@@ -222,6 +332,10 @@ projection:
       - credit_limit_status
       - used_amount
       - used_amount_status
+      - recent_6_month_average_used_amount
+      - maximum_used_amount
+      - recent_6_month_average_overdraft_balance
+      - maximum_overdraft_balance
       - loan_amount
       - loan_amount_status
       - balance

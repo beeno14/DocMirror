@@ -1534,6 +1534,16 @@ def _plain(value: Any) -> Any:
     return None
 
 
+def _record_value(record: dict[str, Any], key: str) -> Any:
+    value = _plain(record.get(key))
+    if value not in (None, ""):
+        return value
+    normalized = record.get("normalized")
+    if isinstance(normalized, dict):
+        return _plain(normalized.get(key))
+    return None
+
+
 def derive_overdue_records(
     credit_accounts: list[Any],
     repayment_records: list[Any],
@@ -1542,16 +1552,20 @@ def derive_overdue_records(
     """Build one canonical overdue view from narrative, account, and month-grid facts."""
     out = [dict(item) for item in existing or [] if isinstance(item, dict)]
     seen = {str(item.get("overdue_id") or "") for item in out}
+    account_types: dict[str, str] = {}
     for account in credit_accounts or []:
         if not isinstance(account, dict):
             continue
-        status = str(_plain(account.get("account_status")) or "")
-        five_tier = str(_plain(account.get("five_tier_class")) or "")
-        overdue_amount = _number(str(_plain(account.get("overdue_amount")) or ""))
+        account_id = str(_record_value(account, "account_id") or account.get("source_structure_id") or "")
+        account_type = str(_record_value(account, "account_type") or _record_value(account, "credit_card_type") or "")
+        if account_id and account_type:
+            account_types[account_id] = account_type
+        status = str(_record_value(account, "account_status") or _record_value(account, "status") or "")
+        five_tier = str(_record_value(account, "five_tier_class") or "")
+        overdue_amount = _number(str(_record_value(account, "overdue_amount") or ""))
         if status not in {"逾期", "overdue"} and five_tier not in {"关注", "次级", "可疑", "损失", "违约"}:
             if not overdue_amount:
                 continue
-        account_id = str(account.get("account_id") or account.get("source_structure_id") or "")
         overdue_id = _stable_id("credit_overdue", account_id, "account_snapshot")
         if overdue_id in seen:
             continue
@@ -1575,6 +1589,10 @@ def derive_overdue_records(
         if status not in {"1", "2", "3", "4", "5", "6", "7"}:
             continue
         account_id = str(record.get("account_id") or record.get("grid_id") or "")
+        # The personal-report legend assigns quasi-credit-card codes 1 and 2
+        # to normal balance states; only codes 3 through 7 are overdue.
+        if account_types.get(account_id) == "quasi_credit_card" and status in {"1", "2"}:
+            continue
         try:
             year = int(record.get("year") or 0)
             month = int(record.get("month") or 0)

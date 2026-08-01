@@ -14,9 +14,9 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
-ReportFamily = Literal["enterprise", "personal_brief"]
+ReportFamily = Literal["enterprise", "personal_brief", "personal_detail"]
 UnitKind = Literal["table", "ledger", "text", "heading"]
 EntityKind = Literal["table", "text", "mixed"]
 TransitionAction = Literal[
@@ -253,6 +253,12 @@ class _BeamState:
     open_unit_ids: tuple[str, ...]
     decisions: tuple[EntityTransitionDecision, ...]
     log_score: float
+
+
+TransitionScorer = Callable[
+    [tuple[CreditReportUnit, ...], CreditReportUnit, CreditReportUnit | None],
+    tuple[TransitionHypothesis, ...],
+]
 
 
 def _compact(value: Any) -> str:
@@ -701,6 +707,7 @@ def _decode_units(
     *,
     report_family: ReportFamily,
     beam_width: int,
+    transition_scorer: TransitionScorer | None = None,
 ) -> tuple[tuple[tuple[str, ...], ...], tuple[EntityTransitionDecision, ...]]:
     if not units:
         return (), ()
@@ -718,11 +725,15 @@ def _decode_units(
         expanded: list[_BeamState] = []
         for state in beam:
             open_units = tuple(by_id[unit_id] for unit_id in state.open_unit_ids)
-            hypotheses = _score_transition(
-                open_units,
-                candidate,
-                lookahead,
-                report_family=report_family,
+            hypotheses = (
+                transition_scorer(open_units, candidate, lookahead)
+                if transition_scorer is not None
+                else _score_transition(
+                    open_units,
+                    candidate,
+                    lookahead,
+                    report_family=report_family,
+                )
             )
             compatible = [item for item in hypotheses if "incompatible_content_types" not in item.signals]
             for hypothesis in compatible[:3]:
@@ -796,12 +807,46 @@ def decode_credit_report_entities(
     if report_family not in {"enterprise", "personal_brief"}:
         raise ValueError(f"unsupported credit-report entity family: {report_family}")
     units, furniture_ids = _collect_units(parse_result)
-    grouped_ids, decisions = _decode_units(units, report_family=report_family, beam_width=beam_width)
-    by_id = {unit.unit_id: unit for unit in units}
+    return decode_credit_report_units(
+        units,
+        report_family=report_family,
+        furniture_unit_ids=furniture_ids,
+        beam_width=beam_width,
+    )
+
+
+def decode_credit_report_units(
+    units: Iterable[CreditReportUnit],
+    *,
+    report_family: ReportFamily,
+    furniture_unit_ids: Iterable[str] = (),
+    beam_width: int = 5,
+    transition_scorer: TransitionScorer | None = None,
+    entity_prefix: str | None = None,
+) -> CreditReportEntityContext:
+    """Decode caller-owned units with an optional variant-local scorer.
+
+    Existing native report families continue to enter through
+    :func:`decode_credit_report_entities`; this lower-level seam lets a variant
+    provide logical-page units and business contracts without changing the
+    shared default collector or score tables.
+    """
+    if report_family not in {"enterprise", "personal_brief", "personal_detail"}:
+        raise ValueError(f"unsupported credit-report entity family: {report_family}")
+    ordered_units = tuple(units)
+    grouped_ids, decisions = _decode_units(
+        ordered_units,
+        report_family=report_family,
+        beam_width=beam_width,
+        transition_scorer=transition_scorer,
+    )
+    by_id = {unit.unit_id: unit for unit in ordered_units}
+    if len(by_id) != len(ordered_units):
+        raise ValueError("credit-report unit ids must be unique")
     decision_by_pair = {(decision.left_unit_id, decision.right_unit_id): decision for decision in decisions}
     entities: list[CreditReportEntity] = []
     assigned: list[str] = []
-    prefix = "enterprise" if report_family == "enterprise" else "personal_brief"
+    prefix = entity_prefix or report_family
     for index, unit_ids in enumerate(grouped_ids, start=1):
         grouped_units = tuple(by_id[unit_id] for unit_id in unit_ids)
         internal_decisions = [
@@ -826,12 +871,12 @@ def decode_credit_report_entities(
             )
         )
         assigned.extend(unit_ids)
-    active_ids = [unit.unit_id for unit in units]
+    active_ids = [unit.unit_id for unit in ordered_units]
     unassigned = tuple(unit_id for unit_id in active_ids if assigned.count(unit_id) != 1)
     return CreditReportEntityContext(
         report_family=report_family,
-        units=units,
-        furniture_unit_ids=furniture_ids,
+        units=ordered_units,
+        furniture_unit_ids=tuple(furniture_unit_ids),
         entities=tuple(entities),
         decisions=decisions,
         unassigned_unit_ids=unassigned,
@@ -846,5 +891,6 @@ __all__ = [
     "TransitionAction",
     "TransitionHypothesis",
     "decode_credit_report_entities",
+    "decode_credit_report_units",
     "score_credit_report_transition",
 ]

@@ -37,7 +37,7 @@ def test_credit_report_variant_routing_is_subtype_owned() -> None:
     # document family or execute another family's heuristics.
     detail = resolve_credit_report_variant("personal_detail", "native_text")
     assert detail.variant_id == "personal_detail_scanned"
-    assert detail.content_mode_is_expected("native_text") is False
+    assert detail.content_mode_is_expected("native_text") is True
 
 
 def test_credit_report_variant_dataset_contracts_preserve_existing_outputs() -> None:
@@ -51,6 +51,19 @@ def test_credit_report_variant_dataset_contracts_preserve_existing_outputs() -> 
     assert personal_brief.keep_query_institution is False
     assert enterprise.keep_query_institution is True
     assert personal_detail.keep_query_institution is True
+
+
+def test_personal_detail_presentation_overrides_are_variant_local() -> None:
+    personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    personal_detail = resolve_credit_report_variant("personal_detail", "native_text")
+
+    overrides = personal_detail.semantic_extensions()["community_projection_overrides"]
+    assert overrides["dataset_labels"]["personal_report_metadata"] == "个人信用报告信息"
+    assert overrides["dataset_labels"]["credit_accounts"] == "信贷交易账户明细"
+    assert overrides["section_markers"]["statements"] == ["statements", "notes"]
+    assert "community_projection_overrides" not in personal_brief.semantic_extensions()
+    assert "community_projection_overrides" not in enterprise.semantic_extensions()
 
 
 def test_unknown_credit_report_variant_preserves_legacy_fallback_shape() -> None:
@@ -87,11 +100,14 @@ def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatc
         "",
         content_mode="native_text",
     ) == {"owner": "enterprise_native"}
-    assert personal_detail.extract_native_business(
-        parse_result,
-        "",
-        content_mode="scanned_ocr",
-    ) == {}
+    assert (
+        personal_detail.extract_native_business(
+            parse_result,
+            "",
+            content_mode="scanned_ocr",
+        )
+        == {}
+    )
 
 
 def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relationships() -> None:
@@ -116,12 +132,8 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     }
     assert "个人简版" in personal_dictionary["datasets"]["credit_accounts"]["definition"]
     assert "个人简版" not in enterprise_dictionary["datasets"]["credit_accounts"]["definition"]
-    assert personal_semantic["presentation_policy"]["classification"] == (
-        "highly_sensitive_personal_financial_data"
-    )
-    assert enterprise_semantic["presentation_policy"]["classification"] == (
-        "sensitive_enterprise_credit_data"
-    )
+    assert personal_semantic["presentation_policy"]["classification"] == ("highly_sensitive_personal_financial_data")
+    assert enterprise_semantic["presentation_policy"]["classification"] == ("sensitive_enterprise_credit_data")
     assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
@@ -140,15 +152,21 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "enterprise_exchange_rates",
         "enterprise_report_identity",
     ]
-    assert enterprise_order.index("enterprise_current_credit_summary") < enterprise_order.index(
-        "enterprise_facility_summary"
-    ) < enterprise_order.index("enterprise_closed_credit_summary")
-    assert enterprise_order.index("enterprise_profile_fields") < enterprise_order.index(
-        "enterprise_capital_summary"
-    ) < enterprise_order.index("enterprise_stakeholders")
-    assert enterprise_order.index("credit_accounts") < enterprise_order.index(
-        "enterprise_displayed_credit_summary"
-    ) < enterprise_order.index("credit_lines")
+    assert (
+        enterprise_order.index("enterprise_current_credit_summary")
+        < enterprise_order.index("enterprise_facility_summary")
+        < enterprise_order.index("enterprise_closed_credit_summary")
+    )
+    assert (
+        enterprise_order.index("enterprise_profile_fields")
+        < enterprise_order.index("enterprise_capital_summary")
+        < enterprise_order.index("enterprise_stakeholders")
+    )
+    assert (
+        enterprise_order.index("credit_accounts")
+        < enterprise_order.index("enterprise_displayed_credit_summary")
+        < enterprise_order.index("credit_lines")
+    )
     assert enterprise_order[-1] == "enterprise_extraction_audit"
     assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
     assert enterprise_dictionary["version"] == "2.0.0"
@@ -164,9 +182,7 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
     assert dictionary["fields"]["public_record_type_counts"]["map_key_enum"] == "record_type"
     assert "public_records" not in dictionary["datasets"]
     assert "public_records" not in dataset_layouts
-    assert list(
-        dictionary["datasets"]["enterprise_public_license_records"]["columns"]
-    ) == [
+    assert list(dictionary["datasets"]["enterprise_public_license_records"]["columns"]) == [
         "sequence",
         "public_record_id",
         "licensing_authority",
