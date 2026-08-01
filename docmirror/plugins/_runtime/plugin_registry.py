@@ -256,31 +256,44 @@ class PluginRegistry:
         """Register bundled providers only after the canonical Seal boundary."""
         import yaml
 
-        for domain_name in _BUNDLED_POST_SEAL_DOMAINS:
-            package = f"docmirror.plugins.{domain_name}"
-            manifest = yaml.safe_load(files(package).joinpath("plugin.yaml").read_text(encoding="utf-8")) or {}
-            provider_config = dict(manifest.get("provider") or {})
-            module = importlib.import_module(f"{package}.community_plugin")
-            projector = getattr(module, "plugin")
-            projectors = [projector]
-            for alias in manifest.get("classification", {}).get("aliases") or []:
-                alias_name = str(alias or "").strip()
-                if alias_name:
-                    projectors.append(_AliasProjector(projector, alias_name))
-            self.register_provider(
-                PluginProvider(
-                    provider_id=f"bundled.{domain_name}",
-                    version=str(provider_config.get("version") or "community-1"),
-                    projectors=tuple(projectors),
-                    resource_package=package,
-                    resources={
-                        str(name): str(relative_path)
-                        for name, relative_path in dict(manifest.get("resources") or {}).items()
-                    },
-                ),
-                manifest=manifest,
-                resource_root=files(package),
-            )
+        ordered_domains = (
+            "generic",
+            *(domain for domain in _BUNDLED_POST_SEAL_DOMAINS if domain != "generic"),
+        )
+        for domain_name in ordered_domains:
+            try:
+                package = f"docmirror.plugins.{domain_name}"
+                manifest = yaml.safe_load(files(package).joinpath("plugin.yaml").read_text(encoding="utf-8")) or {}
+                provider_config = dict(manifest.get("provider") or {})
+                module = importlib.import_module(f"{package}.community_plugin")
+                projector = getattr(module, "plugin")
+                projectors = [projector]
+                for alias in manifest.get("classification", {}).get("aliases") or []:
+                    alias_name = str(alias or "").strip()
+                    if alias_name:
+                        projectors.append(_AliasProjector(projector, alias_name))
+                self.register_provider(
+                    PluginProvider(
+                        provider_id=f"bundled.{domain_name}",
+                        version=str(provider_config.get("version") or "community-1"),
+                        projectors=tuple(projectors),
+                        resource_package=package,
+                        resources={
+                            str(name): str(relative_path)
+                            for name, relative_path in dict(manifest.get("resources") or {}).items()
+                        },
+                    ),
+                    manifest=manifest,
+                    resource_root=files(package),
+                )
+            except Exception as exc:
+                if domain_name == "generic":
+                    raise RuntimeError("Generic Community fallback projector failed to register") from exc
+                logger.warning(
+                    "[PluginRegistry] Bundled Community provider unavailable: %s: %s",
+                    domain_name,
+                    exc,
+                )
 
     def _discover_third_party_providers(self) -> None:
         """Load projector providers through pluggy only at the output boundary."""

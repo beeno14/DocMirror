@@ -127,12 +127,20 @@ def build_community_bundle(
     if not result.verify_integrity():
         raise RuntimeError("Projector boundary violation: invalid sealed snapshot")
     detected_type = str(result.to_read_view().entities.document_type or "generic")
+    registered_projector = registry.get_projector(
+        detected_type,
+        "community",
+    )
     projector = registry.get_projector(
         detected_type,
         "community",
         sealed_schema=result.schema_version,
     )
+    fallback_reason = ""
     if projector is None:
+        fallback_reason = (
+            "sealed_schema_unsupported" if registered_projector is not None else "community_projector_not_registered"
+        )
         projector = registry.get_projector(
             "generic",
             "community",
@@ -140,20 +148,26 @@ def build_community_bundle(
         )
     if projector is None:
         raise RuntimeError("No Community projector is registered")
-    project_bundle = getattr(projector, "project_bundle", None)
-    derives_semantic = not isinstance(projector, CommunityProjector) or type(projector).derive is not CommunityProjector.derive
-    if callable(project_bundle) and derives_semantic:
-        bundle = project_bundle(
-            result,
-            file_path=file_path,
-            file_id=file_id,
-            document_id=document_id,
+
+    def _project(selected_projector):
+        project_bundle = getattr(selected_projector, "project_bundle", None)
+        derives_semantic = (
+            not isinstance(selected_projector, CommunityProjector)
+            or type(selected_projector).derive is not CommunityProjector.derive
         )
-    else:
-        projected = projector.project(result)
-        if projected is None or not isinstance(projected, dict):
-            raise RuntimeError(f"{detected_type}:community projector returned no payload")
-        bundle = materialize_community_bundle(
+        if callable(project_bundle) and derives_semantic:
+            return project_bundle(
+                result,
+                file_path=file_path,
+                file_id=file_id,
+                document_id=document_id,
+            )
+        projected = selected_projector.project(result)
+        if projected is None:
+            return None
+        if not isinstance(projected, dict):
+            raise TypeError(f"{detected_type}:community projector must return dict or None")
+        return materialize_community_bundle(
             projected,
             result.to_read_view(),
             file_path=file_path,
@@ -162,8 +176,51 @@ def build_community_bundle(
             source_fingerprint=result.integrity_fingerprint,
             parse_result_schema=result.schema_version,
         )
+
+    bundle = _project(projector)
+    if bundle is None and str(getattr(projector, "domain_name", "") or "") != "generic":
+        fallback_reason = "community_projector_returned_none"
+        projector = registry.get_projector(
+            "generic",
+            "community",
+            sealed_schema=result.schema_version,
+        )
+        if projector is None:
+            raise RuntimeError("No generic Community fallback projector is registered")
+        bundle = _project(projector)
     if bundle is None:
         raise RuntimeError(f"{detected_type}:community projector returned no semantic bundle")
+    if fallback_reason:
+        fallback_message = (
+            f"Community projector unavailable for {detected_type!r} ({fallback_reason}); "
+            "generated from ParseResult via the generic projector."
+        )
+        bundle.schema["support_level"] = "generic"
+        bundle.classification.update(
+            {
+                "projector_id": "parse_result_fallback",
+                "support_level": "generic",
+                "fallback_reason": fallback_reason,
+                "fallback_from_document_type": detected_type,
+            }
+        )
+        bundle.diagnostics["community_fallback"] = {
+            "reason": fallback_reason,
+            "document_type": detected_type,
+            "source": "sealed_parse_result",
+        }
+        if not any(
+            warning.get("code") == "COMMUNITY_PARSE_RESULT_FALLBACK"
+            for warning in bundle.warnings
+            if isinstance(warning, dict)
+        ):
+            bundle.warnings.append(
+                {
+                    "code": "COMMUNITY_PARSE_RESULT_FALLBACK",
+                    "level": "warning",
+                    "message": fallback_message,
+                }
+            )
     if not result.verify_integrity():
         raise RuntimeError("Projector boundary violation: sealed snapshot changed")
     bundle.render_markdown()
