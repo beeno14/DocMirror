@@ -55,6 +55,13 @@ def _builtin_specs() -> dict[str, ProjectionSchemaSpec]:
             compatibility="additive-community-companion",
         ),
         ProjectionSchemaSpec(
+            name="personal_credit_report_detailed",
+            path=_SCHEMAS_DIR / "personal_credit_report_detailed.schema.json",
+            version="1.0.0",
+            description="Canonical dataset contract for individual detailed credit reports",
+            compatibility="community-v3-domain-profile",
+        ),
+        ProjectionSchemaSpec(
             name="community_v2",
             path=_SCHEMAS_DIR / "edition_community.schema.json",
             version="2.2",

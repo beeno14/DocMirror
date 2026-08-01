@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://valuemapglobal.github.io/DocMirror/schemas/personal_credit_report_detailed.schema.json",
+  "title": "DocMirror Personal Detailed Credit Report v1",
+  "description": "Domain contract for individual detailed credit reports. datasets[*].rows is the sole canonical business-record storage.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "document", "sections", "datasets", "reading", "files", "warnings"],
+  "properties": {
+    "schema": {
+      "type": "object",
+      "required": ["name", "version", "edition", "domain", "support_level"],
+      "properties": {
+        "name": {"const": "docmirror.community"},
+        "version": {"const": "3.0.0"},
+        "edition": {"const": "community"},
+        "domain": {"const": "personal_credit_report_detailed"},
+        "support_level": {"enum": ["ga", "beta"]}
+      },
+      "additionalProperties": false
+    },
+    "document": {
+      "type": "object",
+      "required": ["id", "type", "title", "page_count", "language", "source_file", "units"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {"const": "personal_credit_report_detailed"},
+        "title": {"type": "string", "minLength": 1},
+        "page_count": {"type": "integer", "minimum": 1},
+        "language": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "source_file": {
+          "type": "object",
+          "required": ["name", "mime_type", "sha256"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "mime_type": {"const": "application/pdf"},
+            "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        },
+        "units": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "sections": {"type": "array", "items": {"type": "object"}},
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/canonicalDataset"},
+      "contains": {
+        "type": "object",
+        "properties": {"name": {"const": "personal_report_metadata"}},
+        "required": ["name"]
+      }
+    },
+    "reading": {"type": "object"},
+    "files": {"type": "object"},
+    "warnings": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "pageRange": {
+      "type": "array",
+      "prefixItems": [
+        {"type": "integer", "minimum": 1},
+        {"type": "integer", "minimum": 1}
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "source_refs": {"type": "array", "items": {"type": "object"}},
+        "source_cell_refs": {"type": "array", "items": {"type": "object"}},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": ["number", "string"]},
+        "page_range": {"$ref": "#/$defs/pageRange"}
+      },
+      "additionalProperties": true
+    },
+    "record": {
+      "type": "object",
+      "required": ["record_id", "normalized", "canonical_raw", "raw", "source"],
+      "properties": {
+        "record_id": {"type": "string", "minLength": 1},
+        "normalized": {"type": "object"},
+        "canonical_raw": {"type": "object"},
+        "raw": {"type": "object"},
+        "source": {"$ref": "#/$defs/source"},
+        "confidence": {"type": ["number", "string"]},
+        "review": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "canonicalDataset": {
+      "type": "object",
+      "required": [
+        "id", "name", "label", "type", "section_id", "csv", "row_count",
+        "grain", "primary_key", "schema_version", "storage_role", "record_path",
+        "status", "columns", "completeness", "rows"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "pattern": "^[a-z][a-z0-9_]*$"},
+        "label": {"type": "string"},
+        "type": {"type": "string", "minLength": 1},
+        "section_id": {"type": "string"},
+        "csv": {"type": "string", "pattern": "_datasets/[0-9a-z_]+\\.csv$"},
+        "row_count": {"type": "integer", "minimum": 0},
+        "grain": {"type": "string", "minLength": 1},
+        "primary_key": {"const": "record_id"},
+        "schema_version": {"const": "1.0"},
+        "storage_role": {"const": "canonical"},
+        "record_path": {"const": "rows"},
+        "status": {"enum": ["complete", "empty", "partial", "failed"]},
+        "columns": {"type": "array", "items": {"type": "object"}},
+        "completeness": {
+          "type": "object",
+          "required": ["expected_row_count", "emitted_row_count", "omitted_row_count", "verified", "basis"],
+          "properties": {
+            "expected_row_count": {"type": "integer", "minimum": 0},
+            "emitted_row_count": {"type": "integer", "minimum": 0},
+            "omitted_row_count": {"type": "integer", "minimum": 0},
+            "verified": {"type": "boolean"},
+            "basis": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        },
+        "reading_columns": {"type": "array", "items": {"type": "string"}},
+        "rows": {"type": "array", "items": {"$ref": "#/$defs/record"}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"name": {"const": "credit_accounts"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["account_id", "sequence", "account_type"],
+                      "properties": {
+                        "account_id": {"type": "string", "minLength": 1},
+                        "sequence": {"type": "integer", "minimum": 1},
+                        "account_type": {
+                          "enum": [
+                            "non_revolving_loan", "revolving_loan_subaccount",
+                            "revolving_loan_account", "credit_card", "quasi_credit_card"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "repayment_records"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["repayment_id", "account_id", "year", "month", "status"],
+                      "properties": {
+                        "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                        "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                        "status": {"enum": ["*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#"]}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "credit_lines"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {"required": ["credit_line_id", "account_identifier", "institution"]}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "inquiry_records"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["inquiry_id", "sequence", "inquiry_type", "inquiry_date", "institution", "reason"],
+                      "properties": {"inquiry_type": {"enum": ["institution", "personal"]}}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "personal_detail_source_rows"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {"required": ["source_table_row_id", "page", "table_id", "row_index", "cells"]}
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
+      "additionalProperties": true
+    }
+  }
+}

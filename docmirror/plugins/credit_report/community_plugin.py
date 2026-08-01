@@ -59,6 +59,49 @@ class CreditReportPlugin(CommunityProjector):
 
         return derive_credit_report_projection(self, parse_result, text)
 
+    def project_bundle(
+        self,
+        sealed,
+        *,
+        file_path: str = "",
+        file_id: str = "001",
+        document_id: str = "",
+    ):
+        """Apply document-variant presentation overrides inside this plugin."""
+        from docmirror.models.sealed import SealedParseResult
+        from docmirror.output.community_bundle import project_community_bundle
+        from docmirror.plugins._base.projector import load_projection_policy
+
+        if not isinstance(sealed, SealedParseResult):
+            raise TypeError(f"{type(self).__name__}.project expects SealedParseResult")
+        if not self.supports(sealed):
+            return None
+        before = sealed.integrity_fingerprint
+        read_view = sealed.to_read_view()
+        derived = self.derive(
+            read_view,
+            str(read_view.full_text or read_view.raw_text or ""),
+        )
+        policy = load_projection_policy(type(self).__module__.rsplit(".", 1)[0])
+        overrides = derived.semantic.get("community_projection_overrides")
+        if isinstance(overrides, dict):
+            for key, values in overrides.items():
+                if not isinstance(values, dict):
+                    continue
+                policy[key] = {**dict(policy.get(key) or {}), **values}
+        bundle = project_community_bundle(
+            sealed,
+            file_path=file_path,
+            file_id=file_id,
+            document_id=document_id,
+            projection_data=derived.model_dump(mode="python"),
+            projection_policy=policy,
+        )
+        bundle.render_markdown()
+        if sealed.integrity_fingerprint != before or not sealed.verify_integrity():
+            raise RuntimeError("Post-seal projector changed the sealed snapshot")
+        return bundle
+
     def reading_projection(self, parse_result):
         from docmirror.plugins.credit_report.report_profile import (
             detect_credit_report_content_mode,

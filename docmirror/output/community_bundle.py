@@ -1752,6 +1752,8 @@ class CommunityDataset:
         )
         metadata["row_count"] = emitted
         metadata["primary_key"] = "record_id"
+        metadata["storage_role"] = "canonical"
+        metadata["record_path"] = "rows"
         metadata["status"] = (
             "empty"
             if emitted == 0 and expected == 0
