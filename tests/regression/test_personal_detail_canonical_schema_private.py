@@ -7,6 +7,7 @@ import asyncio
 import json
 import re
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -42,9 +43,29 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
 
     assert payload["document"]["type"] == "personal_credit_report_detailed"
     assert semantic["domain"]["data_dictionary"]["schema_id"] == "personal_credit_report_detailed"
-    assert semantic["domain"]["data_dictionary"]["version"] == "1.0.0"
+    assert semantic["domain"]["data_dictionary"]["version"] == "1.2.0"
     assert validate_projection_payload("community", payload).valid
     assert validate_projection_payload("personal_credit_report_detailed", payload).valid
+
+    malformed = deepcopy(payload)
+    malformed_profile = next(
+        dataset for dataset in malformed["datasets"] if dataset["name"] == "personal_profile"
+    )
+    malformed_profile["rows"][0]["normalized"]["birth_date"] = {"ocr": "1981.08.15"}
+    assert not validate_projection_payload("personal_credit_report_detailed", malformed).valid
+
+    malformed = deepcopy(payload)
+    malformed_observations = next(
+        dataset
+        for dataset in malformed["datasets"]
+        if dataset["name"] == "personal_detail_field_observations"
+    )
+    malformed_observations["rows"][0]["normalized"]["observation_status"] = "maybe"
+    assert not validate_projection_payload("personal_credit_report_detailed", malformed).valid
+
+    malformed = deepcopy(payload)
+    malformed["datasets"].append(deepcopy(malformed["datasets"][0]))
+    assert not validate_projection_payload("personal_credit_report_detailed", malformed).valid
 
     expected_counts = {
         "personal_report_metadata": 1,
@@ -63,7 +84,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "postpaid_payment_history": 48,
         "personal_detail_account_events": 8,
         "personal_detail_summary_records": 13,
-        "personal_detail_summary_cells": 193,
+        "personal_detail_summary_cells": 127,
         "public_records": 10,
         "inquiry_records": 12,
         "statements": 2,
@@ -108,6 +129,8 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
 
     assert {name: datasets[name]["label"] for name in datasets} == {
         "personal_report_metadata": "个人信用报告信息",
+        "personal_profile": "个人基本资料",
+        "personal_detail_field_observations": "字段观测与不确定性",
         "identity_documents": "身份证件",
         "mobile_phone_records": "手机号码历史",
         "spouse_records": "配偶信息",
@@ -124,10 +147,19 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "personal_detail_account_events": "账户补充事件",
         "personal_detail_summary_records": "信息概要表",
         "personal_detail_summary_cells": "信息概要单元格",
+        "personal_detail_credit_summary_metrics": "信用概要业务指标",
         "public_records": "公共信息明细",
+        "tax_arrears_records": "欠税记录",
+        "civil_judgment_records": "民事判决记录",
+        "enforcement_records": "强制执行记录",
+        "administrative_penalty_records": "行政处罚记录",
+        "personal_housing_fund_records": "住房公积金参缴记录",
+        "professional_qualification_records": "执业资格记录",
+        "award_records": "行政奖励记录",
         "inquiry_records": "查询记录",
         "statements": "机构说明与本人声明",
         "annotations": "异议标注",
+        "personal_detail_dataset_status": "业务数据集存在状态",
     }
 
     sections = {section["id"]: section for section in payload["sections"]}
@@ -143,10 +175,12 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "sec_statements": ("机构说明与本人声明", "statements", [6, 6]),
         "sec_annotations": ("异议标注", "annotations", [2, 13]),
         "sec_inquiries": ("查询记录", "inquiries", [13, 13]),
+        "sec_report_explanation": ("报告说明与编制说明", "report_explanation", [14, 15]),
     }
     assert sections["sec_credit_summary"]["dataset_refs"] == [
         "ds_personal_detail_summary_records",
         "ds_personal_detail_summary_cells",
+        "ds_personal_detail_credit_summary_metrics",
     ]
     assert "ds_recovery_records" in sections["sec_credit_details"]["dataset_refs"]
     assert "ds_personal_detail_account_events" in sections["sec_credit_details"]["dataset_refs"]
@@ -183,6 +217,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
     revolving_subaccount = accounts_by_id["credit_account:revolving_loan_subaccount:1"]
     assert revolving_subaccount["credit_agreement_identifier"] == "X10114560H0001BOC22223"
     assert revolving_subaccount["overdue_principal_91_180"] == "0"
+    assert accounts_by_id["credit_account:revolving_loan_subaccount:2"].get("credit_agreement_identifier") is None
 
     revolving_account = accounts_by_id["credit_account:revolving_loan_account:1"]
     assert revolving_account["credit_agreement_identifier"] == "B11011122G0001BOC0255220"
@@ -302,9 +337,38 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
 
     summaries = [row["normalized"] for row in datasets["personal_detail_summary_records"]["rows"]]
     assert all("columns" not in row and "rows" not in row for row in summaries)
+    overdue_summary = next(row for row in summaries if row["title"] == "逾期（透支）信息汇总")
+    assert overdue_summary["source_row_count"] == 5
     summary_cells = [row["normalized"] for row in datasets["personal_detail_summary_cells"]["rows"]]
     assert all(not isinstance(value, (dict, list)) for row in summary_cells for value in row.values())
+    assert all(row.get("column_label") for row in summary_cells)
+    assert not any(row["value"] in {"账户类型", "账户数", "月份数"} for row in summary_cells)
     assert any(row["value"] == "23,505" and row["title"] == "呆账信息汇总" for row in summary_cells)
+    summary_metrics = [
+        row["normalized"] for row in datasets["personal_detail_credit_summary_metrics"]["rows"]
+    ]
+    assert all(row["mapping_status"] == "mapped" for row in summary_metrics)
+    assert all(row.get("text_value") != "--" for row in summary_metrics)
+    assert all(
+        row.get("currency") == "CNY" and row.get("amount_unit") == "yuan"
+        for row in summary_metrics
+        if row["value_type"] == "money"
+    )
+    quasi_summary_cells = [
+        row
+        for row in summary_cells
+        if row["title"] == "逾期（透支）信息汇总" and row["row_index"] == 5
+    ]
+    assert [(row["column_label"], row["value"]) for row in quasi_summary_cells] == [
+        ("账户类型", "准贷记卡账户"),
+        ("账户数", "--"),
+        ("月份数", "--"),
+        ("单月最高逾期/透支总额", "--"),
+        ("最长逾期/透支月数", "--"),
+    ]
+
+    liabilities = [row["normalized"] for row in datasets["repayment_liability_records"]["rows"]]
+    assert [row["overdue_months_or_repayment_status"] for row in liabilities] == ["N", "N", "0", "2"]
 
     public_records = [row["normalized"] for row in datasets["public_records"]["rows"]]
     assert Counter(row["record_type"] for row in public_records) == {
@@ -318,6 +382,33 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
     }
     housing_fund = next(row for row in public_records if row["record_type"] == "housing_fund")
     assert json.loads(housing_fund["content"])["monthly_contribution"] == 3000
+    typed_public_counts = {
+        "tax_arrears_records": 1,
+        "civil_judgment_records": 2,
+        "enforcement_records": 2,
+        "administrative_penalty_records": 1,
+        "personal_housing_fund_records": 1,
+        "professional_qualification_records": 2,
+        "award_records": 1,
+    }
+    assert {name: datasets[name]["row_count"] for name in typed_public_counts} == typed_public_counts
+    for name in typed_public_counts:
+        column_keys = {column["key"] for column in datasets[name]["columns"]}
+        assert all(set(row["normalized"]) <= column_keys for row in datasets[name]["rows"])
+    typed_housing_fund = datasets["personal_housing_fund_records"]["rows"][0]["normalized"]
+    assert typed_housing_fund["public_record_id"] == housing_fund["public_record_id"]
+    assert typed_housing_fund["monthly_contribution"] == "3000"
+    assert typed_housing_fund["reporting_amount_currency"] == "CNY"
+    assert typed_housing_fund["reporting_amount_unit"] == "yuan"
+
+    statuses = {
+        row["normalized"]["dataset_name"]: row["normalized"]
+        for row in datasets["personal_detail_dataset_status"]["rows"]
+    }
+    assert statuses["credit_accounts"]["observed_row_count"] == 15
+    assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
+    assert statuses["inquiry_records"]["observed_row_count"] == 12
+    assert statuses["inquiry_records"]["presence_status"] == "observed_nonempty"
 
     annotations = [row["normalized"]["text"] for row in datasets["annotations"]["rows"]]
     assert annotations == [

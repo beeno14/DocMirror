@@ -436,7 +436,16 @@ def _dataset_columns(rows: list[Any], dictionary: dict[str, Any], dataset_id: st
             column["format"] = "long_id"
         if str(info.get("display_format") or info.get("type") or "").lower() == "percentage":
             column["display_format"] = "percentage"
-        for metadata_key in ("definition", "sensitive", "display", "display_format", "aggregation"):
+        for metadata_key in (
+            "definition",
+            "sensitive",
+            "display",
+            "display_format",
+            "aggregation",
+            "logical_type",
+            "json_type",
+            "enum_ref",
+        ):
             if info.get(metadata_key) not in (None, ""):
                 column[metadata_key] = _json_safe(info[metadata_key])
         columns.append(column)
@@ -2396,6 +2405,9 @@ def project_community_bundle(
         },
         "units": dict(units),
     }
+    domain_schema = semantic_extensions.get("domain_schema")
+    if isinstance(domain_schema, dict):
+        document["domain_schema"] = _json_safe(domain_schema)
     raw_sections = [section for section in (data.get("sections") or []) if isinstance(section, dict)]
     sections = [
         _normalize_section(raw, index, page_count, projection) for index, raw in enumerate(raw_sections, start=1)
@@ -2562,13 +2574,25 @@ def project_community_bundle(
             "section_id": section_id,
             "csv": csv_path,
             "row_count": len(rows),
-            "grain": f"one row per {dataset_type}",
+            "grain": str(
+                (projection.get("dataset_grains") or {}).get(public_name)
+                or f"one row per {dataset_type}"
+            ),
             "primary_key": "record_id",
             "schema_version": "1.0",
             "status": "complete" if rows else "empty",
             "columns": _dataset_columns(rows, dictionary, key),
             "completeness": _dataset_completeness(result, key, rows, projection, data),
         }
+        representation_role = (projection.get("dataset_representation_roles") or {}).get(public_name)
+        if representation_role:
+            public["representation_role"] = str(representation_role)
+        derived_from = (projection.get("dataset_derived_from") or {}).get(public_name)
+        if isinstance(derived_from, (list, tuple)) and derived_from:
+            public["derived_from"] = [str(value) for value in derived_from if str(value)]
+        foreign_keys = (projection.get("dataset_foreign_keys") or {}).get(public_name)
+        if isinstance(foreign_keys, (list, tuple)) and foreign_keys:
+            public["foreign_keys"] = _json_safe(list(foreign_keys))
         configured_reading_columns = list(
             dataset_reading_columns.get(public_name)
             or (projection.get("reading_columns") or {}).get(public_name)

@@ -86,9 +86,14 @@ class CreditReportPlugin(CommunityProjector):
         overrides = derived.semantic.get("community_projection_overrides")
         if isinstance(overrides, dict):
             for key, values in overrides.items():
-                if not isinstance(values, dict):
-                    continue
-                policy[key] = {**dict(policy.get(key) or {}), **values}
+                if isinstance(values, dict):
+                    policy[key] = {**dict(policy.get(key) or {}), **values}
+                elif key in {"internal_fields", "internal_facts"} and isinstance(
+                    values, (list, tuple)
+                ):
+                    policy[key] = list(
+                        dict.fromkeys([*(policy.get(key) or ()), *map(str, values)])
+                    )
         bundle = project_community_bundle(
             sealed,
             file_path=file_path,
