@@ -9,7 +9,15 @@ from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailTransitionPolicy,
     build_personal_detail_extraction_context,
 )
-from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import _extract_accounts
+from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _account_heading_for_table,
+    _extract_accounts,
+    _extract_residence_records,
+    _extract_summary_datasets,
+)
+from docmirror.plugins.credit_report.scanned_business import (
+    _extract_residence_records as _extract_scanned_residence_records,
+)
 from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_accounts
 from docmirror.plugins.credit_report.shared.entity_decoder import CreditReportUnit
 
@@ -332,3 +340,200 @@ def test_scanned_account_extraction_obeys_cross_page_entity_veto() -> None:
     assert len(accounts) == 1
     assert "工作单位" not in accounts[0]["raw_detail_text"]
     assert {line["logical_page"] for line in accounts[0]["raw_detail_lines"]} == {1}
+
+
+def test_personal_detail_subsection_heading_closes_previous_account_entity() -> None:
+    first = SimpleNamespace(
+        table_id="loan-account",
+        metadata={"raw_rows": [["账户标识", "管理机构", "余额"], ["A1", "样例银行", "100"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 620, 580, 780],
+    )
+    second = SimpleNamespace(
+        table_id="revolving-account",
+        metadata={"raw_rows": [["账户标识", "管理机构", "余额"], ["B1", "样例银行", "200"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 60, 580, 220],
+    )
+    heading = SimpleNamespace(content="（三）循环贷账户一", bbox=[200, 20, 400, 45])
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                width=600,
+                height=800,
+                tables=[first],
+                texts=[],
+            ),
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=2,
+                width=600,
+                height=800,
+                tables=[second],
+                texts=[heading],
+            ),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    context = build_personal_detail_extraction_context(result)
+
+    assert context.tables_continue("loan-account", "revolving-account") is False
+    heading_unit = next(unit for unit in context.entity_context.units if unit.text == "（三）循环贷账户一")
+    assert heading_unit.kind == "heading"
+
+
+def test_native_account_extraction_treats_unknown_cross_page_mapping_as_split() -> None:
+    account = SimpleNamespace(
+        table_id="account",
+        metadata={"raw_rows": [["账户标识", "管理机构", "余额"], ["A1", "样例银行", "100"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 600, 580, 780],
+    )
+    unknown = SimpleNamespace(
+        table_id="unknown",
+        metadata={"raw_rows": [["余额"], ["999"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 100],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[account], texts=[]),
+            SimpleNamespace(page_number=2, source_page_number=2, tables=[unknown], texts=[]),
+        ],
+        tables_continue=lambda _left, _right: None,
+    )
+
+    accounts, _repayments, _events = _extract_accounts(result)
+
+    assert len(accounts) == 1
+    assert accounts[0]["balance"] == 100
+
+
+def test_summary_extraction_consumes_headerless_cross_page_fragment() -> None:
+    head = SimpleNamespace(
+        table_id="summary-head",
+        metadata={
+            "raw_rows": [
+                ["逾期（透支）信息汇总", "", "", "", ""],
+                ["账户类型", "账户数", "月份数", "单月最高逾期/透支总额", "最长逾期/透支月数"],
+                ["贷记卡账户", "2", "3", "25,484", "2"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 620, 580, 780],
+    )
+    tail = SimpleNamespace(
+        table_id="summary-tail",
+        metadata={"raw_rows": [["准贷记卡账户", "--", "--", "--", "--"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 80],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[head], texts=[]),
+            SimpleNamespace(page_number=2, source_page_number=2, tables=[tail], texts=[]),
+        ],
+        tables_continue=lambda left, right: (left, right) == ("summary-head", "summary-tail"),
+    )
+
+    records, cells = _extract_summary_datasets(result)
+
+    assert len(records) == 1
+    assert records[0]["source_row_count"] == 2
+    assert len(records[0]["source_refs"]) == 2
+    assert any(
+        cell["value"] == "准贷记卡账户" and cell["column_label"] == "账户类型" and cell["row_index"] == 2
+        for cell in cells
+    )
+    assert not any(cell["value"] == "账户类型" for cell in cells)
+
+
+def test_residence_provider_continuation_uses_entity_and_sequence_not_page_number() -> None:
+    residence = SimpleNamespace(
+        table_id="residence",
+        metadata={
+            "raw_rows": [
+                ["编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"],
+                ["7", "某市某区某路7号", "010-12345678", "租房", "2025.01.02"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 600, 580, 780],
+    )
+    provider = SimpleNamespace(
+        table_id="provider",
+        metadata={"raw_rows": [["7", "样例银行"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 80],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=10, source_page_number=10, tables=[residence]),
+            SimpleNamespace(page_number=11, source_page_number=11, tables=[provider]),
+        ],
+        tables_continue=lambda left, right: (left, right) == ("residence", "provider"),
+    )
+
+    records = _extract_residence_records(result)
+
+    assert len(records) == 1
+    assert records[0]["sequence"] == 7
+    assert records[0]["data_provider"] == "样例银行"
+
+
+def test_scanned_residence_unknown_continuation_does_not_use_structural_fallback() -> None:
+    residence = SimpleNamespace(
+        table_id="residence",
+        metadata={
+            "raw_rows": [
+                ["编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"],
+                ["1", "某市某区某路1号", "", "租房", "2025.01.02"],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    plausible_tail = SimpleNamespace(
+        table_id="plausible-tail",
+        metadata={"raw_rows": [["2", "2024.12.03 某市某区某路2号"]]},
+        headers=[],
+        rows=[],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[residence]),
+            SimpleNamespace(page_number=2, source_page_number=2, tables=[plausible_tail]),
+        ],
+        tables_continue=lambda _left, _right: None,
+    )
+
+    records = _extract_scanned_residence_records(result)
+
+    assert [record["sequence"] for record in records] == [1]
+
+
+def test_account_heading_uses_nearest_account_anchor_even_without_agreement() -> None:
+    page = SimpleNamespace(
+        height=800,
+        texts=[
+            SimpleNamespace(
+                content="账户1（授信协议标识：AGREEMENT1）",
+                bbox=[20, 20, 300, 40],
+            ),
+            SimpleNamespace(content="账户2", bbox=[20, 300, 100, 320]),
+        ],
+    )
+    table = SimpleNamespace(bbox=[20, 325, 580, 600])
+
+    assert _account_heading_for_table(page, table) == {}

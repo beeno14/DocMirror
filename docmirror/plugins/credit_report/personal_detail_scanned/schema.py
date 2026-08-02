@@ -10,6 +10,8 @@ from typing import Any
 
 PERSONAL_DETAIL_DATASET_ORDER = (
     "personal_report_metadata",
+    "personal_profile",
+    "personal_detail_field_observations",
     "identity_documents",
     "mobile_phone_records",
     "spouse_records",
@@ -26,10 +28,19 @@ PERSONAL_DETAIL_DATASET_ORDER = (
     "personal_detail_account_events",
     "personal_detail_summary_records",
     "personal_detail_summary_cells",
+    "personal_detail_credit_summary_metrics",
     "public_records",
+    "tax_arrears_records",
+    "civil_judgment_records",
+    "enforcement_records",
+    "administrative_penalty_records",
+    "personal_housing_fund_records",
+    "professional_qualification_records",
+    "award_records",
     "inquiry_records",
     "statements",
     "annotations",
+    "personal_detail_dataset_status",
 )
 
 
@@ -43,7 +54,7 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
     dictionary.update(
         {
             "schema_id": "personal_credit_report_detailed",
-            "version": "1.0.0",
+            "version": "1.2.0",
             "definitions": {
                 "authoritative_business_records": "datasets[*].rows",
                 "canonical_record_identity": "record_id",
@@ -55,15 +66,83 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
                     "A missing normalized value is omitted or null. Source '--' remains in "
                     "canonical_raw and is never converted to numeric zero."
                 ),
+                "absence_policy": (
+                    "Empty business datasets are never proof of business absence. "
+                    "personal_detail_dataset_status distinguishes explicitly_empty, "
+                    "not_observed, extraction_failed, partial, and not_applicable."
+                ),
+                "uncertainty_policy": (
+                    "personal_detail_field_observations is scoped-exhaustive for the declared "
+                    "personal_profile fields. Other datasets are not assessed unless explicitly "
+                    "declared. Nullable confidence means the source supplied no field confidence."
+                ),
                 "date_policy": "Dates use ISO 8601 day or month precision; long-term is a validity enum.",
                 "amount_policy": (
-                    "Amounts are stored without thousands separators and carry explicit account and "
-                    "reporting currencies plus amount units."
+                    "Amounts are decimal strings without thousands separators and carry explicit "
+                    "currencies and units, or inherit them through declared dataset lineage."
                 ),
             },
         }
     )
+    fields = dictionary.setdefault("fields", {})
+    fields.update(
+        {
+            "gender": {"label": "性别", "type": "string"},
+            "birth_date": {"label": "出生日期", "type": "date"},
+            "employment_status": {"label": "就业状况", "type": "string"},
+            "education_level": {"label": "学历", "type": "string"},
+            "degree": {"label": "学位", "type": "string"},
+            "nationality": {"label": "国籍", "type": "string"},
+            "mobile_phone": {"label": "手机号码", "type": "string", "sensitive": True},
+            "work_phone": {"label": "单位电话", "type": "string", "sensitive": True},
+            "residence_phone": {"label": "住宅电话", "type": "string", "sensitive": True},
+            "email": {"label": "电子邮箱", "type": "string", "sensitive": True},
+            "mailing_address": {"label": "通讯地址", "type": "string", "sensitive": True},
+            "household_address": {"label": "户籍地址", "type": "string", "sensitive": True},
+        }
+    )
     datasets = dictionary.setdefault("datasets", {})
+    datasets["personal_profile"] = {
+        "definition": "One canonical row for the information subject's personal profile.",
+        "columns": {
+            "personal_profile_id": {"label": "个人资料记录ID", "type": "string"},
+            "subject_name": {"label": "姓名", "type": "string"},
+            "primary_id_type": {"label": "主证件类型", "type": "string"},
+            "primary_id_number": {"label": "主证件号码", "type": "long_id", "sensitive": True},
+            "gender": {"label": "性别", "type": "string"},
+            "birth_date": {"label": "出生日期", "type": "date"},
+            "marital_status": {"label": "婚姻状况", "type": "string"},
+            "employment_status": {"label": "就业状况", "type": "string"},
+            "education_level": {"label": "学历", "type": "string"},
+            "degree": {"label": "学位", "type": "string"},
+            "nationality": {"label": "国籍", "type": "string"},
+            "mobile_phone": {"label": "手机号码", "type": "string", "sensitive": True},
+            "work_phone": {"label": "单位电话", "type": "string", "sensitive": True},
+            "residence_phone": {"label": "住宅电话", "type": "string", "sensitive": True},
+            "email": {"label": "电子邮箱", "type": "string", "sensitive": True},
+            "mailing_address": {"label": "通讯地址", "type": "string", "sensitive": True},
+            "household_address": {"label": "户籍地址", "type": "string", "sensitive": True},
+        },
+    }
+    datasets["personal_detail_field_observations"] = {
+        "definition": (
+            "One row per field-level observation when a business value is observed, normalized, "
+            "corrected, inferred, ambiguous, unreadable, absent, or not observed."
+        ),
+        "columns": {
+            "field_observation_id": {"label": "字段观测记录ID", "type": "string"},
+            "dataset_name": {"label": "业务数据集", "type": "string"},
+            "business_record_id": {"label": "业务记录ID", "type": "string"},
+            "field_name": {"label": "字段名", "type": "string"},
+            "raw_value": {"label": "源观测值", "type": "text"},
+            "normalized_value": {"label": "规范值", "type": "text"},
+            "observation_status": {"label": "观测状态", "type": "enum"},
+            "confidence": {"label": "字段置信度", "type": "decimal"},
+            "confidence_status": {"label": "置信度可用状态", "type": "enum"},
+            "confidence_basis": {"label": "置信度依据", "type": "string"},
+            "reason": {"label": "状态原因", "type": "text"},
+        },
+    }
     datasets["personal_report_metadata"]["columns"].update(
         {
             "query_institution": {"label": "查询机构", "type": "string"},
@@ -202,6 +281,7 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
             "effective_date": {"label": "生效日期", "type": "date"},
             "reporting_amount_currency": {"label": "报告金额币种", "type": "enum"},
             "reporting_amount_unit": {"label": "报告金额单位", "type": "string"},
+            "currency": {"label": "币种", "type": "enum", "enum_ref": "currency_code"},
             "validity_type": {"label": "有效期类型", "type": "enum"},
         }
     )
@@ -213,6 +293,7 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
         "label": "账户标识",
         "type": "string",
     }
+    datasets["repayment_records"]["columns"]["status"]["enum_ref"] = "repayment_status_code"
     datasets["repayment_liability_records"]["definition"] = (
         "One row per personal or enterprise related-repayment-responsibility account."
     )
@@ -287,6 +368,39 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
             "value": {"label": "单元格值", "type": "string"},
         },
     }
+    datasets["postpaid_payment_history"]["columns"]["status"]["enum_ref"] = (
+        "postpaid_payment_status_code"
+    )
+    datasets["personal_detail_credit_summary_metrics"] = {
+        "definition": (
+            "One typed metric per source summary cell. The row and column coordinates, business "
+            "category, source value, numeric value, and reporting status remain distinct."
+        ),
+        "columns": {
+            "credit_summary_metric_id": {"label": "信用概要指标ID", "type": "string"},
+            "summary_record_id": {"label": "汇总记录ID", "type": "string"},
+            "summary_type": {"label": "汇总类型", "type": "string"},
+            "summary_code": {"label": "稳定汇总代码", "type": "enum"},
+            "title": {"label": "汇总标题", "type": "string"},
+            "source_table_id": {"label": "源表ID", "type": "string"},
+            "row_index": {"label": "业务行序号", "type": "integer"},
+            "column_index": {"label": "列序号", "type": "integer"},
+            "metric_name": {"label": "指标名称", "type": "string"},
+            "metric_code": {"label": "稳定指标代码", "type": "enum"},
+            "mapping_status": {"label": "代码映射状态", "type": "enum"},
+            "row_dimension_name": {"label": "行维度名称", "type": "string"},
+            "row_dimension_value": {"label": "行维度值", "type": "text"},
+            "business_category": {"label": "业务类别", "type": "string"},
+            "source_value": {"label": "源报告值", "type": "text"},
+            "value_type": {"label": "指标值类型", "type": "enum"},
+            "numeric_value": {"label": "规范数值", "type": "decimal"},
+            "text_value": {"label": "规范文本值", "type": "text"},
+            "date_value": {"label": "规范日期值", "type": "date"},
+            "reporting_status": {"label": "报告状态", "type": "enum"},
+            "currency": {"label": "币种", "type": "enum", "enum_ref": "currency_code"},
+            "amount_unit": {"label": "金额单位", "type": "enum", "enum_ref": "amount_unit"},
+        },
+    }
     datasets["statements"] = {
         "definition": "One row per institution explanation or information-subject statement.",
         "columns": {
@@ -333,6 +447,167 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
         "One row per typed public record; record_type includes tax, judgment, enforcement, "
         "administrative penalty, housing fund, professional qualification, and award records."
     )
+    for typed_public_dataset in (
+        "tax_arrears_records",
+        "civil_judgment_records",
+        "enforcement_records",
+        "administrative_penalty_records",
+    ):
+        datasets[typed_public_dataset]["columns"]["public_record_id"] = {
+            "label": "公共记录源ID",
+            "type": "string",
+        }
+    datasets["personal_housing_fund_records"] = {
+        "definition": "One row per personal housing-fund contribution record.",
+        "columns": {
+            "personal_housing_fund_id": {"label": "住房公积金记录ID", "type": "string"},
+            "public_record_id": {"label": "公共记录源ID", "type": "string"},
+            "sequence": {"label": "序号", "type": "integer"},
+            "employer": {"label": "缴存单位", "type": "string"},
+            "contribution_location": {"label": "缴存地", "type": "string"},
+            "participation_date": {"label": "开户日期", "type": "date"},
+            "first_contribution_month": {"label": "初缴月份", "type": "string"},
+            "paid_through_month": {"label": "缴至月份", "type": "string"},
+            "payment_status": {"label": "当前缴存状态", "type": "enum"},
+            "monthly_contribution": {"label": "月缴存额", "type": "money", "unit": "yuan"},
+            "personal_contribution_ratio": {"label": "个人缴存比例", "type": "string"},
+            "employer_contribution_ratio": {"label": "单位缴存比例", "type": "string"},
+            "information_updated_month": {"label": "信息更新月份", "type": "string"},
+            "reporting_amount_currency": {"label": "报告金额币种", "type": "enum", "enum_ref": "currency_code"},
+            "reporting_amount_unit": {"label": "报告金额单位", "type": "string"},
+        },
+    }
+    datasets["professional_qualification_records"] = {
+        "definition": "One row per reported professional qualification.",
+        "columns": {
+            "professional_qualification_id": {"label": "执业资格记录ID", "type": "string"},
+            "public_record_id": {"label": "公共记录源ID", "type": "string"},
+            "sequence": {"label": "序号", "type": "integer"},
+            "qualification_name": {"label": "执业资格名称", "type": "string"},
+            "level": {"label": "资格等级", "type": "string"},
+            "issuing_authority": {"label": "颁发机构", "type": "string"},
+            "authority_location": {"label": "机构所在地", "type": "string"},
+            "obtained_date": {"label": "取得日期", "type": "date"},
+            "expiry_date": {"label": "到期日期", "type": "date"},
+            "revocation_date": {"label": "吊销日期", "type": "date"},
+        },
+    }
+    datasets["award_records"] = {
+        "definition": "One row per reported administrative or public award.",
+        "columns": {
+            "award_record_id": {"label": "行政奖励记录ID", "type": "string"},
+            "public_record_id": {"label": "公共记录源ID", "type": "string"},
+            "sequence": {"label": "序号", "type": "integer"},
+            "authority": {"label": "奖励机构", "type": "string"},
+            "award_content": {"label": "奖励内容", "type": "text"},
+            "effective_date": {"label": "生效日期", "type": "date"},
+            "end_date": {"label": "截止日期", "type": "date"},
+        },
+    }
+    for typed_public_dataset in (
+        "tax_arrears_records",
+        "civil_judgment_records",
+        "enforcement_records",
+        "administrative_penalty_records",
+        "personal_housing_fund_records",
+        "professional_qualification_records",
+        "award_records",
+    ):
+        datasets[typed_public_dataset]["columns"]["unmapped_content"] = {
+            "label": "未映射源内容",
+            "type": "text",
+        }
+    datasets["personal_detail_dataset_status"] = {
+        "definition": (
+            "One row per expected business dataset. A missing dataset is not a zero-record "
+            "business fact unless presence_status is explicitly_empty with source evidence."
+        ),
+        "columns": {
+            "dataset_status_id": {"label": "数据集状态记录ID", "type": "string"},
+            "dataset_name": {"label": "业务数据集", "type": "string"},
+            "applicability": {"label": "适用性", "type": "enum"},
+            "presence_status": {"label": "存在状态", "type": "enum"},
+            "observed_row_count": {"label": "已观测行数", "type": "integer"},
+            "source_statement": {"label": "源文状态声明", "type": "text"},
+            "confidence": {"label": "状态置信度", "type": "decimal"},
+            "reason": {"label": "状态原因", "type": "text"},
+        },
+    }
+    dictionary.setdefault("enums", {}).update(
+        {
+            "observation_status": {
+                "observed": "直接观测",
+                "normalized": "规范化",
+                "ocr_corrected": "OCR纠正",
+                "inferred": "推断",
+                "ambiguous": "存在歧义",
+                "unreadable": "无法辨认",
+                "not_observed": "未观测到",
+                "explicitly_absent": "源文明确缺失",
+                "not_applicable": "不适用",
+            },
+            "presence_status": {
+                "observed_nonempty": "已观测且非空",
+                "explicitly_empty": "源文明示无记录",
+                "not_applicable": "不适用",
+                "not_observed": "未观测到",
+                "partial": "部分观测",
+                "extraction_failed": "提取失败",
+                "unknown": "未知",
+            },
+            "value_type": {
+                "integer": "整数",
+                "decimal": "小数",
+                "money": "金额",
+                "percentage": "百分比",
+                "date": "日期",
+                "text": "文本",
+                "placeholder": "未报告占位符",
+            },
+            "confidence_status": {
+                "available": "可用",
+                "not_available": "源未提供字段置信度",
+            },
+            "mapping_status": {"mapped": "已映射", "unmapped": "未映射"},
+            "currency_code": {"CNY": "人民币"},
+            "amount_unit": {"yuan": "元"},
+            "repayment_status_code": {
+                "*": "本月没有还款历史",
+                "N": "正常",
+                "1": "逾期1至30天",
+                "2": "逾期31至60天",
+                "3": "逾期61至90天",
+                "4": "逾期91至120天",
+                "5": "逾期121至150天",
+                "6": "逾期151至180天",
+                "7": "逾期180天以上",
+                "A": "信用卡因调整账单日本月不出单",
+                "B": "呆账",
+                "C": "结清或销户（依账户类型解释）",
+                "D": "担保人代还",
+                "G": "结束",
+                "M": "约定还款日后月底前还款",
+                "Z": "以资抵债",
+                "#": "账户已开立但当月状态未知",
+                "unknown": "源状态无法可靠识别（非报告代码）",
+            },
+            "postpaid_payment_status_code": {
+                "*": "服务已开通但本月不需缴费",
+                "N": "正常",
+                "0": "欠费超过宽限期不足1个月",
+                "1": "欠费超过宽限期1个月不足2个月",
+                "2": "欠费超过宽限期2个月不足3个月",
+                "3": "欠费超过宽限期3个月不足4个月",
+                "4": "欠费超过宽限期4个月不足5个月",
+                "5": "欠费超过宽限期5个月不足6个月",
+                "6": "欠费超过宽限期6个月以上",
+                "C": "正常销户（结清后的销户）",
+                "G": "结束（非正常结清的销户）",
+                "#": "未知：没有此期数据",
+                "unknown": "源状态无法可靠识别（非报告代码）",
+            },
+        }
+    )
     return dictionary
 
 
@@ -345,18 +620,161 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
     semantic = credit_report_semantic_extensions(report_subtype="personal_detail")
     semantic["dataset_document_order"] = list(PERSONAL_DETAIL_DATASET_ORDER)
     semantic["community_projection_overrides"] = {
+        "internal_fields": [
+            f"personal_detail_expected_{name}_count"
+            for name in (
+                "personal_profile",
+                "personal_detail_field_observations",
+                "personal_detail_credit_summary_metrics",
+                "tax_arrears_records",
+                "civil_judgment_records",
+                "enforcement_records",
+                "administrative_penalty_records",
+                "personal_housing_fund_records",
+                "professional_qualification_records",
+                "award_records",
+                "personal_detail_dataset_status",
+            )
+        ],
         "dataset_labels": {
             "personal_report_metadata": "个人信用报告信息",
+            "personal_profile": "个人基本资料",
+            "personal_detail_field_observations": "字段观测与不确定性",
             "credit_accounts": "信贷交易账户明细",
             "credit_lines": "授信协议信息",
             "repayment_records": "月度还款记录",
             "overdue_records": "逾期明细（派生）",
+            "personal_detail_credit_summary_metrics": "信用概要业务指标",
             "public_records": "公共信息明细",
+            "tax_arrears_records": "欠税记录",
+            "civil_judgment_records": "民事判决记录",
+            "enforcement_records": "强制执行记录",
+            "administrative_penalty_records": "行政处罚记录",
+            "personal_housing_fund_records": "住房公积金参缴记录",
+            "professional_qualification_records": "执业资格记录",
+            "award_records": "行政奖励记录",
             "statements": "机构说明与本人声明",
+            "personal_detail_dataset_status": "业务数据集存在状态",
         },
         "section_markers": {
+            "personal_profile": ["basic_information"],
+            "personal_detail_field_observations": ["basic_information"],
+            "personal_detail_credit_summary_metrics": ["credit_summary"],
+            "tax_arrears_records": ["public_records"],
+            "civil_judgment_records": ["public_records"],
+            "enforcement_records": ["public_records"],
+            "administrative_penalty_records": ["public_records"],
+            "personal_housing_fund_records": ["public_records"],
+            "professional_qualification_records": ["public_records"],
+            "award_records": ["public_records"],
+            "personal_detail_dataset_status": ["basic_information"],
             "statements": ["statements", "notes"],
             "annotations": ["annotations", "notes"],
+        },
+        "dataset_representation_roles": {
+            "personal_profile": "business_canonical",
+            "personal_detail_credit_summary_metrics": "business_canonical",
+            "tax_arrears_records": "business_canonical",
+            "civil_judgment_records": "business_canonical",
+            "enforcement_records": "business_canonical",
+            "administrative_penalty_records": "business_canonical",
+            "personal_housing_fund_records": "business_canonical",
+            "professional_qualification_records": "business_canonical",
+            "award_records": "business_canonical",
+            "personal_detail_field_observations": "control",
+            "personal_detail_dataset_status": "control",
+            "personal_detail_summary_cells": "source_canonical",
+            "public_records": "source_canonical",
+        },
+        "dataset_grains": {
+            "personal_profile": "one row per information subject in the report",
+            "personal_detail_field_observations": "one row per declared personal-profile field",
+            "personal_detail_credit_summary_metrics": "one row per source summary-grid cell",
+            "tax_arrears_records": "one row per tax-arrears public record",
+            "civil_judgment_records": "one row per civil-judgment public record",
+            "enforcement_records": "one row per enforcement public record",
+            "administrative_penalty_records": "one row per administrative-penalty public record",
+            "personal_housing_fund_records": "one row per housing-fund public record",
+            "professional_qualification_records": "one row per professional-qualification public record",
+            "award_records": "one row per award public record",
+            "personal_detail_dataset_status": "one row per tracked business dataset",
+        },
+        "dataset_derived_from": {
+            "personal_profile": ["personal_report_metadata", "subject_profile_facts"],
+            "personal_detail_field_observations": ["subject_profile_facts"],
+            "personal_detail_credit_summary_metrics": [
+                "personal_detail_summary_records",
+                "personal_detail_summary_cells",
+            ],
+            "tax_arrears_records": ["public_records"],
+            "civil_judgment_records": ["public_records"],
+            "enforcement_records": ["public_records"],
+            "administrative_penalty_records": ["public_records"],
+            "personal_housing_fund_records": ["public_records"],
+            "professional_qualification_records": ["public_records"],
+            "award_records": ["public_records"],
+            "personal_detail_dataset_status": ["final_assembled_business_datasets"],
+        },
+        "dataset_foreign_keys": {
+            "personal_detail_field_observations": [
+                {
+                    "columns": ["business_record_id"],
+                    "reference_dataset": "personal_profile",
+                    "reference_columns": ["record_id"],
+                }
+            ],
+            "repayment_records": [
+                {
+                    "columns": ["account_id"],
+                    "reference_dataset": "credit_accounts",
+                    "reference_columns": ["record_id"],
+                }
+            ],
+            "personal_detail_credit_summary_metrics": [
+                {
+                    "columns": ["summary_record_id"],
+                    "reference_dataset": "personal_detail_summary_records",
+                    "reference_columns": ["summary_record_id"],
+                }
+            ],
+            **{
+                name: [
+                    {
+                        "columns": ["public_record_id"],
+                        "reference_dataset": "public_records",
+                        "reference_columns": ["public_record_id"],
+                    }
+                ]
+                for name in (
+                    "tax_arrears_records",
+                    "civil_judgment_records",
+                    "enforcement_records",
+                    "administrative_penalty_records",
+                    "personal_housing_fund_records",
+                    "professional_qualification_records",
+                    "award_records",
+                )
+            },
+        },
+        "completeness": {
+            name: {
+                "basis": "domain_fact_count",
+                "count_key": f"personal_detail_expected_{name}_count",
+                "public_basis": "contract_projection_count",
+            }
+            for name in (
+                "personal_profile",
+                "personal_detail_field_observations",
+                "personal_detail_credit_summary_metrics",
+                "tax_arrears_records",
+                "civil_judgment_records",
+                "enforcement_records",
+                "administrative_penalty_records",
+                "personal_housing_fund_records",
+                "professional_qualification_records",
+                "award_records",
+                "personal_detail_dataset_status",
+            )
         },
     }
     semantic["dataset_reading_columns"] = {
@@ -368,6 +786,31 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "primary_id_number",
             "query_institution",
             "query_reason",
+        ],
+        "personal_profile": [
+            "subject_name",
+            "primary_id_type",
+            "primary_id_number",
+            "gender",
+            "birth_date",
+            "marital_status",
+            "employment_status",
+            "education_level",
+            "degree",
+            "nationality",
+            "mobile_phone",
+            "email",
+            "mailing_address",
+        ],
+        "personal_detail_field_observations": [
+            "dataset_name",
+            "field_name",
+            "observation_status",
+            "normalized_value",
+            "confidence",
+            "confidence_status",
+            "confidence_basis",
+            "reason",
         ],
         "identity_documents": ["sequence", "holder_name", "document_type", "document_number", "is_primary"],
         "mobile_phone_records": ["sequence", "mobile_phone", "information_updated_date", "data_provider"],
@@ -473,15 +916,136 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "column_label",
             "value",
         ],
+        "personal_detail_credit_summary_metrics": [
+            "summary_type",
+            "summary_code",
+            "row_dimension_name",
+            "row_dimension_value",
+            "business_category",
+            "metric_name",
+            "metric_code",
+            "mapping_status",
+            "source_value",
+            "numeric_value",
+            "value_type",
+            "reporting_status",
+            "currency",
+            "amount_unit",
+        ],
         "public_records": ["sequence", "record_type", "authority", "start_date", "end_date", "content"],
+        "tax_arrears_records": ["sequence", "tax_authority", "statistics_date", "arrears_amount"],
+        "civil_judgment_records": [
+            "sequence",
+            "filing_court",
+            "case_number",
+            "cause",
+            "filing_date",
+            "claim_subject",
+            "claim_amount",
+            "judgment_result",
+        ],
+        "enforcement_records": [
+            "sequence",
+            "court",
+            "case_number",
+            "filing_date",
+            "case_status",
+            "requested_amount",
+            "executed_amount",
+        ],
+        "administrative_penalty_records": [
+            "sequence",
+            "authority",
+            "document_number",
+            "penalty_content",
+            "penalty_amount",
+            "effective_date",
+            "end_date",
+        ],
+        "personal_housing_fund_records": [
+            "sequence",
+            "employer",
+            "contribution_location",
+            "payment_status",
+            "monthly_contribution",
+            "paid_through_month",
+        ],
+        "professional_qualification_records": [
+            "sequence",
+            "qualification_name",
+            "level",
+            "issuing_authority",
+            "obtained_date",
+            "expiry_date",
+        ],
+        "award_records": ["sequence", "authority", "award_content", "effective_date", "end_date"],
         "inquiry_records": ["sequence", "inquiry_date", "institution", "reason", "inquiry_type"],
         "statements": ["note_type", "text", "added_date", "source_page"],
         "annotations": ["note_type", "text", "added_date", "source_page"],
+        "personal_detail_dataset_status": [
+            "dataset_name",
+            "applicability",
+            "presence_status",
+            "observed_row_count",
+            "reason",
+        ],
+    }
+    semantic["personal_detail_contract"] = {
+        "canonical_profile_dataset": "personal_profile",
+        "canonical_credit_summary_dataset": "personal_detail_credit_summary_metrics",
+        "canonical_public_record_datasets": [
+            "tax_arrears_records",
+            "civil_judgment_records",
+            "enforcement_records",
+            "administrative_penalty_records",
+            "personal_housing_fund_records",
+            "professional_qualification_records",
+            "award_records",
+        ],
+        "absence_dataset": "personal_detail_dataset_status",
+        "uncertainty_dataset": "personal_detail_field_observations",
+        "absence_requires_explicit_source_evidence": True,
+        "empty_dataset_means_absent": False,
+        "uncertainty_coverage": {
+            "mode": "scoped_exhaustive",
+            "covered_dataset": "personal_profile",
+            "covered_fields": [
+                "gender",
+                "birth_date",
+                "marital_status",
+                "employment_status",
+                "education_level",
+                "degree",
+                "nationality",
+                "mobile_phone",
+                "work_phone",
+                "residence_phone",
+                "email",
+                "mailing_address",
+                "household_address",
+            ],
+            "unlisted_dataset_default": "not_assessed",
+            "confidence_policy": "nullable_when_source_confidence_unavailable",
+        },
+        "codebooks": {
+            "repayment_records.status": "repayment_status_code",
+            "postpaid_payment_history.status": "postpaid_payment_status_code",
+            "source_pages": [14, 15],
+        },
+    }
+    semantic["domain_schema"] = {
+        "id": "personal_credit_report_detailed",
+        "version": "1.2.0",
+        "contract_uri": (
+            "https://valuemapglobal.github.io/DocMirror/schemas/"
+            "personal_credit_report_detailed.schema.json"
+        ),
+        "compatibility": "additive-over-1.1; community-v3-envelope",
     }
     semantic.setdefault("rendering_contract", {}).update(
         {
             "authoritative_business_records": "datasets[*].rows",
-            "domain_specific_schema": "personal_credit_report_detailed.v1",
+            "domain_specific_schema": "personal_credit_report_detailed.v1.2",
             "do_not_union_representations": True,
         }
     )

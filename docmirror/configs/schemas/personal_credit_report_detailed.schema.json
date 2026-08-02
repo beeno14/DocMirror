@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://valuemapglobal.github.io/DocMirror/schemas/personal_credit_report_detailed.schema.json",
-  "title": "DocMirror Personal Detailed Credit Report v1",
+  "title": "DocMirror Personal Detailed Credit Report v1.2",
   "description": "Domain contract for individual detailed credit reports. datasets[*].rows is the sole canonical business-record storage.",
   "type": "object",
   "additionalProperties": false,
@@ -38,7 +38,18 @@
           },
           "additionalProperties": false
         },
-        "units": {"type": "object"}
+        "units": {"type": "object"},
+        "domain_schema": {
+          "type": "object",
+          "required": ["id", "version", "contract_uri", "compatibility"],
+          "properties": {
+            "id": {"const": "personal_credit_report_detailed"},
+            "version": {"const": "1.2.0"},
+            "contract_uri": {"type": "string", "format": "uri"},
+            "compatibility": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": true
     },
@@ -92,6 +103,11 @@
       },
       "additionalProperties": false
     },
+    "nullableString": {"type": ["string", "null"]},
+    "decimalString": {
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]+(?:\\.[0-9]+)?$"
+    },
     "canonicalDataset": {
       "type": "object",
       "required": [
@@ -127,6 +143,23 @@
           "additionalProperties": false
         },
         "reading_columns": {"type": "array", "items": {"type": "string"}},
+        "representation_role": {
+          "enum": ["source_canonical", "business_canonical", "control"]
+        },
+        "derived_from": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "foreign_keys": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["columns", "reference_dataset", "reference_columns"],
+            "properties": {
+              "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+              "reference_dataset": {"type": "string", "minLength": 1},
+              "reference_columns": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+            },
+            "additionalProperties": false
+          }
+        },
         "rows": {"type": "array", "items": {"$ref": "#/$defs/record"}}
       },
       "allOf": [
@@ -144,7 +177,7 @@
                         "sequence": {"type": "integer", "minimum": 1},
                         "account_type": {
                           "enum": [
-                            "non_revolving_loan", "revolving_loan_subaccount",
+                            "non_revolving_loan", "revolving_loan", "revolving_loan_subaccount",
                             "revolving_loan_account", "credit_card", "quasi_credit_card"
                           ]
                         }
@@ -168,7 +201,7 @@
                       "properties": {
                         "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
                         "month": {"type": "integer", "minimum": 1, "maximum": 12},
-                        "status": {"enum": ["*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#"]}
+                        "status": {"enum": ["*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#", "unknown"]}
                       }
                     }
                   }
@@ -185,6 +218,27 @@
                 "items": {
                   "properties": {
                     "normalized": {"required": ["credit_line_id", "account_identifier", "institution"]}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "postpaid_payment_history"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["postpaid_payment_history_id", "postpaid_record_id", "year", "month", "status"],
+                      "properties": {
+                        "year": {"type": "integer", "minimum": 1900, "maximum": 2200},
+                        "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                        "status": {"enum": ["*", "N", "0", "1", "2", "3", "4", "5", "6", "C", "G", "#", "unknown"]}
+                      }
+                    }
                   }
                 }
               }
@@ -216,6 +270,162 @@
                 "items": {
                   "properties": {
                     "normalized": {"required": ["source_table_row_id", "page", "table_id", "row_index", "cells"]}
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "personal_profile"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "minItems": 1,
+                "maxItems": 1,
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["personal_profile_id"],
+                      "properties": {
+                        "personal_profile_id": {"type": "string", "minLength": 1},
+                        "birth_date": {"type": ["string", "null"], "pattern": "^[0-9]{4}[-.][0-9]{2}[-.][0-9]{2}$"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "personal_detail_field_observations"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": [
+                        "field_observation_id", "dataset_name", "business_record_id",
+                        "field_name", "observation_status"
+                      ],
+                      "properties": {
+                        "dataset_name": {"const": "personal_profile"},
+                        "observation_status": {
+                          "enum": [
+                            "observed", "normalized", "ocr_corrected", "inferred", "ambiguous",
+                            "unreadable", "not_observed", "explicitly_absent", "not_applicable"
+                          ]
+                        },
+                        "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                        "confidence_status": {"enum": ["available", "not_available"]},
+                        "confidence_basis": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "personal_detail_credit_summary_metrics"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": [
+                        "credit_summary_metric_id", "summary_record_id", "row_index", "column_index",
+                        "metric_name", "source_value", "value_type", "reporting_status"
+                      ],
+                      "properties": {
+                        "value_type": {"enum": ["integer", "decimal", "money", "percentage", "date", "text", "placeholder"]},
+                        "reporting_status": {"enum": ["reported", "not_reported"]},
+                        "mapping_status": {"enum": ["mapped", "unmapped"]},
+                        "numeric_value": {"$ref": "#/$defs/decimalString"},
+                        "text_value": {"$ref": "#/$defs/nullableString"},
+                        "date_value": {"type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}(?:-[0-9]{2})?$"},
+                        "currency": {"type": ["string", "null"], "pattern": "^[A-Z]{3}$"},
+                        "amount_unit": {"enum": ["yuan", null]}
+                      },
+                      "allOf": [
+                        {
+                          "if": {
+                            "properties": {
+                              "value_type": {"const": "placeholder"},
+                              "mapping_status": {"enum": ["mapped", "unmapped"]}
+                            },
+                            "required": ["value_type", "mapping_status"]
+                          },
+                          "then": {"properties": {"reporting_status": {"const": "not_reported"}, "text_value": {"type": "null"}}}
+                        },
+                        {
+                          "if": {"properties": {"value_type": {"const": "money"}}, "required": ["value_type"]},
+                          "then": {"properties": {"currency": {"const": "CNY"}, "amount_unit": {"const": "yuan"}}}
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"name": {"const": "personal_detail_dataset_status"}}, "required": ["name"]},
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "required": ["dataset_status_id", "dataset_name", "applicability", "presence_status", "observed_row_count", "reason"],
+                      "properties": {
+                        "applicability": {"enum": ["applicable", "not_applicable", "unknown"]},
+                        "presence_status": {
+                          "enum": ["observed_nonempty", "explicitly_empty", "not_applicable", "not_observed", "partial", "extraction_failed", "unknown"]
+                        },
+                        "observed_row_count": {"type": "integer", "minimum": 0}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "name": {
+                "enum": [
+                  "tax_arrears_records", "civil_judgment_records", "enforcement_records",
+                  "administrative_penalty_records", "personal_housing_fund_records"
+                ]
+              }
+            },
+            "required": ["name"]
+          },
+          "then": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "properties": {
+                    "normalized": {
+                      "properties": {
+                        "arrears_amount": {"$ref": "#/$defs/decimalString"},
+                        "claim_amount": {"$ref": "#/$defs/decimalString"},
+                        "requested_amount": {"$ref": "#/$defs/decimalString"},
+                        "executed_amount": {"$ref": "#/$defs/decimalString"},
+                        "penalty_amount": {"$ref": "#/$defs/decimalString"},
+                        "monthly_contribution": {"$ref": "#/$defs/decimalString"},
+                        "reporting_amount_currency": {"type": ["string", "null"], "pattern": "^[A-Z]{3}$"},
+                        "reporting_amount_unit": {"enum": ["yuan", null]}
+                      }
+                    }
                   }
                 }
               }

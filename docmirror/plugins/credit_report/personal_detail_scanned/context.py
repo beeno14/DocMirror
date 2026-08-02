@@ -63,6 +63,13 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
 _ACCOUNT_ANCHOR_RE = re.compile(r"(?:账户|业务)\s*[（(]?\s*(\d{1,3})\s*[）)]?")
+_BUSINESS_HEADING_RE = re.compile(
+    r"^(?:"
+    r"[（(][一二三四五六七八九十]+[）)].{0,24}"
+    r"|账户\s*\d{1,3}(?:[（(].{0,80}[）)])?"
+    r"|授信协议\s*\d{1,3}"
+    r")$"
+)
 _CONTINUATIONS = frozenset(
     {"same_table", "table_to_text_related", "text_to_table_related", "same_text_section"}
 )
@@ -149,7 +156,9 @@ def _geometry_owner(
 
 def _kind(text: str) -> UnitKind:
     compact = _compact(text).strip(":：")
-    if any(marker in compact and len(compact) <= len(marker) + 12 for marker in _SECTION_MARKERS):
+    if any(marker in compact and len(compact) <= len(marker) + 12 for marker in _SECTION_MARKERS) or (
+        len(compact) <= 96 and _BUSINESS_HEADING_RE.fullmatch(compact)
+    ):
         return "heading"
     if _NUMBERED_RE.match(str(text or "")):
         return "ledger"
@@ -236,6 +245,13 @@ class PersonalDetailTransitionPolicy:
             signals[continuation.action].append(
                 f"personal_detail_family_continues:{left_family}:{right_family}"
             )
+            if crosses_page and {left_family, right_family} <= {"account", "repayment"}:
+                # One account card is composed of several differently shaped
+                # grids. A page break can therefore change column count and
+                # header schema without opening a new business entity.
+                weights[continuation.action] *= 2.25
+                weights[split_action] *= 0.50
+                signals[continuation.action].append("personal_detail_account_card_continues")
 
         if hard_split:
             weights[continuation.action] *= 0.01

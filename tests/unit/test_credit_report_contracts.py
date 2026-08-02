@@ -4,6 +4,13 @@
 """Cross-variant credit-report schema integrity tests."""
 
 from docmirror.plugins.credit_report.contracts import CONTENT_MODE_SCANNED
+from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
+    apply_personal_detail_contract,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+    PERSONAL_DETAIL_DATASET_ORDER,
+    personal_detail_semantic_extensions,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
 )
@@ -38,9 +45,177 @@ def test_scanned_variant_forwards_precomputed_auxiliary_records() -> None:
     )
 
     assert content["facts"]["subject_profile"]["subject_name"]["value"] == "示例"
-    assert set(content["datasets"]) == {
+    assert {
         "residence_records",
         "employment_records",
         "statements",
         "annotations",
+    } <= set(content["datasets"])
+    assert "personal_profile" in content["datasets"]
+    assert "personal_detail_field_observations" in content["datasets"]
+    assert "personal_detail_dataset_status" in content["datasets"]
+
+
+def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_uncertainty() -> None:
+    variant = PersonalDetailScannedVariant()
+    dictionary = variant.data_dictionary()
+    datasets = dictionary["datasets"]
+    semantic = personal_detail_semantic_extensions()
+
+    assert dictionary["version"] == "1.2.0"
+    assert {
+        "gender",
+        "birth_date",
+        "employment_status",
+        "education_level",
+        "degree",
+        "nationality",
+        "mobile_phone",
+        "work_phone",
+        "residence_phone",
+        "email",
+        "mailing_address",
+        "household_address",
+    } <= set(dictionary["fields"])
+    assert {
+        "personal_profile",
+        "personal_detail_credit_summary_metrics",
+        "tax_arrears_records",
+        "civil_judgment_records",
+        "enforcement_records",
+        "administrative_penalty_records",
+        "personal_housing_fund_records",
+        "professional_qualification_records",
+        "award_records",
+        "personal_detail_dataset_status",
+        "personal_detail_field_observations",
+    } <= set(datasets)
+    assert set(PERSONAL_DETAIL_DATASET_ORDER) <= set(datasets)
+    for dataset_name, reading_columns in semantic["dataset_reading_columns"].items():
+        assert set(reading_columns) <= set(datasets[dataset_name]["columns"]), dataset_name
+    contract = semantic["personal_detail_contract"]
+    assert contract["canonical_profile_dataset"] == "personal_profile"
+    assert contract["canonical_credit_summary_dataset"] == "personal_detail_credit_summary_metrics"
+    assert contract["absence_dataset"] == "personal_detail_dataset_status"
+    assert contract["uncertainty_dataset"] == "personal_detail_field_observations"
+    assert contract["absence_requires_explicit_source_evidence"] is True
+    assert contract["empty_dataset_means_absent"] is False
+    assert semantic["domain_schema"]["version"] == "1.2.0"
+    assert semantic["personal_detail_contract"]["uncertainty_coverage"]["mode"] == (
+        "scoped_exhaustive"
+    )
+    assert dictionary["datasets"]["repayment_records"]["columns"]["status"]["enum_ref"] == (
+        "repayment_status_code"
+    )
+
+
+def test_personal_detail_contract_projects_values_without_inventing_absence() -> None:
+    content = {
+        "facts": {
+            "subject_name": "示例用户",
+            "subject_profile": {
+                "gender": {"value": "女", "raw": "女"},
+                "birth_date": {"value": "1980-11-04", "raw": "1980.11.04"},
+            },
+            "personal_detail_dataset_states": {
+                "spouse_records": {
+                    "presence_status": "explicitly_empty",
+                    "source_statement": "配偶信息：无",
+                }
+            },
+        },
+        "datasets": {
+            "personal_report_metadata": [
+                {
+                    "personal_report_metadata_id": "metadata:1",
+                    "subject_name": "示例用户",
+                    "primary_id_type": "身份证",
+                    "primary_id_number": "110101198011040000",
+                }
+            ],
+            "personal_detail_summary_records": [
+                {
+                    "summary_record_id": "summary:1",
+                    "summary_type": "account_count",
+                    "title": "信贷交易信息提示",
+                    "source_table_id": "table:1",
+                }
+            ],
+            "personal_detail_summary_cells": [
+                {
+                    "summary_cell_id": "cell:1",
+                    "summary_record_id": "summary:1",
+                    "summary_type": "account_count",
+                    "title": "信贷交易信息提示",
+                    "row_index": 1,
+                    "column_index": 1,
+                    "column_label": "账户类型",
+                    "value": "贷款",
+                },
+                {
+                    "summary_cell_id": "cell:2",
+                    "summary_record_id": "summary:1",
+                    "summary_type": "account_count",
+                    "title": "信贷交易信息提示",
+                    "row_index": 1,
+                    "column_index": 2,
+                    "column_label": "账户数",
+                    "value": "23,505",
+                },
+            ],
+        },
     }
+    auxiliary = {
+        "public_records": [
+            {
+                "public_record_id": "public:1",
+                "sequence": 1,
+                "record_type": "housing_fund",
+                "authority": "示例单位",
+                "content": {
+                    "employer": "示例单位",
+                    "monthly_contribution": 3000,
+                    "payment_status": "缴交",
+                },
+            }
+        ]
+    }
+
+    projected = apply_personal_detail_contract(
+        content,
+        auxiliary,
+        final_dataset_counts={"credit_accounts": 15, "inquiry_records": 12},
+    )
+    datasets = projected["datasets"]
+    profile = datasets["personal_profile"][0]
+    assert profile["subject_name"] == "示例用户"
+    assert profile["birth_date"] == "1980-11-04"
+
+    observations = {row["field_name"]: row for row in datasets["personal_detail_field_observations"]}
+    assert observations["gender"]["observation_status"] == "observed"
+    assert observations["birth_date"]["observation_status"] == "normalized"
+    assert observations["work_phone"]["observation_status"] == "not_observed"
+    assert observations["work_phone"]["confidence_status"] == "not_available"
+    assert observations["birth_date"]["normalized_value"] == "1980-11-04"
+
+    metrics = datasets["personal_detail_credit_summary_metrics"]
+    account_count = next(row for row in metrics if row["metric_name"] == "账户数")
+    assert account_count["row_dimension_name"] == "账户类型"
+    assert account_count["row_dimension_value"] == "贷款"
+    assert account_count["business_category"] == "贷款"
+    assert account_count["numeric_value"] == "23505"
+    assert account_count["reporting_status"] == "reported"
+    assert account_count["metric_code"] == "account_count"
+
+    housing_fund = datasets["personal_housing_fund_records"][0]
+    assert housing_fund["public_record_id"] == "public:1"
+    assert housing_fund["monthly_contribution"] == 3000
+
+    statuses = {row["dataset_name"]: row for row in datasets["personal_detail_dataset_status"]}
+    assert statuses["public_records"]["presence_status"] == "observed_nonempty"
+    assert statuses["credit_accounts"]["observed_row_count"] == 15
+    assert statuses["inquiry_records"]["observed_row_count"] == 12
+    assert statuses["mobile_phone_records"]["presence_status"] == "not_observed"
+    assert statuses["mobile_phone_records"]["reason"] == "no_explicit_absence_evidence"
+    assert statuses["spouse_records"]["presence_status"] == "explicitly_empty"
+    assert statuses["spouse_records"]["source_statement"] == "配偶信息：无"

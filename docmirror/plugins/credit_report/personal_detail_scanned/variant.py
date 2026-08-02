@@ -98,7 +98,73 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             normalized = record.get("normalized")
             if isinstance(normalized, dict) and not normalized.get("account_identifier"):
                 normalized["account_identifier"] = record.get("account_identifier")
+        from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
+            project_typed_public_records,
+        )
+
+        reporting_currency: str | None = None
+        reporting_amount_unit: str | None = None
+        content_loader = getattr(variant_input, "section_content", None)
+        if callable(content_loader):
+            source_content = cast(dict[str, Any], content_loader(full_text))
+            metadata_rows = (source_content.get("datasets") or {}).get("personal_report_metadata") or []
+            if metadata_rows:
+                metadata = metadata_rows[0].get("normalized", metadata_rows[0])
+                if isinstance(metadata, dict):
+                    reporting_currency = str(metadata.get("reporting_currency") or "").strip() or None
+                    reporting_amount_unit = str(metadata.get("reporting_amount_unit") or "").strip() or None
+        for dataset_name, records in project_typed_public_records(
+            assembled.get("public_records"),
+            reporting_currency=reporting_currency,
+            reporting_amount_unit=reporting_amount_unit,
+        ).items():
+            if records:
+                assembled[dataset_name] = records
+        setattr(
+            variant_input,
+            "_personal_detail_final_dataset_counts",
+            {
+                name: sum(isinstance(record, dict) for record in records)
+                for name, records in assembled.items()
+                if isinstance(records, list)
+            },
+        )
         return assembled
+
+    def business_dataset_copies(
+        self,
+        assembled: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Publish typed public-record views derived from the common envelope."""
+        typed_names = (
+            "tax_arrears_records",
+            "civil_judgment_records",
+            "enforcement_records",
+            "administrative_penalty_records",
+            "personal_housing_fund_records",
+            "professional_qualification_records",
+            "award_records",
+        )
+        return {
+            name: list(assembled.get(name) or [])
+            for name in typed_names
+            if assembled.get(name)
+        }
+
+    def finalize_datasets(self, datasets: dict[str, list[dict[str, Any]]]) -> None:
+        """Reconcile the absence ledger against the rows that will be published."""
+        for status_row in datasets.get("personal_detail_dataset_status") or []:
+            dataset_name = str(status_row.get("dataset_name") or "")
+            if not dataset_name:
+                continue
+            observed_count = len(datasets.get(dataset_name) or [])
+            status_row["observed_row_count"] = observed_count
+            if observed_count:
+                status_row["presence_status"] = "observed_nonempty"
+                status_row["reason"] = "records_projected"
+            elif status_row.get("presence_status") == "observed_nonempty":
+                status_row["presence_status"] = "not_observed"
+                status_row["reason"] = "no_explicit_absence_evidence"
 
     def refine_domain_facts(
         self,
@@ -134,6 +200,10 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         auxiliary_business: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Use the complete personal-detail parser for every detailed report."""
+        from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
+            apply_personal_detail_contract,
+        )
+
         auxiliary = auxiliary_business or {}
         if not getattr(parse_result, "pages", None):
             facts: dict[str, Any] = {}
@@ -144,10 +214,12 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                 for name in ("residence_records", "employment_records", "statements", "annotations")
                 if auxiliary.get(name)
             }
-            return {
+            return apply_personal_detail_contract({
                 **({"facts": facts} if facts else {}),
                 **({"datasets": datasets} if datasets else {}),
-            }
+            }, auxiliary, final_dataset_counts=getattr(
+                parse_result, "_personal_detail_final_dataset_counts", {}
+            ))
         from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
             extract_personal_detail_section_content,
         )
@@ -165,7 +237,13 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         for name in ("residence_records", "employment_records", "statements", "annotations"):
             if not datasets.get(name) and auxiliary.get(name):
                 datasets[name] = list(auxiliary[name])
-        return content
+        return apply_personal_detail_contract(
+            content,
+            auxiliary,
+            final_dataset_counts=getattr(
+                parse_result, "_personal_detail_final_dataset_counts", {}
+            ),
+        )
 
     def data_dictionary(self) -> dict[str, Any]:
         """Describe the datasets exposed only by the personal detailed variant."""
@@ -181,7 +259,7 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         page_count = len(getattr(parse_result, "pages", None) or [])
         if page_count < 13:
             return super().build_sections(parse_result, "")
-        return (
+        sections = (
             {
                 "id": "sec_personal_basic",
                 "title": "个人基本信息",
@@ -239,6 +317,17 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                 "page_end": 13,
             },
         )
+        if page_count >= 15:
+            sections += (
+                {
+                    "id": "sec_report_explanation",
+                    "title": "报告说明与编制说明",
+                    "type": "report_explanation",
+                    "page_start": 14,
+                    "page_end": 15,
+                },
+            )
+        return sections
 
     def semantic_extensions(self) -> dict[str, Any]:
         """Declare datasets as the detailed report's canonical storage."""

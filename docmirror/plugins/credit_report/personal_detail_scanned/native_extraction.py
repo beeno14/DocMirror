@@ -92,6 +92,7 @@ _ACCOUNT_LABELS = frozenset(
         "主业务借款人证件类型",
         "主业务借款人证件号码",
         "还款状态",
+        "逾期月数",
         "机构名称",
         "业务类型",
         "业务开通日期",
@@ -568,7 +569,7 @@ def _account_heading_for_table(page: Any, table: Any) -> dict[str, str]:
     for text_block in getattr(page, "texts", None) or []:
         text = _clean(getattr(text_block, "content", "") or getattr(text_block, "text", "") or "")
         compact_text = _compact(text)
-        if "卡片尾号" not in compact_text and "授信协议标识" not in compact_text:
+        if not re.match(r"^(?:账户|业务)\s*\d{1,3}", compact_text):
             continue
         text_bbox = getattr(text_block, "bbox", None) or []
         bottom = float(text_bbox[3]) if len(text_bbox) == 4 else 0.0
@@ -576,7 +577,12 @@ def _account_heading_for_table(page: Any, table: Any) -> dict[str, str]:
             candidates.append((bottom, text))
     if not candidates:
         return {}
-    text = _compact(max(candidates, key=lambda item: item[0])[1])
+    bottom, raw_text = max(candidates, key=lambda item: item[0])
+    page_height = float(getattr(page, "height", 0.0) or 0.0)
+    maximum_gap = max(72.0, page_height * 0.10) if page_height else 72.0
+    if table_top != float("inf") and table_top - bottom > maximum_gap:
+        return {}
+    text = _compact(raw_text)
     tail = re.search(r"卡片尾号[：:]?([0-9]{4})", text)
     agreement = re.search(r"授信协议标识[：:]?([A-Z0-9]+)", text, re.IGNORECASE)
     return {
@@ -718,10 +724,14 @@ def _extract_accounts(
 
             logical_page = int(getattr(page, "page_number", 0) or 0)
             crosses_page = bool(current_logical_page and logical_page != current_logical_page)
-            if current is not None and crosses_page and callable(continuation_check):
+            if current is not None and crosses_page:
                 candidate_table_id = str(getattr(table, "table_id", "") or "")
-                continuation = continuation_check(current_table_id, candidate_table_id)
-                if continuation is False:
+                continuation = (
+                    continuation_check(current_table_id, candidate_table_id)
+                    if callable(continuation_check)
+                    else None
+                )
+                if continuation is not True:
                     current = None
                     pending_labels = None
                     current_table_id = ""
@@ -1071,6 +1081,8 @@ def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
 def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
     records: dict[int, dict[str, Any]] = {}
     provider_rows: dict[int, tuple[str, dict[str, Any]]] = {}
+    residence_table_id = ""
+    continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "page_number", 0) or 0)
         source_page = int(getattr(page, "source_page_number", 0) or page_number)
@@ -1090,6 +1102,7 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                 None,
             )
             if header_index is not None:
+                residence_table_id = str(getattr(table, "table_id", "") or residence_table_id)
                 for row_index, row in enumerate(rows[header_index + 1 :], start=header_index + 1):
                     values = _nonempty(row)
                     if len(values) < 5 or not values[0].isdigit():
@@ -1110,7 +1123,14 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                         "source_refs": [_source_ref(page, table, row=row_index)],
                         "confidence": 1.0,
                     }
-            if page_number == 2 and len(rows) >= 5:
+            table_id = str(getattr(table, "table_id", "") or "")
+            if (
+                records
+                and residence_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(residence_table_id, table_id) is True
+            ):
                 candidates: dict[int, tuple[str, dict[str, Any]]] = {}
                 for row_index, row in enumerate(rows):
                     values = _nonempty(row)
@@ -1118,8 +1138,8 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                         candidates = {}
                         break
                     candidates[int(values[0])] = (values[1], _source_ref(page, table, row=row_index))
-                if set(candidates) == set(range(1, 6)):
-                    provider_rows = candidates
+                if candidates and set(candidates) <= set(records):
+                    provider_rows.update(candidates)
     for sequence, record in records.items():
         provider = provider_rows.get(sequence)
         if provider:
@@ -1458,75 +1478,170 @@ def _extract_postpaid_payment_history(parse_result: Any) -> list[dict[str, Any]]
     return records
 
 
+def _is_summary_anchor(rows: list[list[str]]) -> bool:
+    compact = _compact(" ".join(cell for row in rows for cell in row))
+    return bool(
+        "汇总" in compact
+        or ("账户数" in compact and "首笔业务发放月份" in compact)
+        or "最近1个月内的查询" in compact
+    )
+
+
+def _summary_title(rows: list[list[str]]) -> str:
+    compact = _compact(" ".join(cell for row in rows for cell in row))
+    return next(
+        (_clean(cell) for row in rows for cell in row if "汇总" in _compact(cell)),
+        "信用业务概要" if "首笔业务发放月份" in compact else "查询记录概要",
+    )
+
+
+def _summary_row_has_values(row: list[str]) -> bool:
+    """Distinguish business rows from textual/group header rows."""
+    for value in row:
+        compact = _compact(value)
+        if compact in {"--", "-"} or re.fullmatch(r"[-+]?\d[\d,./年月-]*", compact):
+            return True
+    return False
+
+
+def _expanded_summary_headers(row: list[str], width: int) -> list[str]:
+    values = [_clean(row[index] if index < len(row) else "") for index in range(width)]
+    populated = [index for index, value in enumerate(values) if value]
+    if not populated:
+        return [""] * width
+    expanded = [""] * width
+    for position, start in enumerate(populated):
+        end = populated[position + 1] if position + 1 < len(populated) else width
+        for column in range(start, end):
+            expanded[column] = values[start]
+    if populated[0] > 0:
+        for column in range(populated[0]):
+            expanded[column] = values[populated[0]]
+    return expanded
+
+
+def _summary_business_rows(
+    fragments: list[tuple[Any, Any, list[list[str]]]],
+) -> list[tuple[Any, Any, int, list[str], list[str]]]:
+    width = max((len(row) for _page, _table, rows in fragments for row in rows), default=0)
+    header_paths: list[list[str]] = [[] for _column in range(width)]
+    output: list[tuple[Any, Any, int, list[str], list[str]]] = []
+    for page, table, rows in fragments:
+        for source_row_index, row in enumerate(rows):
+            nonempty = _nonempty(row)
+            if len(nonempty) == 1 and "汇总" in _compact(nonempty[0]):
+                continue
+            if _summary_row_has_values(row):
+                labels = ["/".join(path) for path in header_paths]
+                output.append((page, table, source_row_index, row, labels))
+                continue
+            expanded = _expanded_summary_headers(row, width)
+            distinct = {value for value in expanded if value}
+            if len(distinct) == 1:
+                label = next(iter(distinct))
+                header_paths = [[label] for _column in range(width)]
+                continue
+            for column, label in enumerate(expanded):
+                if label and (not header_paths[column] or header_paths[column][-1] != label):
+                    header_paths[column].append(label)
+    return output
+
+
 def _extract_summary_datasets(
     parse_result: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Represent each summary grid and each populated grid cell with scalar fields."""
+    """Project logical summary grids, including headerless cross-page fragments."""
     records: list[dict[str, Any]] = []
     cells: list[dict[str, Any]] = []
+    physical: list[tuple[Any, Any, list[list[str]]]] = []
     for page in getattr(parse_result, "pages", None) or []:
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            if not rows:
-                continue
-            compact = _compact(" ".join(cell for row in rows for cell in row))
+            if rows:
+                physical.append((page, table, rows))
+
+    continuation_check = getattr(parse_result, "tables_continue", None)
+    consumed: set[int] = set()
+    for index, (page, table, rows) in enumerate(physical):
+        if index in consumed or not _is_summary_anchor(rows):
+            continue
+        fragments = [(page, table, rows)]
+        anchor_width = max((len(row) for row in rows), default=0)
+        cursor = index + 1
+        while cursor < len(physical):
+            next_page, next_table, next_rows = physical[cursor]
+            if _is_summary_anchor(next_rows):
+                break
+            previous_page, previous_table, _previous_rows = fragments[-1]
+            previous_page_number = int(getattr(previous_page, "page_number", 0) or 0)
+            next_page_number = int(getattr(next_page, "page_number", 0) or 0)
+            next_width = max((len(row) for row in next_rows), default=0)
+            previous_table_id = str(getattr(previous_table, "table_id", "") or "")
+            next_table_id = str(getattr(next_table, "table_id", "") or "")
             if (
-                "汇总" not in compact
-                and not ("账户数" in compact and "首笔业务发放月份" in compact)
-                and "最近1个月内的查询" not in compact
+                next_page_number != previous_page_number + 1
+                or not callable(continuation_check)
+                or continuation_check(previous_table_id, next_table_id) is not True
+                or (anchor_width and next_width != anchor_width)
             ):
-                continue
-            title = next(
-                (_clean(cell) for row in rows for cell in row if "汇总" in _compact(cell)),
-                "信用业务概要" if "首笔业务发放月份" in compact else "查询记录概要",
-            )
-            table_id = str(getattr(table, "table_id", "") or "")
-            page_number = int(getattr(page, "page_number", 0) or 0)
-            summary_id = stable_record_id("personal_detail_summary", page_number, table_id, title)
-            records.append(
-                {
-                    "record_id": summary_id,
-                    "summary_record_id": summary_id,
-                    "summary_type": re.sub(r"信息?汇总$", "", title) or title,
-                    "title": title,
-                    "source_table_id": table_id,
-                    "source_column_count": max((len(row) for row in rows), default=0),
-                    "source_row_count": max(0, len(rows) - 1),
-                    "source": "native_personal_detail_summary_table",
-                    "source_refs": [_source_ref(page, table)],
-                    "confidence": 1.0,
-                }
-            )
-            headers = list(rows[0])
-            for row_index, row in enumerate(rows[1:], start=1):
-                for column_index, value in enumerate(row, start=1):
-                    value = _clean(value)
-                    if not value:
-                        continue
-                    header = _clean(headers[column_index - 1] if column_index <= len(headers) else "")
-                    cell_id = stable_record_id(
-                        "personal_detail_summary_cell",
-                        summary_id,
-                        row_index,
-                        column_index,
-                        value,
-                    )
-                    cells.append(
-                        {
-                            "record_id": cell_id,
-                            "summary_cell_id": cell_id,
-                            "summary_record_id": summary_id,
-                            "summary_type": re.sub(r"信息?汇总$", "", title) or title,
-                            "title": title,
-                            "row_index": row_index,
-                            "column_index": column_index,
-                            "column_label": header or None,
-                            "value": value,
-                            "source": "native_personal_detail_summary_cell",
-                            "source_refs": [_source_ref(page, table, row=row_index)],
-                            "confidence": 1.0,
-                        }
-                    )
+                break
+            fragments.append((next_page, next_table, next_rows))
+            consumed.add(cursor)
+            cursor += 1
+
+        title = _summary_title(rows)
+        table_id = str(getattr(table, "table_id", "") or "")
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        summary_id = stable_record_id("personal_detail_summary", page_number, table_id, title)
+        business_rows = _summary_business_rows(fragments)
+        records.append(
+            {
+                "record_id": summary_id,
+                "summary_record_id": summary_id,
+                "summary_type": re.sub(r"信息?汇总$", "", title) or title,
+                "title": title,
+                "source_table_id": table_id,
+                "source_column_count": max(
+                    (len(row) for _fragment_page, _fragment_table, fragment_rows in fragments for row in fragment_rows),
+                    default=0,
+                ),
+                "source_row_count": len(business_rows),
+                "source": "native_personal_detail_summary_table",
+                "source_refs": [_source_ref(fragment_page, fragment_table) for fragment_page, fragment_table, _ in fragments],
+                "confidence": 1.0,
+            }
+        )
+        for logical_row_index, (source_page, source_table, source_row_index, row, labels) in enumerate(
+            business_rows, start=1
+        ):
+            for column_index, value in enumerate(row, start=1):
+                value = _clean(value)
+                if not value:
+                    continue
+                header = labels[column_index - 1] if column_index <= len(labels) else ""
+                cell_id = stable_record_id(
+                    "personal_detail_summary_cell",
+                    summary_id,
+                    logical_row_index,
+                    column_index,
+                    value,
+                )
+                cells.append(
+                    {
+                        "record_id": cell_id,
+                        "summary_cell_id": cell_id,
+                        "summary_record_id": summary_id,
+                        "summary_type": re.sub(r"信息?汇总$", "", title) or title,
+                        "title": title,
+                        "row_index": logical_row_index,
+                        "column_index": column_index,
+                        "column_label": header or None,
+                        "value": value,
+                        "source": "native_personal_detail_summary_cell",
+                        "source_refs": [_source_ref(source_page, source_table, row=source_row_index)],
+                        "confidence": 1.0,
+                    }
+                )
     return records, cells
 
 

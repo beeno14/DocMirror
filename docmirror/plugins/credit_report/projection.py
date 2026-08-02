@@ -289,6 +289,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
                                 ref.pop("node_id", None)
                                 ref.pop("node_ids", None)
                 datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
+    variant.finalize_datasets(datasets)
     domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
         dict.fromkeys(

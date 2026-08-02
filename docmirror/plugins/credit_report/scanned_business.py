@@ -256,6 +256,10 @@ def _normalized_header(value: Any) -> str:
 
 def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
     records: dict[int, dict[str, Any]] = {}
+    residence_table_id = ""
+    residence_page_number: int | None = None
+    residence_source_page_number: int | None = None
+    continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", []) or []:
         for table in getattr(page, "tables", []) or []:
             matrix = _table_matrix(table)
@@ -263,6 +267,9 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                 continue
             headers = [_normalized_header(value) for value in matrix[0]]
             if "居住地址" in headers and "信息更新日期" in headers:
+                residence_table_id = str(getattr(table, "table_id", "") or residence_table_id)
+                residence_page_number = int(getattr(page, "page_number", 0) or 0)
+                residence_source_page_number = int(getattr(page, "source_page_number", 0) or 0)
                 for row_index, row in enumerate(matrix[1:], start=1):
                     sequence_match = re.search(r"\d+", str(row[0] if row else ""))
                     if not sequence_match:
@@ -295,22 +302,83 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                     }
                 continue
 
-            # The residence table is split by the physical-page boundary.  Its
-            # final two rows arrive as a two-column continuation table.
+            table_id = str(getattr(table, "table_id", "") or "")
+            if not records or not residence_table_id or not table_id:
+                continue
+
+            candidate_rows = [
+                row
+                for row in matrix
+                if len(row) >= 2 and re.fullmatch(r"\d+", str(row[0] or "").strip())
+            ]
+            if callable(continuation_check):
+                # A present continuation graph is authoritative. In particular,
+                # an unknown decision must not silently become a join.
+                continues = continuation_check(residence_table_id, table_id) is True
+            else:
+                # Raw ParseResult callers predate the continuation graph. Keep a
+                # deliberately narrow structural fallback for adjacent logical
+                # pages (including two logical pages from one source-page image).
+                page_number = int(getattr(page, "page_number", 0) or 0)
+                source_page_number = int(getattr(page, "source_page_number", 0) or 0)
+                existing_max = max(records)
+                sequences = [int(str(row[0]).strip()) for row in candidate_rows]
+                adjacent = (
+                    residence_page_number is not None
+                    and (
+                        page_number == residence_page_number + 1
+                        or (
+                            residence_source_page_number is not None
+                            and source_page_number == residence_source_page_number
+                            and page_number > residence_page_number
+                        )
+                    )
+                )
+                rows_are_residence_like = bool(candidate_rows) and all(
+                    _DATE_RE.search(str(row[1] or ""))
+                    and len(_DATE_RE.sub("", str(row[1] or "")).strip()) >= 6
+                    for row in candidate_rows
+                )
+                continues = (
+                    adjacent
+                    and rows_are_residence_like
+                    and len(sequences) == len(set(sequences))
+                    and all(sequence > existing_max for sequence in sequences)
+                )
+            if not continues:
+                continue
+
+            # A headerless continuation may carry more residence rows or the
+            # provider subtable. Link by decoded entity and sequence, never by
+            # a fixture-specific page or ordinal.
             for row_index, row in enumerate(matrix):
                 if len(row) < 2:
                     continue
                 sequence_text = str(row[0] or "").strip()
-                if not re.fullmatch(r"[45]", sequence_text):
+                if not re.fullmatch(r"\d+", sequence_text):
                     continue
                 raw_text = str(row[1] or "").strip()
                 date = _DATE_RE.search(raw_text)
-                if not date or not re.search(r"[省市县区镇村路号]", raw_text):
+                sequence = int(sequence_text)
+                ref_list = [
+                    _source_ref(page, table, row_index, col_index)
+                    for col_index, value in enumerate(row)
+                    if str(value or "").strip()
+                ]
+                address_tail = _DATE_RE.sub("", raw_text).strip()
+                is_residence_row = bool(date) and (
+                    bool(re.search(r"[省市县区镇村路号]", raw_text))
+                    or (not callable(continuation_check) and len(address_tail) >= 6)
+                )
+                if not is_residence_row:
+                    if sequence in records and raw_text and not _is_placeholder(raw_text):
+                        records[sequence]["values"]["数据发生机构名称"] = raw_text
+                        records[sequence]["raw_values"]["provider_continuation"] = raw_text
+                        records[sequence]["source_refs"].extend(ref_list)
                     continue
                 address = _DATE_RE.sub(" ", raw_text)
                 address = re.sub(r"[\"'“”‘’*#=]+", " ", address)
                 address = re.sub(r"\s+", " ", address).strip()
-                sequence = int(sequence_text)
                 values = {
                     "编号": sequence_text,
                     "居住地址": address,
@@ -321,11 +389,7 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                     "sequence": sequence,
                     "values": values,
                     "raw_values": {"continuation_row": raw_text},
-                    "source_refs": [
-                        _source_ref(page, table, row_index, col_index)
-                        for col_index, value in enumerate(row)
-                        if str(value or "").strip()
-                    ],
+                    "source_refs": ref_list,
                     "audit": {"cross_page_continuation": True},
                 }
     return [records[key] for key in sorted(records)]
@@ -922,10 +986,8 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
                 break
             previous = flattened[index - 1]
             candidate = flattened[index]
-            if (
-                callable(continuation_check)
-                and int(previous.get("page") or 0) != int(candidate.get("page") or 0)
-                and continuation_check(
+            if callable(continuation_check) and int(previous.get("page") or 0) != int(candidate.get("page") or 0):
+                continuation = continuation_check(
                     int(previous.get("page") or 0),
                     previous,
                     int(previous.get("_page_line_index") or 0),
@@ -933,10 +995,9 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
                     candidate,
                     int(candidate.get("_page_line_index") or 0),
                 )
-                is False
-            ):
-                end = index
-                break
+                if continuation is not True:
+                    end = index
+                    break
         detail_lines = flattened[start:end]
         anchor_text = str(anchor.get("text") or anchor.get("content") or "")
         match = _ACCOUNT_LINE_RE.search(anchor_text)

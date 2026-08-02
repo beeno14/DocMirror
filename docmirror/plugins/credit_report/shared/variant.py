@@ -46,6 +46,10 @@ class CreditReportVariantAdapter:
         del assembled
         return {}
 
+    def finalize_datasets(self, datasets: dict[str, list[dict[str, Any]]]) -> None:
+        """Apply a variant-owned final contract pass after all dataset merges."""
+        del datasets
+
     def content_mode_is_expected(self, content_mode: str) -> bool:
         """Report whether routing received the variant's normal source mode."""
         return content_mode in self.expected_content_modes
