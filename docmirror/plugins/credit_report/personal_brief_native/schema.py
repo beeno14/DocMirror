@@ -44,6 +44,10 @@ def personal_brief_data_dictionary() -> dict[str, Any]:
     for field_name in ("amount_unit", "reporting_amount_unit"):
         enums[field_name] = dict(amount_unit_labels)
 
+    dictionary["datasets"]["personal_report_metadata"]["columns"][
+        "marital_status"
+    ] = deepcopy(dictionary["fields"]["marital_status"])
+
     enums["is_primary"] = {"true": "是", "false": "否"}
     enums["summary_scope"] = {
         "source_reported": "源报告",

@@ -9,6 +9,13 @@ import re
 from typing import Any
 
 
+_MARITAL_STATUS_CODES = {
+    "未婚": "unmarried",
+    "已婚": "married",
+    "离婚": "divorced",
+}
+
+
 def _personal_brief_blocks(parse_result: Any) -> list[tuple[int, str]]:
     blocks: list[tuple[int, str]] = []
     entity_context = getattr(parse_result, "entity_context", None)
@@ -120,6 +127,7 @@ def _personal_header_datasets(
     name_match = re.search(r"姓名[:：]([^:：]+?)(?=证件类型[:：])", compact)
     id_type_match = re.search(r"证件类型[:：]([^:：]+?)(?=证件号码[:：])", compact)
     id_number_match = re.search(r"证件号码[:：]([A-Za-z0-9*]+)", compact)
+    marital_status_match = re.search(r"(?:婚姻状况[:：]?)?(未婚|已婚|离婚)", compact)
     report_time = (
         f"{int(report_time_match.group(1)):04d}-{int(report_time_match.group(2)):02d}-"
         f"{int(report_time_match.group(3)):02d}T{int(report_time_match.group(4)):02d}:"
@@ -131,6 +139,11 @@ def _personal_header_datasets(
     subject_name = name_match.group(1) if name_match else None
     primary_id_type = id_type_match.group(1) if id_type_match else None
     primary_id_number = id_number_match.group(1) if id_number_match else None
+    marital_status = (
+        _MARITAL_STATUS_CODES[marital_status_match.group(1)]
+        if marital_status_match
+        else None
+    )
     page = blocks[0][0] if blocks else 1
     identity_documents: list[dict[str, Any]] = []
     if primary_id_type and primary_id_number:
@@ -191,6 +204,7 @@ def _personal_header_datasets(
             "subject_name": subject_name,
             "primary_id_type": primary_id_type,
             "primary_id_number": primary_id_number,
+            "marital_status": marital_status,
             **amount_policy,
             "source": "personal_brief_header",
             "source_refs": _source_refs(page, "native_text_header"),
