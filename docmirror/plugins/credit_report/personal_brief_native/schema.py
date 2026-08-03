@@ -47,6 +47,22 @@ def personal_brief_data_dictionary() -> dict[str, Any]:
     dictionary["datasets"]["personal_report_metadata"]["columns"][
         "marital_status"
     ] = deepcopy(dictionary["fields"]["marital_status"])
+    dictionary["fields"]["marital_status_raw"] = {
+        "label": "婚姻状况原文",
+        "type": "string",
+        "definition": "源报告中婚姻状况的原始标签，用于保留未来或未枚举值。",
+    }
+    dictionary["datasets"]["personal_report_metadata"]["columns"][
+        "marital_status_raw"
+    ] = deepcopy(dictionary["fields"]["marital_status_raw"])
+    enums["marital_status"] = {
+        "unmarried": "未婚",
+        "married": "已婚",
+        "divorced": "离婚",
+        "widowed": "丧偶",
+        "other": "其他",
+        "not_reported": "未说明",
+    }
 
     enums["is_primary"] = {"true": "是", "false": "否"}
     enums["summary_scope"] = {

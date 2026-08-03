@@ -149,6 +149,7 @@ def materialize_credit_repayment_micro_grids(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     line_list = list(lines or [])
     anchor_indices = [
@@ -166,6 +167,7 @@ def materialize_credit_repayment_micro_grids(
             page_image=page_image,
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            extra_status_chars=extra_status_chars,
             grid_index=grid_index,
         )
         grid = out.get("micro_grid")
@@ -188,6 +190,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
     *,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Materialize credit-only grids on a post-seal read view."""
     from docmirror.models.mirror.page_evidence_bundles import (
@@ -205,6 +208,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
             page_height=evidence.get("page_height"),
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            extra_status_chars=extra_status_chars,
         )
         if grids:
             merge_micro_grid_structures_into_bundles(domain_specific, grids)

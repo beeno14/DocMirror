@@ -28,8 +28,9 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
-_DATE_TOKEN_RE = re.compile(r"(?<!\d)(20\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
-_DATE_LOOSE_RE = re.compile(r"(?<!\d)(20\d{2})[.,/-]?(\d{2})[.,/-](\d{2})(?!\d)")
+_DATE_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
+_DATE_LOOSE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[.,/-]?(\d{2})[.,/-](\d{2})(?!\d)")
+_MONTH_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})(?![\d./-])")
 _DATETIME_DIGITS_RE = re.compile(r"(?<!\d)(20\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})(?!\d)")
 _CN_ID_RE = re.compile(r"^\d{17}[0-9X]$")
 _MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
@@ -58,15 +59,48 @@ _INQUIRY_REASON_MARKERS = _VALID_INQUIRY_REASONS + (
     "贷后智理",
 )
 _INSTITUTION_SUFFIX_RE = re.compile(
-    r"[\u3400-\u9fff（）()·]{2,80}?(?:"
+    r"[A-Za-z0-9\u3400-\u9fff（）()·]{2,100}?(?:"
     r"银行卡业务部[（(]牡丹卡中心[）)]|信用卡中心|个人信贷部|"
-    r"(?:福州|厦门|福建省|温泉|鼓楼|晋安|华林)[\u3400-\u9fff]{0,6}支行|"
-    r"(?:福州|厦门市|福建省)[\u3400-\u9fff]{0,4}分行|"
-    r"农村信用合作联社|股份有限公司|有限责任公司|有限公司|管理中心"
+    r"支行|分行|"
+    r"农村信用合作联社|农村信用社联合社|股份有限公司|股份公司|有限责任公司|有限公司|管理中心"
     r")"
 )
 _LEADING_ROW_NOISE_RE = re.compile(r"^[\s\W_]*(?:[A-Za-z\u3400-\u9fff]{1,2}\s+)?(?=\d{0,3}\s*20\d{2})")
 _TRAILING_INSTITUTION_NOISE_RE = re.compile(r"(?:\s+[A-Za-z0-9￥¥?$]{1,3})+$")
+_REPAYMENT_STATUSES = frozenset({"*", "/", "N", "A", "C", "M", "B", "D", "Z", "G", "#", *"1234567"})
+_PLACEHOLDERS = frozenset({"-", "--"})
+_ACCOUNT_TYPE_LABELS = (
+    "非循环贷账户",
+    "循环贷账户一",
+    "循环贷账户二",
+    "贷记卡账户",
+    "准贷记卡账户",
+)
+_ACCOUNT_STATES = frozenset(
+    {
+        "正常",
+        "逾期",
+        "结清",
+        "呆账",
+        "转出",
+        "结束",
+        "冻结",
+        "止付",
+        "银行止付",
+        "销户",
+        "未激活",
+        "司法追偿",
+        "担保物不足",
+        "强制平仓",
+        "催收",
+        "open",
+        "closed",
+        "settled",
+        "transferred_out",
+        "unknown",
+    }
+)
+_FIVE_TIER_CLASSES = frozenset({"正常", "关注", "次级", "可疑", "损失", "违约", "未分类", "unknown"})
 
 _FIELD_ROLES: dict[str, str] = {
     "report_time": "report_datetime",
@@ -88,21 +122,27 @@ _FIELD_ROLES: dict[str, str] = {
     "data_provider": "institution_name",
     "数据发生机构名称": "institution_name",
     "信息更新日期": "date",
-    "open_date": "date",
-    "due_date": "date",
-    "snapshot_date": "date",
-    "close_date": "date",
+    "open_date": "date_or_month",
+    "due_date": "date_or_month",
+    "snapshot_date": "date_or_month",
+    "close_date": "date_or_month",
     "inquiry_date": "date",
     "birth_date": "date",
-    "event_date": "date",
-    "repayment_date": "date",
+    "event_date": "date_or_month",
+    "repayment_date": "date_or_month",
     "balance": "amount",
     "loan_amount": "amount",
     "credit_limit": "amount",
     "used_amount": "amount",
     "overdue_amount": "amount",
-    "status": "repayment_status",
     "repayment_status": "repayment_status",
+    "account_state": "account_state",
+    "account_lifecycle_state": "account_state",
+    "five_tier_class": "five_tier_class",
+    "current_overdue_periods": "nonnegative_integer",
+    "overdue_months": "nonnegative_integer",
+    "remaining_periods": "nonnegative_integer",
+    "repayment_periods": "nonnegative_integer",
 }
 _RAW_OR_PROVENANCE_KEYS = frozenset(
     {
@@ -141,6 +181,20 @@ class PersonalDetailCorrectionDecision:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class PersonalDetailCellAnomaly:
+    anomaly_id: str
+    stage: str
+    path: str
+    role: str
+    value: str
+    reason_codes: tuple[str, ...]
+    source_refs: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @lru_cache(maxsize=1)
 def _pack() -> dict[str, Any]:
     payload = yaml.safe_load(
@@ -160,6 +214,16 @@ def _plain_text(value: Any) -> str:
 def _valid_date(value: str) -> bool:
     try:
         datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _valid_date_or_month(value: str) -> bool:
+    if _valid_date(value):
+        return True
+    try:
+        datetime.strptime(value, "%Y-%m")
         return True
     except ValueError:
         return False
@@ -191,6 +255,18 @@ def _normalize_datetime(value: str) -> str:
     except ValueError:
         return text
     return candidate
+
+
+def _normalize_date_or_month(value: str) -> str:
+    date = _normalize_date(value)
+    if _valid_date(date):
+        return date
+    text = _plain_text(value).replace(",", ".")
+    match = _MONTH_TOKEN_RE.search(text)
+    if not match:
+        return text
+    candidate = f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
+    return candidate if _valid_date_or_month(candidate) else text
 
 
 def _cn_id_checksum_valid(value: str) -> bool:
@@ -227,6 +303,8 @@ def _normalize_identifier(value: str) -> str:
 
 def _normalize_amount(value: str) -> str:
     text = _plain_text(value).replace("，", ",").replace(",", "")
+    if text.startswith("+"):
+        text = text[1:]
     if not _AMOUNT_RE.fullmatch(text):
         substitutions = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "S": "5", "B": "8"})
         candidate = text.translate(substitutions)
@@ -237,6 +315,49 @@ def _normalize_amount(value: str) -> str:
         Decimal(text)
     except InvalidOperation:
         return _plain_text(value)
+    return text
+
+
+def _normalize_nonnegative_integer(value: str, *, allow_placeholder: bool = False) -> str:
+    text = _plain_text(value).replace(",", "").replace("，", "")
+    if allow_placeholder and text in _PLACEHOLDERS:
+        return text
+    if re.fullmatch(r"\d{1,12}", text):
+        return str(int(text))
+    unit_match = re.fullmatch(r"(\d{1,12})(?:个)?(?:月|期|次|笔|家|户)", text)
+    if unit_match:
+        return str(int(unit_match.group(1)))
+    substitutions = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "S": "5", "B": "8"})
+    candidate = text.upper().translate(substitutions)
+    if re.fullmatch(r"\d{1,12}", candidate):
+        return str(int(candidate))
+    chinese_digits = {"〇": "0", "零": "0", "一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+    if text and len(text) <= 4 and all(char in chinese_digits for char in text):
+        return str(int("".join(chinese_digits[char] for char in text)))
+    return _plain_text(value)
+
+
+def _normalize_amount_or_placeholder(value: str) -> str:
+    text = _plain_text(value)
+    return text if text in _PLACEHOLDERS else _normalize_amount(text)
+
+
+def _normalize_business_enum(value: str, candidates: Iterable[str]) -> str:
+    text = re.sub(r"\s+", "", _plain_text(value)).strip("-_:：,，;；")
+    options = tuple(dict.fromkeys(str(item) for item in candidates if item))
+    if text in options or not text:
+        return text
+    scored = sorted(
+        ((SequenceMatcher(None, text, option).ratio(), option) for option in options),
+        reverse=True,
+    )
+    if not scored:
+        return text
+    best_score, best = scored[0]
+    runner_score = scored[1][0] if len(scored) > 1 else 0.0
+    length_delta = abs(len(text) - len(best))
+    if best_score >= 0.86 and best_score - runner_score >= 0.08 and length_delta <= 2:
+        return best
     return text
 
 
@@ -256,8 +377,7 @@ def normalize_institution_name(value: str) -> str:
         trailing = text[selected_match.end() :]
         specialized_tail = re.match(
             r"(?:信用卡中心|个人信贷部|银行卡业务部[（(]牡丹卡中心[）)]|"
-            r"(?:福州|厦门|福建省|温泉|鼓楼|晋安|华林)[\u3400-\u9fff]{0,6}支行|"
-            r"(?:福州|厦门市|福建省)[\u3400-\u9fff]{0,4}分行)",
+            r"[A-Za-z0-9\u3400-\u9fff（）()·]{1,24}(?:支行|分行))",
             trailing,
         )
         if specialized_tail:
@@ -288,6 +408,8 @@ def _normalize_account_line(value: str) -> str:
 def _is_valid_for_role(value: str, role: str) -> bool:
     if role == "date":
         return _valid_date(value)
+    if role == "date_or_month":
+        return _valid_date_or_month(value)
     if role == "report_datetime":
         try:
             datetime.fromisoformat(value)
@@ -304,10 +426,22 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         return bool(_ACCOUNT_IDENTIFIER_RE.fullmatch(value))
     if role == "amount":
         return bool(_AMOUNT_RE.fullmatch(value))
+    if role == "amount_or_placeholder":
+        return value in _PLACEHOLDERS or bool(_AMOUNT_RE.fullmatch(value))
+    if role == "nonnegative_integer":
+        return bool(re.fullmatch(r"\d{1,12}", value))
+    if role == "integer_or_placeholder":
+        return value in _PLACEHOLDERS or bool(re.fullmatch(r"\d{1,12}", value))
     if role == "institution_name":
         return bool(_INSTITUTION_SUFFIX_RE.fullmatch(value) or value == "本人")
     if role == "repayment_status":
-        return value in {"N", "C", "M", "B", "D", "G", "#", "*", "1", "2", "3", "4", "5", "6", "7"}
+        return value in _REPAYMENT_STATUSES
+    if role == "account_type_label":
+        return value in _ACCOUNT_TYPE_LABELS
+    if role == "account_state":
+        return value in _ACCOUNT_STATES
+    if role == "five_tier_class":
+        return value in _FIVE_TIER_CLASSES
     if role == "inquiry_row":
         return bool(_DATE_TOKEN_RE.search(value) and any(marker in value for marker in _VALID_INQUIRY_REASONS))
     return bool(value)
@@ -316,6 +450,8 @@ def _is_valid_for_role(value: str, role: str) -> bool:
 def _normalize_role(value: str, role: str) -> str:
     if role == "date":
         return _normalize_date(value)
+    if role == "date_or_month":
+        return _normalize_date_or_month(value)
     if role == "report_datetime":
         return _normalize_datetime(value)
     if role == "identity_document_number":
@@ -328,10 +464,22 @@ def _normalize_role(value: str, role: str) -> str:
         return _normalize_identifier(value)
     if role == "amount":
         return _normalize_amount(value)
+    if role == "amount_or_placeholder":
+        return _normalize_amount_or_placeholder(value)
+    if role == "nonnegative_integer":
+        return _normalize_nonnegative_integer(value)
+    if role == "integer_or_placeholder":
+        return _normalize_nonnegative_integer(value, allow_placeholder=True)
     if role == "institution_name":
         return normalize_institution_name(value)
     if role == "repayment_status":
         return _plain_text(value).upper()
+    if role == "account_type_label":
+        return _normalize_business_enum(value, _ACCOUNT_TYPE_LABELS)
+    if role == "account_state":
+        return _normalize_business_enum(value, _ACCOUNT_STATES)
+    if role == "five_tier_class":
+        return _normalize_business_enum(value, _FIVE_TIER_CLASSES)
     if role == "inquiry_row":
         return _normalize_inquiry_line(value)
     if role == "account_line":
@@ -343,6 +491,51 @@ def _source_refs(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
         return ()
     return tuple(dict(item) for item in value if isinstance(item, dict))
+
+
+def _summary_cell_role(value: Mapping[str, Any]) -> str | None:
+    label = re.sub(r"\s+", "", _plain_text(value.get("column_label")))
+    if not label:
+        return None
+    if "账户类型" in label:
+        return "account_type_label"
+    if any(marker in label for marker in ("金额", "余额", "额度", "总额", "本金")):
+        return "amount_or_placeholder"
+    if any(marker in label for marker in ("账户数", "月份数", "月数", "笔数", "次数", "机构数", "记录数")):
+        return "integer_or_placeholder"
+    return None
+
+
+def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
+    if key == "value":
+        return _summary_cell_role(owner)
+    role = _FIELD_ROLES.get(key)
+    if role:
+        return role
+    if key == "status" and {"year", "month"} <= set(owner):
+        return "repayment_status"
+    if key.endswith("_date") and not key.endswith("_date_text"):
+        return "date_or_month"
+    if key.endswith("_amount") or key in {
+        "actual_payment",
+        "balance",
+        "credit_limit",
+        "loan_amount",
+        "maximum_overdraft_balance",
+        "maximum_used_amount",
+        "scheduled_payment",
+        "shared_credit_limit",
+        "unbilled_installment_balance",
+        "used_amount",
+    }:
+        return "amount"
+    if key.endswith(("_count", "_periods", "_months")) or key in {"sequence", "year", "month"}:
+        return "nonnegative_integer"
+    return None
+
+
+def _cell_scoped(refs: Iterable[dict[str, Any]]) -> bool:
+    return any(ref.get("geometry_scope") == "cell" for ref in refs)
 
 
 class PersonalDetailOCRCorrectionOverlay:
@@ -369,6 +562,9 @@ class PersonalDetailOCRCorrectionOverlay:
         self._targeted_requests = 0
         self._decisions: list[PersonalDetailCorrectionDecision] = []
         self._decision_keys: set[tuple[str, str, str, str]] = set()
+        self._audited_cells: set[tuple[str, str, str, str]] = set()
+        self._cell_anomalies: list[PersonalDetailCellAnomaly] = []
+        self._cell_anomaly_keys: set[tuple[str, str, str, str, str]] = set()
 
     @property
     def decisions(self) -> tuple[PersonalDetailCorrectionDecision, ...]:
@@ -383,8 +579,43 @@ class PersonalDetailOCRCorrectionOverlay:
             "applied_count": counts.get("applied", 0),
             "suggested_count": counts.get("suggested", 0),
             "targeted_ocr_requests": self._targeted_requests,
+            "audited_cell_count": len(self._audited_cells),
+            "abnormal_cell_count": len(self._cell_anomalies),
+            "cell_anomalies": [anomaly.to_dict() for anomaly in self._cell_anomalies],
             "decisions": [decision.to_dict() for decision in self._decisions],
         }
+
+    def _audit_cell(
+        self,
+        *,
+        stage: str,
+        path: str,
+        role: str,
+        value: Any,
+        refs: tuple[dict[str, Any], ...],
+        valid: bool,
+    ) -> None:
+        text = str(value or "")
+        marker = (stage, path, role, repr(refs))
+        self._audited_cells.add(marker)
+        if valid:
+            return
+        anomaly_marker = (stage, path, role, text, repr(refs))
+        if anomaly_marker in self._cell_anomaly_keys:
+            return
+        self._cell_anomaly_keys.add(anomaly_marker)
+        digest = hashlib.sha256("\x1f".join(anomaly_marker).encode("utf-8")).hexdigest()[:16]
+        self._cell_anomalies.append(
+            PersonalDetailCellAnomaly(
+                anomaly_id=f"personal_detail_cell:{digest}",
+                stage=stage,
+                path=path,
+                role=role,
+                value=text,
+                reason_codes=("role_validation_failed", "preserved_unresolved_value"),
+                source_refs=refs,
+            )
+        )
 
     def _record(
         self,
@@ -470,9 +701,14 @@ class PersonalDetailOCRCorrectionOverlay:
         if ref is None:
             return None
         if self._page_image_resolver is None:
-            from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
+            from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
+                PersonalDetailLogicalPageImageResolver,
+            )
 
-            self._page_image_resolver = LogicalPageImageResolver(self.parse_result, zoom=3.0)
+            self._page_image_resolver = PersonalDetailLogicalPageImageResolver(
+                self.parse_result,
+                zoom=3.0,
+            )
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
         rendered = self._page_image_resolver(logical_page)
         if not rendered:
@@ -576,7 +812,7 @@ class PersonalDetailOCRCorrectionOverlay:
 
     def correct_business_candidates(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
         corrected = deepcopy(dict(payload))
-        self._walk(corrected, parent=None, refs=(), stage=stage)
+        self._walk(corrected, parent="", refs=(), stage=stage)
         self._apply_institution_consensus(corrected)
         self._promote_account_identifier_candidates(corrected)
         return corrected
@@ -597,22 +833,53 @@ class PersonalDetailOCRCorrectionOverlay:
             return
         local_refs = _source_refs(value.get("source_refs")) or refs
         confidence = value.get("confidence")
+        node_id = str(
+            value.get("record_id")
+            or value.get("summary_cell_id")
+            or value.get("account_id")
+            or ""
+        )
+        base_path = f"{parent}[{node_id}]" if node_id else str(parent or "")
         for key, item in list(value.items()):
-            role = _FIELD_ROLES.get(str(key))
+            field_path = f"{base_path}.{key}".lstrip(".")
+            role = _mapping_role(value, str(key))
             if role and item not in (None, "") and not isinstance(item, (dict, list)):
+                cell_target = (
+                    stage == "native_business"
+                    and _cell_scoped(local_refs)
+                    and role in {
+                        "account_type_label",
+                        "amount_or_placeholder",
+                        "integer_or_placeholder",
+                    }
+                )
                 updated, decision = self.correct_text(
                     item,
                     role=role,
                     source_refs=local_refs,
                     confidence=float(confidence or 0.0),
-                    allow_targeted_ocr=len(local_refs) == 1 and role in {
-                        "identity_document_number",
-                        "report_datetime",
-                        "date",
-                    },
+                    allow_targeted_ocr=len(local_refs) == 1
+                    and (
+                        cell_target
+                        or role in {
+                            "identity_document_number",
+                            "report_datetime",
+                            "date",
+                            "date_or_month",
+                        }
+                    ),
                 )
                 if decision is not None:
                     value[key] = updated
+                final_value = value[key]
+                self._audit_cell(
+                    stage=stage,
+                    path=field_path,
+                    role=role,
+                    value=final_value,
+                    refs=local_refs,
+                    valid=_is_valid_for_role(str(final_value), role),
+                )
             elif isinstance(item, dict) and role and item.get("value") not in (None, ""):
                 nested_refs = _source_refs(item.get("source_refs")) or local_refs
                 updated, decision = self.correct_text(
@@ -620,13 +887,22 @@ class PersonalDetailOCRCorrectionOverlay:
                     role=role,
                     source_refs=nested_refs,
                     confidence=float(item.get("confidence") or confidence or 0.0),
-                    allow_targeted_ocr=role in {"identity_document_number", "report_datetime", "date"},
+                    allow_targeted_ocr=role
+                    in {"identity_document_number", "report_datetime", "date", "date_or_month"},
                 )
                 if decision is not None:
                     item.setdefault("raw", item["value"])
                     item["value"] = updated
+                self._audit_cell(
+                    stage=stage,
+                    path=f"{field_path}.value",
+                    role=role,
+                    value=item["value"],
+                    refs=nested_refs,
+                    valid=_is_valid_for_role(str(item["value"]), role),
+                )
             if isinstance(item, (dict, list)) and str(key) not in _RAW_OR_PROVENANCE_KEYS:
-                self._walk(item, parent=str(key), refs=local_refs, stage=stage)
+                self._walk(item, parent=field_path, refs=local_refs, stage=stage)
 
     def _apply_institution_consensus(self, payload: dict[str, Any]) -> None:
         fields: list[tuple[dict[str, Any], str, str]] = []

@@ -14,6 +14,7 @@ import json
 import os
 import re
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 PBOC_SCHEMA_ID = "personal_credit_report_detailed"
@@ -171,6 +172,25 @@ _PUBLIC_RECORD_TARGETS = {
     "administrative_award": "administrative_award_records",
 }
 
+_ACCOUNT_EVENT_TARGETS = {
+    "latest_repayment": "credit_account_latest_repayments",
+    "large_installment": "credit_card_large_installments",
+    "special_event": "credit_account_special_events",
+    "special_event_note": "credit_account_special_events",
+    "special_transaction": "credit_account_special_transactions",
+}
+
+_PUBLIC_STATUS_TARGETS = (
+    "tax_arrears_records",
+    "civil_judgment_records",
+    "enforcement_records",
+    "administrative_penalty_records",
+    "housing_fund_records",
+    "social_assistance_records",
+    "professional_qualification_records",
+    "administrative_award_records",
+)
+
 
 def _normalized(record: dict[str, Any]) -> dict[str, Any]:
     value = record.get("normalized")
@@ -234,6 +254,52 @@ def _rename_key(values: dict[str, Any], old: str, new: str) -> None:
         values[new] = values.pop(old)
 
 
+def _integer(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value or "").strip()
+    return int(text) if re.fullmatch(r"[+-]?\d+", text) else None
+
+
+def _year_month(year: Any, month: Any) -> str | None:
+    normalized_year = _integer(year)
+    normalized_month = _integer(month)
+    if normalized_year is None or normalized_month is None:
+        return None
+    if not (1 <= normalized_year <= 9999 and 1 <= normalized_month <= 12):
+        return None
+    return f"{normalized_year:04d}-{normalized_month:02d}"
+
+
+def _month_value(value: Any) -> str | None:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(\d{4})[-./](\d{1,2})(?:[-./]\d{1,2})?", text)
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not (1 <= year <= 9999 and 1 <= month <= 12):
+        return None
+    return f"{year:04d}-{month:02d}"
+
+
+def _decimal_string(value: Any) -> str | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    text = str(value).strip().replace(",", "")
+    try:
+        number = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not number.is_finite():
+        return None
+    normalized = format(number, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    return normalized or "0"
+
+
 def _report_metadata(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "personal_report_metadata_id", "report_metadata_id")
@@ -291,18 +357,30 @@ def _monthly_performance(
     _rename_key(values, "repayment_id", "monthly_performance_id")
     year = values.pop("year", None)
     month = values.pop("month", None)
-    if isinstance(year, int) and isinstance(month, int):
-        values["performance_month"] = f"{year:04d}-{month:02d}"
+    performance_month = _year_month(year, month)
+    if performance_month is not None:
+        values["performance_month"] = performance_month
+    else:
+        if year not in (None, ""):
+            values["source_year"] = year
+        if month not in (None, ""):
+            values["source_month"] = month
     _rename_key(values, "status", "status_code")
+    if values.get("status_code") not in (None, ""):
+        values["status_code"] = str(values["status_code"])
     amount = values.pop("overdue_amount", None)
     if amount not in (None, ""):
-        values["status_amount"] = amount
-        account_type = account_types.get(str(values.get("account_id") or ""), "")
-        values["status_amount_semantics"] = (
-            "overdraft_balance" if account_type == "quasi_credit_card" else "delinquent_amount"
-        )
-        values.setdefault("reporting_amount_currency", "CNY")
-        values.setdefault("reporting_amount_unit", "yuan")
+        normalized_amount = _decimal_string(amount)
+        if normalized_amount is not None:
+            values["status_amount"] = normalized_amount
+            account_type = account_types.get(str(values.get("account_id") or ""), "")
+            values["status_amount_semantics"] = (
+                "overdraft_balance" if account_type == "quasi_credit_card" else "delinquent_amount"
+            )
+            values.setdefault("reporting_amount_currency", "CNY")
+            values.setdefault("reporting_amount_unit", "yuan")
+        else:
+            values["source_status_amount"] = amount
     return values
 
 
@@ -340,9 +418,17 @@ def _monthly_postpaid(values: dict[str, Any]) -> dict[str, Any]:
     _rename_key(values, "postpaid_payment_history_id", "postpaid_monthly_performance_id")
     year = values.pop("year", None)
     month = values.pop("month", None)
-    if isinstance(year, int) and isinstance(month, int):
-        values["performance_month"] = f"{year:04d}-{month:02d}"
+    performance_month = _year_month(year, month)
+    if performance_month is not None:
+        values["performance_month"] = performance_month
+    else:
+        if year not in (None, ""):
+            values["source_year"] = year
+        if month not in (None, ""):
+            values["source_month"] = month
     _rename_key(values, "status", "status_code")
+    if values.get("status_code") not in (None, ""):
+        values["status_code"] = str(values["status_code"])
     return values
 
 
@@ -362,13 +448,9 @@ def _summary_metric(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _event_target(values: dict[str, Any]) -> str:
+def _event_target(values: dict[str, Any]) -> str | None:
     event_type = str(values.get("event_type") or "")
-    return {
-        "latest_repayment": "credit_account_latest_repayments",
-        "large_installment": "credit_card_large_installments",
-        "special_event": "credit_account_special_events",
-    }.get(event_type, "credit_account_special_transactions")
+    return _ACCOUNT_EVENT_TARGETS.get(event_type)
 
 
 def _account_event(values: dict[str, Any], target: str) -> dict[str, Any]:
@@ -407,7 +489,12 @@ def _month_precision_public(values: dict[str, Any], renames: tuple[tuple[str, st
     values = dict(values)
     for old, new in renames:
         if old in values:
-            values[new] = values.pop(old)
+            original = values.pop(old)
+            month = _month_value(original)
+            if month is not None:
+                values[new] = month
+            elif original not in (None, ""):
+                values[f"source_{old}"] = original
     return values
 
 
@@ -511,6 +598,128 @@ def _generic_public_records(
     return typed, extensions
 
 
+def _status_sources_by_target() -> dict[str, tuple[str, ...]]:
+    sources = {new: (old,) for old, new in _DIRECT_DATASET_RENAMES.items()}
+    sources.update(
+        {
+            "report_metadata": ("personal_report_metadata",),
+            "report_query": ("personal_report_metadata",),
+            "credit_accounts": ("credit_accounts",),
+            "credit_account_monthly_performance": ("repayment_records",),
+            "credit_business_overview": (
+                "personal_detail_credit_summary_metrics",
+                "personal_detail_summary_records",
+                "personal_detail_summary_cells",
+            ),
+            "credit_account_latest_repayments": ("personal_detail_account_events",),
+            "credit_account_special_transactions": ("personal_detail_account_events",),
+            "credit_account_special_events": ("personal_detail_account_events",),
+            "credit_card_large_installments": ("personal_detail_account_events",),
+            "repayment_responsibilities": ("repayment_liability_records",),
+            "annotation_statement_groups": ("statements", "annotations"),
+            "annotation_statements": ("statements", "annotations"),
+            "pboc_extension_fields": (
+                "personal_detail_account_events",
+                "personal_detail_summary_cells",
+                "public_records",
+            ),
+        }
+    )
+    for target in _PUBLIC_STATUS_TARGETS:
+        legacy_sources = sources.get(target, ())
+        sources[target] = tuple(dict.fromkeys((*legacy_sources, "public_records")))
+    return sources
+
+
+def _project_dataset_status(
+    status_rows: list[dict[str, Any]],
+    projected: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Build one schema-native status row per v2 business dataset."""
+    indexed: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for record in status_rows:
+        if not isinstance(record, dict):
+            continue
+        values = _normalized(record)
+        source_name = str(values.get("dataset_name") or "")
+        if source_name:
+            indexed.setdefault(source_name, []).append((record, values))
+
+    source_mapping = _status_sources_by_target()
+    result: list[dict[str, Any]] = []
+    for target in PBOC_DATASET_ORDER:
+        if target == "dataset_status":
+            continue
+        source_names = source_mapping.get(target, ())
+        source_rows = [item for name in source_names for item in indexed.get(name, ())]
+        source_values = [values for _record, values in source_rows]
+        observed_count = len(projected.get(target, ()))
+        source_presence = {
+            str(values.get("presence_status") or "") for values in source_values
+        }
+        if observed_count:
+            presence_status = "observed_nonempty"
+            reason = "records_projected"
+        elif "extraction_failed" in source_presence:
+            presence_status = "extraction_failed"
+            reason = "source_extraction_failed"
+        elif "partial" in source_presence:
+            presence_status = "partial"
+            reason = "source_partially_observed"
+        elif source_presence and source_presence <= {"not_applicable"}:
+            presence_status = "not_applicable"
+            reason = "source_not_applicable"
+        elif source_presence and source_presence <= {"explicitly_empty"}:
+            presence_status = "explicitly_empty"
+            reason = "source_explicitly_empty"
+        elif "unknown" in source_presence:
+            presence_status = "unknown"
+            reason = "source_status_unknown"
+        elif source_values:
+            presence_status = "not_observed"
+            reason = "no_records_for_projected_dataset"
+        else:
+            presence_status = "not_observed"
+            reason = "no_source_status_mapping"
+
+        status_id = f"dataset_status:{target}"
+        normalized: dict[str, Any] = {
+            "dataset_status_record_id": status_id,
+            "dataset_name": target,
+            "applicability": (
+                "not_applicable" if presence_status == "not_applicable" else "applicable"
+            ),
+            "presence_status": presence_status,
+            "observed_row_count": observed_count,
+            "reason": reason,
+        }
+        if source_names:
+            normalized["source_dataset_name"] = ",".join(source_names)
+        source_statements = tuple(
+            dict.fromkeys(
+                str(values.get("source_statement") or "").strip()
+                for values in source_values
+                if str(values.get("source_statement") or "").strip()
+            )
+        )
+        if source_statements:
+            normalized["source_statement"] = " | ".join(source_statements)
+        confidences = [
+            float(values["confidence"])
+            for values in source_values
+            if isinstance(values.get("confidence"), (int, float))
+            and not isinstance(values.get("confidence"), bool)
+        ]
+        if confidences:
+            normalized["confidence"] = max(0.0, min(1.0, min(confidences)))
+
+        template = source_rows[0][0] if source_rows else {}
+        row = _replace_normalized(template, normalized)
+        row["record_id"] = status_id
+        result.append(row)
+    return result
+
+
 def project_personal_detail_v2_datasets(
     datasets: dict[str, list[dict[str, Any]]],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -573,8 +782,18 @@ def project_personal_detail_v2_datasets(
     if metrics:
         projected["credit_business_overview"] = _project_records(metrics, _summary_metric)
 
-    for record in source.get("personal_detail_account_events") or []:
+    extensions: list[dict[str, Any]] = []
+    for index, record in enumerate(source.get("personal_detail_account_events") or [], start=1):
         target = _event_target(_normalized(record))
+        if target is None:
+            extensions.append(
+                _extension_record(
+                    "personal_detail_account_events",
+                    record,
+                    index,
+                )
+            )
+            continue
         projected.setdefault(target, []).append(
             _replace_normalized(record, _account_event(_normalized(record), target))
         )
@@ -592,7 +811,7 @@ def project_personal_detail_v2_datasets(
     for name, rows in typed_public.items():
         projected.setdefault(name, []).extend(rows)
 
-    extensions = list(public_extensions)
+    extensions.extend(public_extensions)
     mapped_metric_cells = {
         (
             _normalized(row).get("summary_record_id"),
@@ -623,27 +842,7 @@ def project_personal_detail_v2_datasets(
 
     status_rows = source.get("personal_detail_dataset_status") or []
     if status_rows:
-        reverse_names = {
-            **_DIRECT_DATASET_RENAMES,
-            "personal_report_metadata": "report_metadata",
-            "repayment_records": "credit_account_monthly_performance",
-            "repayment_liability_records": "repayment_responsibilities",
-            "personal_detail_credit_summary_metrics": "credit_business_overview",
-            "statements": "annotation_statements",
-            "annotations": "annotation_statements",
-            "personal_detail_account_events": "credit_account_special_transactions",
-        }
-
-        def status(values: dict[str, Any]) -> dict[str, Any]:
-            values = dict(values)
-            _rename_key(values, "dataset_status_id", "dataset_status_record_id")
-            source_name = str(values.get("dataset_name") or "")
-            values["source_dataset_name"] = source_name
-            values["dataset_name"] = reverse_names.get(source_name, source_name)
-            values["observed_row_count"] = len(projected.get(values["dataset_name"], ()))
-            return values
-
-        projected["dataset_status"] = _project_records(status_rows, status)
+        projected["dataset_status"] = _project_dataset_status(status_rows, projected)
 
     return {
         name: projected[name]

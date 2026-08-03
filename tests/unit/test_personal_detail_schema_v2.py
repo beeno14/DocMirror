@@ -70,10 +70,10 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
                 "monthly:quasi",
                 repayment_id="monthly:quasi",
                 account_id="account:quasi",
-                year=2025,
-                month=5,
-                status="1",
-                overdue_amount=1000,
+                year="2025",
+                month="05",
+                status=1,
+                overdue_amount="1,000.00",
             ),
         ],
         "repayment_liability_records": [
@@ -105,8 +105,8 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
             _record(
                 "penalty:1",
                 administrative_penalty_id="penalty:1",
-                effective_date="2021-08",
-                end_date="2024-07",
+                effective_date="2021-08-31",
+                end_date="2024/7/15",
             )
         ],
         "statements": [_record("statement:1", statement_id="statement:1", text="本人声明")],
@@ -156,7 +156,11 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
         for row in projected["credit_account_monthly_performance"]
     }
     assert monthly["account:loan"]["performance_month"] == "2025-05"
+    assert monthly["account:loan"]["status_amount"] == "100"
     assert monthly["account:loan"]["status_amount_semantics"] == "delinquent_amount"
+    assert monthly["account:quasi"]["performance_month"] == "2025-05"
+    assert monthly["account:quasi"]["status_code"] == "1"
+    assert monthly["account:quasi"]["status_amount"] == "1000"
     assert monthly["account:quasi"]["status_amount_semantics"] == "overdraft_balance"
     assert "overdue_amount" not in monthly["account:quasi"]
     responsibilities = {
@@ -177,6 +181,122 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
     assert penalty["end_month"] == "2024-07"
     assert projected["annotation_statements"][0]["annotation_statement_group_id"]
     assert projected["pboc_extension_fields"][0]["value"] == "业务值"
+
+
+def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> None:
+    source = {
+        "personal_detail_account_events": [
+            _record(
+                "event:latest",
+                account_event_id="event:latest",
+                account_id="account:1",
+                event_type="latest_repayment",
+            ),
+            _record(
+                "event:special",
+                account_event_id="event:special",
+                account_id="account:1",
+                event_type="special_event_note",
+                details="sample event",
+            ),
+            _record(
+                "event:transaction",
+                account_event_id="event:transaction",
+                account_id="account:1",
+                event_type="special_transaction",
+                transaction_type="debt restructuring",
+            ),
+            _record(
+                "event:unknown",
+                account_event_id="event:unknown",
+                account_id="account:1",
+                event_type="future_event_type",
+                details="future extension",
+            ),
+        ],
+        "personal_detail_dataset_status": [
+            _record(
+                "status:events",
+                dataset_status_id="status:events",
+                dataset_name="personal_detail_account_events",
+                applicability="applicable",
+                presence_status="observed_nonempty",
+                observed_row_count=4,
+                reason="records_projected",
+            ),
+            _record(
+                "status:statements",
+                dataset_status_id="status:statements",
+                dataset_name="statements",
+                applicability="applicable",
+                presence_status="explicitly_empty",
+                observed_row_count=0,
+                reason="source_explicitly_empty",
+            ),
+            _record(
+                "status:annotations",
+                dataset_status_id="status:annotations",
+                dataset_name="annotations",
+                applicability="applicable",
+                presence_status="explicitly_empty",
+                observed_row_count=0,
+                reason="source_explicitly_empty",
+            ),
+        ],
+    }
+
+    projected = project_personal_detail_v2_datasets(source)
+
+    assert len(projected["credit_account_latest_repayments"]) == 1
+    assert len(projected["credit_account_special_events"]) == 1
+    assert len(projected["credit_account_special_transactions"]) == 1
+    extensions = projected["pboc_extension_fields"]
+    assert any(
+        row["source_dataset"] == "personal_detail_account_events"
+        and row["source_record_id"] == "event:unknown"
+        for row in extensions
+    )
+
+    statuses = {row["dataset_name"]: row for row in projected["dataset_status"]}
+    assert set(statuses) == set(PBOC_DATASET_ORDER) - {"dataset_status"}
+    assert len({row["dataset_status_record_id"] for row in statuses.values()}) == len(statuses)
+    assert statuses["credit_account_latest_repayments"]["observed_row_count"] == 1
+    assert statuses["credit_account_special_events"]["observed_row_count"] == 1
+    assert statuses["credit_account_special_transactions"]["observed_row_count"] == 1
+    assert statuses["credit_card_large_installments"]["presence_status"] == "not_observed"
+    assert statuses["annotation_statements"]["presence_status"] == "explicitly_empty"
+    assert "source_dataset_name" not in statuses["fraud_warnings"]
+    assert not any(row["dataset_name"].startswith("personal_detail_") for row in statuses.values())
+
+
+def test_v2_preserves_invalid_month_source_without_emitting_invalid_month() -> None:
+    projected = project_personal_detail_v2_datasets(
+        {
+            "administrative_penalty_records": [
+                _record(
+                    "penalty:invalid",
+                    administrative_penalty_id="penalty:invalid",
+                    effective_date="2021-19-01",
+                )
+            ],
+            "postpaid_payment_history": [
+                _record(
+                    "postpaid:1",
+                    postpaid_payment_history_id="postpaid:1",
+                    year="2024",
+                    month="7",
+                    status=1,
+                )
+            ],
+        }
+    )
+
+    penalty = projected["administrative_penalty_records"][0]
+    assert "effective_month" not in penalty
+    assert penalty["source_effective_date"] == "2021-19-01"
+    postpaid = projected["postpaid_monthly_performance"][0]
+    assert postpaid["performance_month"] == "2024-07"
+    assert postpaid["status_code"] == "1"
 
 
 def test_v2_dictionary_covers_pboc_catalog_and_logical_types() -> None:
@@ -333,6 +453,29 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
                 overdue_amount=1000,
             )
         ],
+        "personal_detail_dataset_status": [
+            _record(
+                "status:metadata",
+                dataset_status_id="status:metadata",
+                dataset_name="personal_report_metadata",
+                presence_status="observed_nonempty",
+                observed_row_count=1,
+            ),
+            _record(
+                "status:accounts",
+                dataset_status_id="status:accounts",
+                dataset_name="credit_accounts",
+                presence_status="observed_nonempty",
+                observed_row_count=1,
+            ),
+            _record(
+                "status:repayments",
+                dataset_status_id="status:repayments",
+                dataset_name="repayment_records",
+                presence_status="observed_nonempty",
+                observed_row_count=1,
+            ),
+        ],
     }
     semantic = personal_detail_v2_semantic_extensions()
     projection = {
@@ -372,3 +515,5 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     assert validate_projection_payload("community", payload).valid
     v2_validation = validate_projection_payload("personal_credit_report_detailed_v2", payload)
     assert v2_validation.valid, v2_validation.errors
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 1

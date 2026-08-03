@@ -18,6 +18,10 @@ from dataclasses import replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, TypeVar, cast
 
+from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
+    PersonalDetailLogicalPageImageResolver,
+    PersonalDetailPageTopology,
+)
 from docmirror.plugins.credit_report.shared.entity_decoder import (
     CreditReportEntityContext,
     CreditReportUnit,
@@ -301,7 +305,10 @@ def _domain_specific(parse_result: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _printed_reading_order(parse_result: Any) -> dict[int, int]:
+def _printed_reading_order(
+    parse_result: Any,
+    topology: PersonalDetailPageTopology | None = None,
+) -> dict[int, int]:
     """Map sealed logical pages to the report's printed reading order.
 
     Detailed reports are commonly scanned as two-page spreads. Physical
@@ -374,11 +381,16 @@ def _printed_reading_order(parse_result: Any) -> dict[int, int]:
         image_pages, image_totals = _ocr_printed_page_footers(
             parse_result,
             missing_pages=observed_pages - printed_by_logical.keys(),
+            topology=topology,
         )
         printed_by_logical.update(image_pages)
         totals.extend(image_totals)
 
-    _infer_paired_printed_pages(printed_by_logical, source_by_logical)
+    _infer_paired_printed_pages(
+        printed_by_logical,
+        source_by_logical,
+        topology=topology,
+    )
     if len(printed_by_logical) != len(observed_pages):
         return identity
     if len(set(printed_by_logical.values())) != len(observed_pages):
@@ -407,13 +419,16 @@ def _ocr_printed_page_footers(
     parse_result: Any,
     *,
     missing_pages: Iterable[int],
+    topology: PersonalDetailPageTopology | None = None,
 ) -> tuple[dict[int, int], list[int]]:
     """Read only footer strips for structural page order, never cell values."""
     try:
         from docmirror.ocr.repair.recognizers import rapidocr_recognize
-        from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
-
-        resolver = LogicalPageImageResolver(parse_result, zoom=2.0)
+        resolver = PersonalDetailLogicalPageImageResolver(
+            parse_result,
+            zoom=2.0,
+            topology=topology,
+        )
     except Exception:
         return {}, []
 
@@ -449,14 +464,16 @@ def _ocr_printed_page_footers(
 def _infer_paired_printed_pages(
     printed_by_logical: dict[int, int],
     source_by_logical: dict[int, int],
+    *,
+    topology: PersonalDetailPageTopology | None = None,
 ) -> None:
-    """Infer one unread footer from its adjacent half of the same spread."""
+    """Infer one unread footer from a geometry-confirmed adjacent half."""
     logicals_by_source: dict[int, list[int]] = {}
     for logical, source in source_by_logical.items():
         logicals_by_source.setdefault(source, []).append(logical)
     for logicals in logicals_by_source.values():
-        ordered = sorted(logicals)
-        if len(ordered) != 2:
+        ordered = topology.ordered_pair(logicals) if topology is not None else None
+        if ordered is None:
             continue
         left, right = ordered
         if left in printed_by_logical and right not in printed_by_logical:
@@ -476,6 +493,8 @@ def _evidence_key(page: int, line: dict[str, Any], index: int) -> str:
 
 def _collect_personal_detail_units(
     parse_result: Any,
+    *,
+    topology: PersonalDetailPageTopology | None = None,
 ) -> tuple[
     tuple[CreditReportUnit, ...],
     tuple[str, ...],
@@ -491,7 +510,7 @@ def _collect_personal_detail_units(
     table_owners: dict[int, list[tuple[tuple[float, float, float, float], str]]] = {}
     text_owners: dict[int, list[tuple[str, tuple[float, float, float, float] | None, str]]] = {}
     edge_occurrences: dict[str, list[tuple[int, str]]] = {}
-    reading_order = _printed_reading_order(parse_result)
+    reading_order = _printed_reading_order(parse_result, topology)
 
     for page_index, page in enumerate(pages, start=1):
         logical = int(getattr(page, "page_number", 0) or page_index)
@@ -658,18 +677,26 @@ class PersonalDetailExtractionContext:
         evidence_unit_ids: dict[str, str],
         source_page_by_logical: dict[int, int],
         reading_order_by_logical: dict[int, int],
+        page_topology: PersonalDetailPageTopology,
     ) -> None:
         self.parse_result = parse_result
         self.entity_context = entity_context
         self.evidence_unit_ids = MappingProxyType(dict(evidence_unit_ids))
         self.source_page_by_logical = MappingProxyType(dict(source_page_by_logical))
         self.reading_order_by_logical = MappingProxyType(dict(reading_order_by_logical))
+        self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
         )
 
-        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(parse_result)
+        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(
+            parse_result,
+            page_image_resolver=PersonalDetailLogicalPageImageResolver(
+                parse_result,
+                topology=page_topology,
+            ),
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.parse_result, name)
@@ -728,7 +755,6 @@ class PersonalDetailExtractionContext:
                 augment_credit_repayment_evidence_bundles,
                 materialize_credit_repayment_micro_grids_from_bundles,
             )
-            from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
             from docmirror.plugins.credit_report.repayment_grid import (
                 dedupe_repayment_records,
                 records_from_micro_grid_dict,
@@ -743,12 +769,16 @@ class PersonalDetailExtractionContext:
                 detached,
                 reading_order_by_logical=dict(self.reading_order_by_logical),
             )
-            resolver = LogicalPageImageResolver(self.parse_result)
+            resolver = PersonalDetailLogicalPageImageResolver(
+                self.parse_result,
+                topology=self.page_topology,
+            )
             try:
                 materialize_credit_repayment_micro_grids_from_bundles(
                     detached,
                     page_image_resolver=resolver,
                     enable_cell_ocr=True,
+                    extra_status_chars={"A"},
                 )
             finally:
                 resolver.clear()
@@ -826,6 +856,10 @@ class PersonalDetailExtractionContext:
         """Return a detached audit snapshot for diagnostics and regression tests."""
         return deepcopy(self._ocr_correction_overlay.audit())
 
+    def page_topology_audit(self) -> dict[str, Any]:
+        """Return the plugin's detached logical-page validation result."""
+        return deepcopy(self.page_topology.audit())
+
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)
         right_unit_id = self.entity_context.table_unit_id(right_table_id)
@@ -859,7 +893,11 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
     """Build the detailed-report logical-page graph exactly once."""
     if isinstance(parse_result, PersonalDetailExtractionContext):
         return parse_result
-    units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(parse_result)
+    page_topology = PersonalDetailPageTopology(parse_result)
+    units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(
+        parse_result,
+        topology=page_topology,
+    )
     policy = PersonalDetailTransitionPolicy()
     entity_context = decode_credit_report_units(
         units,
@@ -874,6 +912,7 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
         evidence_unit_ids=evidence_units,
         source_page_by_logical=source_pages,
         reading_order_by_logical=reading_order,
+        page_topology=page_topology,
     )
 
 

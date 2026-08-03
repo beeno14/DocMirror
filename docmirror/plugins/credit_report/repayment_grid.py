@@ -184,15 +184,20 @@ def _strong_visual_status(recognition: Any) -> bool:
     return False
 
 
-def _neighbor_status_fallback(statuses: dict[int, str], month: int) -> str:
+def _neighbor_status_fallback(
+    statuses: dict[int, str],
+    month: int,
+    *,
+    zero_overdue_statuses: set[str] | frozenset[str] = frozenset(_ZERO_OVERDUE_STATUSES),
+) -> str:
     """Repair one unreadable cell only when adjacent row context is decisive."""
     left = [statuses.get(month - offset, "") for offset in (1, 2)]
     right = [statuses.get(month + offset, "") for offset in (1, 2)]
-    if left[0] and right[0] and left[0] == right[0] and left[0] in _ZERO_OVERDUE_STATUSES:
+    if left[0] and right[0] and left[0] == right[0] and left[0] in zero_overdue_statuses:
         return left[0]
-    if not left[0] and right[0] and right[0] == right[1] and right[0] in _ZERO_OVERDUE_STATUSES:
+    if not left[0] and right[0] and right[0] == right[1] and right[0] in zero_overdue_statuses:
         return right[0]
-    if not right[0] and left[0] and left[0] == left[1] and left[0] in _ZERO_OVERDUE_STATUSES:
+    if not right[0] and left[0] and left[0] == left[1] and left[0] in zero_overdue_statuses:
         return left[0]
     return ""
 
@@ -449,10 +454,13 @@ def reconstruct_repayment_micro_grid_from_lines(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
     grid_index: int = 0,
 ) -> RepaymentExtraction:
     """Reconstruct a credit repayment grid from OCR line-level geometry."""
     line_items = _line_items(lines)
+    status_charset = _STATUS_CHARS | {str(item) for item in extra_status_chars if str(item)}
+    zero_overdue_statuses = _ZERO_OVERDUE_STATUSES | ({"A"} if "A" in status_charset else set())
     evidence_tokens = _coerce_tokens(tokens, page=page)
     candidates = detect_micro_grid_candidates(
         evidence_tokens,
@@ -659,7 +667,7 @@ def reconstruct_repayment_micro_grid_from_lines(
         # Preserve an OCR uncertainty marker for positional alignment. It is
         # never emitted as a credit status, but dropping it here would shift
         # every later month one cell to the left.
-        status_chars = [ch for ch in raw_status_text if ch in _STATUS_CHARS or ch == "#"]
+        status_chars = [ch for ch in raw_status_text if ch in status_charset or ch == "#"]
         active_months = [month for yy, month in sorted(record_months) if yy == year]
         if year == end_year and len(status_chars) == 2 and set(status_chars) == {"N", "C"}:
             status_by_month = {active_months[0]: "N", active_months[1]: "C"} if len(active_months) == 2 else {}
@@ -697,12 +705,20 @@ def reconstruct_repayment_micro_grid_from_lines(
                 if abs(token.center[1] - status_center_y) <= abs(token.center[1] - amount_center_y)
             ]
             status = normalize_allowlist_text(
-                status_by_month.get(month) or _token_text(st_tokens), _STATUS_CHARS, max_chars=1
+                status_by_month.get(month) or _token_text(st_tokens), status_charset, max_chars=1
             )
             status_crop = None
             status_recognition_source = "tokens"
             status_recognition_audit: dict[str, Any] = {}
-            neighbor_status = _neighbor_status_fallback(status_by_month, month) if not status else ""
+            neighbor_status = (
+                _neighbor_status_fallback(
+                    status_by_month,
+                    month,
+                    zero_overdue_statuses=zero_overdue_statuses,
+                )
+                if not status
+                else ""
+            )
             if neighbor_status:
                 status = neighbor_status
                 status_recognition_source = "row_neighbor_consensus"
@@ -731,7 +747,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                         visual_bbox,
                         page_width=visual_width,
                         page_height=visual_height,
-                        allowed_charset=_STATUS_CHARS,
+                        allowed_charset=status_charset,
                         max_chars=1,
                         reference_templates=status_templates,
                     )
@@ -749,7 +765,11 @@ def reconstruct_repayment_micro_grid_from_lines(
                         if (weak_cell and (_strong_visual_status(rec) or template_confirmed)) or consensus_count >= 2:
                             status = rec.text
             if not status:
-                neighbor_status = _neighbor_status_fallback(status_by_month, month)
+                neighbor_status = _neighbor_status_fallback(
+                    status_by_month,
+                    month,
+                    zero_overdue_statuses=zero_overdue_statuses,
+                )
                 if neighbor_status:
                     status = neighbor_status
                     status_recognition_source = "row_neighbor_consensus"
@@ -786,7 +806,7 @@ def reconstruct_repayment_micro_grid_from_lines(
             if amount_band is not None:
                 amt_tokens = amount_assignments.get(month, [])
                 amount = _normalize_amount_text(_token_text(amt_tokens))
-                status_implies_zero = status in _ZERO_OVERDUE_STATUSES
+                status_implies_zero = status in zero_overdue_statuses
                 if status_implies_zero:
                     # These status codes explicitly mean no overdue balance.
                     # Do not let the calendar-year prefix, a neighbouring
@@ -931,6 +951,7 @@ def extract_credit_repayment_records(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
     grid_index: int = 0,
 ) -> dict[str, Any]:
     extraction = reconstruct_repayment_micro_grid_from_lines(
@@ -942,6 +963,7 @@ def extract_credit_repayment_records(
         page_image=page_image,
         page_image_resolver=page_image_resolver,
         enable_cell_ocr=enable_cell_ocr,
+        extra_status_chars=extra_status_chars,
         grid_index=grid_index,
     )
     return {

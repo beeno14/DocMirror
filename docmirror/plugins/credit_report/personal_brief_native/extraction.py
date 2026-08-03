@@ -8,11 +8,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
 _MARITAL_STATUS_CODES = {
     "未婚": "unmarried",
     "已婚": "married",
+    "初婚": "married",
+    "再婚": "married",
     "离婚": "divorced",
+    "丧偶": "widowed",
+    "其他": "other",
+    "未说明": "not_reported",
+    "未知": "not_reported",
 }
 
 
@@ -74,6 +79,54 @@ def _table_chunks(parse_result: Any, required_label: str) -> list[tuple[int, str
     return chunks
 
 
+def _pair_record_chunks(
+    anchors: list[tuple[int, str]],
+    chunks: list[tuple[int, str]],
+    *,
+    identity_labels: tuple[str, ...],
+) -> list[tuple[int, str]]:
+    """Pair public-record fragments by identity/page evidence, never ordinal alone."""
+    paired: list[tuple[int, str]] = []
+    unused = set(range(len(chunks)))
+    for anchor_page, anchor_text in anchors:
+        anchor_fields = _label_fields(anchor_text, identity_labels)
+
+        def score(chunk_index: int) -> tuple[int, int, int, int]:
+            chunk_page, chunk_text = chunks[chunk_index]
+            chunk_fields = _label_fields(chunk_text, identity_labels)
+            shared = sum(
+                bool(anchor_fields.get(label) and anchor_fields.get(label) == chunk_fields.get(label))
+                for label in identity_labels
+            )
+            page_affinity = 3 if chunk_page == anchor_page else 2 if chunk_page == anchor_page + 1 else 1
+            return shared, page_affinity, -abs(chunk_page - anchor_page), -chunk_index
+
+        if not unused:
+            paired.append((anchor_page, ""))
+            continue
+        best = max(unused, key=score)
+        # A fragment more than one page away with no shared identity is not a
+        # defensible match.  Leave it unpaired instead of shifting every later
+        # record by one physical table.
+        best_page, best_text = chunks[best]
+        best_score = score(best)
+        if best_score[0] == 0 and abs(best_page - anchor_page) > 1:
+            paired.append((anchor_page, ""))
+            continue
+        unused.remove(best)
+        paired.append((best_page, best_text))
+    return paired
+
+
+def _public_record_refs(anchor_page: int, detail_page: int) -> list[dict[str, Any]]:
+    refs = [{"source": "native_text_public_record_anchor", "page": anchor_page}]
+    if detail_page != anchor_page:
+        refs.append({"source": "canonical_public_record_table", "page": detail_page})
+    else:
+        refs[0]["source"] = "native_text_and_table"
+    return refs
+
+
 def _date_or_month(value: str) -> str | None:
     from docmirror.plugins.credit_report.business_records import _iso_date, _iso_month
 
@@ -127,7 +180,15 @@ def _personal_header_datasets(
     name_match = re.search(r"姓名[:：]([^:：]+?)(?=证件类型[:：])", compact)
     id_type_match = re.search(r"证件类型[:：]([^:：]+?)(?=证件号码[:：])", compact)
     id_number_match = re.search(r"证件号码[:：]([A-Za-z0-9*]+)", compact)
-    marital_status_match = re.search(r"(?:婚姻状况[:：]?)?(未婚|已婚|离婚)", compact)
+    marital_status_match = re.search(
+        r"婚姻状况[:：]?([^:：，,；;。]{1,8}?)(?=其他证件信息|信贷记录|报告|[:：，,；;。]|$)",
+        compact,
+    )
+    if not marital_status_match:
+        marital_status_match = re.search(
+            r"(未婚|已婚|初婚|再婚|离婚|丧偶|其他|未说明|未知)",
+            compact,
+        )
     report_time = (
         f"{int(report_time_match.group(1)):04d}-{int(report_time_match.group(2)):02d}-"
         f"{int(report_time_match.group(3)):02d}T{int(report_time_match.group(4)):02d}:"
@@ -139,11 +200,8 @@ def _personal_header_datasets(
     subject_name = name_match.group(1) if name_match else None
     primary_id_type = id_type_match.group(1) if id_type_match else None
     primary_id_number = id_number_match.group(1) if id_number_match else None
-    marital_status = (
-        _MARITAL_STATUS_CODES[marital_status_match.group(1)]
-        if marital_status_match
-        else None
-    )
+    marital_status_raw = marital_status_match.group(1) if marital_status_match else None
+    marital_status = _MARITAL_STATUS_CODES.get(marital_status_raw or "")
     page = blocks[0][0] if blocks else 1
     identity_documents: list[dict[str, Any]] = []
     if primary_id_type and primary_id_number:
@@ -205,6 +263,7 @@ def _personal_header_datasets(
             "primary_id_type": primary_id_type,
             "primary_id_number": primary_id_number,
             "marital_status": marital_status,
+            "marital_status_raw": marital_status_raw,
             **amount_policy,
             "source": "personal_brief_header",
             "source_refs": _source_refs(page, "native_text_header"),
@@ -464,10 +523,19 @@ def _postpaid_records(blocks: list[tuple[int, str]]) -> list[dict[str, Any]]:
         if "后付费记录" not in preceding and records == []:
             continue
         parts = [content]
+        end_page = page
         for next_page, candidate in blocks[index + 1 :]:
-            if next_page != page or "机构名称" in candidate or "公共记录" in candidate:
+            compact_candidate = re.sub(r"\s+", "", candidate)
+            if (
+                next_page > page + 1
+                or "机构名称" in candidate
+                or any(marker in compact_candidate for marker in ("公共记录", "查询记录", "欠税记录", "民事判决记录"))
+            ):
                 break
+            if "第" in compact_candidate and "页" in compact_candidate and len(compact_candidate) < 20:
+                continue
             parts.append(candidate)
+            end_page = next_page
             if "当前欠费金额" in candidate:
                 break
         fields = _label_fields(
@@ -492,7 +560,14 @@ def _postpaid_records(blocks: list[tuple[int, str]]) -> list[dict[str, Any]]:
                 "reporting_amount_currency": "CNY",
                 "reporting_amount_unit": "yuan",
                 "source": "personal_brief_postpaid_record",
-                "source_refs": _source_refs(page, "native_text_labeled_record"),
+                "source_refs": [
+                    *_source_refs(page, "native_text_labeled_record"),
+                    *(
+                        _source_refs(end_page, "native_text_labeled_record_continuation")
+                        if end_page != page
+                        else []
+                    ),
+                ],
                 "confidence": 0.98,
             }
         )
@@ -519,10 +594,31 @@ def _personal_public_records(
         index for index, (_page, value) in enumerate(blocks) if "执行法院" in value and "案号" in value
     ]
     penalty_anchors = [(page, value) for page, value in blocks if "处罚机构" in value and "文书编号" in value]
+    paired_taxes = _pair_record_chunks(
+        tax_anchors,
+        tax_tables,
+        identity_labels=("主管税务机关", "纳税人识别号"),
+    )
+    paired_judgments = _pair_record_chunks(
+        judgment_anchors,
+        judgment_tables,
+        identity_labels=("立案法院", "案号"),
+    )
+    enforcement_anchors = [blocks[position] for position in enforcement_positions]
+    paired_enforcements = _pair_record_chunks(
+        enforcement_anchors,
+        enforcement_tables,
+        identity_labels=("执行法院", "案号"),
+    )
+    paired_penalties = _pair_record_chunks(
+        penalty_anchors,
+        penalty_tables,
+        identity_labels=("处罚机构", "文书编号"),
+    )
 
     taxes: list[dict[str, Any]] = []
     for index, (page, anchor) in enumerate(tax_anchors):
-        detail = tax_tables[index][1] if index < len(tax_tables) else ""
+        detail_page, detail = paired_taxes[index]
         fields = _label_fields(
             anchor + "\n" + detail,
             ("主管税务机关", "欠税统计日期", "欠税总额", "纳税人识别号"),
@@ -538,7 +634,7 @@ def _personal_public_records(
                 "reporting_amount_currency": "CNY",
                 "reporting_amount_unit": "yuan",
                 "source": "personal_brief_public_record",
-                "source_refs": _source_refs(page, "native_text_and_table"),
+                "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.98,
             }
         )
@@ -549,7 +645,7 @@ def _personal_public_records(
         "诉讼标的", "判决/调解生效日期", "诉讼标的金额",
     )
     for index, (page, anchor) in enumerate(judgment_anchors):
-        detail = judgment_tables[index][1] if index < len(judgment_tables) else ""
+        detail_page, detail = paired_judgments[index]
         fields = _label_fields(anchor + "\n" + detail, judgment_labels)
         cause = _reported_text(fields.get("案由"))
         judgments.append(
@@ -569,7 +665,7 @@ def _personal_public_records(
                 "reporting_amount_currency": "CNY",
                 "reporting_amount_unit": "yuan",
                 "source": "personal_brief_public_record",
-                "source_refs": _source_refs(page, "native_text_and_table"),
+                "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.97,
             }
         )
@@ -588,7 +684,7 @@ def _personal_public_records(
             if "第" in candidate and "页" in candidate and len(re.sub(r"\s+", "", candidate)) < 20:
                 continue
             following.append(candidate)
-        table_detail = enforcement_tables[index][1] if index < len(enforcement_tables) else ""
+        detail_page, table_detail = paired_enforcements[index]
         fields = _label_fields(
             "\n".join([anchor, table_detail, *following]),
             enforcement_labels,
@@ -613,7 +709,7 @@ def _personal_public_records(
                 "reporting_amount_currency": "CNY",
                 "reporting_amount_unit": "yuan",
                 "source": "personal_brief_public_record",
-                "source_refs": _source_refs(page, "native_text_and_table"),
+                "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.96,
             }
         )
@@ -623,7 +719,7 @@ def _personal_public_records(
         "处罚机构", "文书编号", "处罚内容", "行政复议结果", "处罚金额", "生效日期", "截止日期",
     )
     for index, (page, anchor) in enumerate(penalty_anchors):
-        detail = penalty_tables[index][1] if index < len(penalty_tables) else ""
+        detail_page, detail = paired_penalties[index]
         fields = _label_fields(anchor + "\n" + detail, penalty_labels)
         review_result = _reported_text(fields.get("行政复议结果"))
         penalties.append(
@@ -643,7 +739,7 @@ def _personal_public_records(
                 "reporting_amount_currency": "CNY",
                 "reporting_amount_unit": "yuan",
                 "source": "personal_brief_public_record",
-                "source_refs": _source_refs(page, "native_text_and_table"),
+                "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.98,
             }
         )

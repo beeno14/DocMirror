@@ -294,6 +294,18 @@
           "then": {"properties": {"rows": {"items": {"properties": {"normalized": {
             "required": ["pboc_extension_field_id", "namespace", "source_dataset", "source_record_id", "field_name", "value"]
           }}}}}}
+        },
+        {
+          "if": {"properties": {"name": {"const": "dataset_status"}}, "required": ["name"]},
+          "then": {"properties": {"rows": {"items": {"properties": {"normalized": {
+            "required": ["dataset_status_record_id", "dataset_name", "applicability", "presence_status", "observed_row_count", "reason"],
+            "properties": {
+              "dataset_name": {"$ref": "#/$defs/datasetName", "not": {"const": "dataset_status"}},
+              "source_dataset_name": {"type": ["string", "null"]},
+              "presence_status": {"enum": ["observed_nonempty", "explicitly_empty", "not_applicable", "not_observed", "partial", "extraction_failed", "unknown"]},
+              "observed_row_count": {"type": "integer", "minimum": 0}
+            }
+          }}}}}}
         }
       ]
     }

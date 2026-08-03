@@ -179,7 +179,13 @@ def _table_rows(table: Any) -> list[list[str]]:
     return ([headers] if headers else []) + rows
 
 
-def _source_ref(page: Any, table: Any, *, row: int | None = None) -> dict[str, Any]:
+def _source_ref(
+    page: Any,
+    table: Any,
+    *,
+    row: int | None = None,
+    column: int | None = None,
+) -> dict[str, Any]:
     ref: dict[str, Any] = {
         "source": "native_detail_table",
         "logical_page": int(getattr(page, "page_number", 0) or 0),
@@ -188,7 +194,36 @@ def _source_ref(page: Any, table: Any, *, row: int | None = None) -> dict[str, A
     }
     if row is not None:
         ref["row"] = row
-    bbox = getattr(table, "bbox", None)
+    if column is not None:
+        ref["column"] = column
+    metadata = getattr(table, "metadata", None) or {}
+    bbox = None
+    if row is not None and column is not None and isinstance(metadata, dict):
+        cell_bboxes = metadata.get("cell_bboxes")
+        if (
+            isinstance(cell_bboxes, list)
+            and 0 <= row < len(cell_bboxes)
+            and isinstance(cell_bboxes[row], list)
+            and 0 <= column < len(cell_bboxes[row])
+        ):
+            candidate = cell_bboxes[row][column]
+            if isinstance(candidate, (list, tuple)) and len(candidate) == 4:
+                bbox = candidate
+                ref["source"] = "native_detail_table_cell"
+                ref["geometry_scope"] = "cell"
+        cell_evidence_ids = metadata.get("cell_evidence_ids")
+        if (
+            isinstance(cell_evidence_ids, list)
+            and 0 <= row < len(cell_evidence_ids)
+            and isinstance(cell_evidence_ids[row], list)
+            and 0 <= column < len(cell_evidence_ids[row])
+            and isinstance(cell_evidence_ids[row][column], list)
+        ):
+            ref["evidence_ids"] = [str(item) for item in cell_evidence_ids[row][column] if item]
+    if bbox is None:
+        bbox = getattr(table, "bbox", None)
+        if bbox and len(bbox) == 4:
+            ref["geometry_scope"] = "table"
     if bbox and len(bbox) == 4:
         ref["bbox"] = list(bbox)
     return ref
@@ -1801,7 +1836,14 @@ def _extract_summary_datasets(
                         "column_label": header or None,
                         "value": value,
                         "source": "native_personal_detail_summary_cell",
-                        "source_refs": [_source_ref(source_page, source_table, row=source_row_index)],
+                        "source_refs": [
+                            _source_ref(
+                                source_page,
+                                source_table,
+                                row=source_row_index,
+                                column=column_index - 1,
+                            )
+                        ],
                         "confidence": 1.0,
                     }
                 )

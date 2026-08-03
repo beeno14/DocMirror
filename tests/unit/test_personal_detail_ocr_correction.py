@@ -6,6 +6,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from docmirror.evidence.repair import RepairCandidate
+from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import _source_ref
 from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
     PersonalDetailOCRCorrectionOverlay,
     normalize_institution_name,
@@ -32,13 +33,26 @@ def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
         role="identity_document_number",
     )
     amount, amount_decision = overlay.correct_text("1O0", role="amount")
+    signed_amount, signed_amount_decision = overlay.correct_text("+500", role="amount")
+    birth_date, birth_date_decision = overlay.correct_text("1987.09.05", role="date")
+    event_month, event_month_decision = overlay.correct_text("2018.10", role="date_or_month")
     invalid, invalid_decision = overlay.correct_text("amount S", role="amount")
 
     assert report_time == "2024-03-13T11:05:32+08:00"
     assert identity == "11010519491231002X"
     assert amount == "100"
+    assert signed_amount == "500"
+    assert birth_date == "1987-09-05"
+    assert event_month == "2018-10"
     assert invalid == "amount S"
-    assert time_decision and identity_decision and amount_decision
+    assert (
+        time_decision
+        and identity_decision
+        and amount_decision
+        and signed_amount_decision
+        and birth_date_decision
+        and event_month_decision
+    )
     assert invalid_decision is None
     assert all(decision.action == "applied" for decision in overlay.decisions)
 
@@ -49,6 +63,118 @@ def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -
         "中信银行股份有限公司个人信贷部"
     )
     assert normalize_institution_name("未知机构名称") == "未知机构名称"
+    assert normalize_institution_name("新疆样例银行股份有限公司乌鲁木齐分行") == (
+        "新疆样例银行股份有限公司乌鲁木齐分行"
+    )
+    assert normalize_institution_name("云南省农村信用社联合社") == "云南省农村信用社联合社"
+
+
+def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() -> None:
+    payload = {
+        "personal_detail_summary_cells": [
+            {
+                "record_id": "cell:type",
+                "column_label": "账户类型",
+                "row_index": 1,
+                "column_index": 1,
+                "value": "教 循环贷账户一",
+                "source_refs": [
+                    {
+                        "logical_page": 3,
+                        "bbox": [10, 20, 30, 40],
+                        "geometry_scope": "cell",
+                    }
+                ],
+            },
+            {
+                "record_id": "cell:count",
+                "column_label": "月份数",
+                "row_index": 1,
+                "column_index": 2,
+                "value": "二",
+                "source_refs": [{"logical_page": 3, "bbox": [30, 20, 40, 40]}],
+            },
+            {
+                "record_id": "cell:amount",
+                "column_label": "单月最高逾期/透支总额",
+                "row_index": 1,
+                "column_index": 3,
+                "value": "*-",
+                "source_refs": [{"logical_page": 3, "bbox": [40, 20, 50, 40]}],
+            },
+        ]
+    }
+    overlay = _overlay()
+
+    corrected = overlay.correct_business_candidates(payload, stage="native_business")
+    audit = overlay.audit()
+
+    cells = corrected["personal_detail_summary_cells"]
+    assert cells[0]["value"] == "循环贷账户一"
+    assert cells[1]["value"] == "2"
+    assert cells[2]["value"] == "*-"
+    assert audit["audited_cell_count"] >= 3
+    assert audit["abnormal_cell_count"] == 1
+    assert audit["cell_anomalies"][0]["role"] == "amount_or_placeholder"
+    assert audit["cell_anomalies"][0]["value"] == "*-"
+
+
+def test_count_roles_remove_only_canonical_display_units() -> None:
+    overlay = _overlay()
+
+    months, months_decision = overlay.correct_text("12月", role="nonnegative_integer")
+    contaminated, contaminated_decision = overlay.correct_text("12月还款", role="nonnegative_integer")
+
+    assert months == "12"
+    assert months_decision is not None
+    assert contaminated == "12月还款"
+    assert contaminated_decision is None
+
+
+def test_account_open_date_accepts_pboc_month_precision() -> None:
+    overlay = _overlay()
+    payload = {
+        "credit_accounts": [
+            {
+                "record_id": "account:1",
+                "open_date": "2018.10",
+                "source_refs": [{"logical_page": 2, "bbox": [1, 2, 3, 4]}],
+            }
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(payload, stage="native_business")
+
+    assert corrected["credit_accounts"][0]["open_date"] == "2018-10"
+    assert overlay.audit()["abnormal_cell_count"] == 0
+
+
+def test_r2_billing_adjustment_is_a_valid_personal_detail_repayment_status() -> None:
+    overlay = _overlay()
+
+    value, decision = overlay.correct_text("a", role="repayment_status")
+
+    assert value == "A"
+    assert decision is not None
+
+
+def test_summary_source_ref_prefers_exact_cell_geometry() -> None:
+    page = SimpleNamespace(page_number=3, source_page_number=2)
+    table = SimpleNamespace(
+        table_id="summary:1",
+        bbox=[0, 0, 100, 100],
+        metadata={
+            "cell_bboxes": [[[1, 2, 3, 4], [5, 6, 7, 8]]],
+            "cell_evidence_ids": [[['ocr:1'], ['ocr:2']]],
+        },
+    )
+
+    ref = _source_ref(page, table, row=0, column=1)
+
+    assert ref["bbox"] == [5, 6, 7, 8]
+    assert ref["geometry_scope"] == "cell"
+    assert ref["source"] == "native_detail_table_cell"
+    assert ref["evidence_ids"] == ["ocr:2"]
 
 
 def test_evidence_overlay_corrects_inquiry_lines_without_mutating_raw_evidence() -> None:
@@ -222,6 +348,21 @@ class _FakeInquiryRepairEngine:
         ]
 
 
+class _FakeCellRepairEngine:
+    def repair_from_image(self, request, image, **_kwargs):
+        assert request.kind == "integer_or_placeholder"
+        assert request.bbox == (30.0, 20.0, 40.0, 40.0)
+        return [
+            RepairCandidate(
+                candidate_id="candidate:cell:1",
+                request_id=request.request_id,
+                text="2",
+                confidence=0.93,
+                source="test_cell_ocr",
+            )
+        ]
+
+
 def test_targeted_crop_ocr_only_adopts_a_typed_valid_candidate() -> None:
     overlay = PersonalDetailOCRCorrectionOverlay(
         SimpleNamespace(),
@@ -272,6 +413,39 @@ def test_damaged_inquiry_date_triggers_bounded_typed_crop_ocr() -> None:
     assert line["ocr_original_text"] == pages[0]["lines"][0]["text"]
     assert line["ocr_correction"]["method"] == "targeted_crop_ocr_consensus"
     assert overlay.audit()["targeted_ocr_requests"] == 1
+
+
+def test_invalid_summary_value_uses_only_cell_scoped_targeted_ocr() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(
+        SimpleNamespace(),
+        page_image_resolver=_FakeResolver(),
+        repair_engine=_FakeCellRepairEngine(),
+        enable_targeted_ocr=True,
+    )
+    payload = {
+        "personal_detail_summary_cells": [
+            {
+                "record_id": "cell:count",
+                "column_label": "月份数",
+                "value": "达",
+                "source_refs": [
+                    {
+                        "logical_page": 1,
+                        "bbox": [30, 20, 40, 40],
+                        "geometry_scope": "cell",
+                    }
+                ],
+            }
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(payload, stage="native_business")
+    audit = overlay.audit()
+
+    assert corrected["personal_detail_summary_cells"][0]["value"] == "2"
+    assert audit["targeted_ocr_requests"] == 1
+    assert audit["abnormal_cell_count"] == 0
+    assert any(decision["method"] == "targeted_crop_ocr_consensus" for decision in audit["decisions"])
 
 
 def test_repayment_linking_uses_global_predecessor_and_collapses_duplicate_months() -> None:

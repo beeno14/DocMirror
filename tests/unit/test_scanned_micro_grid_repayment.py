@@ -229,6 +229,10 @@ def test_allowlist_normalization_filters_ocr_noise():
 def test_hash_is_uncertainty_not_a_credit_status():
     assert "#" not in repayment_mod._STATUS_CHARS
     assert "/" in repayment_mod._STATUS_CHARS
+    # R2-only status A is enabled by the personal-detail caller; the shared
+    # extractor default remains unchanged for other credit-report variants.
+    assert "A" not in repayment_mod._STATUS_CHARS
+    assert "A" not in repayment_mod._ZERO_OVERDUE_STATUSES
 
 
 def test_unreadable_boundary_cell_uses_two_matching_neighbors_only():
