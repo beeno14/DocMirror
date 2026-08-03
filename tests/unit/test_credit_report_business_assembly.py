@@ -142,6 +142,36 @@ def test_assembly_merges_same_natural_account_and_audits_conflict() -> None:
     assert first["credit_extraction_audit"]["status"] == "review"
 
 
+def test_personal_structural_accounts_do_not_collapse_on_shared_identifier() -> None:
+    accounts = [
+        {
+            "account_id": "credit_account:credit_card:10",
+            "account_identifier": "SHARED-AGREEMENT-001",
+            "account_type": "credit_card",
+            "sequence": 10,
+        },
+        {
+            "account_id": "credit_account:credit_card:12",
+            "account_identifier": "SHARED-AGREEMENT-001",
+            "account_type": "credit_card",
+            "sequence": 12,
+        },
+    ]
+
+    assembled = assemble_credit_report_business(
+        _result(),
+        "",
+        report_subtype="personal_detail",
+        content_mode="scanned_ocr",
+        existing_collections={"credit_accounts": accounts},
+    )
+
+    assert [record["account_id"] for record in assembled["credit_accounts"]] == [
+        "credit_account:credit_card:10",
+        "credit_account:credit_card:12",
+    ]
+
+
 def test_assembly_normalizes_repayment_and_derives_overdue() -> None:
     repayment = {
         "year": "2024",

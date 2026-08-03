@@ -102,11 +102,26 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     assert set(statuses) == set(PERSONAL_DETAIL_BUSINESS_DATASETS)
     assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
     assert statuses["personal_profile"]["presence_status"] == "observed_nonempty"
-    # This OCR result did not emit these repeating tables. The contract must
-    # not turn that extraction gap into a business assertion of no records.
-    assert statuses["mobile_phone_records"]["presence_status"] == "not_observed"
-    assert statuses["spouse_records"]["presence_status"] == "not_observed"
+    assert statuses["mobile_phone_records"]["presence_status"] == "observed_nonempty"
+    assert statuses["spouse_records"]["presence_status"] == "observed_nonempty"
     assert not any(row["presence_status"] == "explicitly_empty" for row in statuses.values())
+
+    # Source-grounded structure: these counts protect the continuation repair
+    # and the positional profile-table extraction from schema-only regressions.
+    assert datasets["credit_accounts"]["row_count"] == 42
+    assert datasets["residence_records"]["row_count"] == 5
+    assert datasets["employment_records"]["row_count"] == 5
+    assert datasets["mobile_phone_records"]["row_count"] == 1
+    assert datasets["spouse_records"]["row_count"] == 1
+
+    account_ids = {
+        row["normalized"]["account_id"] for row in datasets["credit_accounts"]["rows"]
+    }
+    repayment_rows = [
+        row["normalized"] for row in datasets["repayment_records"]["rows"]
+    ]
+    assert repayment_rows
+    assert all(row.get("account_id") in account_ids for row in repayment_rows)
 
     contract = semantic["domain"]["extensions"]["personal_detail_contract"]
     assert contract["absence_requires_explicit_source_evidence"] is True

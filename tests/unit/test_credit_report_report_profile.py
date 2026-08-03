@@ -186,3 +186,16 @@ def test_enterprise_detection_needs_title_or_both_identifiers() -> None:
         )
         == "enterprise"
     )
+
+
+def test_personal_detail_related_business_identifiers_do_not_route_enterprise() -> None:
+    result = _result(PageContent(page_number=1, page_mode="scanned_ocr"))
+    text = (
+        "\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a\uff08\u672c\u4eba\u7248\uff09 "
+        "\u4fe1\u8d37\u4ea4\u6613\u4fe1\u606f\u660e\u7ec6 "
+        "\u76f8\u5173\u8fd8\u6b3e\u8d23\u4efb "
+        "\u4e3b\u4e1a\u52a1\u501f\u6b3e\u4eba\u4e2d\u5f81\u7801 35020300119734252 "
+        "\u7edf\u4e00\u793e\u4f1a\u4fe1\u7528\u4ee3\u7801 91350203MA33H1DP8L"
+    )
+
+    assert detect_credit_report_subtype(result, text) == "personal_detail"

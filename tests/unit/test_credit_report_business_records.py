@@ -17,6 +17,7 @@ from docmirror.plugins.credit_report.currency_codes import (
     normalize_currency_code,
 )
 from docmirror.plugins.credit_report.enterprise_native.extraction import (
+    _merge_accounts,
     extract_enterprise_attachment_datasets,
     extract_enterprise_capital_summary,
     extract_enterprise_credit_lines_from_tables,
@@ -947,6 +948,176 @@ def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() 
     assert personal_inquiry["query_channel"] == "商业银行网上银行"
     assert business["credit_summary"]["activated_credit_card_account_count"] == 0
     assert business["credit_summary"]["inactive_credit_card_account_count"] == 1
+
+
+def test_enterprise_merge_fills_only_reconciled_main_account_gap() -> None:
+    canonical = [
+        {
+            "account_identifier": "ACCOUNT000001",
+            "management_institution": "示例银行一",
+            "business_type": "流动资金贷款",
+            "open_date": "2025-01-01",
+            "due_date": "2026-01-01",
+            "balance": 10,
+        }
+    ]
+    fallback = [
+        dict(canonical[0]),
+        {
+            "account_identifier": "ACCOUNT000002",
+            "management_institution": "示例银行二",
+            "business_type": "订单融资",
+            "open_date": "2025-02-01",
+            "due_date": "2026-02-01",
+        },
+    ]
+
+    merged = _merge_accounts(fallback, canonical, expected=2)
+
+    assert [row["account_identifier"] for row in merged] == ["ACCOUNT000001", "ACCOUNT000002"]
+
+
+def test_enterprise_merge_does_not_guess_when_population_is_ambiguous() -> None:
+    canonical = [
+        {
+            "account_identifier": "ACCOUNT000001",
+            "management_institution": "示例银行一",
+            "business_type": "流动资金贷款",
+            "open_date": "2025-01-01",
+        }
+    ]
+    fallback = [
+        *canonical,
+        *[
+            {
+                "account_identifier": f"ACCOUNT00000{index}",
+                "management_institution": f"示例银行{index}",
+                "business_type": "附件历史",
+                "open_date": f"2025-0{index}-01",
+            }
+            for index in (2, 3)
+        ],
+    ]
+
+    assert _merge_accounts(fallback, canonical, expected=2) == canonical
+
+
+def test_enterprise_identity_can_continue_in_an_adjacent_table_and_page() -> None:
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=3,
+                texts=[_native_text("身份标识", top=0)],
+                tables=[_native_table("identity_name", [["企业名称", "示例企业"]])],
+            ),
+            SimpleNamespace(
+                page_number=4,
+                source_page_number=4,
+                texts=[],
+                tables=[
+                    _native_table(
+                        "identity_codes",
+                        [["中征码", "1234567890"], ["统一社会信用代码", "91110000123456789X"]],
+                    )
+                ],
+            ),
+        ]
+    )
+
+    assert extract_enterprise_identity_facts(result) == {
+        "subject_name": "示例企业",
+        "zhongzheng_code": "1234567890",
+        "unified_social_credit_code": "91110000123456789X",
+    }
+
+
+def test_enterprise_summary_binds_semantic_headers_with_spacers_and_new_category() -> None:
+    table = _native_table(
+        "current_summary",
+        [
+            ["", "正常类", "", "", "关注类", "", "", "不良类", "", "", "合计", "", ""],
+            ["业务", "账户数", "", "余额", "账户数", "", "余额", "账户数", "", "余额", "账户数", "", "余额"],
+            ["供应链融资", "2", "", "30", "1", "", "4", "0", "", "0", "3", "", "34"],
+        ],
+        top=20,
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=3,
+                texts=[_native_text("借贷交易", top=0)],
+                tables=[table],
+            )
+        ]
+    )
+
+    rows = extract_enterprise_summary_datasets(result)["enterprise_current_credit_summary"]
+
+    assert len(rows) == 1
+    assert rows[0]["business_category"] == "供应链融资"
+    assert rows[0]["transaction_group"] == "借贷交易"
+    assert rows[0]["total_account_count"] == 3
+    assert rows[0]["total_balance"] == 34
+
+
+def test_personal_brief_accepts_equivalent_account_action_wording() -> None:
+    text = """
+    个人信用报告 信贷记录
+    2025年01月02日示例商业银行办理的200,000元（人民币）个人消费贷款，
+    2027年01月02日到期。截至2026年07月，余额180,000，当前无逾期。
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert len(business["credit_accounts"]) == 1
+    assert business["credit_accounts"][0]["management_institution"] == "示例商业银行"
+    assert business["credit_accounts"][0]["loan_amount"] == 200000
+
+
+def test_personal_brief_does_not_turn_liability_narrative_into_account() -> None:
+    text = """
+    个人信用报告 信贷记录 相关还款责任信息
+    2025年01月02日，为张三（证件类型：身份证，证件号码：110101199001011234）
+    在示例商业银行办理的个人经营性贷款承担相关还款责任，责任人类型为保证人，
+    相关还款责任金额50,000。
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert business["credit_accounts"] == []
+    assert len(business["repayment_liability_records"]) == 1
+
+
+def test_personal_brief_accepts_new_structured_inquiry_reason_suffix() -> None:
+    text = """
+    个人信用报告 查询记录
+    机构查询记录明细
+    编号 查询日期 查询机构 查询原因
+    9 2026年07月01日 示例商业银行 客户准入审查
+    个人查询记录明细
+    """
+
+    business = extract_native_credit_business(
+        _result(text),
+        text,
+        report_subtype="personal_brief",
+        content_mode="native_text",
+    )
+
+    assert business["inquiry_records"][0]["institution"] == "示例商业银行"
+    assert business["inquiry_records"][0]["reason"] == "客户准入审查"
 
 
 def test_enterprise_extracts_summary_facilities_accounts_and_public_records() -> None:

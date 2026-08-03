@@ -363,9 +363,9 @@ def _summary_value(value: Any) -> tuple[str, str | None, str]:
         return "integer", compact, "reported"
     if re.fullmatch(r"\d{4}[-./]\d{1,2}(?:[-./]\d{1,2})?", compact):
         return "date", None, "reported"
-    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)", compact):
+    if re.fullmatch(r"[-+]?\d+\.\d+", compact):
         return "decimal", compact, "reported"
-    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+|\d+)%", compact):
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%", compact):
         return "percentage", compact[:-1], "reported"
     return "text", None, "reported"
 

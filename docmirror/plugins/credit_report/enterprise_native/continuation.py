@@ -52,6 +52,10 @@ class ContinuationContract:
     """A declarative, family-specific permission to follow one table."""
 
     name: str
+    # An empty set deliberately means "semantic shape only".  Native PBOC
+    # PDFs sometimes materialize merged/spacer cells differently when the
+    # same logical row lands at another page position, so an exact physical
+    # width must never be the sole continuation key.
     expected_columns: frozenset[int]
     row_predicate: RowPredicate
     max_page_gap: int = 1
@@ -474,7 +478,7 @@ class EnterpriseContinuationResolver:
             candidate_row_index=candidate_row_index,
         )
         if not decision.accepted:
-            if len(row) not in contract.expected_columns:
+            if contract.expected_columns and len(row) not in contract.expected_columns:
                 reason = "column_shape"
             elif any(marker in signature for marker in contract.forbidden_markers):
                 reason = "new_header"
@@ -815,7 +819,7 @@ def _candidate_semantic_match(
     validator = candidate_validator or (contract.row_predicate if contract is not None else None)
     candidate_row = list(candidate.rows[candidate_row_index]) if 0 <= candidate_row_index < len(candidate.rows) else []
     if contract is not None and candidate_row:
-        if len(candidate_row) not in contract.expected_columns:
+        if contract.expected_columns and len(candidate_row) not in contract.expected_columns:
             return False
         signature = "".join(candidate_row)
         if any(marker in signature for marker in contract.forbidden_markers):
@@ -1000,7 +1004,9 @@ def _score_table_boundary(
             split_score += 0.42
             split_signals.append("semantic_row_shape_diverges")
     if contract is not None:
-        if candidate_row and len(candidate_row) in contract.expected_columns:
+        if candidate_row and (
+            not contract.expected_columns or len(candidate_row) in contract.expected_columns
+        ):
             same_score += 0.08
             same_signals.append("expected_column_contract")
         elif candidate_row:
@@ -1241,15 +1247,26 @@ def _number_like(value: Any) -> bool:
 
 def _settled_account_detail_row(row: Row) -> bool:
     values = [str(value or "").strip() for value in row]
-    if len(values) != 8:
+    if len(values) < 4:
         return False
-    suffix = re.sub(r"[^0-9A-Z]", "", values[0].upper())
+    date_indexes = [index for index, value in enumerate(values) if _date_like(value)]
+    if len(date_indexes) < 2:
+        return False
+    first_date, second_date = date_indexes[:2]
+    suffix = re.sub(r"[^0-9A-Z]", "", "".join(values[:first_date]).upper())
+    classification = next(
+        (
+            value
+            for value in values[first_date + 1 : second_date]
+            if value and value not in {"-", "--", "—"}
+        ),
+        "",
+    )
     return bool(
         (not suffix or len(suffix) <= 16)
-        and _date_like(values[1])
-        and values[2] in {"正常", "关注", "次级", "可疑", "损失", "违约", "未分类"}
-        and _date_like(values[3])
-        and (not values[5] or "还款" in values[5])
+        and classification
+        and not any(marker in classification for marker in ("账户编号", "五级分类", "关闭日期"))
+        and any((not value or "还款" in value) for value in values[second_date + 1 :])
     )
 
 
@@ -1271,32 +1288,31 @@ def _attachment_history_continuation_row(row: Row) -> bool:
 
 FACILITY_VALUE_CONTRACT = ContinuationContract(
     name="facility_summary_values",
-    expected_columns=frozenset({6}),
-    row_predicate=lambda row: numeric_row(row, numeric_indexes=range(6)),
+    expected_columns=frozenset(),
+    row_predicate=lambda row: sum(_number_like(value) for value in row) >= 6,
     forbidden_markers=("非循环信用额度", "循环信用额度", "总额", "已用额度"),
 )
 
 CLOSED_SUMMARY_BODY_CONTRACT = ContinuationContract(
     name="closed_credit_summary_body",
-    expected_columns=frozenset({5}),
-    row_predicate=lambda row: numeric_row(
-        row,
-        numeric_indexes=range(1, 5),
-        nonempty_indexes=(0,),
+    expected_columns=frozenset(),
+    row_predicate=lambda row: bool(
+        next((str(value or "").strip() for value in row if str(value or "").strip()), "")
+        and sum(_number_like(value) for value in row) >= 4
     ),
     forbidden_markers=("正常类账户数", "关注类账户数", "不良类账户数"),
 )
 
 ACCOUNT_SETTLED_DETAIL_CONTRACT = ContinuationContract(
     name="enterprise_account_settled_detail",
-    expected_columns=frozenset({8}),
+    expected_columns=frozenset(),
     row_predicate=_settled_account_detail_row,
     forbidden_markers=("账户编号", "授信机构", "业务种类", "借款金额"),
 )
 
 ATTACHMENT_HISTORY_BODY_CONTRACT = ContinuationContract(
     name="enterprise_attachment_history_body",
-    expected_columns=frozenset({7, 8, 11}),
+    expected_columns=frozenset(),
     row_predicate=_attachment_history_continuation_row,
     forbidden_markers=("账户编号", "授信机构", "开户日期", "开立日期", "信息报告日期"),
 )

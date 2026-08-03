@@ -976,7 +976,9 @@ def credit_report_semantic_extensions(*, report_subtype: str) -> dict[str, Any]:
         "presentation_policy": {
             "classification": "highly_sensitive_personal_financial_data",
             "default_display": "masked",
-            "enhanced_markdown_display": "full" if report_subtype == "personal_brief" else "masked",
+            "enhanced_markdown_display": (
+                "full" if report_subtype in {"personal_brief", "personal_detail"} else "masked"
+            ),
             "mask_fields": [
                 "id_number",
                 "subject_id",

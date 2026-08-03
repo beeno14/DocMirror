@@ -17,6 +17,10 @@ from datetime import date
 from types import MappingProxyType
 from typing import Any
 
+from docmirror.plugins.credit_report.currency_codes import (
+    CURRENCY_CODE_BY_ALIAS,
+    normalize_currency_code,
+)
 from docmirror.plugins.credit_report.enterprise_native.continuation import (
     ACCOUNT_SETTLED_DETAIL_CONTRACT,
     ATTACHMENT_HISTORY_BODY_CONTRACT,
@@ -49,6 +53,7 @@ _CURRENCY_CODES = {
     "欧元": "EUR",
     "港币": "HKD",
 }
+_MISSING_MARKERS = frozenset({"", "--", "-", "—"})
 
 
 def _date(value: Any) -> str:
@@ -74,6 +79,55 @@ def _percentage(value: Any) -> float | int | None:
 
 def _identifier(value: Any) -> str:
     return re.sub(r"[^0-9A-Z]", "", _compact(value).upper())
+
+
+def _currency_code(value: Any) -> str:
+    """Normalize known currencies while preserving future source labels."""
+    raw = _compact(value)
+    return normalize_currency_code(raw) or _CURRENCY_CODES.get(raw, raw)
+
+
+def _amount_unit_for_currency(currency: str, *, scale: str = "10K") -> str:
+    """Keep amount scale independent from the source currency."""
+    normalized = _currency_code(currency)
+    return f"{normalized}_{scale}" if normalized else scale
+
+
+def _looks_like_currency(value: Any) -> bool:
+    raw = _compact(value)
+    upper = raw.upper()
+    return bool(
+        raw
+        and (
+            raw in _CURRENCY_CODES
+            or upper in CURRENCY_CODE_BY_ALIAS
+            or re.fullmatch(r"[A-Z]{3}", upper)
+            or raw.endswith(("元", "币"))
+        )
+    )
+
+
+def _account_category_heading(row: list[str]) -> tuple[str, str] | None:
+    """Recognize an account-card heading without a closed category allowlist."""
+    values = [_compact(value) for value in row]
+    signature = "".join(values)
+    count_match = re.search(r"共\s*\d+\s*笔", signature)
+    if not count_match:
+        return None
+    category = next(
+        (
+            value
+            for value in values
+            if value
+            and not re.fullmatch(r"共\s*\d+\s*笔", value)
+            and not any(marker in value for marker in ("账户编号", "授信机构", "业务种类", "业务类型"))
+        ),
+        "",
+    )
+    if not category:
+        return None
+    status = "settled" if "已结清" in signature else "active" if "未结清" in signature else ""
+    return category, status
 
 
 def _raw_table_rows(table: Any) -> list[list[str]]:
@@ -338,7 +392,7 @@ def _primary_account_field_indexes(
     if len(date_indexes) < 2:
         return None
     detected_currency_index = next(
-        (index for index, value in enumerate(row) if _compact(value) in _CURRENCY_CODES),
+        (index for index, value in enumerate(row) if _looks_like_currency(value)),
         -1,
     )
     if detected_currency_index < 0:
@@ -360,7 +414,41 @@ def _primary_account_field_indexes(
 
 
 def _is_account_detail_row(row: list[str]) -> bool:
-    return bool(len(row) >= 4 and _number(row[2]) is not None and row[3] in _FIVE_TIER_CLASSES)
+    classification = _compact(row[3]) if len(row) > 3 else ""
+    return bool(
+        len(row) >= 4
+        and _number(row[2]) is not None
+        and classification not in _MISSING_MARKERS
+        and not any(marker in classification for marker in ("五级分类", "账户编号", "还款"))
+    )
+
+
+def _is_account_continuation_row(row: list[str]) -> bool:
+    values = [_compact(value) for value in row]
+    signature = "".join(values)
+    if "关闭日期" in signature and "五级分类" in signature:
+        return True
+    if _is_account_detail_row(values):
+        return True
+    date_indexes = [index for index, value in enumerate(values) if _date(value)]
+    if len(date_indexes) >= 2:
+        first_date, second_date = date_indexes[:2]
+        classification = next(
+            (value for value in values[first_date + 1 : second_date] if value not in _MISSING_MARKERS),
+            "",
+        )
+        if classification and not any(marker in classification for marker in ("五级分类", "关闭日期")):
+            return True
+    if len(_identifier(values[0] if values else "")) >= _MIN_ENTERPRISE_ACCOUNT_IDENTIFIER_LENGTH:
+        return bool(
+            sum(bool(_date(value)) for value in values) >= 2
+            and any(_looks_like_currency(value) for value in values)
+            and any(_number(value) is not None for value in values[1:])
+        )
+    return bool(
+        any(_date(value) for value in values)
+        and any("还款" in value for value in values)
+    )
 
 
 def _finalize_account(record: dict[str, Any] | None, out: list[dict[str, Any]]) -> None:
@@ -438,22 +526,29 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
         def follows_active_fragment() -> bool:
             if active_fragment_index < 0 or fragment_index < 0:
                 return True
-            return (
-                fragment_index in {active_fragment_index, active_fragment_index + 1}
-                and 0 <= page - active_fragment_page <= 1
+            if fragment_index == active_fragment_index:
+                return True
+            if fragment_index != active_fragment_index + 1 or not 0 <= page - active_fragment_page <= 1:
+                return False
+            return resolver.table_continues(
+                resolver.fragments[active_fragment_index],
+                fragment,
+                candidate_validator=_is_account_continuation_row,
+                candidate_validator_scope="fragment",
+                context="enterprise_account_card",
             )
 
         for row_index, row in enumerate(rows):
             cells = [*row, *([""] * max(0, 8 - len(row)))]
             first = cells[0]
-            if first in _ACCOUNT_CATEGORIES and any("共" in cell and "笔" in cell for cell in cells):
+            category_heading = _account_category_heading(cells)
+            if category_heading is not None:
                 _finalize_account(current, accounts)
                 current = None
-                category = first
+                category, heading_status = category_heading
                 header_seen = False
                 settled_schema = False
-                signature = "".join(cells)
-                account_status_hint = "settled" if "已结清" in signature else "active" if "未结清" in signature else ""
+                account_status_hint = heading_status
                 active_fragment_index = fragment_index
                 active_fragment_page = page
                 continue
@@ -547,12 +642,9 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                     "business_type": _compact(cells[resolved_business_type_index]),
                     "open_date": _date(cells[resolved_open_date_index]),
                     "due_date": _date(cells[resolved_due_date_index]),
-                    "currency": _CURRENCY_CODES.get(
-                        _compact(cells[resolved_currency_index]),
-                        _compact(cells[resolved_currency_index]),
-                    ),
+                    "currency": _currency_code(cells[resolved_currency_index]),
                     amount_field: _number(cells[resolved_amount_index]),
-                    "amount_unit": "CNY_10K",
+                    "amount_unit": _amount_unit_for_currency(cells[resolved_currency_index]),
                     "account_status": account_status_hint or ("settled" if settled_schema else "active"),
                     "source": "canonical_enterprise_account_card",
                     "source_refs": source_refs,
@@ -582,8 +674,9 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                     in settled_continuation_rows,
                 )
                 current["close_date"] = _date(cells[1])
-                if cells[2] in _FIVE_TIER_CLASSES:
-                    current["five_tier_class"] = cells[2]
+                classification = _compact(cells[2])
+                if classification not in _MISSING_MARKERS and "五级分类" not in classification:
+                    current["five_tier_class"] = classification
                 current["last_repayment_date"] = _date(cells[3])
                 current["repayment_method"] = _compact(cells[5])
                 current["history_status"] = _compact(cells[7])
@@ -603,7 +696,7 @@ def extract_enterprise_accounts_from_tables(parse_result: Any) -> list[dict[str,
                 )
                 current["guarantee_type"] = _compact(cells[1])
                 current["balance"] = _number(cells[2])
-                current["five_tier_class"] = cells[3]
+                current["five_tier_class"] = _compact(cells[3])
                 overdue_values = (
                     _number(cells[4]),
                     _number(cells[5]),
@@ -677,18 +770,18 @@ def _facility_summary_lines(parse_result: Any) -> list[dict[str, Any]]:
             value_table_id = table_id
             value_row_index = row_index + 2
             values = rows[value_row_index] if value_row_index < len(rows) else []
-            if len(values) < 6:
+            numeric_values = [_number(value) for value in values if _number(value) is not None]
+            if len(numeric_values) < 6:
                 match = resolver.following_row(fragment, FACILITY_VALUE_CONTRACT)
                 if match is not None:
                     value_page = match.fragment.page
                     value_table_id = match.fragment.table_id
                     value_row_index = match.row_index
                     values = [_compact(value) for value in match.row]
-            if len(values) < 6:
+                    numeric_values = [_number(value) for value in values if _number(value) is not None]
+            if len(numeric_values) < 6:
                 continue
-            numbers = [_number(value) for value in values[:6]]
-            if any(value is None for value in numbers):
-                continue
+            numbers = numeric_values[:6]
             source_refs = [
                 _source_ref(page, table_id, row_index),
                 _source_ref(value_page, value_table_id, value_row_index),
@@ -871,19 +964,38 @@ _IDENTITY_LABELS = {
 
 
 def extract_enterprise_identity_facts(parse_result: Any) -> dict[str, Any]:
-    """Read all enterprise identity codes from the canonical identity table."""
+    """Read identity fields across split canonical identity tables.
+
+    A page break or PDF producer may split the label/value form into multiple
+    physical tables.  Conflicting values are withheld rather than silently
+    selecting whichever table happened to be visited last.
+    """
     facts: dict[str, Any] = {}
-    for _page, _table_id, rows in _table_stream(parse_result):
-        labels = {row[0] for row in rows if len(row) >= 2}
-        if not {"企业名称", "中征码", "统一社会信用代码"} <= labels:
+    conflicts: set[str] = set()
+    page_texts = _page_texts(parse_result)
+    last_identity_page: int | None = None
+    for page, _table_id, rows in _table_stream(parse_result):
+        recognized = [row for row in rows if len(row) >= 2 and _compact(row[0]) in _IDENTITY_LABELS]
+        page_signature = _compact(page_texts.get(page, ""))
+        in_identity_context = bool(
+            "身份标识" in page_signature
+            or len(recognized) >= 2
+            or (last_identity_page is not None and 0 <= page - last_identity_page <= 1)
+        )
+        if not recognized or not in_identity_context:
             continue
-        for row in rows:
-            if len(row) < 2:
+        last_identity_page = page
+        for row in recognized:
+            field = _IDENTITY_LABELS.get(_compact(row[0]))
+            value = _compact(row[1])
+            if not field or value in _MISSING_MARKERS:
                 continue
-            field = _IDENTITY_LABELS.get(row[0])
-            if field and row[1] and row[1] != "--":
-                facts[field] = row[1]
-        break
+            if field in facts and facts[field] != value:
+                conflicts.add(field)
+                continue
+            facts[field] = value
+    for field in conflicts:
+        facts.pop(field, None)
     return facts
 
 
@@ -952,6 +1064,107 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
     return summary
 
 
+def _classification_group(label: str) -> str:
+    compact = _compact(label)
+    if "正常" in compact:
+        return "normal"
+    if "关注" in compact:
+        return "attention"
+    if any(marker in compact for marker in ("不良", "次级", "可疑", "损失")):
+        return "adverse"
+    if "合计" in compact or "总计" in compact:
+        return "total"
+    return ""
+
+
+def _current_summary_schema(header_rows: list[list[str]]) -> dict[str, int]:
+    """Bind classification summary columns by labels, not physical widths."""
+    if len(header_rows) < 2:
+        return {}
+    groups, metrics = header_rows[:2]
+    active_group = ""
+    schema: dict[str, int] = {}
+    for index in range(max(len(groups), len(metrics))):
+        group = _classification_group(groups[index] if index < len(groups) else "")
+        if group:
+            active_group = group
+        metric = _compact(metrics[index] if index < len(metrics) else "")
+        if not active_group:
+            continue
+        if "账户数" in metric or metric in {"户数", "笔数"}:
+            schema[f"{active_group}_account_count"] = index
+        elif "余额" in metric or "金额" in metric:
+            schema[f"{active_group}_balance"] = index
+    required = {
+        "normal_account_count",
+        "normal_balance",
+        "attention_account_count",
+        "attention_balance",
+        "adverse_account_count",
+        "adverse_balance",
+        "total_account_count",
+        "total_balance",
+    }
+    return schema if required <= schema.keys() else {}
+
+
+def _values_for_schema(row: list[str], schema: dict[str, int]) -> dict[str, int | float] | None:
+    values: dict[str, int | float] = {}
+    for field, index in schema.items():
+        parsed = _number(row[index] if index < len(row) else "")
+        if parsed is None:
+            return None
+        values[field] = parsed
+    return values
+
+
+def _closed_summary_schema(header: list[str]) -> dict[str, int]:
+    schema: dict[str, int] = {}
+    for index, label in enumerate(header):
+        group = _classification_group(label)
+        if group and ("账户" in _compact(label) or "户数" in _compact(label) or group == "total"):
+            schema[group] = index
+    required = {"normal", "attention", "adverse", "total"}
+    return schema if required <= schema.keys() else {}
+
+
+def _closed_summary_values(
+    row: list[str],
+    schema: dict[str, int],
+) -> tuple[int | float, int | float, int | float, int | float] | None:
+    ordered = []
+    for group in ("normal", "attention", "adverse", "total"):
+        index = schema[group]
+        value = _number(row[index] if index < len(row) else "")
+        ordered.append(value)
+    if any(value is None for value in ordered):
+        # Merged cells can move spacer columns on a continuation page.  The
+        # semantic contract still requires exactly four reported counts.
+        dense = [_number(value) for value in row if _number(value) is not None]
+        if len(dense) != 4:
+            return None
+        ordered = dense
+    return tuple(value for value in ordered if value is not None)  # type: ignore[return-value]
+
+
+def _enterprise_transaction_group(
+    categories: set[str],
+    heading: str = "",
+    *,
+    summary_kind: str = "current",
+) -> str:
+    signature = "".join(sorted(categories)) + _compact(heading)
+    if any(marker in signature for marker in ("借款", "透支", "贴现", "融资", "借贷")):
+        return "借贷交易"
+    if any(marker in signature for marker in ("承兑", "信用证")):
+        return "银行承兑汇票和信用证" if summary_kind == "closed" else "担保交易"
+    if any(marker in signature for marker in ("保函", "担保")):
+        return "银行保函及其他业务"
+    # Preserve new PBOC categories instead of dropping a structurally valid
+    # table just because its business label is not in today's vocabulary.
+    return "其他"
+
+
 def extract_enterprise_summary_datasets(
     parse_result: Any,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -961,6 +1174,7 @@ def extract_enterprise_summary_datasets(
     displayed_rows: list[dict[str, Any]] = []
     responsibility_rows: list[dict[str, Any]] = []
     resolver = EnterpriseContinuationResolver(parse_result)
+    headings = _table_headings(parse_result)
     for fragment in resolver.fragments:
         page = fragment.page
         table_id = fragment.table_id
@@ -968,7 +1182,6 @@ def extract_enterprise_summary_datasets(
         if not rows:
             continue
         headers = rows[0]
-        signature = "".join(headers)
         displayed_header_index = next(
             (
                 row_index
@@ -1098,42 +1311,20 @@ def extract_enterprise_summary_datasets(
                     emitted += 1
                 if emitted:
                     continue
-        if (
-            len(rows) >= 3
-            and len(headers) >= 9
-            and all(marker in signature for marker in ("正常类", "关注类", "不良类", "合计"))
-        ):
-            subheaders = rows[1]
-            if len(subheaders) >= 9 and subheaders[1:9] == [
-                "账户数",
-                "余额",
-                "账户数",
-                "余额",
-                "账户数",
-                "余额",
-                "账户数",
-                "余额",
-            ]:
-                categories = {_compact(row[0]) for row in rows[2:] if row}
-                if categories & {"中长期借款", "短期借款", "循环透支", "贴现"}:
-                    transaction_group = "借贷交易"
-                elif categories & {"银行承兑汇票", "信用证"}:
-                    transaction_group = "担保交易"
-                elif categories & {"银行保函", "其他担保交易"}:
-                    transaction_group = "银行保函及其他业务"
-                else:
-                    transaction_group = ""
-                if transaction_group:
-                    for row_index, row in enumerate(rows[2:], start=2):
-                        if len(row) < 9 or not _compact(row[0]):
-                            continue
-                        values = [_number(value) for value in row[1:9]]
-                        if any(value is None for value in values):
-                            continue
-                        numeric_values = [value for value in values if value is not None]
-                        category = _compact(row[0])
-                        current_rows.append(
-                            {
+        current_schema = _current_summary_schema(rows[:2])
+        if len(rows) >= 3 and current_schema:
+            categories = {_compact(row[0]) for row in rows[2:] if row and _compact(row[0])}
+            transaction_group = _enterprise_transaction_group(
+                categories,
+                headings.get(table_id, ""),
+            )
+            for row_index, row in enumerate(rows[2:], start=2):
+                category = _compact(row[0]) if row else ""
+                values = _values_for_schema(row, current_schema)
+                if not category or values is None:
+                    continue
+                current_rows.append(
+                    {
                                 "current_summary_id": _stable_id(
                                     "enterprise_current_summary",
                                     transaction_group,
@@ -1144,14 +1335,14 @@ def extract_enterprise_summary_datasets(
                                 "sequence": len(current_rows) + 1,
                                 "transaction_group": transaction_group,
                                 "business_category": category,
-                                "normal_account_count": int(numeric_values[0]),
-                                "normal_balance": numeric_values[1],
-                                "attention_account_count": int(numeric_values[2]),
-                                "attention_balance": numeric_values[3],
-                                "adverse_account_count": int(numeric_values[4]),
-                                "adverse_balance": numeric_values[5],
-                                "total_account_count": int(numeric_values[6]),
-                                "total_balance": numeric_values[7],
+                                "normal_account_count": int(values["normal_account_count"]),
+                                "normal_balance": values["normal_balance"],
+                                "attention_account_count": int(values["attention_account_count"]),
+                                "attention_balance": values["attention_balance"],
+                                "adverse_account_count": int(values["adverse_account_count"]),
+                                "adverse_balance": values["adverse_balance"],
+                                "total_account_count": int(values["total_account_count"]),
+                                "total_balance": values["total_balance"],
                                 "currency": "CNY",
                                 "amount_unit": "CNY_10K",
                                 "is_total": category == "合计",
@@ -1162,13 +1353,9 @@ def extract_enterprise_summary_datasets(
                                 "confidence": 1.0,
                             }
                         )
-                    continue
-        if (
-            "正常类账户数" in signature
-            and "关注类账户数" in signature
-            and "不良类账户数" in signature
-            and "合计" in signature
-        ):
+            continue
+        closed_schema = _closed_summary_schema(headers)
+        if closed_schema:
             closed_data: list[tuple[int, str, int, list[str]]] = [
                 (page, table_id, row_index, row) for row_index, row in enumerate(rows[1:], start=1)
             ]
@@ -1179,10 +1366,7 @@ def extract_enterprise_summary_datasets(
                 )
                 if match is not None:
                     candidate_rows = [[_compact(value) for value in row] for row in match.fragment.rows]
-                    if all(
-                        len(row) == 5 and _compact(row[0]) and all(_number(value) is not None for value in row[1:5])
-                        for row in candidate_rows
-                    ):
+                    if all(_closed_summary_values(row, closed_schema) is not None for row in candidate_rows):
                         closed_data = [
                             (
                                 match.fragment.page,
@@ -1193,22 +1377,16 @@ def extract_enterprise_summary_datasets(
                             for row_index, row in enumerate(candidate_rows)
                         ]
             categories = {_compact(row[0]) for _, _, _, row in closed_data if row}
-            if categories & {"中长期借款", "短期借款", "贴现"}:
-                transaction_group = "借贷交易"
-            elif "银行承兑汇票" in categories:
-                transaction_group = "银行承兑汇票和信用证"
-            elif "其他担保交易" in categories:
-                transaction_group = "银行保函及其他业务"
-            else:
-                transaction_group = "其他"
+            transaction_group = _enterprise_transaction_group(
+                categories,
+                headings.get(table_id, ""),
+                summary_kind="closed",
+            )
             for source_page, source_table_id, row_index, row in closed_data:
-                if len(row) < 5 or not _compact(row[0]):
+                category = next((_compact(value) for value in row if _compact(value) and _number(value) is None), "")
+                counts = _closed_summary_values(row, closed_schema)
+                if not category or counts is None:
                     continue
-                counts = [_number(value) for value in row[1:5]]
-                if any(value is None for value in counts):
-                    continue
-                numeric_counts = [value for value in counts if value is not None]
-                category = _compact(row[0])
                 closed_rows.append(
                     {
                         "closed_summary_id": _stable_id(
@@ -1221,10 +1399,10 @@ def extract_enterprise_summary_datasets(
                         "sequence": len(closed_rows) + 1,
                         "transaction_group": transaction_group,
                         "business_category": category,
-                        "normal_account_count": int(numeric_counts[0]),
-                        "attention_account_count": int(numeric_counts[1]),
-                        "adverse_account_count": int(numeric_counts[2]),
-                        "total_account_count": int(numeric_counts[3]),
+                        "normal_account_count": int(counts[0]),
+                        "attention_account_count": int(counts[1]),
+                        "adverse_account_count": int(counts[2]),
+                        "total_account_count": int(counts[3]),
                         "is_total": category == "合计",
                         "source_page": source_page,
                         "source_table_id": source_table_id,
@@ -1442,11 +1620,11 @@ def extract_enterprise_repayment_liability_records(
                 len(account_identifier) < 12
                 or not open_date
                 or not _compact(row[1])
-                or _compact(row[3]) not in _CURRENCY_CODES
+                or not _looks_like_currency(row[3])
             ):
                 continue
             finish_pending()
-            currency = _CURRENCY_CODES.get(_compact(row[3]), _compact(row[3]))
+            currency = _currency_code(row[3])
             pending = {
                 "liability_id": f"repayment_liability:{account_identifier}",
                 "account_identifier": account_identifier,
@@ -1454,7 +1632,7 @@ def extract_enterprise_repayment_liability_records(
                 "contract_number": contract_number,
                 "contract_number_status": ("reported" if contract_number else "not_reported"),
                 "currency": currency,
-                "amount_unit": "CNY_10K",
+                "amount_unit": _amount_unit_for_currency(currency),
                 "responsibility_amount": responsibility_amount,
                 "responsibility_amount_reported": responsibility_amount is not None,
                 "responsibility_amount_status": ("reported" if responsibility_amount is not None else "not_reported"),
@@ -1494,37 +1672,16 @@ def extract_enterprise_continuation_audit(
         rows = [[_compact(value) for value in row] for row in fragment.rows]
         if not rows:
             continue
-        signature = "".join(rows[0])
         first_two = "".join(value for row in rows[:2] for value in row)
-        if (
-            len(rows) >= 3
-            and len(rows[0]) >= 9
-            and all(marker in signature for marker in ("正常类", "关注类", "不良类", "合计"))
-            and len(rows[1]) >= 9
-            and rows[1][1:9] == ["账户数", "余额", "账户数", "余额", "账户数", "余额", "账户数", "余额"]
-        ):
-            categories = {_compact(row[0]) for row in rows[2:] if row}
-            if categories & {
-                "中长期借款",
-                "短期借款",
-                "循环透支",
-                "贴现",
-                "银行承兑汇票",
-                "信用证",
-                "银行保函",
-                "其他担保交易",
-            }:
-                expected["current_credit_summary"] += sum(
-                    1
-                    for row in rows[2:]
-                    if len(row) >= 9 and _compact(row[0]) and all(_number(value) is not None for value in row[1:9])
-                )
-        if (
-            "正常类账户数" in signature
-            and "关注类账户数" in signature
-            and "不良类账户数" in signature
-            and "合计" in signature
-        ):
+        current_schema = _current_summary_schema(rows[:2])
+        if len(rows) >= 3 and current_schema:
+            expected["current_credit_summary"] += sum(
+                1
+                for row in rows[2:]
+                if row and _compact(row[0]) and _values_for_schema(row, current_schema) is not None
+            )
+        closed_schema = _closed_summary_schema(rows[0])
+        if closed_schema:
             body = rows[1:]
             if not body:
                 match = resolver.following_row(fragment, CLOSED_SUMMARY_BODY_CONTRACT)
@@ -1532,7 +1689,7 @@ def extract_enterprise_continuation_audit(
             expected["closed_credit_summary"] += sum(
                 1
                 for row in body
-                if len(row) == 5 and _compact(row[0]) and all(_number(value) is not None for value in row[1:5])
+                if _closed_summary_values(row, closed_schema) is not None
             )
         if (
             len(rows[0]) >= 9
@@ -3538,10 +3695,101 @@ def _merge_accounts(
 ) -> list[dict[str, Any]]:
     if not canonical:
         return original
-    # Canonical account cards and heuristic history/appendix candidates have
-    # different grains.  Once cards exist, mixing the two populations creates
-    # duplicates and field-shifted pseudo-accounts.
-    return canonical
+
+    def identifier(record: dict[str, Any]) -> str:
+        return _identifier(record.get("account_identifier"))
+
+    def compatible(candidate: dict[str, Any]) -> bool:
+        """Require main-account identity evidence before filling a gap."""
+        return bool(
+            len(identifier(candidate)) >= _MIN_ENTERPRISE_ACCOUNT_IDENTIFIER_LENGTH
+            and _compact(candidate.get("management_institution"))
+            and _compact(candidate.get("business_type"))
+            and (_date(candidate.get("open_date")) or _date(candidate.get("due_date")))
+        )
+
+    def merge_record(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+        merged = dict(primary)
+        for key, value in secondary.items():
+            if key == "source_refs":
+                refs = list(merged.get("source_refs") or [])
+                for ref in value or []:
+                    if ref not in refs:
+                        refs.append(ref)
+                merged["source_refs"] = refs
+            elif merged.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
+                merged[key] = value
+        return merged
+
+    original_by_id = {
+        identifier(record): record
+        for record in original
+        if isinstance(record, dict) and compatible(record)
+    }
+    merged: list[dict[str, Any]] = []
+    consumed_original: set[str] = set()
+    for record in canonical:
+        canonical_id = identifier(record)
+        exact = original_by_id.get(canonical_id)
+        prefix_id = next(
+            (
+                candidate_id
+                for candidate_id in original_by_id
+                if candidate_id != canonical_id
+                and (candidate_id.startswith(canonical_id) or canonical_id.startswith(candidate_id))
+            ),
+            "",
+        )
+        fallback = exact or original_by_id.get(prefix_id)
+        if fallback is not None:
+            consumed_original.add(identifier(fallback))
+            record = merge_record(record, fallback)
+            fallback_id = identifier(fallback)
+            if len(fallback_id) > len(canonical_id) and fallback_id.startswith(canonical_id):
+                record["account_identifier"] = fallback_id
+                record["account_id"] = f"credit_account:{fallback_id}"
+        merged.append(record)
+
+    if expected is None or len(merged) == expected:
+        return merged
+
+    candidates = [
+        record
+        for candidate_id, record in original_by_id.items()
+        if candidate_id not in consumed_original
+        and not any(
+            candidate_id.startswith(identifier(item)) or identifier(item).startswith(candidate_id)
+            for item in merged
+        )
+    ]
+    reconciled = [*merged, *candidates]
+    if len(reconciled) == expected:
+        return reconciled
+    if len(original_by_id) == expected:
+        # The fallback population exactly reconciles with the report total and
+        # every row passed the main-account evidence guard.
+        return list(original_by_id.values())
+    # Do not guess which extra appendix/history candidate belongs to the main
+    # account population.  Returning the strongest canonical population keeps
+    # the mismatch visible to the extraction reconciliation audit.
+    return merged
+
+
+def _enterprise_source_display_limited(text: str) -> bool:
+    compact = _compact(text)
+    partial_credit = bool(
+        re.search(
+            r"(?:受?篇幅(?:所限|限制)?.{0,30})?"
+            r"(?:只|仅)?(?:展示|列示|显示|提供).{0,12}部分.{0,12}(?:信贷|信用)记录",
+            compact,
+        )
+        or re.search(r"部分(?:信贷|信用)记录.{0,12}(?:展示|列示|显示|提供)", compact)
+    )
+    limited_period = bool(
+        re.search(r"(?:仅|只)?展示.{0,12}(?:期限|期间|年限|时间范围).{0,20}已结清信贷信息", compact)
+        and any(marker in compact for marker in ("非信贷信息", "公共信息", "公共记录"))
+    )
+    return partial_credit or limited_period
 
 
 def refine_enterprise_business(
@@ -3579,30 +3827,21 @@ def refine_enterprise_business(
             public_record_counts[record_type] = public_record_counts.get(record_type, 0) + 1
         summary["public_record_type_counts"] = public_record_counts
     refined["credit_accounts"] = accounts
-    summary["account_population_comparable"] = bool(isinstance(expected, int) and expected == len(canonical_accounts))
+    summary["account_population_comparable"] = bool(isinstance(expected, int) and expected == len(accounts))
+    summary["account_population_reconciliation_status"] = (
+        "complete"
+        if isinstance(expected, int) and expected == len(accounts)
+        else "not_reported"
+        if not isinstance(expected, int)
+        else "unresolved"
+    )
     attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
     attachment_accounts = attachment_datasets["enterprise_attachment_accounts"]
     attachment_details = attachment_datasets["enterprise_attachment_credit_details"]
     attachment_transactions = attachment_datasets["enterprise_special_transactions"]
     source_display_limited = any(
-        (
-            "受篇幅所限" in compact_text
-            and any(
-                marker in compact_text
-                for marker in ("只展示部分信贷记录", "仅展示部分信贷记录")
-            )
-        )
-        or (
-            "仅展示一定期限范围内" in compact_text
-            and "已结清信贷信息" in compact_text
-            and any(
-                marker in compact_text
-                for marker in ("非信贷信息", "公共信息")
-            )
-        )
-        for compact_text in (
-            _compact(text) for text in _page_texts(parse_result).values()
-        )
+        _enterprise_source_display_limited(text)
+        for text in _page_texts(parse_result).values()
     )
     summary.update(
         {

@@ -1511,7 +1511,13 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
-        enums["amount_unit"] = {"CNY_10K": "万元（人民币）"}
+        enums["amount_unit"] = {
+            "CNY_10K": "万元（人民币）",
+            "USD_10K": "万美元",
+            "EUR_10K": "万欧元",
+            "HKD_10K": "万港币",
+            "10K": "万（源币种）",
+        }
         enums["currency"] = {
             "CNY": "人民币",
             "USD": "美元",
