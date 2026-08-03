@@ -309,7 +309,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "page": 1,
         "residence_record_id": residences[0]["residence_record_id"],
         "residence_status": "按揭",
-        "residential_phone": "010—83234323",
+        "residential_phone": "01083234323",
         "sequence": 1,
         "source_page": 1,
     }
@@ -321,7 +321,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "data_provider": "样例小额贷款公司",
         "employer": "某软件中心",
         "employer_address": "某市经开区北辰东路2 号",
-        "employer_phone": "010—57888888",
+        "employer_phone": "01057888888",
         "employer_type": "外资企业",
         "employment_record_id": fifth_employment["employment_record_id"],
         "entry_year": 2022,

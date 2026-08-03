@@ -87,9 +87,43 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             existing_summary=existing_summary,
             variant_input=variant_input,
         )
+        accounts = [account for account in assembled.get("credit_accounts") or [] if isinstance(account, dict)]
+        valid_account_ids = {str(account.get("account_id") or "") for account in accounts if account.get("account_id")}
+        repayment_records = [
+            dict(record) for record in assembled.get("repayment_records") or [] if isinstance(record, dict)
+        ]
+        needs_relink = False
+        for record in repayment_records:
+            account_id = str(record.get("account_id") or "")
+            if account_id and account_id not in valid_account_ids:
+                needs_relink = True
+                record.pop("account_id", None)
+                record.pop("account_identifier", None)
+                normalized = record.get("normalized")
+                if isinstance(normalized, dict):
+                    normalized = dict(normalized)
+                    normalized.pop("account_id", None)
+                    normalized.pop("account_identifier", None)
+                    record["normalized"] = normalized
+        if needs_relink:
+            from docmirror.models.mirror.domain_access import micro_grid_structures_from_domain_specific
+            from docmirror.plugins.credit_report.scanned_business import link_repayment_records_to_accounts
+
+            domain_specific = getattr(getattr(parse_result, "entities", None), "domain_specific", {})
+            repayment_records = link_repayment_records_to_accounts(
+                repayment_records,
+                accounts,
+                micro_grid_structures_from_domain_specific(
+                    domain_specific if isinstance(domain_specific, dict) else {}
+                ),
+                reading_order_by_logical=dict(
+                    getattr(variant_input, "reading_order_by_logical", {}) or {}
+                ),
+            )
+            assembled["repayment_records"] = repayment_records
         account_identifiers = {
             str(account.get("account_id") or ""): account.get("account_identifier")
-            for account in assembled.get("credit_accounts") or []
+            for account in accounts
             if account.get("account_id")
         }
         for record in assembled.get("repayment_records") or []:

@@ -153,6 +153,47 @@ def test_repayment_records_link_to_nearest_preceding_account() -> None:
     assert actual[0]["account_id"] == "a2"
 
 
+def test_rebuilt_repayment_uses_status_bbox_when_grid_catalog_is_detached() -> None:
+    records = [
+        {
+            "year": 2025,
+            "month": 1,
+            "status": "N",
+            "status_bbox": [50, 260, 80, 280],
+            "source_cell_refs": [{"grid_id": "rebuilt-grid", "page": 4}],
+        }
+    ]
+    accounts = [
+        {"account_id": "a1", "page": 4, "bbox": [20, 100, 500, 200]},
+        {"account_id": "a2", "page": 4, "bbox": [20, 300, 500, 400]},
+    ]
+
+    actual = link_repayment_records_to_accounts(records, accounts, [])
+
+    assert actual[0]["account_id"] == "a1"
+
+
+def test_unresolved_first_grid_links_to_first_account_on_same_page() -> None:
+    records = [
+        {
+            "year": 2025,
+            "month": 1,
+            "status": "unknown",
+            "source_cell_refs": [
+                {"grid_id": "unresolved-grid", "page": 4, "geometry_status": "unresolved"}
+            ],
+        }
+    ]
+    accounts = [
+        {"account_id": "a1", "page": 4, "bbox": [20, 100, 500, 200]},
+        {"account_id": "a2", "page": 4, "bbox": [20, 300, 500, 400]},
+    ]
+
+    actual = link_repayment_records_to_accounts(records, accounts, [])
+
+    assert actual[0]["account_id"] == "a1"
+
+
 def test_report_explanations_are_not_emitted_as_subject_statements() -> None:
     result = ParseResult(
         pages=[

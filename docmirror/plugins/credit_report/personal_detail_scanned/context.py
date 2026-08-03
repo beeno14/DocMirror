@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 from types import MappingProxyType
@@ -61,6 +62,11 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("summary", ("信息概要",)),
 )
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
+_PRINTED_PAGE_RE = re.compile(
+    r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页"
+)
+_PRINTED_PAGE_ONLY_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*[页面]")
+_PRINTED_TOTAL_ONLY_RE = re.compile(r"共\s*(?P<total>\d{1,3})\s*页?")
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
 _ACCOUNT_ANCHOR_RE = re.compile(r"(?:账户|业务)\s*[（(]?\s*(\d{1,3})\s*[）)]?")
 _BUSINESS_HEADING_RE = re.compile(
@@ -295,6 +301,170 @@ def _domain_specific(parse_result: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _printed_reading_order(parse_result: Any) -> dict[int, int]:
+    """Map sealed logical pages to the report's printed reading order.
+
+    Detailed reports are commonly scanned as two-page spreads. Physical
+    sheets can be out of order even though each half retains the report's own
+    ``第 N 页，共 M 页`` footer. Provenance page numbers remain unchanged; only
+    continuation and evidence traversal use this order.
+
+    Reordering is deliberately conservative: every observed logical page must
+    resolve to one unique printed number, either from its footer or from the
+    adjacent half of the same source spread, and the observed totals must be
+    coherent. Partial OCR therefore cannot invent an isolated page position.
+    """
+    texts_by_page: dict[int, list[str]] = {}
+    observed_pages: set[int] = set()
+    source_by_logical: dict[int, int] = {}
+
+    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
+        logical = int(getattr(page, "page_number", 0) or page_index)
+        observed_pages.add(logical)
+        transform = dict(getattr(page, "coordinate_transform", None) or {})
+        source_by_logical[logical] = int(
+            transform.get("source_page_number")
+            or getattr(page, "source_page_number", 0)
+            or logical
+        )
+        texts_by_page.setdefault(logical, []).extend(
+            str(getattr(block, "content", "") or "")
+            for block in getattr(page, "texts", None) or []
+        )
+
+    for bundle in _domain_specific(parse_result).get("_page_evidence_bundles") or []:
+        if not isinstance(bundle, dict):
+            continue
+        local = bundle.get("local_structure_evidence")
+        if not isinstance(local, dict):
+            continue
+        logical = int(bundle.get("page") or local.get("page") or 0)
+        if logical <= 0:
+            continue
+        observed_pages.add(logical)
+        source_by_logical.setdefault(
+            logical,
+            int(bundle.get("source_page_number") or local.get("source_page") or logical),
+        )
+        texts_by_page.setdefault(logical, []).extend(
+            str(line.get("text") or line.get("content") or "")
+            for line in local.get("lines") or []
+            if isinstance(line, dict)
+        )
+
+    identity = {page: page for page in observed_pages}
+    if len(observed_pages) < 2:
+        return identity
+
+    printed_by_logical: dict[int, int] = {}
+    totals: list[int] = []
+    for logical in observed_pages:
+        exact_matches = {
+            (int(match.group("page")), int(match.group("total")))
+            for text in texts_by_page.get(logical, ())
+            for match in _PRINTED_PAGE_RE.finditer(text)
+        }
+        if len(exact_matches) == 1:
+            printed, total = next(iter(exact_matches))
+            if 1 <= printed <= total:
+                printed_by_logical[logical] = printed
+                totals.append(total)
+
+    if len(printed_by_logical) != len(observed_pages):
+        image_pages, image_totals = _ocr_printed_page_footers(
+            parse_result,
+            missing_pages=observed_pages - printed_by_logical.keys(),
+        )
+        printed_by_logical.update(image_pages)
+        totals.extend(image_totals)
+
+    _infer_paired_printed_pages(printed_by_logical, source_by_logical)
+    if len(printed_by_logical) != len(observed_pages):
+        return identity
+    if len(set(printed_by_logical.values())) != len(observed_pages):
+        return identity
+
+    total_counts = Counter(total for total in totals if total >= len(observed_pages))
+    expected_total = total_counts.most_common(1)[0][0] if total_counts else len(observed_pages)
+    printed_pages = set(printed_by_logical.values())
+    if (
+        max(printed_pages, default=0) > expected_total
+        or min(printed_pages, default=1) < 1
+        or expected_total - len(observed_pages) > 2
+    ):
+        return identity
+
+    return {
+        logical: index
+        for index, logical in enumerate(
+            sorted(observed_pages, key=lambda page: (printed_by_logical[page], page)),
+            start=1,
+        )
+    }
+
+
+def _ocr_printed_page_footers(
+    parse_result: Any,
+    *,
+    missing_pages: Iterable[int],
+) -> tuple[dict[int, int], list[int]]:
+    """Read only footer strips for structural page order, never cell values."""
+    try:
+        from docmirror.ocr.repair.recognizers import rapidocr_recognize
+        from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
+
+        resolver = LogicalPageImageResolver(parse_result, zoom=2.0)
+    except Exception:
+        return {}, []
+
+    printed: dict[int, int] = {}
+    totals: list[int] = []
+    for logical in sorted(set(int(page) for page in missing_pages if int(page) > 0)):
+        rendered = resolver(logical)
+        if not rendered:
+            continue
+        image = rendered.get("image")
+        shape = getattr(image, "shape", None)
+        if not shape or len(shape) < 2:
+            continue
+        footer = image[int(shape[0] * 0.82) : shape[0], :]
+        words = rapidocr_recognize(footer)
+        texts = [
+            str(word.get("text") or "")
+            for word in words
+            if float(word.get("confidence") or 0.0) >= 0.75
+        ]
+        joined = " ".join(texts)
+        pages = {int(match.group("page")) for match in _PRINTED_PAGE_ONLY_RE.finditer(joined)}
+        if len(pages) == 1:
+            printed[logical] = next(iter(pages))
+        totals.extend(
+            int(match.group("total"))
+            for match in _PRINTED_TOTAL_ONLY_RE.finditer(joined)
+        )
+    resolver.clear()
+    return printed, totals
+
+
+def _infer_paired_printed_pages(
+    printed_by_logical: dict[int, int],
+    source_by_logical: dict[int, int],
+) -> None:
+    """Infer one unread footer from its adjacent half of the same spread."""
+    logicals_by_source: dict[int, list[int]] = {}
+    for logical, source in source_by_logical.items():
+        logicals_by_source.setdefault(source, []).append(logical)
+    for logicals in logicals_by_source.values():
+        ordered = sorted(logicals)
+        if len(ordered) != 2:
+            continue
+        left, right = ordered
+        if left in printed_by_logical and right not in printed_by_logical:
+            printed_by_logical[right] = printed_by_logical[left] + 1
+        elif right in printed_by_logical and left not in printed_by_logical:
+            printed_by_logical[left] = printed_by_logical[right] - 1
+
+
 def _evidence_key(page: int, line: dict[str, Any], index: int) -> str:
     evidence_ids = tuple(str(value) for value in line.get("evidence_ids") or [] if value)
     if evidence_ids:
@@ -306,7 +476,13 @@ def _evidence_key(page: int, line: dict[str, Any], index: int) -> str:
 
 def _collect_personal_detail_units(
     parse_result: Any,
-) -> tuple[tuple[CreditReportUnit, ...], tuple[str, ...], dict[str, str], dict[int, int]]:
+) -> tuple[
+    tuple[CreditReportUnit, ...],
+    tuple[str, ...],
+    dict[str, str],
+    dict[int, int],
+    dict[int, int],
+]:
     candidates: list[CreditReportUnit] = []
     furniture: set[str] = set()
     evidence_units: dict[str, str] = {}
@@ -315,6 +491,7 @@ def _collect_personal_detail_units(
     table_owners: dict[int, list[tuple[tuple[float, float, float, float], str]]] = {}
     text_owners: dict[int, list[tuple[str, tuple[float, float, float, float] | None, str]]] = {}
     edge_occurrences: dict[str, list[tuple[int, str]]] = {}
+    reading_order = _printed_reading_order(parse_result)
 
     for page_index, page in enumerate(pages, start=1):
         logical = int(getattr(page, "page_number", 0) or page_index)
@@ -333,7 +510,7 @@ def _collect_personal_detail_units(
             unit_id = f"personal_detail:table:p{logical}:{table_id}"
             unit = CreditReportUnit(
                 unit_id=unit_id,
-                page=logical,
+                page=reading_order.get(logical, logical),
                 order=0,
                 source_index=table_index,
                 kind="table",
@@ -356,7 +533,7 @@ def _collect_personal_detail_units(
             unit_id = f"personal_detail:text:p{logical}:{text_index}"
             unit = CreditReportUnit(
                 unit_id=unit_id,
-                page=logical,
+                page=reading_order.get(logical, logical),
                 order=0,
                 source_index=text_index,
                 kind=_kind(content),
@@ -389,8 +566,12 @@ def _collect_personal_detail_units(
             continue
         source_pages.setdefault(logical, int(bundle.get("source_page_number") or local.get("source_page") or logical))
         lines = [dict(line) for line in local.get("lines") or [] if isinstance(line, dict)]
-        width = _finite(local.get("width") or bundle.get("width"))
-        height = _finite(local.get("height") or bundle.get("height"))
+        width = _finite(
+            local.get("page_width") or bundle.get("page_width") or local.get("width") or bundle.get("width")
+        )
+        height = _finite(
+            local.get("page_height") or bundle.get("page_height") or local.get("height") or bundle.get("height")
+        )
         ordered_lines = sorted(
             lines,
             key=lambda item: (
@@ -424,7 +605,7 @@ def _collect_personal_detail_units(
             candidates.append(
                 CreditReportUnit(
                     unit_id=unit_id,
-                    page=logical,
+                    page=reading_order.get(logical, logical),
                     order=line_index,
                     source_index=line_index,
                     kind=_kind(content),
@@ -463,7 +644,7 @@ def _collect_personal_detail_units(
             ),
         )
         active.extend(replace(unit, order=order) for order, unit in enumerate(page_units))
-    return tuple(active), tuple(sorted(furniture)), evidence_units, source_pages
+    return tuple(active), tuple(sorted(furniture)), evidence_units, source_pages, reading_order
 
 
 class PersonalDetailExtractionContext:
@@ -476,12 +657,19 @@ class PersonalDetailExtractionContext:
         *,
         evidence_unit_ids: dict[str, str],
         source_page_by_logical: dict[int, int],
+        reading_order_by_logical: dict[int, int],
     ) -> None:
         self.parse_result = parse_result
         self.entity_context = entity_context
         self.evidence_unit_ids = MappingProxyType(dict(evidence_unit_ids))
         self.source_page_by_logical = MappingProxyType(dict(source_page_by_logical))
+        self.reading_order_by_logical = MappingProxyType(dict(reading_order_by_logical))
         self._cache: dict[str, Any] = {}
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            PersonalDetailOCRCorrectionOverlay,
+        )
+
+        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(parse_result)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.parse_result, name)
@@ -504,19 +692,139 @@ class PersonalDetailExtractionContext:
             extract_personal_detail_native_business,
         )
 
-        return self.cached("native_business", lambda: extract_personal_detail_native_business(self, full_text))
+        return self.cached(
+            "native_business",
+            lambda: self._ocr_correction_overlay.correct_business_candidates(
+                extract_personal_detail_native_business(self, full_text),
+                stage="native_business",
+            ),
+        )
 
     def scanned_business(self, full_text: str) -> dict[str, Any]:
         from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_business
 
-        return self.cached("scanned_business", lambda: extract_scanned_credit_business(self, full_text))
+        return self.cached(
+            "scanned_business",
+            lambda: self._ocr_correction_overlay.correct_business_candidates(
+                extract_scanned_credit_business(self, full_text),
+                stage="scanned_business",
+            ),
+        )
+
+    def corrected_repayment_records(self) -> list[dict[str, Any]]:
+        """Rebuild monthly cells from images using corrected document order.
+
+        Parse-time micro-grids may contain ``unknown`` placeholders and may
+        have augmented a shuffled physical neighbor. Work on a detached copy,
+        force grid reconstruction, and enable typed one-cell OCR. The sealed
+        evidence plane remains unchanged.
+        """
+
+        def rebuild() -> list[dict[str, Any]]:
+            from docmirror.models.mirror.domain_access import (
+                micro_grid_structures_from_domain_specific,
+            )
+            from docmirror.plugins.credit_report.micro_grid_materialize import (
+                augment_credit_repayment_evidence_bundles,
+                materialize_credit_repayment_micro_grids_from_bundles,
+            )
+            from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
+            from docmirror.plugins.credit_report.repayment_grid import (
+                dedupe_repayment_records,
+                records_from_micro_grid_dict,
+            )
+
+            detached = deepcopy(_domain_specific(self.parse_result))
+            detached.pop("credit_repayment_records", None)
+            for bundle in detached.get("_page_evidence_bundles") or []:
+                if isinstance(bundle, dict):
+                    bundle.pop("micro_grid_structures", None)
+            augment_credit_repayment_evidence_bundles(
+                detached,
+                reading_order_by_logical=dict(self.reading_order_by_logical),
+            )
+            resolver = LogicalPageImageResolver(self.parse_result)
+            try:
+                materialize_credit_repayment_micro_grids_from_bundles(
+                    detached,
+                    page_image_resolver=resolver,
+                    enable_cell_ocr=True,
+                )
+            finally:
+                resolver.clear()
+            records = [
+                record
+                for grid in micro_grid_structures_from_domain_specific(detached)
+                for record in records_from_micro_grid_dict(grid)
+            ]
+            return dedupe_repayment_records(records)
+
+        return self.cached("corrected_repayment_records", rebuild)
 
     def section_content(self, full_text: str) -> dict[str, Any]:
         from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
             extract_personal_detail_section_content,
         )
 
-        return self.cached("section_content", lambda: extract_personal_detail_section_content(self, full_text))
+        return self.cached(
+            "section_content",
+            lambda: self._ocr_correction_overlay.correct_business_candidates(
+                extract_personal_detail_section_content(self, full_text),
+                stage="section_content",
+            ),
+        )
+
+    def corrected_evidence_pages(self) -> list[dict[str, Any]]:
+        """Return corrected copies of OCR lines while preserving sealed evidence."""
+        domain_specific = _domain_specific(self.parse_result)
+        pages: list[dict[str, Any]] = []
+        for bundle in domain_specific.get("_page_evidence_bundles") or []:
+            if not isinstance(bundle, dict):
+                continue
+            local = bundle.get("local_structure_evidence")
+            if not isinstance(local, dict):
+                continue
+            lines = [dict(line) for line in local.get("lines") or [] if isinstance(line, dict)]
+            if not lines:
+                continue
+            pages.append(
+                {
+                    "page": int(bundle.get("page") or local.get("page") or 0),
+                    "source_page": int(bundle.get("source_page_number") or local.get("source_page") or 0),
+                    "page_width": _finite(
+                        local.get("page_width")
+                        or bundle.get("page_width")
+                        or local.get("width")
+                        or bundle.get("width")
+                    ),
+                    "page_height": _finite(
+                        local.get("page_height")
+                        or bundle.get("page_height")
+                        or local.get("height")
+                        or bundle.get("height")
+                    ),
+                    "lines": sorted(
+                        lines,
+                        key=lambda line: (
+                            (_bbox(line) or (0, 0, 0, 0))[1],
+                            (_bbox(line) or (0, 0, 0, 0))[0],
+                        ),
+                    ),
+                }
+            )
+        return self._ocr_correction_overlay.corrected_evidence_pages(
+            sorted(
+                pages,
+                key=lambda item: (
+                    self.reading_order_by_logical.get(item["page"], item["page"]),
+                    item["page"],
+                ),
+            )
+        )
+
+    def ocr_correction_audit(self) -> dict[str, Any]:
+        """Return a detached audit snapshot for diagnostics and regression tests."""
+        return deepcopy(self._ocr_correction_overlay.audit())
 
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)
@@ -551,7 +859,7 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
     """Build the detailed-report logical-page graph exactly once."""
     if isinstance(parse_result, PersonalDetailExtractionContext):
         return parse_result
-    units, furniture, evidence_units, source_pages = _collect_personal_detail_units(parse_result)
+    units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(parse_result)
     policy = PersonalDetailTransitionPolicy()
     entity_context = decode_credit_report_units(
         units,
@@ -565,6 +873,7 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
         entity_context,
         evidence_unit_ids=evidence_units,
         source_page_by_logical=source_pages,
+        reading_order_by_logical=reading_order,
     )
 
 

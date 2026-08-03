@@ -205,7 +205,12 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         content_mode=content_mode,
     )
 
-    repayment_records = list(source_domain.get("credit_repayment_records") or [])
+    corrected_repayment_loader = getattr(variant_input, "corrected_repayment_records", None)
+    repayment_records = (
+        list(corrected_repayment_loader())
+        if variant.variant_id == "personal_detail_scanned" and callable(corrected_repayment_loader)
+        else list(source_domain.get("credit_repayment_records") or [])
+    )
     if not repayment_records and (
         content_mode in {"scanned_ocr", "mixed"} or _has_credit_repayment_structures(parse_result)
     ):
@@ -227,6 +232,10 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         repayment_records,
         credit_accounts,
         micro_grid_structures_from_domain_specific(source_domain),
+        reading_order_by_logical=dict(
+            getattr(variant_input, "reading_order_by_logical", {}) or {}
+        ),
+        force_relink=variant.variant_id == "personal_detail_scanned",
     )
     assembled = variant.assemble_business(
         parse_result,
@@ -290,7 +299,23 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
                                 ref.pop("node_ids", None)
                 datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
     variant.finalize_datasets(datasets)
-    domain_facts["data_dictionary"] = variant.data_dictionary()
+    semantic = variant.semantic_extensions()
+    if variant.variant_id == "personal_detail_scanned":
+        from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
+            personal_detail_v2_data_dictionary,
+            personal_detail_v2_enabled,
+            personal_detail_v2_semantic_extensions,
+            project_personal_detail_v2_datasets,
+        )
+
+        if personal_detail_v2_enabled():
+            datasets = project_personal_detail_v2_datasets(datasets)
+            domain_facts["data_dictionary"] = personal_detail_v2_data_dictionary()
+            semantic = personal_detail_v2_semantic_extensions()
+        else:
+            domain_facts["data_dictionary"] = variant.data_dictionary()
+    else:
+        domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
         dict.fromkeys(
             [
@@ -330,7 +355,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         document_type=base.document_type,
         entity_fields=entity_fields,
         domain_facts=domain_facts,
-        semantic=variant.semantic_extensions(),
+        semantic=semantic,
         datasets=datasets,
         sections=variant.build_sections(variant_input, full_text),
         warnings=warnings,

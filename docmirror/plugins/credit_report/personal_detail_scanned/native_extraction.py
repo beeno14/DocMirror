@@ -1103,26 +1103,70 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
             )
             if header_index is not None:
                 residence_table_id = str(getattr(table, "table_id", "") or residence_table_id)
-                for row_index, row in enumerate(rows[header_index + 1 :], start=header_index + 1):
-                    values = _nonempty(row)
-                    if len(values) < 5 or not values[0].isdigit():
+                provider_header = next(
+                    (
+                        index
+                        for index, row in enumerate(rows[header_index + 1 :], start=header_index + 1)
+                        if "数据发生机构名称" in _compact("".join(row))
+                    ),
+                    len(rows),
+                )
+                for row_index, row in enumerate(rows[header_index + 1 : provider_header], start=header_index + 1):
+                    sequence_match = re.search(r"\d+", str(row[0] if row else ""))
+                    if sequence_match is None:
                         break
-                    sequence = int(values[0])
-                    residence_id = stable_record_id("credit_residence", sequence, values[1], values[4])
+                    sequence = int(sequence_match.group(0))
+                    address = _clean(row[1] if len(row) > 1 else "")
+                    phone = _clean(row[2] if len(row) > 2 else "")
+                    status = _clean(row[3] if len(row) > 3 else "")
+                    updated = _date(row[4] if len(row) > 4 else "")
+                    if not address:
+                        continue
+                    residence_id = stable_record_id("credit_residence", sequence, address, updated)
                     records[sequence] = {
                         "record_id": residence_id,
                         "residence_record_id": residence_id,
                         "sequence": sequence,
-                        "address": values[1],
-                        "residential_phone": values[2],
-                        "residence_status": values[3],
-                        "information_updated_date": _date(values[4]),
+                        "address": address,
+                        **({"residential_phone": phone} if phone and phone != "--" else {}),
+                        **({"residence_status": status} if status and status != "--" else {}),
+                        **({"information_updated_date": updated} if updated and updated != "--" else {}),
                         "page": page_number,
                         "source_page": source_page,
                         "source": "native_personal_detail_residence_table",
                         "source_refs": [_source_ref(page, table, row=row_index)],
                         "confidence": 1.0,
                     }
+                available_sequences = iter(sorted(records))
+                used_provider_sequences: set[int] = set()
+                for row_index, row in enumerate(rows[provider_header + 1 :], start=provider_header + 1):
+                    nonempty = [(index, _clean(value)) for index, value in enumerate(row) if _clean(value)]
+                    if not nonempty:
+                        continue
+                    sequence_match = re.search(r"\d+", nonempty[0][1]) if nonempty[0][0] == 0 else None
+                    sequence = int(sequence_match.group(0)) if sequence_match else None
+                    institution_parts = [
+                        value
+                        for index, value in nonempty
+                        if not (
+                            index == 0
+                            and (
+                                sequence_match is not None
+                                or (len(value) <= 2 and len(nonempty) > 1)
+                            )
+                        )
+                    ]
+                    institution = " ".join(institution_parts).strip()
+                    if sequence not in records:
+                        sequence = next(
+                            (candidate for candidate in available_sequences if candidate not in used_provider_sequences),
+                            None,
+                        )
+                    if sequence is None or sequence not in records or not institution:
+                        continue
+                    institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
+                    provider_rows[sequence] = (institution, _source_ref(page, table, row=row_index))
+                    used_provider_sequences.add(sequence)
             table_id = str(getattr(table, "table_id", "") or "")
             if (
                 records
@@ -1146,6 +1190,70 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
             record["data_provider"] = provider[0]
             record["source_refs"].append(provider[1])
     return [records[key] for key in sorted(records)]
+
+
+_EMPLOYER_TYPES = (
+    "国有企业",
+    "集体企业",
+    "私营企业",
+    "外资企业",
+    "事业单位",
+    "国家机关",
+    "个体经营",
+    "其他",
+)
+
+
+def _split_employment_basic_row(row: tuple[str, ...]) -> dict[str, Any]:
+    """Recover a basic employment row even when OCR merged its columns."""
+    cells = [_clean(value) for value in row]
+    positional_phone = next(
+        (
+            value
+            for value in reversed(cells[4:])
+            if len(re.sub(r"\D", "", value)) >= 7
+        ),
+        "",
+    )
+    if len(cells) >= 5 and cells[1] and (cells[2] or positional_phone):
+        # Preserve a table that already has positional columns. Applying the
+        # collapsed-row heuristic here can detach an area-code prefix from the
+        # phone and shift every employment-detail field that follows it.
+        return {
+            "employer": cells[1],
+            **({"employer_type": cells[2]} if cells[2] and cells[2] != "--" else {}),
+            **({"employer_address": cells[3]} if cells[3] and cells[3] != "--" else {}),
+            **({"employer_phone": positional_phone} if positional_phone else {}),
+        }
+
+    text = re.sub(r"\s+", " ", " ".join(_clean(value) for value in row[1:] if _clean(value))).strip()
+    parsed: dict[str, Any] = {}
+    phone_match = re.search(r"(?<!\d)(\d{7,16})(?!\d)\s*$", text)
+    if phone_match:
+        parsed["employer_phone"] = phone_match.group(1)
+        text = text[: phone_match.start()].strip()
+
+    employer_type = next((value for value in _EMPLOYER_TYPES if value in text), "")
+    if employer_type:
+        employer, address = text.split(employer_type, 1)
+        parsed["employer"] = employer.strip()
+        parsed["employer_type"] = employer_type
+        if address.strip() and address.strip() != "--":
+            parsed["employer_address"] = address.strip()
+        return parsed
+
+    # Most legal names have a reliable suffix even when every table column was
+    # collapsed into one OCR cell. Keep uncertain trailing text as the address
+    # instead of silently appending it to the employer name.
+    legal = re.match(r"(.{2,60}?(?:有限责任公司|股份有限公司|有限公司|工业公司|学校|公司))(?:\s+|(?=[省市县区镇路街]))?(.*)$", text)
+    if legal:
+        parsed["employer"] = legal.group(1).strip()
+        trailing = legal.group(2).strip()
+        if trailing and trailing != "--":
+            parsed["employer_address"] = trailing
+    elif text and text != "--":
+        parsed["employer"] = text
+    return parsed
 
 
 def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
@@ -1184,16 +1292,11 @@ def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
                 len(rows),
             )
             for row_index, row in enumerate(rows[basic_header + 1 : detail_header], start=basic_header + 1):
-                values = _nonempty(row)
-                if not values or not re.fullmatch(r"\d+", values[0]):
+                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
+                if sequence_match is None:
                     continue
-                sequence = int(values[0])
-                parsed = {
-                    "employer": _clean(row[1] if len(row) > 1 else ""),
-                    "employer_type": _clean(row[2] if len(row) > 2 else ""),
-                    "employer_address": _clean(row[3] if len(row) > 3 else ""),
-                    "employer_phone": _clean(row[-1] if len(row) > 4 else ""),
-                }
+                sequence = int(sequence_match.group(0))
+                parsed = _split_employment_basic_row(row)
                 records[sequence] = {
                     "employment_record_id": stable_record_id("credit_employment", sequence, parsed),
                     "sequence": sequence,
@@ -1205,30 +1308,74 @@ def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
                     "confidence": 1.0,
                 }
             for row_index, row in enumerate(rows[detail_header + 1 : institution_header], start=detail_header + 1):
-                values = _nonempty(row)
-                if len(values) < 2 or not re.fullmatch(r"\d+", values[0]):
+                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
+                if sequence_match is None:
                     continue
-                sequence = int(values[0])
+                sequence = int(sequence_match.group(0))
                 if sequence not in records:
                     continue
+                cells = [_clean(value) for value in row]
+                if len(cells) >= 7 and _date(cells[6]):
+                    entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", cells[5])
+                    detail = {
+                        "occupation": cells[1],
+                        "industry": cells[2],
+                        "position": cells[3],
+                        "professional_title": cells[4],
+                        "entry_year": int(entry_match.group(0)) if entry_match else None,
+                        "information_updated_date": _date(cells[6]),
+                    }
+                    records[sequence].update(
+                        {key: value for key, value in detail.items() if value and value != "--"}
+                    )
+                    records[sequence]["source_refs"].append(
+                        _source_ref(page, table, row=row_index)
+                    )
+                    continue
+                role_text = _clean(row[1] if len(row) > 1 else "")
+                industry = "批发和零售业" if "批发和零售业" in role_text else ""
+                occupation = role_text.replace(industry, "").strip(" #*-.")
+                trailing = re.sub(
+                    r"\s+",
+                    " ",
+                    " ".join(_clean(value) for value in row[3:] if _clean(value)),
+                ).strip()
+                date_match = re.search(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", trailing)
+                updated = _date(date_match.group(0)) if date_match else None
+                before_date = trailing[: date_match.start()].strip() if date_match else trailing
+                entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", before_date)
                 detail = {
-                    "occupation": _clean(row[1] if len(row) > 1 else ""),
-                    "industry": _clean(row[2] if len(row) > 2 else ""),
-                    "position": _clean(row[3] if len(row) > 3 else ""),
-                    "professional_title": _clean(row[4] if len(row) > 4 else ""),
-                    "entry_year": _number(row[5] if len(row) > 5 else ""),
-                    "information_updated_date": _date(row[6] if len(row) > 6 else ""),
+                    "occupation": occupation,
+                    "industry": industry,
+                    "position": _clean(row[2] if len(row) > 2 else ""),
+                    "professional_title": re.sub(r"[\s#*\-.]+", "", before_date),
+                    "entry_year": int(entry_match.group(0)) if entry_match else None,
+                    "information_updated_date": updated,
                 }
                 records[sequence].update({key: value for key, value in detail.items() if value and value != "--"})
                 records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
+            used_provider_sequences: set[int] = set()
             for row_index, row in enumerate(rows[institution_header + 1 :], start=institution_header + 1):
-                values = _nonempty(row)
-                if len(values) < 2 or not re.fullmatch(r"\d+", values[0]):
-                    break
-                sequence = int(values[0])
-                if sequence in records:
-                    records[sequence]["data_provider"] = values[1]
-                    records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
+                cells = [_clean(value) for value in row]
+                first = cells[0] if cells else ""
+                sequence_match = re.search(r"\d+", first)
+                sequence = int(sequence_match.group(0)) if sequence_match else None
+                institution = " ".join(
+                    value
+                    for index, value in enumerate(cells)
+                    if value and not (index == 0 and sequence_match is not None)
+                ).strip()
+                if sequence not in records:
+                    sequence = next(
+                        (candidate for candidate in sorted(records) if candidate not in used_provider_sequences),
+                        None,
+                    )
+                if sequence is None or sequence not in records or not institution:
+                    continue
+                institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
+                records[sequence]["data_provider"] = institution
+                records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
+                used_provider_sequences.add(sequence)
     for sequence, record in records.items():
         record["employment_record_id"] = stable_record_id(
             "credit_employment",
@@ -1247,19 +1394,34 @@ def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[st
             for row_index, row in enumerate(rows):
                 compact = _compact("".join(row))
                 if all(marker in compact for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")):
-                    for data_index, data_row in enumerate(rows[row_index + 1 :], start=row_index + 1):
-                        values = _nonempty(data_row)
-                        if len(values) < 4 or not values[0].isdigit():
+                    for ordinal, (data_index, data_row) in enumerate(
+                        enumerate(rows[row_index + 1 :], start=row_index + 1),
+                        start=1,
+                    ):
+                        cells = [_clean(value) for value in data_row]
+                        phone = next((re.sub(r"\D", "", value) for value in cells if len(re.sub(r"\D", "", value)) == 11), "")
+                        updated = next((value for value in cells if re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", value)), "")
+                        if not phone or not updated:
                             break
-                        mobile_id = stable_record_id("personal_mobile_phone", values[0], values[1], values[2])
+                        sequence_match = re.fullmatch(r"\d{1,3}", cells[0] if cells else "")
+                        sequence = int(sequence_match.group(0)) if sequence_match else ordinal
+                        provider = next(
+                            (
+                                value
+                                for value in reversed(cells)
+                                if value and value not in {phone, updated} and re.search(r"[\u3400-\u9fff]", value)
+                            ),
+                            None,
+                        )
+                        mobile_id = stable_record_id("personal_mobile_phone", sequence, phone, updated)
                         mobile_records.append(
                             {
                                 "record_id": mobile_id,
                                 "mobile_phone_record_id": mobile_id,
-                                "sequence": int(values[0]),
-                                "mobile_phone": values[1],
-                                "information_updated_date": _date(values[2]),
-                                "data_provider": values[3],
+                                "sequence": sequence,
+                                "mobile_phone": phone,
+                                "information_updated_date": _date(updated),
+                                "data_provider": provider,
                                 "source": "native_personal_detail_profile_table",
                                 "source_refs": [_source_ref(page, table, row=data_index)],
                                 "confidence": 1.0,
@@ -1268,23 +1430,24 @@ def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[st
                 if all(marker in compact for marker in ("姓名", "证件类型", "证件号码", "工作单位", "联系电话")):
                     if row_index + 1 >= len(rows):
                         continue
-                    values = _nonempty(rows[row_index + 1])
-                    if len(values) < 5:
+                    values = [_clean(value) for value in rows[row_index + 1]]
+                    if not values or not values[0]:
                         continue
                     provider = None
                     if row_index + 3 < len(rows) and "数据发生机构名称" in _compact("".join(rows[row_index + 2])):
                         provider_values = _nonempty(rows[row_index + 3])
                         provider = provider_values[0] if provider_values else None
+                    values.extend([""] * (5 - len(values)))
                     spouse_id = stable_record_id("personal_spouse", values[0], values[2])
                     spouse_records.append(
                         {
                             "record_id": spouse_id,
                             "spouse_record_id": spouse_id,
                             "name": values[0],
-                            "document_type": values[1],
-                            "document_number": values[2],
-                            "employer": values[3],
-                            "phone": values[4],
+                            **({"document_type": values[1]} if values[1] and values[1] != "--" else {}),
+                            **({"document_number": values[2]} if values[2] and values[2] != "--" else {}),
+                            **({"employer": values[3]} if values[3] and values[3] != "--" else {}),
+                            **({"phone": values[4]} if values[4] and values[4] != "--" else {}),
                             "data_provider": provider,
                             "source": "native_personal_detail_profile_table",
                             "source_refs": [_source_ref(page, table, row=row_index + 1)],

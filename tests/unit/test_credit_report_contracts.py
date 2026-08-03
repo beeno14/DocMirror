@@ -5,6 +5,7 @@
 
 from docmirror.plugins.credit_report.contracts import CONTENT_MODE_SCANNED
 from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
+    _summary_value,
     apply_personal_detail_contract,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -28,6 +29,13 @@ def test_scanned_content_mode_uses_the_runtime_vocabulary() -> None:
     enums = credit_report_data_dictionary()["enums"]["content_mode"]
     assert CONTENT_MODE_SCANNED in enums
     assert "scanned" not in enums
+
+
+def test_summary_numeric_values_require_complete_decimal_lexemes() -> None:
+    assert _summary_value("2.0") == ("decimal", "2.0", "reported")
+    assert _summary_value("12.5%") == ("percentage", "12.5", "reported")
+    assert _summary_value("2.") == ("text", None, "reported")
+    assert _summary_value(".0") == ("text", None, "reported")
 
 
 def test_scanned_variant_forwards_precomputed_auxiliary_records() -> None:
@@ -101,6 +109,7 @@ def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_un
     assert contract["absence_requires_explicit_source_evidence"] is True
     assert contract["empty_dataset_means_absent"] is False
     assert semantic["domain_schema"]["version"] == "1.2.0"
+    assert semantic["presentation_policy"]["enhanced_markdown_display"] == "full"
     assert semantic["personal_detail_contract"]["uncertainty_coverage"]["mode"] == (
         "scoped_exhaustive"
     )
