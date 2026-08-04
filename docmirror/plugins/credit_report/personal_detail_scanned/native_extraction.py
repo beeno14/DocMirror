@@ -841,6 +841,42 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
                 "confidence": 1.0,
             }
             records.append(record)
+    if records:
+        return records
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+        PBOCPersonalDetailNativeParser,
+    )
+
+    for candidate in PBOCPersonalDetailNativeParser(parse_result).records("credit_lines"):
+        facts = candidate.fields
+        identifier = _identifier(_field(facts, "授信协议标识"))
+        if not identifier:
+            continue
+        due_raw = _field(facts, "到期日期")
+        currency = _currency(_field(facts, "币种")) or "CNY"
+        records.append(
+            {
+                "credit_line_id": stable_record_id("credit_line", identifier),
+                "account_identifier": identifier,
+                "institution": _clean(_field(facts, "管理机构")),
+                "facility_type": _clean(_field(facts, "授信额度用途")),
+                "effective_date": _date(_field(facts, "生效日期")),
+                "due_date": _date(due_raw),
+                "validity_type": "perpetual" if _compact(due_raw) == "长期" else "fixed_term",
+                "total_limit": _number(_field(facts, "授信额度")),
+                "used_limit": _number(_field(facts, "已用额度")),
+                "limit_identifier": _identifier(_field(facts, "授信限额编号")),
+                "currency": currency,
+                "account_currency": currency,
+                "reporting_amount_currency": "CNY",
+                "amount_unit": "yuan",
+                "reporting_amount_unit": "yuan",
+                "status": "active",
+                "source": "native_detail_tolerant_credit_agreement_table",
+                "source_refs": list(candidate.source_refs),
+                "confidence": candidate.confidence,
+            }
+        )
     return records
 
 
@@ -892,6 +928,45 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                     "confidence": 1.0,
                 }
             )
+    if records:
+        return records
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+        PBOCPersonalDetailNativeParser,
+    )
+
+    for candidate in PBOCPersonalDetailNativeParser(parse_result).records("repayment_liability_records"):
+        facts = candidate.fields
+        contract_number = _identifier(_field(facts, "保证合同编号"))
+        related_id = _identifier(_field(facts, "主业务借款人证件号码"))
+        identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
+        currency = _currency(_field(facts, "币种")) or "CNY"
+        records.append(
+            {
+                "liability_id": stable_record_id("repayment_liability", identifier),
+                "sequence": len(records) + 1,
+                "open_date": _date(_field(facts, "开立日期")),
+                "due_date": _date(_field(facts, "到期日期")),
+                "related_party_name": _clean(_field(facts, "主业务借款人")),
+                "related_party_id_type": _clean(_field(facts, "主业务借款人证件类型")),
+                "related_party_id_number": related_id,
+                "institution": _clean(_field(facts, "管理机构")),
+                "business_type": _clean(_field(facts, "业务种类")),
+                "responsibility_type": _clean(_field(facts, "责任人类型")),
+                "responsibility_amount": _number(_field(facts, "还款责任金额")),
+                "responsibility_amount_reported": True,
+                "contract_number": contract_number,
+                "balance": _number(_field(facts, "余额")),
+                "five_tier_class": _clean(_field(facts, "五级分类")),
+                "overdue_months_or_repayment_status": _clean(_field(facts, "逾期月数", "还款状态")),
+                "currency": currency,
+                "reporting_amount_currency": currency,
+                "amount_unit": "yuan",
+                "reporting_amount_unit": "yuan",
+                "source": "native_detail_tolerant_liability_table",
+                "source_refs": list(candidate.source_refs),
+                "confidence": candidate.confidence,
+            }
+        )
     return records
 
 
@@ -1759,6 +1834,7 @@ def _extract_summary_datasets(
                 physical.append((page, table, rows))
 
     continuation_check = getattr(parse_result, "tables_continue", None)
+    reading_order = dict(getattr(parse_result, "reading_order_by_logical", {}) or {})
     consumed: set[int] = set()
     for index, (page, table, rows) in enumerate(physical):
         if index in consumed or not _is_summary_anchor(rows):
@@ -1776,8 +1852,10 @@ def _extract_summary_datasets(
             next_width = max((len(row) for row in next_rows), default=0)
             previous_table_id = str(getattr(previous_table, "table_id", "") or "")
             next_table_id = str(getattr(next_table, "table_id", "") or "")
+            previous_order = reading_order.get(previous_page_number, previous_page_number)
+            next_order = reading_order.get(next_page_number, next_page_number)
             if (
-                next_page_number != previous_page_number + 1
+                next_order != previous_order + 1
                 or not callable(continuation_check)
                 or continuation_check(previous_table_id, next_table_id) is not True
                 or (anchor_width and next_width != anchor_width)
@@ -1926,6 +2004,42 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
                     subject_name, id_type, id_number, query_institution, query_reason = values[:5]
                 elif labels == ["证件类型", "证件号码"] and len(values) >= 2:
                     other_documents.append((values[0], values[1]))
+    if not all((subject_name, id_type, id_number, query_institution, query_reason)):
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            make_issue,
+            record_issue,
+        )
+        from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+            PBOCPersonalDetailNativeParser,
+        )
+
+        candidates = PBOCPersonalDetailNativeParser(parse_result).records("report_header")
+        fingerprints = {
+            tuple(candidate.fields.get(label, "") for label in (
+                "被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因"
+            ))
+            for candidate in candidates
+        }
+        if len(fingerprints) == 1 and candidates:
+            fallback = candidates[0].fields
+            subject_name = subject_name or fallback.get("被查询者姓名")
+            id_type = id_type or fallback.get("被查询者证件类型")
+            id_number = id_number or fallback.get("被查询者证件号码")
+            query_institution = query_institution or fallback.get("查询机构")
+            query_reason = query_reason or fallback.get("查询原因")
+        elif len(fingerprints) > 1:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="ambiguous_native_report_header",
+                    message="Multiple conflicting report-header candidates were preserved; no candidate was selected.",
+                    parser_stage="native_tolerant_parser",
+                    target_dataset="personal_report_metadata",
+                    observed_value=[list(value) for value in sorted(fingerprints)],
+                    reason_codes=("multiple_header_candidates", "no_guess_applied"),
+                ),
+            )
     metadata = [
         {
             "personal_report_metadata_id": stable_record_id(

@@ -11,6 +11,7 @@ extractors without exposing mutable cached values to their consumers.
 from __future__ import annotations
 
 import math
+import os
 import re
 from collections import Counter
 from copy import deepcopy
@@ -402,7 +403,6 @@ def _printed_reading_order(
     if (
         max(printed_pages, default=0) > expected_total
         or min(printed_pages, default=1) < 1
-        or expected_total - len(observed_pages) > 2
     ):
         return identity
 
@@ -686,16 +686,23 @@ class PersonalDetailExtractionContext:
         self.reading_order_by_logical = MappingProxyType(dict(reading_order_by_logical))
         self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
+        self._page_ocr_cache: dict[int, dict[str, Any] | None] = {}
+        self._supplemental_ocr_cache: dict[str, dict[str, Any]] = {}
+        self._page_ocr_requests: list[dict[str, Any]] = []
+        self._page_ocr_max_requests = max(
+            0, int(os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR_MAX_REQUESTS", "4"))
+        )
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
         )
 
+        self._page_image_resolver = PersonalDetailLogicalPageImageResolver(
+            parse_result,
+            topology=page_topology,
+        )
         self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(
             parse_result,
-            page_image_resolver=PersonalDetailLogicalPageImageResolver(
-                parse_result,
-                topology=page_topology,
-            ),
+            page_image_resolver=self._page_image_resolver,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -852,13 +859,180 @@ class PersonalDetailExtractionContext:
             )
         )
 
+    def full_page_ocr_evidence(
+        self,
+        logical_pages: Iterable[int],
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Re-OCR complete logical pages as bounded supplemental evidence.
+
+        This path avoids reliance on a possibly incorrect cell crop.  Results
+        retain logical-page coordinates and never replace sealed OCR evidence.
+        """
+        if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR", "1") == "0":
+            return []
+        requested = sorted({int(page) for page in logical_pages if int(page) > 0})
+        output: list[dict[str, Any]] = []
+        for logical in requested:
+            if logical in self._page_ocr_cache:
+                cached = self._page_ocr_cache[logical]
+                if cached:
+                    output.append(deepcopy(cached))
+                continue
+            if len(self._page_ocr_requests) >= self._page_ocr_max_requests:
+                break
+            request = {"logical_page": logical, "reason": str(reason), "status": "requested"}
+            self._page_ocr_requests.append(request)
+            rendered = self._page_image_resolver(logical)
+            if not rendered:
+                request["status"] = "render_failed"
+                self._page_ocr_cache[logical] = None
+                continue
+            image = rendered.get("image")
+            shape = getattr(image, "shape", None)
+            if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
+                request["status"] = "invalid_image"
+                self._page_ocr_cache[logical] = None
+                continue
+            from docmirror.ocr.repair.recognizers import rapidocr_recognize
+
+            words = rapidocr_recognize(image, source="personal_detail_full_page_ocr")
+            page_width = float(rendered.get("page_width") or shape[1])
+            page_height = float(rendered.get("page_height") or shape[0])
+            scale_x = page_width / float(shape[1])
+            scale_y = page_height / float(shape[0])
+            lines: list[dict[str, Any]] = []
+            for index, word in enumerate(words):
+                text = str(word.get("text") or "").strip()
+                bbox = word.get("bbox")
+                confidence = float(word.get("confidence") or 0.0)
+                if not text or confidence < 0.45 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                lines.append(
+                    {
+                        "text": text,
+                        "confidence": confidence,
+                        "bbox": [
+                            float(bbox[0]) * scale_x,
+                            float(bbox[1]) * scale_y,
+                            float(bbox[2]) * scale_x,
+                            float(bbox[3]) * scale_y,
+                        ],
+                        "evidence_ids": [f"personal_detail_full_page_ocr:p{logical}:w{index}"],
+                        "source": "personal_detail_full_page_ocr",
+                    }
+                )
+            if not lines:
+                request["status"] = "ocr_empty"
+                self._page_ocr_cache[logical] = None
+                continue
+            request["status"] = "completed"
+            request["word_count"] = len(lines)
+            page = {
+                "page": logical,
+                "source_page": int(rendered.get("source_page") or self.source_page_by_logical.get(logical, logical)),
+                "page_width": page_width,
+                "page_height": page_height,
+                "reason": str(reason),
+                "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
+            }
+            corrected = self._ocr_correction_overlay.corrected_evidence_pages([page])[0]
+            self._page_ocr_cache[logical] = deepcopy(corrected)
+            output.append(corrected)
+        return output
+
+    def supplemental_page_ocr_evidence(
+        self,
+        source_pages: Iterable[int],
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """OCR only footer-confirmed missing spread halves as supplemental pages."""
+        slices = self._page_image_resolver.supplemental_spread_slices(source_pages)
+        output: list[dict[str, Any]] = []
+        for recovered in slices:
+            supplemental_id = str(recovered.get("supplemental_page_id") or "")
+            if not supplemental_id:
+                continue
+            if supplemental_id in self._supplemental_ocr_cache:
+                output.append(deepcopy(self._supplemental_ocr_cache[supplemental_id]))
+                continue
+            if len(self._page_ocr_requests) >= self._page_ocr_max_requests:
+                break
+            request = {
+                "supplemental_page_id": supplemental_id,
+                "source_page": int(recovered.get("source_page") or 0),
+                "printed_page": int(recovered.get("printed_page") or 0),
+                "reason": str(reason),
+                "status": "requested",
+            }
+            self._page_ocr_requests.append(request)
+            image = recovered.get("image")
+            shape = getattr(image, "shape", None)
+            if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
+                request["status"] = "invalid_image"
+                continue
+            from docmirror.ocr.repair.recognizers import rapidocr_recognize
+
+            page_width = float(recovered.get("page_width") or shape[1])
+            page_height = float(recovered.get("page_height") or shape[0])
+            scale_x = page_width / float(shape[1])
+            scale_y = page_height / float(shape[0])
+            lines: list[dict[str, Any]] = []
+            for index, word in enumerate(
+                rapidocr_recognize(image, source="personal_detail_supplemental_page_ocr")
+            ):
+                text = str(word.get("text") or "").strip()
+                bbox = word.get("bbox")
+                confidence = float(word.get("confidence") or 0.0)
+                if not text or confidence < 0.45 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                lines.append(
+                    {
+                        "text": text,
+                        "confidence": confidence,
+                        "bbox": [
+                            float(bbox[0]) * scale_x,
+                            float(bbox[1]) * scale_y,
+                            float(bbox[2]) * scale_x,
+                            float(bbox[3]) * scale_y,
+                        ],
+                        "evidence_ids": [f"personal_detail_supplemental_ocr:{supplemental_id}:w{index}"],
+                        "source": "personal_detail_supplemental_page_ocr",
+                    }
+                )
+            if not lines:
+                request["status"] = "ocr_empty"
+                continue
+            page = {
+                "supplemental_page_id": supplemental_id,
+                "printed_page": int(recovered.get("printed_page") or 0),
+                "printed_total": int(recovered.get("printed_total") or 0),
+                "source_page": int(recovered.get("source_page") or 0),
+                "segment_index": int(recovered.get("segment_index") or 0),
+                "page_width": page_width,
+                "page_height": page_height,
+                "reason": str(reason),
+                "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
+            }
+            request["status"] = "completed"
+            request["word_count"] = len(lines)
+            self._supplemental_ocr_cache[supplemental_id] = deepcopy(page)
+            output.append(page)
+        return output
+
     def ocr_correction_audit(self) -> dict[str, Any]:
         """Return a detached audit snapshot for diagnostics and regression tests."""
-        return deepcopy(self._ocr_correction_overlay.audit())
+        return {
+            **deepcopy(self._ocr_correction_overlay.audit()),
+            "full_page_ocr_requests": deepcopy(self._page_ocr_requests),
+            "full_page_ocr_request_count": len(self._page_ocr_requests),
+        }
 
     def page_topology_audit(self) -> dict[str, Any]:
         """Return the plugin's detached logical-page validation result."""
-        return deepcopy(self.page_topology.audit())
+        return deepcopy(self._page_image_resolver.audit())
 
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)
@@ -868,6 +1042,11 @@ class PersonalDetailExtractionContext:
         left = self.entity_context.entity_for_unit(left_unit_id)
         right = self.entity_context.entity_for_unit(right_unit_id)
         return bool(left is not None and right is not None and left.entity_id == right.entity_id)
+
+    def pages_adjacent_in_reading_order(self, left_page: int, right_page: int) -> bool:
+        left_order = self.reading_order_by_logical.get(int(left_page), int(left_page))
+        right_order = self.reading_order_by_logical.get(int(right_page), int(right_page))
+        return right_order == left_order + 1
 
     def allows_scanned_line_transition(
         self,
@@ -883,6 +1062,22 @@ class PersonalDetailExtractionContext:
         left_id = self.evidence_unit_ids.get(_evidence_key(left_page, left_line, left_index))
         right_id = self.evidence_unit_ids.get(_evidence_key(right_page, right_line, right_index))
         if not left_id or not right_id:
+            left_box = _bbox(left_line)
+            right_box = _bbox(right_line)
+            left_geometry = self.page_topology.geometry(left_page)
+            right_geometry = self.page_topology.geometry(right_page)
+            if (
+                left_box
+                and right_box
+                and left_geometry
+                and right_geometry
+                and left_geometry.height > 0
+                and right_geometry.height > 0
+                and left_box[3] / left_geometry.height >= 0.75
+                and right_box[1] / right_geometry.height <= 0.25
+                and self.pages_adjacent_in_reading_order(left_page, right_page)
+            ):
+                return True
             return None
         left = self.entity_context.entity_for_unit(left_id)
         right = self.entity_context.entity_for_unit(right_id)

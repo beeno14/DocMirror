@@ -143,6 +143,20 @@ _FIELD_ROLES: dict[str, str] = {
     "overdue_months": "nonnegative_integer",
     "remaining_periods": "nonnegative_integer",
     "repayment_periods": "nonnegative_integer",
+    "gender": "gender",
+    "marital_status": "marital_status",
+    "employment_status": "employment_status",
+    "education_level": "education_level",
+    "degree": "degree",
+    "currency": "currency",
+    "account_currency": "currency",
+    "responsibility_type": "responsibility_type",
+    "responsible_person_type": "responsibility_type",
+    "query_reason": "inquiry_reason",
+    "residence_status": "residence_status",
+    "postal_code": "postal_code",
+    "organization_code": "organization_code",
+    "nationality": "country_or_region_code",
 }
 _RAW_OR_PROVENANCE_KEYS = frozenset(
     {
@@ -406,6 +420,13 @@ def _normalize_account_line(value: str) -> str:
 
 
 def _is_valid_for_role(value: str, role: str) -> bool:
+    from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+        validate_pboc_field,
+    )
+
+    contract = validate_pboc_field(value, role)
+    if contract.assessed:
+        return contract.valid
     if role == "date":
         return _valid_date(value)
     if role == "date_or_month":
@@ -509,6 +530,8 @@ def _summary_cell_role(value: Mapping[str, Any]) -> str | None:
 def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
     if key == "value":
         return _summary_cell_role(owner)
+    if key == "reason" and any(name in owner for name in ("inquiry_date", "inquiry_type")):
+        return "inquiry_reason"
     role = _FIELD_ROLES.get(key)
     if role:
         return role

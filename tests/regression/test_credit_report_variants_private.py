@@ -392,13 +392,9 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     )
     assert validate_community_artifacts(written["community"]) == []
     persisted = json.loads(written["community"].read_text(encoding="utf-8"))
-    persisted_semantic = json.loads(written["community_semantic"].read_text(encoding="utf-8"))
-    persisted_reconciliation = next(
-        item
-        for item in persisted_semantic["domain"]["facts"]["credit_extraction_audit"]["reconciliations"]
-        if item["name"] == "credit_account_balance"
-    )
-    assert persisted_reconciliation == balance_reconciliation
+    assert "community_semantic" not in written
+    assert "semantic_json" not in persisted["files"]
+    assert not (written["community"].parent / "001_community_semantic.json").exists()
     assert "_audit_reconciliations" not in {dataset["name"] for dataset in persisted["datasets"]}
     audit_rows = list(
         csv.DictReader((written["datasets"] / "_audit_cells.csv").read_text(encoding="utf-8-sig").splitlines())

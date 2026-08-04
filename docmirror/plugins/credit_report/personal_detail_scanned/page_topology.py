@@ -14,11 +14,14 @@ its coordinate system.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 from docmirror.plugins.credit_report.page_image_resolver import LogicalPageImageResolver
+
+_PRINTED_FOOTER_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*[,，]?\s*共\s*(?P<total>\d+)\s*页")
 
 
 @dataclass(frozen=True)
@@ -187,6 +190,8 @@ class PersonalDetailLogicalPageImageResolver:
         self._base = LogicalPageImageResolver(parse_result, zoom=self._zoom)
         self._cache: dict[int, dict[str, Any] | None] = {}
         self._recoveries: set[int] = set()
+        self._supplemental_cache: dict[int, tuple[dict[str, Any], ...]] = {}
+        self._supplemental_recoveries: list[dict[str, Any]] = []
 
     def __call__(self, logical_page: int) -> dict[str, Any] | None:
         logical = int(logical_page or 0)
@@ -203,12 +208,118 @@ class PersonalDetailLogicalPageImageResolver:
     def clear(self) -> None:
         self._base.clear()
         self._cache.clear()
+        self._supplemental_cache.clear()
 
     def audit(self) -> dict[str, Any]:
         return {
             **self.topology.audit(),
             "recovered_logical_pages": sorted(self._recoveries),
+            "supplemental_spread_recoveries": list(self._supplemental_recoveries),
         }
+
+    def supplemental_spread_slices(self, source_pages: Iterable[int]) -> list[dict[str, Any]]:
+        """Recover footer-confirmed missing halves without inventing logical pages."""
+        result: list[dict[str, Any]] = []
+        for source_page in sorted({int(page) for page in source_pages if int(page) > 0}):
+            if source_page not in self._supplemental_cache:
+                self._supplemental_cache[source_page] = tuple(
+                    self._recover_missing_spread_slice(source_page)
+                )
+            result.extend(dict(item) for item in self._supplemental_cache[source_page])
+        return result
+
+    def _recover_missing_spread_slice(self, source_page: int) -> list[dict[str, Any]]:
+        siblings = self.topology.logicals_for_source(source_page)
+        if len(siblings) != 1:
+            return []
+        geometry = self.topology.geometry(siblings[0])
+        if (
+            geometry is None
+            or geometry.split_kind != "two_page_spread"
+            or geometry.segment_index not in {0, 1}
+            or not self._file_path.is_file()
+            or self._file_path.suffix.lower() != ".pdf"
+        ):
+            return []
+        try:
+            import cv2
+            import fitz
+            import numpy as np
+
+            from docmirror.input.extraction.page_splitter import (
+                analyze_spread_candidates,
+                decision_from_analyses,
+                split_or_passthrough,
+            )
+            from docmirror.ocr.repair.recognizers import rapidocr_recognize
+
+            with fitz.open(self._file_path) as document:
+                if source_page > len(document):
+                    return []
+                source = document[source_page - 1]
+                source_width = float(source.rect.width)
+                source_height = float(source.rect.height)
+                pix = source.get_pixmap(matrix=fitz.Matrix(self._zoom, self._zoom), alpha=False)
+            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            image = image[:, :, :3] if pix.n >= 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+            decision = decision_from_analyses(analyze_spread_candidates(image), mode="auto")
+            if not decision.should_split or not decision.analyses:
+                return []
+            rotation = int(decision.analyses[0].rotation) % 360
+            slices = split_or_passthrough(
+                _rotate_image(image, rotation),
+                source_width=source_width,
+                source_height=source_height,
+                selected_rotation=rotation,
+                zoom=self._zoom,
+                decision=decision,
+                mode="auto",
+            )
+            missing_segment = 1 - int(geometry.segment_index)
+            candidate = next(
+                (item for item in slices if int(item.segment_index) == missing_segment),
+                None,
+            )
+            if candidate is None:
+                return []
+            candidate_image = candidate.image
+            height = int(candidate_image.shape[0])
+            footer_words = rapidocr_recognize(
+                candidate_image[int(height * 0.80) : height, :],
+                source="personal_detail_supplemental_footer_ocr",
+            )
+            footer_text = " ".join(
+                str(word.get("text") or "")
+                for word in footer_words
+                if float(word.get("confidence") or 0.0) >= 0.65
+            )
+            matches = {
+                (int(match.group("page")), int(match.group("total")))
+                for match in _PRINTED_FOOTER_RE.finditer(footer_text)
+            }
+            if len(matches) != 1:
+                return []
+            printed_page, printed_total = next(iter(matches))
+            if not 1 <= printed_page <= printed_total:
+                return []
+            recovery = {
+                "image": candidate_image,
+                "page_width": float(candidate.width),
+                "page_height": float(candidate.height),
+                "source_page": source_page,
+                "segment_index": missing_segment,
+                "printed_page": printed_page,
+                "printed_total": printed_total,
+                "zoom": self._zoom,
+                "source_crop_bbox": list(candidate.source_crop_bbox),
+                "supplemental_page_id": f"source:{source_page}:segment:{missing_segment}:printed:{printed_page}",
+            }
+            self._supplemental_recoveries.append(
+                {key: value for key, value in recovery.items() if key != "image"}
+            )
+            return [recovery]
+        except Exception:
+            return []
 
     def _recover_with_core_splitter(self, logical_page: int) -> dict[str, Any] | None:
         """Recover an existing logical slice; never invent a new logical page."""

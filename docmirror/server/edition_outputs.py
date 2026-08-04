@@ -59,9 +59,9 @@ def _write_community_bundle_files(
 ) -> dict[str, Path]:
     """Render and publish the Community index, reading view, and Dataset Bundle."""
     bundle.document["id"] = document_id
+    bundle.files.pop("semantic_json", None)
     bundle.files.update(
         {
-            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
@@ -73,7 +73,6 @@ def _write_community_bundle_files(
         dataset.public["csv"] = f"{file_id}_datasets/{csv_name}"
     targets = {
         "community": task_dir / f"{file_id}_community.json",
-        "community_semantic": task_dir / f"{file_id}_community_semantic.json",
         "content": task_dir / f"{file_id}_content.md",
         "enhanced_reading": task_dir / f"{file_id}_enhanced_reading.md",
         "datasets": task_dir / f"{file_id}_datasets",
@@ -93,10 +92,9 @@ def _write_community_bundle_files(
     if conservation_issues:
         raise ValueError("Community dataset conservation failed: " + "; ".join(conservation_issues))
     writer = ArtifactWriter(task_dir)
-    writer.write_text(
-        targets["community_semantic"].name,
-        dumps_json(semantic_payload, ensure_ascii=False, indent=2),
-    )
+    obsolete_semantic_path = task_dir / f"{file_id}_community_semantic.json"
+    if obsolete_semantic_path.is_file():
+        obsolete_semantic_path.unlink()
     writer.write_text(targets["community"].name, dumps_json(community_payload, ensure_ascii=False, indent=2))
     writer.write_text(targets["content"].name, content)
     writer.write_text(targets["enhanced_reading"].name, enhanced_reading)

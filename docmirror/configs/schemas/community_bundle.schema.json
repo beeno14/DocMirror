@@ -55,8 +55,7 @@
         "additionalProperties": true,
         "required": ["content_md", "enhanced_reading_md", "datasets_dir", "dataset_audit_csv"],
         "properties": {
-          "semantic_json": {"type": "string", "pattern": "_community_semantic\\.json$"},
-        "content_md": {"type": "string", "pattern": "_content\\.md$"},
+          "content_md": {"type": "string", "pattern": "_content\\.md$"},
         "enhanced_reading_md": {"type": "string", "pattern": "_enhanced_reading\\.md$"},
         "datasets_dir": {"type": "string", "pattern": "_datasets$"},
         "dataset_audit_csv": {"type": "string", "pattern": "_datasets/_audit_cells\\.csv$"}
