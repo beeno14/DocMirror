@@ -74,6 +74,98 @@ _DATASET_RECORD_ID_KEYS = {
     "personal_detail_source_rows": ("record_id", "source_table_row_id"),
 }
 
+_PUBLIC_SOURCE_PRIVATE_KEYS = frozenset(
+    {
+        "bbox",
+        "evidence_ids",
+        "source_anchor",
+        "source_cell_refs",
+        "source_fact_ids",
+        "source_refs",
+    }
+)
+_SOURCE_PAGE_KEYS = frozenset({"page", "page_id", "page_number", "source_page"})
+
+
+def _page_number(value: Any) -> int | None:
+    """Return a positive, one-based source page number when one is explicit."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            number = int(text)
+            return number if number > 0 else None
+        if len(text) > 1 and text[0].casefold() == "p" and text[1:].isdigit():
+            number = int(text[1:])
+            return number if number > 0 else None
+    return None
+
+
+def _source_page_range(record: dict[str, Any]) -> list[int]:
+    """Summarize rich private provenance as a compact public page range."""
+    pages: list[int] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).casefold()
+                if normalized_key == "page_range" and isinstance(item, (list, tuple)):
+                    pages.extend(page for candidate in item if (page := _page_number(candidate)) is not None)
+                elif normalized_key in _SOURCE_PAGE_KEYS:
+                    page = _page_number(item)
+                    if page is not None:
+                        pages.append(page)
+                elif isinstance(item, (dict, list, tuple)):
+                    collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, (dict, list, tuple)):
+                    collect(item)
+
+    for key in (
+        "source",
+        "source_refs",
+        "source_cell_refs",
+        "source_anchor",
+        "page_range",
+        "page",
+        "page_id",
+        "page_number",
+        "source_page",
+    ):
+        if key in record:
+            collect({key: record[key]})
+    return [min(pages), max(pages)] if pages else []
+
+
+def _compact_public_datasets(
+    datasets: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Remove private extraction linkage from public credit-report datasets.
+
+    Projection derives and links records with the original rows first. This final
+    copy keeps those internal rows untouched while reducing each public ``source``
+    object to a useful page range. Core Community Bundle record requirements are
+    preserved, including stable record IDs and the source object itself.
+    """
+    public_datasets: dict[str, list[dict[str, Any]]] = {}
+    for dataset_name, records in datasets.items():
+        public_records: list[dict[str, Any]] = []
+        for record in records:
+            public_record = dict(record)
+            page_range = _source_page_range(record)
+            for key in _PUBLIC_SOURCE_PRIVATE_KEYS:
+                public_record.pop(key, None)
+            public_record["source"] = {"page_range": page_range} if page_range else {}
+            public_records.append(public_record)
+        public_datasets[dataset_name] = public_records
+    return public_datasets
+
 
 def _records(dataset_id: str, values: Any) -> list[dict[str, Any]]:
     """Give projected business records stable canonical record identities."""
@@ -205,7 +297,12 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         content_mode=content_mode,
     )
 
-    repayment_records = list(source_domain.get("credit_repayment_records") or [])
+    corrected_repayment_loader = getattr(variant_input, "corrected_repayment_records", None)
+    repayment_records = (
+        list(corrected_repayment_loader())
+        if variant.variant_id == "personal_detail_scanned" and callable(corrected_repayment_loader)
+        else list(source_domain.get("credit_repayment_records") or [])
+    )
     if not repayment_records and (
         content_mode in {"scanned_ocr", "mixed"} or _has_credit_repayment_structures(parse_result)
     ):
@@ -227,6 +324,8 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         repayment_records,
         credit_accounts,
         micro_grid_structures_from_domain_specific(source_domain),
+        reading_order_by_logical=dict(getattr(variant_input, "reading_order_by_logical", {}) or {}),
+        force_relink=variant.variant_id == "personal_detail_scanned",
     )
     assembled = variant.assemble_business(
         parse_result,
@@ -234,7 +333,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         content_mode=content_mode,
         existing_collections={
             "credit_accounts": credit_accounts,
-            "credit_lines": [],
+            "credit_lines": list(scanned_business.get("credit_lines") or []),
             "repayment_liability_records": list(scanned_business.get("repayment_liability_records") or []),
             "repayment_records": repayment_records,
             "overdue_records": [],
@@ -290,7 +389,23 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
                                 ref.pop("node_ids", None)
                 datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
     variant.finalize_datasets(datasets)
-    domain_facts["data_dictionary"] = variant.data_dictionary()
+    semantic = variant.semantic_extensions()
+    if variant.variant_id == "personal_detail_scanned":
+        from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
+            personal_detail_v2_data_dictionary,
+            personal_detail_v2_enabled,
+            personal_detail_v2_semantic_extensions,
+            project_personal_detail_v2_datasets,
+        )
+
+        if personal_detail_v2_enabled():
+            datasets = project_personal_detail_v2_datasets(datasets)
+            domain_facts["data_dictionary"] = personal_detail_v2_data_dictionary()
+            semantic = personal_detail_v2_semantic_extensions()
+        else:
+            domain_facts["data_dictionary"] = variant.data_dictionary()
+    else:
+        domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
         dict.fromkeys(
             [
@@ -330,7 +445,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         document_type=base.document_type,
         entity_fields=entity_fields,
         domain_facts=domain_facts,
-        semantic=variant.semantic_extensions(),
+        semantic=semantic,
         datasets=datasets,
         sections=variant.build_sections(variant_input, full_text),
         warnings=warnings,

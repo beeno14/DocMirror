@@ -90,7 +90,6 @@ def test_projection_schema_runtime_validation():
                 "tables": [],
             },
             "files": {
-                "semantic_json": "001_community_semantic.json",
                 "content_md": "001_content.md",
                 "enhanced_reading_md": "001_enhanced_reading.md",
                 "datasets_dir": "001_datasets",

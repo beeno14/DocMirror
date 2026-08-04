@@ -635,7 +635,7 @@ def test_csv_preserves_signed_numbers_but_neutralizes_text_formulas() -> None:
     assert status["csv_escape_applied"] == "true"
 
 
-def test_long_identifiers_are_excel_safe_and_sensitive_fields_are_masked_in_markdown() -> None:
+def test_personal_detail_markdown_shows_sensitive_identifiers_and_phone_numbers() -> None:
     candidate = _candidate(
         [
             {
@@ -647,9 +647,16 @@ def test_long_identifiers_are_excel_safe_and_sensitive_fields_are_masked_in_mark
         ]
     )
     candidate["data"]["fields"]["id_number"] = "350600198703032041"
+    candidate["data"]["fields"]["mobile_phone"] = "13812345678"
     candidate["data"]["data_dictionary"]["fields"]["id_number"] = {
         "label": "证件号码",
         "type": "long_id",
+        "sensitive": True,
+        "display": "masked",
+    }
+    candidate["data"]["data_dictionary"]["fields"]["mobile_phone"] = {
+        "label": "手机号码",
+        "type": "string",
         "sensitive": True,
         "display": "masked",
     }
@@ -669,9 +676,47 @@ def test_long_identifiers_are_excel_safe_and_sensitive_fields_are_masked_in_mark
     enhanced = bundle.render_enhanced_markdown()
 
     assert rows[0]["account_identifier"] == "'123456789012345678"
-    assert "3506**********2041" in enhanced
-    assert "350600198703032041" not in enhanced
+    assert "350600198703032041" in enhanced
+    assert "13812345678" in enhanced
+    assert "123456789012345678" in enhanced
+    assert "3506**********2041" not in enhanced
+    assert "1234**********5678" not in enhanced
+
+
+def test_enterprise_markdown_keeps_sensitive_identifiers_masked() -> None:
+    candidate = _candidate(
+        [
+            {
+                "repayment_id": "rep_1",
+                "month": "2025-01",
+                "status": "N",
+                "account_identifier": "123456789012345678",
+            }
+        ]
+    )
+    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"][
+        "account_identifier"
+    ] = {
+        "label": "账户标识",
+        "type": "long_id",
+        "sensitive": True,
+        "display": "masked",
+    }
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="enterprise_credit_report")),
+        candidate,
+    )
+
+    enhanced = _project_community_bundle(
+        seal_parse_result(result),
+        file_id="001",
+        document_id="doc_enterprise_sensitive",
+        projection_data=_PROJECTIONS[id(result)],
+        projection_policy={},
+    ).render_enhanced_markdown()
+
     assert "1234**********5678" in enhanced
+    assert "123456789012345678" not in enhanced
 
 
 def test_audit_uses_canonical_field_keys_with_original_source_values() -> None:

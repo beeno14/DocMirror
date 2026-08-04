@@ -63,6 +63,13 @@ def _builtin_specs() -> dict[str, ProjectionSchemaSpec]:
             compatibility="community-v3-domain-profile",
         ),
         ProjectionSchemaSpec(
+            name="personal_credit_report_detailed_v2",
+            path=_SCHEMAS_DIR / "personal_credit_report_detailed_v2.schema.json",
+            version="2.0.0",
+            description="PBOC-native contract for individual detailed credit reports",
+            compatibility="breaking-from-1.2; community-v3-domain-profile; detailed-report-only",
+        ),
+        ProjectionSchemaSpec(
             name="community_v2",
             path=_SCHEMAS_DIR / "edition_community.schema.json",
             version="2.2",
@@ -176,8 +183,13 @@ def _personal_detail_invariant_errors(payload: dict[str, Any]) -> tuple[str, ...
         actual_count = len((target or {}).get("rows") or [])
         if int(status.get("observed_row_count") or 0) != actual_count:
             errors.append(f"{dataset_name}: dataset-status observed_row_count mismatch")
-        if actual_count and status.get("presence_status") != "observed_nonempty":
-            errors.append(f"{dataset_name}: nonempty dataset must be observed_nonempty")
+        if actual_count and status.get("presence_status") not in {
+            "observed_nonempty",
+            "partial",
+            "unknown",
+            "extraction_failed",
+        }:
+            errors.append(f"{dataset_name}: nonempty dataset must be observed or explicitly uncertain")
 
     for dataset_name, dataset in by_name.items():
         for foreign_key in dataset.get("foreign_keys") or []:
@@ -204,6 +216,97 @@ def _personal_detail_invariant_errors(payload: dict[str, Any]) -> tuple[str, ...
     return tuple(errors)
 
 
+def _personal_detail_v2_invariant_errors(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Check PBOC v2 relationships and semantic discriminators."""
+    datasets = [item for item in payload.get("datasets", []) if isinstance(item, dict)]
+    names = [str(dataset.get("name") or "") for dataset in datasets]
+    errors: list[str] = []
+    if len(names) != len(set(names)):
+        errors.append("datasets must have unique names")
+    by_name = {str(dataset.get("name") or ""): dataset for dataset in datasets}
+    for required_name in ("report_metadata", "report_query", "subject_profile"):
+        if required_name not in by_name:
+            errors.append(f"missing PBOC v2 contract dataset: {required_name}")
+    for dataset_name, dataset in by_name.items():
+        rows = [row for row in dataset.get("rows", []) if isinstance(row, dict)]
+        if dataset.get("row_count") != len(rows):
+            errors.append(f"{dataset_name}: row_count does not match rows length")
+        record_ids = [str(row.get("record_id") or "") for row in rows]
+        if len(record_ids) != len(set(record_ids)):
+            errors.append(f"{dataset_name}: record_id values must be unique")
+
+    accounts = {
+        str((row.get("normalized") or {}).get("account_id") or ""): row.get("normalized") or {}
+        for row in (by_name.get("credit_accounts") or {}).get("rows") or []
+        if isinstance(row, dict)
+    }
+    for row in (by_name.get("credit_account_monthly_performance") or {}).get("rows") or []:
+        normalized = row.get("normalized") or {}
+        account_id = str(normalized.get("account_id") or "")
+        account = accounts.get(account_id)
+        if account is None:
+            errors.append(
+                "credit_account_monthly_performance: unresolved account_id=" f"{account_id}"
+            )
+            continue
+        expected_semantics = (
+            "overdraft_balance"
+            if account.get("pboc_account_type_code") == "R4"
+            else "delinquent_amount"
+        )
+        if normalized.get("status_amount") not in (None, "") and normalized.get(
+            "status_amount_semantics"
+        ) != expected_semantics:
+            errors.append(
+                "credit_account_monthly_performance: status_amount_semantics conflicts "
+                f"with {account.get('pboc_account_type_code')}"
+            )
+
+    for row in (by_name.get("repayment_responsibilities") or {}).get("rows") or []:
+        normalized = row.get("normalized") or {}
+        if "overdue_months_or_repayment_status" in normalized:
+            errors.append(
+                "repayment_responsibilities: combined overdue/status field is forbidden"
+            )
+        if normalized.get("related_party_category") == "person" and normalized.get(
+            "source_status_value"
+        ) not in (None, "") and normalized.get("overdue_months") is None and not normalized.get(
+            "repayment_status_code"
+        ):
+            errors.append(
+                "repayment_responsibilities: person row requires separated overdue months or status"
+            )
+        if normalized.get("related_party_category") == "organization" and not normalized.get(
+            "repayment_status_code"
+        ):
+            errors.append(
+                "repayment_responsibilities: organization row requires repayment_status_code"
+            )
+
+    for dataset_name, dataset in by_name.items():
+        for foreign_key in dataset.get("foreign_keys") or []:
+            columns = list(foreign_key.get("columns") or [])
+            reference_columns = list(foreign_key.get("reference_columns") or [])
+            reference_dataset = by_name.get(str(foreign_key.get("reference_dataset") or ""))
+            if not columns or len(columns) != len(reference_columns) or reference_dataset is None:
+                errors.append(f"{dataset_name}: invalid foreign-key declaration")
+                continue
+            reference_values = {
+                tuple(
+                    reference_row.get(column)
+                    if column == "record_id"
+                    else (reference_row.get("normalized") or {}).get(column)
+                    for column in reference_columns
+                )
+                for reference_row in reference_dataset.get("rows") or []
+            }
+            for row in dataset.get("rows") or []:
+                value = tuple((row.get("normalized") or {}).get(column) for column in columns)
+                if any(part not in (None, "") for part in value) and value not in reference_values:
+                    errors.append(f"{dataset_name}: unresolved foreign key {columns}={value}")
+    return tuple(errors)
+
+
 def validate_projection_payload(name: str, payload: dict[str, Any]) -> ProjectionSchemaValidation:
     """Validate a projection payload against the registered JSON schema.
 
@@ -218,13 +321,21 @@ def validate_projection_payload(name: str, payload: dict[str, Any]) -> Projectio
         import jsonschema
 
         jsonschema.validate(instance=payload, schema=schema)
-        errors = _personal_detail_invariant_errors(payload) if name == "personal_credit_report_detailed" else ()
+        if name == "personal_credit_report_detailed":
+            errors = _personal_detail_invariant_errors(payload)
+        elif name == "personal_credit_report_detailed_v2":
+            errors = _personal_detail_v2_invariant_errors(payload)
+        else:
+            errors = ()
         return ProjectionSchemaValidation(name=name, valid=not errors, errors=errors)
     except ImportError:
         missing = [key for key in schema.get("required", []) if key not in payload]
         errors = list(f"missing required key: {key}" for key in missing)
-        if name == "personal_credit_report_detailed" and not errors:
-            errors.extend(_personal_detail_invariant_errors(payload))
+        if not errors:
+            if name == "personal_credit_report_detailed":
+                errors.extend(_personal_detail_invariant_errors(payload))
+            elif name == "personal_credit_report_detailed_v2":
+                errors.extend(_personal_detail_v2_invariant_errors(payload))
         return ProjectionSchemaValidation(
             name=name,
             valid=not errors,

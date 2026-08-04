@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
@@ -12,14 +13,52 @@ from docmirror.plugins.credit_report.personal_detail_scanned.context import (
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _account_heading_for_table,
     _extract_accounts,
+    _extract_employment_records,
+    _extract_profile_detail_records,
     _extract_residence_records,
     _extract_summary_datasets,
+    _split_employment_basic_row,
 )
 from docmirror.plugins.credit_report.scanned_business import (
     _extract_residence_records as _extract_scanned_residence_records,
 )
 from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_accounts
 from docmirror.plugins.credit_report.shared.entity_decoder import CreditReportUnit
+
+
+def test_split_replay_has_an_independent_full_page_ocr_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    context._page_ocr_max_requests = 1
+    context._page_ocr_requests = [{"logical_page": 1, "status": "completed"}]
+    context._supplemental_ocr_cache = {}
+    context._page_image_resolver = SimpleNamespace(
+        supplemental_spread_slices=lambda _pages: [
+            {
+                "supplemental_page_id": "source:2:segment:1:split",
+                "source_page": 2,
+                "segment_index": 1,
+                "image": np.zeros((100, 80, 3), dtype=np.uint8),
+                "zoom": 1.0,
+                "subpage_basis": "core_split_result",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.context._complete_page_ocr",
+        lambda image: (
+            [{"text": "查询记录", "confidence": 0.99, "bbox": [1, 2, 70, 20]}],
+            image,
+            0,
+            0.0,
+            1.0,
+        ),
+    )
+
+    pages = context.supplemental_page_ocr_evidence([2], reason="split_result_topology_replay")
+
+    assert len(pages) == 1
+    assert pages[0]["source_page"] == 2
+    assert len(context._page_ocr_requests) == 2
 
 
 def _unit(
@@ -298,6 +337,30 @@ def test_native_account_extraction_obeys_cross_page_entity_veto() -> None:
     assert accounts[0]["balance"] == 100
 
 
+def test_native_account_extraction_rejects_repayment_liability_table() -> None:
+    liability = SimpleNamespace(
+        table_id="repayment-liability",
+        metadata={
+            "raw_rows": [
+                ["管理机构", "账户标识", "责任人类型", "还款责任金额", "保证合同编号"],
+                ["样例银行", "A1", "保证人", "4,000,000", "G-001"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 220],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[liability], texts=[])],
+    )
+
+    accounts, repayments, events = _extract_accounts(result)
+
+    assert accounts == []
+    assert repayments == []
+    assert events == []
+
+
 def test_scanned_account_extraction_obeys_cross_page_entity_veto() -> None:
     bundles = [
         {
@@ -537,3 +600,159 @@ def test_account_heading_uses_nearest_account_anchor_even_without_agreement() ->
     table = SimpleNamespace(bbox=[20, 325, 580, 600])
 
     assert _account_heading_for_table(page, table) == {}
+
+
+def test_printed_page_footers_restore_plugin_continuation_order() -> None:
+    def bundle(logical: int, printed: int, *texts: str) -> dict[str, object]:
+        lines = [
+            {"text": text, "bbox": [20, 40 + index * 30, 580, 65 + index * 30]} for index, text in enumerate(texts)
+        ]
+        lines.append(
+            {
+                "text": f"第 {printed} 页，共 4 页",
+                "bbox": [220, 760, 380, 785],
+            }
+        )
+        return {
+            "page": logical,
+            "source_page_number": (logical + 1) // 2,
+            "local_structure_evidence": {
+                "page": logical,
+                "page_width": 600,
+                "page_height": 800,
+                "lines": lines,
+            },
+        }
+
+    # The sealed logical order is 1, 4, 2, 3. The plugin must use printed
+    # order 1, 2, 3, 4 without rewriting logical/source provenance.
+    bundles = [
+        bundle(1, 1, "（四）贷记卡账户", "账户 1（授信协议标识：A1）"),
+        bundle(2, 4, "（五）授信协议信息", "授信协议 1"),
+        bundle(3, 2, "账户 2（授信协议标识：A2）"),
+        bundle(4, 3, "账户 3（授信协议标识：A3）"),
+    ]
+    result = SimpleNamespace(
+        pages=[],
+        entities=SimpleNamespace(domain_specific={"_page_evidence_bundles": bundles}),
+    )
+
+    context = build_personal_detail_extraction_context(result)
+    accounts = extract_scanned_credit_accounts(context)
+
+    assert dict(context.reading_order_by_logical) == {1: 1, 3: 2, 4: 3, 2: 4}
+    assert [page["page"] for page in context.corrected_evidence_pages()] == [1, 3, 4, 2]
+    assert [account["account_id"] for account in accounts] == [
+        "credit_account:credit_card:1",
+        "credit_account:credit_card:2",
+        "credit_account:credit_card:3",
+    ]
+    assert [account["source_refs"][0]["logical_page"] for account in accounts] == [1, 3, 4]
+
+
+def test_native_profile_tables_preserve_empty_cells_and_embedded_subtables() -> None:
+    residence = SimpleNamespace(
+        table_id="residence",
+        bbox=[20, 20, 580, 300],
+        metadata={
+            "raw_rows": [
+                ["编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"],
+                ["1", "某市某区一号", "", "按揭", "2023.11.07"],
+                ["2.", "某市某区二号", "13800138000", "其他", "2023.08.15"],
+                ["编号", "数据发生机构名称", "", "", ""],
+                ["1", "示例银行一", "", "", ""],
+                ["敬", "示例银行二", "", "", ""],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    employment = SimpleNamespace(
+        table_id="employment",
+        bbox=[20, 320, 580, 700],
+        metadata={
+            "raw_rows": [
+                ["编号", "单位地址 工作单位 单位性质 单位电话", "", ""],
+                ["1", "示例粮油有限公司 国有企业 某市某路60号 059100000000", "", ""],
+                ["编号", "行业 职业", "职务", "职称 进入本单位年份 信息更新日期"],
+                ["1", "商业、服务业人员 批发和零售业", "一般员工", "-- 2022.05.31"],
+                ["编号", "数据发生机构名称", "", ""],
+                ["P", "示例银行", "", ""],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    profile = SimpleNamespace(
+        table_id="profile",
+        bbox=[20, 20, 580, 300],
+        metadata={
+            "raw_rows": [
+                ["编号 手机号码", "", "信息更新日期", "数据发生机构名称"],
+                ["13799911561", "", "2023.11.07", "示例银行"],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    spouse = SimpleNamespace(
+        table_id="spouse",
+        bbox=[20, 320, 580, 500],
+        metadata={
+            "raw_rows": [
+                ["姓名", "证件类型", "证件号码", "工作单位", "联系电话"],
+                ["林航", "", "--", "", "13763822211"],
+                ["数据发生机构名称", "", "", "", ""],
+                ["示例消费金融有限公司", "", "", "", ""],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[profile, spouse]),
+            SimpleNamespace(page_number=2, source_page_number=1, tables=[residence, employment]),
+        ],
+        tables_continue=lambda _left, _right: False,
+    )
+
+    residences = _extract_residence_records(result)
+    employments = _extract_employment_records(result)
+    details = _extract_profile_detail_records(result)
+
+    assert [(row["address"], row.get("residential_phone"), row["data_provider"]) for row in residences] == [
+        ("某市某区一号", None, "示例银行一"),
+        ("某市某区二号", "13800138000", "示例银行二"),
+    ]
+    assert employments[0]["employer"] == "示例粮油有限公司"
+    assert employments[0]["employer_type"] == "国有企业"
+    assert employments[0]["employer_address"] == "某市某路60号"
+    assert employments[0]["employer_phone"] == "059100000000"
+    assert employments[0]["occupation"] == "商业、服务业人员"
+    assert employments[0]["industry"] == "批发和零售业"
+    assert employments[0]["data_provider"] == "示例银行"
+    assert details["mobile_phone_records"][0]["mobile_phone"] == "13799911561"
+    assert details["spouse_records"][0]["name"] == "林航"
+    assert details["spouse_records"][0]["phone"] == "13763822211"
+
+
+def test_native_employment_preserves_separated_phone_after_empty_columns() -> None:
+    parsed = _split_employment_basic_row(
+        (
+            "5",
+            "Example Software Center",
+            "foreign-owned enterprise",
+            "Example Road 2",
+            "",
+            "",
+            "010—57888888",
+        )
+    )
+
+    assert parsed == {
+        "employer": "Example Software Center",
+        "employer_type": "foreign-owned enterprise",
+        "employer_address": "Example Road 2",
+        "employer_phone": "010—57888888",
+    }

@@ -368,7 +368,7 @@ def test_nonadjacent_and_distant_tables_are_never_skipped_into_a_merge() -> None
         is None
     )
     assert resolver.audit_rows()[0]["candidate_table_id"] == "intervening"
-    assert resolver.audit_rows()[0]["reason"] == "column_shape"
+    assert resolver.audit_rows()[0]["reason"] == "row_semantics"
 
 
 def test_account_and_history_continuation_contracts_require_business_shapes() -> None:
@@ -564,6 +564,57 @@ def test_enterprise_account_recovers_header_only_page_then_shifted_settled_rows(
     assert accounts[0]["close_date"] == "2025-08-09"
     assert accounts[0]["five_tier_class"] == "正常"
     assert [ref["page"] for ref in accounts[0]["source_refs"]] == [5, 6, 6]
+
+
+def test_continuation_contract_accepts_semantic_row_with_spacer_columns() -> None:
+    result = _result(
+        (
+            1,
+            [
+                _table(
+                    "facility_header",
+                    [
+                        ["非循环信用额度", "", "", "循环信用额度", "", ""],
+                        ["总额", "已用额度", "剩余可用额度", "总额", "已用额度", "剩余可用额度"],
+                    ],
+                )
+            ],
+        ),
+        (2, [_table("facility_values", [["3000", "", "3000", "0", "", "4900", "4900", "0"]])]),
+    )
+    resolver = EnterpriseContinuationResolver(result)
+
+    match = resolver.following_row(resolver.fragments[0], FACILITY_VALUE_CONTRACT)
+
+    assert match is not None
+    assert match.fragment.table_id == "facility_values"
+
+
+def test_enterprise_account_preserves_new_category_classification_and_currency() -> None:
+    result = _result(
+        (
+            1,
+            [
+                _table(
+                    "future_account",
+                    [
+                        ["供应链融资", "未结清 共1笔", "", "", "", "", "", ""],
+                        ["账户编号", "授信机构", "业务类型", "开立日期", "到期日", "币种", "借款金额", ""],
+                        ["SCF202600000001", "示例银行", "订单融资", "2026-01-01", "2027-01-01", "USD", "12.5", ""],
+                        ["", "信用", "8.5", "观察", "0", "0", "0", "2026-08-01"],
+                    ],
+                )
+            ],
+        )
+    )
+
+    accounts = extract_enterprise_accounts_from_tables(result)
+
+    assert len(accounts) == 1
+    assert accounts[0]["business_category"] == "供应链融资"
+    assert accounts[0]["five_tier_class"] == "观察"
+    assert accounts[0]["currency"] == "USD"
+    assert accounts[0]["amount_unit"] == "USD_10K"
 
 
 def test_enterprise_account_maps_issuance_form_and_validates_legacy_dates() -> None:

@@ -83,10 +83,23 @@ def _date_range_only_grid(
     }
 
 
-def augment_credit_repayment_evidence_bundles(domain_specific: dict[str, Any]) -> None:
+def augment_credit_repayment_evidence_bundles(
+    domain_specific: dict[str, Any],
+    *,
+    reading_order_by_logical: dict[int, int] | None = None,
+) -> None:
     """Append next-page leading grid rows using shifted y coordinates."""
     bundles = [item for item in domain_specific.get("_page_evidence_bundles") or [] if isinstance(item, dict)]
-    bundles.sort(key=lambda item: int(item.get("page") or 0))
+    page_order = {
+        int(page): int(order)
+        for page, order in (reading_order_by_logical or {}).items()
+    }
+    bundles.sort(
+        key=lambda item: (
+            page_order.get(int(item.get("page") or 0), int(item.get("page") or 0)),
+            int(item.get("page") or 0),
+        )
+    )
     for index, bundle in enumerate(bundles[:-1]):
         evidence = bundle.get("micro_grid_evidence")
         next_evidence = bundles[index + 1].get("micro_grid_evidence")
@@ -136,6 +149,7 @@ def materialize_credit_repayment_micro_grids(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     line_list = list(lines or [])
     anchor_indices = [
@@ -153,6 +167,7 @@ def materialize_credit_repayment_micro_grids(
             page_image=page_image,
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            extra_status_chars=extra_status_chars,
             grid_index=grid_index,
         )
         grid = out.get("micro_grid")
@@ -175,6 +190,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
     *,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    extra_status_chars: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Materialize credit-only grids on a post-seal read view."""
     from docmirror.models.mirror.page_evidence_bundles import (
@@ -192,6 +208,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
             page_height=evidence.get("page_height"),
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            extra_status_chars=extra_status_chars,
         )
         if grids:
             merge_micro_grid_structures_into_bundles(domain_specific, grids)

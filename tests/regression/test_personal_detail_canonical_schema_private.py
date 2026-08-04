@@ -159,6 +159,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "inquiry_records": "查询记录",
         "statements": "机构说明与本人声明",
         "annotations": "异议标注",
+        "personal_detail_extraction_issues": "提取问题与人工复核队列",
         "personal_detail_dataset_status": "业务数据集存在状态",
     }
 
@@ -176,6 +177,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "sec_annotations": ("异议标注", "annotations", [2, 13]),
         "sec_inquiries": ("查询记录", "inquiries", [13, 13]),
         "sec_report_explanation": ("报告说明与编制说明", "report_explanation", [14, 15]),
+        "sec_extraction_review": ("提取问题与人工复核", "extraction_review", [1, 15]),
     }
     assert sections["sec_credit_summary"]["dataset_refs"] == [
         "ds_personal_detail_summary_records",
@@ -309,7 +311,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "page": 1,
         "residence_record_id": residences[0]["residence_record_id"],
         "residence_status": "按揭",
-        "residential_phone": "010—83234323",
+        "residential_phone": "01083234323",
         "sequence": 1,
         "source_page": 1,
     }
@@ -321,7 +323,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         "data_provider": "样例小额贷款公司",
         "employer": "某软件中心",
         "employer_address": "某市经开区北辰东路2 号",
-        "employer_phone": "010—57888888",
+        "employer_phone": "01057888888",
         "employer_type": "外资企业",
         "employment_record_id": fifth_employment["employment_record_id"],
         "entry_year": 2022,
@@ -343,7 +345,7 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
     assert all(not isinstance(value, (dict, list)) for row in summary_cells for value in row.values())
     assert all(row.get("column_label") for row in summary_cells)
     assert not any(row["value"] in {"账户类型", "账户数", "月份数"} for row in summary_cells)
-    assert any(row["value"] == "23,505" and row["title"] == "呆账信息汇总" for row in summary_cells)
+    assert any(row["value"] == "23505" and row["title"] == "呆账信息汇总" for row in summary_cells)
     summary_metrics = [
         row["normalized"] for row in datasets["personal_detail_credit_summary_metrics"]["rows"]
     ]
@@ -405,10 +407,12 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         row["normalized"]["dataset_name"]: row["normalized"]
         for row in datasets["personal_detail_dataset_status"]["rows"]
     }
-    assert statuses["credit_accounts"]["observed_row_count"] == 15
-    assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
-    assert statuses["inquiry_records"]["observed_row_count"] == 12
-    assert statuses["inquiry_records"]["presence_status"] == "observed_nonempty"
+    assert "credit_accounts" not in statuses
+    assert "inquiry_records" not in statuses
+    assert all(
+        row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for row in statuses.values()
+    )
 
     annotations = [row["normalized"]["text"] for row in datasets["annotations"]["rows"]]
     assert annotations == [

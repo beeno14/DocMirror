@@ -39,9 +39,25 @@ _INQUIRY_REASONS = (
     "贷款审批",
     "信用卡审批",
     "担保资格审查",
+    "融资审批",
+    "保前审查",
+    "保后管理",
+    "客户准入资格审查",
+    "资信审查",
+    "法人代表、负责人、高管",
     "实名审查",
     "异议处理",
 )
+_INQUIRY_REASON_NORMALIZATION = {
+    "费后管理": "贷后管理",
+    "货后管理": "贷后管理",
+    "货款审批": "贷款审批",
+    "资款审批": "贷款审批",
+    "信用卡审抵": "信用卡审批",
+    "担保资格申查": "担保资格审查",
+    "贷后智理": "贷后管理",
+    "磁资审批": "融资审批",
+}
 _DATE_RE = re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}")
 _FACT_DATE_RE = re.compile(r"(20\d{2})[年./:-]\s*(\d{1,2})[月./:-]\s*(\d{1,2})(?:日)?")
 _ACCOUNT_ANCHOR_RE = re.compile(r"账户\s*[（(]?(\d{1,3})")
@@ -64,11 +80,92 @@ _GENERIC_HEADER_LABELS = _KNOWN_PROFILE_LABELS | frozenset(
         "数据发生机构名称",
     }
 )
+
+
+def _normalize_inquiry_reason_text(value: str) -> str:
+    text = str(value or "")
+    for observed, canonical in _INQUIRY_REASON_NORMALIZATION.items():
+        text = text.replace(observed, canonical)
+    return text
+
+
+def _inquiry_detail_section_start(value: str) -> bool:
+    compact = _compact(value)
+    if any(marker in compact for marker in ("机构查询记录明细", "本人查询记录明细")):
+        return True
+    return bool(re.search(r"(?:^|[一二三四五六七八九十])[、.．)）]?查询记录(?!概要)", compact))
+
+
+def _reconstructed_inquiry_rows(evidence_page: dict[str, Any]) -> list[dict[str, Any]]:
+    """Join full-page OCR cells into schema rows using date-column anchors."""
+    cells: list[tuple[dict[str, Any], tuple[float, float, float, float]]] = []
+    for line in evidence_page.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        raw_bbox = line.get("bbox")
+        if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+            continue
+        try:
+            bbox = tuple(float(value) for value in raw_bbox)
+        except (TypeError, ValueError):
+            continue
+        if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+            continue
+        cells.append((line, bbox))
+    anchors = [
+        (line, bbox, (bbox[1] + bbox[3]) / 2.0)
+        for line, bbox in cells
+        if _DATE_RE.search(str(line.get("text") or line.get("content") or ""))
+    ]
+    anchors.sort(key=lambda item: item[2])
+    if not anchors:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for index, (_anchor, _anchor_bbox, center) in enumerate(anchors):
+        lower = (anchors[index - 1][2] + center) / 2.0 if index else float("-inf")
+        upper = (center + anchors[index + 1][2]) / 2.0 if index + 1 < len(anchors) else float("inf")
+        members = [(line, bbox) for line, bbox in cells if lower < (bbox[1] + bbox[3]) / 2.0 <= upper]
+        members.sort(key=lambda item: (item[1][0], item[1][1]))
+        text = " ".join(
+            str(line.get("text") or line.get("content") or "").strip()
+            for line, _bbox in members
+            if str(line.get("text") or line.get("content") or "").strip()
+        )
+        if not text:
+            continue
+        confidences = [float(line.get("confidence") or 0.0) for line, _bbox in members]
+        evidence_ids = [
+            str(evidence_id)
+            for line, _bbox in members
+            for evidence_id in line.get("evidence_ids") or []
+            if str(evidence_id)
+        ]
+        rows.append(
+            {
+                "text": text,
+                "confidence": min(confidences, default=0.0),
+                "bbox": [
+                    min(bbox[0] for _line, bbox in members),
+                    min(bbox[1] for _line, bbox in members),
+                    max(bbox[2] for _line, bbox in members),
+                    max(bbox[3] for _line, bbox in members),
+                ],
+                "evidence_ids": evidence_ids,
+            }
+        )
+    return rows
+
+
 _ACCOUNT_LINE_RE = re.compile(r"^[^\u3400-\u9fff0-9]*账户\s*(\d{1,3})?\s*(?:[（(]|$|\s)")
 _ACCOUNT_SECTION_MARKERS: tuple[tuple[str, str], ...] = (
     ("非循环贷账户", "non_revolving_loan"),
     ("循环贷账户", "revolving_loan"),
     ("贷记卡账户", "credit_card"),
+)
+_ACCOUNT_DETAIL_END_MARKERS: tuple[str, ...] = (
+    "授信协议信息",
+    "查询记录",
 )
 
 
@@ -307,9 +404,7 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                 continue
 
             candidate_rows = [
-                row
-                for row in matrix
-                if len(row) >= 2 and re.fullmatch(r"\d+", str(row[0] or "").strip())
+                row for row in matrix if len(row) >= 2 and re.fullmatch(r"\d+", str(row[0] or "").strip())
             ]
             if callable(continuation_check):
                 # A present continuation graph is authoritative. In particular,
@@ -323,20 +418,16 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                 source_page_number = int(getattr(page, "source_page_number", 0) or 0)
                 existing_max = max(records)
                 sequences = [int(str(row[0]).strip()) for row in candidate_rows]
-                adjacent = (
-                    residence_page_number is not None
-                    and (
-                        page_number == residence_page_number + 1
-                        or (
-                            residence_source_page_number is not None
-                            and source_page_number == residence_source_page_number
-                            and page_number > residence_page_number
-                        )
+                adjacent = residence_page_number is not None and (
+                    page_number == residence_page_number + 1
+                    or (
+                        residence_source_page_number is not None
+                        and source_page_number == residence_source_page_number
+                        and page_number > residence_page_number
                     )
                 )
                 rows_are_residence_like = bool(candidate_rows) and all(
-                    _DATE_RE.search(str(row[1] or ""))
-                    and len(_DATE_RE.sub("", str(row[1] or "")).strip()) >= 6
+                    _DATE_RE.search(str(row[1] or "")) and len(_DATE_RE.sub("", str(row[1] or "")).strip()) >= 6
                     for row in candidate_rows
                 )
                 continues = (
@@ -561,8 +652,28 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     evidence_pages = _evidence_pages(parse_result)
     line_sources: list[tuple[str, int, int, float, dict[str, Any]]] = []
     if evidence_pages:
-        for evidence_page in evidence_pages:
-            for line in evidence_page["lines"]:
+        page_texts = [
+            " ".join(str(line.get("text") or line.get("content") or "") for line in page.get("lines") or [])
+            for page in evidence_pages
+        ]
+        has_explicit_inquiry_section = any(_inquiry_detail_section_start(text) for text in page_texts)
+        inquiry_section_active = not has_explicit_inquiry_section
+        for evidence_page, page_text in zip(evidence_pages, page_texts, strict=True):
+            if _inquiry_detail_section_start(page_text):
+                inquiry_section_active = True
+            if not inquiry_section_active:
+                continue
+            reconstructed = _reconstructed_inquiry_rows(evidence_page)
+            reconstructed_has_inquiry = any(
+                _DATE_RE.search(_normalize_inquiry_reason_text(str(line.get("text") or "")))
+                and any(
+                    reason in _compact(_normalize_inquiry_reason_text(str(line.get("text") or "")))
+                    for reason in _INQUIRY_REASONS
+                )
+                for line in reconstructed
+            )
+            selected_lines = reconstructed if reconstructed_has_inquiry else evidence_page["lines"]
+            for line in selected_lines:
                 ref = {
                     "source": "scanned_ocr_line",
                     "logical_page": evidence_page["page"],
@@ -579,6 +690,8 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                         ref,
                     )
                 )
+            if "报告说明" in _compact(page_text):
+                inquiry_section_active = False
     else:
         for page in getattr(parse_result, "pages", []) or []:
             for block in getattr(page, "texts", []) or []:
@@ -592,8 +705,10 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     )
                 )
 
+    sequence_by_type = {"institution": 0, "personal": 0}
+    last_sequence_by_type = {"institution": 0, "personal": 0}
     for raw_line, logical_page, _source_page, confidence, ref in line_sources:
-        line = raw_line.strip()
+        line = _normalize_inquiry_reason_text(raw_line.strip())
         date_match = _DATE_RE.search(line)
         reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in _compact(line)), "")
         if not date_match or not reason:
@@ -615,6 +730,25 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
         reason_detail = line[reason_index:].strip()
         inquiry_date = date_match.group(0).replace(".", "-").replace("/", "-")
         inquiry_type = "personal" if "本人" in reason or institution == "本人" else "institution"
+        sequence_by_type[inquiry_type] += 1
+        expected_sequence = sequence_by_type[inquiry_type]
+        prefix = line[: date_match.start()]
+        detected_sequence = next(
+            (int(value) for value in reversed(re.findall(r"\d{1,3}", prefix)) if int(value) <= 999),
+            None,
+        )
+        source_sequence = expected_sequence
+        sequence_source = "inferred_from_section_order"
+        if (
+            detected_sequence is not None
+            and detected_sequence > last_sequence_by_type[inquiry_type]
+            and abs(detected_sequence - expected_sequence) <= 1
+        ):
+            source_sequence = detected_sequence
+            sequence_source = "ocr_row_number"
+        elif source_sequence <= last_sequence_by_type[inquiry_type]:
+            source_sequence = last_sequence_by_type[inquiry_type] + 1
+        last_sequence_by_type[inquiry_type] = source_sequence
         text_records.append(
             {
                 "inquiry_id": _stable_id(
@@ -624,7 +758,8 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     reason_detail,
                     logical_page,
                 ),
-                "sequence": len(text_records) + 1,
+                "sequence": source_sequence,
+                "sequence_source": sequence_source,
                 "inquiry_type": inquiry_type,
                 "inquiry_date": inquiry_date,
                 "institution": institution,
@@ -649,7 +784,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 continue
             for row_index, row in enumerate(matrix):
                 cells = [str(value or "").strip() for value in row]
-                joined = " ".join(value for value in cells if value)
+                joined = _normalize_inquiry_reason_text(" ".join(value for value in cells if value))
                 date_match = _DATE_RE.search(joined)
                 reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in _compact(joined)), "")
                 if not date_match or not reason:
@@ -750,6 +885,11 @@ def _reported_account_count(full_text: str, parse_result: Any | None = None) -> 
 
 
 def _evidence_pages(parse_result: Any) -> list[dict[str, Any]]:
+    corrected_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if callable(corrected_loader):
+        corrected = corrected_loader()
+        if corrected:
+            return corrected
     domain_specific = getattr(getattr(parse_result, "entities", None), "domain_specific", {})
     bundles = domain_specific.get("_page_evidence_bundles") if isinstance(domain_specific, dict) else []
     pages: list[dict[str, Any]] = []
@@ -897,6 +1037,21 @@ def _account_field_facts(detail_text: str, *, account_type: str) -> dict[str, An
     identifier_candidates = re.findall(r"(?<![A-Z0-9])[A-Z0-9]{8,}(?![A-Z0-9])", header_region.upper())
     if identifier_candidates:
         facts["account_identifier_candidates"] = identifier_candidates
+    compact_header_upper = re.sub(r"\s+", "", header_region).upper()
+    labelled_identifier = re.search(
+        r"(?:账户标识|联户标识)[:：]?([A-Z0-9]{8,64})(?=[^A-Z0-9]|$)",
+        compact_header_upper,
+    )
+    if labelled_identifier:
+        facts["account_identifier"] = labelled_identifier.group(1)
+    else:
+        typed_identifiers = [
+            candidate
+            for candidate in identifier_candidates
+            if re.search(r"[A-Z]", candidate) and re.search(r"\d", candidate) and len(candidate) >= 12
+        ]
+        if len(typed_identifiers) == 1:
+            facts["account_identifier"] = typed_identifiers[0]
     currency_amount = re.search(r"(\d{1,3}(?:,\d{3})*|\d+)\s*人民币元", header_region)
     if currency_amount:
         amount = int(currency_amount.group(1).replace(",", ""))
@@ -950,7 +1105,7 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
         for line_index, line in enumerate(page["lines"]):
             text = str(line.get("text") or line.get("content") or "")
             compact = re.sub(r"\s+", "", text)
-            if any(marker in compact for marker in ("授信协议信息", "查询记录")) and current_type:
+            if any(marker in compact for marker in _ACCOUNT_DETAIL_END_MARKERS) and current_type:
                 detail_ended = True
             marker = next((value for label, value in _ACCOUNT_SECTION_MARKERS if label in compact), None)
             if marker:
@@ -974,6 +1129,8 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
         starts.append(index)
 
     accounts: list[dict[str, Any]] = []
+    category_counts: dict[str, int] = {}
+    category_ordinals: dict[str, set[int]] = {}
     continuation_check = getattr(parse_result, "allows_scanned_line_transition", None)
     for position, start in enumerate(starts):
         anchor = flattened[start]
@@ -999,11 +1156,32 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
                     end = index
                     break
         detail_lines = flattened[start:end]
+        liability_boundary = next(
+            (
+                index
+                for index, line in enumerate(detail_lines[1:], start=1)
+                if "还款责任金额" in _compact(str(line.get("text") or line.get("content") or ""))
+                and "保证合同编号" in _compact(str(line.get("text") or line.get("content") or ""))
+            ),
+            None,
+        )
+        if liability_boundary is not None:
+            detail_lines = detail_lines[:liability_boundary]
         anchor_text = str(anchor.get("text") or anchor.get("content") or "")
         match = _ACCOUNT_LINE_RE.search(anchor_text)
-        ordinal = int(match.group(1)) if match and match.group(1) else 1
-        account_id = f"credit_account:{account_type}:{ordinal}"
         detail_text = "\n".join(str(line.get("text") or line.get("content") or "") for line in detail_lines)
+        category_counts[account_type] = category_counts.get(account_type, 0) + 1
+        expected_ordinal = category_counts[account_type]
+        detected_ordinal = int(match.group(1)) if match and match.group(1) else None
+        used_ordinals = category_ordinals.setdefault(account_type, set())
+        if detected_ordinal is not None and detected_ordinal > 0 and detected_ordinal not in used_ordinals:
+            ordinal = detected_ordinal
+        else:
+            ordinal = expected_ordinal
+            while ordinal in used_ordinals:
+                ordinal += 1
+        used_ordinals.add(ordinal)
+        account_id = f"credit_account:{account_type}:{ordinal}"
         record: dict[str, Any] = {
             "account_id": account_id,
             "sequence": len(accounts) + 1,
@@ -1037,6 +1215,14 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
             "audit": {
                 "projection_completeness": "raw_complete_semantic_partial",
                 "raw_line_count": len(detail_lines),
+                **(
+                    {
+                        "liability_table_boundary_truncated": True,
+                        "liability_only_anchor_candidate": liability_boundary == 1,
+                    }
+                    if liability_boundary is not None
+                    else {}
+                ),
             },
             **_account_field_facts(detail_text, account_type=account_type),
         }
@@ -1097,6 +1283,17 @@ def extract_scanned_credit_business(parse_result: Any, full_text: str) -> dict[s
     summary: dict[str, Any] = {"source": "scanned_credit_report"}
     if account_count is not None:
         summary["reported_account_count"] = account_count
+        excess = len(accounts) - account_count
+        liability_candidates = [
+            account
+            for account in accounts
+            if (account.get("audit") or {}).get("liability_only_anchor_candidate") is True
+        ]
+        if 0 < excess <= len(liability_candidates):
+            suppressed_ids = {id(account) for account in liability_candidates[-excess:]}
+            accounts = [account for account in accounts if id(account) not in suppressed_ids]
+            summary["suppressed_liability_anchor_count"] = excess
+            summary["pre_reconciliation_account_count"] = account_count + excess
     return {
         "subject_profile": profile,
         "residence_records": residences,
@@ -1114,25 +1311,52 @@ def link_repayment_records_to_accounts(
     repayment_records: list[dict[str, Any]],
     credit_accounts: list[dict[str, Any]],
     micro_grids: list[dict[str, Any]],
+    *,
+    reading_order_by_logical: dict[int, int] | None = None,
+    force_relink: bool = False,
 ) -> list[dict[str, Any]]:
     """Attach each repayment grid to the nearest preceding account card."""
+    page_order = {int(page): int(order) for page, order in (reading_order_by_logical or {}).items()}
+
+    def reading_page(page: int) -> int:
+        return page_order.get(page, page)
+
     grids = {str(grid.get("grid_id") or ""): grid for grid in micro_grids if isinstance(grid, dict)}
     accounts_by_page: dict[int, list[dict[str, Any]]] = {}
+    ordered_accounts: list[tuple[int, float, dict[str, Any]]] = []
     for account in credit_accounts:
         if isinstance(account, dict):
-            accounts_by_page.setdefault(int(account.get("page") or 0), []).append(account)
+            page = int(account.get("page") or 0)
+            accounts_by_page.setdefault(page, []).append(account)
+            bbox = account.get("bbox")
+            bottom = float(bbox[3]) if isinstance(bbox, list) and len(bbox) == 4 else 0.0
+            ordered_accounts.append((reading_page(page), bottom, account))
+    ordered_accounts.sort(key=lambda item: (item[0], item[1], int(item[2].get("sequence") or 0)))
+    accounts_by_reading_page: dict[int, list[dict[str, Any]]] = {}
+    for page, accounts in accounts_by_page.items():
+        accounts_by_reading_page.setdefault(reading_page(page), []).extend(accounts)
+    valid_account_ids = {
+        str(account.get("account_id") or "")
+        for account in credit_accounts
+        if isinstance(account, dict) and account.get("account_id")
+    }
     out: list[dict[str, Any]] = []
     for record in repayment_records:
         item = dict(record)
-        if item.get("account_id"):
-            out.append(item)
-            continue
         refs = item.get("source_cell_refs") if isinstance(item.get("source_cell_refs"), list) else []
         first_ref = refs[0] if refs and isinstance(refs[0], dict) else {}
         grid_id = str(first_ref.get("grid_id") or item.get("grid_id") or "")
         grid = grids.get(grid_id, {})
         page = int(grid.get("page") or first_ref.get("page") or 0)
-        raw_grid_bbox = grid.get("bbox")
+        original_account_id = str(item.get("account_id") or "")
+        original_is_valid = original_account_id in valid_account_ids
+        if original_is_valid and (not force_relink or page <= 0):
+            out.append(item)
+            continue
+        if original_account_id:
+            item.pop("account_id", None)
+            item.pop("account_identifier", None)
+        raw_grid_bbox = grid.get("bbox") or item.get("status_bbox") or first_ref.get("bbox")
         grid_bbox: list[Any] = raw_grid_bbox if isinstance(raw_grid_bbox, list) else [0, 0, 0, 0]
         grid_y = float(grid_bbox[1]) if len(grid_bbox) == 4 else 0.0
         current = accounts_by_page.get(page) or []
@@ -1143,12 +1367,86 @@ def link_repayment_records_to_accounts(
             and len(account["bbox"]) == 4
             and float(account["bbox"][3]) <= grid_y + 8.0
         ]
-        previous = accounts_by_page.get(page - 1) or []
-        if preceding or previous:
-            selected = max(preceding, key=lambda account: float(account["bbox"][3])) if preceding else previous[-1]
+        ordered_page = reading_page(page)
+        previous = accounts_by_reading_page.get(ordered_page - 1) or []
+        global_preceding = [
+            account
+            for account_page, account_bottom, account in ordered_accounts
+            if account_page < ordered_page or (account_page == ordered_page and account_bottom <= grid_y + 8.0)
+        ]
+        first_same_page = current[0] if current and grid_y <= 0.0 else None
+        if preceding or previous or global_preceding or first_same_page:
+            selected = (
+                max(preceding, key=lambda account: float(account["bbox"][3]))
+                if preceding
+                else previous[-1]
+                if previous
+                else global_preceding[-1]
+                if global_preceding
+                else first_same_page
+            )
             item["account_id"] = selected.get("account_id")
+            if selected.get("account_identifier") and not item.get("account_identifier"):
+                item["account_identifier"] = selected.get("account_identifier")
+        elif original_is_valid:
+            item["account_id"] = original_account_id
         out.append(item)
-    return out
+
+    # One account has at most one status for a reporting month. Multiple local
+    # structure detectors may materialize the same cell; collapse only after an
+    # account link exists so unrelated grids are never merged accidentally.
+    deduplicated: list[dict[str, Any]] = []
+    positions: dict[tuple[str, int, int], int] = {}
+    for item in out:
+        account_id = str(item.get("account_id") or "")
+        try:
+            year = int(item.get("year") or 0)
+            month = int(item.get("month") or 0)
+        except (TypeError, ValueError):
+            year = month = 0
+        if not account_id or year < 1900 or not 1 <= month <= 12:
+            deduplicated.append(item)
+            continue
+        key = (account_id, year, month)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(deduplicated)
+            deduplicated.append(item)
+            continue
+        current = deduplicated[position]
+
+        def score(record: dict[str, Any]) -> tuple[int, int, float, int]:
+            source = str(record.get("recognition_source") or "")
+            status = str(record.get("status") or "")
+            try:
+                confidence = float(record.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            return (
+                int(source == "cell_crop_consensus"),
+                int(status not in {"", "unknown"}),
+                confidence,
+                len(record.get("source_cell_refs") or []),
+            )
+
+        if score(item) > score(current):
+            selected, other = dict(item), current
+        else:
+            selected, other = dict(current), item
+        refs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for ref in [*(selected.get("source_cell_refs") or []), *(other.get("source_cell_refs") or [])]:
+            if not isinstance(ref, dict):
+                continue
+            marker = repr(sorted(ref.items()))
+            if marker not in seen_refs:
+                seen_refs.add(marker)
+                refs.append(dict(ref))
+        if refs:
+            selected["source_cell_refs"] = refs
+        selected.setdefault("audit", {})["duplicate_month_candidates"] = 2
+        deduplicated[position] = selected
+    return deduplicated
 
 
 __all__ = [

@@ -1,0 +1,30 @@
+pack_id: pboc.personal_detail.zh-CN
+version: 1
+
+# These substitutions are intentionally scoped to typed personal-credit-report
+# fields. They must never be applied as an unrestricted whole-document rewrite.
+institution_substitutions:
+  蚂蚊消费金融: 蚂蚁消费金融
+  偏用卡中心: 信用卡中心
+  个大信贷部: 个人信贷部
+
+inquiry_reason_substitutions:
+  费后管理: 贷后管理
+  货后管理: 贷后管理
+  货款审批: 贷款审批
+  资款审批: 贷款审批
+  信用卡审抵: 信用卡审批
+  担保资格申查: 担保资格审查
+  贷后智理: 贷后管理
+  磁资审批: 融资审批
+
+account_label_substitutions:
+  营理机构: 管理机构
+  发卡机树: 发卡机构
+  联户标识: 账户标识
+  账户师种: 账户币种
+  开立白期: 开立日期
+  账户授信概度: 账户授信额度
+  账户授信舰度: 账户授信额度
+  共事授信额度: 共享授信额度
+  还款妈数: 还款期数

@@ -31,9 +31,10 @@ from docmirror.plugins.credit_report.value_utils import (
 
 _DATE_CN_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 _ACCOUNT_DATE_PATTERN = r"20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
+_ACCOUNT_ACTION_PATTERN = r"(?:发放(?:了)?(?:的)?|办理(?:了)?(?:的)?|开立(?:了)?(?:的)?|提供(?:了)?(?:的)?|为(?=.{0,40}贷款授信))"
 _ACCOUNT_START_RE = re.compile(
     rf"{_ACCOUNT_DATE_PATTERN}"
-    rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,100}}?(?:发放的|为(?=.{{0,30}}贷款授信)))"
+    rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,180}}?{_ACCOUNT_ACTION_PATTERN})"
 )
 _PERSONAL_BRIEF_CARD_TYPE_RE = re.compile(r"^(?P<business_type>准贷记卡|贷记卡)(?=[（(，,。；;账户]|$)")
 _ENTERPRISE_ACCOUNT_RE = re.compile(r"(?:\d+\.)?(未结清|已结清)账户编号\s*[:：]?")
@@ -352,6 +353,30 @@ def _personal_brief_credit_lines(accounts: list[dict[str, Any]]) -> list[dict[st
     return out
 
 
+def _personal_brief_overdue_section_state(text: str, account_start: int) -> bool | None:
+    """Apply only an explicit, still-open account-group overdue heading."""
+    prefix = text[:account_start]
+    states = list(
+        re.finditer(
+            r"(?P<never>从未发生过逾期|从未逾期过)|(?P<ever>发生过逾期)"
+            r".{0,80}?(?:账户|卡片|贷款).{0,30}?(?:明细|如下)",
+            prefix,
+        )
+    )
+    if not states:
+        return None
+    state = states[-1]
+    intervening = prefix[state.end() :]
+    # A new business/record section closes the group.  Numbered account rows,
+    # page footers and repeated group titles do not.
+    if re.search(
+        r"(?:相关还款责任信息|非信贷交易记录|公共记录|查询记录|资产处置信息|保证人代偿信息)",
+        intervening,
+    ):
+        return None
+    return state.group("never") is None
+
+
 def _personal_brief_accounts(text: str, page_texts: list[tuple[int, str, str]]) -> list[dict[str, Any]]:
     # Account narratives can continue on later pages even after a page-one
     # column has already introduced non-credit or responsibility headings.
@@ -368,9 +393,11 @@ def _personal_brief_accounts(text: str, page_texts: list[tuple[int, str, str]]) 
             if marker_at >= 0:
                 end = min(end, marker_at)
         chunk = text[match.start() : end].strip()
+        if "承担相关还款责任" in _compact(chunk):
+            continue
         if not any(marker in chunk for marker in ("贷记卡", "准贷记卡", "贷款", "授信")):
             continue
-        if "发放的" not in chunk and not re.search(r"为.{0,30}贷款授信", chunk):
+        if not re.search(_ACCOUNT_ACTION_PATTERN, chunk):
             continue
         account = _personal_brief_account_from_chunk(chunk, page_texts)
         if not account or not account.get("account_id"):
@@ -389,15 +416,10 @@ def _personal_brief_accounts(text: str, page_texts: list[tuple[int, str, str]]) 
             account["sequence"],
         )
         if "ever_overdue" not in account:
-            states = list(
-                re.finditer(
-                    r"从未发生过逾期|从未逾期过|发生过逾期",
-                    text[: match.start()],
-                )
-            )
-            if states:
-                account["ever_overdue"] = not states[-1].group(0).startswith("从未")
-                if not account["ever_overdue"]:
+            section_state = _personal_brief_overdue_section_state(text, match.start())
+            if section_state is not None:
+                account["ever_overdue"] = section_state
+                if not section_state:
                     account["overdue_months_last_5y"] = 0
         accounts.append(account)
     return accounts
@@ -412,7 +434,7 @@ def _personal_brief_account_from_chunk(
         return None
     open_date = _iso_date(opened.group(0))
     remainder = chunk[opened.end() :]
-    action_match = re.search(r"发放的|为(?=.{0,30}贷款授信)", remainder)
+    action_match = re.search(_ACCOUNT_ACTION_PATTERN, remainder)
     if not action_match:
         return None
     institution = re.sub(r"\s+", "", remainder[: action_match.start()]).strip("，,。.;；")
@@ -510,6 +532,10 @@ def _personal_brief_account_from_chunk(
         amount_match = re.search(pattern, compact_chunk)
         if amount_match:
             account[field] = _number(amount_match.group(1))
+    if account_type == "loan" and "loan_amount" not in account:
+        issued_amount = re.match(r"([\d,]+(?:\.\d+)?)元", compact_body)
+        if issued_amount:
+            account["loan_amount"] = _number(issued_amount.group(1))
 
     due_match = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)到期", compact_chunk)
     if due_match:
@@ -615,11 +641,11 @@ def _personal_brief_repayment_liabilities(
         chunk = section[match.start() : end].strip()
         compact = _compact(chunk)
         core = re.search(
-            r"^(20\d{2}年\d{1,2}月\d{1,2}日)，?为"
-            r"(.+?)（证件类型：(.+?)，证件号码：(.+?)）"
-            r"在(.+?)办理的(.+?)承担相关还款责任，"
-            r"责任人类型为(.+?)，相关还款责任金额([\d,.]+|--)"
-            r"(?:（保证合同编号：(.+?)）)?。",
+            r"^(20\d{2}年\d{1,2}月\d{1,2}日)[，,]?为"
+            r"(.+?)[（(]证件类型[:：](.+?)[，,]证件号码[:：](.+?)[）)]"
+            r"在(.+?)办理(?:的)?(.+?)承担相关还款责任[，,]"
+            r"责任人类型为(.+?)[，,]相关还款责任金额([\d,.]+|--)"
+            r"(?:[（(]保证合同编号[:：](.+?)[）)])?[。.]",
             compact,
         )
         if not core:
@@ -803,6 +829,8 @@ def _personal_brief_inquiry_rows(
         rest = _compact(section[match.end() : end])
         source_reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in rest), "")
         if not source_reason:
+            source_reason = _personal_brief_inquiry_reason(rest, inquiry_type)
+        if not source_reason:
             continue
         source_reason = source_reason.replace("(", "（").replace(")", "）")
         institution = "本人" if inquiry_type == "personal" else rest.split(source_reason, 1)[0]
@@ -836,6 +864,22 @@ def _personal_brief_inquiry_rows(
             }
         )
     return out
+
+
+def _personal_brief_inquiry_reason(rest: str, inquiry_type: str) -> str:
+    """Read new PBOC reason labels conservatively from the ledger tail."""
+    normalized = rest.replace("(", "（").replace(")", "）")
+    if inquiry_type == "personal":
+        match = re.search(r"(本人查询(?:（[^）]{1,40}）)?)$", normalized)
+        return match.group(1) if match else ""
+    matches = list(re.finditer(
+        r"((?:个人|企业|信用卡|融资|授信|担保|法人|负责人|高管|贷后|保前|资信|客户|风险|关联|异议|账户|商户)"
+        r"[^，,。；;]{0,24}(?:审批|审查|管理|查询|核查|复核|评估|授信|准入)"
+        r"(?:（[^）]{1,40}）)?)$",
+        normalized,
+    ))
+    match = min(matches, key=lambda item: len(item.group(1))) if matches else None
+    return match.group(1) if match else ""
 
 
 def _overdue_from_personal_brief_accounts(

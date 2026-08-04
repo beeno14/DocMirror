@@ -69,9 +69,9 @@ def materialize_community_bundle(
         )
         document.setdefault("title", source_path.stem)
     files = dict(projected.get("files") or {})
+    files.pop("semantic_json", None)
     files.update(
         {
-            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
@@ -555,7 +555,6 @@ def build_all_projections(
     outputs: dict[str, Any] = {
         "mirror": mirror,
         "community": community,
-        "community_semantic": community_semantic,
         "enterprise": enterprise,
         "finance": finance,
         "edition_availability": commercial_availability,

@@ -51,9 +51,13 @@ def detect_credit_report_subtype(parse_result: Any, full_text: str = "") -> str:
         "统一社会信用代码",
         "中征码",
     )
+    has_personal_title = "个人信用报告" in compact
     if (
         any(marker in compact for marker in enterprise_markers[:2])
-        or sum(marker in compact for marker in enterprise_markers[2:]) >= 2
+        or (
+            not has_personal_title
+            and sum(marker in compact for marker in enterprise_markers[2:]) >= 2
+        )
     ):
         return "enterprise"
 

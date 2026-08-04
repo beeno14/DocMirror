@@ -416,6 +416,16 @@ def _business_identity(record: dict[str, Any]) -> tuple[str, ...]:
 
 def _natural_key(collection: str, record: dict[str, Any], index: int) -> tuple[Any, ...]:
     if collection == "credit_accounts":
+        # Personal-detail extractors assign category-local ordinal IDs from
+        # explicit account anchors. Prefer that structural identity over an
+        # OCR account identifier: the latter can accidentally contain a shared
+        # credit-agreement ID and would collapse distinct cards.
+        account_id = _compact(record.get("account_id"))
+        if re.fullmatch(
+            r"CREDIT_ACCOUNT:(?:NON_REVOLVING_LOAN|REVOLVING_LOAN|CREDIT_CARD):\d+",
+            account_id,
+        ):
+            return (collection, "structural_account_id", account_id)
         account_identifier = _identifier(record.get("account_identifier"))
         if account_identifier:
             return (collection, "account_identifier", account_identifier)

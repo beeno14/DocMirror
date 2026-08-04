@@ -40,6 +40,7 @@ PERSONAL_DETAIL_DATASET_ORDER = (
     "inquiry_records",
     "statements",
     "annotations",
+    "personal_detail_extraction_issues",
     "personal_detail_dataset_status",
 )
 
@@ -72,9 +73,9 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
                     "not_observed, extraction_failed, partial, and not_applicable."
                 ),
                 "uncertainty_policy": (
-                    "personal_detail_field_observations is scoped-exhaustive for the declared "
-                    "personal_profile fields. Other datasets are not assessed unless explicitly "
-                    "declared. Nullable confidence means the source supplied no field confidence."
+                    "personal_detail_field_observations contains only potentially flawed personal_profile fields "
+                    "and typed failures from other assessed business datasets. Successful observations are omitted. "
+                    "Nullable confidence means the source supplied no field confidence."
                 ),
                 "date_policy": "Dates use ISO 8601 day or month precision; long-term is a validity enum.",
                 "amount_policy": (
@@ -141,6 +142,28 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
             "confidence_status": {"label": "置信度可用状态", "type": "enum"},
             "confidence_basis": {"label": "置信度依据", "type": "string"},
             "reason": {"label": "状态原因", "type": "text"},
+        },
+    }
+    datasets["personal_detail_extraction_issues"] = {
+        "definition": (
+            "One row per unresolved or safely suppressed extraction condition. Decoding continues, "
+            "the observed value is preserved, and a human may correct the cited field."
+        ),
+        "columns": {
+            "extraction_issue_id": {"label": "提取问题记录ID", "type": "string"},
+            "category": {"label": "问题类别", "type": "enum"},
+            "issue_code": {"label": "问题代码", "type": "string"},
+            "severity": {"label": "严重程度", "type": "enum"},
+            "status": {"label": "处理状态", "type": "enum"},
+            "parser_stage": {"label": "解析阶段", "type": "string"},
+            "target_dataset": {"label": "受影响数据集", "type": "string"},
+            "target_record_id": {"label": "受影响记录ID", "type": "string"},
+            "field_name": {"label": "受影响字段", "type": "string"},
+            "observed_value": {"label": "保留的观测值", "type": "text"},
+            "candidate_value": {"label": "候选值", "type": "text"},
+            "confidence": {"label": "候选置信度", "type": "decimal"},
+            "reason_codes": {"label": "原因代码", "type": "array"},
+            "message": {"label": "人工复核说明", "type": "text"},
         },
     }
     datasets["personal_report_metadata"]["columns"].update(
@@ -368,9 +391,7 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
             "value": {"label": "单元格值", "type": "string"},
         },
     }
-    datasets["postpaid_payment_history"]["columns"]["status"]["enum_ref"] = (
-        "postpaid_payment_status_code"
-    )
+    datasets["postpaid_payment_history"]["columns"]["status"]["enum_ref"] = "postpaid_payment_status_code"
     datasets["personal_detail_credit_summary_metrics"] = {
         "definition": (
             "One typed metric per source summary cell. The row and column coordinates, business "
@@ -519,8 +540,8 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
         }
     datasets["personal_detail_dataset_status"] = {
         "definition": (
-            "One row per expected business dataset. A missing dataset is not a zero-record "
-            "business fact unless presence_status is explicitly_empty with source evidence."
+            "One row per potentially incomplete or uncertain business dataset. Successful observations and "
+            "source-confirmed empty/not-applicable datasets are omitted."
         ),
         "columns": {
             "dataset_status_id": {"label": "数据集状态记录ID", "type": "string"},
@@ -625,6 +646,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             for name in (
                 "personal_profile",
                 "personal_detail_field_observations",
+                "personal_detail_extraction_issues",
                 "personal_detail_credit_summary_metrics",
                 "tax_arrears_records",
                 "civil_judgment_records",
@@ -640,6 +662,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "personal_report_metadata": "个人信用报告信息",
             "personal_profile": "个人基本资料",
             "personal_detail_field_observations": "字段观测与不确定性",
+            "personal_detail_extraction_issues": "提取问题与人工复核队列",
             "credit_accounts": "信贷交易账户明细",
             "credit_lines": "授信协议信息",
             "repayment_records": "月度还款记录",
@@ -658,7 +681,8 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
         },
         "section_markers": {
             "personal_profile": ["basic_information"],
-            "personal_detail_field_observations": ["basic_information"],
+            "personal_detail_field_observations": ["extraction_review"],
+            "personal_detail_extraction_issues": ["extraction_review"],
             "personal_detail_credit_summary_metrics": ["credit_summary"],
             "tax_arrears_records": ["public_records"],
             "civil_judgment_records": ["public_records"],
@@ -667,7 +691,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "personal_housing_fund_records": ["public_records"],
             "professional_qualification_records": ["public_records"],
             "award_records": ["public_records"],
-            "personal_detail_dataset_status": ["basic_information"],
+            "personal_detail_dataset_status": ["extraction_review"],
             "statements": ["statements", "notes"],
             "annotations": ["annotations", "notes"],
         },
@@ -682,13 +706,17 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "professional_qualification_records": "business_canonical",
             "award_records": "business_canonical",
             "personal_detail_field_observations": "control",
+            "personal_detail_extraction_issues": "control",
             "personal_detail_dataset_status": "control",
             "personal_detail_summary_cells": "source_canonical",
             "public_records": "source_canonical",
         },
         "dataset_grains": {
             "personal_profile": "one row per information subject in the report",
-            "personal_detail_field_observations": "one row per declared personal-profile field",
+            "personal_detail_field_observations": (
+                "one row per potentially flawed personal-profile field or assessed typed extraction failure"
+            ),
+            "personal_detail_extraction_issues": "one row per distinct extraction condition",
             "personal_detail_credit_summary_metrics": "one row per source summary-grid cell",
             "tax_arrears_records": "one row per tax-arrears public record",
             "civil_judgment_records": "one row per civil-judgment public record",
@@ -697,11 +725,12 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "personal_housing_fund_records": "one row per housing-fund public record",
             "professional_qualification_records": "one row per professional-qualification public record",
             "award_records": "one row per award public record",
-            "personal_detail_dataset_status": "one row per tracked business dataset",
+            "personal_detail_dataset_status": "one row per potentially incomplete or uncertain business dataset",
         },
         "dataset_derived_from": {
             "personal_profile": ["personal_report_metadata", "subject_profile_facts"],
-            "personal_detail_field_observations": ["subject_profile_facts"],
+            "personal_detail_field_observations": ["subject_profile_facts", "personal_detail_extraction_issues"],
+            "personal_detail_extraction_issues": ["ocr_audit", "page_topology_audit", "native_parser"],
             "personal_detail_credit_summary_metrics": [
                 "personal_detail_summary_records",
                 "personal_detail_summary_cells",
@@ -716,13 +745,6 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "personal_detail_dataset_status": ["final_assembled_business_datasets"],
         },
         "dataset_foreign_keys": {
-            "personal_detail_field_observations": [
-                {
-                    "columns": ["business_record_id"],
-                    "reference_dataset": "personal_profile",
-                    "reference_columns": ["record_id"],
-                }
-            ],
             "repayment_records": [
                 {
                     "columns": ["account_id"],
@@ -765,6 +787,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             for name in (
                 "personal_profile",
                 "personal_detail_field_observations",
+                "personal_detail_extraction_issues",
                 "personal_detail_credit_summary_metrics",
                 "tax_arrears_records",
                 "civil_judgment_records",
@@ -811,6 +834,18 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "confidence_status",
             "confidence_basis",
             "reason",
+        ],
+        "personal_detail_extraction_issues": [
+            "category",
+            "issue_code",
+            "severity",
+            "status",
+            "target_dataset",
+            "field_name",
+            "observed_value",
+            "candidate_value",
+            "confidence",
+            "message",
         ],
         "identity_documents": ["sequence", "holder_name", "document_type", "document_number", "is_primary"],
         "mobile_phone_records": ["sequence", "mobile_phone", "information_updated_date", "data_provider"],
@@ -1004,10 +1039,11 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
         ],
         "absence_dataset": "personal_detail_dataset_status",
         "uncertainty_dataset": "personal_detail_field_observations",
+        "extraction_issue_dataset": "personal_detail_extraction_issues",
         "absence_requires_explicit_source_evidence": True,
         "empty_dataset_means_absent": False,
         "uncertainty_coverage": {
-            "mode": "scoped_exhaustive",
+            "mode": "potentially_flawed_only",
             "covered_dataset": "personal_profile",
             "covered_fields": [
                 "gender",
@@ -1037,8 +1073,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
         "id": "personal_credit_report_detailed",
         "version": "1.2.0",
         "contract_uri": (
-            "https://valuemapglobal.github.io/DocMirror/schemas/"
-            "personal_credit_report_detailed.schema.json"
+            "https://valuemapglobal.github.io/DocMirror/schemas/personal_credit_report_detailed.schema.json"
         ),
         "compatibility": "additive-over-1.1; community-v3-envelope",
     }

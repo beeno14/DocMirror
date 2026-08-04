@@ -311,7 +311,7 @@
                         "field_name", "observation_status"
                       ],
                       "properties": {
-                        "dataset_name": {"const": "personal_profile"},
+                        "dataset_name": {"type": "string", "minLength": 1},
                         "observation_status": {
                           "enum": [
                             "observed", "normalized", "ocr_corrected", "inferred", "ambiguous",

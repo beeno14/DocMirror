@@ -139,7 +139,6 @@
       "type": "object",
       "additionalProperties": true,
       "required": [
-        "semantic_json",
         "content_md",
         "enhanced_reading_md",
         "datasets_dir",

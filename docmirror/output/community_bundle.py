@@ -782,6 +782,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     if (payload.get("schema") or {}).get("name") == "docmirror.community.semantic":
         payload = _community_view_from_semantic(payload)
     document = payload.get("document") or {}
+    if document.get("type") == "personal_credit_report_detailed":
+        privacy_mode = "full"
     sections = {str(section.get("id") or ""): section for section in payload.get("sections") or []}
     datasets = {str(dataset.get("id") or ""): dataset for dataset in payload.get("datasets") or []}
     reading = payload.get("reading") or {}
@@ -2717,7 +2719,6 @@ def project_community_bundle(
         sections=sections,
         datasets=datasets,
         files={
-            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
