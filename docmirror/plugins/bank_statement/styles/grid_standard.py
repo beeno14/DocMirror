@@ -89,6 +89,13 @@ _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
+    compact_needles = {
+        re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(needle or ""))).lower() for needle in needles
+    }
+    for key, value in raw_txn.items():
+        compact_key = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(key or ""))).lower()
+        if compact_key in compact_needles:
+            return str(value or "").strip()
     for key, value in raw_txn.items():
         norm_key = normalize_header_cell(key)
         for needle in needles:
@@ -137,7 +144,15 @@ def _normalize_source_counterparty_columns(
         ),
     )
     if counter_party:
-        normalized["counter_party"] = _clean_wrapped_text(counter_party)
+        cleaned_party = _clean_wrapped_text(counter_party)
+        compact_party = re.sub(r"\s+", "", cleaned_party)
+        if re.fullmatch(r"[0-9*＊]{6,32}", compact_party):
+            normalized["counter_account"] = compact_party
+            normalized["counter_party"] = ""
+        elif compact_party in {"--", "-"}:
+            normalized["counter_party"] = ""
+        else:
+            normalized["counter_party"] = cleaned_party
 
     counter_bank = _explicit_source_column_value(
         raw_txn,
@@ -283,7 +298,8 @@ def _normalize_direction_text(value: str) -> str:
 
 def _clean_wrapped_text(value: str) -> str:
     text = re.sub(r"\s+", " ", value or "").strip()
-    return re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff(（])", "", text)
+    return re.sub(r"(?<=[)）])\s+(?=[\u4e00-\u9fff])", "", text)
 
 
 def _clean_account(value: str) -> str:
@@ -332,6 +348,7 @@ def _with_internal_row_sources(
         if isinstance(source, dict) and _positive_int(source.get("source_page")) is not None:
             source_page = _positive_int(source.get("source_page"))
             source.setdefault("page_range", [source_page, source_page])
+            _ensure_row_bbox_source_ref(source)
             continue
         source_page = _internal_source_page(transaction)
         if source_page is None:
@@ -339,7 +356,7 @@ def _with_internal_row_sources(
             if inferred is not None:
                 transaction["_source"] = inferred
             continue
-        transaction["_source"] = {
+        row_source: dict[str, Any] = {
             "source_page": source_page,
             "page_range": [source_page, source_page],
             **({"table_id": table_id} if (table_id := _internal_source_value(transaction, "_source_table_id")) else {}),
@@ -349,7 +366,37 @@ def _with_internal_row_sources(
                 else {}
             ),
         }
+        bbox_value = _internal_source_value(transaction, "_source_bbox")
+        try:
+            bbox = [float(value) for value in bbox_value.split(",")]
+        except ValueError:
+            bbox = []
+        if len(bbox) == 4:
+            row_source["bbox"] = bbox
+            _ensure_row_bbox_source_ref(row_source)
+        transaction["_source"] = row_source
     return transactions
+
+
+def _ensure_row_bbox_source_ref(source: dict[str, Any]) -> None:
+    """Expose a recovered row bbox through the standard audit source-ref path."""
+    bbox = source.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return
+    refs = source.get("source_refs")
+    if not isinstance(refs, list):
+        refs = []
+        source["source_refs"] = refs
+    if any(isinstance(ref, dict) and ref.get("bbox") == list(bbox) for ref in refs):
+        return
+    refs.append(
+        {
+            "source_page": source.get("source_page"),
+            "page_range": list(source.get("page_range") or []),
+            "bbox": list(bbox),
+            "source": "native_pdf_words",
+        }
+    )
 
 
 def _finalize_transactions(
@@ -995,6 +1042,8 @@ def _extract_internal_source_grid_records(
     tables: list[list[list[str]]],
     parse_result: Any | None = None,
     full_text: str = "",
+    *,
+    require_bbox: bool = False,
 ) -> list[dict[str, Any]]:
     transactions: list[dict[str, Any]] = []
     for tbl in tables:
@@ -1005,6 +1054,7 @@ def _extract_internal_source_grid_records(
                 idx
                 for idx, row in enumerate(tbl[:10])
                 if any(str(cell or "").strip() == "_source_page" for cell in row)
+                and (not require_bbox or any(str(cell or "").strip() == "_source_bbox" for cell in row))
                 and any("交易" in str(cell or "") for cell in row)
             ),
             -1,
@@ -1067,6 +1117,14 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
     if split_txns:
         return _finalize_transactions(split_txns, ctx.parse_result, ctx.full_text)
 
+    internal_source_batch = _extract_internal_source_grid_records(
+        ctx.tables,
+        ctx.parse_result,
+        ctx.full_text,
+        require_bbox=True,
+    )
+    if internal_source_batch:
+        return internal_source_batch
     tables = normalize_table_headers(ctx.tables, variant=variant)
     internal_source_batch = _extract_internal_source_grid_records(tables, ctx.parse_result, ctx.full_text)
     if internal_source_batch:
@@ -1135,7 +1193,7 @@ def _normalize_wrapped_temporal_fields(
         parsed = normalize_timestamp(temporal_candidate)
         if re.match(r"^\d{4}-\d{2}-\d{2}", parsed):
             out["date"] = parsed[:10]
-            if ":" in temporal_candidate:
+            if ":" in temporal_candidate or re.fullmatch(r"\d{6}", timestamp_compact):
                 out["timestamp"] = parsed
 
     balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))

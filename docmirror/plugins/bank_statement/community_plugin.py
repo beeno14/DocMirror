@@ -27,12 +27,19 @@ from collections.abc import Sequence
 from docmirror.plugins._base.base_table_parser import BaseTableParser
 from docmirror.plugins._base.column_registry import ColumnMapping
 from docmirror.plugins._base.projector import ProjectionData
+from docmirror.plugins.bank_statement.canonical_quality import audit_row_accounting
 from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text
-from docmirror.plugins.bank_statement.wide_table_recovery import count_expected_rows_from_bank_footer
+from docmirror.plugins.bank_statement.wide_table_recovery import (
+    count_expected_rows_from_bank_footer,
+    page_texts_from_parse_result,
+)
 
 BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
-    "序号": ColumnMapping(field="sequence_no", aliases=["No.", "序列号"]),
+    "序号": ColumnMapping(
+        field="sequence_no",
+        aliases=["No.", "序列号", "日志号", "日 志 号", "交易流水号", "流水号"],
+    ),
     "交易日期": ColumnMapping(field="date", format_hint="date", aliases=["日期", "记账日期", "记账日", "Date"]),
     "交易时间": ColumnMapping(field="timestamp", format_hint="datetime", aliases=["时间", "Time"]),
     "收/支": ColumnMapping(
@@ -74,7 +81,7 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         unit="CNY",
         aliases=["金额", "发生额", "Amount", "借方发生额", "贷方发生额", "收入金额", "支出金额"],
     ),
-    "余额": ColumnMapping(field="balance", unit="CNY", aliases=["账户余额", "Balance"]),
+    "余额": ColumnMapping(field="balance", unit="CNY", aliases=["账户余额", "本次余额", "Balance"]),
     "对方户名": ColumnMapping(
         field="counter_party",
         aliases=[
@@ -95,7 +102,7 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         aliases=["对方开户行", "对方银行名称", "对手机构", "Counterparty Institution"],
     ),
     "交易渠道": ColumnMapping(field="channel", aliases=["渠道", "交易方式", "交易地点"]),
-    "用途": ColumnMapping(field="purpose", aliases=["交易用途"]),
+    "用途": ColumnMapping(field="purpose", aliases=["交易用途", "交易附言", "附言"]),
 }
 
 BANK_STANDARD_FIELDS = [
@@ -163,7 +170,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
             "print_date": ("打印日期", r"打印日期\s*[:：]\s*(20\d{2}-\d{2}-\d{2})"),
             "query_period": (
                 "交易时段",
-                r"(?:交易时段|起止日期)\s*[:：]\s*"
+                r"(?:交易时段|交易时间|起止日期)\s*[:：]\s*"
                 r"(20\d{2}(?:-\d{2}-\d{2}|年\d{1,2}月\d{1,2}日)|20\d{6})\s*"
                 r"(?:至|~|-)\s*"
                 r"(20\d{2}(?:-\d{2}-\d{2}|年\d{1,2}月\d{1,2}日)|20\d{6})",
@@ -297,6 +304,18 @@ class BankStatementCommunityPlugin(BaseTableParser):
         """Run the style-aware extractor and return projector-local facts."""
         result = run_bank_statement_extract(parse_result, text, self)
         records = _sanitize_bank_records(result.records)
+        result.emitted_rows = len(records)
+        accounting_warnings = audit_row_accounting(
+            parsed_rows=result.parsed_rows,
+            canonical_rows=result.canonical_rows,
+            emitted_rows=result.emitted_rows,
+        )
+        if accounting_warnings:
+            result.style_meta.extract_status = "degraded"
+        projection_warnings = [
+            *result.warnings,
+            *accounting_warnings,
+        ]
         summary = self._build_summary(records)
         period = summary.get("period", {})
         period_detail = result.identity_fields.get("query_period")
@@ -326,20 +345,10 @@ class BankStatementCommunityPlugin(BaseTableParser):
             if bank_value:
                 extra_domain_facts["institution_hint"] = bank_value
                 extra_domain_facts["institution_authority"] = "identity.bank_name"
-        source_reported_count = count_expected_rows_from_bank_footer(result.ctx.full_text)
-        if source_reported_count <= 0:
-            total_detail = result.identity_fields.get("total_transactions")
-            if isinstance(total_detail, dict):
-                total_value = next(
-                    (
-                        str(total_detail.get(candidate) or "")
-                        for candidate in ("normalized_value", "value", "raw_value")
-                        if total_detail.get(candidate) not in (None, "")
-                    ),
-                    "",
-                )
-                match = re.search(r"\d+", total_value)
-                source_reported_count = int(match.group()) if match else 0
+        source_reported_count = count_expected_rows_from_bank_footer(
+            result.ctx.full_text,
+            page_texts=page_texts_from_parse_result(parse_result),
+        )
         if source_reported_count > 0:
             extra_domain_facts["source_reported_transaction_count"] = source_reported_count
         projection = self._projection_data_from_components(
@@ -349,8 +358,11 @@ class BankStatementCommunityPlugin(BaseTableParser):
             summary=summary,
             period=period,
             extra_domain_facts=extra_domain_facts,
-            warnings=result.warnings,
-            confidence=1.0 if result.style_meta.extract_status != "degraded" else 0.5,
+            warnings=projection_warnings,
+            confidence={"success": 1.0, "low_coverage": 0.65, "degraded": 0.35}.get(
+                result.style_meta.extract_status,
+                0.35,
+            ),
         )
         identity_values: dict[str, str] = {}
         for field_name, detail in result.identity_fields.items():
@@ -420,7 +432,12 @@ def _render_bank_statement_content_markdown(
         page_records = rows_by_page.get(page, [])
         if raw_headers:
             page_source_text = source_pages.get(page, "")
-            header_lines = _raw_statement_header_lines(identity, period, page_source_text or source_text)
+            header_lines = _raw_statement_header_lines(
+                identity,
+                period,
+                page_source_text or source_text,
+                allow_identity_fallback=page == page_numbers[0],
+            )
             statement_title = str(identity.get("statement_title") or "").strip()
             if (
                 page == page_numbers[0]
@@ -661,7 +678,8 @@ def _usable_counterparty_alias(value: str) -> bool:
 
 def _clean_counterparty_text(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
-    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff(（])", "", text)
+    text = re.sub(r"(?<=[)）])\s+(?=[\u4e00-\u9fff])", "", text)
     if text in {"入", "收", "出", "支", "限公司", "有限公司", "代收）", "代收)"}:
         return ""
     text = _strip_counterparty_header_fragment(text)
@@ -861,7 +879,7 @@ _HEADER_VALUE_KEYS = {
 
 
 def _raw_statement_table_headers(records: list[dict], source_text: str = "") -> list[str]:
-    """Return source-table headers when records already carry a readable bank ledger shape."""
+    """Return source-table headers when records carry a readable bank ledger shape."""
     if not records:
         return []
     source_headers = _source_statement_table_headers(source_text)
@@ -958,15 +976,27 @@ def _records_support_source_headers(records: list[dict], headers: list[str]) -> 
     return support > 0
 
 
-def _raw_statement_header_lines(identity: dict[str, str], period: str | dict, source_text: str) -> list[str]:
+def _raw_statement_header_lines(
+    identity: dict[str, str],
+    period: str | dict,
+    source_text: str,
+    *,
+    allow_identity_fallback: bool = True,
+) -> list[str]:
     source_lines = _source_statement_header_block(source_text)
     source_identity = _compat_compact(" ".join(source_lines))
     has_empty_source_label = any(re.search(r"[:：]\s*$", line) for line in source_lines)
     if (
         source_lines
         and not has_empty_source_label
-        and any(marker in source_identity for marker in ("客户名称", "账户名称", "账号", "账单统计日期"))
+        and any(
+            marker in source_identity
+            for marker in ("客户名称", "账户名称", "账号", "账户", "户名", "起止日期", "账单统计日期")
+        )
     ):
+        return source_lines
+
+    if not allow_identity_fallback:
         return source_lines
 
     source_title = _source_statement_title(source_text)
@@ -1006,13 +1036,36 @@ def _source_statement_header_block(source_text: str) -> list[str]:
                 continue
             if candidate.count("|") >= 3:
                 break
-            if _looks_like_source_table_header(candidate) or _looks_like_transaction_line(candidate):
+            if (
+                _looks_like_source_table_header(candidate)
+                or _looks_like_source_table_header_fragment(candidate)
+                or _looks_like_transaction_line(candidate)
+            ):
                 break
             if _is_footer_line(candidate):
                 break
             out.append(candidate)
-        return out
+        return _merge_source_page_number_lines(out)
     return []
+
+
+def _merge_source_page_number_lines(lines: list[str]) -> list[str]:
+    """Coalesce a positioned ``第 N / M 页`` header split into text fragments."""
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        if (
+            index + 2 < len(lines)
+            and re.fullmatch(r"第\s*\d+", lines[index])
+            and lines[index + 1] == "/"
+            and re.fullmatch(r"\d+\s*页", lines[index + 2])
+        ):
+            merged.append(f"{lines[index]} / {lines[index + 2]}")
+            index += 3
+            continue
+        merged.append(lines[index])
+        index += 1
+    return merged
 
 
 def _source_statement_note_lines(page_text: str) -> list[str]:
@@ -1108,6 +1161,7 @@ def _normalize_evidence_date(value: str) -> str:
 
 def _raw_statement_after_table_lines(source_text: str, page: int) -> list[str]:
     lines = [line.strip() for line in str(source_text or "").splitlines()]
+    disclaimers = list(dict.fromkeys(line for line in lines if _is_statement_disclaimer(line)))
     for idx, line in enumerate(lines):
         if not _is_bank_footer_line(line):
             continue
@@ -1121,8 +1175,9 @@ def _raw_statement_after_table_lines(source_text: str, page: int) -> list[str]:
             if _is_statement_note_line(prev):
                 out.insert(0, prev)
         out.extend(_raw_statement_footer_lines(source_text, page))
-        return out
-    return _raw_statement_footer_lines(source_text, page)
+        out.extend(disclaimers)
+        return list(dict.fromkeys(out))
+    return list(dict.fromkeys([*_raw_statement_footer_lines(source_text, page), *disclaimers]))
 
 
 def _raw_statement_footer_lines(source_text: str, page: int) -> list[str]:
@@ -1159,6 +1214,16 @@ def _source_header_value(raw: dict, normalized: dict, header: str) -> object:
     return ""
 
 
+def _source_raw_header_value(raw: dict, header: str) -> object:
+    """Return only source-backed values for the original-table Markdown view."""
+    raw_keys, _ = _HEADER_VALUE_KEYS.get(header, ((header,), ()))
+    for key in (header, *raw_keys):
+        value = raw.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
 def _looks_like_source_table_header(text: str) -> bool:
     compact = _compat_compact(text)
     if any(
@@ -1170,17 +1235,36 @@ def _looks_like_source_table_header(text: str) -> bool:
     return sum(_compat_compact(header) in compact for header in generic_headers) >= 4
 
 
+def _looks_like_source_table_header_fragment(text: str) -> bool:
+    """Detect a single source column label emitted as its own text block."""
+    compact = _compat_compact(text)
+    headers = {header for group in _GENERIC_RAW_HEADER_ORDER for header in group}
+    headers.update(header for layout in _SOURCE_TABLE_HEADER_LAYOUTS for header in layout)
+    headers.update({"序号", "流水号", "收入", "支出", "附言", "对手信息", "日志号"})
+    return compact in {_compat_compact(header) for header in headers}
+
+
 def _looks_like_transaction_line(text: str) -> bool:
     return bool(re.match(r"^20\d{6}(?:\s|$)", _compat_text(text)))
 
 
 def _is_statement_title_line(text: str) -> bool:
     compact = _compat_compact(text)
-    if not compact or len(compact) > 60 or re.match(r"^\d+[、.．]", str(text or "").strip()):
+    if (
+        not compact
+        or len(compact) > 60
+        or _is_statement_disclaimer(text)
+        or re.match(r"^\d+[、.．]", str(text or "").strip())
+    ):
         return False
     if "对账单" in compact or any(marker in compact for marker in ("交易明细", "明细清单")):
         return True
     return "交易流水" in compact and any(marker in compact for marker in ("银行", "账户", "个人", "企业"))
+
+
+def _is_statement_disclaimer(text: str) -> bool:
+    compact = _compat_compact(text)
+    return "数据缺失" in compact and "仅供参考" in compact
 
 
 def _is_statement_note_line(text: str) -> bool:
@@ -1235,8 +1319,7 @@ def _render_raw_statement_table(records: list[dict], headers: list[str]) -> str:
     ]
     for record in records:
         raw = _record_raw(record)
-        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
-        values = [_raw_markdown_cell(_source_header_value(raw, normalized, header)) for header in headers]
+        values = [_raw_markdown_cell(_source_raw_header_value(raw, header)) for header in headers]
         lines.append("| " + " | ".join(values) + " |")
     return "\n".join(lines)
 
@@ -1254,7 +1337,10 @@ def _raw_markdown_cell(value: object) -> str:
     out = parts[0]
     numeric_fragment = re.compile(r"^[+-]?[\d,.*-]+$")
     for part in parts[1:]:
-        join_without_space = bool(re.search(r"[\u3400-\u9fff]$", out) and re.match(r"^[\u3400-\u9fff]", part)) or bool(
+        continues_wrapped_text = bool(
+            re.search(r"[\u3400-\u9fff]$", out) and re.match(r"^[\u3400-\u9fff(（]", part)
+        ) or bool(re.search(r"[)）]$", out) and re.match(r"^[\u3400-\u9fff]", part))
+        join_without_space = continues_wrapped_text or bool(
             numeric_fragment.fullmatch(out) and numeric_fragment.fullmatch(part)
         )
         out += part if join_without_space else f" {part}"

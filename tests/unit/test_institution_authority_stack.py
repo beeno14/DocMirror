@@ -170,3 +170,17 @@ def test_horizontal_header_supports_hyphenated_account_and_chinese_dates():
     assert identity["account_holder"] == "测试农业科技有限公司"
     assert identity["currency"] == "CNY"
     assert identity["query_period"] == "2025-11-01 ~ 2025-12-31"
+
+
+def test_header_transaction_time_range_is_an_explicit_query_period() -> None:
+    text = (
+        "银行交易明细\n"
+        "账号:651204680300015 账户名:测试科技有限公司 币种:人民币\n"
+        "交易时间:2025-07-01 至 2025-12-31\n"
+        "日期 支出 收入 余额 对方账户 对方户名 摘要/附言\n"
+        "2025-09-21 0.04 306.09 结息\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["query_period"] == "2025-07-01 ~ 2025-12-31"

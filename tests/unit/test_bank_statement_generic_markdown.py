@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
+    _raw_statement_header_lines,
     _render_bank_statement_content_markdown,
     _sanitize_bank_records,
 )
@@ -114,6 +115,91 @@ def test_bank_statement_summary_markdown_compacts_wrapped_numeric_counter_accoun
 
     assert "83010078801300000220" in markdown
     assert "830100788013000002 20" not in markdown
+
+
+def test_source_markdown_keeps_dynamic_raw_columns_without_normalized_fallback() -> None:
+    headers = ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额", "对手信息", "日志号", "交易渠道", "交易附言"]
+    records = [
+        {
+            "raw": dict(
+                zip(
+                    headers,
+                    [
+                        "20230622",
+                        "195925",
+                        "微信支付",
+                        "-500.00",
+                        "10705.87",
+                        "243300133",
+                        "457272650",
+                        "电子商务",
+                        "二维码付款",
+                    ],
+                    strict=True,
+                )
+            ),
+            "normalized": {"date": "2023-06-22", "timestamp": "2023-06-22T19:59:25", "amount": 500.0},
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "raw": dict(
+                zip(
+                    headers,
+                    ["20231221", "", "利息税", "+0.00", "2953.20", "--", "1", "", "个人活期结息"],
+                    strict=True,
+                )
+            ),
+            "normalized": {"date": "2023-12-21", "timestamp": "2023-12-21T00:00:00", "amount": 0.0},
+            "source": {"source_page": 2, "page_range": [2, 2]},
+        },
+    ]
+    page_one = "\n".join(
+        [
+            "中国农业银行账户活期交易明细清单",
+            "户名：徐雪 账户：6228481048429419672",
+            "币种：人民币 钞汇标识：本币",
+            "起止日期：20230622-20231221 电子流水号：2312211530229831551",
+            " ".join(headers),
+        ]
+    )
+    disclaimer = "该交易明细因不可预测的非人控技术原因可能导致数据缺失，明细内容仅供参考。"
+    page_two = "\n".join([" ".join(headers), disclaimer])
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {"account_holder": "徐雪", "account_number": "6228481048429419672", "currency": "CNY"},
+        {"start": "2023-06-22", "end": "2023-12-21"},
+        page_one,
+        source_pages={1: page_one, 2: page_two},
+    )
+
+    assert "币种：人民币 钞汇标识：本币" in markdown
+    assert "电子流水号：2312211530229831551" in markdown
+    assert markdown.count("户名：徐雪") == 1
+    assert "| 20230622 | 195925 | 微信支付 | -500.00 |" in markdown
+    assert "| 20231221 |  | 利息税 | +0.00 |" in markdown
+    assert "2023-12-21T00:00:00" not in markdown
+    assert markdown.rfind(disclaimer) > markdown.rfind("| 20231221 |")
+
+
+def test_source_header_stops_before_individually_positioned_table_labels() -> None:
+    source_text = "\n".join(
+        [
+            "中国农业银行账户活期交易明细清单",
+            "户名：徐雪",
+            "账户：6228481048429419672",
+            "币种：人民币",
+            "起止日期：20230622-20231221",
+            "交易日期",
+            "交易时间",
+            "交易摘要",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "起止日期：20230622-20231221"
+    assert "交易日期" not in lines
 
 
 def test_source_first_markdown_fills_split_header_values_and_keeps_footer_outside_table() -> None:

@@ -16,6 +16,13 @@ projection:
       basis: domain_fact_count
       count_key: expected_primary_rows
       public_basis: bank_expected_primary_rows
+      count_candidates:
+        - key: source_reported_transaction_count
+          public_basis: source_footer_transaction_count
+        - key: expected_primary_rows
+          public_basis: bank_expected_primary_rows
+      verification_status_key: extract_status
+      verified_statuses: [success]
 
 classification:
   aliases: [bank_reconciliation]

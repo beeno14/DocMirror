@@ -401,7 +401,7 @@ def _extract_year_month_period(header: str) -> str:
 def _extract_query_period(header: str) -> str:
     date_token = r"(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{8}|\d{4}年\d{1,2}月\d{1,2}日)"
     m = re.search(
-        r"(?:查询日期|起止日期|起讫日期|日期范围|账单统计日期(?:\s*Start Time\s*&\s*End Time)?)[:：]?\s*"
+        r"(?:查询日期|起止日期|起讫日期|日期范围|交易时间|账单统计日期(?:\s*Start Time\s*&\s*End Time)?)[:：]?\s*"
         rf"({date_token})\s*(?:至|~|—|-)\s*({date_token})",
         header,
         re.I,

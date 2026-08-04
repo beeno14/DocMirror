@@ -38,6 +38,16 @@ def test_audit_cqf_success_requires_full_coverage():
     assert result.canonical_ratio == 1.0
 
 
+def test_audit_cqf_does_not_mark_over_extraction_as_success():
+    records = [{"normalized": {"date": "2024-01-01", "direction": "income", "amount": 1.0}} for _ in range(2)]
+
+    result = audit_cqf(records, canonical_expected=1)
+
+    assert result.extract_status == "low_coverage"
+    assert result.coverage_ratio == 1.0
+    assert result.canonical_ratio == 1.0
+
+
 def test_resolve_extract_status_thresholds():
     assert resolve_extract_status(coverage_ratio=1.0, canonical_ratio=1.0) == "success"
     assert resolve_extract_status(coverage_ratio=0.9, canonical_ratio=0.9) == "low_coverage"

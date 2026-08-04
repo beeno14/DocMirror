@@ -16,13 +16,13 @@ Key exports: ``BankExtractResult``, ``run_bank_statement_extract``,
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from docmirror.plugins.bank_statement.blo import BankLedgerOrchestrator
 from docmirror.plugins.bank_statement.canonical import StyleMeta, build_style_meta
 from docmirror.plugins.bank_statement.canonical_quality import (
+    audit_row_accounting,
     is_canonical_row,
     physical_transaction_row_estimate,
 )
@@ -36,6 +36,7 @@ from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegis
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     audit_bank_statement_invariants,
     count_expected_rows_from_bank_footer,
+    page_texts_from_parse_result,
 )
 
 
@@ -47,6 +48,10 @@ class BankExtractResult:
     identity_fields: dict[str, dict]
     style_meta: StyleMeta
     warnings: list[str]
+    parsed_rows: int = 0
+    canonical_rows: int = 0
+    emitted_rows: int = 0
+    candidate_diagnostics: list[dict[str, Any]] | None = None
 
 
 def enrich_identity_fields(
@@ -220,12 +225,14 @@ def run_bank_statement_extract(
         ctx,
         plugin,
     )
-    parsed_record_count = len(records)
+    parsed_rows = len(records)
     direction_count = sum(
         1 for record in records if (record.get("normalized") or {}).get("direction") in {"income", "expense"}
     )
     records = [record for record in records if is_canonical_row(record.get("normalized") or {})]
-    blocked_noncanonical_count = parsed_record_count - len(records)
+    canonical_rows = len(records)
+    emitted_rows = canonical_rows
+    blocked_noncanonical_count = parsed_rows - canonical_rows
     identity_fields = enrich_identity_fields(identity_fields, ctx.full_text, parse_result)
     try:
         evidence_identity = plugin._recover_identity_from_evidence(parse_result)
@@ -248,20 +255,11 @@ def run_bank_statement_extract(
                 or (evidence_preferred and current_source in {"header.kv", "bank_statement.default"})
             ):
                 identity_fields[field_name] = detail
-    source_reported_count = count_expected_rows_from_bank_footer(ctx.full_text)
-    total_detail = identity_fields.get("total_transactions")
-    if isinstance(total_detail, dict):
-        total_value = next(
-            (
-                str(total_detail.get(candidate) or "")
-                for candidate in ("normalized_value", "value", "raw_value")
-                if total_detail.get(candidate) not in (None, "")
-            ),
-            "",
-        )
-        match = re.search(r"\d+", total_value)
-        if match:
-            source_reported_count = int(match.group())
+    page_texts = page_texts_from_parse_result(parse_result)
+    source_reported_count = count_expected_rows_from_bank_footer(
+        ctx.full_text,
+        page_texts=page_texts,
+    )
     style_meta = build_style_meta(
         detection,
         reconstruction=ctx.reconstruction,
@@ -285,19 +283,39 @@ def run_bank_statement_extract(
         )
     if blocked_noncanonical_count > 0:
         warnings.append(
-            f"BANK_DATASET_NONCANONICAL_ROWS_BLOCKED:blocked={blocked_noncanonical_count}:parsed={parsed_record_count}"
+            f"BANK_DATASET_NONCANONICAL_ROWS_BLOCKED:blocked={blocked_noncanonical_count}:parsed={parsed_rows}"
         )
-    if parsed_record_count > 0 and direction_count < parsed_record_count:
-        warnings.append(f"BANK_DIRECTION_COVERAGE_LOW:directional={direction_count}:parsed={parsed_record_count}")
+        if style_meta.extract_status == "success":
+            style_meta.extract_status = "degraded"
+    if parsed_rows > 0 and direction_count < parsed_rows:
+        warnings.append(f"BANK_DIRECTION_COVERAGE_LOW:directional={direction_count}:parsed={parsed_rows}")
+        style_meta.extract_status = "degraded"
+    if physical_expected > 0 and style_meta.canonical_extracted < physical_expected:
+        style_meta.extract_status = "degraded"
     sourced_count = sum(1 for record in records if _has_single_page_source(record))
     if records and sourced_count < len(records):
         warnings.append(f"BANK_SOURCE_PAGE_COVERAGE_LOW:sourced={sourced_count}:canonical={len(records)}")
         style_meta.extract_status = "degraded"
-    invariant_failures = audit_bank_statement_invariants(records, ctx.full_text)
+    invariant_failures = audit_bank_statement_invariants(
+        records,
+        ctx.full_text,
+        page_texts=page_texts,
+    )
     if invariant_failures:
         if any(warning.startswith("bank_invariant_failed:") for warning in invariant_failures):
             style_meta.extract_status = "degraded"
         warnings.extend(invariant_failures)
+    accounting_warnings = audit_row_accounting(
+        parsed_rows=parsed_rows,
+        canonical_rows=canonical_rows,
+        emitted_rows=emitted_rows,
+    )
+    if accounting_warnings:
+        style_meta.extract_status = "degraded"
+        warnings.extend(accounting_warnings)
+    if parsed_rows > 0 and not records:
+        style_meta.extract_status = "degraded"
+        warnings.append("BANK_CANONICAL_EMPTY_AFTER_FILTER:parsed_records_present")
     return BankExtractResult(
         ctx=ctx,
         detection=detection,
@@ -305,6 +323,10 @@ def run_bank_statement_extract(
         identity_fields=identity_fields,
         style_meta=style_meta,
         warnings=warnings,
+        parsed_rows=parsed_rows,
+        canonical_rows=canonical_rows,
+        emitted_rows=emitted_rows,
+        candidate_diagnostics=list(getattr(blo_meta, "candidate_diagnostics", []) or []),
     )
 
 

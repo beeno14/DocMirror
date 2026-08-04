@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from statistics import median
+from typing import Any, Iterable
 
 from docmirror.evidence.repair import RepairRequest
-from docmirror.plugins.bank_statement.header_resolve import normalize_header_cell
+from docmirror.plugins.bank_statement.header_resolve import has_split_debit_credit_headers, normalize_header_cell
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,15 @@ _DEBIT_CREDIT_REQUIRED = ("借方发生额", "贷方发生额", "余额")
 _INCOME_EXPENSE_REQUIRED = ("支出金额", "收入金额", "余额")
 _AMOUNT_HEADERS = ("交易金额", "发生额", "借方/贷方金额", "支/收交易金额")
 _ROW_ANCHOR_HEADERS = ("序号", "交易日期", "交易时间", "记账日期", "会计日期", "日期")
+_BORDERLESS_DATE_RE = re.compile(r"(?:20\d{6}|20\d{2}[-/.]\d{2}[-/.]\d{2})")
+_BORDERLESS_SIGNED_AMOUNT_RE = re.compile(r"[+-]\d[\d,]*(?:\.\d{1,2})?")
+_BORDERLESS_BALANCE_RE = re.compile(r"-?\d[\d,]*(?:\.\d{1,2})?")
+_BORDERLESS_ROW_RE = re.compile(
+    r"^\s*(?:20\d{6}|20\d{2}[-/.]\d{2}[-/.]\d{2})(?:\s+(?:\d{6}|\d{1,2}:\d{2}:\d{2}))?.*?"
+    r"[+-]\d[\d,]*(?:\.\d{1,2})?\s+"
+    r"-?\d[\d,]*(?:\.\d{1,2})?(?:\s|$)"
+)
+_BORDERLESS_FOOTER_MARKERS = ("数据缺失", "明细内容仅供参考", "本页合计")
 _FOOTER_MARKERS = (
     "当前账单借方发生数",
     "当前账单贷方发生数",
@@ -82,6 +94,135 @@ _CREDIT_TOTAL_PATTERNS = (
 )
 
 
+@dataclass(frozen=True)
+class RowCountEvidence:
+    """A transaction-count fact together with its source and confidence."""
+
+    count: int
+    source: str
+    confidence: float
+    page: int | None = None
+    evidence_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def empty(cls) -> RowCountEvidence:
+        """Return an explicit no-evidence value."""
+        return cls(count=0, source="none", confidence=0.0)
+
+
+_SINGLE_LINE_COUNT_PATTERN = re.compile(
+    r"(?:\u603b\u6761\u6570|\u4ea4\u6613\u603b\u7b14\u6570|\u603b\u7b14\u6570|\u5408\u8ba1\u7b14\u6570)"
+    r"[ \t]*[:\uff1a][ \t]*(?P<count>\d+)"
+)
+
+
+def page_texts_from_parse_result(parse_result: Any) -> list[tuple[int, str]]:
+    """Build page-local text scopes without relying on flattened PDF reading order."""
+    if parse_result is None:
+        return []
+    result = getattr(parse_result, "to_read_view", lambda: parse_result)()
+    page_texts: list[tuple[int, str]] = []
+    for page in getattr(result, "pages", []) or []:
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+        if page_number <= 0:
+            continue
+        parts = [
+            str(getattr(block, "content", "") or getattr(block, "text", "") or "").strip()
+            for block in getattr(page, "texts", []) or []
+        ]
+        for table in getattr(page, "tables", []) or []:
+            for row in getattr(table, "rows", []) or []:
+                cells = [str(getattr(cell, "text", "") or "").strip() for cell in getattr(row, "cells", []) or []]
+                if any(cells):
+                    parts.append(" ".join(cells))
+        text = "\n".join(part for part in parts if part)
+        if text:
+            page_texts.append((page_number, text))
+    return page_texts
+
+
+def _count_scopes(text: str, page_texts: Iterable[tuple[int, str]] | None) -> list[tuple[int | None, str]]:
+    scoped = [(int(page), str(value or "")) for page, value in (page_texts or ()) if str(value or "").strip()]
+    if scoped:
+        return scoped
+    parts = [part for part in re.split(r"\f", str(text or "")) if part.strip()]
+    return [(None, part) for part in (parts or [str(text or "")])]
+
+
+def resolve_row_count_evidence(
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None = None,
+) -> RowCountEvidence:
+    """Resolve a transaction count only from a bounded, semantically labelled scope.
+
+    Flattened PDF text is deliberately used only as a compatibility fallback. Counts
+    that require a newline between the label and value are not accepted from that
+    fallback because page numbers commonly occupy the next text position.
+    """
+    scopes = _count_scopes(text, page_texts)
+    has_page_scopes = any(page is not None for page, _ in scopes)
+
+    for page, scoped_text in scopes:
+        for pattern in _SPLIT_COUNT_PATTERNS:
+            match = pattern.search(scoped_text)
+            if match:
+                count = _safe_count(int(match.group("debit")) + int(match.group("credit")))
+                if count:
+                    return RowCountEvidence(count, "split_footer", 0.98, page)
+
+    for page, scoped_text in scopes:
+        patterns = _COUNT_PATTERNS if page is not None else (_SINGLE_LINE_COUNT_PATTERN,)
+        for pattern in patterns:
+            match = pattern.search(scoped_text)
+            if match:
+                count = _safe_count(int(match.group("count")))
+                if count:
+                    return RowCountEvidence(count, "header_total", 0.94, page)
+
+    page_counts: list[tuple[int | None, int]] = []
+    for page, scoped_text in scopes:
+        for match in _PAGE_COUNT_PATTERN.finditer(scoped_text):
+            count = _safe_count(int(match.group("count")))
+            if count:
+                page_counts.append((page, count))
+    if page_counts:
+        return RowCountEvidence(
+            count=_safe_count(sum(count for _, count in page_counts)),
+            source="page_footer",
+            confidence=0.90,
+            page=page_counts[0][0] if len(page_counts) == 1 else None,
+        )
+
+    # PageContent can be sparse even when the flattened canonical text retained
+    # the footer. Only same-line or explicitly page-local labels are accepted in
+    # this compatibility fallback, so a following page number cannot become a count.
+    if has_page_scopes:
+        if match := _SINGLE_LINE_COUNT_PATTERN.search(str(text or "")):
+            count = _safe_count(int(match.group("count")))
+            if count:
+                return RowCountEvidence(count, "header_total", 0.90)
+        flattened_page_counts = [
+            _safe_count(int(match.group("count"))) for match in _PAGE_COUNT_PATTERN.finditer(str(text or ""))
+        ]
+        if flattened_page_counts and all(flattened_page_counts):
+            return RowCountEvidence(sum(flattened_page_counts), "page_footer", 0.86)
+
+    anchored_counts = [
+        _count_borderless_transaction_anchors(scoped_text)
+        for _, scoped_text in scopes
+        if _has_borderless_source_header(scoped_text)
+    ]
+    if anchored_counts and all(count > 0 for count in anchored_counts):
+        return RowCountEvidence(
+            count=_safe_count(sum(anchored_counts)),
+            source="page_transaction_anchors",
+            confidence=0.93,
+        )
+
+    return RowCountEvidence.empty()
+
+
 def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[list[list[str]]]:
     """Return high-confidence wide debit/credit table candidates from source PDF."""
     pdf_path = _source_pdf_path(parse_result)
@@ -96,16 +237,22 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
     page_tables: list[list[list[str]]] = []
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
-            for page in pdf.pages:
+            for page_number, page in enumerate(pdf.pages, start=1):
+                native_tables_found = False
                 for table in page.extract_tables() or []:
                     normalized = _normalize_table(table)
                     if normalized:
                         page_tables.append(normalized)
+                        native_tables_found = True
+                if not native_tables_found:
+                    borderless = _recover_borderless_native_page(page, page_number)
+                    if borderless:
+                        page_tables.append(borderless)
     except Exception as exc:
         logger.debug("[BankWideTableRecovery] native PDF table recovery failed: %s", exc)
         return []
 
-    candidates = _recover_cross_page_wide_tables(page_tables)
+    candidates = _recover_cross_page_wide_tables(page_tables) if len(page_tables) > 1 else []
     for table in page_tables:
         wide = _select_wide_bank_table(table)
         if wide:
@@ -117,34 +264,289 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
     return candidates
 
 
-def count_expected_rows_from_bank_footer(text: str) -> int:
-    """Read expected transaction count from bank-statement footer/header totals."""
-    source = text or ""
-    for pat in _SPLIT_COUNT_PATTERNS:
-        if m := pat.search(source):
-            return _safe_count(int(m.group("debit")) + int(m.group("credit")))
-    for pat in _COUNT_PATTERNS:
-        if m := pat.search(source):
-            return _safe_count(m.group("count"))
-    page_counts = [_safe_count(match.group("count")) for match in _PAGE_COUNT_PATTERN.finditer(source)]
-    if page_counts and all(page_counts):
-        return _safe_count(sum(page_counts))
-    return 0
+def _count_borderless_transaction_anchors(text: str) -> int:
+    """Count validated source rows from a page-local borderless ledger."""
+    return sum(1 for line in str(text or "").splitlines() if _BORDERLESS_ROW_RE.search(line))
 
 
-def audit_bank_statement_invariants(records: list[dict[str, Any]], text: str) -> list[str]:
+def _has_borderless_source_header(text: str) -> bool:
+    return any(_looks_like_borderless_header_text(line) for line in str(text or "").splitlines())
+
+
+def _recover_borderless_native_page(page: Any, page_number: int) -> list[list[str]]:
+    """Recover a native source-column ledger from word coordinates.
+
+    The branch is deliberately gated by the complete source header. It does not
+    run for generic prose, payment documents, scanned OCR, or ledgers whose
+    source column roles are ambiguous.
+    """
+    try:
+        words = [
+            dict(word)
+            for word in page.extract_words(
+                x_tolerance=1,
+                y_tolerance=1,
+                keep_blank_chars=False,
+                use_text_flow=False,
+            )
+            if str(word.get("text") or "").strip()
+        ]
+    except Exception:
+        return []
+    if not words:
+        return []
+
+    lines = _group_native_words_by_line(words)
+    header_spec = next(
+        ((line, spec) for line in lines if (spec := _borderless_header_spec(line)) is not None),
+        None,
+    )
+    if header_spec is None:
+        return []
+    header_words, (source_headers, starts) = header_spec
+    date_column = _source_date_column(source_headers)
+    amount_columns = _source_amount_columns(source_headers)
+    balance_column = _source_balance_column(source_headers)
+
+    header_bottom = max(float(word.get("bottom") or word.get("top") or 0.0) for word in header_words)
+    column_words = [
+        (word, _column_index(float(word.get("x0") or 0.0), starts))
+        for word in words
+        if float(word.get("top") or 0.0) > header_bottom
+    ]
+    anchors = [
+        word
+        for word, column in column_words
+        if column == date_column and _BORDERLESS_DATE_RE.fullmatch(str(word.get("text") or "").strip())
+    ]
+    anchors.sort(key=_word_vertical_center)
+    if not anchors:
+        return []
+
+    centers = [_word_vertical_center(word) for word in anchors]
+    gaps = [current - previous for previous, current in zip(centers, centers[1:]) if current > previous]
+    typical_gap = median(gaps) if gaps else 18.0
+    footer_top = min(
+        (
+            float(word.get("top") or 0.0)
+            for word in words
+            if _word_vertical_center(word) > centers[-1]
+            and any(
+                marker in normalize_header_cell(str(word.get("text") or "")) for marker in _BORDERLESS_FOOTER_MARKERS
+            )
+        ),
+        default=float(getattr(page, "height", centers[-1] + typical_gap)),
+    )
+
+    header = [*source_headers, "_source_page", "_source_bbox"]
+    rows: list[list[str]] = [list(header)]
+    for index, anchor in enumerate(anchors):
+        lower = header_bottom if index == 0 else (centers[index - 1] + centers[index]) / 2.0
+        if index + 1 < len(anchors):
+            upper = (centers[index] + centers[index + 1]) / 2.0
+        else:
+            upper = min(footer_top, centers[index] + max(typical_gap, 18.0))
+        row_words = [(word, column) for word, column in column_words if lower <= _word_vertical_center(word) < upper]
+        cells = [
+            _join_native_cell_words([word for word, col in row_words if col == column])
+            for column in range(len(source_headers))
+        ]
+        anchor_text = str(anchor.get("text") or "").strip()
+        if not _BORDERLESS_DATE_RE.search(cells[date_column]):
+            cells[date_column] = anchor_text
+        if not _valid_borderless_row(
+            cells,
+            date_column=date_column,
+            amount_columns=amount_columns,
+            balance_column=balance_column,
+        ):
+            continue
+        bbox = _native_row_bbox([word for word, _ in row_words])
+        rows.append([*cells, str(page_number), ",".join(f"{value:.3f}" for value in bbox)])
+    return rows if len(rows) > 1 else []
+
+
+def _group_native_words_by_line(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    lines: list[list[dict[str, Any]]] = []
+    for word in sorted(words, key=lambda item: (float(item.get("top") or 0.0), float(item.get("x0") or 0.0))):
+        top = float(word.get("top") or 0.0)
+        if not lines or abs(top - float(lines[-1][0].get("top") or 0.0)) > 1.5:
+            lines.append([word])
+        else:
+            lines[-1].append(word)
+    return lines
+
+
+def _borderless_header_spec(words: list[dict[str, Any]]) -> tuple[list[str], list[float]] | None:
+    if not words:
+        return None
+    ordered = sorted(words, key=lambda item: float(item.get("x0") or 0.0))
+    groups: list[list[dict[str, Any]]] = []
+    for word in ordered:
+        if not groups:
+            groups.append([word])
+            continue
+        previous = groups[-1][-1]
+        gap = float(word.get("x0") or 0.0) - float(previous.get("x1") or previous.get("x0") or 0.0)
+        if gap <= 4.0:
+            groups[-1].append(word)
+        else:
+            groups.append([word])
+    headers = [
+        unicodedata.normalize("NFKC", "".join(str(word.get("text") or "").strip() for word in group))
+        for group in groups
+    ]
+    if len(headers) < 4 or not is_wide_bank_header(headers):
+        return None
+    if _source_date_column(headers) < 0 or not _source_amount_columns(headers) or _source_balance_column(headers) < 0:
+        return None
+    support_markers = ("摘要", "对方", "对手", "渠道", "附言", "用途", "借贷", "收支")
+    joined = normalize_header_cell("".join(headers))
+    if sum(marker in joined for marker in support_markers) < 1:
+        return None
+    return headers, [min(float(word.get("x0") or 0.0) for word in group) for group in groups]
+
+
+def _looks_like_borderless_header_text(text: str) -> bool:
+    compact = re.sub(r"\s+", "", normalize_header_cell(text))
+    has_date = any(marker in compact for marker in ("交易日期", "交易时间", "记账日期", "日期"))
+    has_single_amount = any(marker in compact for marker in ("交易金额", "发生额"))
+    has_split_amount = any(marker in compact for marker in ("收入", "贷方")) and any(
+        marker in compact for marker in ("支出", "借方")
+    )
+    has_support = any(marker in compact for marker in ("摘要", "附言", "对方", "对手"))
+    return has_date and (has_single_amount or has_split_amount) and "余额" in compact and has_support
+
+
+def _source_date_column(headers: list[str]) -> int:
+    for index, header in enumerate(headers):
+        compact = normalize_header_cell(header)
+        if any(marker in compact for marker in ("交易日期", "记账日期", "会计日期")):
+            return index
+    for index, header in enumerate(headers):
+        if "日期" in normalize_header_cell(header):
+            return index
+    return -1
+
+
+def _source_amount_columns(headers: list[str]) -> list[int]:
+    exact_amount_headers = {
+        "金额",
+        "交易金额",
+        "发生额",
+        "收入",
+        "支出",
+        "收入金额",
+        "支出金额",
+        "借方",
+        "贷方",
+        "借方发生额",
+        "贷方发生额",
+        "转入金额",
+        "转出金额",
+    }
+    indexes: list[int] = []
+    for index, header in enumerate(headers):
+        normalized = normalize_header_cell(header)
+        if normalized in exact_amount_headers or any(
+            marker in normalized
+            for marker in ("交易金额", "借方发生额", "贷方发生额", "收入金额", "支出金额", "转入金额", "转出金额")
+        ):
+            indexes.append(index)
+    return indexes
+
+
+def _source_balance_column(headers: list[str]) -> int:
+    return next((index for index, header in enumerate(headers) if "余额" in normalize_header_cell(header)), -1)
+
+
+def _column_index(x0: float, starts: list[float]) -> int:
+    boundaries = [(left + right) / 2.0 for left, right in zip(starts, starts[1:])]
+    return sum(x0 >= boundary for boundary in boundaries)
+
+
+def _word_vertical_center(word: dict[str, Any]) -> float:
+    top = float(word.get("top") or 0.0)
+    bottom = float(word.get("bottom") or top)
+    return (top + bottom) / 2.0
+
+
+def _join_native_cell_words(words: list[dict[str, Any]]) -> str:
+    if not words:
+        return ""
+    lines = _group_native_words_by_line(words)
+    return "\n".join(
+        "".join(
+            str(word.get("text") or "").strip()
+            for word in sorted(line, key=lambda item: float(item.get("x0") or 0.0))
+        )
+        for line in lines
+    )
+
+
+def _valid_borderless_row(
+    cells: list[str],
+    *,
+    date_column: int,
+    amount_columns: list[int],
+    balance_column: int,
+) -> bool:
+    amount_values = [cells[index].replace(" ", "") for index in amount_columns if index < len(cells)]
+    return bool(
+        date_column >= 0
+        and balance_column >= 0
+        and date_column < len(cells)
+        and balance_column < len(cells)
+        and _BORDERLESS_DATE_RE.search(cells[date_column])
+        and (
+            any(_BORDERLESS_SIGNED_AMOUNT_RE.fullmatch(value) for value in amount_values if value)
+            or (
+                len(amount_columns) > 1
+                and any(_BORDERLESS_BALANCE_RE.fullmatch(value) for value in amount_values if value)
+            )
+        )
+        and _BORDERLESS_BALANCE_RE.fullmatch(cells[balance_column].replace(" ", ""))
+    )
+
+
+def _native_row_bbox(words: list[dict[str, Any]]) -> tuple[float, float, float, float]:
+    if not words:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (
+        min(float(word.get("x0") or 0.0) for word in words),
+        min(float(word.get("top") or 0.0) for word in words),
+        max(float(word.get("x1") or word.get("x0") or 0.0) for word in words),
+        max(float(word.get("bottom") or word.get("top") or 0.0) for word in words),
+    )
+
+
+def count_expected_rows_from_bank_footer(
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None = None,
+) -> int:
+    """Return the compatible integer form of :func:`resolve_row_count_evidence`."""
+    return resolve_row_count_evidence(text, page_texts=page_texts).count
+
+
+def audit_bank_statement_invariants(
+    records: list[dict[str, Any]],
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None = None,
+) -> list[str]:
     """Hard semantic gates for bank ledger rows against source footer totals."""
     failures: list[str] = []
     if page_gap_warning := _source_page_gap_warning(text):
         failures.append(page_gap_warning)
-    expected = count_expected_rows_from_bank_footer(text)
+    expected = count_expected_rows_from_bank_footer(text, page_texts=page_texts)
     if expected > 0 and len(records) != expected:
         failures.append(f"bank_invariant_failed:row_count:{len(records)}/{expected}")
 
     normalized = [rec.get("normalized") or {} for rec in records]
     debit_rows = [row for row in normalized if row.get("direction") == "expense"]
     credit_rows = [row for row in normalized if row.get("direction") == "income"]
-    reported_counts = _reported_direction_counts(text)
+    reported_counts = _reported_direction_counts(text, page_texts=page_texts)
     if reported_counts is not None:
         expected_debit, expected_credit = reported_counts
         if len(debit_rows) != expected_debit:
@@ -169,12 +571,16 @@ def audit_bank_statement_invariants(records: list[dict[str, Any]], text: str) ->
     return failures
 
 
-def _reported_direction_counts(text: str) -> tuple[int, int] | None:
-    source = text or ""
-    for pattern in _SPLIT_COUNT_PATTERNS:
-        match = pattern.search(source)
-        if match:
-            return int(match.group("debit")), int(match.group("credit"))
+def _reported_direction_counts(
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None = None,
+) -> tuple[int, int] | None:
+    for _, source in _count_scopes(text, page_texts):
+        for pattern in _SPLIT_COUNT_PATTERNS:
+            match = pattern.search(source)
+            if match:
+                return int(match.group("debit")), int(match.group("credit"))
     return None
 
 
@@ -415,6 +821,9 @@ def is_wide_bank_header(row: list[str] | tuple[str, ...] | None) -> bool:
         normalize_header_cell("余额") in joined
         and any(normalize_header_cell(item) in joined for item in _AMOUNT_HEADERS)
     )
+    has_required = has_required or (
+        normalize_header_cell("余额") in joined and has_split_debit_credit_headers([[list(row)]])
+    )
     has_anchor = any(normalize_header_cell(item) in joined for item in _ROW_ANCHOR_HEADERS)
     return has_required and has_anchor
 
@@ -469,9 +878,11 @@ def _recover_cross_page_wide_tables(page_tables: list[list[list[str]]]) -> list[
         table = [[_clean_native_cell(cell) for cell in row] for row in table]
         header_idx = next((idx for idx, row in enumerate(table[:8]) if is_wide_bank_header(row)), -1)
         if header_idx >= 0:
-            if current_rows:
+            next_header = [str(cell or "").strip() for cell in table[header_idx]]
+            if current_rows and current_header != next_header:
                 flush()
-            current_header = [str(cell or "").strip() for cell in table[header_idx]]
+            if current_header is None:
+                current_header = next_header
             data_rows = table[header_idx + 1 :]
         elif current_header and _is_continuation_table(table, current_header, previous_seq):
             data_rows = table
@@ -521,7 +932,7 @@ def _fit_row_width(row: list[str], width: int) -> list[str]:
 def _dedupe_tables(tables: list[list[list[str]]]) -> list[list[list[str]]]:
     out: list[list[list[str]]] = []
     seen: set[tuple[int, str, str]] = set()
-    for table in sorted(tables, key=lambda tbl: len(tbl), reverse=True):
+    for table in tables:
         if not table:
             continue
         key = (
@@ -533,18 +944,28 @@ def _dedupe_tables(tables: list[list[list[str]]]) -> list[list[list[str]]]:
             continue
         if any(_table_contains(existing, table) for existing in out):
             continue
+        contained = [index for index, existing in enumerate(out) if _table_contains(table, existing)]
+        if contained:
+            insert_at = contained[0]
+            out = [existing for index, existing in enumerate(out) if index not in contained]
+            out.insert(insert_at, table)
+        else:
+            out.append(table)
         seen.add(key)
-        out.append(table)
     return out
 
 
 def _table_contains(larger: list[list[str]], smaller: list[list[str]]) -> bool:
     if len(larger) < len(smaller) or not larger or not smaller:
         return False
-    if larger[0] != smaller[0]:
+    if _table_row_signature(larger[0]) != _table_row_signature(smaller[0]):
         return False
-    large_rows = {"|".join(row) for row in larger[1:]}
-    return all("|".join(row) in large_rows for row in smaller[1:])
+    large_rows = {_table_row_signature(row) for row in larger[1:]}
+    return all(_table_row_signature(row) in large_rows for row in smaller[1:])
+
+
+def _table_row_signature(row: list[str]) -> str:
+    return "|".join(re.sub(r"\s+", "", str(cell or "")) for cell in row)
 
 
 def _normalize_table(table: list[list[Any]]) -> list[list[str]]:
