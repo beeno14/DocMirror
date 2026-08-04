@@ -40,10 +40,10 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     task_id, written = write_outputs(result, tmp_path, file_id="001", task_id="test_task_001")
 
     assert task_id == "test_task_001"
-    assert {"mirror", "community", "community_semantic", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert {"mirror", "community", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert "community_semantic" not in written
     assert written["community"].is_file()
-    assert written["community_semantic"].name == "001_community_semantic.json"
-    assert written["community_semantic"].is_file()
+    assert not (tmp_path / task_id / "001_community_semantic.json").exists()
     assert written["content"].name == "001_content.md"
     assert written["enhanced_reading"].name == "001_enhanced_reading.md"
     assert written["enhanced_reading"].is_file()
@@ -61,7 +61,6 @@ def test_write_outputs_uses_fixed_delivery(tmp_path: Path):
     assert comm_data["document"]["id"] == f"doc_{task_id}_001"
     assert set(comm_data) == {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
     assert comm_data["files"] == {
-        "semantic_json": "001_community_semantic.json",
         "content_md": "001_content.md",
         "enhanced_reading_md": "001_enhanced_reading.md",
         "datasets_dir": "001_datasets",
@@ -94,10 +93,34 @@ def test_write_outputs_can_omit_cli_support_files(tmp_path: Path):
     )
 
     task_dir = tmp_path / task_id
-    assert {"community", "community_semantic", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert {"community", "content", "enhanced_reading", "datasets"} <= set(written)
+    assert "community_semantic" not in written
     assert "mirror" not in written
     assert not (task_dir / "001_mirror.json").exists()
     assert not (task_dir / "manifest.json").exists()
+
+
+def test_write_outputs_overwrite_removes_obsolete_semantic_sidecar(tmp_path: Path) -> None:
+    result = ParseResult(status=ResultStatus.SUCCESS)
+    result.entities = DocumentEntities(document_type="business_license")
+    task_id = "legacy_semantic_cleanup"
+    task_dir = tmp_path / task_id
+    task_dir.mkdir()
+    obsolete_semantic = task_dir / "001_community_semantic.json"
+    obsolete_semantic.write_text("{}", encoding="utf-8")
+
+    _task_id, written = write_outputs(
+        result,
+        tmp_path,
+        file_id="001",
+        task_id=task_id,
+        overwrite=True,
+        include_mirror=False,
+        include_manifest=False,
+    )
+
+    assert "community_semantic" not in written
+    assert not obsolete_semantic.exists()
 
 
 def test_content_markdown_is_identical_between_default_and_all_modes(tmp_path: Path):

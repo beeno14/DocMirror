@@ -2684,7 +2684,6 @@ def project_community_bundle(
         sections=sections,
         datasets=datasets,
         files={
-            "semantic_json": f"{file_id}_community_semantic.json",
             "content_md": f"{file_id}_content.md",
             "enhanced_reading_md": f"{file_id}_enhanced_reading.md",
             "datasets_dir": f"{file_id}_datasets",
