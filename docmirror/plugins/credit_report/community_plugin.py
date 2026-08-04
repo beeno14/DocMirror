@@ -21,8 +21,26 @@ Dependencies: ``ProjectionData`` and the credit-report projection orchestrator.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Any
 
+from docmirror.output.community_bundle import CommunityBundle
 from docmirror.plugins._base.projector import CommunityProjector, ProjectionData
+
+
+class _CreditReportCommunityBundle(CommunityBundle):
+    """Publish compact Community JSON without weakening rich semantic bindings."""
+
+    def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
+        from docmirror.plugins.credit_report.projection import _compact_public_datasets
+
+        payload = super().json_payload(semantic)
+        for dataset in payload.get("datasets") or []:
+            if not isinstance(dataset, dict):
+                continue
+            dataset_id = str(dataset.get("id") or dataset.get("name") or "dataset")
+            records = [record for record in (dataset.get("rows") or []) if isinstance(record, dict)]
+            dataset["rows"] = _compact_public_datasets({dataset_id: records})[dataset_id]
+        return payload
 
 
 class CreditReportPlugin(CommunityProjector):
@@ -94,13 +112,28 @@ class CreditReportPlugin(CommunityProjector):
                     policy[key] = list(
                         dict.fromkeys([*(policy.get(key) or ()), *map(str, values)])
                     )
-        bundle = project_community_bundle(
+        projected = project_community_bundle(
             sealed,
             file_path=file_path,
             file_id=file_id,
             document_id=document_id,
             projection_data=derived.model_dump(mode="python"),
             projection_policy=policy,
+        )
+        bundle = _CreditReportCommunityBundle(
+            schema=projected.schema,
+            document=projected.document,
+            sections=projected.sections,
+            datasets=projected.datasets,
+            files=projected.files,
+            warnings=projected.warnings,
+            result=projected.result,
+            source_fingerprint=projected.source_fingerprint,
+            parse_result_schema=projected.parse_result_schema,
+            classification=projected.classification,
+            domain=projected.domain,
+            diagnostics=projected.diagnostics,
+            content_markdown_override=projected.content_markdown_override,
         )
         bundle.render_markdown()
         if sealed.integrity_fingerprint != before or not sealed.verify_integrity():
