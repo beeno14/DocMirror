@@ -131,6 +131,75 @@ def _identifier(value: Any) -> str | None:
     return compact if compact and compact != "--" else None
 
 
+def _typed_identifier(value: Any) -> str | None:
+    identifier = _identifier(value)
+    if not identifier or not re.fullmatch(r"[A-Z0-9-]{8,}", identifier, re.IGNORECASE):
+        return None
+    if not re.search(r"[A-Z]", identifier, re.IGNORECASE) or not re.search(r"\d", identifier):
+        return None
+    return identifier
+
+
+def _dedupe_prefixed_identifiers(records: list[dict[str, Any]], field: str) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for record in records:
+        identifier = str(record.get(field) or "")
+        replaced = False
+        for index, existing in enumerate(kept):
+            prior = str(existing.get(field) or "")
+            if identifier and prior and (identifier.startswith(prior) or prior.startswith(identifier)):
+                if len(identifier) > len(prior):
+                    kept[index] = record
+                replaced = True
+                break
+        if not replaced:
+            kept.append(record)
+    return kept
+
+
+def _dedupe_liability_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Suppress full-page OCR replays of an already parsed liability card.
+
+    OCR can transpose chunks of a long guarantee-contract identifier, so an
+    identifier-prefix comparison alone is not sufficient.  A replay is only
+    treated as the same source card when at least three independent business
+    fields agree.  Earlier native-table rows win over later tolerant OCR rows.
+    """
+    kept: list[dict[str, Any]] = []
+    comparison_fields = (
+        "related_party_id_number",
+        "responsibility_amount",
+        "balance",
+        "open_date",
+        "due_date",
+    )
+    for record in records:
+        contract_number = str(record.get("contract_number") or "")
+        duplicate = False
+        for existing in kept:
+            prior_contract = str(existing.get("contract_number") or "")
+            if contract_number and prior_contract and (
+                contract_number.startswith(prior_contract) or prior_contract.startswith(contract_number)
+            ):
+                duplicate = True
+                break
+            matching_fields = sum(
+                1
+                for field in comparison_fields
+                if record.get(field) not in (None, "")
+                and existing.get(field) not in (None, "")
+                and record.get(field) == existing.get(field)
+            )
+            if matching_fields >= 3:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(record)
+    for sequence, record in enumerate(kept, start=1):
+        record["sequence"] = sequence
+    return kept
+
+
 def _number(value: Any) -> int | str | None:
     raw = _compact(value).replace(",", "")
     if raw in {"", "--", "-"}:
@@ -577,7 +646,7 @@ def _repayment_records(
 
 def _account_base(rows: list[list[str]]) -> bool:
     compact = _compact(" ".join(cell for row in rows[:4] for cell in row))
-    return "账户标识" in compact and ("管理机构" in compact or "发卡机构" in compact)
+    return "账户标识" in compact and ("管理机构" in compact or "发卡机构" in compact) and not _other_entity_table(rows)
 
 
 def _other_entity_table(rows: list[list[str]]) -> bool:
@@ -762,9 +831,7 @@ def _extract_accounts(
             if current is not None and crosses_page:
                 candidate_table_id = str(getattr(table, "table_id", "") or "")
                 continuation = (
-                    continuation_check(current_table_id, candidate_table_id)
-                    if callable(continuation_check)
-                    else None
+                    continuation_check(current_table_id, candidate_table_id) if callable(continuation_check) else None
                 )
                 if continuation is not True:
                     current = None
@@ -841,15 +908,13 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
                 "confidence": 1.0,
             }
             records.append(record)
-    if records:
-        return records
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
 
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("credit_lines"):
         facts = candidate.fields
-        identifier = _identifier(_field(facts, "授信协议标识"))
+        identifier = _typed_identifier(_field(facts, "授信协议标识"))
         if not identifier:
             continue
         due_raw = _field(facts, "到期日期")
@@ -877,7 +942,7 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
                 "confidence": candidate.confidence,
             }
         )
-    return records
+    return _dedupe_prefixed_identifiers(records, "account_identifier")
 
 
 def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
@@ -889,8 +954,11 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
             if "责任人类型" not in compact or "保证合同编号" not in compact:
                 continue
             facts = _pairs(rows)
-            contract_number = _identifier(_field(facts, "保证合同编号"))
+            contract_number = _typed_identifier(_field(facts, "保证合同编号"))
             related_id = _identifier(_field(facts, "主业务借款人证件号码"))
+            responsibility_amount = _number(_field(facts, "还款责任金额"))
+            if contract_number is None and not isinstance(responsibility_amount, int):
+                continue
             identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
             currency = _currency(_field(facts, "币种")) or "CNY"
             records.append(
@@ -905,7 +973,7 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                     "institution": _clean(_field(facts, "管理机构")),
                     "business_type": _clean(_field(facts, "业务种类")),
                     "responsibility_type": _clean(_field(facts, "责任人类型")),
-                    "responsibility_amount": _number(_field(facts, "还款责任金额")),
+                    "responsibility_amount": responsibility_amount,
                     "responsibility_amount_reported": True,
                     "contract_number": contract_number,
                     "snapshot_date": next(
@@ -928,16 +996,17 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                     "confidence": 1.0,
                 }
             )
-    if records:
-        return records
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
 
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("repayment_liability_records"):
         facts = candidate.fields
-        contract_number = _identifier(_field(facts, "保证合同编号"))
+        contract_number = _typed_identifier(_field(facts, "保证合同编号"))
         related_id = _identifier(_field(facts, "主业务借款人证件号码"))
+        responsibility_amount = _number(_field(facts, "还款责任金额"))
+        if contract_number is None and not isinstance(responsibility_amount, int):
+            continue
         identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
         currency = _currency(_field(facts, "币种")) or "CNY"
         records.append(
@@ -952,9 +1021,10 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                 "institution": _clean(_field(facts, "管理机构")),
                 "business_type": _clean(_field(facts, "业务种类")),
                 "responsibility_type": _clean(_field(facts, "责任人类型")),
-                "responsibility_amount": _number(_field(facts, "还款责任金额")),
+                "responsibility_amount": responsibility_amount,
                 "responsibility_amount_reported": True,
                 "contract_number": contract_number,
+                "snapshot_date": _date(_field(facts, "报告日期")),
                 "balance": _number(_field(facts, "余额")),
                 "five_tier_class": _clean(_field(facts, "五级分类")),
                 "overdue_months_or_repayment_status": _clean(_field(facts, "逾期月数", "还款状态")),
@@ -967,7 +1037,35 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                 "confidence": candidate.confidence,
             }
         )
-    return records
+    deduped = _dedupe_liability_records(records)
+    if len(deduped) < len(records):
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            make_issue,
+            record_issue,
+        )
+
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="duplicate_liability_ocr_replay_suppressed",
+                message=(
+                    "A complete-page OCR replay matched an already parsed repayment-liability card on at least "
+                    "three independent business fields; the redundant replay was suppressed."
+                ),
+                severity="info",
+                status="suppressed_redundant",
+                parser_stage="native_detail_liability_merge",
+                target_dataset="repayment_liability_records",
+                observed_value={"candidate_count": len(records), "emitted_count": len(deduped)},
+                reason_codes=(
+                    "native_table_preferred",
+                    "three_field_semantic_match",
+                    "ocr_identifier_transposition_tolerated",
+                ),
+            ),
+        )
+    return deduped
 
 
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
@@ -1258,18 +1356,16 @@ def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
                     institution_parts = [
                         value
                         for index, value in nonempty
-                        if not (
-                            index == 0
-                            and (
-                                sequence_match is not None
-                                or (len(value) <= 2 and len(nonempty) > 1)
-                            )
-                        )
+                        if not (index == 0 and (sequence_match is not None or (len(value) <= 2 and len(nonempty) > 1)))
                     ]
                     institution = " ".join(institution_parts).strip()
                     if sequence not in records:
                         sequence = next(
-                            (candidate for candidate in available_sequences if candidate not in used_provider_sequences),
+                            (
+                                candidate
+                                for candidate in available_sequences
+                                if candidate not in used_provider_sequences
+                            ),
                             None,
                         )
                     if sequence is None or sequence not in records or not institution:
@@ -1318,11 +1414,7 @@ def _split_employment_basic_row(row: tuple[str, ...]) -> dict[str, Any]:
     """Recover a basic employment row even when OCR merged its columns."""
     cells = [_clean(value) for value in row]
     positional_phone = next(
-        (
-            value
-            for value in reversed(cells[4:])
-            if len(re.sub(r"\D", "", value)) >= 7
-        ),
+        (value for value in reversed(cells[4:]) if len(re.sub(r"\D", "", value)) >= 7),
         "",
     )
     if len(cells) >= 5 and cells[1] and (cells[2] or positional_phone):
@@ -1355,7 +1447,9 @@ def _split_employment_basic_row(row: tuple[str, ...]) -> dict[str, Any]:
     # Most legal names have a reliable suffix even when every table column was
     # collapsed into one OCR cell. Keep uncertain trailing text as the address
     # instead of silently appending it to the employer name.
-    legal = re.match(r"(.{2,60}?(?:有限责任公司|股份有限公司|有限公司|工业公司|学校|公司))(?:\s+|(?=[省市县区镇路街]))?(.*)$", text)
+    legal = re.match(
+        r"(.{2,60}?(?:有限责任公司|股份有限公司|有限公司|工业公司|学校|公司))(?:\s+|(?=[省市县区镇路街]))?(.*)$", text
+    )
     if legal:
         parsed["employer"] = legal.group(1).strip()
         trailing = legal.group(2).strip()
@@ -1435,12 +1529,8 @@ def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
                         "entry_year": int(entry_match.group(0)) if entry_match else None,
                         "information_updated_date": _date(cells[6]),
                     }
-                    records[sequence].update(
-                        {key: value for key, value in detail.items() if value and value != "--"}
-                    )
-                    records[sequence]["source_refs"].append(
-                        _source_ref(page, table, row=row_index)
-                    )
+                    records[sequence].update({key: value for key, value in detail.items() if value and value != "--"})
+                    records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
                     continue
                 role_text = _clean(row[1] if len(row) > 1 else "")
                 industry = "批发和零售业" if "批发和零售业" in role_text else ""
@@ -1509,8 +1599,12 @@ def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[st
                         start=1,
                     ):
                         cells = [_clean(value) for value in data_row]
-                        phone = next((re.sub(r"\D", "", value) for value in cells if len(re.sub(r"\D", "", value)) == 11), "")
-                        updated = next((value for value in cells if re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", value)), "")
+                        phone = next(
+                            (re.sub(r"\D", "", value) for value in cells if len(re.sub(r"\D", "", value)) == 11), ""
+                        )
+                        updated = next(
+                            (value for value in cells if re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", value)), ""
+                        )
                         if not phone or not updated:
                             break
                         sequence_match = re.fullmatch(r"\d{1,3}", cells[0] if cells else "")
@@ -1754,9 +1848,7 @@ def _extract_postpaid_payment_history(parse_result: Any) -> list[dict[str, Any]]
 def _is_summary_anchor(rows: list[list[str]]) -> bool:
     compact = _compact(" ".join(cell for row in rows for cell in row))
     return bool(
-        "汇总" in compact
-        or ("账户数" in compact and "首笔业务发放月份" in compact)
-        or "最近1个月内的查询" in compact
+        "汇总" in compact or ("账户数" in compact and "首笔业务发放月份" in compact) or "最近1个月内的查询" in compact
     )
 
 
@@ -1883,7 +1975,9 @@ def _extract_summary_datasets(
                 ),
                 "source_row_count": len(business_rows),
                 "source": "native_personal_detail_summary_table",
-                "source_refs": [_source_ref(fragment_page, fragment_table) for fragment_page, fragment_table, _ in fragments],
+                "source_refs": [
+                    _source_ref(fragment_page, fragment_table) for fragment_page, fragment_table, _ in fragments
+                ],
                 "confidence": 1.0,
             }
         )
@@ -2015,9 +2109,10 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
 
         candidates = PBOCPersonalDetailNativeParser(parse_result).records("report_header")
         fingerprints = {
-            tuple(candidate.fields.get(label, "") for label in (
-                "被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因"
-            ))
+            tuple(
+                candidate.fields.get(label, "")
+                for label in ("被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因")
+            )
             for candidate in candidates
         }
         if len(fingerprints) == 1 and candidates:

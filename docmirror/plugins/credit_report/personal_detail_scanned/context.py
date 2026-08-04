@@ -67,9 +67,7 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("summary", ("信息概要",)),
 )
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
-_PRINTED_PAGE_RE = re.compile(
-    r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页"
-)
+_PRINTED_PAGE_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页")
 _PRINTED_PAGE_ONLY_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*[页面]")
 _PRINTED_TOTAL_ONLY_RE = re.compile(r"共\s*(?P<total>\d{1,3})\s*页?")
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
@@ -81,15 +79,24 @@ _BUSINESS_HEADING_RE = re.compile(
     r"|授信协议\s*\d{1,3}"
     r")$"
 )
-_CONTINUATIONS = frozenset(
-    {"same_table", "table_to_text_related", "text_to_table_related", "same_text_section"}
-)
+_CONTINUATIONS = frozenset({"same_table", "table_to_text_related", "text_to_table_related", "same_text_section"})
 _SPLIT_FOR: dict[TransitionAction, TransitionAction] = {
     "same_table": "different_table",
     "table_to_text_related": "table_to_text_unrelated",
     "text_to_table_related": "text_to_table_unrelated",
     "same_text_section": "different_text_section",
 }
+_PAGE_OCR_ANCHORS = (
+    "个人信用报告",
+    "报告编号",
+    "个人基本信息",
+    "信息概要",
+    "信贷交易信息明细",
+    "查询记录",
+    "账户",
+    "管理机构",
+    "查询日期",
+)
 
 
 def _compact(value: Any) -> str:
@@ -102,6 +109,51 @@ def _finite(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) else 0.0
+
+
+def _page_ocr_score(words: Iterable[dict[str, Any]]) -> float:
+    texts = [str(word.get("text") or "").strip() for word in words if str(word.get("text") or "").strip()]
+    joined = " ".join(texts)
+    anchors = sum(joined.count(marker) for marker in _PAGE_OCR_ANCHORS)
+    long_cjk = sum(1 for text in texts if len(re.findall(r"[\u3400-\u9fff]", text)) >= 2)
+    confidences = [float(word.get("confidence") or 0.0) for word in words if word.get("text")]
+    mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    return float(len(joined) + anchors * 80 + long_cjk * 4 + mean_confidence * 30)
+
+
+def _complete_page_ocr(image: Any) -> tuple[list[dict[str, Any]], Any, int, float, float]:
+    """OCR a complete logical page with per-page orientation and deskew selection."""
+    import cv2
+
+    from docmirror.ocr.image_preprocessing import deskew_image
+    from docmirror.ocr.repair.recognizers import rapidocr_recognize
+
+    rotations = (
+        (0, 90, 180, 270) if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_ORIENTATION_PROBE", "1") != "0" else (0,)
+    )
+    candidates: list[tuple[float, int, list[dict[str, Any]], Any]] = []
+    for rotation in rotations:
+        if rotation == 0:
+            oriented = image
+        elif rotation == 90:
+            oriented = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation == 180:
+            oriented = cv2.rotate(image, cv2.ROTATE_180)
+        else:
+            oriented = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        words = rapidocr_recognize(oriented, source="personal_detail_full_page_ocr")
+        candidates.append((_page_ocr_score(words), rotation, words, oriented))
+    score, rotation, words, selected = max(candidates, key=lambda item: item[0])
+    deskewed, deskew_angle = deskew_image(selected)
+    if abs(float(deskew_angle or 0.0)) >= 0.5:
+        deskew_words = rapidocr_recognize(
+            deskewed,
+            source="personal_detail_full_page_ocr_deskewed",
+        )
+        deskew_score = _page_ocr_score(deskew_words)
+        if deskew_score > score:
+            return deskew_words, deskewed, rotation, float(deskew_angle), deskew_score
+    return words, selected, rotation, 0.0, score
 
 
 def _bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -182,10 +234,7 @@ def _family(units: Iterable[CreditReportUnit]) -> str:
         if any(marker in text for marker in markers):
             return family
     ranked = sorted(
-        (
-            (sum(marker in text for marker in markers), family)
-            for family, markers in _FAMILY_MARKERS
-        ),
+        ((sum(marker in text for marker in markers), family) for family, markers in _FAMILY_MARKERS),
         reverse=True,
     )
     return ranked[0][1] if ranked and ranked[0][0] >= 2 else ""
@@ -253,9 +302,7 @@ class PersonalDetailTransitionPolicy:
             signals[split_action].append("personal_detail_family_mismatch")
         elif left_family and right_family:
             weights[continuation.action] *= 1.35
-            signals[continuation.action].append(
-                f"personal_detail_family_continues:{left_family}:{right_family}"
-            )
+            signals[continuation.action].append(f"personal_detail_family_continues:{left_family}:{right_family}")
             if crosses_page and {left_family, right_family} <= {"account", "repayment"}:
                 # One account card is composed of several differently shaped
                 # grids. A page break can therefore change column count and
@@ -331,13 +378,10 @@ def _printed_reading_order(
         observed_pages.add(logical)
         transform = dict(getattr(page, "coordinate_transform", None) or {})
         source_by_logical[logical] = int(
-            transform.get("source_page_number")
-            or getattr(page, "source_page_number", 0)
-            or logical
+            transform.get("source_page_number") or getattr(page, "source_page_number", 0) or logical
         )
         texts_by_page.setdefault(logical, []).extend(
-            str(getattr(block, "content", "") or "")
-            for block in getattr(page, "texts", None) or []
+            str(getattr(block, "content", "") or "") for block in getattr(page, "texts", None) or []
         )
 
     for bundle in _domain_specific(parse_result).get("_page_evidence_bundles") or []:
@@ -400,10 +444,7 @@ def _printed_reading_order(
     total_counts = Counter(total for total in totals if total >= len(observed_pages))
     expected_total = total_counts.most_common(1)[0][0] if total_counts else len(observed_pages)
     printed_pages = set(printed_by_logical.values())
-    if (
-        max(printed_pages, default=0) > expected_total
-        or min(printed_pages, default=1) < 1
-    ):
+    if max(printed_pages, default=0) > expected_total or min(printed_pages, default=1) < 1:
         return identity
 
     return {
@@ -424,6 +465,7 @@ def _ocr_printed_page_footers(
     """Read only footer strips for structural page order, never cell values."""
     try:
         from docmirror.ocr.repair.recognizers import rapidocr_recognize
+
         resolver = PersonalDetailLogicalPageImageResolver(
             parse_result,
             zoom=2.0,
@@ -444,19 +486,12 @@ def _ocr_printed_page_footers(
             continue
         footer = image[int(shape[0] * 0.82) : shape[0], :]
         words = rapidocr_recognize(footer)
-        texts = [
-            str(word.get("text") or "")
-            for word in words
-            if float(word.get("confidence") or 0.0) >= 0.75
-        ]
+        texts = [str(word.get("text") or "") for word in words if float(word.get("confidence") or 0.0) >= 0.75]
         joined = " ".join(texts)
         pages = {int(match.group("page")) for match in _PRINTED_PAGE_ONLY_RE.finditer(joined)}
         if len(pages) == 1:
             printed[logical] = next(iter(pages))
-        totals.extend(
-            int(match.group("total"))
-            for match in _PRINTED_TOTAL_ONLY_RE.finditer(joined)
-        )
+        totals.extend(int(match.group("total")) for match in _PRINTED_TOTAL_ONLY_RE.finditer(joined))
     resolver.clear()
     return printed, totals
 
@@ -682,15 +717,18 @@ class PersonalDetailExtractionContext:
         self.parse_result = parse_result
         self.entity_context = entity_context
         self.evidence_unit_ids = MappingProxyType(dict(evidence_unit_ids))
-        self.source_page_by_logical = MappingProxyType(dict(source_page_by_logical))
-        self.reading_order_by_logical = MappingProxyType(dict(reading_order_by_logical))
+        # Plugin-owned supplemental subpages are added lazily after a confirmed
+        # split replay, so these two ledgers intentionally remain mutable while
+        # the sealed ParseResult and evidence IDs stay immutable.
+        self.source_page_by_logical = dict(source_page_by_logical)
+        self.reading_order_by_logical = dict(reading_order_by_logical)
         self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
         self._page_ocr_cache: dict[int, dict[str, Any] | None] = {}
         self._supplemental_ocr_cache: dict[str, dict[str, Any]] = {}
         self._page_ocr_requests: list[dict[str, Any]] = []
         self._page_ocr_max_requests = max(
-            0, int(os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR_MAX_REQUESTS", "4"))
+            0, int(os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR_MAX_REQUESTS", "12"))
         )
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
@@ -703,6 +741,7 @@ class PersonalDetailExtractionContext:
         self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(
             parse_result,
             page_image_resolver=self._page_image_resolver,
+            full_page_ocr_loader=self.full_page_ocr_evidence,
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -744,6 +783,10 @@ class PersonalDetailExtractionContext:
                 stage="scanned_business",
             ),
         )
+
+    def correct_assembled_business(self, payload: dict[str, Any], *, stage: str) -> dict[str, Any]:
+        """Apply cross-field contracts after candidate collections are merged."""
+        return self._ocr_correction_overlay.enforce_cross_field_contracts(payload, stage=stage)
 
     def corrected_repayment_records(self) -> list[dict[str, Any]]:
         """Rebuild monthly cells from images using corrected document order.
@@ -813,6 +856,9 @@ class PersonalDetailExtractionContext:
 
     def corrected_evidence_pages(self) -> list[dict[str, Any]]:
         """Return corrected copies of OCR lines while preserving sealed evidence."""
+        return self.cached("corrected_evidence_pages", self._build_corrected_evidence_pages)
+
+    def _build_corrected_evidence_pages(self) -> list[dict[str, Any]]:
         domain_specific = _domain_specific(self.parse_result)
         pages: list[dict[str, Any]] = []
         for bundle in domain_specific.get("_page_evidence_bundles") or []:
@@ -829,10 +875,7 @@ class PersonalDetailExtractionContext:
                     "page": int(bundle.get("page") or local.get("page") or 0),
                     "source_page": int(bundle.get("source_page_number") or local.get("source_page") or 0),
                     "page_width": _finite(
-                        local.get("page_width")
-                        or bundle.get("page_width")
-                        or local.get("width")
-                        or bundle.get("width")
+                        local.get("page_width") or bundle.get("page_width") or local.get("width") or bundle.get("width")
                     ),
                     "page_height": _finite(
                         local.get("page_height")
@@ -849,7 +892,7 @@ class PersonalDetailExtractionContext:
                     ),
                 }
             )
-        return self._ocr_correction_overlay.corrected_evidence_pages(
+        corrected = self._ocr_correction_overlay.corrected_evidence_pages(
             sorted(
                 pages,
                 key=lambda item: (
@@ -857,6 +900,111 @@ class PersonalDetailExtractionContext:
                     item["page"],
                 ),
             )
+        )
+        return self._merge_split_replay_pages(corrected)
+
+    def _merge_split_replay_pages(
+        self,
+        pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Overlay actual splitter slices on core pages that remained unsplit."""
+        audit = self.page_topology.audit()
+        source_candidates = {
+            int(source)
+            for source, logicals in (audit.get("logical_pages_by_source") or {}).items()
+            if len(logicals) == 1
+        }
+        if not source_candidates:
+            return pages
+        supplemental = self.supplemental_page_ocr_evidence(
+            source_candidates,
+            reason="split_result_topology_replay",
+        )
+        if not supplemental:
+            return pages
+
+        base_by_source: dict[int, list[dict[str, Any]]] = {}
+        for page in pages:
+            base_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
+        supplemental_by_source: dict[int, list[dict[str, Any]]] = {}
+        for page in supplemental:
+            supplemental_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
+
+        next_logical = max(self.source_page_by_logical, default=0) + 1
+        merged: list[dict[str, Any]] = []
+        for source in sorted(set(base_by_source) | set(supplemental_by_source)):
+            base_pages = base_by_source.get(source, [])
+            replay_pages = sorted(
+                supplemental_by_source.get(source, []),
+                key=lambda item: int(item.get("segment_index") or 0),
+            )
+            if not replay_pages:
+                merged.extend(base_pages)
+                continue
+            logicals = self.page_topology.logicals_for_source(source)
+            geometries = {
+                int(geometry.segment_index): logical
+                for logical in logicals
+                if (geometry := self.page_topology.geometry(logical)) is not None
+                and geometry.split_kind == "two_page_spread"
+                and geometry.segment_index in {0, 1}
+            }
+            base_by_segment: dict[int, dict[str, Any]] = {}
+            for page in base_pages:
+                geometry = self.page_topology.geometry(int(page.get("page") or 0))
+                if (
+                    geometry is not None
+                    and geometry.split_kind == "two_page_spread"
+                    and geometry.segment_index in {0, 1}
+                ):
+                    base_by_segment[int(geometry.segment_index)] = page
+
+            replay_by_segment = {int(page.get("segment_index") or 0): page for page in replay_pages}
+            unsplit_logical = logicals[0] if len(logicals) == 1 and not geometries else 0
+            for segment in (0, 1):
+                if segment in base_by_segment:
+                    merged.append(base_by_segment[segment])
+                    continue
+                replay = replay_by_segment.get(segment)
+                if replay is None:
+                    continue
+                logical = geometries.get(segment, 0)
+                if not logical and unsplit_logical and segment == 0:
+                    logical = unsplit_logical
+                if not logical:
+                    logical = next_logical
+                    next_logical += 1
+                replay = dict(replay)
+                replay["page"] = logical
+                replay["logical_page"] = logical
+                replay["plugin_replayed_subpage"] = True
+                replay["lines"] = self._ocr_correction_overlay.corrected_evidence_pages([replay])[0]["lines"]
+                self.source_page_by_logical[logical] = source
+                merged.append(replay)
+
+        order_keys: dict[int, tuple[int, int, int]] = {}
+        for logical, source in self.source_page_by_logical.items():
+            source_logicals = self.page_topology.logicals_for_source(source)
+            source_order = min(
+                (self.reading_order_by_logical.get(item, item) for item in source_logicals),
+                default=self.reading_order_by_logical.get(logical, logical),
+            )
+            geometry = self.page_topology.geometry(logical)
+            segment = int(geometry.segment_index) if geometry and geometry.segment_index in {0, 1} else 0
+            replay = next((item for item in merged if int(item.get("page") or 0) == logical), None)
+            if replay and replay.get("plugin_replayed_subpage"):
+                segment = int(replay.get("segment_index") or 0)
+            order_keys[logical] = (source_order, segment, logical)
+        self.reading_order_by_logical.clear()
+        self.reading_order_by_logical.update(
+            {logical: index for index, logical in enumerate(sorted(order_keys, key=order_keys.get), start=1)}
+        )
+        return sorted(
+            merged,
+            key=lambda item: (
+                self.reading_order_by_logical.get(int(item.get("page") or 0), int(item.get("page") or 0)),
+                int(item.get("segment_index") or 0),
+            ),
         )
 
     def full_page_ocr_evidence(
@@ -895,13 +1043,16 @@ class PersonalDetailExtractionContext:
                 request["status"] = "invalid_image"
                 self._page_ocr_cache[logical] = None
                 continue
-            from docmirror.ocr.repair.recognizers import rapidocr_recognize
-
-            words = rapidocr_recognize(image, source="personal_detail_full_page_ocr")
-            page_width = float(rendered.get("page_width") or shape[1])
-            page_height = float(rendered.get("page_height") or shape[0])
+            words, selected_image, selected_rotation, deskew_angle, orientation_score = _complete_page_ocr(image)
+            selected_shape = getattr(selected_image, "shape", shape)
+            zoom = float(rendered.get("zoom") or 1.0)
+            page_width = float(selected_shape[1]) / zoom
+            page_height = float(selected_shape[0]) / zoom
             scale_x = page_width / float(shape[1])
             scale_y = page_height / float(shape[0])
+            if selected_rotation in {90, 270}:
+                scale_x = page_width / float(selected_shape[1])
+                scale_y = page_height / float(selected_shape[0])
             lines: list[dict[str, Any]] = []
             for index, word in enumerate(words):
                 text = str(word.get("text") or "").strip()
@@ -929,17 +1080,25 @@ class PersonalDetailExtractionContext:
                 continue
             request["status"] = "completed"
             request["word_count"] = len(lines)
+            request["selected_rotation"] = selected_rotation
+            request["deskew_angle"] = deskew_angle
+            request["orientation_score"] = orientation_score
             page = {
                 "page": logical,
                 "source_page": int(rendered.get("source_page") or self.source_page_by_logical.get(logical, logical)),
                 "page_width": page_width,
                 "page_height": page_height,
                 "reason": str(reason),
+                "selected_rotation": selected_rotation,
+                "deskew_angle": deskew_angle,
+                "orientation_score": orientation_score,
                 "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
             }
-            corrected = self._ocr_correction_overlay.corrected_evidence_pages([page])[0]
-            self._page_ocr_cache[logical] = deepcopy(corrected)
-            output.append(corrected)
+            # Keep the replay raw. Typed correction happens only after a
+            # structural parser assigns the page token to a schema role. This
+            # also prevents recursive page repair while producing the replay.
+            self._page_ocr_cache[logical] = deepcopy(page)
+            output.append(page)
         return output
 
     def supplemental_page_ocr_evidence(
@@ -948,7 +1107,11 @@ class PersonalDetailExtractionContext:
         *,
         reason: str,
     ) -> list[dict[str, Any]]:
-        """OCR only footer-confirmed missing spread halves as supplemental pages."""
+        """OCR splitter-confirmed supplemental logical subpages.
+
+        Footer text may corroborate printed order but does not decide whether
+        the physical source is subpaged.
+        """
         slices = self._page_image_resolver.supplemental_spread_slices(source_pages)
         output: list[dict[str, Any]] = []
         for recovered in slices:
@@ -958,12 +1121,19 @@ class PersonalDetailExtractionContext:
             if supplemental_id in self._supplemental_ocr_cache:
                 output.append(deepcopy(self._supplemental_ocr_cache[supplemental_id]))
                 continue
-            if len(self._page_ocr_requests) >= self._page_ocr_max_requests:
+            # Splitter-confirmed subpages are part of the corrected document
+            # topology, not optional anomaly probes. Count their budget
+            # independently so earlier field-repair OCR cannot silently drop
+            # a later half of the document.
+            supplemental_request_count = sum(bool(item.get("supplemental_page_id")) for item in self._page_ocr_requests)
+            if supplemental_request_count >= self._page_ocr_max_requests:
                 break
             request = {
                 "supplemental_page_id": supplemental_id,
                 "source_page": int(recovered.get("source_page") or 0),
                 "printed_page": int(recovered.get("printed_page") or 0),
+                "segment_index": int(recovered.get("segment_index") or 0),
+                "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),
                 "reason": str(reason),
                 "status": "requested",
             }
@@ -973,16 +1143,15 @@ class PersonalDetailExtractionContext:
             if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
                 request["status"] = "invalid_image"
                 continue
-            from docmirror.ocr.repair.recognizers import rapidocr_recognize
-
-            page_width = float(recovered.get("page_width") or shape[1])
-            page_height = float(recovered.get("page_height") or shape[0])
-            scale_x = page_width / float(shape[1])
-            scale_y = page_height / float(shape[0])
+            words, selected_image, page_rotation, deskew_angle, orientation_score = _complete_page_ocr(image)
+            selected_shape = getattr(selected_image, "shape", shape)
+            zoom = float(recovered.get("zoom") or 1.0)
+            page_width = float(selected_shape[1]) / zoom
+            page_height = float(selected_shape[0]) / zoom
+            scale_x = page_width / float(selected_shape[1])
+            scale_y = page_height / float(selected_shape[0])
             lines: list[dict[str, Any]] = []
-            for index, word in enumerate(
-                rapidocr_recognize(image, source="personal_detail_supplemental_page_ocr")
-            ):
+            for index, word in enumerate(words):
                 text = str(word.get("text") or "").strip()
                 bbox = word.get("bbox")
                 confidence = float(word.get("confidence") or 0.0)
@@ -1011,6 +1180,14 @@ class PersonalDetailExtractionContext:
                 "printed_total": int(recovered.get("printed_total") or 0),
                 "source_page": int(recovered.get("source_page") or 0),
                 "segment_index": int(recovered.get("segment_index") or 0),
+                "selected_rotation": int(recovered.get("selected_rotation") or 0),
+                "page_rotation": page_rotation,
+                "deskew_angle": deskew_angle,
+                "orientation_score": orientation_score,
+                "split_confidence": float(recovered.get("split_confidence") or 0.0),
+                "split_ratio": float(recovered.get("split_ratio") or 0.5),
+                "split_consensus_boost": float(recovered.get("split_consensus_boost") or 0.0),
+                "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),
                 "page_width": page_width,
                 "page_height": page_height,
                 "reason": str(reason),
@@ -1018,6 +1195,9 @@ class PersonalDetailExtractionContext:
             }
             request["status"] = "completed"
             request["word_count"] = len(lines)
+            request["page_rotation"] = page_rotation
+            request["deskew_angle"] = deskew_angle
+            request["orientation_score"] = orientation_score
             self._supplemental_ocr_cache[supplemental_id] = deepcopy(page)
             output.append(page)
         return output

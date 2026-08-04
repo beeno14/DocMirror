@@ -174,3 +174,106 @@ def test_resolver_recovers_existing_halves_with_the_core_splitter(tmp_path: Path
     assert rendered_left["coordinate_transform"]["decomposition"]["segment_index"] == 0
     assert rendered_right["coordinate_transform"]["decomposition"]["segment_index"] == 1
     assert resolver.audit()["recovered_logical_pages"] == [1, 2]
+
+
+def test_supplemental_subpage_uses_split_result_without_requiring_footer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import fitz
+
+    pdf_path = tmp_path / "unsplit-spread.pdf"
+    with fitz.open() as document:
+        source = document.new_page(width=1200, height=850)
+        for y in range(40, 810, 55):
+            source.draw_rect(fitz.Rect(40, y, 590, y + 12), color=(0, 0, 0), fill=(0, 0, 0))
+            source.draw_rect(fitz.Rect(610, y, 1160, y + 12), color=(0, 0, 0), fill=(0, 0, 0))
+        document.save(pdf_path)
+
+    monkeypatch.setattr(
+        "docmirror.ocr.repair.recognizers.rapidocr_recognize",
+        lambda *_args, **_kwargs: [],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        width=1200,
+        height=850,
+        coordinate_transform=_transform(
+            source=1,
+            kind="none",
+            segment=0,
+            crop=[0, 0, 1200, 850],
+        ),
+        texts=[],
+    )
+    resolver = PersonalDetailLogicalPageImageResolver(
+        SimpleNamespace(pages=[page], file_path=str(pdf_path)),
+        zoom=1.0,
+    )
+
+    recovered = resolver.supplemental_spread_slices({1})
+
+    assert [item["segment_index"] for item in recovered] == [0, 1]
+    assert all(item["subpage_basis"] == "core_split_result" for item in recovered)
+    assert all(item["printed_confirmation"] is False for item in recovered)
+    assert all(item["split_confidence"] >= 0.72 for item in recovered)
+
+
+def test_supplemental_split_replay_uses_existing_split_results_as_consensus(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import fitz
+
+    pdf_path = tmp_path / "consensus-spread.pdf"
+    with fitz.open() as document:
+        source = document.new_page(width=1200, height=850)
+        for y in range(40, 810, 55):
+            source.draw_rect(fitz.Rect(40, y, 590, y + 12), color=(0, 0, 0), fill=(0, 0, 0))
+            source.draw_rect(fitz.Rect(610, y, 1160, y + 12), color=(0, 0, 0), fill=(0, 0, 0))
+        document.save(pdf_path)
+
+    pages = [
+        SimpleNamespace(
+            page_number=1,
+            source_page_number=1,
+            width=1200,
+            height=850,
+            coordinate_transform=_transform(
+                source=1,
+                kind="none",
+                segment=0,
+                crop=[0, 0, 1200, 850],
+            ),
+            texts=[],
+        ),
+        _page(2, source=2, segment=0, crop=[0, 0, 600, 850]),
+        _page(3, source=2, segment=1, crop=[600, 0, 1200, 850]),
+        _page(4, source=3, segment=0, crop=[0, 0, 600, 850]),
+        _page(5, source=3, segment=1, crop=[600, 0, 1200, 850]),
+    ]
+    observed_boosts: list[float] = []
+    from docmirror.input.extraction import page_splitter
+
+    original = page_splitter.decision_from_analyses
+
+    def record_boost(*args, **kwargs):
+        observed_boosts.append(float(kwargs.get("consensus_boost") or 0.0))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(page_splitter, "decision_from_analyses", record_boost)
+    monkeypatch.setattr(
+        "docmirror.ocr.repair.recognizers.rapidocr_recognize",
+        lambda *_args, **_kwargs: [],
+    )
+    resolver = PersonalDetailLogicalPageImageResolver(
+        SimpleNamespace(pages=pages, file_path=str(pdf_path)),
+        zoom=1.0,
+    )
+
+    recovered = resolver.supplemental_spread_slices({1})
+
+    assert observed_boosts == [0.05]
+    assert [item["segment_index"] for item in recovered] == [0, 1]
+    assert all(item["split_consensus_boost"] == 0.05 for item in recovered)

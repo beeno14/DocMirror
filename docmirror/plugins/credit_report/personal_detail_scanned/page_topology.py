@@ -123,9 +123,7 @@ class PersonalDetailPageTopology:
         if len(requested) != 2:
             return None
         sources = {
-            geometry.source_page
-            for logical in requested
-            if (geometry := self._geometry.get(logical)) is not None
+            geometry.source_page for logical in requested if (geometry := self._geometry.get(logical)) is not None
         }
         if len(sources) != 1:
             return None
@@ -138,9 +136,7 @@ class PersonalDetailPageTopology:
     def transform_usable(self, logical_page: int) -> bool:
         geometry = self.geometry(logical_page)
         return bool(
-            geometry is not None
-            and geometry.transform_usable
-            and geometry.source_page not in self._invalid_sources
+            geometry is not None and geometry.transform_usable and geometry.source_page not in self._invalid_sources
         )
 
     def audit(self) -> dict[str, Any]:
@@ -157,9 +153,8 @@ class PersonalDetailPageTopology:
                 else:
                     single_sources += 1
         return {
-            "valid": not self._invalid_sources and not any(
-                issue.startswith("invalid_or_duplicate_logical_page:") for issue in self._issues
-            ),
+            "valid": not self._invalid_sources
+            and not any(issue.startswith("invalid_or_duplicate_logical_page:") for issue in self._issues),
             "logical_page_count": len(self._geometry),
             "source_page_count": len(self._logicals_by_source),
             "single_page_sources": single_sources,
@@ -218,28 +213,33 @@ class PersonalDetailLogicalPageImageResolver:
         }
 
     def supplemental_spread_slices(self, source_pages: Iterable[int]) -> list[dict[str, Any]]:
-        """Recover footer-confirmed missing halves without inventing logical pages."""
+        """Return splitter-confirmed subpages missing from the sealed topology.
+
+        The core split result is authoritative for whether a physical page is a
+        spread and for the segment geometry.  Printed footers are optional
+        ordering evidence only; an unreadable footer must not erase a valid
+        two-slice split result.
+        """
         result: list[dict[str, Any]] = []
         for source_page in sorted({int(page) for page in source_pages if int(page) > 0}):
             if source_page not in self._supplemental_cache:
-                self._supplemental_cache[source_page] = tuple(
-                    self._recover_missing_spread_slice(source_page)
-                )
+                self._supplemental_cache[source_page] = tuple(self._recover_missing_spread_slice(source_page))
             result.extend(dict(item) for item in self._supplemental_cache[source_page])
         return result
 
     def _recover_missing_spread_slice(self, source_page: int) -> list[dict[str, Any]]:
         siblings = self.topology.logicals_for_source(source_page)
-        if len(siblings) != 1:
+        if not siblings or len(siblings) > 2:
             return []
-        geometry = self.topology.geometry(siblings[0])
-        if (
-            geometry is None
-            or geometry.split_kind != "two_page_spread"
-            or geometry.segment_index not in {0, 1}
-            or not self._file_path.is_file()
-            or self._file_path.suffix.lower() != ".pdf"
-        ):
+        geometries = [geometry for logical in siblings if (geometry := self.topology.geometry(logical)) is not None]
+        if not geometries or not self._file_path.is_file() or self._file_path.suffix.lower() != ".pdf":
+            return []
+        existing_segments = {
+            int(geometry.segment_index)
+            for geometry in geometries
+            if geometry.split_kind == "two_page_spread" and geometry.segment_index in {0, 1}
+        }
+        if existing_segments == {0, 1}:
             return []
         try:
             import cv2
@@ -253,19 +253,49 @@ class PersonalDetailLogicalPageImageResolver:
             )
             from docmirror.ocr.repair.recognizers import rapidocr_recognize
 
+            analysis_zoom = min(1.25, self._zoom)
             with fitz.open(self._file_path) as document:
                 if source_page > len(document):
                     return []
                 source = document[source_page - 1]
                 source_width = float(source.rect.width)
                 source_height = float(source.rect.height)
-                pix = source.get_pixmap(matrix=fitz.Matrix(self._zoom, self._zoom), alpha=False)
+                pix = source.get_pixmap(matrix=fitz.Matrix(analysis_zoom, analysis_zoom), alpha=False)
             image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
             image = image[:, :, :3] if pix.n >= 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-            decision = decision_from_analyses(analyze_spread_candidates(image), mode="auto")
+            consensus_boost = self._split_consensus_boost()
+            decision = decision_from_analyses(
+                analyze_spread_candidates(image),
+                mode="auto",
+                consensus_boost=consensus_boost,
+            )
             if not decision.should_split or not decision.analyses:
                 return []
             rotation = int(decision.analyses[0].rotation) % 360
+            if rotation in {90, 270}:
+                # Geometry alone can make a dense upright portrait page look
+                # like a spread after synthetic rotation. Confirm the sideways
+                # orientation on this physical page rather than borrowing one
+                # document-wide orientation decision.
+                from docmirror.input.extraction.extractor import _select_ocr_orientation
+                from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
+
+                _words, confirmed_rotation, _selected, _width, _height, _metrics = _select_ocr_orientation(
+                    image,
+                    get_ocr_engine(),
+                    zoom=analysis_zoom,
+                    forced_rotations=decision.rotation_candidates,
+                    probe_low_quality=False,
+                )
+                if int(confirmed_rotation) % 360 not in {90, 270}:
+                    return []
+                rotation = int(confirmed_rotation) % 360
+            if self._zoom > analysis_zoom:
+                with fitz.open(self._file_path) as document:
+                    source = document[source_page - 1]
+                    pix = source.get_pixmap(matrix=fitz.Matrix(self._zoom, self._zoom), alpha=False)
+                image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                image = image[:, :, :3] if pix.n >= 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
             slices = split_or_passthrough(
                 _rotate_image(image, rotation),
                 source_width=source_width,
@@ -275,57 +305,76 @@ class PersonalDetailLogicalPageImageResolver:
                 decision=decision,
                 mode="auto",
             )
-            missing_segment = 1 - int(geometry.segment_index)
-            candidate = next(
-                (item for item in slices if int(item.segment_index) == missing_segment),
-                None,
-            )
-            if candidate is None:
+            slices_by_segment = {int(item.segment_index): item for item in slices}
+            if set(slices_by_segment) != {0, 1}:
                 return []
-            candidate_image = candidate.image
-            height = int(candidate_image.shape[0])
-            footer_words = rapidocr_recognize(
-                candidate_image[int(height * 0.80) : height, :],
-                source="personal_detail_supplemental_footer_ocr",
-            )
-            footer_text = " ".join(
-                str(word.get("text") or "")
-                for word in footer_words
-                if float(word.get("confidence") or 0.0) >= 0.65
-            )
-            matches = {
-                (int(match.group("page")), int(match.group("total")))
-                for match in _PRINTED_FOOTER_RE.finditer(footer_text)
-            }
-            if len(matches) != 1:
-                return []
-            printed_page, printed_total = next(iter(matches))
-            if not 1 <= printed_page <= printed_total:
-                return []
-            recovery = {
-                "image": candidate_image,
-                "page_width": float(candidate.width),
-                "page_height": float(candidate.height),
-                "source_page": source_page,
-                "segment_index": missing_segment,
-                "printed_page": printed_page,
-                "printed_total": printed_total,
-                "zoom": self._zoom,
-                "source_crop_bbox": list(candidate.source_crop_bbox),
-                "supplemental_page_id": f"source:{source_page}:segment:{missing_segment}:printed:{printed_page}",
-            }
-            self._supplemental_recoveries.append(
-                {key: value for key, value in recovery.items() if key != "image"}
-            )
-            return [recovery]
+            # A single unsplit core page represents neither half reliably, so
+            # both split slices become supplemental candidates.  For a partial
+            # core spread, only the segment absent from the sealed topology is
+            # supplemental.
+            missing_segments = ({0, 1} - existing_segments) if existing_segments else {0, 1}
+            recoveries: list[dict[str, Any]] = []
+            for missing_segment in sorted(missing_segments):
+                candidate = slices_by_segment[missing_segment]
+                candidate_image = candidate.image
+                height = int(candidate_image.shape[0])
+                footer_words = rapidocr_recognize(
+                    candidate_image[int(height * 0.80) : height, :],
+                    source="personal_detail_supplemental_footer_ocr",
+                )
+                footer_text = " ".join(
+                    str(word.get("text") or "") for word in footer_words if float(word.get("confidence") or 0.0) >= 0.65
+                )
+                matches = {
+                    (int(match.group("page")), int(match.group("total")))
+                    for match in _PRINTED_FOOTER_RE.finditer(footer_text)
+                }
+                printed_page = 0
+                printed_total = 0
+                if len(matches) == 1:
+                    candidate_page, candidate_total = next(iter(matches))
+                    if 1 <= candidate_page <= candidate_total:
+                        printed_page = candidate_page
+                        printed_total = candidate_total
+                recovery = {
+                    "image": candidate_image,
+                    "page_width": float(candidate.width),
+                    "page_height": float(candidate.height),
+                    "source_page": source_page,
+                    "segment_index": missing_segment,
+                    "printed_page": printed_page,
+                    "printed_total": printed_total,
+                    "printed_confirmation": bool(printed_page and printed_total),
+                    "zoom": self._zoom,
+                    "source_crop_bbox": list(candidate.source_crop_bbox),
+                    "selected_rotation": rotation,
+                    "split_confidence": float(candidate.split_confidence),
+                    "split_ratio": float(decision.split_ratio),
+                    "split_consensus_boost": consensus_boost,
+                    "subpage_basis": "core_split_result",
+                    "supplemental_page_id": f"source:{source_page}:segment:{missing_segment}:split",
+                }
+                self._supplemental_recoveries.append({key: value for key, value in recovery.items() if key != "image"})
+                recoveries.append(recovery)
+            return recoveries
         except Exception:
             return []
+
+    def _split_consensus_boost(self) -> float:
+        """Reuse strong document topology evidence without consulting footers."""
+        audit = self.topology.audit()
+        return 0.05 if int(audit.get("double_page_sources") or 0) >= 2 else 0.0
 
     def _recover_with_core_splitter(self, logical_page: int) -> dict[str, Any] | None:
         """Recover an existing logical slice; never invent a new logical page."""
         page = self.topology.page(logical_page)
         geometry = self.topology.geometry(logical_page)
-        if page is None or geometry is None or not self._file_path.is_file() or self._file_path.suffix.lower() != ".pdf":
+        if (
+            page is None
+            or geometry is None
+            or not self._file_path.is_file()
+            or self._file_path.suffix.lower() != ".pdf"
+        ):
             return None
         if geometry.source_page <= 0:
             return None
@@ -415,11 +464,7 @@ class PersonalDetailLogicalPageImageResolver:
 def _page_geometry(page: Any, logical_page: int) -> LogicalPageGeometry:
     transform = dict(getattr(page, "coordinate_transform", None) or {})
     decomposition = dict(transform.get("decomposition") or {})
-    source_page = int(
-        transform.get("source_page_number")
-        or getattr(page, "source_page_number", 0)
-        or logical_page
-    )
+    source_page = int(transform.get("source_page_number") or getattr(page, "source_page_number", 0) or logical_page)
     width = _finite(getattr(page, "width", 0) or transform.get("display_width"))
     height = _finite(getattr(page, "height", 0) or transform.get("display_height"))
     split_kind = str(decomposition.get("kind") or "")
@@ -505,9 +550,7 @@ def _is_matrix3(value: Any) -> bool:
         return False
     try:
         return all(
-            isinstance(row, (list, tuple))
-            and len(row) == 3
-            and all(math.isfinite(float(item)) for item in row)
+            isinstance(row, (list, tuple)) and len(row) == 3 and all(math.isfinite(float(item)) for item in row)
             for row in value
         )
     except (TypeError, ValueError):

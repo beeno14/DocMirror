@@ -45,6 +45,7 @@ _VALID_INQUIRY_REASONS = (
     "担保资格审查",
     "融资审批",
     "保前审查",
+    "保后管理",
     "客户准入资格审查",
     "资信审查",
     "法人代表、负责人、高管",
@@ -57,6 +58,7 @@ _INQUIRY_REASON_MARKERS = _VALID_INQUIRY_REASONS + (
     "信用卡审抵",
     "担保资格申查",
     "贷后智理",
+    "磁资审批",
 )
 _INSTITUTION_SUFFIX_RE = re.compile(
     r"[A-Za-z0-9\u3400-\u9fff（）()·]{2,100}?(?:"
@@ -203,6 +205,11 @@ class PersonalDetailCellAnomaly:
     role: str
     value: str
     reason_codes: tuple[str, ...]
+    dataset_name: str = ""
+    record_id: str = ""
+    field_name: str = ""
+    extraction_status: str = "unreadable"
+    normalized_value_withheld: bool = False
     source_refs: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,11 +218,14 @@ class PersonalDetailCellAnomaly:
 
 @lru_cache(maxsize=1)
 def _pack() -> dict[str, Any]:
-    payload = yaml.safe_load(
-        files("docmirror.plugins.credit_report.personal_detail_scanned")
-        .joinpath("ocr_corrections.yaml")
-        .read_text(encoding="utf-8")
-    ) or {}
+    payload = (
+        yaml.safe_load(
+            files("docmirror.plugins.credit_report.personal_detail_scanned")
+            .joinpath("ocr_corrections.yaml")
+            .read_text(encoding="utf-8")
+        )
+        or {}
+    )
     if not isinstance(payload, dict) or int(payload.get("version") or 0) < 1:
         raise ValueError("invalid personal-detail OCR correction pack")
     return payload
@@ -345,7 +355,19 @@ def _normalize_nonnegative_integer(value: str, *, allow_placeholder: bool = Fals
     candidate = text.upper().translate(substitutions)
     if re.fullmatch(r"\d{1,12}", candidate):
         return str(int(candidate))
-    chinese_digits = {"〇": "0", "零": "0", "一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9"}
+    chinese_digits = {
+        "〇": "0",
+        "零": "0",
+        "一": "1",
+        "二": "2",
+        "三": "3",
+        "四": "4",
+        "五": "5",
+        "六": "6",
+        "七": "7",
+        "八": "8",
+        "九": "9",
+    }
     if text and len(text) <= 4 and all(char in chinese_digits for char in text):
         return str(int("".join(chinese_digits[char] for char in text)))
     return _plain_text(value)
@@ -548,8 +570,10 @@ def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
         "maximum_used_amount",
         "scheduled_payment",
         "shared_credit_limit",
+        "total_limit",
         "unbilled_installment_balance",
         "used_amount",
+        "used_limit",
     }:
         return "amount"
     if key.endswith(("_count", "_periods", "_months")) or key in {"sequence", "year", "month"}:
@@ -561,6 +585,28 @@ def _cell_scoped(refs: Iterable[dict[str, Any]]) -> bool:
     return any(ref.get("geometry_scope") == "cell" for ref in refs)
 
 
+def _boxes_associate(
+    target: tuple[float, float, float, float],
+    candidate: tuple[float, float, float, float],
+) -> bool:
+    """Return whether a page-wide OCR token belongs to a schema field box."""
+    tx0, ty0, tx1, ty1 = target
+    cx0, cy0, cx1, cy1 = candidate
+    intersection_width = max(0.0, min(tx1, cx1) - max(tx0, cx0))
+    intersection_height = max(0.0, min(ty1, cy1) - max(ty0, cy0))
+    intersection = intersection_width * intersection_height
+    target_area = max(1.0, (tx1 - tx0) * (ty1 - ty0))
+    candidate_area = max(1.0, (cx1 - cx0) * (cy1 - cy0))
+    if intersection / min(target_area, candidate_area) >= 0.25:
+        return True
+    # OCR boxes can move slightly between complete-page passes.  Permit a
+    # bounded half-line-height halo while keeping the association local.
+    halo = max(2.0, min(12.0, (ty1 - ty0) * 0.5))
+    center_x = (cx0 + cx1) / 2.0
+    center_y = (cy0 + cy1) / 2.0
+    return tx0 - halo <= center_x <= tx1 + halo and ty0 - halo <= center_y <= ty1 + halo
+
+
 class PersonalDetailOCRCorrectionOverlay:
     """Schema-independent corrected view over one sealed personal report."""
 
@@ -569,12 +615,14 @@ class PersonalDetailOCRCorrectionOverlay:
         parse_result: Any,
         *,
         page_image_resolver: Any | None = None,
+        full_page_ocr_loader: Any | None = None,
         repair_engine: Any | None = None,
         enable_targeted_ocr: bool | None = None,
         max_targeted_requests: int = 8,
     ) -> None:
         self.parse_result = parse_result
         self._page_image_resolver = page_image_resolver
+        self._full_page_ocr_loader = full_page_ocr_loader
         self._repair_engine = repair_engine
         self.enable_targeted_ocr = (
             os.environ.get("DOCMIRROR_PERSONAL_DETAIL_TARGETED_OCR", "1") != "0"
@@ -614,9 +662,14 @@ class PersonalDetailOCRCorrectionOverlay:
         stage: str,
         path: str,
         role: str,
+        dataset_name: str,
+        record_id: str,
+        field_name: str,
         value: Any,
         refs: tuple[dict[str, Any], ...],
         valid: bool,
+        normalized_value_withheld: bool = False,
+        reason_codes: tuple[str, ...] | None = None,
     ) -> None:
         text = str(value or "")
         marker = (stage, path, role, repr(refs))
@@ -635,7 +688,16 @@ class PersonalDetailOCRCorrectionOverlay:
                 path=path,
                 role=role,
                 value=text,
-                reason_codes=("role_validation_failed", "preserved_unresolved_value"),
+                reason_codes=reason_codes
+                or (
+                    "role_validation_failed",
+                    "normalized_value_withheld" if normalized_value_withheld else "preserved_unresolved_value",
+                ),
+                dataset_name=dataset_name,
+                record_id=record_id,
+                field_name=field_name,
+                extraction_status="unreadable",
+                normalized_value_withheld=normalized_value_withheld,
                 source_refs=refs,
             )
         )
@@ -723,6 +785,18 @@ class PersonalDetailOCRCorrectionOverlay:
         )
         if ref is None:
             return None
+        logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
+        self._targeted_requests += 1
+        if callable(self._full_page_ocr_loader):
+            repaired = self._repair_from_full_page(
+                original,
+                role=role,
+                ref=ref,
+                refs=refs,
+                logical_page=logical_page,
+            )
+            if repaired is not None:
+                return repaired
         if self._page_image_resolver is None:
             from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
                 PersonalDetailLogicalPageImageResolver,
@@ -732,7 +806,6 @@ class PersonalDetailOCRCorrectionOverlay:
                 self.parse_result,
                 zoom=3.0,
             )
-        logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
         rendered = self._page_image_resolver(logical_page)
         if not rendered:
             return None
@@ -742,7 +815,6 @@ class PersonalDetailOCRCorrectionOverlay:
             self._repair_engine = LocalOCRRepairEngine()
         from docmirror.evidence.repair import RepairRequest
 
-        self._targeted_requests += 1
         request_id = f"personal_detail:{logical_page}:{self._targeted_requests:04d}"
         request = RepairRequest(
             request_id=request_id,
@@ -784,6 +856,70 @@ class PersonalDetailOCRCorrectionOverlay:
             candidates=tuple(dict.fromkeys(value for _score, value in valid)),
         )
         return selected, decision
+
+    def _repair_from_full_page(
+        self,
+        original: str,
+        *,
+        role: str,
+        ref: dict[str, Any],
+        refs: tuple[dict[str, Any], ...],
+        logical_page: int,
+    ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
+        """Select a typed value from one cached complete-page OCR pass.
+
+        The source bbox is used only to associate the already page-wide OCR
+        result with its schema-assigned field.  OCR itself is never rerun on a
+        crop here.
+        """
+        pages = self._full_page_ocr_loader(
+            {logical_page},
+            reason=f"schema_role_repair:{role}",
+        )
+        target = tuple(float(item) for item in ref.get("bbox") or ())
+        if len(target) != 4:
+            return None
+        candidates: list[tuple[float, str]] = []
+        for page in pages or ():
+            if int(page.get("page") or 0) != logical_page:
+                continue
+            selected: list[tuple[float, float, str, float]] = []
+            for line in page.get("lines") or ():
+                if not isinstance(line, dict):
+                    continue
+                bbox = line.get("bbox")
+                text = str(line.get("text") or line.get("content") or "").strip()
+                if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                    continue
+                candidate_box = tuple(float(item) for item in bbox)
+                if not _boxes_associate(target, candidate_box):
+                    continue
+                confidence = float(line.get("confidence") or 0.0)
+                selected.append((candidate_box[1], candidate_box[0], text, confidence))
+                normalized = _normalize_role(text, role)
+                if _is_valid_for_role(normalized, role):
+                    candidates.append((confidence, normalized))
+            if selected:
+                joined = " ".join(item[2] for item in sorted(selected))
+                normalized = _normalize_role(joined, role)
+                if _is_valid_for_role(normalized, role):
+                    candidates.append((min(item[3] for item in selected), normalized))
+        valid = sorted(candidates, reverse=True)
+        if not valid or valid[0][0] < 0.72:
+            return None
+        if len(valid) > 1 and valid[0][1] != valid[1][1] and valid[0][0] - valid[1][0] < 0.08:
+            return None
+        selected = valid[0][1]
+        return selected, self._record(
+            role=role,
+            original=original,
+            corrected=selected,
+            method="full_page_ocr_role_reparse",
+            reason_codes=("complete_logical_page_rerendered", "schema_role_validation", "candidate_margin"),
+            confidence=valid[0][0],
+            refs=refs,
+            candidates=tuple(dict.fromkeys(value for _score, value in valid)),
+        )
 
     @staticmethod
     def _line_role(text: str) -> str | None:
@@ -836,9 +972,60 @@ class PersonalDetailOCRCorrectionOverlay:
     def correct_business_candidates(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
         corrected = deepcopy(dict(payload))
         self._walk(corrected, parent="", refs=(), stage=stage)
+        self._enforce_cross_field_contracts(corrected, stage=stage)
         self._apply_institution_consensus(corrected)
         self._promote_account_identifier_candidates(corrected)
         return corrected
+
+    def enforce_cross_field_contracts(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
+        """Validate merged records without replaying all single-field corrections."""
+        corrected = deepcopy(dict(payload))
+        self._enforce_cross_field_contracts(corrected, stage=stage)
+        return corrected
+
+    def _enforce_cross_field_contracts(self, payload: dict[str, Any], *, stage: str) -> None:
+        """Withhold individually valid values that violate the dataset schema."""
+        for index, record in enumerate(payload.get("credit_lines") or [], start=1):
+            if not isinstance(record, dict):
+                continue
+            pools = [record]
+            if isinstance(record.get("normalized"), dict):
+                pools.append(record["normalized"])
+            original: Any | None = None
+            for pool in pools:
+                try:
+                    total_limit = Decimal(str(pool.get("total_limit")))
+                    used_limit = Decimal(str(pool.get("used_limit")))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if total_limit < 0 or used_limit < 0 or used_limit <= total_limit:
+                    continue
+                if original is None:
+                    original = pool.get("used_limit")
+                pool["used_limit"] = None
+                if "used_limit_status" in pool:
+                    pool["used_limit_status"] = "unknown"
+            if original is None:
+                continue
+            refs = _source_refs(record.get("source_refs"))
+            record_id = str(record.get("record_id") or record.get("credit_line_id") or f"row:{index}")
+            self._audit_cell(
+                stage=stage,
+                path=f"credit_lines[{record_id}].used_limit",
+                role="amount",
+                dataset_name="credit_lines",
+                record_id=record_id,
+                field_name="used_limit",
+                value=original,
+                refs=refs,
+                valid=False,
+                normalized_value_withheld=True,
+                reason_codes=(
+                    "cross_field_contract_failed",
+                    "used_limit_exceeds_total_limit",
+                    "normalized_value_withheld",
+                ),
+            )
 
     def _walk(
         self,
@@ -856,13 +1043,9 @@ class PersonalDetailOCRCorrectionOverlay:
             return
         local_refs = _source_refs(value.get("source_refs")) or refs
         confidence = value.get("confidence")
-        node_id = str(
-            value.get("record_id")
-            or value.get("summary_cell_id")
-            or value.get("account_id")
-            or ""
-        )
+        node_id = str(value.get("record_id") or value.get("summary_cell_id") or value.get("account_id") or "")
         base_path = f"{parent}[{node_id}]" if node_id else str(parent or "")
+        dataset_name = str(parent or "").split(".", 1)[0].split("[", 1)[0]
         for key, item in list(value.items()):
             field_path = f"{base_path}.{key}".lstrip(".")
             role = _mapping_role(value, str(key))
@@ -870,7 +1053,8 @@ class PersonalDetailOCRCorrectionOverlay:
                 cell_target = (
                     stage == "native_business"
                     and _cell_scoped(local_refs)
-                    and role in {
+                    and role
+                    in {
                         "account_type_label",
                         "amount_or_placeholder",
                         "integer_or_placeholder",
@@ -884,7 +1068,8 @@ class PersonalDetailOCRCorrectionOverlay:
                     allow_targeted_ocr=len(local_refs) == 1
                     and (
                         cell_target
-                        or role in {
+                        or role
+                        in {
                             "identity_document_number",
                             "report_datetime",
                             "date",
@@ -895,13 +1080,23 @@ class PersonalDetailOCRCorrectionOverlay:
                 if decision is not None:
                     value[key] = updated
                 final_value = value[key]
+                valid = _is_valid_for_role(str(final_value), role)
+                withhold_invalid = bool(
+                    not valid and stage == "native_business" and len(local_refs) == 1 and _cell_scoped(local_refs)
+                )
+                if withhold_invalid:
+                    value[key] = None
                 self._audit_cell(
                     stage=stage,
                     path=field_path,
                     role=role,
+                    dataset_name=dataset_name,
+                    record_id=node_id,
+                    field_name=str(key),
                     value=final_value,
                     refs=local_refs,
-                    valid=_is_valid_for_role(str(final_value), role),
+                    valid=valid,
+                    normalized_value_withheld=withhold_invalid,
                 )
             elif isinstance(item, dict) and role and item.get("value") not in (None, ""):
                 nested_refs = _source_refs(item.get("source_refs")) or local_refs
@@ -910,19 +1105,30 @@ class PersonalDetailOCRCorrectionOverlay:
                     role=role,
                     source_refs=nested_refs,
                     confidence=float(item.get("confidence") or confidence or 0.0),
-                    allow_targeted_ocr=role
-                    in {"identity_document_number", "report_datetime", "date", "date_or_month"},
+                    allow_targeted_ocr=role in {"identity_document_number", "report_datetime", "date", "date_or_month"},
                 )
                 if decision is not None:
                     item.setdefault("raw", item["value"])
                     item["value"] = updated
+                final_value = item["value"]
+                valid = _is_valid_for_role(str(final_value), role)
+                withhold_invalid = bool(
+                    not valid and stage == "native_business" and len(nested_refs) == 1 and _cell_scoped(nested_refs)
+                )
+                if withhold_invalid:
+                    item.setdefault("raw", final_value)
+                    item["value"] = None
                 self._audit_cell(
                     stage=stage,
                     path=f"{field_path}.value",
                     role=role,
-                    value=item["value"],
+                    dataset_name=dataset_name,
+                    record_id=node_id,
+                    field_name=str(key),
+                    value=final_value,
                     refs=nested_refs,
-                    valid=_is_valid_for_role(str(item["value"]), role),
+                    valid=valid,
+                    normalized_value_withheld=withhold_invalid,
                 )
             if isinstance(item, (dict, list)) and str(key) not in _RAW_OR_PROVENANCE_KEYS:
                 self._walk(item, parent=field_path, refs=local_refs, stage=stage)
@@ -942,18 +1148,28 @@ class PersonalDetailOCRCorrectionOverlay:
 
         collect(payload)
         counts = Counter(normalize_institution_name(item) for _owner, _key, item in fields)
-        references = [name for name, count in counts.items() if count >= 1 and _is_valid_for_role(name, "institution_name")]
+        references = [
+            name for name, count in counts.items() if count >= 1 and _is_valid_for_role(name, "institution_name")
+        ]
         for owner, key, original in fields:
             current = normalize_institution_name(original)
             scored = sorted(
-                ((SequenceMatcher(None, current, candidate).ratio(), counts[candidate], candidate) for candidate in references),
+                (
+                    (SequenceMatcher(None, current, candidate).ratio(), counts[candidate], candidate)
+                    for candidate in references
+                ),
                 reverse=True,
             )
             if not scored:
                 continue
             best_score, best_count, best = scored[0]
             runner_score = scored[1][0] if len(scored) > 1 else 0.0
-            if best != current and best_score >= 0.94 and best_score - runner_score >= 0.015 and best_count >= counts[current]:
+            if (
+                best != current
+                and best_score >= 0.94
+                and best_score - runner_score >= 0.015
+                and best_count >= counts[current]
+            ):
                 owner[key] = best
                 self._record(
                     role="institution_name",

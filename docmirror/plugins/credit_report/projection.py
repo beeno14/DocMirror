@@ -115,11 +115,7 @@ def _source_page_range(record: dict[str, Any]) -> list[int]:
             for key, item in value.items():
                 normalized_key = str(key).casefold()
                 if normalized_key == "page_range" and isinstance(item, (list, tuple)):
-                    pages.extend(
-                        page
-                        for candidate in item
-                        if (page := _page_number(candidate)) is not None
-                    )
+                    pages.extend(page for candidate in item if (page := _page_number(candidate)) is not None)
                 elif normalized_key in _SOURCE_PAGE_KEYS:
                     page = _page_number(item)
                     if page is not None:
@@ -328,9 +324,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         repayment_records,
         credit_accounts,
         micro_grid_structures_from_domain_specific(source_domain),
-        reading_order_by_logical=dict(
-            getattr(variant_input, "reading_order_by_logical", {}) or {}
-        ),
+        reading_order_by_logical=dict(getattr(variant_input, "reading_order_by_logical", {}) or {}),
         force_relink=variant.variant_id == "personal_detail_scanned",
     )
     assembled = variant.assemble_business(
@@ -339,7 +333,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         content_mode=content_mode,
         existing_collections={
             "credit_accounts": credit_accounts,
-            "credit_lines": [],
+            "credit_lines": list(scanned_business.get("credit_lines") or []),
             "repayment_liability_records": list(scanned_business.get("repayment_liability_records") or []),
             "repayment_records": repayment_records,
             "overdue_records": [],

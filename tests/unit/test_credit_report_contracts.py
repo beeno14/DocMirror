@@ -3,6 +3,7 @@
 
 """Cross-variant credit-report schema integrity tests."""
 
+from docmirror.models.schemas.registry import _personal_detail_invariant_errors
 from docmirror.plugins.credit_report.contracts import CONTENT_MODE_SCANNED
 from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
     _summary_value,
@@ -29,6 +30,37 @@ def test_scanned_content_mode_uses_the_runtime_vocabulary() -> None:
     enums = credit_report_data_dictionary()["enums"]["content_mode"]
     assert CONTENT_MODE_SCANNED in enums
     assert "scanned" not in enums
+
+
+def test_nonempty_personal_detail_dataset_may_be_explicitly_partial() -> None:
+    payload = {
+        "document": {"domain_schema": {"id": "personal_credit_report_detailed"}},
+        "datasets": [
+            {"name": "personal_profile", "row_count": 0, "rows": []},
+            {"name": "personal_detail_field_observations", "row_count": 0, "rows": []},
+            {
+                "name": "credit_lines",
+                "row_count": 1,
+                "rows": [{"record_id": "credit_line:1", "normalized": {"credit_line_id": "credit_line:1"}}],
+            },
+            {
+                "name": "personal_detail_dataset_status",
+                "row_count": 1,
+                "rows": [
+                    {
+                        "record_id": "dataset_status:credit_lines",
+                        "normalized": {
+                            "dataset_name": "credit_lines",
+                            "observed_row_count": 1,
+                            "presence_status": "partial",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    assert _personal_detail_invariant_errors(payload) == ()
 
 
 def test_summary_numeric_values_require_complete_decimal_lexemes() -> None:
@@ -111,11 +143,9 @@ def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_un
     assert semantic["domain_schema"]["version"] == "1.2.0"
     assert semantic["presentation_policy"]["enhanced_markdown_display"] == "full"
     assert semantic["personal_detail_contract"]["uncertainty_coverage"]["mode"] == (
-        "scoped_exhaustive"
+        "potentially_flawed_only"
     )
-    assert dictionary["datasets"]["repayment_records"]["columns"]["status"]["enum_ref"] == (
-        "repayment_status_code"
-    )
+    assert dictionary["datasets"]["repayment_records"]["columns"]["status"]["enum_ref"] == ("repayment_status_code")
 
 
 def test_personal_detail_contract_projects_values_without_inventing_absence() -> None:
@@ -201,11 +231,10 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
     assert profile["birth_date"] == "1980-11-04"
 
     observations = {row["field_name"]: row for row in datasets["personal_detail_field_observations"]}
-    assert observations["gender"]["observation_status"] == "observed"
-    assert observations["birth_date"]["observation_status"] == "normalized"
+    assert "gender" not in observations
+    assert "birth_date" not in observations
     assert observations["work_phone"]["observation_status"] == "not_observed"
     assert observations["work_phone"]["confidence_status"] == "not_available"
-    assert observations["birth_date"]["normalized_value"] == "1980-11-04"
 
     metrics = datasets["personal_detail_credit_summary_metrics"]
     account_count = next(row for row in metrics if row["metric_name"] == "账户数")
@@ -221,10 +250,9 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
     assert housing_fund["monthly_contribution"] == 3000
 
     statuses = {row["dataset_name"]: row for row in datasets["personal_detail_dataset_status"]}
-    assert statuses["public_records"]["presence_status"] == "observed_nonempty"
-    assert statuses["credit_accounts"]["observed_row_count"] == 15
-    assert statuses["inquiry_records"]["observed_row_count"] == 12
+    assert "public_records" not in statuses
+    assert "credit_accounts" not in statuses
+    assert "inquiry_records" not in statuses
     assert statuses["mobile_phone_records"]["presence_status"] == "not_observed"
     assert statuses["mobile_phone_records"]["reason"] == "no_explicit_absence_evidence"
-    assert statuses["spouse_records"]["presence_status"] == "explicitly_empty"
-    assert statuses["spouse_records"]["source_statement"] == "配偶信息：无"
+    assert "spouse_records" not in statuses

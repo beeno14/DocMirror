@@ -635,7 +635,7 @@ def _project_dataset_status(
     status_rows: list[dict[str, Any]],
     projected: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """Build one schema-native status row per v2 business dataset."""
+    """Build sparse schema-native status rows for potentially flawed datasets."""
     indexed: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
     for record in status_rows:
         if not isinstance(record, dict):
@@ -657,30 +657,33 @@ def _project_dataset_status(
         source_presence = {
             str(values.get("presence_status") or "") for values in source_values
         }
-        if observed_count:
-            presence_status = "observed_nonempty"
-            reason = "records_projected"
-        elif "extraction_failed" in source_presence:
+        if "extraction_failed" in source_presence:
             presence_status = "extraction_failed"
             reason = "source_extraction_failed"
         elif "partial" in source_presence:
             presence_status = "partial"
             reason = "source_partially_observed"
+        elif "unknown" in source_presence:
+            presence_status = "unknown"
+            reason = "source_status_unknown"
+        elif observed_count:
+            presence_status = "observed_nonempty"
+            reason = "records_projected"
         elif source_presence and source_presence <= {"not_applicable"}:
             presence_status = "not_applicable"
             reason = "source_not_applicable"
         elif source_presence and source_presence <= {"explicitly_empty"}:
             presence_status = "explicitly_empty"
             reason = "source_explicitly_empty"
-        elif "unknown" in source_presence:
-            presence_status = "unknown"
-            reason = "source_status_unknown"
         elif source_values:
             presence_status = "not_observed"
             reason = "no_records_for_projected_dataset"
         else:
             presence_status = "not_observed"
             reason = "no_source_status_mapping"
+
+        if presence_status not in {"not_observed", "partial", "extraction_failed", "unknown"}:
+            continue
 
         status_id = f"dataset_status:{target}"
         normalized: dict[str, Any] = {

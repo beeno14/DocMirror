@@ -407,10 +407,12 @@ def test_personal_detail_sample_uses_canonical_typed_datasets() -> None:
         row["normalized"]["dataset_name"]: row["normalized"]
         for row in datasets["personal_detail_dataset_status"]["rows"]
     }
-    assert statuses["credit_accounts"]["observed_row_count"] == 15
-    assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
-    assert statuses["inquiry_records"]["observed_row_count"] == 12
-    assert statuses["inquiry_records"]["presence_status"] == "observed_nonempty"
+    assert "credit_accounts" not in statuses
+    assert "inquiry_records" not in statuses
+    assert all(
+        row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for row in statuses.values()
+    )
 
     annotations = [row["normalized"]["text"] for row in datasets["annotations"]["rows"]]
     assert annotations == [

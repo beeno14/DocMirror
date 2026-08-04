@@ -46,7 +46,6 @@ _LIABILITY_FIELDS = frozenset(
         "responsibility_amount",
         "guarantee_amount",
         "balance",
-        "currency",
         "effective_date",
         "expiration_date",
         "data_provider",
@@ -82,9 +81,7 @@ def _issue_id(payload: Mapping[str, Any]) -> str:
             "source_refs",
         )
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:20]
+    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     return f"personal_detail_extraction_issue:{digest}"
 
 
@@ -192,14 +189,21 @@ def _ocr_audit_issues(context: Any) -> list[dict[str, Any]]:
         if not isinstance(anomaly, Mapping):
             continue
         path = str(anomaly.get("path") or "")
+        withheld = bool(anomaly.get("normalized_value_withheld"))
         result.append(
             make_issue(
                 category="ocr_cell_level_error",
                 issue_code="pboc_cell_contract_unresolved",
-                message="The OCR value does not satisfy its PBOC field contract; the value was preserved for review.",
+                message=(
+                    "The OCR value does not satisfy its PBOC field contract; the normalized value was withheld "
+                    "and the raw observation was retained for review."
+                    if withheld
+                    else "The OCR value does not satisfy its PBOC field contract; the value was preserved for review."
+                ),
                 parser_stage=str(anomaly.get("stage") or "ocr_correction"),
-                target_dataset=_dataset_from_path(path),
-                field_name=str(anomaly.get("role") or "") or None,
+                target_dataset=str(anomaly.get("dataset_name") or "") or _dataset_from_path(path),
+                target_record_id=str(anomaly.get("record_id") or "") or None,
+                field_name=str(anomaly.get("field_name") or anomaly.get("role") or "") or None,
                 observed_value=anomaly.get("value"),
                 source_refs=anomaly.get("source_refs") or (),
                 reason_codes=anomaly.get("reason_codes") or (),
@@ -256,16 +260,21 @@ def _topology_issues(context: Any) -> list[dict[str, Any]]:
         result.append(
             make_issue(
                 category="page_continuation",
-                issue_code="footer_confirmed_missing_spread_half_recovered",
+                issue_code="split_result_subpage_recovered",
                 message=(
-                    "The sealed ParseResult omitted one spread half; the plugin recovered it with the core splitter "
-                    "and confirmed its printed PBOC footer without modifying the ParseResult."
+                    "The plugin recovered a logical subpage from the core splitter's two-slice result without "
+                    "modifying the sealed ParseResult; printed footer evidence is optional corroboration."
                 ),
                 severity="info",
                 status="resolved",
                 parser_stage="supplemental_page_recovery",
                 observed_value=dict(recovery),
-                reason_codes=("parseresult_page_missing", "core_splitter_recovery", "printed_footer_confirmed"),
+                reason_codes=(
+                    "parseresult_subpage_missing_or_unsplit",
+                    "core_splitter_recovery",
+                    "split_geometry_authoritative",
+                    *("printed_footer_corroborated" for _ in [0] if recovery.get("printed_confirmation")),
+                ),
             )
         )
     return result
@@ -295,14 +304,15 @@ def dataset_states_from_issues(
     for issue in issues:
         dataset_name = str(issue.get("target_dataset") or "")
         issue_code = str(issue.get("issue_code") or "")
-        if (
-            not dataset_name
-            or str(issue.get("status") or "") in _NON_DEGRADING_STATUSES
-            or issue_code not in _ROW_BLOCKING_ISSUE_CODES
-        ):
+        if not dataset_name or str(issue.get("status") or "") in _NON_DEGRADING_STATUSES:
+            continue
+        reason_codes = {str(value) for value in issue.get("reason_codes") or ()}
+        row_blocking = issue_code in _ROW_BLOCKING_ISSUE_CODES
+        value_withheld = "normalized_value_withheld" in reason_codes
+        if not row_blocking and not value_withheld:
             continue
         current = states.get(dataset_name)
-        status = "extraction_failed"
+        status = "extraction_failed" if row_blocking else "partial"
         if current and current.get("presence_status") == "extraction_failed":
             continue
         states[dataset_name] = {
