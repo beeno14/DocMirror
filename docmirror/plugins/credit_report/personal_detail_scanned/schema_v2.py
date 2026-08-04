@@ -837,6 +837,17 @@ def project_personal_detail_v2_datasets(
                     value=values.get("value"),
                 )
             )
+    for index, record in enumerate(source.get("personal_detail_extraction_issues") or [], start=1):
+        values = _normalized(record)
+        extensions.append(
+            _extension_record(
+                "personal_detail_extraction_issues",
+                record,
+                index,
+                field_name=str(values.get("issue_code") or "extraction_issue"),
+                value=values,
+            )
+        )
     if extensions:
         projected["pboc_extension_fields"] = extensions
 
@@ -1283,6 +1294,8 @@ def personal_detail_v2_semantic_extensions() -> dict[str, Any]:
             "annotation_statement_groups": ["statements", "annotations"],
             "annotation_statements": ["statements", "annotations"],
             "inquiries": ["inquiries"],
+            "pboc_extension_fields": ["extraction_review"],
+            "dataset_status": ["extraction_review"],
         },
     }
     assert set(semantic["dataset_reading_columns"]) <= set(dictionary["datasets"])

@@ -87,6 +87,39 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             existing_summary=existing_summary,
             variant_input=variant_input,
         )
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            liability_record_is_substantive,
+            make_issue,
+            record_issue,
+        )
+
+        liability_rows: list[dict[str, Any]] = []
+        for index, record in enumerate(assembled.get("repayment_liability_records") or [], start=1):
+            if not isinstance(record, dict):
+                continue
+            if liability_record_is_substantive(record):
+                liability_rows.append(record)
+                continue
+            record_issue(
+                variant_input,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="identifier_only_liability_row_suppressed",
+                    message=(
+                        "A compatibility extractor produced a repayment-responsibility row with no "
+                        "business fields; the redundant row was suppressed."
+                    ),
+                    severity="info",
+                    status="suppressed_redundant",
+                    parser_stage="business_assembly",
+                    target_dataset="repayment_liability_records",
+                    target_record_id=str(record.get("record_id") or f"row:{index}"),
+                    source_refs=record.get("source_refs") or (),
+                    reason_codes=("no_substantive_liability_field", "canonical_row_guard"),
+                ),
+            )
+        if liability_rows or assembled.get("repayment_liability_records"):
+            assembled["repayment_liability_records"] = liability_rows
         accounts = [account for account in assembled.get("credit_accounts") or [] if isinstance(account, dict)]
         valid_account_ids = {str(account.get("account_id") or "") for account in accounts if account.get("account_id")}
         repayment_records = [
@@ -264,10 +297,25 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             if callable(cached)
             else extract_personal_detail_section_content(parse_result, full_text)
         )
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            ISSUE_DATASET,
+            collect_extraction_issues,
+            dataset_states_from_issues,
+        )
+
+        issues = collect_extraction_issues(parse_result)
         facts = content.setdefault("facts", {})
+        states = facts.setdefault("personal_detail_dataset_states", {})
+        if not isinstance(states, dict):
+            states = {}
+            facts["personal_detail_dataset_states"] = states
+        for dataset_name, state in dataset_states_from_issues(issues).items():
+            states.setdefault(dataset_name, state)
         if not facts.get("subject_profile") and isinstance(auxiliary.get("subject_profile"), dict):
             facts["subject_profile"] = deepcopy(auxiliary["subject_profile"])
         datasets = content.setdefault("datasets", {})
+        if issues:
+            datasets[ISSUE_DATASET] = issues
         for name in ("residence_records", "employment_records", "statements", "annotations"):
             if not datasets.get(name) and auxiliary.get(name):
                 datasets[name] = list(auxiliary[name])
@@ -361,6 +409,15 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                     "page_end": 15,
                 },
             )
+        sections += (
+            {
+                "id": "sec_extraction_review",
+                "title": "提取问题与人工复核",
+                "type": "extraction_review",
+                "page_start": 1,
+                "page_end": page_count,
+            },
+        )
         return sections
 
     def semantic_extensions(self) -> dict[str, Any]:

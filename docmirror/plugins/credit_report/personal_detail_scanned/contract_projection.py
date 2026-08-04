@@ -604,6 +604,7 @@ def apply_personal_detail_contract(
     for dataset_name in (
         "personal_profile",
         "personal_detail_field_observations",
+        "personal_detail_extraction_issues",
         "personal_detail_credit_summary_metrics",
         "tax_arrears_records",
         "civil_judgment_records",
