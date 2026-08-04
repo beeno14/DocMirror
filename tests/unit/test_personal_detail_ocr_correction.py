@@ -59,9 +59,7 @@ def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
 
 def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -> None:
     assert normalize_institution_name("重庆蚂蚊消费金融有限公司 Ss") == "重庆蚂蚁消费金融有限公司"
-    assert normalize_institution_name("福 中信银行股份有限公司个人信贷部") == (
-        "中信银行股份有限公司个人信贷部"
-    )
+    assert normalize_institution_name("福 中信银行股份有限公司个人信贷部") == ("中信银行股份有限公司个人信贷部")
     assert normalize_institution_name("未知机构名称") == "未知机构名称"
     assert normalize_institution_name("新疆样例银行股份有限公司乌鲁木齐分行") == (
         "新疆样例银行股份有限公司乌鲁木齐分行"
@@ -100,7 +98,13 @@ def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() 
                 "row_index": 1,
                 "column_index": 3,
                 "value": "*-",
-                "source_refs": [{"logical_page": 3, "bbox": [40, 20, 50, 40]}],
+                "source_refs": [
+                    {
+                        "logical_page": 3,
+                        "bbox": [40, 20, 50, 40],
+                        "geometry_scope": "cell",
+                    }
+                ],
             },
         ]
     }
@@ -112,11 +116,43 @@ def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() 
     cells = corrected["personal_detail_summary_cells"]
     assert cells[0]["value"] == "循环贷账户一"
     assert cells[1]["value"] == "2"
-    assert cells[2]["value"] == "*-"
+    assert cells[2]["value"] is None
     assert audit["audited_cell_count"] >= 3
     assert audit["abnormal_cell_count"] == 1
     assert audit["cell_anomalies"][0]["role"] == "amount_or_placeholder"
     assert audit["cell_anomalies"][0]["value"] == "*-"
+    assert audit["cell_anomalies"][0]["normalized_value_withheld"] is True
+
+
+def test_credit_line_cross_field_contract_withholds_impossible_used_limit() -> None:
+    overlay = _overlay()
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "credit_lines": [
+                {
+                    "credit_line_id": "credit_line:1",
+                    "total_limit": 100,
+                    "used_limit": 108000,
+                    "normalized": {
+                        "total_limit": "100",
+                        "used_limit": "108000",
+                        "used_limit_status": "reported",
+                    },
+                    "source_refs": [{"logical_page": 20, "geometry_scope": "table"}],
+                }
+            ]
+        },
+        stage="native_business",
+    )
+
+    assert corrected["credit_lines"][0]["used_limit"] is None
+    assert corrected["credit_lines"][0]["normalized"]["used_limit"] is None
+    assert corrected["credit_lines"][0]["normalized"]["used_limit_status"] == "unknown"
+    anomaly = next(item for item in overlay.audit()["cell_anomalies"] if item["field_name"] == "used_limit")
+    assert anomaly["value"] == "108000"
+    assert "used_limit_exceeds_total_limit" in anomaly["reason_codes"]
+    assert anomaly["normalized_value_withheld"] is True
 
 
 def test_count_roles_remove_only_canonical_display_units() -> None:
@@ -165,7 +201,7 @@ def test_summary_source_ref_prefers_exact_cell_geometry() -> None:
         bbox=[0, 0, 100, 100],
         metadata={
             "cell_bboxes": [[[1, 2, 3, 4], [5, 6, 7, 8]]],
-            "cell_evidence_ids": [[['ocr:1'], ['ocr:2']]],
+            "cell_evidence_ids": [[["ocr:1"], ["ocr:2"]]],
         },
     )
 
@@ -218,13 +254,19 @@ def test_inquiry_row_correction_handles_typed_date_and_reason_confusions() -> No
         "4 2022.1214 平安普惠融资担保有限公司 担保资格审查",
         role="inquiry_row",
     )
+    financing, financing_decision = overlay.correct_text(
+        "101 2023.01.06 平安国际融资租赁（天津）有限公司 磁资审批",
+        role="inquiry_row",
+    )
 
     assert corrected == "12 2025.03.20 福鼎市农村信用合作联社 信用卡审批"
     assert reason_corrected == "19 2020.12.12 深圳市中融小额贷款有限公司 贷款审批"
     assert compact_date == "4 2022.12.14 平安普惠融资担保有限公司 担保资格审查"
+    assert financing == "101 2023.01.06 平安国际融资租赁(天津)有限公司 融资审批"
     assert decision is not None
     assert reason_decision is not None
     assert compact_date_decision is not None
+    assert financing_decision is not None
 
 
 def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences() -> None:
@@ -236,6 +278,7 @@ def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences(
                 {"text": "1 2024.03.08 泉州银行股份有限公司 贷后管理", "confidence": 0.99},
                 {"text": "2024,02.16 中邮消费金融有限公司 费后管理", "confidence": 0.95},
                 {"text": "3 2024.02.13 重庆蚂蚊消费金融有限公司 Ss 贷后管理", "confidence": 0.90},
+                {"text": "4 2024.01.13 中国平安财产保险股份有限公司 保后管理", "confidence": 0.92},
                 {"text": "1 2024.01.15 本人 本人查询(自助查询机)", "confidence": 0.98},
             ],
         }
@@ -248,11 +291,69 @@ def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences(
 
     records = _extract_inquiries(parse_result)
 
-    assert len(records) == 4
-    assert [record["sequence"] for record in records if record["inquiry_type"] == "institution"] == [1, 2, 3]
+    assert len(records) == 5
+    assert [record["sequence"] for record in records if record["inquiry_type"] == "institution"] == [1, 2, 3, 4]
     assert [record["sequence"] for record in records if record["inquiry_type"] == "personal"] == [1]
     corrected = overlay.correct_business_candidates({"inquiry_records": records}, stage="test")
     assert corrected["inquiry_records"][2]["institution"] == "重庆蚂蚁消费金融有限公司"
+
+
+def test_inquiry_extraction_reconstructs_full_page_ocr_cells_by_date_row() -> None:
+    pages = [
+        {
+            "page": 35,
+            "source_page": 18,
+            "lines": [
+                {"text": "1", "confidence": 0.99, "bbox": [10, 100, 20, 120]},
+                {"text": "2024.08.12", "confidence": 0.99, "bbox": [80, 100, 150, 120]},
+                {"text": "样例银行股份有限公司", "confidence": 0.98, "bbox": [210, 100, 350, 120]},
+                {"text": "担保资格审查", "confidence": 0.97, "bbox": [410, 100, 500, 120]},
+                {"text": "2", "confidence": 0.99, "bbox": [10, 140, 20, 160]},
+                {"text": "2024.08.02", "confidence": 0.99, "bbox": [80, 140, 150, 160]},
+                {"text": "样例保险股份有限公司", "confidence": 0.98, "bbox": [210, 140, 350, 160]},
+                {"text": "保后管理", "confidence": 0.97, "bbox": [410, 140, 480, 160]},
+            ],
+        }
+    ]
+    parse_result = SimpleNamespace(corrected_evidence_pages=lambda: pages, pages=[])
+
+    records = _extract_inquiries(parse_result)
+
+    assert [(record["sequence"], record["inquiry_date"], record["reason"]) for record in records] == [
+        (1, "2024-08-12", "担保资格审查"),
+        (2, "2024-08-02", "保后管理"),
+    ]
+    assert records[0]["institution"] == "样例银行股份有限公司"
+
+
+def test_inquiry_extraction_excludes_report_header_query_request() -> None:
+    pages = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                {
+                    "text": "2024.08.17 被查询者姓名 曾耀 查询机构 征信中心 查询原因 本人查询",
+                    "confidence": 0.99,
+                }
+            ],
+        },
+        {
+            "page": 35,
+            "source_page": 18,
+            "lines": [
+                {"text": "四 查询记录 机构查询记录明细", "confidence": 0.99},
+                {"text": "1 2024.08.12 样例银行股份有限公司 担保资格审查", "confidence": 0.99},
+            ],
+        },
+    ]
+    parse_result = SimpleNamespace(corrected_evidence_pages=lambda: pages, pages=[])
+
+    records = _extract_inquiries(parse_result)
+
+    assert len(records) == 1
+    assert records[0]["inquiry_type"] == "institution"
+    assert records[0]["inquiry_date"] == "2024-08-12"
 
 
 def test_inquiry_sequences_preserve_gaps_but_repair_duplicate_ocr_ordinals() -> None:
@@ -381,6 +482,46 @@ def test_targeted_crop_ocr_only_adopts_a_typed_valid_candidate() -> None:
     assert corrected == "11010519491231002X"
     assert decision is not None
     assert decision.method == "targeted_crop_ocr_consensus"
+    assert overlay.audit()["targeted_ocr_requests"] == 1
+
+
+def test_complete_page_ocr_precedes_crop_repair_for_schema_assigned_field() -> None:
+    calls: list[tuple[set[int], str]] = []
+
+    def full_page_loader(pages: set[int], *, reason: str):
+        calls.append((pages, reason))
+        return [
+            {
+                "page": 1,
+                "lines": [
+                    {
+                        "text": "11010519491231002X",
+                        "confidence": 0.96,
+                        "bbox": [1, 1, 20, 10],
+                    }
+                ],
+            }
+        ]
+
+    overlay = PersonalDetailOCRCorrectionOverlay(
+        SimpleNamespace(),
+        page_image_resolver=_FakeResolver(),
+        full_page_ocr_loader=full_page_loader,
+        repair_engine=_FakeRepairEngine(),
+        enable_targeted_ocr=True,
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=({"logical_page": 1, "bbox": [1, 1, 20, 10]},),
+        allow_targeted_ocr=True,
+    )
+
+    assert corrected == "11010519491231002X"
+    assert decision is not None
+    assert decision.method == "full_page_ocr_role_reparse"
+    assert calls == [({1}, "schema_role_repair:identity_document_number")]
     assert overlay.audit()["targeted_ocr_requests"] == 1
 
 

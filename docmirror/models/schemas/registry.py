@@ -183,8 +183,13 @@ def _personal_detail_invariant_errors(payload: dict[str, Any]) -> tuple[str, ...
         actual_count = len((target or {}).get("rows") or [])
         if int(status.get("observed_row_count") or 0) != actual_count:
             errors.append(f"{dataset_name}: dataset-status observed_row_count mismatch")
-        if actual_count and status.get("presence_status") != "observed_nonempty":
-            errors.append(f"{dataset_name}: nonempty dataset must be observed_nonempty")
+        if actual_count and status.get("presence_status") not in {
+            "observed_nonempty",
+            "partial",
+            "unknown",
+            "extraction_failed",
+        }:
+            errors.append(f"{dataset_name}: nonempty dataset must be observed or explicitly uncertain")
 
     for dataset_name, dataset in by_name.items():
         for foreign_key in dataset.get("foreign_keys") or []:

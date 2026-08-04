@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
@@ -23,6 +24,41 @@ from docmirror.plugins.credit_report.scanned_business import (
 )
 from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_accounts
 from docmirror.plugins.credit_report.shared.entity_decoder import CreditReportUnit
+
+
+def test_split_replay_has_an_independent_full_page_ocr_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    context._page_ocr_max_requests = 1
+    context._page_ocr_requests = [{"logical_page": 1, "status": "completed"}]
+    context._supplemental_ocr_cache = {}
+    context._page_image_resolver = SimpleNamespace(
+        supplemental_spread_slices=lambda _pages: [
+            {
+                "supplemental_page_id": "source:2:segment:1:split",
+                "source_page": 2,
+                "segment_index": 1,
+                "image": np.zeros((100, 80, 3), dtype=np.uint8),
+                "zoom": 1.0,
+                "subpage_basis": "core_split_result",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.context._complete_page_ocr",
+        lambda image: (
+            [{"text": "查询记录", "confidence": 0.99, "bbox": [1, 2, 70, 20]}],
+            image,
+            0,
+            0.0,
+            1.0,
+        ),
+    )
+
+    pages = context.supplemental_page_ocr_evidence([2], reason="split_result_topology_replay")
+
+    assert len(pages) == 1
+    assert pages[0]["source_page"] == 2
+    assert len(context._page_ocr_requests) == 2
 
 
 def _unit(
@@ -301,6 +337,30 @@ def test_native_account_extraction_obeys_cross_page_entity_veto() -> None:
     assert accounts[0]["balance"] == 100
 
 
+def test_native_account_extraction_rejects_repayment_liability_table() -> None:
+    liability = SimpleNamespace(
+        table_id="repayment-liability",
+        metadata={
+            "raw_rows": [
+                ["管理机构", "账户标识", "责任人类型", "还款责任金额", "保证合同编号"],
+                ["样例银行", "A1", "保证人", "4,000,000", "G-001"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 220],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[liability], texts=[])],
+    )
+
+    accounts, repayments, events = _extract_accounts(result)
+
+    assert accounts == []
+    assert repayments == []
+    assert events == []
+
+
 def test_scanned_account_extraction_obeys_cross_page_entity_veto() -> None:
     bundles = [
         {
@@ -545,8 +605,7 @@ def test_account_heading_uses_nearest_account_anchor_even_without_agreement() ->
 def test_printed_page_footers_restore_plugin_continuation_order() -> None:
     def bundle(logical: int, printed: int, *texts: str) -> dict[str, object]:
         lines = [
-            {"text": text, "bbox": [20, 40 + index * 30, 580, 65 + index * 30]}
-            for index, text in enumerate(texts)
+            {"text": text, "bbox": [20, 40 + index * 30, 580, 65 + index * 30]} for index, text in enumerate(texts)
         ]
         lines.append(
             {
@@ -588,9 +647,7 @@ def test_printed_page_footers_restore_plugin_continuation_order() -> None:
         "credit_account:credit_card:2",
         "credit_account:credit_card:3",
     ]
-    assert [
-        account["source_refs"][0]["logical_page"] for account in accounts
-    ] == [1, 3, 4]
+    assert [account["source_refs"][0]["logical_page"] for account in accounts] == [1, 3, 4]
 
 
 def test_native_profile_tables_preserve_empty_cells_and_embedded_subtables() -> None:

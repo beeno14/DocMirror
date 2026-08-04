@@ -258,13 +258,18 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
     )
 
     statuses = {row["dataset_name"]: row for row in projected["dataset_status"]}
-    assert set(statuses) == set(PBOC_DATASET_ORDER) - {"dataset_status"}
+    assert set(statuses) == set(PBOC_DATASET_ORDER) - {
+        "dataset_status",
+        "credit_account_latest_repayments",
+        "credit_account_special_events",
+        "credit_account_special_transactions",
+        "annotation_statements",
+        "annotation_statement_groups",
+        "pboc_extension_fields",
+    }
     assert len({row["dataset_status_record_id"] for row in statuses.values()}) == len(statuses)
-    assert statuses["credit_account_latest_repayments"]["observed_row_count"] == 1
-    assert statuses["credit_account_special_events"]["observed_row_count"] == 1
-    assert statuses["credit_account_special_transactions"]["observed_row_count"] == 1
+    assert all(row["presence_status"] == "not_observed" for row in statuses.values())
     assert statuses["credit_card_large_installments"]["presence_status"] == "not_observed"
-    assert statuses["annotation_statements"]["presence_status"] == "explicitly_empty"
     assert "source_dataset_name" not in statuses["fraud_warnings"]
     assert not any(row["dataset_name"].startswith("personal_detail_") for row in statuses.values())
 
@@ -516,4 +521,9 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     v2_validation = validate_projection_payload("personal_credit_report_detailed_v2", payload)
     assert v2_validation.valid, v2_validation.errors
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
-    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 1
+    statuses = [row["normalized"] for row in datasets["dataset_status"]["rows"]]
+    assert all(
+        row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for row in statuses
+    )
+    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 6

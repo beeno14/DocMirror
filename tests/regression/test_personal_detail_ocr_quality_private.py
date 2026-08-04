@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -82,15 +83,38 @@ def test_personal_detail_ocr_correction_invariants(
     assert raw_bundles == raw_snapshot
     assert topology_audit["valid"] is True
     assert topology_audit["logical_page_count"] == len(result.pages)
-    assert all(
-        1 <= len(logical_pages) <= 2
-        for logical_pages in topology_audit["logical_pages_by_source"].values()
-    )
+    assert all(1 <= len(logical_pages) <= 2 for logical_pages in topology_audit["logical_pages_by_source"].values())
     assert sorted(context.reading_order_by_logical.values()) == list(
         range(1, len(context.reading_order_by_logical) + 1)
     )
     assert context.entity_context.content_conserved is True
-    assert len(corrected_pages) == len(ocr_bundles)
+    replayed_pages = [page for page in corrected_pages if page.get("plugin_replayed_subpage")]
+    replayed_sources = {int(page.get("source_page") or 0) for page in replayed_pages}
+    if replayed_pages:
+        raw_counts = Counter(
+            int(
+                bundle.get("source_page_number")
+                or (bundle.get("local_structure_evidence") or {}).get("source_page")
+                or 0
+            )
+            for bundle in ocr_bundles
+        )
+        corrected_counts = Counter(int(page.get("source_page") or 0) for page in corrected_pages)
+        assert all(
+            sorted(
+                int(page.get("segment_index") or 0)
+                for page in replayed_pages
+                if int(page.get("source_page") or 0) == source
+            )
+            == [0, 1]
+            for source in replayed_sources
+        )
+        assert all(corrected_counts[source] == 2 and raw_counts[source] == 1 for source in replayed_sources)
+        assert all(
+            corrected_counts[source] == count for source, count in raw_counts.items() if source not in replayed_sources
+        )
+    else:
+        assert len(corrected_pages) == len(ocr_bundles)
     assert audit["targeted_ocr_requests"] <= 8
     assert all(
         decision["original"] != decision["corrected"]
@@ -147,8 +171,7 @@ def test_personal_detail_ocr_correction_invariants(
     assert v2_datasets["credit_accounts"]["row_count"] == expected_accounts
     assert v2_datasets["credit_account_monthly_performance"]["row_count"] == expected_repayments
     v2_statuses = {
-        row["normalized"]["dataset_name"]: row["normalized"]
-        for row in v2_datasets["dataset_status"]["rows"]
+        row["normalized"]["dataset_name"]: row["normalized"] for row in v2_datasets["dataset_status"]["rows"]
     }
     assert set(v2_statuses) == set(PBOC_DATASET_ORDER) - {"dataset_status"}
     assert all(

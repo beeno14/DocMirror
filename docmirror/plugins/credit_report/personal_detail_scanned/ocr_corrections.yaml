@@ -16,6 +16,7 @@ inquiry_reason_substitutions:
   信用卡审抵: 信用卡审批
   担保资格申查: 担保资格审查
   贷后智理: 贷后管理
+  磁资审批: 融资审批
 
 account_label_substitutions:
   营理机构: 管理机构

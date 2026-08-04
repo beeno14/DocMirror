@@ -82,6 +82,12 @@ _DATASET_PRESENCE_STATUSES = frozenset(
         "unknown",
     }
 )
+_POTENTIALLY_FLAWED_OBSERVATION_STATUSES = frozenset(
+    {"ocr_corrected", "inferred", "ambiguous", "unreadable", "not_observed"}
+)
+_POTENTIALLY_FLAWED_DATASET_STATUSES = frozenset(
+    {"not_observed", "partial", "extraction_failed", "unknown"}
+)
 
 _SUMMARY_CODES = {
     "信用业务概要": "credit_business_overview",
@@ -297,11 +303,7 @@ def _profile_contract(
     for field_name in PERSONAL_PROFILE_FIELDS:
         entry = profile.get(field_name)
         entry_map = dict(entry) if isinstance(entry, Mapping) else {}
-        normalized = (
-            entry_map.get("normalized_value", entry_map.get("value"))
-            if entry_map
-            else entry
-        )
+        normalized = entry_map.get("normalized_value", entry_map.get("value")) if entry_map else entry
         raw = entry_map.get("canonical_raw", entry_map.get("raw", normalized)) if entry_map else entry
         if field_name == "birth_date" and normalized not in (None, ""):
             normalized = _iso_date(normalized)
@@ -336,9 +338,7 @@ def _profile_contract(
         if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
             observation["confidence"] = max(0.0, min(1.0, float(confidence)))
             observation["confidence_status"] = "available"
-            observation["confidence_basis"] = str(
-                entry_map.get("confidence_basis") or "source_field_confidence"
-            )
+            observation["confidence_basis"] = str(entry_map.get("confidence_basis") or "source_field_confidence")
         else:
             observation["confidence_status"] = "not_available"
             observation["confidence_basis"] = "source_did_not_report_field_confidence"
@@ -379,7 +379,14 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         if (values := _record_values(row)).get("summary_record_id")
     }
     dimensions: dict[tuple[str, int], tuple[str, str]] = {}
-    for cell in sorted(cells, key=lambda item: (str(item.get("summary_record_id") or ""), int(item.get("row_index") or 0), int(item.get("column_index") or 0))):
+    for cell in sorted(
+        cells,
+        key=lambda item: (
+            str(item.get("summary_record_id") or ""),
+            int(item.get("row_index") or 0),
+            int(item.get("column_index") or 0),
+        ),
+    ):
         key = (str(cell.get("summary_record_id") or ""), int(cell.get("row_index") or 0))
         if key not in dimensions and str(cell.get("value") or "").strip() not in _PLACEHOLDERS:
             dimensions[key] = (
@@ -528,7 +535,10 @@ def _dataset_status_contract(
         explicit = states.get(dataset_name)
         explicit_map = dict(explicit) if isinstance(explicit, Mapping) else {}
         explicit_status = str(explicit_map.get("presence_status") or "")
-        if observed_count:
+        if explicit_status in {"partial", "extraction_failed", "unknown"}:
+            presence_status = explicit_status
+            reason = str(explicit_map.get("reason") or "source_state_reported")
+        elif observed_count:
             presence_status = "observed_nonempty"
             reason = "records_projected"
         elif explicit_status in _DATASET_PRESENCE_STATUSES:
@@ -555,6 +565,46 @@ def _dataset_status_contract(
         refs = _source_refs(explicit_map)
         if refs:
             row["source_refs"] = refs
+        if presence_status in _POTENTIALLY_FLAWED_DATASET_STATUSES:
+            rows.append(row)
+    return rows
+
+
+def _issue_field_observations(datasets: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project typed extraction failures into the field uncertainty ledger."""
+    rows: list[dict[str, Any]] = []
+    for issue in datasets.get("personal_detail_extraction_issues") or ():
+        if not isinstance(issue, Mapping) or issue.get("issue_code") != "pboc_cell_contract_unresolved":
+            continue
+        dataset_name = str(issue.get("target_dataset") or "")
+        field_name = str(issue.get("field_name") or "")
+        if not dataset_name or not field_name:
+            continue
+        issue_id = str(issue.get("extraction_issue_id") or issue.get("record_id") or len(rows) + 1)
+        reason_codes = {str(value) for value in issue.get("reason_codes") or ()}
+        withheld = "normalized_value_withheld" in reason_codes
+        observation_id = f"field_extraction:{issue_id}"
+        row: dict[str, Any] = {
+            "record_id": observation_id,
+            "field_observation_id": observation_id,
+            "dataset_name": dataset_name,
+            "business_record_id": str(issue.get("target_record_id") or "unresolved_record"),
+            "field_name": field_name,
+            "observation_status": "unreadable" if withheld else "ambiguous",
+            "confidence_status": "not_available",
+            "confidence_basis": "typed_field_contract_failure",
+            "reason": str(issue.get("issue_code") or "pboc_cell_contract_unresolved"),
+        }
+        if issue.get("observed_value") not in (None, ""):
+            row["raw_value"] = issue["observed_value"]
+        confidence = issue.get("confidence")
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            row["confidence"] = max(0.0, min(1.0, float(confidence)))
+            row["confidence_status"] = "available"
+            row["confidence_basis"] = "ocr_field_contract_failure"
+        refs = _source_refs(issue)
+        if refs:
+            row["source_refs"] = refs
         rows.append(row)
     return rows
 
@@ -576,10 +626,27 @@ def apply_personal_detail_contract(
         datasets = {}
         content["datasets"] = datasets
 
+    # Counts captured before the canonical business merge can be zero when a
+    # scanned repayment grid is available only through the auxiliary path.
+    # Reconcile that impossible zero/positive contradiction without replacing
+    # any nonzero source count that could still expose a real omission.
+    for dataset_name, final_count in (final_dataset_counts or {}).items():
+        count_key = f"personal_detail_expected_{dataset_name}_count"
+        if facts.get(count_key) == 0 and isinstance(final_count, int) and final_count > 0:
+            facts[count_key] = final_count
+
     profile_rows, field_observations = _profile_contract(facts, datasets)
     if profile_rows:
         datasets["personal_profile"] = profile_rows
-    datasets["personal_detail_field_observations"] = field_observations
+    observations = [
+        *field_observations,
+        *_issue_field_observations(datasets),
+    ]
+    datasets["personal_detail_field_observations"] = [
+        row
+        for row in observations
+        if str(row.get("observation_status") or "") in _POTENTIALLY_FLAWED_OBSERVATION_STATUSES
+    ]
 
     summary_metrics = _summary_metric_contract(datasets)
     if summary_metrics:

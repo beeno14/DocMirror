@@ -51,10 +51,10 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     }
     assert domain_validation.valid, {
         "errors": domain_validation.errors,
-        "credit_lines": (datasets.get("credit_lines", {}).get("row_count", 0), status_counts["credit_lines"]),
+        "credit_lines": (datasets.get("credit_lines", {}).get("row_count", 0), status_counts.get("credit_lines")),
         "overdue_records": (
             datasets.get("overdue_records", {}).get("row_count", 0),
-            status_counts["overdue_records"],
+            status_counts.get("overdue_records"),
         ),
     }
     dictionary = semantic["domain"]["data_dictionary"]
@@ -66,20 +66,20 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     assert profile["primary_id_number"]
     assert profile["mobile_phone"]
 
-    observations = [
-        row["normalized"] for row in datasets["personal_detail_field_observations"]["rows"]
-    ]
-    assert {row["field_name"] for row in observations} == set(PERSONAL_PROFILE_FIELDS)
+    observations = [row["normalized"] for row in datasets["personal_detail_field_observations"]["rows"]]
+    profile_observations = [row for row in observations if row["dataset_name"] == "personal_profile"]
+    assert {row["field_name"] for row in profile_observations} <= set(PERSONAL_PROFILE_FIELDS)
+    assert all(
+        row["observation_status"] in {"ambiguous", "unreadable"}
+        for row in observations
+        if row["dataset_name"] != "personal_profile"
+    )
     assert {row["observation_status"] for row in observations} <= {
-        "observed",
-        "normalized",
         "ocr_corrected",
         "inferred",
         "ambiguous",
         "unreadable",
         "not_observed",
-        "explicitly_absent",
-        "not_applicable",
     }
     assert all(
         row.get("reason") == "no_field_observation_emitted"
@@ -90,21 +90,21 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
 
     summary_metrics = datasets["personal_detail_credit_summary_metrics"]
     assert summary_metrics["row_count"] == datasets["personal_detail_summary_cells"]["row_count"]
-    assert all(
-        row["normalized"]["reporting_status"] in {"reported", "not_reported"}
-        for row in summary_metrics["rows"]
-    )
+    assert all(row["normalized"]["reporting_status"] in {"reported", "not_reported"} for row in summary_metrics["rows"])
 
     statuses = {
         row["normalized"]["dataset_name"]: row["normalized"]
         for row in datasets["personal_detail_dataset_status"]["rows"]
     }
-    assert set(statuses) == set(PERSONAL_DETAIL_BUSINESS_DATASETS)
-    assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
-    assert statuses["personal_profile"]["presence_status"] == "observed_nonempty"
-    assert statuses["mobile_phone_records"]["presence_status"] == "observed_nonempty"
-    assert statuses["spouse_records"]["presence_status"] == "observed_nonempty"
-    assert not any(row["presence_status"] == "explicitly_empty" for row in statuses.values())
+    assert set(statuses) <= set(PERSONAL_DETAIL_BUSINESS_DATASETS)
+    assert all(
+        row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for row in statuses.values()
+    )
+    assert "credit_accounts" not in statuses
+    assert "personal_profile" not in statuses
+    assert "mobile_phone_records" not in statuses
+    assert "spouse_records" not in statuses
 
     # Source-grounded structure: these counts protect the continuation repair
     # and the positional profile-table extraction from schema-only regressions.
@@ -114,12 +114,8 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     assert datasets["mobile_phone_records"]["row_count"] == 1
     assert datasets["spouse_records"]["row_count"] == 1
 
-    account_ids = {
-        row["normalized"]["account_id"] for row in datasets["credit_accounts"]["rows"]
-    }
-    repayment_rows = [
-        row["normalized"] for row in datasets["repayment_records"]["rows"]
-    ]
+    account_ids = {row["normalized"]["account_id"] for row in datasets["credit_accounts"]["rows"]}
+    repayment_rows = [row["normalized"] for row in datasets["repayment_records"]["rows"]]
     assert repayment_rows
     assert all(row.get("account_id") in account_ids for row in repayment_rows)
 
