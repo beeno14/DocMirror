@@ -74,6 +74,102 @@ _DATASET_RECORD_ID_KEYS = {
     "personal_detail_source_rows": ("record_id", "source_table_row_id"),
 }
 
+_PUBLIC_SOURCE_PRIVATE_KEYS = frozenset(
+    {
+        "bbox",
+        "evidence_ids",
+        "source_anchor",
+        "source_cell_refs",
+        "source_fact_ids",
+        "source_refs",
+    }
+)
+_SOURCE_PAGE_KEYS = frozenset({"page", "page_id", "page_number", "source_page"})
+
+
+def _page_number(value: Any) -> int | None:
+    """Return a positive, one-based source page number when one is explicit."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit():
+            number = int(text)
+            return number if number > 0 else None
+        if len(text) > 1 and text[0].casefold() == "p" and text[1:].isdigit():
+            number = int(text[1:])
+            return number if number > 0 else None
+    return None
+
+
+def _source_page_range(record: dict[str, Any]) -> list[int]:
+    """Summarize rich private provenance as a compact public page range."""
+    pages: list[int] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized_key = str(key).casefold()
+                if normalized_key == "page_range" and isinstance(item, (list, tuple)):
+                    pages.extend(
+                        page
+                        for candidate in item
+                        if (page := _page_number(candidate)) is not None
+                    )
+                elif normalized_key in _SOURCE_PAGE_KEYS:
+                    page = _page_number(item)
+                    if page is not None:
+                        pages.append(page)
+                elif isinstance(item, (dict, list, tuple)):
+                    collect(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, (dict, list, tuple)):
+                    collect(item)
+
+    for key in (
+        "source",
+        "source_refs",
+        "source_cell_refs",
+        "source_anchor",
+        "page_range",
+        "page",
+        "page_id",
+        "page_number",
+        "source_page",
+    ):
+        if key in record:
+            collect({key: record[key]})
+    return [min(pages), max(pages)] if pages else []
+
+
+def _compact_public_datasets(
+    datasets: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Remove private extraction linkage from public credit-report datasets.
+
+    Projection derives and links records with the original rows first. This final
+    copy keeps those internal rows untouched while reducing each public ``source``
+    object to a useful page range. Core Community Bundle record requirements are
+    preserved, including stable record IDs and the source object itself.
+    """
+    public_datasets: dict[str, list[dict[str, Any]]] = {}
+    for dataset_name, records in datasets.items():
+        public_records: list[dict[str, Any]] = []
+        for record in records:
+            public_record = dict(record)
+            page_range = _source_page_range(record)
+            for key in _PUBLIC_SOURCE_PRIVATE_KEYS:
+                public_record.pop(key, None)
+            public_record["source"] = {"page_range": page_range} if page_range else {}
+            public_records.append(public_record)
+        public_datasets[dataset_name] = public_records
+    return public_datasets
+
 
 def _records(dataset_id: str, values: Any) -> list[dict[str, Any]]:
     """Give projected business records stable canonical record identities."""
