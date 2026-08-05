@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
@@ -26,7 +28,12 @@ from docmirror.server.output_builder import build_community_bundle
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 
-_FIXTURE_DIR = Path("tests/fixtures-private/credit_report/Scanned Personal Detailed")
+_FIXTURE_DIR = Path(
+    os.environ.get(
+        "DOCMIRROR_PERSONAL_DETAIL_FIXTURE_DIR",
+        "tests/fixtures-private/credit_report/Scanned Personal Detailed",
+    )
+)
 _FIXTURES = sorted(_FIXTURE_DIR.glob("*.pdf"))
 _EXPECTED_SCHEMA_INPUT_COUNTS = {
     "余泽熙7.15征信.pdf": (27, 641),
@@ -78,6 +85,20 @@ def test_personal_detail_ocr_correction_invariants(
         and bundle["local_structure_evidence"].get("lines")
     ]
 
+    # Persist the JSON audit artifact before diagnostic assertions so a
+    # topology/test-harness failure cannot discard an otherwise usable output.
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    audit_dir = os.environ.get("DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
+    if audit_dir:
+        destination = Path(audit_dir)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / f"{fixture.stem}.community.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     assert raw_bundles == raw_snapshot
     assert topology_audit["valid"] is True
     assert topology_audit["logical_page_count"] == len(result.pages)
@@ -98,15 +119,18 @@ def test_personal_detail_ocr_correction_invariants(
             for bundle in ocr_bundles
         )
         corrected_counts = Counter(int(page.get("source_page") or 0) for page in corrected_pages)
-        assert all(
-            sorted(
-                int(page.get("segment_index") or 0)
-                for page in replayed_pages
-                if int(page.get("source_page") or 0) == source
-            )
-            == [0, 1]
-            for source in replayed_sources
-        )
+        for source in replayed_sources:
+            corrected_segments = []
+            for page in corrected_pages:
+                if int(page.get("source_page") or 0) != source:
+                    continue
+                if page.get("plugin_replayed_subpage"):
+                    corrected_segments.append(int(page.get("segment_index") or 0))
+                    continue
+                geometry = context.page_topology.geometry(int(page.get("page") or 0))
+                if geometry is not None and geometry.segment_index in {0, 1}:
+                    corrected_segments.append(int(geometry.segment_index))
+            assert sorted(corrected_segments) == [0, 1]
         assert all(corrected_counts[source] == 2 and raw_counts[source] == 1 for source in replayed_sources)
         assert all(
             corrected_counts[source] == count for source, count in raw_counts.items() if source not in replayed_sources
@@ -122,8 +146,10 @@ def test_personal_detail_ocr_correction_invariants(
     )
 
     accounts = business.get("credit_accounts") or []
-    expected_accounts, expected_repayments = _EXPECTED_SCHEMA_INPUT_COUNTS[fixture.name]
-    assert len(accounts) == expected_accounts
+    expected_counts = _EXPECTED_SCHEMA_INPUT_COUNTS.get(fixture.name)
+    if expected_counts is not None:
+        expected_accounts, expected_repayments = expected_counts
+        assert len(accounts) == expected_accounts
     linked_repayments = link_repayment_records_to_accounts(
         repayment_records,
         _canonicalize_credit_accounts(accounts),
@@ -131,7 +157,8 @@ def test_personal_detail_ocr_correction_invariants(
         reading_order_by_logical=dict(context.reading_order_by_logical),
         force_relink=True,
     )
-    assert len(linked_repayments) == expected_repayments
+    if expected_counts is not None:
+        assert len(linked_repayments) == expected_repayments
     assert all(record.get("account_id") for record in linked_repayments)
     account_ids = [account.get("account_id") for account in accounts]
     assert len(account_ids) == len(set(account_ids))
@@ -157,16 +184,13 @@ def test_personal_detail_ocr_correction_invariants(
         # duplicate/backward row numbers must not leak into reconstruction.
         assert sequences == sorted(set(sequences))
 
-    bundle = build_community_bundle(sealed, file_path=str(fixture))
-    semantic = bundle.semantic_payload()
-    payload = bundle.json_payload(semantic)
     assert validate_projection_payload("community", payload).valid
     v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert v2_validation.valid, v2_validation.errors
     assert payload["document"]["domain_schema"]["version"] == "2.0.0"
     v2_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
-    assert v2_datasets["credit_accounts"]["row_count"] == expected_accounts
-    assert v2_datasets["credit_account_monthly_performance"]["row_count"] == expected_repayments
+    assert v2_datasets["credit_accounts"]["row_count"] == len(accounts)
+    assert v2_datasets["credit_account_monthly_performance"]["row_count"] == len(linked_repayments)
     v2_statuses = {
         row["normalized"]["dataset_name"]: row["normalized"] for row in v2_datasets["dataset_status"]["rows"]
     }

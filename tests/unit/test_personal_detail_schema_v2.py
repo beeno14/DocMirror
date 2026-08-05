@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -270,18 +271,81 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
         "dataset_status",
         "field_observations",
         "extraction_issues",
-        "credit_account_latest_repayments",
-        "credit_account_special_events",
-        "credit_account_special_transactions",
         "annotation_statements",
         "annotation_statement_groups",
         "pboc_extension_fields",
     }
     assert len({row["dataset_status_record_id"] for row in statuses.values()}) == len(statuses)
-    assert all(row["presence_status"] == "not_observed" for row in statuses.values())
+    for dataset_name in (
+        "credit_account_latest_repayments",
+        "credit_account_special_events",
+        "credit_account_special_transactions",
+    ):
+        assert statuses[dataset_name]["presence_status"] == "partial"
+    assert all(
+        row["presence_status"] == "not_observed"
+        for name, row in statuses.items()
+        if name not in {
+            "credit_account_latest_repayments",
+            "credit_account_special_events",
+            "credit_account_special_transactions",
+        }
+    )
+    assert {
+        row["target_dataset"]
+        for row in projected["extraction_issues"]
+        if row["issue_code"] == "unresolved_account_event_link"
+    } == {
+        "credit_account_latest_repayments",
+        "credit_account_special_events",
+        "credit_account_special_transactions",
+    }
+    assert all(
+        row.get("account_id") is None
+        for name in (
+            "credit_account_latest_repayments",
+            "credit_account_special_events",
+            "credit_account_special_transactions",
+        )
+        for row in projected[name]
+    )
     assert statuses["credit_card_large_installments"]["presence_status"] == "not_observed"
     assert "source_dataset_name" not in statuses["fraud_warnings"]
     assert not any(row["dataset_name"].startswith("personal_detail_") for row in statuses.values())
+
+
+def test_v2_does_not_treat_wrapper_record_id_as_emitted_account_foreign_key() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:wrapper-only",
+                    sequence=1,
+                    account_type="non_revolving_loan",
+                )
+            ],
+            "personal_detail_account_events": [
+                _record(
+                    "event:1",
+                    account_event_id="event:1",
+                    account_id="account:wrapper-only",
+                    event_type="special_transaction",
+                    canonical_raw={"account_id": "account:wrapper-only"},
+                )
+            ],
+        }
+    )
+
+    event = projected["credit_account_special_transactions"][0]
+    assert event["account_id"] is None
+    assert event["normalized"]["account_id"] is None
+    assert event["canonical_raw"]["account_id"] == "account:wrapper-only"
+    issue = next(
+        row
+        for row in projected["extraction_issues"]
+        if row.get("issue_code") == "unresolved_account_event_link"
+    )
+    assert issue["target_record_id"] == "event:1"
 
 
 def test_v2_preserves_invalid_month_source_without_emitting_invalid_month() -> None:
@@ -350,13 +414,22 @@ def test_v2_preserves_sparse_uncertainty_as_typed_control_datasets() -> None:
         }
     )
 
-    observation, unresolved = projected["field_observations"]
+    observation = next(
+        row for row in projected["field_observations"] if row["field_observation_id"] == "field:1"
+    )
+    unresolved = next(
+        row for row in projected["field_observations"] if row["field_observation_id"] == "field:2"
+    )
     issue = projected["extraction_issues"][0]
     assert observation["dataset_name"] == "subject_profile"
     assert observation["observation_status"] == "not_observed"
     assert unresolved["dataset_name"] == "unknown"
     assert unresolved["source_dataset_name"] == "datasets"
     assert issue["target_dataset"] == "credit_agreements"
+    assert any(
+        row["dataset_name"] == "credit_agreements" and row["field_name"] == "facility_limit"
+        for row in projected["field_observations"]
+    )
     assert "pboc_extension_fields" not in projected
 
 
@@ -542,15 +615,20 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
         ],
     }
     semantic = personal_detail_semantic_extensions()
+    projected_datasets = project_personal_detail_datasets(source)
     projection = {
         "projector_id": "credit_report",
         "document_type": "personal_credit_report_detailed",
         "domain_facts": {
             "document_label": "个人信用报告",
             "data_dictionary": personal_detail_data_dictionary(),
+            **{
+                f"personal_detail_v2_expected_{name}_count": len(rows)
+                for name, rows in projected_datasets.items()
+            },
         },
         "semantic": semantic,
-        "datasets": project_personal_detail_datasets(source),
+        "datasets": projected_datasets,
         "sections": [
             {
                 "id": "sec_personal_basic",
@@ -588,4 +666,227 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
         row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
         for row in statuses
     )
-    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 9
+    # The incomplete header/profile copies are now explicitly partial instead
+    # of silently passing because each contained some optional data.
+    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 7
+    assert not {
+        warning["code"]
+        for warning in payload["warnings"]
+        if warning["code"] in {"DATASET_COMPLETENESS_UNVERIFIED", "DATASET_ROW_COUNT_MISMATCH"}
+    }
+
+
+def test_v2_decodes_employment_mapping_blob_into_typed_fields() -> None:
+    blob = json.dumps(
+        {
+            "编号": "3",
+            "工作单位": "示例科技有限公司",
+            "单位地址": "浙江省杭州市西湖区文三路一号",
+            "职业": "专业技术人员",
+            "进入本单位年份": "2021",
+        },
+        ensure_ascii=False,
+    )
+
+    projected = project_personal_detail_datasets(
+        {
+            "employment_records": [
+                _record(
+                    "employment:3",
+                    normalized={"employment_record_id": None, "sequence": None},
+                    canonical_raw={"values": blob},
+                )
+            ]
+        }
+    )
+
+    wrapper = projected["subject_employment"][0]
+    row = wrapper["normalized"]
+    assert row["sequence"] == 3
+    assert row["employer"] == "示例科技有限公司"
+    assert row["occupation"] == "专业技术人员"
+    assert row["entry_year"] == 2021
+    assert "values" not in row
+    assert "values" not in wrapper.get("canonical_raw", {})
+    assert wrapper["review"]["source_values_blob"] == blob
+    assert not any(
+        issue["issue_code"] == "unstructured_multifield_blob"
+        for issue in projected.get("extraction_issues", [])
+    )
+
+
+def test_v2_rejects_ambiguous_employment_blob_and_reports_it() -> None:
+    blob = "编号=3;工作单位=示例科技有限公司;职业=职员"
+
+    projected = project_personal_detail_datasets(
+        {"employment_records": [_record("employment:3", values=blob)]}
+    )
+
+    row = projected["subject_employment"][0]
+    assert "values" not in row
+    assert "values" not in row.get("canonical_raw", {})
+    assert row["review"]["source_values_blob"] == blob
+    issue = next(
+        issue
+        for issue in projected["extraction_issues"]
+        if issue["issue_code"] == "unstructured_multifield_blob"
+    )
+    assert issue["target_dataset"] == "subject_employment"
+    status = next(
+        row for row in projected["dataset_status"] if row["dataset_name"] == "subject_employment"
+    )
+    assert status["presence_status"] == "partial"
+
+
+def test_v2_normalizes_valid_currency_and_suppresses_false_issue() -> None:
+    false_issue = _record(
+        "issue:currency",
+        extraction_issue_id="issue:currency",
+        category="ocr_cell_level_error",
+        issue_code="pboc_cell_contract_unresolved",
+        severity="warning",
+        status="requires_review",
+        target_dataset="repayment_records",
+        target_record_id="monthly:1",
+        field_name="reporting_amount_currency",
+        observed_value="人民币元",
+    )
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record("account:1", account_id="account:1", account_type="credit_card")
+            ],
+            "repayment_records": [
+                _record(
+                    "monthly:1",
+                    repayment_id="monthly:1",
+                    account_id="account:1",
+                    year=2025,
+                    month=1,
+                    status="N",
+                    reporting_amount_currency="人民币元",
+                )
+            ],
+            "personal_detail_extraction_issues": [false_issue],
+        }
+    )
+
+    assert projected["credit_account_monthly_performance"][0][
+        "reporting_amount_currency"
+    ] == "CNY"
+    assert "extraction_issues" not in projected
+    assert "field_observations" not in projected
+
+
+def test_v2_withholds_invalid_header_values_in_every_canonical_copy() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_report_metadata": [
+                _record(
+                    "metadata:bad",
+                    personal_report_metadata_id="metadata:bad",
+                    report_number="20O5BAD",
+                    report_time="2025-19-45 99:00",
+                    subject_name="被查询者证件类型",
+                    primary_id_type="身份证",
+                    primary_id_number="11010519491231002X",
+                    query_institution="本人",
+                    query_reason="本人查询",
+                )
+            ]
+        }
+    )
+
+    for dataset_name in ("report_metadata", "report_query"):
+        row = projected[dataset_name][0]
+        assert row["report_number"] is None
+        assert row["report_time"] is None
+        assert row["subject_name"] is None
+        assert row["canonical_raw"]["report_number"] == "20O5BAD"
+    affected = {
+        issue["target_dataset"]
+        for issue in projected["extraction_issues"]
+        if issue["field_name"] == "report_number"
+    }
+    assert affected == {"report_metadata", "report_query"}
+
+
+def test_v2_projection_policy_hides_conservation_facts_and_covers_all_datasets() -> None:
+    policy = personal_detail_semantic_extensions()["community_projection_overrides"]
+
+    assert set(policy["completeness"]) == set(PBOC_DATASET_ORDER)
+    assert set(policy["internal_fields"]) == {
+        f"personal_detail_v2_expected_{name}_count" for name in PBOC_DATASET_ORDER
+    }
+
+
+def test_v2_prefers_record_specific_schema_issue_over_unlinked_source_duplicate() -> None:
+    source_issue = _record(
+        "issue:unlinked",
+        extraction_issue_id="issue:unlinked",
+        category="ocr_cell_level_error",
+        issue_code="pboc_cell_contract_unresolved",
+        severity="warning",
+        status="requires_review",
+        target_dataset="credit_lines",
+        field_name="used_limit",
+        observed_value="ЁА",
+    )
+
+    projected = project_personal_detail_datasets(
+        {
+            "credit_lines": [
+                _record(
+                    "credit-line:1",
+                    credit_line_id="credit-line:1",
+                    used_limit="ЁА",
+                )
+            ],
+            "personal_detail_extraction_issues": [source_issue],
+        }
+    )
+
+    issues = [
+        issue
+        for issue in projected["extraction_issues"]
+        if issue.get("field_name") == "used_limit"
+    ]
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "canonical_money_invalid"
+    assert issues[0]["target_record_id"] == "credit-line:1"
+
+
+def test_v2_links_unambiguous_source_issue_to_projected_business_record() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "inquiry_records": [
+                _record(
+                    "inquiry:1",
+                    inquiry_id="inquiry:1",
+                    institution="本人 业 您",
+                    inquiry_date="2025-01-02",
+                    reason="本人查询",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:unlinked-inquiry",
+                    extraction_issue_id="issue:unlinked-inquiry",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="inquiries",
+                    field_name="institution",
+                    observed_value="本人 业 您",
+                )
+            ],
+        }
+    )
+
+    issue = next(
+        row
+        for row in projected["extraction_issues"]
+        if row.get("field_name") == "institution"
+    )
+    assert issue["target_record_id"] == "inquiry:1"

@@ -308,8 +308,8 @@
         {
           "if": {"properties": {"name": {"const": "extraction_issues"}}, "required": ["name"]},
           "then": {"properties": {"rows": {"items": {"properties": {"normalized": {
-            "required": ["extraction_issue_id", "category", "issue_code", "severity", "status", "target_dataset"],
-            "properties": {"target_dataset": {"type": "string", "minLength": 1}}
+            "required": ["extraction_issue_id", "category", "issue_code", "severity", "status"],
+            "properties": {"target_dataset": {"type": ["string", "null"], "minLength": 1}}
           }}}}}}
         },
         {

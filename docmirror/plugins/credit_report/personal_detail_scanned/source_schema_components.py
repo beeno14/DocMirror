@@ -511,6 +511,7 @@ def personal_detail_source_dictionary_components() -> dict[str, Any]:
             "applicability": {"label": "适用性", "type": "enum"},
             "presence_status": {"label": "存在状态", "type": "enum"},
             "observed_row_count": {"label": "已观测行数", "type": "integer"},
+            "expected_row_count": {"label": "源文预期行数", "type": "integer"},
             "source_statement": {"label": "源文状态声明", "type": "text"},
             "confidence": {"label": "状态置信度", "type": "decimal"},
             "reason": {"label": "状态原因", "type": "text"},

@@ -17,6 +17,11 @@ import re
 from collections import defaultdict
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
+from docmirror.plugins.credit_report.personal_detail_scanned.quality import (
+    cn_identity_number_valid,
+    header_field_valid,
+)
 from docmirror.plugins.credit_report.value_utils import stable_record_id
 
 _DATE_RE = re.compile(r"(20\d{2})[.年/-]\s*(\d{1,2})(?:[.月/-]\s*(\d{1,2}))?")
@@ -1585,6 +1590,91 @@ def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
     return [records[key] for key in sorted(records)]
 
 
+def _credible_sequence_endpoint(values: set[int]) -> tuple[int | None, list[int]]:
+    """Return a dense sequence endpoint and isolate implausible OCR outliers."""
+    if not values:
+        return None, []
+    # Printed ordinals are dense within a PBOC account family. Permit a small
+    # number of missing observations, but never let one account identifier or
+    # OCR-joined number inflate the expected row count by dozens of records.
+    ceiling = max(3, len(values) + max(2, len(values) // 4))
+    credible = {value for value in values if 1 <= value <= ceiling}
+    outliers = sorted(values - credible)
+    return (max(credible) if credible else None), outliers
+
+
+def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
+    """Count printed sequence evidence independently of emitted records."""
+    sequences: dict[str, set[int]] = {
+        "residence_records": set(),
+        "employment_records": set(),
+    }
+    for page in getattr(parse_result, "pages", None) or []:
+        for table in getattr(page, "tables", None) or []:
+            rows = _table_rows(table)
+            compact = _compact(" ".join(cell for row in rows for cell in row))
+            targets: list[str] = []
+            if any(marker in compact for marker in ("居住地址", "住宅电话", "居住状况")):
+                targets.append("residence_records")
+            if any(marker in compact for marker in ("工作单位", "单位性质", "进入本单位年份")) or all(
+                marker in compact for marker in ("职业", "行业", "职务", "职称")
+            ):
+                targets.append("employment_records")
+            for row in rows:
+                first = _clean(row[0] if row else "")
+                numbers = [int(value) for value in re.findall(r"\d{1,3}", first)]
+                sequence = numbers[0] if numbers and len(set(numbers)) == 1 else None
+                if sequence is not None and 1 <= sequence <= 20:
+                    for target in targets:
+                        sequences[target].add(sequence)
+
+    # Account numbers restart for each PBOC account family, so count the
+    # maximum printed endpoint within each observed family instead of taking
+    # one document-wide maximum.
+    family = "non_revolving_loan"
+    family_sequences: defaultdict[str, set[int]] = defaultdict(set)
+    loader = getattr(parse_result, "corrected_evidence_pages", None)
+    pages = loader() if callable(loader) else []
+    for page in pages or []:
+        for line in page.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            text = _compact(line.get("text") or line.get("content") or "")
+            if "非循环贷账户" in text:
+                family = "non_revolving_loan"
+            elif "循环贷账户一" in text:
+                family = "revolving_loan_subaccount"
+            elif "循环贷账户二" in text:
+                family = "revolving_loan_account"
+            elif "准贷记卡账户" in text:
+                family = "quasi_credit_card"
+            elif "贷记卡账户" in text:
+                family = "credit_card"
+            match = re.match(r"^(?:账户|业务)[（(]?(\d{1,3})(?:[）)]|\D|$)", text)
+            if match:
+                family_sequences[family].add(int(match.group(1)))
+
+    endpoints: dict[str, int] = {}
+    sequence_outliers: dict[str, list[int]] = {}
+    for account_family, values in family_sequences.items():
+        endpoint, outliers = _credible_sequence_endpoint(values)
+        if endpoint is not None:
+            endpoints[account_family] = endpoint
+        if outliers:
+            sequence_outliers[account_family] = outliers
+
+    return {
+        "sequence_endpoints": {
+            name: max(values)
+            for name, values in sequences.items()
+            if values
+        },
+        **({"credit_accounts": sum(endpoints.values())} if endpoints else {}),
+        **({"account_family_endpoints": dict(endpoints)} if endpoints else {}),
+        **({"account_family_sequence_outliers": sequence_outliers} if sequence_outliers else {}),
+    }
+
+
 def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
     mobile_records: list[dict[str, Any]] = []
     spouse_records: list[dict[str, Any]] = []
@@ -2079,7 +2169,7 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
         if time_match
         else None
     )
-    subject_name = id_type = id_number = query_institution = query_reason = None
+    field_candidates: dict[str, list[str]] = defaultdict(list)
     other_documents: list[tuple[str, str]] = []
     for page in list(getattr(parse_result, "pages", None) or [])[:1]:
         for table in getattr(page, "tables", None) or []:
@@ -2095,46 +2185,124 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
                     )
                     and len(values) >= 5
                 ):
-                    subject_name, id_type, id_number, query_institution, query_reason = values[:5]
+                    for key, value in zip(
+                        ("subject_name", "primary_id_type", "primary_id_number", "query_institution", "query_reason"),
+                        values[:5],
+                        strict=True,
+                    ):
+                        field_candidates[key].append(value)
                 elif labels == ["证件类型", "证件号码"] and len(values) >= 2:
                     other_documents.append((values[0], values[1]))
-    if not all((subject_name, id_type, id_number, query_institution, query_reason)):
-        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
-            make_issue,
-            record_issue,
-        )
-        from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
-            PBOCPersonalDetailNativeParser,
-        )
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import PBOCPersonalDetailNativeParser
 
-        candidates = PBOCPersonalDetailNativeParser(parse_result).records("report_header")
-        fingerprints = {
-            tuple(
-                candidate.fields.get(label, "")
-                for label in ("被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因")
-            )
-            for candidate in candidates
+    parser = PBOCPersonalDetailNativeParser(parse_result)
+    label_to_key = {
+        "被查询者姓名": "subject_name",
+        "被查询者证件类型": "primary_id_type",
+        "被查询者证件号码": "primary_id_number",
+        "查询机构": "query_institution",
+        "查询原因": "query_reason",
+        "报告编号": "report_number",
+        "报告时间": "report_time",
+    }
+    for candidate in parser.records("report_header"):
+        for label, key in label_to_key.items():
+            value = candidate.fields.get(label)
+            if value not in (None, ""):
+                field_candidates[key].append(str(value))
+    if report_number:
+        field_candidates["report_number"].append(report_number)
+    if report_time:
+        field_candidates["report_time"].append(report_time)
+
+    def candidate_valid(key: str, value: str, selected_id_type: str | None = None) -> bool:
+        if key == "query_reason":
+            return validate_pboc_field(value, "inquiry_reason").valid
+        return header_field_valid(key, value, id_type=selected_id_type)
+
+    provisional_id_types = {
+        value.strip()
+        for value in field_candidates.get("primary_id_type", [])
+        if candidate_valid("primary_id_type", value)
+    }
+    selected_id_type = next(iter(provisional_id_types)) if len(provisional_id_types) == 1 else None
+    trigger_replay = report_time is None or report_number is None
+    for key in (
+        "subject_name",
+        "primary_id_type",
+        "primary_id_number",
+        "query_institution",
+        "query_reason",
+        "report_number",
+        "report_time",
+    ):
+        valid_values = {
+            value.strip()
+            for value in field_candidates.get(key, [])
+            if candidate_valid(key, value, selected_id_type)
         }
-        if len(fingerprints) == 1 and candidates:
-            fallback = candidates[0].fields
-            subject_name = subject_name or fallback.get("被查询者姓名")
-            id_type = id_type or fallback.get("被查询者证件类型")
-            id_number = id_number or fallback.get("被查询者证件号码")
-            query_institution = query_institution or fallback.get("查询机构")
-            query_reason = query_reason or fallback.get("查询原因")
-        elif len(fingerprints) > 1:
-            record_issue(
-                parse_result,
-                make_issue(
-                    category="ocr_structure_correction",
-                    issue_code="ambiguous_native_report_header",
-                    message="Multiple conflicting report-header candidates were preserved; no candidate was selected.",
-                    parser_stage="native_tolerant_parser",
-                    target_dataset="personal_report_metadata",
-                    observed_value=[list(value) for value in sorted(fingerprints)],
-                    reason_codes=("multiple_header_candidates", "no_guess_applied"),
-                ),
-            )
+        if len(valid_values) != 1:
+            trigger_replay = True
+    if trigger_replay:
+        replay, _refs, _confidence = parser._full_page_fields({1}, dataset_name="report_header")
+        for label, key in label_to_key.items():
+            value = replay.get(label)
+            if value not in (None, ""):
+                if key == "report_time":
+                    match = re.search(
+                        r"(20\d{2})[.年/-](\d{1,2})[.月/-](\d{1,2})日?\s*(\d{1,2}):(\d{2}):(\d{2})",
+                        str(value),
+                    )
+                    if match:
+                        value = (
+                            f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+                            f"T{int(match.group(4)):02d}:{match.group(5)}:{match.group(6)}+08:00"
+                        )
+                field_candidates[key].append(str(value))
+
+    def select(key: str, selected_type: str | None = None) -> str | None:
+        observed = tuple(dict.fromkeys(value.strip() for value in field_candidates.get(key, []) if value.strip()))
+        valid = tuple(value for value in observed if candidate_valid(key, value, selected_type))
+        if len(valid) == 1:
+            return valid[0]
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_cell_level_error",
+                issue_code="page_one_consensus_unresolved",
+                message="Page-one header evidence was missing, invalid, or conflicting; the normalized value was withheld.",
+                parser_stage="page_one_consensus",
+                target_dataset="personal_report_metadata",
+                target_record_id="personal_report_metadata:primary",
+                field_name=key,
+                observed_value=list(observed),
+                reason_codes=("page_one_consensus", "schema_field_validation", "normalized_value_withheld"),
+            ),
+        )
+        return None
+
+    subject_name = select("subject_name")
+    id_type = select("primary_id_type")
+    id_number = select("primary_id_number", id_type or "身份证")
+    if id_type is None and cn_identity_number_valid(id_number):
+        id_type = "身份证"
+        for issue in getattr(parse_result, "_personal_detail_extraction_issues", []) or []:
+            if (
+                isinstance(issue, dict)
+                and issue.get("issue_code") == "page_one_consensus_unresolved"
+                and issue.get("field_name") == "primary_id_type"
+            ):
+                issue["status"] = "resolved"
+                issue["severity"] = "info"
+                issue["reason_codes"] = [
+                    *issue.get("reason_codes", []),
+                    "checksum_valid_resident_identity_implies_document_type",
+                ]
+    query_institution = select("query_institution")
+    query_reason = select("query_reason")
+    report_number = select("report_number")
+    report_time = select("report_time")
     metadata = [
         {
             "personal_report_metadata_id": stable_record_id(
@@ -2279,11 +2447,13 @@ def extract_personal_detail_section_content(parse_result: Any, full_text: str) -
         "overdue_records": len(derive_overdue_records(accounts, repayments)),
         "public_records": len(native_compatible.get("public_records") or []),
     }
+    completeness_ledger = _source_completeness_ledger(parse_result)
     return {
         "facts": {
             "subject_profile": subject_profile,
             **profile_facts,
             "canonical_dataset_schema": "personal_credit_report_detailed.v2",
+            "personal_detail_source_completeness_ledger": completeness_ledger,
             **{f"personal_detail_expected_{name}_count": count for name, count in expected_counts.items()},
         },
         "datasets": {name: rows for name, rows in datasets.items() if rows},

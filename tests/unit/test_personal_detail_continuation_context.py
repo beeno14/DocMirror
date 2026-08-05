@@ -61,6 +61,45 @@ def test_split_replay_has_an_independent_full_page_ocr_budget(monkeypatch: pytes
     assert len(context._page_ocr_requests) == 2
 
 
+def test_split_replay_budget_is_atomic_per_physical_spread(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    context._page_ocr_max_requests = 1
+    context._page_ocr_requests = []
+    context._supplemental_ocr_cache = {}
+    image = np.zeros((100, 80, 3), dtype=np.uint8)
+    context._page_image_resolver = SimpleNamespace(
+        supplemental_spread_slices=lambda _pages: [
+            {
+                "supplemental_page_id": f"source:{source}:segment:{segment}:split",
+                "source_page": source,
+                "segment_index": segment,
+                "image": image,
+                "zoom": 1.0,
+                "subpage_basis": "core_split_result",
+            }
+            for source, segment in ((2, 0), (2, 1), (3, 0), (3, 1))
+        ]
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.context._complete_page_ocr",
+        lambda candidate: (
+            [{"text": "evidence", "confidence": 0.99, "bbox": [1, 2, 70, 20]}],
+            candidate,
+            0,
+            0.0,
+            1.0,
+        ),
+    )
+
+    pages = context.supplemental_page_ocr_evidence([2, 3], reason="split_result_topology_replay")
+
+    assert [(page["source_page"], page["segment_index"]) for page in pages] == [(2, 0), (2, 1)]
+    assert any(
+        request.get("source_page") == 3 and request.get("status") == "budget_exhausted"
+        for request in context._page_ocr_requests
+    )
+
+
 def _unit(
     unit_id: str,
     page: int,

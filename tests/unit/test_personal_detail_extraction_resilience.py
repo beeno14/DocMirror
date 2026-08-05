@@ -14,8 +14,11 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _credible_sequence_endpoint,
     _dedupe_liability_records,
+    _extract_header_datasets,
     _extract_liabilities,
+    _source_completeness_ledger,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
@@ -69,6 +72,11 @@ def test_uncertain_cell_is_preserved_and_published_for_review() -> None:
 def test_pboc_controlled_vocabulary_is_diagnostic_and_broad() -> None:
     assert validate_pboc_field("贷后管理", "inquiry_reason").valid is True
     assert validate_pboc_field("司法调查", "inquiry_reason").valid is True
+    assert validate_pboc_field("保后管理", "inquiry_reason").valid is True
+    assert validate_pboc_field("人民币元", "currency").valid is True
+    assert validate_pboc_field("专业技术人员", "employment_status").valid is True
+    assert validate_pboc_field("中专、职高、技校", "education_level").valid is True
+    assert validate_pboc_field("本人查询 (商业银行网上 银行)", "inquiry_reason").valid is True
     invalid = validate_pboc_field("贷后管埋", "inquiry_reason")
     assert invalid.assessed is True
     assert invalid.valid is False
@@ -147,10 +155,18 @@ def test_liability_dedupe_tolerates_transposed_ocr_contract_identifier() -> None
 
 
 def test_credit_line_limits_are_schema_typed_amounts() -> None:
-    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import _mapping_role
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        _is_valid_for_role,
+        _mapping_role,
+        _normalize_amount,
+        normalize_institution_name,
+    )
 
     assert _mapping_role({}, "total_limit") == "amount"
     assert _mapping_role({}, "used_limit") == "amount"
+    assert _normalize_amount("00") == "0"
+    assert _is_valid_for_role("M10255810H0001GALC-HL-2107233906-1", "account_identifier")
+    assert normalize_institution_name("河南中原消费金融股份 有限公司") == "河南中原消费金融股份有限公司"
 
 
 def test_final_grid_count_repairs_only_zero_expected_count() -> None:
@@ -167,6 +183,153 @@ def test_final_grid_count_repairs_only_zero_expected_count() -> None:
 
     assert content["facts"]["personal_detail_expected_repayment_records_count"] == 583
     assert content["facts"]["personal_detail_expected_credit_lines_count"] == 5
+
+
+def test_source_sequence_ledger_reports_partial_datasets_without_inventing_rows() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "sequence_endpoints": {"employment_records": 5},
+                    "credit_accounts": 2,
+                }
+            },
+            "datasets": {
+                "employment_records": [
+                    {"record_id": f"employment:{sequence}", "sequence": sequence}
+                    for sequence in (1, 2, 3, 5)
+                ],
+                "inquiry_records": [
+                    {
+                        "record_id": f"inquiry:{sequence}",
+                        "sequence": sequence,
+                        "inquiry_type": "institution",
+                    }
+                    for sequence in (1, 3)
+                ],
+                "credit_accounts": [{"record_id": "account:1", "account_id": "account:1"}],
+            },
+        },
+        final_dataset_counts={"credit_accounts": 1},
+    )
+
+    statuses = {
+        row["dataset_name"]: row
+        for row in content["datasets"]["personal_detail_dataset_status"]
+    }
+    assert statuses["employment_records"]["presence_status"] == "partial"
+    assert statuses["employment_records"]["expected_row_count"] == 5
+    assert statuses["inquiry_records"]["presence_status"] == "partial"
+    assert statuses["inquiry_records"]["expected_row_count"] == 3
+    assert statuses["credit_accounts"]["presence_status"] == "partial"
+    assert statuses["credit_accounts"]["expected_row_count"] == 2
+    assert len(content["datasets"]["employment_records"]) == 4
+    assert len(content["datasets"]["inquiry_records"]) == 2
+    assert {
+        issue["target_dataset"]
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+        if issue["issue_code"] == "source_sequence_or_count_gap"
+    } == {"employment_records", "inquiry_records", "credit_accounts"}
+
+
+def test_source_ledger_treats_spaced_duplicate_sequence_digits_as_one_number() -> None:
+    table = _table(
+        "employment",
+        [
+            ["编号", "工作单位", "单位性质", "进入本单位年份"],
+            ["子 2 2", "示例公司", "民营企业", "2024"],
+        ],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[table])],
+        corrected_evidence_pages=lambda: [],
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["sequence_endpoints"]["employment_records"] == 2
+
+
+def test_source_ledger_rejects_isolated_account_sequence_outlier() -> None:
+    endpoint, outliers = _credible_sequence_endpoint(set(range(1, 28)) | {115})
+
+    assert endpoint == 27
+    assert outliers == [115]
+
+
+def test_duplicate_issue_stages_merge_evidence_instead_of_repeating() -> None:
+    first = make_issue(
+        category="ocr_cell_level_error",
+        issue_code="pboc_cell_contract_unresolved",
+        message="first stage",
+        parser_stage="native",
+        target_dataset="credit_accounts",
+        target_record_id="account:1",
+        field_name="balance",
+        observed_value="12O0",
+        source_refs=({"logical_page": 4, "evidence_id": "native"},),
+    )
+    context = SimpleNamespace(
+        _personal_detail_extraction_issues=[first],
+        ocr_correction_audit=lambda: {
+            "cell_anomalies": [
+                {
+                    "stage": "projection",
+                    "path": "credit_accounts[0].balance",
+                    "dataset_name": "credit_accounts",
+                    "record_id": "account:1",
+                    "field_name": "balance",
+                    "role": "amount",
+                    "value": "12O0",
+                    "source_refs": [{"logical_page": 4, "evidence_id": "projection"}],
+                }
+            ]
+        },
+    )
+
+    issues = collect_extraction_issues(context)
+
+    assert len(issues) == 1
+    assert {ref["evidence_id"] for ref in issues[0]["source_refs"]} == {"native", "projection"}
+
+
+def test_header_consensus_replays_the_whole_page_when_fields_are_missing(monkeypatch) -> None:
+    replay_calls: list[tuple[set[int], str]] = []
+
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
+
+    def replay(self, pages: set[int], *, dataset_name: str):
+        replay_calls.append((pages, dataset_name))
+        return (
+            {
+                "被查询者姓名": "张三",
+                "被查询者证件类型": "鑫",
+                "被查询者证件号码": "11010519491231002X",
+                "查询机构": "本人",
+                "查询原因": "本人查询",
+                "报告编号": "2025052510051518624525",
+                "报告时间": "2025年5月25日 10:05:15",
+            },
+            [],
+            0.98,
+        )
+
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "_full_page_fields", replay)
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[])],
+        _personal_detail_extraction_issues=[],
+    )
+
+    datasets = _extract_header_datasets(result, "")
+
+    metadata = datasets["personal_report_metadata"][0]
+    assert replay_calls == [({1}, "report_header")]
+    assert metadata["subject_name"] == "张三"
+    assert metadata["primary_id_type"] == "身份证"
+    assert metadata["primary_id_number"] == "11010519491231002X"
+    assert metadata["report_time"] == "2025-05-25T10:05:15+08:00"
+    assert len(result._personal_detail_extraction_issues) == 1
+    assert result._personal_detail_extraction_issues[0]["status"] == "resolved"
 
 
 def test_withheld_typed_value_is_partial_and_has_field_observation() -> None:
@@ -454,6 +617,31 @@ def test_split_replay_replaces_unsplit_evidence_and_inserts_dense_order() -> Non
     assert [page["page"] for page in merged] == [1, 3, 2]
     assert context.source_page_by_logical == {1: 1, 2: 2, 3: 1}
     assert context.reading_order_by_logical == {1: 1, 3: 2, 2: 3}
+
+
+def test_split_replay_preserves_unsplit_evidence_when_pair_is_incomplete() -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    unsplit_geometry = SimpleNamespace(split_kind="none", segment_index=0)
+    context.page_topology = SimpleNamespace(
+        audit=lambda: {"logical_pages_by_source": {"1": [1]}},
+        logicals_for_source=lambda _source: (1,),
+        geometry=lambda _logical: unsplit_geometry,
+    )
+    context.source_page_by_logical = {1: 1}
+    context.reading_order_by_logical = {1: 1}
+    context._page_ocr_requests = []
+    context.supplemental_page_ocr_evidence = lambda _sources, **_kwargs: [
+        {"source_page": 1, "segment_index": 0, "lines": [{"text": "left-only"}]},
+    ]
+    context._ocr_correction_overlay = SimpleNamespace(corrected_evidence_pages=lambda pages: pages)
+
+    merged = context._merge_split_replay_pages(
+        [{"page": 1, "source_page": 1, "lines": [{"text": "unsplit"}]}]
+    )
+
+    assert [page["lines"][0]["text"] for page in merged] == ["unsplit"]
+    assert context._page_ocr_requests[-1]["status"] == "pair_incomplete"
+    assert context._page_ocr_requests[-1]["observed_segments"] == [0]
 
 
 def test_identifier_only_liability_rows_are_redundant_not_business_records() -> None:

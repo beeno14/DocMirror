@@ -15,6 +15,14 @@ from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
+from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
+from docmirror.plugins.credit_report.personal_detail_scanned.quality import (
+    decode_mapping,
+    header_field_valid,
+    normalize_currency,
+    valid_iso_date,
+)
+
 PBOC_SCHEMA_ID = "personal_credit_report_detailed"
 PBOC_SCHEMA_VERSION = "2.0.0"
 PBOC_CONTRACT_URI = (
@@ -249,6 +257,9 @@ def _project_records(
         normalized = _normalized(record)
         if transform is not None:
             normalized = transform(normalized)
+        for key in ("currency", "account_currency", "reporting_amount_currency"):
+            if normalized.get(key) not in (None, ""):
+                normalized[key] = normalize_currency(normalized[key])
         projected.append(_replace_normalized(record, normalized))
     return projected
 
@@ -711,6 +722,15 @@ def _project_dataset_status(
         )
         if source_statements:
             normalized["source_statement"] = " | ".join(source_statements)
+        expected_counts = [
+            int(values["expected_row_count"])
+            for values in source_values
+            if isinstance(values.get("expected_row_count"), int)
+            and not isinstance(values.get("expected_row_count"), bool)
+            and int(values["expected_row_count"]) >= 0
+        ]
+        if expected_counts:
+            normalized["expected_row_count"] = max(expected_counts)
         confidences = [
             float(values["confidence"])
             for values in source_values
@@ -739,6 +759,8 @@ def _canonical_dataset_name(source_name: Any) -> str:
 def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     source_name = str(values.get("dataset_name") or "")
+    if source_name == "unknown" and values.get("source_dataset_name"):
+        return values
     canonical_name = _canonical_dataset_name(source_name)
     if canonical_name in PBOC_DATASET_ORDER and canonical_name not in _CONTROL_DATASETS:
         values["dataset_name"] = canonical_name
@@ -749,11 +771,571 @@ def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+_EMPLOYMENT_BLOB_FIELDS = {
+    "编号": "sequence",
+    "工作单位": "employer",
+    "单位性质": "employer_type",
+    "单位地址": "employer_address",
+    "单位电话": "employer_phone",
+    "职业": "occupation",
+    "行业": "industry",
+    "职务": "position",
+    "职称": "professional_title",
+    "进入本单位年份": "entry_year",
+    "信息更新日期": "information_updated_date",
+    "数据发生机构名称": "data_provider",
+}
+
+
+def _employment_source_records(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Decode legacy multi-field JSON blobs before the canonical projection."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    repaired: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for index, source_record in enumerate(records, start=1):
+        if not isinstance(source_record, dict):
+            continue
+        record = deepcopy(source_record)
+        values = _normalized(record)
+        canonical_raw = dict(record.get("canonical_raw") or {})
+        source_raw = dict(record.get("raw") or {})
+        blob = next(
+            (
+                candidate
+                for candidate in (
+                    values.get("values"),
+                    canonical_raw.get("values"),
+                    source_raw.get("values"),
+                )
+                if candidate not in (None, "")
+            ),
+            None,
+        )
+        decoded = decode_mapping(blob)
+        raw_blob = next(
+            (
+                candidate
+                for candidate in (
+                    values.get("raw_values"),
+                    canonical_raw.get("raw_values"),
+                    source_raw.get("raw_values"),
+                )
+                if candidate not in (None, "")
+            ),
+            None,
+        )
+        if blob not in (None, "") or raw_blob not in (None, ""):
+            review = dict(record.get("review") or {})
+            if blob not in (None, ""):
+                review["source_values_blob"] = deepcopy(blob)
+            if raw_blob not in (None, ""):
+                review["source_raw_values_blob"] = deepcopy(raw_blob)
+            record["review"] = review
+        for pool_name, pool in (("canonical_raw", canonical_raw), ("raw", source_raw)):
+            pool.pop("values", None)
+            pool.pop("raw_values", None)
+            if pool:
+                record[pool_name] = pool
+            else:
+                record.pop(pool_name, None)
+        unknown_keys: list[str] = []
+        if decoded is not None:
+            for source_key, source_value in decoded.items():
+                target = _EMPLOYMENT_BLOB_FIELDS.get(str(source_key))
+                if target is None:
+                    if source_value not in (None, "", "--"):
+                        unknown_keys.append(str(source_key))
+                    continue
+                if values.get(target) in (None, "") and source_value not in (None, "", "--"):
+                    values[target] = source_value
+            try:
+                if values.get("sequence") not in (None, ""):
+                    values["sequence"] = int(str(values["sequence"]).strip())
+            except ValueError:
+                unknown_keys.append("编号")
+                values.pop("sequence", None)
+            try:
+                if values.get("entry_year") not in (None, ""):
+                    values["entry_year"] = int(str(values["entry_year"]).strip())
+            except ValueError:
+                unknown_keys.append("进入本单位年份")
+                values.pop("entry_year", None)
+        values.pop("values", None)
+        values.pop("raw_values", None)
+        values.setdefault(
+            "employment_record_id",
+            str(record.get("record_id") or f"employment_record:{values.get('sequence') or index}"),
+        )
+        record = _replace_normalized(record, values)
+        repaired.append(record)
+        if (blob not in (None, "") and decoded is None) or unknown_keys:
+            issues.append(
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="unstructured_multifield_blob",
+                    message="A serialized multi-field value could not be mapped completely to typed employment fields.",
+                    parser_stage="v2_pre_projection_gate",
+                    target_dataset="employment_records",
+                    target_record_id=str(record.get("record_id") or values["employment_record_id"]),
+                    field_name="values",
+                    observed_value=blob,
+                    reason_codes=("multi_field_scalar_rejected", "raw_evidence_preserved", "normalized_value_withheld"),
+                )
+            )
+    return repaired, issues
+
+
 def _extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     if values.get("target_dataset"):
         values["target_dataset"] = _canonical_dataset_name(values["target_dataset"])
+    else:
+        values.pop("target_dataset", None)
     return values
+
+
+def _issue_role(field_name: str) -> str | None:
+    if field_name in {"currency", "account_currency", "reporting_amount_currency"}:
+        return "currency"
+    if field_name in {
+        "gender",
+        "marital_status",
+        "employment_status",
+        "education_level",
+        "degree",
+        "responsibility_type",
+        "residence_status",
+    }:
+        return field_name
+    if field_name in {"query_reason", "reason"}:
+        return "inquiry_reason"
+    if field_name == "nationality":
+        return "country_or_region_code"
+    return None
+
+
+def _actionable_issue(record: dict[str, Any]) -> bool:
+    values = _normalized(record)
+    if str(values.get("status") or "") in {"resolved", "suppressed_redundant", "informational"}:
+        return False
+    if str(values.get("severity") or "") == "info":
+        return False
+    if str(values.get("target_dataset") or "") in {"datasets", "facts"}:
+        return False
+    if values.get("issue_code") != "pboc_cell_contract_unresolved":
+        return True
+    field_name = str(values.get("field_name") or "")
+    observed = values.get("observed_value")
+    if field_name == "status_inferred_from_adjacent_months" and isinstance(observed, bool):
+        return False
+    role = _issue_role(field_name)
+    if role is None:
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            _is_valid_for_role,
+            _mapping_role,
+        )
+
+        role = _mapping_role({}, field_name)
+        if role and observed not in (None, ""):
+            return not _is_valid_for_role(str(observed), role)
+    if role is None or observed in (None, "") or isinstance(observed, (dict, list)):
+        return True
+    return not validate_pboc_field(str(observed), role).valid
+
+
+def _withhold(record: dict[str, Any], field_name: str) -> tuple[dict[str, Any], Any]:
+    values = _normalized(record)
+    original = values.get(field_name)
+    if original in (None, ""):
+        return record, original
+    raw = deepcopy(record.get("canonical_raw"))
+    if not isinstance(raw, dict):
+        raw = {}
+    raw.setdefault(field_name, deepcopy(original))
+    record = deepcopy(record)
+    record["canonical_raw"] = raw
+    values[field_name] = None
+    projected = _replace_normalized(record, values)
+    # Live credit projection rows are usually flat mappings with a separate
+    # canonical_raw pool. Community serialization otherwise treats that raw
+    # pool as normalized and resurrects the withheld value. Preserve the flat
+    # compatibility view while making the normalized override explicit.
+    if not isinstance(record.get("normalized"), dict):
+        projected["normalized"] = deepcopy(values)
+    if field_name in projected:
+        projected[field_name] = None
+    return projected, original
+
+
+def _record_identity(record: dict[str, Any], dataset_name: str, index: int) -> str:
+    values = _normalized(record)
+    return str(
+        record.get("record_id")
+        or next((value for key, value in values.items() if key.endswith("_id") and value), None)
+        or f"{dataset_name}:row:{index}"
+    )
+
+
+def _link_unique_issue_records(
+    projected: dict[str, list[dict[str, Any]]],
+    issues: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach a row ID when an unlinked issue value identifies exactly one row."""
+    linked: list[dict[str, Any]] = []
+    for issue in issues:
+        values = _normalized(issue)
+        dataset_name = str(values.get("target_dataset") or "")
+        field_name = str(values.get("field_name") or "")
+        observed = values.get("observed_value")
+        if (
+            values.get("target_record_id")
+            or not dataset_name
+            or not field_name
+            or observed in (None, "")
+            or isinstance(observed, (dict, list))
+        ):
+            linked.append(issue)
+            continue
+
+        matching_ids: set[str] = set()
+        for index, record in enumerate(projected.get(dataset_name) or [], start=1):
+            candidates = (_normalized(record), record.get("canonical_raw"), record.get("raw"))
+            if any(
+                isinstance(candidate, dict)
+                and candidate.get(field_name) not in (None, "")
+                and str(candidate.get(field_name)) == str(observed)
+                for candidate in candidates
+            ):
+                matching_ids.add(_record_identity(record, dataset_name, index))
+        if len(matching_ids) == 1:
+            values["target_record_id"] = next(iter(matching_ids))
+            issue = _replace_normalized(issue, values)
+        linked.append(issue)
+    return linked
+
+
+def _address_suspicious(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        len(re.sub(r"\s+", "", text)) < 4
+        or re.search(r"[=<>]", text)
+        or re.search(r"\s[\u3400-\u9fff]\s*(?:[#*=?]+)?$", text)
+    )
+
+
+def _money_field(field_name: str) -> bool:
+    if field_name.startswith("source_") or field_name in {"amount_unit", "reporting_amount_precision"}:
+        return False
+    return field_name.endswith(
+        ("_amount", "_balance", "_limit", "_principal", "_payment", "_contribution")
+    ) or field_name in {"amount", "balance", "facility_limit", "credit_limit", "loan_amount"}
+
+
+def _decimal_valid(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return Decimal(str(value).replace(",", "")).is_finite()
+    except (InvalidOperation, ValueError):
+        return False
+
+
+def _canonical_quality_gate(
+    projected: dict[str, list[dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Withhold invalid v2 values and publish one deduplicated uncertainty."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    issues = [
+        record
+        for record in projected.get("extraction_issues") or []
+        if isinstance(record, dict) and _actionable_issue(record)
+    ]
+    generated: list[dict[str, Any]] = []
+    money_fields_by_dataset = {
+        dataset_name: {
+            field_name
+            for field_name, descriptor in ((definition.get("columns") or {}).items())
+            if isinstance(descriptor, dict) and descriptor.get("type") == "money"
+        }
+        for dataset_name, definition in personal_detail_data_dictionary()["datasets"].items()
+    }
+
+    account_ids = {
+        str(_normalized(record).get("account_id") or "")
+        for record in projected.get("credit_accounts") or []
+    }
+    account_ids.discard("")
+    account_ids_by_identifier: dict[str, set[str]] = {}
+    for record in projected.get("credit_accounts") or []:
+        values = _normalized(record)
+        identifier = str(values.get("account_identifier") or "")
+        account_id = str(values.get("account_id") or "")
+        if identifier and account_id:
+            account_ids_by_identifier.setdefault(identifier, set()).add(account_id)
+    account_by_identifier = {
+        identifier: next(iter(identifiers))
+        for identifier, identifiers in account_ids_by_identifier.items()
+        if len(identifiers) == 1
+    }
+
+    linked_datasets = (
+        "credit_account_latest_repayments",
+        "credit_account_special_transactions",
+        "credit_account_special_events",
+        "credit_card_large_installments",
+    )
+    for dataset_name in linked_datasets:
+        repaired_rows: list[dict[str, Any]] = []
+        for index, record in enumerate(projected.get(dataset_name) or [], start=1):
+            values = _normalized(record)
+            account_id = str(values.get("account_id") or "")
+            if account_id not in account_ids:
+                relinked = account_by_identifier.get(str(values.get("account_identifier") or ""))
+                if relinked:
+                    values["account_id"] = relinked
+                    record = _replace_normalized(record, values)
+                else:
+                    record, observed = _withhold(record, "account_id")
+                    generated.append(
+                        make_issue(
+                            category="schema_incompleteness",
+                            issue_code="unresolved_account_event_link",
+                            message="The account event could not be linked to an emitted account; the foreign key was withheld.",
+                            parser_stage="v2_post_projection_gate",
+                            target_dataset=dataset_name,
+                            target_record_id=_record_identity(record, dataset_name, index),
+                            field_name="account_id",
+                            observed_value=observed,
+                            reason_codes=("orphan_foreign_key", "raw_evidence_preserved", "normalized_value_withheld"),
+                        )
+                    )
+            repaired_rows.append(record)
+        if repaired_rows:
+            projected[dataset_name] = repaired_rows
+
+    required_query_fields = (
+        "report_number",
+        "report_time",
+        "subject_name",
+        "primary_id_type",
+        "primary_id_number",
+        "query_institution",
+        "query_reason",
+    )
+    for dataset_name, rows in list(projected.items()):
+        if dataset_name in _CONTROL_DATASETS:
+            continue
+        checked_rows: list[dict[str, Any]] = []
+        for index, record in enumerate(rows, start=1):
+            values = _normalized(record)
+            record_id = _record_identity(record, dataset_name, index)
+            invalid: list[tuple[str, Any, str]] = []
+            if dataset_name in {"report_metadata", "report_query"}:
+                header_fields = (
+                    required_query_fields
+                    if dataset_name == "report_query"
+                    else required_query_fields[:5]
+                )
+                for field_name in header_fields:
+                    value = values.get(field_name)
+                    id_type = values.get("primary_id_type")
+                    valid = (
+                        validate_pboc_field(str(value or ""), "inquiry_reason").valid
+                        if field_name == "query_reason" and value not in (None, "")
+                        else header_field_valid(field_name, value, id_type=id_type)
+                    )
+                    if not valid:
+                        invalid.append((field_name, value, "required_header_field_unresolved"))
+            if dataset_name == "subject_profile":
+                for field_name in ("subject_name", "primary_id_type", "primary_id_number"):
+                    if values.get(field_name) not in (None, "") and not header_field_valid(
+                        field_name, values[field_name], id_type=values.get("primary_id_type")
+                    ):
+                        invalid.append((field_name, values[field_name], "canonical_field_contract_failed"))
+            if dataset_name == "subject_identity_documents":
+                for field_name in ("document_type", "document_number"):
+                    if values.get(field_name) not in (None, "") and not header_field_valid(
+                        field_name, values[field_name], id_type=values.get("document_type")
+                    ):
+                        invalid.append((field_name, values[field_name], "canonical_field_contract_failed"))
+            for field_name, value in list(values.items()):
+                if value in (None, "") or field_name.startswith("source_"):
+                    continue
+                if field_name.endswith("_date") or field_name in {"birth_date", "inquiry_date"}:
+                    if not valid_iso_date(value):
+                        invalid.append((field_name, value, "canonical_date_invalid"))
+                elif field_name.endswith("_month"):
+                    if not valid_iso_date(value, month_precision=True):
+                        invalid.append((field_name, value, "canonical_month_invalid"))
+                elif (
+                    _money_field(field_name)
+                    or field_name in money_fields_by_dataset.get(dataset_name, set())
+                ) and not _decimal_valid(value):
+                    invalid.append((field_name, value, "canonical_money_invalid"))
+                elif field_name in {"mailing_address", "household_address", "address", "employer_address"}:
+                    if _address_suspicious(value):
+                        invalid.append((field_name, value, "canonical_address_suspicious"))
+
+            seen_fields: set[str] = set()
+            for field_name, observed, issue_code in invalid:
+                if field_name in seen_fields:
+                    continue
+                seen_fields.add(field_name)
+                record, retained = _withhold(record, field_name)
+                generated.append(
+                    make_issue(
+                        category="schema_incompleteness" if observed in (None, "") else "ocr_cell_level_error",
+                        issue_code=issue_code,
+                        message="A required or typed canonical value was not safely extractable; its normalized value was withheld.",
+                        parser_stage="v2_post_projection_gate",
+                        target_dataset=dataset_name,
+                        target_record_id=record_id,
+                        field_name=field_name,
+                        observed_value=retained,
+                        reason_codes=("canonical_schema_gate", "raw_evidence_preserved", "normalized_value_withheld"),
+                    )
+                )
+            checked_rows.append(record)
+        projected[dataset_name] = checked_rows
+
+    generated_signatures = {
+        (
+            str(_normalized(record).get("target_dataset") or ""),
+            str(_normalized(record).get("field_name") or ""),
+            json.dumps(
+                _normalized(record).get("observed_value"),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        for record in generated
+    }
+    issues = [
+        record
+        for record in issues
+        if _normalized(record).get("target_record_id")
+        or (
+            str(_normalized(record).get("target_dataset") or ""),
+            str(_normalized(record).get("field_name") or ""),
+            json.dumps(
+                _normalized(record).get("observed_value"),
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        not in generated_signatures
+    ]
+    issues.extend(generated)
+    issues = _link_unique_issue_records(projected, issues)
+    unique_issues: dict[str, dict[str, Any]] = {}
+    for record in issues:
+        values = _extraction_issue(_normalized(record))
+        marker = json.dumps(
+            {
+                "target_dataset": values.get("target_dataset"),
+                "target_record_id": values.get("target_record_id"),
+                "field_name": values.get("field_name"),
+                "observed_value": values.get("observed_value"),
+                "issue_code": values.get("issue_code") if not values.get("field_name") else None,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        unique_issues.setdefault(marker, _replace_normalized(record, values))
+    if unique_issues:
+        projected["extraction_issues"] = list(unique_issues.values())
+    else:
+        projected.pop("extraction_issues", None)
+
+    observations = [
+        record
+        for record in projected.get("field_observations") or []
+        if isinstance(record, dict)
+    ]
+    for record in unique_issues.values():
+        values = _normalized(record)
+        field_name = str(values.get("field_name") or "")
+        target = str(values.get("target_dataset") or "")
+        if not field_name or not target:
+            continue
+        issue_id = str(values.get("extraction_issue_id") or record.get("record_id") or len(observations) + 1)
+        observed = values.get("observed_value")
+        observation = {
+            "record_id": f"field_observation:{issue_id}",
+            "field_observation_id": f"field_observation:{issue_id}",
+            "dataset_name": target,
+            "business_record_id": str(values.get("target_record_id") or "unresolved_record"),
+            "field_name": field_name,
+            "observation_status": "not_observed" if observed in (None, "", []) else "unreadable",
+            "reason": str(values.get("issue_code") or "extraction_uncertain"),
+            **({"raw_value": observed} if observed not in (None, "", []) else {}),
+        }
+        observations.append(observation)
+    unique_observations: dict[str, dict[str, Any]] = {}
+    for record in observations:
+        values = _field_observation(_normalized(record))
+        raw_value = values.get("raw_value")
+        role = _issue_role(str(values.get("field_name") or ""))
+        if role and raw_value not in (None, "") and validate_pboc_field(str(raw_value), role).valid:
+            continue
+        marker = json.dumps(
+            {
+                "dataset_name": values.get("dataset_name"),
+                "business_record_id": values.get("business_record_id"),
+                "field_name": values.get("field_name"),
+                "raw_value": raw_value,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        unique_observations.setdefault(marker, _replace_normalized(record, values))
+    if unique_observations:
+        projected["field_observations"] = list(unique_observations.values())
+    else:
+        projected.pop("field_observations", None)
+
+    statuses = list(projected.get("dataset_status") or [])
+    status_index = {
+        str(_normalized(record).get("dataset_name") or ""): index
+        for index, record in enumerate(statuses)
+    }
+    affected = {
+        str(_normalized(record).get("target_dataset") or "")
+        for record in unique_issues.values()
+        if str(_normalized(record).get("target_dataset") or "") in PBOC_DATASET_ORDER
+        and str(_normalized(record).get("target_dataset") or "") not in _CONTROL_DATASETS
+    }
+    for target in sorted(affected):
+        existing_values = (
+            _normalized(statuses[status_index[target]])
+            if target in status_index
+            else {}
+        )
+        normalized = {
+            **existing_values,
+            "dataset_status_record_id": f"dataset_status:{target}",
+            "dataset_name": target,
+            "applicability": "applicable",
+            "presence_status": "partial",
+            "observed_row_count": len(projected.get(target) or []),
+            "reason": str(existing_values.get("reason") or "unresolved_extraction_issue"),
+        }
+        if target in status_index:
+            index = status_index[target]
+            statuses[index] = _replace_normalized(statuses[index], normalized)
+        else:
+            statuses.append({"record_id": normalized["dataset_status_record_id"], **normalized})
+    if statuses:
+        projected["dataset_status"] = statuses
+    return projected
 
 
 def project_personal_detail_datasets(
@@ -761,6 +1343,11 @@ def project_personal_detail_datasets(
 ) -> dict[str, list[dict[str, Any]]]:
     """Return only PBOC v2 datasets while retaining unmapped business values."""
     source = {name: list(rows or []) for name, rows in datasets.items()}
+    employment_rows, blob_issues = _employment_source_records(source.get("employment_records") or [])
+    if employment_rows:
+        source["employment_records"] = employment_rows
+    if blob_issues:
+        source.setdefault("personal_detail_extraction_issues", []).extend(blob_issues)
     projected: dict[str, list[dict[str, Any]]] = {}
 
     metadata = source.get("personal_report_metadata") or []
@@ -892,6 +1479,7 @@ def project_personal_detail_datasets(
     if status_rows:
         projected["dataset_status"] = _project_dataset_status(status_rows, projected)
 
+    projected = _canonical_quality_gate(projected)
     return {
         name: projected[name]
         for name in PBOC_DATASET_ORDER
@@ -1330,6 +1918,24 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             name: f"one row per {_PBOC_DATASET_LABELS[name]}"
             for name in PBOC_DATASET_ORDER
         },
+        # Community's generic warning is only a projection-conservation check.
+        # Source-document completeness is represented explicitly by dataset_status.
+        "completeness": {
+            name: {
+                "basis": "domain_fact_count",
+                "count_key": f"personal_detail_v2_expected_{name}_count",
+                "public_basis": "personal_detail_v2_projection_row_conservation",
+            }
+            for name in PBOC_DATASET_ORDER
+        },
+        "internal_facts": [
+            f"personal_detail_v2_expected_{name}_count"
+            for name in PBOC_DATASET_ORDER
+        ],
+        "internal_fields": [
+            f"personal_detail_v2_expected_{name}_count"
+            for name in PBOC_DATASET_ORDER
+        ],
         "dataset_foreign_keys": foreign_keys,
         "dataset_derived_from": {
             "report_query": ["report_metadata"],

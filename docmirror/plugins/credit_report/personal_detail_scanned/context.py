@@ -960,6 +960,29 @@ class PersonalDetailExtractionContext:
                     base_by_segment[int(geometry.segment_index)] = page
 
             replay_by_segment = {int(page.get("segment_index") or 0): page for page in replay_pages}
+            available_segments = set(base_by_segment) | set(replay_by_segment)
+            if available_segments != {0, 1}:
+                # Never replace an unsplit/core page with only one half of a
+                # splitter-confirmed spread. Preserve the original evidence
+                # and publish an explicit page-continuation uncertainty.
+                merged.extend(base_pages)
+                incomplete_id = f"source:{source}:split-pair"
+                if not any(
+                    str(item.get("supplemental_page_id") or "") == incomplete_id
+                    and item.get("status") == "pair_incomplete"
+                    for item in self._page_ocr_requests
+                ):
+                    self._page_ocr_requests.append(
+                        {
+                            "supplemental_page_id": incomplete_id,
+                            "source_page": source,
+                            "expected_segments": [0, 1],
+                            "observed_segments": sorted(available_segments),
+                            "reason": "split_result_topology_replay",
+                            "status": "pair_incomplete",
+                        }
+                    )
+                continue
             unsplit_logical = logicals[0] if len(logicals) == 1 and not geometries else 0
             for segment in (0, 1):
                 if segment in base_by_segment:
@@ -1114,9 +1137,18 @@ class PersonalDetailExtractionContext:
         """
         slices = self._page_image_resolver.supplemental_spread_slices(source_pages)
         output: list[dict[str, Any]] = []
+        requested_sources = {
+            int(item.get("source_page") or 0)
+            for item in self._page_ocr_requests
+            if item.get("supplemental_page_id") and item.get("status") != "budget_exhausted"
+        }
+        budget_exhausted_sources: set[int] = set()
         for recovered in slices:
             supplemental_id = str(recovered.get("supplemental_page_id") or "")
             if not supplemental_id:
+                continue
+            source_page = int(recovered.get("source_page") or 0)
+            if source_page in budget_exhausted_sources:
                 continue
             if supplemental_id in self._supplemental_ocr_cache:
                 output.append(deepcopy(self._supplemental_ocr_cache[supplemental_id]))
@@ -1124,13 +1156,24 @@ class PersonalDetailExtractionContext:
             # Splitter-confirmed subpages are part of the corrected document
             # topology, not optional anomaly probes. Count their budget
             # independently so earlier field-repair OCR cannot silently drop
-            # a later half of the document.
-            supplemental_request_count = sum(bool(item.get("supplemental_page_id")) for item in self._page_ocr_requests)
-            if supplemental_request_count >= self._page_ocr_max_requests:
-                break
+            # a later half of the document. A physical spread is one atomic
+            # budget unit, so both of its splitter slices are always attempted.
+            if source_page not in requested_sources and len(requested_sources) >= self._page_ocr_max_requests:
+                budget_exhausted_sources.add(source_page)
+                self._page_ocr_requests.append(
+                    {
+                        "supplemental_page_id": f"source:{source_page}:split-pair",
+                        "source_page": source_page,
+                        "expected_segments": [0, 1],
+                        "reason": str(reason),
+                        "status": "budget_exhausted",
+                    }
+                )
+                continue
+            requested_sources.add(source_page)
             request = {
                 "supplemental_page_id": supplemental_id,
-                "source_page": int(recovered.get("source_page") or 0),
+                "source_page": source_page,
                 "printed_page": int(recovered.get("printed_page") or 0),
                 "segment_index": int(recovered.get("segment_index") or 0),
                 "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),

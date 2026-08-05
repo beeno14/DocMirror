@@ -73,12 +73,10 @@ def _issue_id(payload: Mapping[str, Any]) -> str:
         for key in (
             "category",
             "issue_code",
-            "parser_stage",
             "target_dataset",
             "target_record_id",
             "field_name",
             "observed_value",
-            "source_refs",
         )
     }
     digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:20]
@@ -292,7 +290,36 @@ def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
         issue_id = str(row.get("extraction_issue_id") or _issue_id(row))
         row["extraction_issue_id"] = issue_id
         row.setdefault("record_id", issue_id)
-        unique.setdefault(issue_id, row)
+        existing = unique.get(issue_id)
+        if existing is None:
+            unique[issue_id] = row
+            continue
+        refs = [
+            *[dict(value) for value in existing.get("source_refs") or () if isinstance(value, Mapping)],
+            *[dict(value) for value in row.get("source_refs") or () if isinstance(value, Mapping)],
+        ]
+        if refs:
+            seen: set[str] = set()
+            existing["source_refs"] = [
+                value
+                for value in refs
+                if not (
+                    (marker := json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)) in seen
+                    or seen.add(marker)
+                )
+            ]
+        reasons = tuple(
+            dict.fromkeys(
+                str(value)
+                for value in (*existing.get("reason_codes", ()), *row.get("reason_codes", ()))
+                if value
+            )
+        )
+        if reasons:
+            existing["reason_codes"] = list(reasons)
+        if existing.get("status") in _NON_DEGRADING_STATUSES and row.get("status") not in _NON_DEGRADING_STATUSES:
+            existing["status"] = row["status"]
+            existing["severity"] = row.get("severity", existing.get("severity"))
     return list(unique.values())
 
 

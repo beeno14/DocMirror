@@ -395,6 +395,11 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         )
 
         datasets = project_personal_detail_datasets(datasets)
+        # Compute row-conservation facts only after every assembled source
+        # collection has entered v2. Source completeness remains explicit in
+        # dataset_status and is not inferred from these projection counts.
+        for dataset_name, rows in datasets.items():
+            domain_facts[f"personal_detail_v2_expected_{dataset_name}_count"] = len(rows)
     semantic = variant.semantic_extensions()
     domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
