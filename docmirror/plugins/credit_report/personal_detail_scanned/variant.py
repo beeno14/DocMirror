@@ -127,6 +127,10 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         """Return private collection names emitted by the extraction assembly."""
         return super().dataset_names()
 
+    def use_generic_credit_accounts(self) -> bool:
+        """Candidate B never trusts projector-level account candidates."""
+        return False
+
     def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
         """Build one logical-page graph and cache for the detailed report."""
         del full_text
@@ -143,17 +147,9 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         *,
         content_mode: str,
     ) -> dict[str, Any]:
-        """Project the labelled native tables into canonical datasets."""
-        if content_mode not in {"native_text", "mixed"}:
-            return {}
-        from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
-            extract_personal_detail_native_business,
-        )
-
-        cached = getattr(parse_result, "native_business", None)
-        if callable(cached):
-            return cast(dict[str, Any], cached(full_text))
-        return extract_personal_detail_native_business(parse_result, full_text)
+        """Disable the shared assembly's second candidate population."""
+        del parse_result, full_text, content_mode
+        return {}
 
     def extract_auxiliary_business(
         self,
@@ -162,26 +158,12 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         *,
         content_mode: str,
     ) -> dict[str, Any]:
-        """Reuse the detailed context's scanned evidence pass."""
-        if content_mode not in {"scanned_ocr", "mixed"}:
+        """Expose Candidate B to the generic routing envelope without merging."""
+        del content_mode
+        loader = getattr(parse_result, "candidate_b_extraction", None)
+        if not callable(loader):
             return {}
-        cached = getattr(parse_result, "scanned_business", None)
-        if callable(cached):
-            auxiliary = cast(dict[str, Any], cached(full_text))
-        else:
-            auxiliary = super().extract_auxiliary_business(
-                parse_result,
-                full_text,
-                content_mode=content_mode,
-            )
-        if content_mode == "scanned_ocr":
-            native_loader = getattr(parse_result, "native_business", None)
-            if callable(native_loader):
-                native = cast(dict[str, Any], native_loader(full_text))
-                for dataset_name in ("credit_lines", "repayment_liability_records"):
-                    if native.get(dataset_name):
-                        auxiliary[dataset_name] = list(native[dataset_name])
-        return auxiliary
+        return deepcopy(cast(Any, loader(full_text)).business)
 
     def assemble_business(
         self,
@@ -193,116 +175,13 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         existing_summary: dict[str, Any] | None,
         variant_input: Any,
     ) -> dict[str, Any]:
-        """Complete detailed-report links after the shared canonical merge."""
-        assembled = super().assemble_business(
-            parse_result,
-            full_text,
-            content_mode=content_mode,
-            existing_collections=existing_collections,
-            existing_summary=existing_summary,
-            variant_input=variant_input,
-        )
-        post_merge_corrector = getattr(variant_input, "correct_assembled_business", None)
-        if callable(post_merge_corrector):
-            assembled = post_merge_corrector(assembled, stage="business_assembly")
-        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
-            liability_record_is_substantive,
-            make_issue,
-            record_issue,
-        )
-
-        liability_rows: list[dict[str, Any]] = []
-        for index, record in enumerate(assembled.get("repayment_liability_records") or [], start=1):
-            if not isinstance(record, dict):
-                continue
-            if liability_record_is_substantive(record):
-                liability_rows.append(record)
-                continue
-            record_issue(
-                variant_input,
-                make_issue(
-                    category="schema_incompleteness",
-                    issue_code="identifier_only_liability_row_suppressed",
-                    message=(
-                        "A compatibility extractor produced a repayment-responsibility row with no "
-                        "business fields; the redundant row was suppressed."
-                    ),
-                    severity="info",
-                    status="suppressed_redundant",
-                    parser_stage="business_assembly",
-                    target_dataset="repayment_liability_records",
-                    target_record_id=str(record.get("record_id") or f"row:{index}"),
-                    source_refs=record.get("source_refs") or (),
-                    reason_codes=("no_substantive_liability_field", "canonical_row_guard"),
-                ),
-            )
-        if liability_rows or assembled.get("repayment_liability_records"):
-            assembled["repayment_liability_records"] = liability_rows
-        accounts = [account for account in assembled.get("credit_accounts") or [] if isinstance(account, dict)]
-        valid_account_ids = {str(account.get("account_id") or "") for account in accounts if account.get("account_id")}
-        repayment_records = [
-            dict(record) for record in assembled.get("repayment_records") or [] if isinstance(record, dict)
-        ]
-        needs_relink = False
-        for record in repayment_records:
-            account_id = str(record.get("account_id") or "")
-            if account_id and account_id not in valid_account_ids:
-                needs_relink = True
-                record.pop("account_id", None)
-                record.pop("account_identifier", None)
-                normalized = record.get("normalized")
-                if isinstance(normalized, dict):
-                    normalized = dict(normalized)
-                    normalized.pop("account_id", None)
-                    normalized.pop("account_identifier", None)
-                    record["normalized"] = normalized
-        if needs_relink:
-            from docmirror.models.mirror.domain_access import micro_grid_structures_from_domain_specific
-            from docmirror.plugins.credit_report.scanned_business import link_repayment_records_to_accounts
-
-            domain_specific = getattr(getattr(parse_result, "entities", None), "domain_specific", {})
-            repayment_records = link_repayment_records_to_accounts(
-                repayment_records,
-                accounts,
-                micro_grid_structures_from_domain_specific(
-                    domain_specific if isinstance(domain_specific, dict) else {}
-                ),
-                reading_order_by_logical=dict(getattr(variant_input, "reading_order_by_logical", {}) or {}),
-            )
-            assembled["repayment_records"] = repayment_records
-        account_identifiers = {
-            str(account.get("account_id") or ""): account.get("account_identifier")
-            for account in accounts
-            if account.get("account_id")
-        }
-        for record in assembled.get("repayment_records") or []:
-            if not record.get("account_identifier"):
-                record["account_identifier"] = account_identifiers.get(str(record.get("account_id") or ""))
-            normalized = record.get("normalized")
-            if isinstance(normalized, dict) and not normalized.get("account_identifier"):
-                normalized["account_identifier"] = record.get("account_identifier")
-        from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
-            project_typed_public_records,
-        )
-
-        reporting_currency: str | None = None
-        reporting_amount_unit: str | None = None
-        content_loader = getattr(variant_input, "section_content", None)
-        if callable(content_loader):
-            source_content = cast(dict[str, Any], content_loader(full_text))
-            metadata_rows = (source_content.get("datasets") or {}).get("personal_report_metadata") or []
-            if metadata_rows:
-                metadata = metadata_rows[0].get("normalized", metadata_rows[0])
-                if isinstance(metadata, dict):
-                    reporting_currency = str(metadata.get("reporting_currency") or "").strip() or None
-                    reporting_amount_unit = str(metadata.get("reporting_amount_unit") or "").strip() or None
-        for dataset_name, records in project_typed_public_records(
-            assembled.get("public_records"),
-            reporting_currency=reporting_currency,
-            reporting_amount_unit=reporting_amount_unit,
-        ).items():
-            if records:
-                assembled[dataset_name] = records
+        """Return Candidate B verbatim; discard every projector candidate."""
+        del parse_result, content_mode, existing_collections, existing_summary
+        loader = getattr(variant_input, "candidate_b_extraction", None)
+        if not callable(loader):
+            return {}
+        result = loader(full_text)
+        assembled = deepcopy(cast(Any, result).business)
         setattr(
             variant_input,
             "_personal_detail_final_dataset_counts",
@@ -318,17 +197,9 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         self,
         assembled: dict[str, Any],
     ) -> dict[str, list[dict[str, Any]]]:
-        """Publish typed public-record views derived from the common envelope."""
-        typed_names = (
-            "tax_arrears_records",
-            "civil_judgment_records",
-            "enforcement_records",
-            "administrative_penalty_records",
-            "personal_housing_fund_records",
-            "professional_qualification_records",
-            "award_records",
-        )
-        return {name: list(assembled.get(name) or []) for name in typed_names if assembled.get(name)}
+        """Typed views are emitted once by Candidate B section projection."""
+        del assembled
+        return {}
 
     def finalize_datasets(self, datasets: dict[str, list[dict[str, Any]]]) -> None:
         """Reconcile the absence ledger against the rows that will be published."""
@@ -379,66 +250,12 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         *,
         auxiliary_business: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Use the complete personal-detail parser for every detailed report."""
-        from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
-            prepare_personal_detail_source_collections,
-        )
-
-        auxiliary = auxiliary_business or {}
-        if not getattr(parse_result, "pages", None):
-            facts: dict[str, Any] = {}
-            if isinstance(auxiliary.get("subject_profile"), dict):
-                facts["subject_profile"] = deepcopy(auxiliary["subject_profile"])
-            datasets = {
-                name: list(auxiliary.get(name) or [])
-                for name in ("residence_records", "employment_records", "statements", "annotations")
-                if auxiliary.get(name)
-            }
-            return prepare_personal_detail_source_collections(
-                {
-                    **({"facts": facts} if facts else {}),
-                    **({"datasets": datasets} if datasets else {}),
-                },
-                auxiliary,
-                final_dataset_counts=getattr(parse_result, "_personal_detail_final_dataset_counts", {}),
-            )
-        from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
-            extract_personal_detail_section_content,
-        )
-
-        cached = getattr(parse_result, "section_content", None)
-        content: dict[str, Any] = (
-            cast(dict[str, Any], cached(full_text))
-            if callable(cached)
-            else extract_personal_detail_section_content(parse_result, full_text)
-        )
-        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
-            ISSUE_DATASET,
-            collect_extraction_issues,
-            dataset_states_from_issues,
-        )
-
-        issues = collect_extraction_issues(parse_result)
-        facts = content.setdefault("facts", {})
-        states = facts.setdefault("personal_detail_dataset_states", {})
-        if not isinstance(states, dict):
-            states = {}
-            facts["personal_detail_dataset_states"] = states
-        for dataset_name, state in dataset_states_from_issues(issues).items():
-            states.setdefault(dataset_name, state)
-        if not facts.get("subject_profile") and isinstance(auxiliary.get("subject_profile"), dict):
-            facts["subject_profile"] = deepcopy(auxiliary["subject_profile"])
-        datasets = content.setdefault("datasets", {})
-        if issues:
-            datasets[ISSUE_DATASET] = issues
-        for name in ("residence_records", "employment_records", "statements", "annotations"):
-            if not datasets.get(name) and auxiliary.get(name):
-                datasets[name] = list(auxiliary[name])
-        return prepare_personal_detail_source_collections(
-            content,
-            auxiliary,
-            final_dataset_counts=getattr(parse_result, "_personal_detail_final_dataset_counts", {}),
-        )
+        """Return Candidate B supplemental datasets without a fallback merge."""
+        del auxiliary_business
+        loader = getattr(parse_result, "candidate_b_extraction", None)
+        if not callable(loader):
+            return {}
+        return deepcopy(cast(Any, loader(full_text)).section_content)
 
     def data_dictionary(self) -> dict[str, Any]:
         """Return the canonical PBOC v2 dictionary for detailed reports."""

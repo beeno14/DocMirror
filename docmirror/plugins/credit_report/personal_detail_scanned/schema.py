@@ -1480,6 +1480,23 @@ def project_personal_detail_datasets(
         projected["dataset_status"] = _project_dataset_status(status_rows, projected)
 
     projected = _canonical_quality_gate(projected)
+    # Candidate B rows may retain a canonical_raw evidence pool beside their
+    # flat compatibility fields. Community serialization treats such a pool
+    # as authoritative when no explicit normalized pool exists, which would
+    # otherwise discard schema-derived identities and enums. Add the explicit
+    # pool only after all internal linking/gating has finished so the flat
+    # compatibility view remains usable during projection.
+    for rows in projected.values():
+        for record in rows:
+            if (
+                isinstance(record, dict)
+                and not isinstance(record.get("normalized"), dict)
+                and (
+                    isinstance(record.get("canonical_raw"), dict)
+                    or isinstance(record.get("raw"), dict)
+                )
+            ):
+                record["normalized"] = _normalized(record)
     return {
         name: projected[name]
         for name in PBOC_DATASET_ORDER

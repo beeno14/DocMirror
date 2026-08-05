@@ -73,6 +73,22 @@ def test_topology_orders_spread_siblings_by_core_segment_geometry() -> None:
     assert topology.audit()["double_page_sources"] == 1
 
 
+def test_topology_preserves_any_number_of_nonoverlapping_core_fragments() -> None:
+    result = SimpleNamespace(
+        pages=[
+            _page(30, source=1, segment=2, crop=[0, 600, 600, 900]),
+            _page(10, source=1, segment=0, crop=[0, 0, 600, 300]),
+            _page(20, source=1, segment=1, crop=[0, 300, 600, 600]),
+        ]
+    )
+
+    topology = PersonalDetailPageTopology(result)
+
+    assert topology.ordered_fragments(1) == (10, 20, 30)
+    assert topology.audit()["valid"] is True
+    assert topology.audit()["fragmented_sources"] == 1
+
+
 def test_printed_page_inference_uses_geometry_instead_of_logical_ids() -> None:
     result = SimpleNamespace(
         pages=[

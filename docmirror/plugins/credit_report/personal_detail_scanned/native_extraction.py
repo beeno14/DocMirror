@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any
 
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
@@ -27,6 +28,29 @@ from docmirror.plugins.credit_report.value_utils import stable_record_id
 _DATE_RE = re.compile(r"(20\d{2})[.年/-]\s*(\d{1,2})(?:[.月/-]\s*(\d{1,2}))?")
 _AS_OF_RE = re.compile(r"截至\s*(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 _STATUS_CODES = frozenset({"*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#"})
+_INQUIRY_REASONS = (
+    "本人查询",
+    "贷后管理",
+    "贷款审批",
+    "信用卡审批",
+    "担保资格审查",
+    "融资审批",
+    "保前审查",
+    "保后管理",
+    "客户准入资格审查",
+    "资信审查",
+    "法人代表、负责人、高管等资信审查",
+    "特约商户实名审查",
+    "异议处理",
+    "司法调查",
+)
+_INQUIRY_REASON_REPAIRS = {
+    "货后管理": "贷后管理",
+    "贷后智理": "贷后管理",
+    "货款审批": "贷款审批",
+    "资款审批": "贷款审批",
+    "信用卡审抛": "信用卡审批",
+}
 
 _ACCOUNT_LABELS = frozenset(
     {
@@ -774,7 +798,7 @@ def _account_events(
     return events
 
 
-def _extract_accounts(
+def _extract_table_accounts(
     parse_result: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     accounts: list[dict[str, Any]] = []
@@ -877,50 +901,419 @@ def _extract_accounts(
     return accounts, list(deduped.values()), account_events
 
 
-def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for page in getattr(parse_result, "pages", None) or []:
-        for table in getattr(page, "tables", None) or []:
-            rows = _table_rows(table)
-            compact = _compact(" ".join(cell for row in rows[:4] for cell in row))
-            if "授信协议标识" not in compact or "授信额度用途" not in compact:
-                continue
-            facts = _pairs(rows)
-            identifier = _identifier(_field(facts, "授信协议标识"))
-            if not identifier:
-                continue
-            due_raw = _field(facts, "到期日期")
-            currency = _currency(_field(facts, "币种")) or "CNY"
-            record = {
-                "credit_line_id": stable_record_id("credit_line", identifier),
-                "account_identifier": identifier,
-                "institution": _clean(_field(facts, "管理机构")),
-                "facility_type": _clean(_field(facts, "授信额度用途")),
-                "effective_date": _date(_field(facts, "生效日期")),
-                "due_date": _date(due_raw),
-                "validity_type": "perpetual" if _compact(due_raw) == "长期" else "fixed_term",
-                "total_limit": _number(_field(facts, "授信额度")),
-                "used_limit": _number(_field(facts, "已用额度")),
-                "limit_identifier": _identifier(_field(facts, "授信限额编号")),
-                "currency": currency,
-                "account_currency": currency,
-                "reporting_amount_currency": "CNY",
-                "amount_unit": "yuan",
-                "reporting_amount_unit": "yuan",
-                "status": "active",
-                "source": "native_detail_credit_agreement_table",
-                "source_refs": [_source_ref(page, table)],
-                "confidence": 1.0,
+_ACCOUNT_SECTION_TYPES: tuple[tuple[str, str], ...] = (
+    ("非循环贷账户", "non_revolving_loan"),
+    ("循环贷账户一", "revolving_loan_subaccount"),
+    ("循环贷账户二", "revolving_loan_account"),
+    ("循环贷账户", "revolving_loan_subaccount"),
+    ("准贷记卡账户", "quasi_credit_card"),
+    ("贷记卡账户", "credit_card"),
+)
+_ACCOUNT_SECTION_END = (
+    "授信协议信息",
+    "相关还款责任信息",
+    "非信贷交易信息明细",
+    "公共信息明细",
+    "查询记录",
+    "报告说明",
+)
+_ACCOUNT_ANCHOR_RE = re.compile(
+    r"^[^\u3400-\u9fff0-9]*账户\s*(\d{1,3})?\s*(?:[：:(（]|$|\s)"
+)
+_ACCOUNT_IDENTIFIER_PREFIX_RE = re.compile(
+    r"(?<![A-Z0-9])([A-Z][0-9]{8}[A-Z][A-Z0-9]{0,20})(?![A-Z0-9])",
+    re.I,
+)
+_ACCOUNT_IDENTIFIER_SUFFIX_RE = re.compile(
+    r"(?<![A-Z0-9])(?=[A-Z0-9]{4,})(?=[A-Z0-9]*\d)[A-Z0-9]{4,}(?![A-Z0-9])",
+    re.I,
+)
+
+
+def _account_identifier_from_detail(detail: list[dict[str, Any]]) -> str | None:
+    """Recover one identifier from the canonical account table row text.
+
+    Whole-page OCR commonly emits the ten-character identifier prefix as its
+    own line and the numeric suffix inside the following multi-cell row.  The
+    printed open date is the canonical boundary that prevents credit limits or
+    other numeric fields from being absorbed into the identifier.
+    """
+    header = next(
+        (
+            index
+            for index, line in enumerate(detail)
+            if "账户标识" in _compact(str(line.get("text") or ""))
+        ),
+        None,
+    )
+    if header is None:
+        return None
+
+    prefix = ""
+    suffix_parts: list[str] = []
+    saw_date_boundary = False
+    for line in detail[header + 1 : header + 9]:
+        text = str(line.get("text") or "").upper()
+        if "授信协议标识" in _compact(text):
+            continue
+        date_match = re.search(r"(?:19|20)\d{2}\s*(?:[./,，-]|年)\s*\d{1,2}", text)
+        before_date = text[: date_match.start()] if date_match else text
+        matches = list(_ACCOUNT_IDENTIFIER_PREFIX_RE.finditer(before_date))
+        if matches:
+            if prefix or len(matches) != 1:
+                return None
+            prefix = matches[0].group(1).upper()
+            before_date = before_date[matches[0].end() :]
+        if prefix:
+            suffix_parts.extend(match.group(0) for match in _ACCOUNT_IDENTIFIER_SUFFIX_RE.finditer(before_date))
+        if date_match and prefix:
+            saw_date_boundary = True
+            break
+
+    candidate = prefix + "".join(suffix_parts)
+    if saw_date_boundary and 24 <= len(candidate) <= 80 and re.fullmatch(r"[A-Z0-9]+", candidate):
+        return candidate
+    return None
+
+
+def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
+    """Build the canonical account row skeleton from printed account anchors."""
+    evidence_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if not callable(evidence_loader):
+        return []
+    flattened: list[dict[str, Any]] = []
+    active_type = ""
+    for page in evidence_loader():
+        lines = [line for line in page.get("lines") or () if isinstance(line, dict)]
+        for index, line in enumerate(lines):
+            text = str(line.get("text") or line.get("content") or "")
+            compact = _compact(text)
+            if active_type and any(marker in compact for marker in _ACCOUNT_SECTION_END):
+                active_type = ""
+            marker = next(
+                (account_type for label, account_type in _ACCOUNT_SECTION_TYPES if label in compact),
+                None,
+            )
+            if marker is not None:
+                active_type = marker
+            flattened.append(
+                {
+                    **line,
+                    "text": text,
+                    "page": int(page.get("page") or 0),
+                    "source_page": int(page.get("source_page") or 0),
+                    "account_type": active_type,
+                    "line_index": index,
+                }
+            )
+
+    starts = [
+        index
+        for index, line in enumerate(flattened)
+        if line.get("account_type") and _ACCOUNT_ANCHOR_RE.search(str(line.get("text") or ""))
+    ]
+    category_counts: defaultdict[str, int] = defaultdict(int)
+    used: defaultdict[str, set[int]] = defaultdict(set)
+    skeletons: list[dict[str, Any]] = []
+    for position, start in enumerate(starts):
+        anchor = flattened[start]
+        account_type = str(anchor["account_type"])
+        next_start = starts[position + 1] if position + 1 < len(starts) else len(flattened)
+        end = next_start
+        for index in range(start + 1, next_start):
+            if flattened[index].get("account_type") != account_type:
+                end = index
+                break
+        detail = flattened[start:end]
+        match = _ACCOUNT_ANCHOR_RE.search(str(anchor.get("text") or ""))
+        detected = int(match.group(1)) if match and match.group(1) else 0
+        category_counts[account_type] += 1
+        ordinal = detected if detected > 0 and detected not in used[account_type] else category_counts[account_type]
+        while ordinal in used[account_type]:
+            ordinal += 1
+        used[account_type].add(ordinal)
+        account_id = f"credit_account:{account_type}:{ordinal}"
+        skeleton = {
+                "account_id": account_id,
+                "sequence": len(skeletons) + 1,
+                "category_sequence": ordinal,
+                "account_type": account_type,
+                "account_state": "unknown",
+                "source": "candidate_b_account_anchor",
+                "page": int(anchor.get("page") or 0),
+                "source_page": int(anchor.get("source_page") or 0),
+                "bbox": list(anchor.get("bbox") or ()),
+                "source_refs": [
+                    {
+                        "source": "candidate_b_account_anchor",
+                        "logical_page": int(anchor.get("page") or 0),
+                        "source_page": int(anchor.get("source_page") or 0),
+                        "bbox": list(anchor.get("bbox") or ()),
+                        "evidence_ids": list(anchor.get("evidence_ids") or ()),
+                    }
+                ],
+                "raw_detail_lines": [
+                    {
+                        "logical_page": int(line.get("page") or 0),
+                        "source_page": int(line.get("source_page") or 0),
+                        "text": str(line.get("text") or ""),
+                        "bbox": list(line.get("bbox") or ()),
+                        "evidence_ids": list(line.get("evidence_ids") or ()),
+                    }
+                    for line in detail
+                ],
+                "confidence": float(anchor.get("confidence") or 0.0),
             }
-            records.append(record)
+        reconstructed_identifier = _account_identifier_from_detail(detail)
+        if reconstructed_identifier:
+            skeleton["account_identifier"] = reconstructed_identifier
+            skeleton["account_identifier_source"] = "canonical_anchor_table_row"
+        skeletons.append(skeleton)
+    return skeletons
+
+
+def _account_stream_position(record: dict[str, Any]) -> tuple[int, float] | None:
+    """Return the canonical logical-page position of an account observation."""
+    page = int(record.get("page") or 0)
+    bbox = record.get("bbox")
+    if not page:
+        for ref in record.get("source_refs") or ():
+            if not isinstance(ref, dict):
+                continue
+            page = int(ref.get("logical_page") or 0)
+            if not bbox:
+                bbox = ref.get("bbox")
+            if page:
+                break
+    if not page:
+        return None
+    try:
+        top = float(bbox[1]) if isinstance(bbox, (list, tuple)) and len(bbox) == 4 else 0.0
+    except (TypeError, ValueError):
+        top = 0.0
+    return page, top
+
+
+def _match_account_table_observations(
+    skeletons: list[dict[str, Any]],
+    table_accounts: list[dict[str, Any]],
+) -> dict[int, int]:
+    """Match table observations to printed anchors in canonical stream order.
+
+    OCR table classification is deliberately not an identity key.  For
+    example, a table headed ``账户授信额度`` can occur inside a type-R2 card
+    and look like an R1 table in isolation.  The printed anchor and registered
+    logical-page stream own identity; the table only supplies business cells.
+    """
+    matches: dict[int, int] = {}
+    consumed_tables: set[int] = set()
+    positioned_tables = sorted(
+        (
+            (position, table_index)
+            for table_index, table in enumerate(table_accounts)
+            if (position := _account_stream_position(table)) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    positioned_skeletons = {
+        index: position
+        for index, skeleton in enumerate(skeletons)
+        if (position := _account_stream_position(skeleton)) is not None
+    }
+
+    for table_position, table_index in positioned_tables:
+        eligible: list[tuple[tuple[int, float], int]] = []
+        for skeleton_index, skeleton_position in positioned_skeletons.items():
+            same_page_precedes = (
+                skeleton_position[0] == table_position[0]
+                and skeleton_position[1] <= table_position[1] + 24.0
+            )
+            earlier_page = skeleton_position[0] < table_position[0]
+            if same_page_precedes or earlier_page:
+                eligible.append((skeleton_position, skeleton_index))
+        if eligible:
+            _position, skeleton_index = max(eligible, key=lambda item: item[0])
+            # The immediately preceding printed anchor owns this canonical
+            # stream segment.  If it already has a base-table observation,
+            # this is a replay/secondary table, not evidence for an older
+            # unmatched anchor.
+            if skeleton_index in matches:
+                continue
+            matches[skeleton_index] = table_index
+            consumed_tables.add(table_index)
+
+    # Geometry can be unavailable in synthetic/native-table ParseResults.
+    # Exact canonical keys are a safe secondary match, but never override a
+    # stream-position match.
+    for skeleton_index, skeleton in enumerate(skeletons):
+        if skeleton_index in matches:
+            continue
+        key = (str(skeleton.get("account_type") or ""), int(skeleton.get("category_sequence") or 0))
+        if not key[0] or key[1] <= 0:
+            continue
+        for table_index, table in enumerate(table_accounts):
+            if table_index in consumed_tables:
+                continue
+            table_key = (str(table.get("account_type") or ""), int(table.get("category_sequence") or 0))
+            if table_key == key:
+                matches[skeleton_index] = table_index
+                consumed_tables.add(table_index)
+                break
+    return matches
+
+
+def _extract_accounts(
+    parse_result: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Materialize one account population from anchors enriched by tables."""
+    table_accounts, repayments, events = _extract_table_accounts(parse_result)
+    skeletons = _account_anchor_skeletons(parse_result)
+    if not skeletons:
+        return table_accounts, repayments, events
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    table_matches = _match_account_table_observations(skeletons, table_accounts)
+    emitted: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+    account_id_remap: dict[str, str] = {}
+    for skeleton_index, skeleton in enumerate(skeletons):
+        table_index = table_matches.get(skeleton_index)
+        table = table_accounts[table_index] if table_index is not None else None
+        if table is not None:
+            record = dict(table)
+            # Printed anchors own population identity and canonical ordering;
+            # the table contributes only decoded business cells.
+            for field_name in (
+                "account_id",
+                "sequence",
+                "category_sequence",
+                "account_type",
+                "page",
+                "source_page",
+                "bbox",
+            ):
+                record[field_name] = deepcopy(skeleton.get(field_name))
+            if not record.get("account_identifier") and skeleton.get("account_identifier"):
+                record["account_identifier"] = skeleton["account_identifier"]
+                record["account_identifier_source"] = skeleton.get("account_identifier_source")
+            record["source_refs"] = [
+                *(table.get("source_refs") or ()),
+                *(skeleton.get("source_refs") or ()),
+            ]
+            record["raw_detail_lines"] = list(skeleton.get("raw_detail_lines") or ())
+            emitted.append(record)
+            consumed.add(table_index)
+            prior_account_id = str(table.get("account_id") or "")
+            canonical_account_id = str(skeleton.get("account_id") or "")
+            if prior_account_id and canonical_account_id:
+                account_id_remap[prior_account_id] = canonical_account_id
+            continue
+
+        emitted.append(skeleton)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_table_missing",
+                message="A printed account anchor was present but its canonical account table was not recoverable.",
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=str(skeleton.get("account_id") or ""),
+                observed_value={
+                    "account_type": skeleton.get("account_type"),
+                    "category_sequence": skeleton.get("category_sequence"),
+                },
+                source_refs=skeleton.get("source_refs") or (),
+                reason_codes=("printed_account_anchor", "canonical_table_missing", "record_partial"),
+            ),
+        )
+
+    anchored_types = {
+        str(skeleton.get("account_type") or "")
+        for skeleton in skeletons
+        if skeleton.get("account_type")
+    }
+    for table_index, table in enumerate(table_accounts):
+        if table_index in consumed:
+            continue
+        account_type = str(table.get("account_type") or "")
+        structurally_missing_category = bool(account_type) and account_type not in anchored_types
+        if structurally_missing_category:
+            record = dict(table)
+            record["sequence"] = len(emitted) + 1
+            emitted.append(record)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code=(
+                    "candidate_b_account_category_anchor_missing"
+                    if structurally_missing_category
+                    else "candidate_b_unmatched_account_table_suppressed"
+                ),
+                message=(
+                    "A canonical account category had table evidence but no recoverable printed anchor; "
+                    "the table row was retained with uncertainty."
+                    if structurally_missing_category
+                    else "An unmatched table row duplicated an already anchored account category and was suppressed."
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=str(table.get("account_id") or ""),
+                source_refs=table.get("source_refs") or (),
+                reason_codes=(
+                    "canonical_account_table",
+                    "printed_anchor_missing",
+                    "record_requires_review" if structurally_missing_category else "duplicate_candidate_suppressed",
+                ),
+            ),
+        )
+
+    account_identifiers = {
+        str(account.get("account_id") or ""): account.get("account_identifier")
+        for account in emitted
+        if account.get("account_id")
+    }
+    for related_record in [*repayments, *events]:
+        prior_account_id = str(related_record.get("account_id") or "")
+        canonical_account_id = account_id_remap.get(prior_account_id)
+        if not canonical_account_id:
+            continue
+        related_record["account_id"] = canonical_account_id
+        if not related_record.get("account_identifier"):
+            related_record["account_identifier"] = account_identifiers.get(canonical_account_id)
+    return emitted, repayments, events
+
+
+def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
+    records: list[dict[str, Any]] = []
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("credit_lines"):
         facts = candidate.fields
         identifier = _typed_identifier(_field(facts, "授信协议标识"))
         if not identifier:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_credit_agreement_identifier_unresolved",
+                    message="A canonical credit-agreement card was observed but its agreement identifier was not safely extractable.",
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    field_name="account_identifier",
+                    observed_value=_field(facts, "授信协议标识") or None,
+                    source_refs=candidate.source_refs,
+                    reason_codes=("canonical_credit_agreement_card", "typed_identifier_failed", "record_withheld"),
+                ),
+            )
             continue
         due_raw = _field(facts, "到期日期")
         currency = _currency(_field(facts, "币种")) or "CNY"
@@ -942,7 +1335,7 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
                 "amount_unit": "yuan",
                 "reporting_amount_unit": "yuan",
                 "status": "active",
-                "source": "native_detail_tolerant_credit_agreement_table",
+                "source": "candidate_b_credit_agreement_schema",
                 "source_refs": list(candidate.source_refs),
                 "confidence": candidate.confidence,
             }
@@ -950,67 +1343,120 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
     return _dedupe_prefixed_identifiers(records, "account_identifier")
 
 
-def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for page in getattr(parse_result, "pages", None) or []:
-        for table in getattr(page, "tables", None) or []:
-            rows = _table_rows(table)
-            compact = _compact(" ".join(cell for row in rows[:5] for cell in row))
-            if "责任人类型" not in compact or "保证合同编号" not in compact:
-                continue
-            facts = _pairs(rows)
-            contract_number = _typed_identifier(_field(facts, "保证合同编号"))
-            related_id = _identifier(_field(facts, "主业务借款人证件号码"))
-            responsibility_amount = _number(_field(facts, "还款责任金额"))
-            if contract_number is None and not isinstance(responsibility_amount, int):
-                continue
-            identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
-            currency = _currency(_field(facts, "币种")) or "CNY"
-            records.append(
-                {
-                    "liability_id": stable_record_id("repayment_liability", identifier),
-                    "sequence": len(records) + 1,
-                    "open_date": _date(_field(facts, "开立日期")),
-                    "due_date": _date(_field(facts, "到期日期")),
-                    "related_party_name": _clean(_field(facts, "主业务借款人")),
-                    "related_party_id_type": _clean(_field(facts, "主业务借款人证件类型")),
-                    "related_party_id_number": related_id,
-                    "institution": _clean(_field(facts, "管理机构")),
-                    "business_type": _clean(_field(facts, "业务种类")),
-                    "responsibility_type": _clean(_field(facts, "责任人类型")),
-                    "responsibility_amount": responsibility_amount,
-                    "responsibility_amount_reported": True,
-                    "contract_number": contract_number,
-                    "snapshot_date": next(
-                        (
-                            _date("-".join(match.groups()))
-                            for row in rows
-                            if (match := _AS_OF_RE.search(_clean(" ".join(row))))
-                        ),
-                        None,
+def reconcile_candidate_b_credit_lines(
+    parse_result: Any,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the one-row-per-agreement schema constraint after correction."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for index, source in enumerate(records):
+        record = dict(source)
+        identifier = _typed_identifier(record.get("account_identifier"))
+        if identifier:
+            record["account_identifier"] = identifier
+            record["credit_line_id"] = stable_record_id("credit_line", identifier)
+        identity = str(record.get("credit_line_id") or f"candidate_b_credit_line_row:{index + 1}")
+        if identity not in groups:
+            groups[identity] = []
+            order.append(identity)
+        groups[identity].append(record)
+
+    reconciled: list[dict[str, Any]] = []
+    ignored_fields = {"source", "source_refs", "confidence", "credit_line_id"}
+    for identity in order:
+        observations = groups[identity]
+        ranked = sorted(
+            observations,
+            key=lambda row: (
+                sum(value not in (None, "", [], {}) for key, value in row.items() if key not in ignored_fields),
+                float(row.get("confidence") or 0.0),
+                len(str(row.get("account_identifier") or "")),
+            ),
+            reverse=True,
+        )
+        selected = dict(ranked[0])
+        conflicts: set[str] = set()
+        merged_refs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for observation in ranked:
+            for ref in observation.get("source_refs") or ():
+                if not isinstance(ref, dict):
+                    continue
+                marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen_refs:
+                    seen_refs.add(marker)
+                    merged_refs.append(dict(ref))
+            for key, value in observation.items():
+                if key in ignored_fields or value in (None, "", [], {}):
+                    continue
+                retained = selected.get(key)
+                if retained in (None, "", [], {}):
+                    selected[key] = deepcopy(value)
+                elif retained != value:
+                    conflicts.add(key)
+        if merged_refs:
+            selected["source_refs"] = merged_refs
+        reconciled.append(selected)
+        if len(observations) > 1 and conflicts:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_credit_agreement_observation_conflict",
+                    message=(
+                        "Multiple corrected observations resolved to one canonical credit-agreement identity; "
+                        "the most complete observation was retained and conflicting fields require review."
                     ),
-                    "balance": _number(_field(facts, "余额")),
-                    "five_tier_class": _clean(_field(facts, "五级分类")),
-                    "overdue_months_or_repayment_status": _clean(_field(facts, "逾期月数", "还款状态")),
-                    "currency": currency,
-                    "reporting_amount_currency": currency,
-                    "amount_unit": "yuan",
-                    "reporting_amount_unit": "yuan",
-                    "source": "native_detail_liability_table",
-                    "source_refs": [_source_ref(page, table)],
-                    "confidence": 1.0,
-                }
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=identity,
+                    observed_value={
+                        "candidate_count": len(observations),
+                        "conflicting_fields": sorted(conflicts),
+                    },
+                    source_refs=merged_refs,
+                    reason_codes=(
+                        "canonical_identity_collision",
+                        "single_schema_record_retained",
+                        "conflicting_fields_reported",
+                    ),
+                ),
             )
+    return reconciled
+
+
+def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
+    records: list[dict[str, Any]] = []
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("repayment_liability_records"):
         facts = candidate.fields
         contract_number = _typed_identifier(_field(facts, "保证合同编号"))
         related_id = _identifier(_field(facts, "主业务借款人证件号码"))
         responsibility_amount = _number(_field(facts, "还款责任金额"))
         if contract_number is None and not isinstance(responsibility_amount, int):
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_repayment_responsibility_identity_unresolved",
+                    message="A canonical repayment-responsibility card was observed but neither its contract identifier nor responsibility amount was safely extractable.",
+                    parser_stage="candidate_b_repayment_responsibility_schema",
+                    target_dataset="repayment_liability_records",
+                    observed_value={
+                        "contract_number": _field(facts, "保证合同编号") or None,
+                        "responsibility_amount": _field(facts, "还款责任金额") or None,
+                    },
+                    source_refs=candidate.source_refs,
+                    reason_codes=("canonical_responsibility_card", "record_identity_unresolved", "record_withheld"),
+                ),
+            )
             continue
         identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
         currency = _currency(_field(facts, "币种")) or "CNY"
@@ -1037,69 +1483,256 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                 "reporting_amount_currency": currency,
                 "amount_unit": "yuan",
                 "reporting_amount_unit": "yuan",
-                "source": "native_detail_tolerant_liability_table",
+                "source": "candidate_b_repayment_responsibility_schema",
                 "source_refs": list(candidate.source_refs),
                 "confidence": candidate.confidence,
             }
         )
     deduped = _dedupe_liability_records(records)
     if len(deduped) < len(records):
-        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
-            make_issue,
-            record_issue,
-        )
-
         record_issue(
             parse_result,
             make_issue(
                 category="schema_incompleteness",
-                issue_code="duplicate_liability_ocr_replay_suppressed",
+                issue_code="candidate_b_duplicate_responsibility_observation_suppressed",
                 message=(
-                    "A complete-page OCR replay matched an already parsed repayment-liability card on at least "
-                    "three independent business fields; the redundant replay was suppressed."
+                    "Two canonical observations matched the same repayment-responsibility card on at least "
+                    "three independent business fields; the redundant observation was suppressed."
                 ),
                 severity="info",
                 status="suppressed_redundant",
-                parser_stage="native_detail_liability_merge",
+                parser_stage="candidate_b_repayment_responsibility_schema",
                 target_dataset="repayment_liability_records",
                 observed_value={"candidate_count": len(records), "emitted_count": len(deduped)},
                 reason_codes=(
-                    "native_table_preferred",
+                    "single_schema_decoder",
                     "three_field_semantic_match",
-                    "ocr_identifier_transposition_tolerated",
+                    "duplicate_observation_suppressed",
                 ),
             ),
         )
     return deduped
 
 
+def _normalize_inquiry_reason(value: str) -> str:
+    text = str(value or "")
+    for observed, canonical in _INQUIRY_REASON_REPAIRS.items():
+        text = text.replace(observed, canonical)
+    return text
+
+
+def _inquiry_geometry_groups(lines: Any) -> list[list[dict[str, Any]]]:
+    """Join OCR tokens that occupy one canonical inquiry-table row."""
+    positioned: list[tuple[float, float, dict[str, Any]]] = []
+    for index, line in enumerate(lines or ()):
+        if not isinstance(line, dict):
+            continue
+        bbox = line.get("bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            try:
+                top, left = float(bbox[1]), float(bbox[0])
+            except (TypeError, ValueError):
+                top, left = float(index * 20), 0.0
+        else:
+            top, left = float(index * 20), 0.0
+        positioned.append((top, left, line))
+    positioned.sort(key=lambda item: (item[0], item[1]))
+
+    groups: list[list[tuple[float, float, dict[str, Any]]]] = []
+    for top, left, line in positioned:
+        if groups and abs(top - sum(item[0] for item in groups[-1]) / len(groups[-1])) <= 3.5:
+            groups[-1].append((top, left, line))
+        else:
+            groups.append([(top, left, line)])
+    return [
+        [line for _top, _left, line in sorted(group, key=lambda item: item[1])]
+        for group in groups
+    ]
+
+
+def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
+    """Reconstruct known inquiry-template rows from canonical line geometry."""
+    evidence_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if not callable(evidence_loader):
+        return []
+    rows: list[dict[str, Any]] = []
+    last_sequence = {"institution": 0, "personal": 0}
+    inferred_sequences: defaultdict[str, list[int]] = defaultdict(list)
+    for page in evidence_loader():
+        if str(page.get("canonical_template_id") or "") != "annotations_and_inquiries":
+            continue
+        for group in _inquiry_geometry_groups(page.get("lines") or ()):
+            text = _normalize_inquiry_reason(
+                " ".join(str(line.get("text") or line.get("content") or "").strip() for line in group)
+            )
+            date_match = re.search(r"20\d{2}[.,/-]\d{1,2}[.,/-]\d{1,2}", text)
+            if date_match is None:
+                continue
+            reason = next(
+                (candidate for candidate in _INQUIRY_REASONS if candidate in text[date_match.end() :]),
+                "",
+            )
+            if not reason:
+                continue
+            reason_index = text.find(reason, date_match.end())
+            institution = re.sub(
+                r"^[^\u3400-\u9fffA-Za-z]+",
+                "",
+                text[date_match.end() : reason_index],
+            ).strip()
+            inquiry_type = "personal" if reason.startswith("本人查询") or institution == "本人" else "institution"
+            if inquiry_type == "personal" and not institution:
+                institution = "本人"
+            if not institution:
+                continue
+            expected = last_sequence[inquiry_type] + 1
+            sequence_tokens = re.findall(r"\d{1,4}", text[: date_match.start()])
+            detected = int(sequence_tokens[-1]) if sequence_tokens else 0
+            inferred_sequence = detected == 0
+            corrected_sequence = detected > expected and str(detected).endswith(str(expected))
+            sequence = expected if inferred_sequence or corrected_sequence else detected
+            if sequence <= last_sequence[inquiry_type]:
+                continue
+            last_sequence[inquiry_type] = sequence
+            if inferred_sequence:
+                inferred_sequences[inquiry_type].append(sequence)
+            inquiry_date = _date(date_match.group(0).replace(",", "."))
+            if inquiry_date is None:
+                continue
+            boxes = [line.get("bbox") for line in group if isinstance(line.get("bbox"), list) and len(line["bbox"]) == 4]
+            bbox = (
+                [
+                    min(float(box[0]) for box in boxes),
+                    min(float(box[1]) for box in boxes),
+                    max(float(box[2]) for box in boxes),
+                    max(float(box[3]) for box in boxes),
+                ]
+                if boxes
+                else []
+            )
+            source_ref = {
+                "source": "candidate_b_canonical_inquiry_line",
+                "logical_page": int(page.get("page") or 0),
+                "source_page": int(page.get("source_page") or 0),
+                "bbox": bbox,
+                "evidence_ids": list(
+                    dict.fromkeys(
+                        str(evidence_id)
+                        for line in group
+                        for evidence_id in (line.get("evidence_ids") or ())
+                        if evidence_id
+                    )
+                ),
+            }
+            row = {
+                "inquiry_id": stable_record_id(
+                    "credit_inquiry", inquiry_type, sequence, inquiry_date, institution, reason
+                ),
+                "sequence": sequence,
+                "inquiry_date": inquiry_date,
+                "institution": institution,
+                "reason": reason,
+                "source_reason": text[reason_index:].strip(),
+                "query_channel": inquiry_type,
+                "inquiry_type": inquiry_type,
+                "source": "candidate_b_canonical_inquiry_line",
+                "source_refs": [source_ref],
+                "confidence": min(
+                    min((float(line.get("confidence") or 0.0) for line in group), default=0.0),
+                    0.8,
+                ),
+            }
+            if corrected_sequence or inferred_sequence:
+                row["extraction_status"] = "review"
+                row["audit"] = {
+                    "reason": (
+                        "sequence_missing_inferred_by_template_row_order"
+                        if inferred_sequence
+                        else "sequence_prefix_noise_corrected_by_template_contract"
+                    ),
+                    "raw_sequence": detected or None,
+                }
+            rows.append(row)
+    if inferred_sequences:
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+        for inquiry_type, sequences in inferred_sequences.items():
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_inquiry_sequence_inferred_from_row_order",
+                    message="One or more inquiry row numbers were unreadable and were inferred from canonical table order.",
+                    parser_stage="candidate_b_inquiry_schema",
+                    target_dataset="inquiry_records",
+                    field_name="sequence",
+                    observed_value={"inquiry_type": inquiry_type, "missing_ocr_sequence": True},
+                    candidate_value={"inferred_sequences": sequences},
+                    reason_codes=("canonical_four_column_table", "contiguous_row_order", "sequence_requires_review"),
+                ),
+            )
+    return rows
+
+
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    active_canonical_table = False
     for page in getattr(parse_result, "pages", None) or []:
+        page_is_canonical_inquiry = (
+            str(getattr(page, "canonical_template_id", "") or "") == "annotations_and_inquiries"
+        )
+        page_had_inquiry_table = False
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
             if not rows:
                 continue
             header = _nonempty(rows[0])
             compact_header = _compact("".join(header))
-            if not all(marker in compact_header for marker in ("查询日期", "查询机构", "查询原因")):
+            has_header = all(marker in compact_header for marker in ("查询日期", "查询机构", "查询原因"))
+            is_continuation = (
+                not has_header
+                and page_is_canonical_inquiry
+                and active_canonical_table
+                and bool(_nonempty(rows[0]))
+                and re.fullmatch(r"\d{1,4}", _nonempty(rows[0])[0]) is not None
+            )
+            if not has_header and not is_continuation:
                 continue
-            for row_index, row in enumerate(rows[1:], start=1):
-                values = _nonempty(row)
-                if len(values) < 4 or not re.fullmatch(r"\d+", values[0]):
+            page_had_inquiry_table = True
+            active_canonical_table = True
+            start = 1 if has_header else 0
+            for row_index, row in enumerate(rows[start:], start=start):
+                cells = [str(value or "").strip() for value in row]
+                values = _nonempty(cells)
+                if not values or re.fullmatch(r"\d{1,4}", values[0]) is None:
                     continue
-                inquiry_date = _date(values[1])
-                institution = values[2]
-                source_reason = values[3]
+                sequence = int(values[0])
+                date_cell = cells[1] if len(cells) > 1 else (values[1] if len(values) > 1 else "")
+                date_match = re.search(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", date_cell)
+                if date_match is None:
+                    continue
+                inquiry_date = _date(date_match.group(0))
+                institution = cells[2] if len(cells) > 2 else ""
+                source_reason = cells[3] if len(cells) > 3 else ""
+                if not institution:
+                    # A border miss can merge the date and institution while
+                    # leaving the reason in its correct final column.  The
+                    # date contract gives an unambiguous, value-agnostic split.
+                    institution = date_cell[date_match.end() :].strip(" :：|/")
+                if (not institution or not source_reason) and len(values) >= 4:
+                    institution = institution or values[2]
+                    source_reason = source_reason or values[3]
+                if not institution or not source_reason or inquiry_date is None:
+                    continue
                 inquiry_type = (
                     "personal" if institution == "本人" or source_reason.startswith("本人查询") else "institution"
                 )
                 records.append(
                     {
                         "inquiry_id": stable_record_id(
-                            "credit_inquiry", inquiry_type, values[0], inquiry_date, institution, source_reason
+                            "credit_inquiry", inquiry_type, sequence, inquiry_date, institution, source_reason
                         ),
-                        "sequence": int(values[0]),
+                        "sequence": sequence,
                         "inquiry_date": inquiry_date,
                         "institution": institution,
                         "reason": source_reason,
@@ -1111,7 +1744,99 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                         "confidence": 1.0,
                     }
                 )
-    return records
+        if not page_is_canonical_inquiry and not page_had_inquiry_table:
+            active_canonical_table = False
+    records.extend(_canonical_inquiry_line_rows(parse_result))
+    best: dict[tuple[str, int], dict[str, Any]] = {}
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    for record in records:
+        key = (str(record.get("inquiry_type") or ""), int(record.get("sequence") or 0))
+        current = best.get(key)
+        if current is None:
+            best[key] = record
+            continue
+        current_values = tuple(current.get(field) for field in ("inquiry_date", "institution", "reason"))
+        candidate_values = tuple(record.get(field) for field in ("inquiry_date", "institution", "reason"))
+        if current_values != candidate_values:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_inquiry_row_conflict",
+                    message="Canonical table and line observations disagree for the same printed inquiry row.",
+                    parser_stage="candidate_b_inquiry_schema",
+                    target_dataset="inquiry_records",
+                    target_record_id=str(current.get("inquiry_id") or record.get("inquiry_id") or ""),
+                    observed_value={"table_or_first": current_values, "line_or_second": candidate_values},
+                    source_refs=[*(current.get("source_refs") or ()), *(record.get("source_refs") or ())],
+                    reason_codes=("canonical_observation_conflict", "requires_review"),
+                ),
+            )
+        if float(record.get("confidence") or 0.0) > float(current.get("confidence") or 0.0):
+            best[key] = record
+    # Full-page OCR occasionally prefixes a row number with a neighbouring
+    # watermark digit (89 -> 789).  If the suffix row already exists in the
+    # same canonical population, the prefixed observation is redundant rather
+    # than a new sequence endpoint.
+    for key, record in list(best.items()):
+        inquiry_type, sequence = key
+        if sequence < 100:
+            continue
+        suffix = sequence % 100
+        suffix_key = (inquiry_type, suffix)
+        if suffix <= 0 or suffix_key not in best:
+            continue
+        suffix_record = best[suffix_key]
+        if record.get("inquiry_date") != suffix_record.get("inquiry_date"):
+            continue
+        best.pop(key, None)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_inquiry_sequence_prefix_suppressed",
+                message="A prefixed OCR row number duplicated an existing canonical inquiry row.",
+                severity="info",
+                status="resolved",
+                parser_stage="candidate_b_inquiry_schema",
+                target_dataset="inquiry_records",
+                target_record_id=str(record.get("inquiry_id") or ""),
+                observed_value={"raw_sequence": sequence},
+                candidate_value={"canonical_sequence": suffix},
+                source_refs=record.get("source_refs") or (),
+                reason_codes=("sequence_prefix_noise", "canonical_duplicate_suppressed"),
+            ),
+        )
+
+    ordered = sorted(best.values(), key=lambda row: (str(row.get("inquiry_type") or ""), int(row.get("sequence") or 0)))
+    for inquiry_type in sorted({str(row.get("inquiry_type") or "unknown") for row in ordered}):
+        sequences = {
+            int(row.get("sequence") or 0)
+            for row in ordered
+            if str(row.get("inquiry_type") or "unknown") == inquiry_type and int(row.get("sequence") or 0) > 0
+        }
+        missing = sorted(set(range(1, max(sequences) + 1)) - sequences) if sequences else []
+        if not missing:
+            continue
+        record_issue(
+            parse_result,
+            make_issue(
+                category="page_continuation",
+                issue_code="canonical_inquiry_sequence_gap",
+                message="Canonical inquiry rows contain a printed sequence gap; no missing row was invented.",
+                parser_stage="candidate_b_inquiry_schema",
+                target_dataset="inquiry_records",
+                observed_value={
+                    "inquiry_type": inquiry_type,
+                    "observed_row_count": len(sequences),
+                    "observed_sequences": sorted(sequences),
+                },
+                candidate_value={"source_sequence_endpoint": max(sequences), "missing_sequences": missing},
+                reason_codes=("canonical_sequence_not_contiguous", "missing_row_not_invented", "dataset_incomplete"),
+            ),
+        )
+    return ordered
 
 
 def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
@@ -2285,6 +3010,17 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
     subject_name = select("subject_name")
     id_type = select("primary_id_type")
     id_number = select("primary_id_number", id_type or "身份证")
+    observed_primary_numbers = tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in field_candidates.get("primary_id_number", [])
+            if value.strip()
+        )
+    )
+    source_primary_id_number = (
+        id_number
+        or (observed_primary_numbers[0] if len(observed_primary_numbers) == 1 else None)
+    )
     if id_type is None and cn_identity_number_valid(id_number):
         id_type = "身份证"
         for issue in getattr(parse_result, "_personal_detail_extraction_issues", []) or []:
@@ -2325,14 +3061,20 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
         }
     ]
     identities: list[dict[str, Any]] = []
-    if id_type and id_number:
+    if id_type and source_primary_id_number:
         identities.append(
             {
-                "identity_document_id": stable_record_id("identity_document", "primary", id_type, id_number),
+                "identity_document_id": stable_record_id(
+                    "identity_document", "primary", id_type, source_primary_id_number
+                ),
                 "sequence": 1,
                 "holder_name": subject_name,
                 "document_type": id_type,
-                "document_number": id_number,
+                # Preserve the source-visible row even when its displayed
+                # number fails a checksum/type contract.  The v2 quality gate
+                # withholds the normalized field and publishes the linked
+                # uncertainty instead of silently deleting the identity row.
+                "document_number": source_primary_id_number,
                 "is_primary": True,
                 "source": "native_detail_header",
                 "source_refs": [{"source": "native_detail_header", "logical_page": 1, "source_page": 1}],
@@ -2357,107 +3099,27 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
 
 
 def extract_personal_detail_native_business(parse_result: Any, full_text: str) -> dict[str, Any]:
-    """Return canonical base collections for a native detailed report."""
-    account_loader = getattr(parse_result, "account_collections", None)
-    accounts, repayments, _account_event_rows = (
-        account_loader() if callable(account_loader) else _extract_accounts(parse_result)
+    """Return the business slice of the authoritative Candidate B result."""
+    from copy import deepcopy
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+        build_personal_detail_extraction_context,
     )
-    credit_lines = _extract_credit_lines(parse_result)
-    liabilities = _extract_liabilities(parse_result)
-    inquiries = _extract_inquiries(parse_result)
-    public_records = _extract_public_records(parse_result)
-    return {
-        "credit_accounts": accounts,
-        "credit_lines": credit_lines,
-        "repayment_liability_records": liabilities,
-        "repayment_records": repayments,
-        "inquiry_records": inquiries,
-        "public_records": public_records,
-        "credit_summary": {
-            "source": "personal_detail_native_tables",
-            "reported_account_count": len(accounts),
-            "projected_account_count": len(accounts),
-            "repayment_liability_count": len(liabilities),
-            "inquiry_count": len(inquiries),
-        },
-    }
+
+    context = build_personal_detail_extraction_context(parse_result)
+    return deepcopy(context.candidate_b_extraction(full_text).business)
 
 
 def extract_personal_detail_section_content(parse_result: Any, full_text: str) -> dict[str, Any]:
-    """Return supplemental canonical datasets and lossless source rows."""
-    from docmirror.plugins.credit_report.business_records import derive_overdue_records
-    from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_business
+    """Return the supplemental slice of the authoritative Candidate B result."""
+    from copy import deepcopy
 
-    scanned_loader = getattr(parse_result, "scanned_business", None)
-    scanned_compatible = (
-        scanned_loader(full_text)
-        if callable(scanned_loader)
-        else extract_scanned_credit_business(parse_result, full_text)
+    from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+        build_personal_detail_extraction_context,
     )
-    account_loader = getattr(parse_result, "account_collections", None)
-    accounts, repayments, account_events = (
-        account_loader() if callable(account_loader) else _extract_accounts(parse_result)
-    )
-    native_loader = getattr(parse_result, "native_business", None)
-    native_compatible = (
-        native_loader(full_text)
-        if callable(native_loader)
-        else extract_personal_detail_native_business(parse_result, full_text)
-    )
-    annotations, statements = _extract_personal_notes(parse_result)
-    employment_records = _extract_employment_records(parse_result)
-    residence_records = _extract_residence_records(parse_result)
-    summary_records, summary_cells = _extract_summary_datasets(parse_result)
-    subject_profile = dict(scanned_compatible.get("subject_profile") or {})
-    profile_facts = {
-        key: value.get("normalized_value", value.get("value"))
-        for key, value in subject_profile.items()
-        if isinstance(value, dict) and value.get("normalized_value", value.get("value")) not in (None, "")
-    }
-    if profile_facts.get("birth_date"):
-        birth_match = re.fullmatch(
-            r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})",
-            _compact(profile_facts["birth_date"]),
-        )
-        if birth_match:
-            profile_facts["birth_date"] = (
-                f"{int(birth_match.group(1)):04d}-{int(birth_match.group(2)):02d}-{int(birth_match.group(3)):02d}"
-            )
-    profile_detail_records = _extract_profile_detail_records(parse_result)
-    header = extract_personal_detail_common_datasets(parse_result, full_text)
-    datasets: dict[str, list[dict[str, Any]]] = {
-        **header,
-        "recovery_records": _extract_recovery_records(parse_result),
-        "postpaid_records": _extract_postpaid_records(parse_result),
-        "postpaid_payment_history": _extract_postpaid_payment_history(parse_result),
-        "personal_detail_account_events": account_events,
-        "personal_detail_summary_records": summary_records,
-        "personal_detail_summary_cells": summary_cells,
-        **profile_detail_records,
-        "residence_records": residence_records or list(scanned_compatible.get("residence_records") or []),
-        "employment_records": employment_records or list(scanned_compatible.get("employment_records") or []),
-        "annotations": annotations or list(scanned_compatible.get("annotations") or []),
-        "statements": statements or list(scanned_compatible.get("statements") or []),
-    }
-    expected_counts = {
-        **{name: len(rows) for name, rows in datasets.items()},
-        "credit_lines": len(native_compatible.get("credit_lines") or []),
-        "repayment_liability_records": len(native_compatible.get("repayment_liability_records") or []),
-        "repayment_records": len(repayments),
-        "overdue_records": len(derive_overdue_records(accounts, repayments)),
-        "public_records": len(native_compatible.get("public_records") or []),
-    }
-    completeness_ledger = _source_completeness_ledger(parse_result)
-    return {
-        "facts": {
-            "subject_profile": subject_profile,
-            **profile_facts,
-            "canonical_dataset_schema": "personal_credit_report_detailed.v2",
-            "personal_detail_source_completeness_ledger": completeness_ledger,
-            **{f"personal_detail_expected_{name}_count": count for name, count in expected_counts.items()},
-        },
-        "datasets": {name: rows for name, rows in datasets.items() if rows},
-    }
+
+    context = build_personal_detail_extraction_context(parse_result)
+    return deepcopy(context.candidate_b_extraction(full_text).section_content)
 
 
 def extract_personal_detail_common_datasets(

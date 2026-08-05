@@ -1,12 +1,13 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tolerant native table grammar for PBOC personal detailed reports.
+"""Schema-directed card decoder for PBOC personal detailed reports.
 
-This is a fallback grammar, not an alternate source of truth.  Exact legacy
-parsers run first; this parser is used only when an expected dataset or field
-is missing.  Fuzzy labels require a unique high-margin match and never cause a
-business value to be guessed.
+This is the single Candidate B decoder for labelled credit-agreement and
+repayment-responsibility cards. Native tables, registered page rows, and
+whole-page OCR retries are observations inside one decoder, not competing
+business populations. Fuzzy labels require a unique high-margin match and
+never cause a business value to be guessed.
 """
 
 from __future__ import annotations
@@ -151,7 +152,7 @@ class NativeLabeledRecord:
 
 
 class PBOCPersonalDetailNativeParser:
-    """Parse labelled native table fragments using sealed table evidence."""
+    """Resolve labelled card observations into one canonical record stream."""
 
     def __init__(self, context: Any) -> None:
         self.context = context

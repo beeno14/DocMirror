@@ -501,13 +501,16 @@ def test_native_parser_carries_credit_agreement_card_across_corrected_pages() ->
     assert len(records[0].source_refs) == 2
 
 
-def test_scanned_auxiliary_includes_schema_parsed_native_datasets() -> None:
+def test_scanned_auxiliary_exposes_only_the_single_candidate_b_result() -> None:
+    expected = {
+        "credit_accounts": [{"account_id": "account:1"}],
+        "credit_lines": [{"credit_line_id": "line:1"}],
+        "repayment_liability_records": [{"liability_id": "liability:1"}],
+    }
     context = SimpleNamespace(
-        scanned_business=lambda _text: {"credit_accounts": [{"account_id": "account:1"}]},
-        native_business=lambda _text: {
-            "credit_lines": [{"credit_line_id": "line:1"}],
-            "repayment_liability_records": [{"liability_id": "liability:1"}],
-        },
+        candidate_b_extraction=lambda _text: SimpleNamespace(business=expected),
+        scanned_business=lambda _text: (_ for _ in ()).throw(AssertionError("legacy scanned path called")),
+        native_business=lambda _text: (_ for _ in ()).throw(AssertionError("legacy native path called")),
     )
 
     result = PersonalDetailScannedVariant().extract_auxiliary_business(
@@ -516,9 +519,8 @@ def test_scanned_auxiliary_includes_schema_parsed_native_datasets() -> None:
         content_mode="scanned_ocr",
     )
 
-    assert result["credit_accounts"] == [{"account_id": "account:1"}]
-    assert result["credit_lines"] == [{"credit_line_id": "line:1"}]
-    assert result["repayment_liability_records"] == [{"liability_id": "liability:1"}]
+    assert result == expected
+    assert result is not expected
 
 
 def test_printed_reading_order_tolerates_large_observed_page_gaps() -> None:
