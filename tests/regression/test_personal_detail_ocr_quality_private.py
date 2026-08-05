@@ -18,9 +18,8 @@ from docmirror.plugins._base.kv_community_enrich import _canonicalize_credit_acc
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     build_personal_detail_extraction_context,
 )
-from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
+from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     PBOC_DATASET_ORDER,
-    PBOC_SCHEMA_VERSION_ENV,
 )
 from docmirror.plugins.credit_report.scanned_business import link_repayment_records_to_accounts
 from docmirror.server.output_builder import build_community_bundle
@@ -56,7 +55,6 @@ def _perceive(fixture: Path):
 @pytest.mark.parametrize("fixture", _FIXTURES, ids=lambda path: path.name)
 def test_personal_detail_ocr_correction_invariants(
     fixture: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Exercise source correction and the schema boundary on every private report."""
     sealed = _perceive(fixture)
@@ -159,12 +157,11 @@ def test_personal_detail_ocr_correction_invariants(
         # duplicate/backward row numbers must not leak into reconstruction.
         assert sequences == sorted(set(sequences))
 
-    monkeypatch.setenv(PBOC_SCHEMA_VERSION_ENV, "2.0.0")
     bundle = build_community_bundle(sealed, file_path=str(fixture))
     semantic = bundle.semantic_payload()
     payload = bundle.json_payload(semantic)
     assert validate_projection_payload("community", payload).valid
-    v2_validation = validate_projection_payload("personal_credit_report_detailed_v2", payload)
+    v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert v2_validation.valid, v2_validation.errors
     assert payload["document"]["domain_schema"]["version"] == "2.0.0"
     v2_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
@@ -173,7 +170,16 @@ def test_personal_detail_ocr_correction_invariants(
     v2_statuses = {
         row["normalized"]["dataset_name"]: row["normalized"] for row in v2_datasets["dataset_status"]["rows"]
     }
-    assert set(v2_statuses) == set(PBOC_DATASET_ORDER) - {"dataset_status"}
+    assert set(v2_statuses) <= set(PBOC_DATASET_ORDER) - {
+        "field_observations",
+        "extraction_issues",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
+    assert all(
+        status["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for status in v2_statuses.values()
+    )
     assert all(
         status["observed_row_count"] == v2_datasets.get(name, {}).get("row_count", 0)
         for name, status in v2_statuses.items()

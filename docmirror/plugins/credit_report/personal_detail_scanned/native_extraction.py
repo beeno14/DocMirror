@@ -2283,7 +2283,7 @@ def extract_personal_detail_section_content(parse_result: Any, full_text: str) -
         "facts": {
             "subject_profile": subject_profile,
             **profile_facts,
-            "canonical_dataset_schema": "personal_credit_report_detailed.v1",
+            "canonical_dataset_schema": "personal_credit_report_detailed.v2",
             **{f"personal_detail_expected_{name}_count": count for name, count in expected_counts.items()},
         },
         "datasets": {name: rows for name, rows in datasets.items() if rows},

@@ -15,13 +15,11 @@ from docmirror.models.schemas.registry import (
 )
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.community_bundle import project_community_bundle
-from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
+from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     PBOC_DATASET_ORDER,
-    PBOC_SCHEMA_VERSION_ENV,
-    personal_detail_v2_data_dictionary,
-    personal_detail_v2_enabled,
-    personal_detail_v2_semantic_extensions,
-    project_personal_detail_v2_datasets,
+    personal_detail_data_dictionary,
+    personal_detail_semantic_extensions,
+    project_personal_detail_datasets,
 )
 
 
@@ -43,6 +41,16 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
         ],
         "personal_profile": [
             _record("profile:1", personal_profile_id="profile:1", birth_date="1981-08-15")
+        ],
+        "personal_detail_field_observations": [
+            _record(
+                "field:1",
+                field_observation_id="field:1",
+                dataset_name="personal_profile",
+                business_record_id="profile:1",
+                field_name="work_phone",
+                observation_status="not_observed",
+            )
         ],
         "credit_accounts": [
             _record(
@@ -144,7 +152,7 @@ def test_v2_projection_corrects_business_semantics_and_retains_unmapped_values()
         ],
     }
 
-    projected = project_personal_detail_v2_datasets(source)
+    projected = project_personal_detail_datasets(source)
 
     assert set(projected) <= set(PBOC_DATASET_ORDER)
     assert "repayment_records" not in projected
@@ -245,7 +253,7 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
         ],
     }
 
-    projected = project_personal_detail_v2_datasets(source)
+    projected = project_personal_detail_datasets(source)
 
     assert len(projected["credit_account_latest_repayments"]) == 1
     assert len(projected["credit_account_special_events"]) == 1
@@ -260,6 +268,8 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
     statuses = {row["dataset_name"]: row for row in projected["dataset_status"]}
     assert set(statuses) == set(PBOC_DATASET_ORDER) - {
         "dataset_status",
+        "field_observations",
+        "extraction_issues",
         "credit_account_latest_repayments",
         "credit_account_special_events",
         "credit_account_special_transactions",
@@ -275,7 +285,7 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
 
 
 def test_v2_preserves_invalid_month_source_without_emitting_invalid_month() -> None:
-    projected = project_personal_detail_v2_datasets(
+    projected = project_personal_detail_datasets(
         {
             "administrative_penalty_records": [
                 _record(
@@ -304,8 +314,54 @@ def test_v2_preserves_invalid_month_source_without_emitting_invalid_month() -> N
     assert postpaid["status_code"] == "1"
 
 
+def test_v2_preserves_sparse_uncertainty_as_typed_control_datasets() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_field_observations": [
+                _record(
+                    "field:1",
+                    field_observation_id="field:1",
+                    dataset_name="personal_profile",
+                    business_record_id="personal_profile:primary",
+                    field_name="work_phone",
+                    observation_status="not_observed",
+                ),
+                _record(
+                    "field:2",
+                    field_observation_id="field:2",
+                    dataset_name="datasets",
+                    business_record_id="unresolved_record",
+                    field_name="balance",
+                    observation_status="ambiguous",
+                ),
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:1",
+                    extraction_issue_id="issue:1",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="open",
+                    target_dataset="credit_lines",
+                    field_name="facility_limit",
+                )
+            ],
+        }
+    )
+
+    observation, unresolved = projected["field_observations"]
+    issue = projected["extraction_issues"][0]
+    assert observation["dataset_name"] == "subject_profile"
+    assert observation["observation_status"] == "not_observed"
+    assert unresolved["dataset_name"] == "unknown"
+    assert unresolved["source_dataset_name"] == "datasets"
+    assert issue["target_dataset"] == "credit_agreements"
+    assert "pboc_extension_fields" not in projected
+
+
 def test_v2_dictionary_covers_pboc_catalog_and_logical_types() -> None:
-    dictionary = personal_detail_v2_data_dictionary()
+    dictionary = personal_detail_data_dictionary()
 
     assert dictionary["version"] == "2.0.0"
     assert set(PBOC_DATASET_ORDER) <= set(dictionary["datasets"])
@@ -314,13 +370,6 @@ def test_v2_dictionary_covers_pboc_catalog_and_logical_types() -> None:
     assert dictionary["datasets"]["housing_fund_records"]["columns"][
         "personal_contribution_ratio_percent"
     ]["logical_type"] == "Short"
-
-
-def test_v2_is_opt_in_during_shadow_rollout(monkeypatch: Any) -> None:
-    monkeypatch.delenv(PBOC_SCHEMA_VERSION_ENV, raising=False)
-    assert personal_detail_v2_enabled() is False
-    monkeypatch.setenv(PBOC_SCHEMA_VERSION_ENV, "2.0.0")
-    assert personal_detail_v2_enabled() is True
 
 
 def _canonical_dataset(name: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -358,9 +407,9 @@ def _canonical_dataset(name: str, row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_v2_schema_is_registered_alongside_frozen_v1() -> None:
-    assert get_projection_schema("personal_credit_report_detailed").version == "1.2.0"
-    assert get_projection_schema("personal_credit_report_detailed_v2").version == "2.0.0"
+def test_v2_schema_is_the_only_registered_detailed_personal_contract() -> None:
+    assert get_projection_schema("personal_credit_report_detailed").version == "2.0.0"
+    assert get_projection_schema("personal_credit_report_detailed_v2") is None
     payload = {
         "schema": {
             "name": "docmirror.community",
@@ -386,9 +435,9 @@ def test_v2_schema_is_registered_alongside_frozen_v1() -> None:
                 "version": "2.0.0",
                 "contract_uri": (
                     "https://valuemapglobal.github.io/DocMirror/schemas/"
-                    "personal_credit_report_detailed_v2.schema.json"
+                    "personal_credit_report_detailed.schema.json"
                 ),
-                "compatibility": "breaking-from-1.2; detailed-report-only",
+                "compatibility": "canonical-v2; detailed-report-only",
             },
         },
         "sections": [],
@@ -420,7 +469,7 @@ def test_v2_schema_is_registered_alongside_frozen_v1() -> None:
         "warnings": [],
     }
 
-    validation = validate_projection_payload("personal_credit_report_detailed_v2", payload)
+    validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert validation.valid, validation.errors
 
 
@@ -438,6 +487,16 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
         ],
         "personal_profile": [
             _record("profile:1", personal_profile_id="profile:1", birth_date="1981-08-15")
+        ],
+        "personal_detail_field_observations": [
+            _record(
+                "field:1",
+                field_observation_id="field:1",
+                dataset_name="personal_profile",
+                business_record_id="profile:1",
+                field_name="work_phone",
+                observation_status="not_observed",
+            )
         ],
         "credit_accounts": [
             _record(
@@ -482,16 +541,16 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
             ),
         ],
     }
-    semantic = personal_detail_v2_semantic_extensions()
+    semantic = personal_detail_semantic_extensions()
     projection = {
         "projector_id": "credit_report",
         "document_type": "personal_credit_report_detailed",
         "domain_facts": {
             "document_label": "个人信用报告",
-            "data_dictionary": personal_detail_v2_data_dictionary(),
+            "data_dictionary": personal_detail_data_dictionary(),
         },
         "semantic": semantic,
-        "datasets": project_personal_detail_v2_datasets(source),
+        "datasets": project_personal_detail_datasets(source),
         "sections": [
             {
                 "id": "sec_personal_basic",
@@ -518,12 +577,15 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
 
     assert payload["document"]["domain_schema"]["version"] == "2.0.0"
     assert validate_projection_payload("community", payload).valid
-    v2_validation = validate_projection_payload("personal_credit_report_detailed_v2", payload)
+    v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert v2_validation.valid, v2_validation.errors
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    observation = datasets["field_observations"]["rows"][0]["normalized"]
+    assert observation["dataset_name"] == "subject_profile"
+    assert observation["source_dataset_name"] is None
     statuses = [row["normalized"] for row in datasets["dataset_status"]["rows"]]
     assert all(
         row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
         for row in statuses
     )
-    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 6
+    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 9

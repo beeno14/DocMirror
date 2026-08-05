@@ -6,9 +6,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailExtractionContext,
     _printed_reading_order,
 )
-from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
-    apply_personal_detail_contract,
-)
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
     collect_extraction_issues,
     dataset_states_from_issues,
@@ -23,8 +20,11 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
 )
-from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
-    project_personal_detail_v2_datasets,
+from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+    project_personal_detail_datasets,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    prepare_personal_detail_source_collections,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
@@ -154,7 +154,7 @@ def test_credit_line_limits_are_schema_typed_amounts() -> None:
 
 
 def test_final_grid_count_repairs_only_zero_expected_count() -> None:
-    content = apply_personal_detail_contract(
+    content = prepare_personal_detail_source_collections(
         {
             "facts": {
                 "personal_detail_expected_repayment_records_count": 0,
@@ -182,7 +182,7 @@ def test_withheld_typed_value_is_partial_and_has_field_observation() -> None:
     )
 
     assert dataset_states_from_issues([issue])["credit_accounts"]["presence_status"] == "partial"
-    content = apply_personal_detail_contract(
+    content = prepare_personal_detail_source_collections(
         {
             "facts": {
                 "personal_detail_dataset_states": dataset_states_from_issues([issue]),
@@ -461,7 +461,7 @@ def test_identifier_only_liability_rows_are_redundant_not_business_records() -> 
     assert liability_record_is_substantive({"liability_id": "row:2", "responsibility_type": "保证人"}) is True
 
 
-def test_v2_projection_keeps_extraction_issues_in_extension_fields() -> None:
+def test_v2_projection_keeps_extraction_issues_as_typed_control_rows() -> None:
     issue = make_issue(
         category="ocr_cell_level_error",
         issue_code="pboc_cell_contract_unresolved",
@@ -471,10 +471,10 @@ def test_v2_projection_keeps_extraction_issues_in_extension_fields() -> None:
         observed_value="12O0",
     )
 
-    projected = project_personal_detail_v2_datasets({"personal_detail_extraction_issues": [issue]})
-    extension_row = projected["pboc_extension_fields"][0]
-    extension = extension_row.get("normalized", extension_row)
+    projected = project_personal_detail_datasets({"personal_detail_extraction_issues": [issue]})
+    issue_row = projected["extraction_issues"][0]
+    values = issue_row.get("normalized", issue_row)
 
-    assert extension["source_dataset"] == "personal_detail_extraction_issues"
-    assert extension["field_name"] == "pboc_cell_contract_unresolved"
-    assert "12O0" in extension["value"]
+    assert values["target_dataset"] == "credit_accounts"
+    assert values["field_name"] == "balance"
+    assert values["observed_value"] == "12O0"

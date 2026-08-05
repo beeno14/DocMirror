@@ -32,7 +32,7 @@ PERSONAL_PROFILE_FIELDS = (
     "household_address",
 )
 
-PERSONAL_DETAIL_BUSINESS_DATASETS = (
+PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS = (
     "personal_profile",
     "personal_report_metadata",
     "identity_documents",
@@ -515,7 +515,7 @@ def _dataset_status_contract(
     explicit_states = facts.get("personal_detail_dataset_states")
     states = dict(explicit_states) if isinstance(explicit_states, Mapping) else {}
     rows: list[dict[str, Any]] = []
-    for dataset_name in PERSONAL_DETAIL_BUSINESS_DATASETS:
+    for dataset_name in PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS:
         local_rows = datasets.get(dataset_name)
         auxiliary_rows = auxiliary_business.get(dataset_name)
         final_count = final_dataset_counts.get(dataset_name)
@@ -609,7 +609,7 @@ def _issue_field_observations(datasets: Mapping[str, Any]) -> list[dict[str, Any
     return rows
 
 
-def apply_personal_detail_contract(
+def prepare_personal_detail_source_collections(
     content: dict[str, Any],
     auxiliary_business: Mapping[str, Any] | None = None,
     *,
@@ -685,13 +685,13 @@ def apply_personal_detail_contract(
         rows = datasets.get(dataset_name)
         if isinstance(rows, list):
             facts[f"personal_detail_expected_{dataset_name}_count"] = len(rows)
-    facts["canonical_dataset_schema"] = "personal_credit_report_detailed.v1.2"
+    facts["canonical_dataset_schema"] = "personal_credit_report_detailed.v2"
     return content
 
 
 __all__ = [
-    "PERSONAL_DETAIL_BUSINESS_DATASETS",
+    "PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS",
     "PERSONAL_PROFILE_FIELDS",
-    "apply_personal_detail_contract",
+    "prepare_personal_detail_source_collections",
     "project_typed_public_records",
 ]

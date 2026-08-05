@@ -5,13 +5,13 @@
 
 from docmirror.models.schemas.registry import _personal_detail_invariant_errors
 from docmirror.plugins.credit_report.contracts import CONTENT_MODE_SCANNED
-from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
-    _summary_value,
-    apply_personal_detail_contract,
-)
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
-    PERSONAL_DETAIL_DATASET_ORDER,
+    PBOC_DATASET_ORDER,
     personal_detail_semantic_extensions,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    _summary_value,
+    prepare_personal_detail_source_collections,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
@@ -36,21 +36,27 @@ def test_nonempty_personal_detail_dataset_may_be_explicitly_partial() -> None:
     payload = {
         "document": {"domain_schema": {"id": "personal_credit_report_detailed"}},
         "datasets": [
-            {"name": "personal_profile", "row_count": 0, "rows": []},
-            {"name": "personal_detail_field_observations", "row_count": 0, "rows": []},
+            {"name": "report_metadata", "row_count": 0, "rows": []},
+            {"name": "report_query", "row_count": 0, "rows": []},
+            {"name": "subject_profile", "row_count": 0, "rows": []},
             {
-                "name": "credit_lines",
-                "row_count": 1,
-                "rows": [{"record_id": "credit_line:1", "normalized": {"credit_line_id": "credit_line:1"}}],
-            },
-            {
-                "name": "personal_detail_dataset_status",
+                "name": "credit_agreements",
                 "row_count": 1,
                 "rows": [
                     {
-                        "record_id": "dataset_status:credit_lines",
+                        "record_id": "credit_agreement:1",
+                        "normalized": {"credit_agreement_id": "credit_agreement:1"},
+                    }
+                ],
+            },
+            {
+                "name": "dataset_status",
+                "row_count": 1,
+                "rows": [
+                    {
+                        "record_id": "dataset_status:credit_agreements",
                         "normalized": {
-                            "dataset_name": "credit_lines",
+                            "dataset_name": "credit_agreements",
                             "observed_row_count": 1,
                             "presence_status": "partial",
                         },
@@ -102,7 +108,7 @@ def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_un
     datasets = dictionary["datasets"]
     semantic = personal_detail_semantic_extensions()
 
-    assert dictionary["version"] == "1.2.0"
+    assert dictionary["version"] == "2.0.0"
     assert {
         "gender",
         "birth_date",
@@ -118,34 +124,38 @@ def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_un
         "household_address",
     } <= set(dictionary["fields"])
     assert {
-        "personal_profile",
-        "personal_detail_credit_summary_metrics",
+        "subject_profile",
+        "credit_business_overview",
         "tax_arrears_records",
         "civil_judgment_records",
         "enforcement_records",
         "administrative_penalty_records",
-        "personal_housing_fund_records",
+        "housing_fund_records",
         "professional_qualification_records",
-        "award_records",
-        "personal_detail_dataset_status",
-        "personal_detail_field_observations",
+        "administrative_award_records",
+        "dataset_status",
+        "field_observations",
+        "extraction_issues",
     } <= set(datasets)
-    assert set(PERSONAL_DETAIL_DATASET_ORDER) <= set(datasets)
+    assert set(PBOC_DATASET_ORDER) <= set(datasets)
     for dataset_name, reading_columns in semantic["dataset_reading_columns"].items():
         assert set(reading_columns) <= set(datasets[dataset_name]["columns"]), dataset_name
     contract = semantic["personal_detail_contract"]
-    assert contract["canonical_profile_dataset"] == "personal_profile"
-    assert contract["canonical_credit_summary_dataset"] == "personal_detail_credit_summary_metrics"
-    assert contract["absence_dataset"] == "personal_detail_dataset_status"
-    assert contract["uncertainty_dataset"] == "personal_detail_field_observations"
+    assert contract["canonical_profile_dataset"] == "subject_profile"
+    assert contract["canonical_credit_summary_dataset"] == "credit_business_overview"
+    assert contract["absence_dataset"] == "dataset_status"
+    assert contract["uncertainty_dataset"] == "field_observations"
+    assert contract["extraction_issue_dataset"] == "extraction_issues"
     assert contract["absence_requires_explicit_source_evidence"] is True
     assert contract["empty_dataset_means_absent"] is False
-    assert semantic["domain_schema"]["version"] == "1.2.0"
+    assert semantic["domain_schema"]["version"] == "2.0.0"
     assert semantic["presentation_policy"]["enhanced_markdown_display"] == "full"
     assert semantic["personal_detail_contract"]["uncertainty_coverage"]["mode"] == (
         "potentially_flawed_only"
     )
-    assert dictionary["datasets"]["repayment_records"]["columns"]["status"]["enum_ref"] == ("repayment_status_code")
+    assert dictionary["datasets"]["credit_account_monthly_performance"]["columns"]["status_code"][
+        "enum_ref"
+    ] == "repayment_status_code"
 
 
 def test_personal_detail_contract_projects_values_without_inventing_absence() -> None:
@@ -220,7 +230,7 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
         ]
     }
 
-    projected = apply_personal_detail_contract(
+    projected = prepare_personal_detail_source_collections(
         content,
         auxiliary,
         final_dataset_counts={"credit_accounts": 15, "inquiry_records": 12},

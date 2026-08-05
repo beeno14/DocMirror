@@ -115,6 +115,18 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             include_credit_lines=True,
         )
 
+    def dataset_names(self) -> tuple[str, ...]:
+        """Return the only public dataset vocabulary: canonical PBOC v2."""
+        from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+            PBOC_DATASET_ORDER,
+        )
+
+        return PBOC_DATASET_ORDER
+
+    def source_dataset_names(self) -> tuple[str, ...]:
+        """Return private collection names emitted by the extraction assembly."""
+        return super().dataset_names()
+
     def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
         """Build one logical-page graph and cache for the detailed report."""
         del full_text
@@ -269,7 +281,7 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
             normalized = record.get("normalized")
             if isinstance(normalized, dict) and not normalized.get("account_identifier"):
                 normalized["account_identifier"] = record.get("account_identifier")
-        from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
+        from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
             project_typed_public_records,
         )
 
@@ -368,8 +380,8 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         auxiliary_business: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Use the complete personal-detail parser for every detailed report."""
-        from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
-            apply_personal_detail_contract,
+        from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+            prepare_personal_detail_source_collections,
         )
 
         auxiliary = auxiliary_business or {}
@@ -382,7 +394,7 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                 for name in ("residence_records", "employment_records", "statements", "annotations")
                 if auxiliary.get(name)
             }
-            return apply_personal_detail_contract(
+            return prepare_personal_detail_source_collections(
                 {
                     **({"facts": facts} if facts else {}),
                     **({"datasets": datasets} if datasets else {}),
@@ -422,14 +434,14 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         for name in ("residence_records", "employment_records", "statements", "annotations"):
             if not datasets.get(name) and auxiliary.get(name):
                 datasets[name] = list(auxiliary[name])
-        return apply_personal_detail_contract(
+        return prepare_personal_detail_source_collections(
             content,
             auxiliary,
             final_dataset_counts=getattr(parse_result, "_personal_detail_final_dataset_counts", {}),
         )
 
     def data_dictionary(self) -> dict[str, Any]:
-        """Describe the datasets exposed only by the personal detailed variant."""
+        """Return the canonical PBOC v2 dictionary for detailed reports."""
         from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
             personal_detail_data_dictionary,
         )
@@ -530,7 +542,7 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         return sections
 
     def semantic_extensions(self) -> dict[str, Any]:
-        """Declare datasets as the detailed report's canonical storage."""
+        """Declare PBOC v2 datasets as the detailed report's canonical storage."""
         from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
             personal_detail_semantic_extensions,
         )
