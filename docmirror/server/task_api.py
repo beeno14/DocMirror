@@ -318,9 +318,14 @@ def _input_entry(file_id: str, filename: str) -> dict[str, Any]:
 
 
 def _safe_filename(filename: str) -> str:
-    basename = Path(filename).name
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", basename).strip("._")
-    return cleaned or "upload.bin"
+    # Upload filenames are untrusted and may use either path separator,
+    # regardless of the server operating system.
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    raw_suffix = Path(basename).suffix
+    suffix = raw_suffix.lower() if re.fullmatch(r"\.[A-Za-z0-9]{1,16}", raw_suffix) else ""
+    stem = basename[: -len(raw_suffix)] if raw_suffix else basename
+    cleaned_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", stem).strip("._") or "upload"
+    return f"{cleaned_stem}{suffix}"
 
 
 def _is_public_artifact_role(role: str) -> bool:
