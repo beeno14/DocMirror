@@ -263,54 +263,6 @@ class PBOCPersonalDetailNativeParser:
                 heights[-1] = max(heights[-1], height)
         return [[text for _left, text in sorted(row)] for row in rows]
 
-    def _full_page_fields(
-        self,
-        pages: set[int],
-        *,
-        dataset_name: str,
-    ) -> tuple[dict[str, str], tuple[dict[str, Any], ...], float]:
-        loader = getattr(self.context, "full_page_ocr_evidence", None)
-        if not callable(loader) or not pages:
-            return {}, (), 0.0
-        evidence_pages = loader(
-            pages,
-            reason=f"native_parser_missing_required_value:{dataset_name}",
-        )
-        candidates: list[tuple[dict[str, str], dict[str, Any], float]] = []
-        for page in evidence_pages:
-            fields, confidence = self._pairs(self._ocr_rows(page))
-            if fields:
-                candidates.append(
-                    (
-                        fields,
-                        {
-                            "source": "personal_detail_full_page_ocr",
-                            "logical_page": int(page.get("page") or 0),
-                            "source_page": int(page.get("source_page") or 0),
-                            "geometry_scope": "logical_page",
-                        },
-                        confidence,
-                    )
-                )
-        if not candidates:
-            return {}, (), 0.0
-        merged: dict[str, str] = {}
-        ambiguous: set[str] = set()
-        refs: list[dict[str, Any]] = []
-        confidences: list[float] = []
-        for fields, ref, confidence in candidates:
-            refs.append(ref)
-            if confidence:
-                confidences.append(confidence)
-            for label, value in fields.items():
-                if label in merged and merged[label] != value:
-                    ambiguous.add(label)
-                else:
-                    merged.setdefault(label, value)
-        for label in ambiguous:
-            merged.pop(label, None)
-        return merged, tuple(refs), min(confidences) if confidences else 0.0
-
     def _evidence_record_groups(
         self,
         dataset_name: str,
@@ -427,6 +379,16 @@ class PBOCPersonalDetailNativeParser:
         lines = [" ".join(str(cell or "").strip() for cell in row if str(cell or "").strip()) for row in rows]
         packed: dict[str, str] = {}
         if dataset_name == "credit_lines":
+            printed_sequence = next(
+                (
+                    match.group(1)
+                    for line in lines
+                    if (match := re.search(r"授信协议\s*(\d{1,3})", line))
+                ),
+                "",
+            )
+            if printed_sequence:
+                packed["__printed_sequence"] = printed_sequence
             header = next((index for index, line in enumerate(lines) if "授信协议标识" in line), None)
             amount_header = next(
                 (
@@ -540,51 +502,6 @@ class PBOCPersonalDetailNativeParser:
                     packed["逾期月数"] = overdue_values[-1]
         return {**generic, **packed}, confidence
 
-    def _supplemental_fields(
-        self,
-        source_pages: set[int],
-        *,
-        dataset_name: str,
-    ) -> tuple[dict[str, str], tuple[dict[str, Any], ...], float]:
-        loader = getattr(self.context, "supplemental_page_ocr_evidence", None)
-        if not callable(loader) or not source_pages:
-            return {}, (), 0.0
-        evidence_pages = loader(
-            source_pages,
-            reason=f"native_parser_missing_spread_continuation:{dataset_name}",
-        )
-        merged: dict[str, str] = {}
-        ambiguous: set[str] = set()
-        refs: list[dict[str, Any]] = []
-        confidences: list[float] = []
-        for page in evidence_pages:
-            fields, confidence = self._pairs(self._ocr_rows(page))
-            if not fields:
-                continue
-            refs.append(
-                {
-                    "source": "personal_detail_supplemental_page_ocr",
-                    "source_page": int(page.get("source_page") or 0),
-                    "source_segment_index": int(page.get("segment_index") or 0),
-                    "printed_page": int(page.get("printed_page") or 0),
-                    "selected_rotation": int(page.get("selected_rotation") or 0),
-                    "split_confidence": float(page.get("split_confidence") or 0.0),
-                    "subpage_basis": str(page.get("subpage_basis") or "core_split_result"),
-                    "supplemental_page_id": str(page.get("supplemental_page_id") or ""),
-                    "geometry_scope": "supplemental_logical_page",
-                }
-            )
-            if confidence:
-                confidences.append(confidence)
-            for label, value in fields.items():
-                if label in merged and merged[label] != value:
-                    ambiguous.add(label)
-                else:
-                    merged.setdefault(label, value)
-        for label in ambiguous:
-            merged.pop(label, None)
-        return merged, tuple(refs), min(confidences) if confidences else 0.0
-
     def records(self, dataset_name: str) -> list[NativeLabeledRecord]:
         required = _SECTION_MARKERS[dataset_name]
         result: list[NativeLabeledRecord] = []
@@ -597,60 +514,6 @@ class PBOCPersonalDetailNativeParser:
                 continue
             missing = required - observed
             if missing:
-                pages = {int(ref.get("logical_page") or 0) for ref in refs if ref.get("logical_page")}
-                recovered, recovered_refs, recovered_confidence = self._full_page_fields(
-                    pages,
-                    dataset_name=dataset_name,
-                )
-                combined = {**recovered, **fields}
-                supplemental_refs: tuple[dict[str, Any], ...] = ()
-                supplemental_confidence = 0.0
-                if not required <= set(combined):
-                    source_pages = {int(ref.get("source_page") or 0) for ref in refs if ref.get("source_page")}
-                    supplemental, supplemental_refs, supplemental_confidence = self._supplemental_fields(
-                        source_pages,
-                        dataset_name=dataset_name,
-                    )
-                    combined = {**supplemental, **combined}
-                if required <= set(combined):
-                    record_issue(
-                        self.context,
-                        make_issue(
-                            category="ocr_structure_correction",
-                            issue_code="full_page_ocr_recovered_native_fields",
-                            message=(
-                                "Missing labelled values were recovered from a complete logical-page OCR pass; "
-                                "a splitter-confirmed supplemental subpage was used when necessary."
-                            ),
-                            severity="info",
-                            status="resolved",
-                            parser_stage="native_tolerant_parser",
-                            target_dataset=dataset_name
-                            if dataset_name != "report_header"
-                            else "personal_report_metadata",
-                            confidence=supplemental_confidence or recovered_confidence or confidence or None,
-                            source_refs=(*refs, *recovered_refs, *supplemental_refs),
-                            reason_codes=(
-                                "logical_page_rerendered",
-                                "unique_label_value",
-                                "cell_crop_not_required",
-                                *("split_result_confirmed_supplemental_subpage" for _ in [0] if supplemental_refs),
-                            ),
-                        ),
-                    )
-                    result.append(
-                        NativeLabeledRecord(
-                            dataset_name=dataset_name,
-                            fields=combined,
-                            source_refs=(*refs, *recovered_refs, *supplemental_refs),
-                            confidence=min(
-                                value for value in (confidence, recovered_confidence, supplemental_confidence) if value
-                            )
-                            if (confidence or recovered_confidence or supplemental_confidence)
-                            else 0.0,
-                        )
-                    )
-                    continue
                 record_issue(
                     self.context,
                     make_issue(
@@ -699,36 +562,29 @@ class PBOCPersonalDetailNativeParser:
                 text = _compact("".join(str(line.get("text") or "") for line in page.get("lines") or []))
                 if sum(marker in text for marker in required) >= max(2, len(required) - 1):
                     candidate_pages.add(int(page.get("page") or 0))
-            recovered, recovered_refs, recovered_confidence = self._full_page_fields(
-                candidate_pages,
-                dataset_name=dataset_name,
-            )
-            if required <= set(recovered):
+            if candidate_pages:
+                candidate_refs = tuple(
+                    {
+                        "source": "candidate_b_visible_unparsed_section",
+                        "logical_page": page,
+                        "geometry_scope": "logical_page",
+                    }
+                    for page in sorted(candidate_pages)
+                )
                 record_issue(
                     self.context,
                     make_issue(
                         category="ocr_structure_correction",
-                        issue_code="full_page_ocr_recovered_unparsed_native_section",
+                        issue_code="recognized_native_section_not_extracted",
                         message=(
                             "The source section was visible in page evidence but absent from native tables; "
-                            "complete-page OCR recovered a unique labelled record."
+                            "schema-triggered page repair may retry the section once."
                         ),
-                        severity="info",
-                        status="resolved",
                         parser_stage="native_tolerant_parser",
                         target_dataset=dataset_name if dataset_name != "report_header" else "personal_report_metadata",
-                        confidence=recovered_confidence or None,
-                        source_refs=recovered_refs,
-                        reason_codes=("native_table_missing", "page_anchor_observed", "full_page_ocr_unique_values"),
+                        source_refs=candidate_refs,
+                        reason_codes=("native_table_missing", "page_anchor_observed", "business_data_uncertain"),
                     ),
-                )
-                result.append(
-                    NativeLabeledRecord(
-                        dataset_name=dataset_name,
-                        fields=recovered,
-                        source_refs=recovered_refs,
-                        confidence=recovered_confidence,
-                    )
                 )
         return result
 

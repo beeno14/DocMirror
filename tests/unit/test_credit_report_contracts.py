@@ -76,7 +76,7 @@ def test_summary_numeric_values_require_complete_decimal_lexemes() -> None:
     assert _summary_value(".0") == ("text", None, "reported")
 
 
-def test_scanned_variant_forwards_precomputed_auxiliary_records() -> None:
+def test_scanned_variant_does_not_merge_precomputed_auxiliary_records() -> None:
     variant = PersonalDetailScannedVariant()
     content = variant.build_section_content(
         object(),
@@ -90,16 +90,7 @@ def test_scanned_variant_forwards_precomputed_auxiliary_records() -> None:
         },
     )
 
-    assert content["facts"]["subject_profile"]["subject_name"]["value"] == "示例"
-    assert {
-        "residence_records",
-        "employment_records",
-        "statements",
-        "annotations",
-    } <= set(content["datasets"])
-    assert "personal_profile" in content["datasets"]
-    assert "personal_detail_field_observations" in content["datasets"]
-    assert "personal_detail_dataset_status" in content["datasets"]
+    assert content == {}
 
 
 def test_personal_detail_dictionary_covers_profile_summary_public_absence_and_uncertainty() -> None:
@@ -243,8 +234,7 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
     observations = {row["field_name"]: row for row in datasets["personal_detail_field_observations"]}
     assert "gender" not in observations
     assert "birth_date" not in observations
-    assert observations["work_phone"]["observation_status"] == "not_observed"
-    assert observations["work_phone"]["confidence_status"] == "not_available"
+    assert "work_phone" not in observations
 
     metrics = datasets["personal_detail_credit_summary_metrics"]
     account_count = next(row for row in metrics if row["metric_name"] == "账户数")
@@ -263,6 +253,6 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
     assert "public_records" not in statuses
     assert "credit_accounts" not in statuses
     assert "inquiry_records" not in statuses
-    assert statuses["mobile_phone_records"]["presence_status"] == "not_observed"
-    assert statuses["mobile_phone_records"]["reason"] == "no_explicit_absence_evidence"
+    assert statuses["mobile_phone_records"]["presence_status"] == "unknown"
+    assert statuses["mobile_phone_records"]["reason"] == "source_presence_not_established"
     assert "spouse_records" not in statuses

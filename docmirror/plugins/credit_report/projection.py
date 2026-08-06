@@ -137,6 +137,8 @@ def _source_page_range(record: dict[str, Any]) -> list[int]:
         "page_id",
         "page_number",
         "source_page",
+        "source_page_end",
+        "normalized",
     ):
         if key in record:
             collect({key: record[key]})
@@ -202,19 +204,6 @@ def _account_structure_warnings(accounts: list[dict[str, Any]]) -> tuple[str, ..
     if failure_rate <= 0.3:
         return ()
     return (f"credit:account_structure_collapse:failure_rate={failure_rate:.3f}",)
-
-
-def _enterprise_scope_warnings(
-    report_subtype: str,
-    summary: dict[str, Any],
-) -> tuple[str, ...]:
-    if report_subtype != "enterprise" or not summary.get("source_display_limited"):
-        return ()
-    return (
-        "credit:enterprise_source_display_limited:"
-        "the source report states that only part of the credit records are shown; "
-        "attachment records are exported in separate enterprise datasets",
-    )
 
 
 def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: str = "") -> ProjectionData:
@@ -432,7 +421,6 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
             (
                 *base.warnings,
                 *_account_structure_warnings(assembled_accounts),
-                *_enterprise_scope_warnings(report_subtype, assembled_summary),
             )
         )
     )

@@ -41,7 +41,6 @@ class CandidateBPipeline:
         self.full_text = str(full_text or "")
 
     def run(self) -> CandidateBExtraction:
-        from docmirror.models.mirror.domain_access import micro_grid_structures_from_domain_specific
         from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
             collect_extraction_issues,
             dataset_states_from_issues,
@@ -75,68 +74,90 @@ class CandidateBPipeline:
             prepare_personal_detail_source_collections,
         )
 
-        # Materializing ``context.pages`` forces registration, whole-page retry,
-        # fragment joining, and canonical continuation decoding before any field
-        # extractor can observe a page.
-        canonical_pages = self.context.pages
-        del canonical_pages
+        def extract_source_pass() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+            # Registration and fragment joining use static ParseResult evidence
+            # only. No OCR can be started before business candidates exist.
+            canonical_pages = self.context.pages
+            del canonical_pages
 
-        accounts, _discarded_parallel_monthly_rows, account_events = self.context.account_collections()
-        repayments = self.context.corrected_repayment_records()
-        source_domain = getattr(getattr(self.context.parse_result, "entities", None), "domain_specific", {})
-        repayments = link_candidate_b_repayments(
-            repayments,
-            accounts,
-            micro_grid_structures_from_domain_specific(source_domain if isinstance(source_domain, dict) else {}),
-            reading_order_by_logical=dict(self.context.reading_order_by_logical),
-            issue_context=self.context,
-        )
+            accounts, _discarded_parallel_monthly_rows, account_events = self.context.account_collections()
+            repayments = self.context.corrected_repayment_records()
+            repayments = link_candidate_b_repayments(
+                repayments,
+                accounts,
+                self.context.corrected_repayment_micro_grids(),
+                reading_order_by_logical=dict(self.context.reading_order_by_logical),
+                issue_context=self.context,
+            )
+            business: dict[str, Any] = {
+                "credit_accounts": accounts,
+                "credit_lines": _extract_credit_lines(self.context),
+                "repayment_liability_records": _extract_liabilities(self.context),
+                "repayment_records": repayments,
+                "overdue_records": derive_candidate_b_overdue_records(accounts, repayments),
+                "inquiry_records": _extract_inquiries(self.context),
+                "public_records": _extract_public_records(self.context),
+            }
+            business["credit_summary"] = {
+                "source": "candidate_b_canonical_templates",
+                "reported_account_count": len(business["credit_accounts"]),
+                "projected_account_count": len(business["credit_accounts"]),
+                "repayment_liability_count": len(business["repayment_liability_records"]),
+                "inquiry_count": len(business["inquiry_records"]),
+                "account_population_comparable": False,
+            }
+            annotations, statements = _extract_personal_notes(self.context)
+            summary_records, summary_cells = _extract_summary_datasets(self.context)
+            datasets: dict[str, list[dict[str, Any]]] = {
+                **_extract_header_datasets(self.context, self.full_text),
+                **{name: list(business.get(name) or ()) for name in _CORE_BUSINESS_DATASETS},
+                "recovery_records": _extract_recovery_records(self.context),
+                "postpaid_records": _extract_postpaid_records(self.context),
+                "postpaid_payment_history": _extract_postpaid_payment_history(self.context),
+                "personal_detail_account_events": account_events,
+                "personal_detail_summary_records": summary_records,
+                "personal_detail_summary_cells": summary_cells,
+                "residence_records": _extract_residence_records(self.context),
+                "employment_records": _extract_employment_records(self.context),
+                "annotations": annotations,
+                "statements": statements,
+                "personal_detail_source_rows": _extract_source_rows(self.context),
+                **_extract_profile_detail_records(self.context),
+            }
+            return business, datasets
 
-        preliminary_business: dict[str, Any] = {
-            "credit_accounts": accounts,
-            "credit_lines": _extract_credit_lines(self.context),
-            "repayment_liability_records": _extract_liabilities(self.context),
-            "repayment_records": repayments,
-            "overdue_records": derive_candidate_b_overdue_records(accounts, repayments),
-            "inquiry_records": _extract_inquiries(self.context),
-            "public_records": _extract_public_records(self.context),
+        first_business, first_datasets = extract_source_pass()
+        repair_payload = {
+            "credit_summary": dict(first_business.get("credit_summary") or {}),
+            **first_datasets,
         }
-        preliminary_business["credit_summary"] = {
-            "source": "candidate_b_canonical_templates",
-            "reported_account_count": len(preliminary_business["credit_accounts"]),
-            "projected_account_count": len(preliminary_business["credit_accounts"]),
-            "repayment_liability_count": len(preliminary_business["repayment_liability_records"]),
-            "inquiry_count": len(preliminary_business["inquiry_records"]),
-            "account_population_comparable": False,
-        }
+        if self.context.prepare_candidate_b_business_repair(repair_payload):
+            source_business, source_datasets = extract_source_pass()
+        else:
+            source_business, source_datasets = first_business, first_datasets
 
-        # One correction pass, after every canonical extractor has emitted its
-        # candidates and before any source/v2 projection observes the result.
-        business = self.context.correct_candidate_b_business(preliminary_business)
-        business["credit_lines"] = reconcile_candidate_b_credit_lines(
-            self.context,
-            list(business.get("credit_lines") or ()),
+        # The final correction plane covers every source dataset, including
+        # monthly grids and profile/detail tables. It consumes only evidence
+        # selected by the document-wide repair coordinator.
+        corrected_payload = self.context.correct_candidate_b_datasets(
+            {
+                "credit_summary": dict(source_business.get("credit_summary") or {}),
+                **source_datasets,
+            }
         )
-
-        annotations, statements = _extract_personal_notes(self.context)
-        summary_records, summary_cells = _extract_summary_datasets(self.context)
-        header_datasets = _extract_header_datasets(self.context, self.full_text)
         all_datasets: dict[str, list[dict[str, Any]]] = {
-            **header_datasets,
-            **{name: list(business.get(name) or ()) for name in _CORE_BUSINESS_DATASETS},
-            "recovery_records": _extract_recovery_records(self.context),
-            "postpaid_records": _extract_postpaid_records(self.context),
-            "postpaid_payment_history": _extract_postpaid_payment_history(self.context),
-            "personal_detail_account_events": account_events,
-            "personal_detail_summary_records": summary_records,
-            "personal_detail_summary_cells": summary_cells,
-            "residence_records": _extract_residence_records(self.context),
-            "employment_records": _extract_employment_records(self.context),
-            "annotations": annotations,
-            "statements": statements,
-            "personal_detail_source_rows": _extract_source_rows(self.context),
-            **_extract_profile_detail_records(self.context),
+            name: list(corrected_payload.get(name) or ())
+            for name in source_datasets
         }
+        all_datasets["credit_lines"] = reconcile_candidate_b_credit_lines(
+            self.context,
+            list(all_datasets.get("credit_lines") or ()),
+        )
+        business: dict[str, Any] = {
+            name: list(all_datasets.get(name) or ())
+            for name in _CORE_BUSINESS_DATASETS
+        }
+        business["credit_summary"] = dict(corrected_payload.get("credit_summary") or {})
         all_datasets = {name: rows for name, rows in all_datasets.items() if rows}
 
         profile = extract_candidate_b_profile(self.context)
@@ -172,8 +193,11 @@ class CandidateBPipeline:
         }
         audit = {
             "architecture": "candidate_b_clean",
-            "source_of_truth": "registered_canonical_pages",
+            "source_of_truth": "static_canonical_pages_then_schema_triggered_repair",
             "candidate_population_count": 1,
+            "schema_extraction_pass_count": 2
+            if self.context.ocr_correction_audit().get("business_repair", {}).get("second_schema_pass_required")
+            else 1,
             "parse_result_mutated": False,
             "canonical_layout": self.context.canonical_layout_audit(),
             "page_topology": self.context.page_topology_audit(),

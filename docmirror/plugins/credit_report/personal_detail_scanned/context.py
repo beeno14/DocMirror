@@ -16,10 +16,12 @@ import re
 from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
-from types import MappingProxyType
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, TypeVar, cast
 
+from docmirror.plugins.credit_report.personal_detail_scanned.page_reocr import (
+    OneShotPageReOCRRegistry,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
     PersonalDetailLogicalPageImageResolver,
     PersonalDetailPageTopology,
@@ -69,8 +71,6 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
 _PRINTED_PAGE_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页")
-_PRINTED_PAGE_ONLY_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*[页面]")
-_PRINTED_TOTAL_ONLY_RE = re.compile(r"共\s*(?P<total>\d{1,3})\s*页?")
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
 _ACCOUNT_ANCHOR_RE = re.compile(r"(?:账户|业务)\s*[（(]?\s*(\d{1,3})\s*[）)]?")
 _BUSINESS_HEADING_RE = re.compile(
@@ -153,39 +153,13 @@ def _page_ocr_score(words: Iterable[dict[str, Any]], *, image_shape: Any = None)
     )
 
 
-def _complete_page_ocr(image: Any) -> tuple[list[dict[str, Any]], Any, int, float, float]:
-    """OCR a complete logical page with per-page orientation and deskew selection."""
-    import cv2
+def _single_page_ocr(image: Any) -> tuple[list[dict[str, Any]], float]:
+    """OCR one already-oriented, frozen logical subpage exactly once."""
 
-    from docmirror.ocr.image_preprocessing import deskew_image
     from docmirror.ocr.repair.recognizers import rapidocr_recognize
 
-    rotations = (
-        (0, 90, 180, 270) if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_ORIENTATION_PROBE", "1") != "0" else (0,)
-    )
-    candidates: list[tuple[float, int, list[dict[str, Any]], Any]] = []
-    for rotation in rotations:
-        if rotation == 0:
-            oriented = image
-        elif rotation == 90:
-            oriented = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
-        elif rotation == 180:
-            oriented = cv2.rotate(image, cv2.ROTATE_180)
-        else:
-            oriented = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        words = rapidocr_recognize(oriented, source="personal_detail_full_page_ocr")
-        candidates.append((_page_ocr_score(words, image_shape=getattr(oriented, "shape", None)), rotation, words, oriented))
-    score, rotation, words, selected = max(candidates, key=lambda item: item[0])
-    deskewed, deskew_angle = deskew_image(selected)
-    if abs(float(deskew_angle or 0.0)) >= 0.5:
-        deskew_words = rapidocr_recognize(
-            deskewed,
-            source="personal_detail_full_page_ocr_deskewed",
-        )
-        deskew_score = _page_ocr_score(deskew_words, image_shape=getattr(deskewed, "shape", None))
-        if deskew_score > score:
-            return deskew_words, deskewed, rotation, float(deskew_angle), deskew_score
-    return words, selected, rotation, 0.0, score
+    words = rapidocr_recognize(image, source="personal_detail_page_reocr_once")
+    return words, _page_ocr_score(words, image_shape=getattr(image, "shape", None))
 
 
 def _bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -194,6 +168,106 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
         return None
     x0, y0, x1, y1 = (_finite(item) for item in raw[:4])
     return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
+
+
+def _matrix3(value: Any) -> list[list[float]] | None:
+    if not (
+        isinstance(value, (list, tuple))
+        and len(value) == 3
+        and all(isinstance(row, (list, tuple)) and len(row) == 3 for row in value)
+    ):
+        return None
+    return [[float(item) for item in row] for row in value]
+
+
+def _transform_bbox(
+    matrix: list[list[float]],
+    bbox: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = bbox
+    points = []
+    for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)):
+        points.append(
+            (
+                matrix[0][0] * x + matrix[0][1] * y + matrix[0][2],
+                matrix[1][0] * x + matrix[1][1] * y + matrix[1][2],
+            )
+        )
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _overlap_fraction(
+    bbox: tuple[float, float, float, float],
+    crop: tuple[float, float, float, float],
+) -> float:
+    intersection = max(0.0, min(bbox[2], crop[2]) - max(bbox[0], crop[0])) * max(
+        0.0, min(bbox[3], crop[3]) - max(bbox[1], crop[1])
+    )
+    area = max(1e-6, (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    return intersection / area
+
+
+def _slice_assignment(
+    source_bbox: tuple[float, float, float, float],
+    recovered_by_segment: Mapping[int, Mapping[str, Any]],
+) -> tuple[int | None, bool]:
+    ranked = sorted(
+        (
+            (
+                _overlap_fraction(
+                    source_bbox,
+                    cast(
+                        tuple[float, float, float, float],
+                        tuple(float(value) for value in recovered["source_crop_bbox"]),
+                    ),
+                ),
+                segment,
+            )
+            for segment, recovered in recovered_by_segment.items()
+        ),
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.55:
+        return None, True
+    second = ranked[1][0] if len(ranked) > 1 else 0.0
+    ambiguous = second >= 0.20 and ranked[0][0] - second < 0.35
+    return (None, True) if ambiguous else (ranked[0][1], False)
+
+
+def _project_table_for_static_slice(
+    table: Any,
+    *,
+    base_to_source: list[list[float]],
+    source_to_slice: list[list[float]],
+) -> Any:
+    def project(raw: Any) -> list[float] | Any:
+        box = _bbox({"bbox": raw})
+        if box is None:
+            return raw
+        source_box = _transform_bbox(base_to_source, box)
+        return list(_transform_bbox(source_to_slice, source_box))
+
+    metadata = deepcopy(dict(getattr(table, "metadata", None) or {}))
+    cell_boxes = metadata.get("cell_bboxes")
+    if isinstance(cell_boxes, list):
+        metadata["cell_bboxes"] = [
+            [project(box) for box in row] if isinstance(row, list) else row
+            for row in cell_boxes
+        ]
+    raw_rows = _raw_rows(table)
+    if raw_rows:
+        metadata["raw_rows"] = [list(row) for row in raw_rows]
+    table_box = _bbox(table)
+    return SimpleNamespace(
+        table_id=str(getattr(table, "table_id", "") or ""),
+        metadata=metadata,
+        headers=[],
+        rows=[],
+        bbox=project(table_box) if table_box is not None else None,
+        confidence=getattr(table, "confidence", None),
+    )
 
 
 def _raw_rows(table: Any) -> tuple[tuple[str, ...], ...]:
@@ -454,15 +528,6 @@ def _printed_reading_order(
                 printed_by_logical[logical] = printed
                 totals.append(total)
 
-    if len(printed_by_logical) != len(observed_pages):
-        image_pages, image_totals = _ocr_printed_page_footers(
-            parse_result,
-            missing_pages=observed_pages - printed_by_logical.keys(),
-            topology=topology,
-        )
-        printed_by_logical.update(image_pages)
-        totals.extend(image_totals)
-
     _infer_paired_printed_pages(
         printed_by_logical,
         source_by_logical,
@@ -486,46 +551,6 @@ def _printed_reading_order(
             start=1,
         )
     }
-
-
-def _ocr_printed_page_footers(
-    parse_result: Any,
-    *,
-    missing_pages: Iterable[int],
-    topology: PersonalDetailPageTopology | None = None,
-) -> tuple[dict[int, int], list[int]]:
-    """Read only footer strips for structural page order, never cell values."""
-    try:
-        from docmirror.ocr.repair.recognizers import rapidocr_recognize
-
-        resolver = PersonalDetailLogicalPageImageResolver(
-            parse_result,
-            zoom=2.0,
-            topology=topology,
-        )
-    except Exception:
-        return {}, []
-
-    printed: dict[int, int] = {}
-    totals: list[int] = []
-    for logical in sorted(set(int(page) for page in missing_pages if int(page) > 0)):
-        rendered = resolver(logical)
-        if not rendered:
-            continue
-        image = rendered.get("image")
-        shape = getattr(image, "shape", None)
-        if not shape or len(shape) < 2:
-            continue
-        footer = image[int(shape[0] * 0.82) : shape[0], :]
-        words = rapidocr_recognize(footer)
-        texts = [str(word.get("text") or "") for word in words if float(word.get("confidence") or 0.0) >= 0.75]
-        joined = " ".join(texts)
-        pages = {int(match.group("page")) for match in _PRINTED_PAGE_ONLY_RE.finditer(joined)}
-        if len(pages) == 1:
-            printed[logical] = next(iter(pages))
-        totals.extend(int(match.group("total")) for match in _PRINTED_TOTAL_ONLY_RE.finditer(joined))
-    resolver.clear()
-    return printed, totals
 
 
 def _infer_paired_printed_pages(
@@ -749,21 +774,34 @@ class PersonalDetailExtractionContext:
         self.parse_result = parse_result
         self.entity_context = entity_context
         self.evidence_unit_ids = MappingProxyType(dict(evidence_unit_ids))
-        # Plugin-owned supplemental subpages are added lazily after a confirmed
-        # split replay, so these two ledgers intentionally remain mutable while
+        # Plugin-owned logical subpages are added during static topology
+        # construction, so these two ledgers intentionally remain mutable while
         # the sealed ParseResult and evidence IDs stay immutable.
         self.source_page_by_logical = dict(source_page_by_logical)
         self.reading_order_by_logical = dict(reading_order_by_logical)
         self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
-        self._page_ocr_cache: dict[int, dict[str, Any] | None] = {}
-        self._supplemental_ocr_cache: dict[str, dict[str, Any]] = {}
-        self._page_ocr_requests: list[dict[str, Any]] = []
+        self._frozen_logical_pages: dict[int, Any] = {
+            int(getattr(page, "page_number", 0) or index): page
+            for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1)
+        }
+        self._topology_recovery_issues: list[dict[str, Any]] = []
+        self._initial_personal_detail_extraction_issues = deepcopy(
+            getattr(self, "_personal_detail_extraction_issues", [])
+        )
         self._canonical_layout_projection_cache: Any | None = None
         self._canonical_entity_context_ready = False
+        self._business_repair_plan: Any | None = None
+        self._business_repair_evidence_by_page: dict[int, dict[str, Any]] = {}
+        self._business_repair_active = False
+        # The contract is one attempt per frozen logical page, not a document-
+        # wide quota.  A fixed quota silently deprived later uncertain business
+        # fields of their only field-aware correction pass on longer reports.
         self._page_ocr_max_requests = max(
-            0, int(os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR_MAX_REQUESTS", "12"))
+            len(self._frozen_logical_pages),
+            len(self.source_page_by_logical),
         )
+        self._page_reocr_registry = OneShotPageReOCRRegistry(max_pages=self._page_ocr_max_requests)
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
         )
@@ -772,11 +810,7 @@ class PersonalDetailExtractionContext:
             parse_result,
             topology=page_topology,
         )
-        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(
-            parse_result,
-            page_image_resolver=self._page_image_resolver,
-            full_page_ocr_loader=self.full_page_ocr_evidence,
-        )
+        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(parse_result)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.parse_result, name)
@@ -818,26 +852,65 @@ class PersonalDetailExtractionContext:
             self._cache[key] = CandidateBPipeline(self, full_text).run()
         return self._cache[key]
 
-    def correct_candidate_b_business(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Apply the branch's correction and cross-field contracts exactly once."""
-        corrected = self._ocr_correction_overlay.correct_business_candidates(
-            payload,
-            stage="candidate_b_schema_extraction",
-        )
-        return self._ocr_correction_overlay.enforce_cross_field_contracts(
-            corrected,
-            stage="candidate_b_schema_extraction",
+    def prepare_candidate_b_business_repair(self, payload: dict[str, Any]) -> bool:
+        """Plan the sole post-schema page repair and prepare a second pass."""
+        from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+            BusinessUncertaintyRepairCoordinator,
         )
 
-    def correct_assembled_business(self, payload: dict[str, Any], *, stage: str) -> dict[str, Any]:
-        """Compatibility hook; Candidate B has already performed this pass."""
-        del stage
-        return deepcopy(payload)
+        coordinator = BusinessUncertaintyRepairCoordinator(self.parse_result)
+        plan = coordinator.plan(
+            payload,
+            canonical_audit=self.canonical_layout_audit(),
+            extraction_issues=(
+                dict(issue)
+                for issue in getattr(self, "_personal_detail_extraction_issues", ())
+                if isinstance(issue, Mapping)
+            ),
+        )
+        plan = coordinator.resolve_page_evidence(
+            plan,
+            source_pages=self._source_evidence_pages(),
+            page_ocr_loader=self.full_page_ocr_evidence,
+        )
+        self._business_repair_plan = plan
+        self._business_repair_evidence_by_page = deepcopy(plan.page_evidence)
+        if not plan.requires_second_pass:
+            return False
+
+        # The first pass exists only to discover schema uncertainty.  Every
+        # extractor in the second pass observes the same repaired evidence.
+        self._business_repair_active = True
+        self._personal_detail_extraction_issues = deepcopy(
+            self._initial_personal_detail_extraction_issues
+        )
+        self._cache.clear()
+        self._canonical_layout_projection_cache = None
+        self._canonical_entity_context_ready = False
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            PersonalDetailOCRCorrectionOverlay,
+        )
+
+        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(self.parse_result)
+        return True
+
+    def correct_candidate_b_datasets(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Correct and validate all final v2 source datasets exactly once."""
+        plan = self._business_repair_plan
+        if plan is not None and plan.affected_pages:
+            self._ocr_correction_overlay.install_business_repair_evidence(
+                self.corrected_evidence_pages(),
+                affected_pages=plan.affected_pages,
+            )
+        return self._ocr_correction_overlay.correct_business_candidates(
+            payload,
+            stage="candidate_b_final_validation",
+        )
 
     def corrected_repayment_records(self) -> list[dict[str, Any]]:
         """Rebuild monthly cells from the same canonical page evidence as all fields.
 
-        No cell-level OCR is permitted here.  Complete-page OCR replay and
+        No cell-level OCR is permitted here. One-shot page re-OCR and
         canonical fragment registration happen before the repayment grid is
         materialized, so monthly performance cannot bypass the template layer.
         The sealed evidence plane remains unchanged.
@@ -939,9 +1012,11 @@ class PersonalDetailExtractionContext:
                 enable_cell_ocr=False,
                 extra_status_chars={"A"},
             )
+            corrected_grids = micro_grid_structures_from_domain_specific(detached)
+            self._corrected_repayment_micro_grids = deepcopy(corrected_grids)
             records = [
                 record
-                for grid in micro_grid_structures_from_domain_specific(detached)
+                for grid in corrected_grids
                 for record in records_from_micro_grid_dict(grid)
             ]
             deduped = dedupe_repayment_records(records)
@@ -1048,9 +1123,59 @@ class PersonalDetailExtractionContext:
                         ),
                     ),
                 )
+            account_gap_issues = [
+                issue
+                for issue in getattr(self, "_personal_detail_extraction_issues", ())
+                if isinstance(issue, Mapping)
+                and issue.get("issue_code") == "candidate_b_account_sequence_gap"
+                and str(issue.get("status") or "open") != "resolved"
+            ]
+            if account_gap_issues:
+                from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                    make_issue,
+                    record_issue,
+                )
+
+                missing_by_family = {
+                    str((issue.get("observed_value") or {}).get("account_type") or "unknown"): list(
+                        (issue.get("candidate_value") or {}).get("missing_category_sequences") or ()
+                    )
+                    for issue in account_gap_issues
+                }
+                record_issue(
+                    self,
+                    make_issue(
+                        category="schema_incompleteness",
+                        issue_code="monthly_population_incomplete_from_account_gap",
+                        message=(
+                            "Monthly performance cannot be population-complete while one or more account-family "
+                            "ordinals are unresolved; no months were invented for the missing accounts."
+                        ),
+                        parser_stage="canonical_monthly_grid_materialization",
+                        target_dataset="repayment_records",
+                        observed_value={"canonical_grid_row_count": len(deduped)},
+                        candidate_value={"missing_account_category_sequences": missing_by_family},
+                        source_refs=(
+                            dict(ref)
+                            for issue in account_gap_issues
+                            for ref in issue.get("source_refs") or ()
+                            if isinstance(ref, Mapping)
+                        ),
+                        reason_codes=(
+                            "credit_account_population_incomplete",
+                            "monthly_population_cannot_be_complete",
+                            "missing_months_not_invented",
+                        ),
+                    ),
+                )
             return deduped
 
         return self.cached("corrected_repayment_records", rebuild)
+
+    def corrected_repayment_micro_grids(self) -> list[dict[str, Any]]:
+        """Return the exact canonical grids used to materialize monthly rows."""
+        self.corrected_repayment_records()
+        return deepcopy(getattr(self, "_corrected_repayment_micro_grids", []))
 
     def section_content(self, full_text: str) -> dict[str, Any]:
         """Return supplemental datasets from the same Candidate B result."""
@@ -1060,9 +1185,9 @@ class PersonalDetailExtractionContext:
         """Return the registered canonical evidence shared by every extractor."""
         return deepcopy(list(self._canonical_layout_projection().evidence_pages))
 
-    def _source_corrected_evidence_pages(self) -> list[dict[str, Any]]:
-        """Return detached pre-template evidence used only to register pages."""
-        return self.cached("source_corrected_evidence_pages", self._build_corrected_evidence_pages)
+    def _source_evidence_pages(self) -> list[dict[str, Any]]:
+        """Return detached static evidence used to register canonical pages."""
+        return self.cached("source_evidence_pages", self._build_source_evidence_pages)
 
     def _canonical_layout_projection(self) -> Any:
         if self._canonical_layout_projection_cache is None:
@@ -1074,9 +1199,9 @@ class PersonalDetailExtractionContext:
                 self.parse_result,
                 topology=self.page_topology,
                 reading_order_by_logical=self.reading_order_by_logical,
-                source_evidence_loader=self._source_corrected_evidence_pages,
-                full_page_ocr_loader=self.full_page_ocr_evidence,
+                source_evidence_loader=self._source_evidence_pages,
                 issue_owner=self,
+                source_page_loader=lambda: list(self._frozen_logical_pages.values()),
             )
             self._canonical_layout_projection_cache = assembler.build()
             self._adopt_canonical_entity_context()
@@ -1110,7 +1235,7 @@ class PersonalDetailExtractionContext:
             self.reading_order_by_logical.update(reading_order)
         self._canonical_entity_context_ready = True
 
-    def _build_corrected_evidence_pages(self) -> list[dict[str, Any]]:
+    def _build_source_evidence_pages(self) -> list[dict[str, Any]]:
         domain_specific = _domain_specific(self.parse_result)
         pages: list[dict[str, Any]] = []
         for bundle in domain_specific.get("_page_evidence_bundles") or []:
@@ -1144,53 +1269,109 @@ class PersonalDetailExtractionContext:
                     ),
                 }
             )
-        corrected = self._ocr_correction_overlay.corrected_evidence_pages(
-            sorted(
-                pages,
-                key=lambda item: (
-                    self.reading_order_by_logical.get(item["page"], item["page"]),
-                    item["page"],
-                ),
-            )
+        ordered = sorted(
+            pages,
+            key=lambda item: (
+                self.reading_order_by_logical.get(item["page"], item["page"]),
+                item["page"],
+            ),
         )
-        return self._merge_split_replay_pages(corrected)
+        static_pages = self._construct_static_topology_pages(ordered)
+        if not self._business_repair_active:
+            return static_pages
 
-    def _merge_split_replay_pages(
+        merged: list[dict[str, Any]] = []
+        affected = set(self._business_repair_evidence_by_page)
+        for source in static_pages:
+            logical = int(source.get("page") or 0)
+            replacement = self._business_repair_evidence_by_page.get(logical)
+            if replacement is None:
+                merged.append(source)
+                continue
+            merged.append(
+                {
+                    **source,
+                    **deepcopy(replacement),
+                    "page": logical,
+                    "logical_page": logical,
+                    "source_page": int(replacement.get("source_page") or source.get("source_page") or logical),
+                }
+            )
+        known = {int(page.get("page") or 0) for page in merged}
+        merged.extend(
+            deepcopy(page)
+            for logical, page in self._business_repair_evidence_by_page.items()
+            if logical not in known
+        )
+        # Line-level normalization is permitted only now: the first schema
+        # pass selected these pages as business-uncertain.
+        selected = [page for page in merged if int(page.get("page") or 0) in affected]
+        corrected_by_page = {
+            int(page.get("page") or 0): page
+            for page in self._ocr_correction_overlay.corrected_evidence_pages(selected)
+        }
+        return [corrected_by_page.get(int(page.get("page") or 0), page) for page in merged]
+
+    def _construct_static_topology_pages(
         self,
         pages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Overlay actual splitter slices on core pages that remained unsplit."""
+        """Freeze statically split pages and partition existing evidence."""
         audit = self.page_topology.audit()
         source_candidates = {
             int(source)
             for source, logicals in (audit.get("logical_pages_by_source") or {}).items()
             if len(logicals) == 1
+            and (
+                (geometry := self.page_topology.geometry(int(logicals[0]))) is not None
+                and (geometry.split_kind == "two_page_spread" or geometry.split_confidence >= 0.55)
+            )
         }
         if not source_candidates:
             return pages
-        supplemental = self.supplemental_page_ocr_evidence(
-            source_candidates,
-            reason="split_result_topology_replay",
-        )
-        if not supplemental:
+        split_pages = self._page_image_resolver.static_split_slices(source_candidates)
+        for decision in self._page_image_resolver.audit().get("static_split_decisions") or []:
+            if not isinstance(decision, Mapping) or decision.get("status") not in {"uncertain", "failed"}:
+                continue
+            source = int(decision.get("source_page") or 0)
+            failed = decision.get("status") == "failed"
+            issue_code = "static_page_split_validation_failed" if failed else "static_page_split_uncertain"
+            if any(
+                item.get("code") == issue_code
+                and int(item.get("source_page") or 0) == source
+                for item in self._topology_recovery_issues
+            ):
+                continue
+            self._topology_recovery_issues.append(
+                {
+                    "code": issue_code,
+                    "message": (
+                        "Static page-split validation could not run; the original logical page was preserved."
+                        if failed
+                        else "Static image geometry could not safely confirm or reject a potential page split."
+                    ),
+                    **deepcopy(dict(decision)),
+                }
+            )
+        if not split_pages:
             return pages
 
         base_by_source: dict[int, list[dict[str, Any]]] = {}
         for page in pages:
             base_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
-        supplemental_by_source: dict[int, list[dict[str, Any]]] = {}
-        for page in supplemental:
-            supplemental_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
+        static_by_source: dict[int, list[dict[str, Any]]] = {}
+        for page in split_pages:
+            static_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
 
         next_logical = max(self.source_page_by_logical, default=0) + 1
         merged: list[dict[str, Any]] = []
-        for source in sorted(set(base_by_source) | set(supplemental_by_source)):
+        for source in sorted(set(base_by_source) | set(static_by_source)):
             base_pages = base_by_source.get(source, [])
-            replay_pages = sorted(
-                supplemental_by_source.get(source, []),
+            constructed_pages = sorted(
+                static_by_source.get(source, []),
                 key=lambda item: int(item.get("segment_index") or 0),
             )
-            if not replay_pages:
+            if not constructed_pages:
                 merged.extend(base_pages)
                 continue
             logicals = self.page_topology.logicals_for_source(source)
@@ -1211,37 +1392,103 @@ class PersonalDetailExtractionContext:
                 ):
                     base_by_segment[int(geometry.segment_index)] = page
 
-            replay_by_segment = {int(page.get("segment_index") or 0): page for page in replay_pages}
-            available_segments = set(base_by_segment) | set(replay_by_segment)
+            split_by_segment = {int(page.get("segment_index") or 0): page for page in constructed_pages}
+            available_segments = set(base_by_segment) | set(split_by_segment)
             if available_segments != {0, 1}:
-                # Never replace an unsplit/core page with only one half of a
-                # splitter-confirmed spread. Preserve the original evidence
-                # and publish an explicit page-continuation uncertainty.
+                # Never replace a source with only one half of a statically
+                # confirmed spread. Preserve the original evidence and report
+                # the topology uncertainty without invoking OCR.
                 merged.extend(base_pages)
-                incomplete_id = f"source:{source}:split-pair"
                 if not any(
-                    str(item.get("supplemental_page_id") or "") == incomplete_id
-                    and item.get("status") == "pair_incomplete"
-                    for item in self._page_ocr_requests
+                    item.get("code") == "static_split_pair_incomplete"
+                    and int(item.get("source_page") or 0) == source
+                    for item in self._topology_recovery_issues
                 ):
-                    self._page_ocr_requests.append(
+                    self._topology_recovery_issues.append(
                         {
-                            "supplemental_page_id": incomplete_id,
+                            "code": "static_split_pair_incomplete",
+                            "message": "Static spread validation did not produce both logical subpages.",
                             "source_page": source,
                             "expected_segments": [0, 1],
                             "observed_segments": sorted(available_segments),
-                            "reason": "split_result_topology_replay",
-                            "status": "pair_incomplete",
                         }
                     )
                 continue
             unsplit_logical = logicals[0] if len(logicals) == 1 and not geometries else 0
+            partitioned_lines: dict[int, list[dict[str, Any]]] = {0: [], 1: []}
+            partitioned_tables: dict[int, list[Any]] = {0: [], 1: []}
+            ambiguous_items = 0
+            if unsplit_logical and base_pages:
+                base_evidence = base_pages[0]
+                raw_page = self._frozen_logical_pages.get(unsplit_logical)
+                transform = dict(getattr(raw_page, "coordinate_transform", None) or {})
+                base_to_source = _matrix3(transform.get("inverse_matrix"))
+                if base_to_source is None:
+                    merged.extend(base_pages)
+                    self._topology_recovery_issues.append(
+                        {
+                            "code": "static_split_evidence_transform_unusable",
+                            "message": (
+                                "The original page evidence could not be projected into the static subpages; "
+                                "the unsplit page was preserved."
+                            ),
+                            "source_page": source,
+                            "logical_page": unsplit_logical,
+                        }
+                    )
+                    continue
+                for line in base_evidence.get("lines") or []:
+                    if not isinstance(line, Mapping) or (box := _bbox(line)) is None:
+                        ambiguous_items += 1
+                        continue
+                    source_box = _transform_bbox(base_to_source, box)
+                    segment, ambiguous = _slice_assignment(source_box, split_by_segment)
+                    if ambiguous or segment is None:
+                        ambiguous_items += 1
+                        continue
+                    source_to_slice = _matrix3(split_by_segment[segment].get("source_to_logical"))
+                    if source_to_slice is None:
+                        ambiguous_items += 1
+                        continue
+                    local = deepcopy(dict(line))
+                    local["source_bbox"] = list(source_box)
+                    local["bbox"] = list(_transform_bbox(source_to_slice, source_box))
+                    partitioned_lines[segment].append(local)
+                for table in getattr(raw_page, "tables", None) or []:
+                    if (box := _bbox(table)) is None:
+                        ambiguous_items += 1
+                        continue
+                    source_box = _transform_bbox(base_to_source, box)
+                    segment, ambiguous = _slice_assignment(source_box, split_by_segment)
+                    if ambiguous or segment is None:
+                        ambiguous_items += 1
+                        continue
+                    source_to_slice = _matrix3(split_by_segment[segment].get("source_to_logical"))
+                    if source_to_slice is None:
+                        ambiguous_items += 1
+                        continue
+                    partitioned_tables[segment].append(
+                        _project_table_for_static_slice(
+                            table,
+                            base_to_source=base_to_source,
+                            source_to_slice=source_to_slice,
+                        )
+                    )
+            if ambiguous_items:
+                self._topology_recovery_issues.append(
+                    {
+                        "code": "static_split_boundary_ambiguous",
+                        "message": "Evidence crossing the static split boundary was withheld from both subpages.",
+                        "source_page": source,
+                        "ambiguous_item_count": ambiguous_items,
+                    }
+                )
             for segment in (0, 1):
                 if segment in base_by_segment:
                     merged.append(base_by_segment[segment])
                     continue
-                replay = replay_by_segment.get(segment)
-                if replay is None:
+                static_page = split_by_segment.get(segment)
+                if static_page is None:
                     continue
                 logical = geometries.get(segment, 0)
                 if not logical and unsplit_logical and segment == 0:
@@ -1249,13 +1496,32 @@ class PersonalDetailExtractionContext:
                 if not logical:
                     logical = next_logical
                     next_logical += 1
-                replay = dict(replay)
-                replay["page"] = logical
-                replay["logical_page"] = logical
-                replay["plugin_replayed_subpage"] = True
-                replay["lines"] = self._ocr_correction_overlay.corrected_evidence_pages([replay])[0]["lines"]
+                static_page = dict(static_page)
+                static_page["page"] = logical
+                static_page["logical_page"] = logical
+                static_page["plugin_static_subpage"] = True
+                static_page["lines"] = sorted(
+                    partitioned_lines.get(segment, []),
+                    key=lambda line: ((_bbox(line) or (0, 0, 0, 0))[1], (_bbox(line) or (0, 0, 0, 0))[0]),
+                )
                 self.source_page_by_logical[logical] = source
-                merged.append(replay)
+                self._page_image_resolver.register_static_logical_page(logical, static_page)
+                # The resolver owns the frozen pixel surface. Canonical
+                # evidence remains lightweight and serializable.
+                static_page.pop("image", None)
+                self._frozen_logical_pages[logical] = SimpleNamespace(
+                    page_number=logical,
+                    source_page_number=source,
+                    width=float(static_page.get("page_width") or 0.0),
+                    height=float(static_page.get("page_height") or 0.0),
+                    coordinate_transform=deepcopy(static_page.get("coordinate_transform") or {}),
+                    tables=partitioned_tables.get(segment, []),
+                    texts=[
+                        SimpleNamespace(content=str(line.get("text") or ""), bbox=list(line.get("bbox") or []))
+                        for line in static_page["lines"]
+                    ],
+                )
+                merged.append(static_page)
 
         order_keys: dict[int, tuple[int, int, int]] = {}
         for logical, source in self.source_page_by_logical.items():
@@ -1266,13 +1532,13 @@ class PersonalDetailExtractionContext:
             )
             geometry = self.page_topology.geometry(logical)
             segment = int(geometry.segment_index) if geometry and geometry.segment_index in {0, 1} else 0
-            replay = next((item for item in merged if int(item.get("page") or 0) == logical), None)
-            if replay and replay.get("plugin_replayed_subpage"):
-                segment = int(replay.get("segment_index") or 0)
+            static_page = next((item for item in merged if int(item.get("page") or 0) == logical), None)
+            if static_page and static_page.get("plugin_static_subpage"):
+                segment = int(static_page.get("segment_index") or 0)
             order_keys[logical] = (source_order, segment, logical)
         self.reading_order_by_logical.clear()
         self.reading_order_by_logical.update(
-            {logical: index for index, logical in enumerate(sorted(order_keys, key=order_keys.get), start=1)}
+            {logical: index for index, logical in enumerate(sorted(order_keys, key=lambda item: order_keys[item]), start=1)}
         )
         return sorted(
             merged,
@@ -1288,230 +1554,121 @@ class PersonalDetailExtractionContext:
         *,
         reason: str,
     ) -> list[dict[str, Any]]:
-        """Re-OCR complete logical pages as bounded supplemental evidence.
-
-        This path avoids reliance on a possibly incorrect cell crop.  Results
-        retain logical-page coordinates and never replace sealed OCR evidence.
-        """
+        """Return the one cached re-OCR result for each frozen logical page."""
         if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR", "1") == "0":
             return []
         requested = sorted({int(page) for page in logical_pages if int(page) > 0})
-        canonical_registration = str(reason).startswith("canonical_template_registration")
         output: list[dict[str, Any]] = []
         for logical in requested:
-            if logical in self._page_ocr_cache:
-                cached = self._page_ocr_cache[logical]
-                if cached:
-                    output.append(deepcopy(cached))
-                continue
-            # Canonical registration is not an optional field probe.  Every
-            # unregistered page receives one complete-page retry even when an
-            # earlier field-repair budget has been consumed.
-            if not canonical_registration and len(self._page_ocr_requests) >= self._page_ocr_max_requests:
-                break
-            request = {"logical_page": logical, "reason": str(reason), "status": "requested"}
-            self._page_ocr_requests.append(request)
             rendered = self._page_image_resolver(logical)
-            if not rendered:
-                request["status"] = "render_failed"
-                self._page_ocr_cache[logical] = None
+            page_key = self._page_image_resolver.page_key(logical)
+            if not page_key:
                 continue
-            image = rendered.get("image")
-            shape = getattr(image, "shape", None)
-            if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
-                request["status"] = "invalid_image"
-                self._page_ocr_cache[logical] = None
-                continue
-            words, selected_image, selected_rotation, deskew_angle, orientation_score = _complete_page_ocr(image)
-            selected_shape = getattr(selected_image, "shape", shape)
-            zoom = float(rendered.get("zoom") or 1.0)
-            page_width = float(selected_shape[1]) / zoom
-            page_height = float(selected_shape[0]) / zoom
-            scale_x = page_width / float(shape[1])
-            scale_y = page_height / float(shape[0])
-            if selected_rotation in {90, 270}:
-                scale_x = page_width / float(selected_shape[1])
-                scale_y = page_height / float(selected_shape[0])
-            lines: list[dict[str, Any]] = []
-            for index, word in enumerate(words):
-                text = str(word.get("text") or "").strip()
-                bbox = word.get("bbox")
-                confidence = float(word.get("confidence") or 0.0)
-                if not text or confidence < 0.45 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                    continue
-                lines.append(
-                    {
-                        "text": text,
-                        "confidence": confidence,
-                        "bbox": [
-                            float(bbox[0]) * scale_x,
-                            float(bbox[1]) * scale_y,
-                            float(bbox[2]) * scale_x,
-                            float(bbox[3]) * scale_y,
-                        ],
-                        "evidence_ids": [f"personal_detail_full_page_ocr:p{logical}:w{index}"],
-                        "source": "personal_detail_full_page_ocr",
-                    }
-                )
-            if not lines:
-                request["status"] = "ocr_empty"
-                self._page_ocr_cache[logical] = None
-                continue
-            request["status"] = "completed"
-            request["word_count"] = len(lines)
-            request["selected_rotation"] = selected_rotation
-            request["deskew_angle"] = deskew_angle
-            request["orientation_score"] = orientation_score
-            page = {
-                "page": logical,
-                "source_page": int(rendered.get("source_page") or self.source_page_by_logical.get(logical, logical)),
-                "page_width": page_width,
-                "page_height": page_height,
-                "reason": str(reason),
-                "selected_rotation": selected_rotation,
-                "deskew_angle": deskew_angle,
-                "orientation_score": orientation_score,
-                "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
-            }
-            # Keep the replay raw. Typed correction happens only after a
-            # structural parser assigns the page token to a schema role. This
-            # also prevents recursive page repair while producing the replay.
-            self._page_ocr_cache[logical] = deepcopy(page)
-            output.append(page)
-        return output
 
-    def supplemental_page_ocr_evidence(
-        self,
-        source_pages: Iterable[int],
-        *,
-        reason: str,
-    ) -> list[dict[str, Any]]:
-        """OCR splitter-confirmed supplemental logical subpages.
+            def produce() -> tuple[dict[str, Any] | None, str, dict[str, Any]]:
+                if not rendered:
+                    return None, "render_failed", {"ocr_invocations": 0}
+                image = rendered.get("image")
+                shape = getattr(image, "shape", None)
+                if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
+                    return None, "invalid_image", {"ocr_invocations": 0}
+                words, page_score = _single_page_ocr(image)
+                page_width = float(rendered.get("page_width") or 0.0)
+                page_height = float(rendered.get("page_height") or 0.0)
+                if page_width <= 0 or page_height <= 0:
+                    zoom = float(rendered.get("zoom") or 1.0)
+                    page_width = float(shape[1]) / zoom
+                    page_height = float(shape[0]) / zoom
+                scale_x = page_width / float(shape[1])
+                scale_y = page_height / float(shape[0])
+                lines: list[dict[str, Any]] = []
+                for index, word in enumerate(words):
+                    text = str(word.get("text") or "").strip()
+                    bbox = word.get("bbox")
+                    confidence = float(word.get("confidence") or 0.0)
+                    if not text or confidence < 0.45 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        continue
+                    lines.append(
+                        {
+                            "text": text,
+                            "confidence": confidence,
+                            "bbox": [
+                                float(bbox[0]) * scale_x,
+                                float(bbox[1]) * scale_y,
+                                float(bbox[2]) * scale_x,
+                                float(bbox[3]) * scale_y,
+                            ],
+                            "evidence_ids": [f"personal_detail_page_reocr:{page_key}:w{index}"],
+                            "source": "personal_detail_page_reocr_once",
+                        }
+                    )
+                details = {
+                    "ocr_invocations": 1,
+                    "word_count": len(lines),
+                    "page_score": page_score,
+                }
+                if not lines:
+                    return None, "ocr_empty", details
+                transform = dict(rendered.get("coordinate_transform") or {})
+                decomposition = dict(transform.get("decomposition") or {})
+                return (
+                    {
+                        "page": logical,
+                        "logical_page": logical,
+                        "page_key": page_key,
+                        "source_page": int(
+                            rendered.get("source_page") or self.source_page_by_logical.get(logical, logical)
+                        ),
+                        "page_width": page_width,
+                        "page_height": page_height,
+                        "selected_rotation": int(decomposition.get("selected_rotation") or 0),
+                        "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
+                    },
+                    "completed",
+                    details,
+                )
 
-        Footer text may corroborate printed order but does not decide whether
-        the physical source is subpaged.
-        """
-        slices = self._page_image_resolver.supplemental_spread_slices(source_pages)
-        output: list[dict[str, Any]] = []
-        requested_sources = {
-            int(item.get("source_page") or 0)
-            for item in self._page_ocr_requests
-            if item.get("supplemental_page_id") and item.get("status") != "budget_exhausted"
-        }
-        budget_exhausted_sources: set[int] = set()
-        for recovered in slices:
-            supplemental_id = str(recovered.get("supplemental_page_id") or "")
-            if not supplemental_id:
-                continue
-            source_page = int(recovered.get("source_page") or 0)
-            if source_page in budget_exhausted_sources:
-                continue
-            if supplemental_id in self._supplemental_ocr_cache:
-                output.append(deepcopy(self._supplemental_ocr_cache[supplemental_id]))
-                continue
-            # Splitter-confirmed subpages are part of the corrected document
-            # topology, not optional anomaly probes. Count their budget
-            # independently so earlier field-repair OCR cannot silently drop
-            # a later half of the document. A physical spread is one atomic
-            # budget unit, so both of its splitter slices are always attempted.
-            if source_page not in requested_sources and len(requested_sources) >= self._page_ocr_max_requests:
-                budget_exhausted_sources.add(source_page)
-                self._page_ocr_requests.append(
-                    {
-                        "supplemental_page_id": f"source:{source_page}:split-pair",
-                        "source_page": source_page,
-                        "expected_segments": [0, 1],
-                        "reason": str(reason),
-                        "status": "budget_exhausted",
-                    }
-                )
-                continue
-            requested_sources.add(source_page)
-            request = {
-                "supplemental_page_id": supplemental_id,
-                "source_page": source_page,
-                "printed_page": int(recovered.get("printed_page") or 0),
-                "segment_index": int(recovered.get("segment_index") or 0),
-                "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),
-                "reason": str(reason),
-                "status": "requested",
-            }
-            self._page_ocr_requests.append(request)
-            image = recovered.get("image")
-            shape = getattr(image, "shape", None)
-            if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
-                request["status"] = "invalid_image"
-                continue
-            words, selected_image, page_rotation, deskew_angle, orientation_score = _complete_page_ocr(image)
-            selected_shape = getattr(selected_image, "shape", shape)
-            zoom = float(recovered.get("zoom") or 1.0)
-            page_width = float(selected_shape[1]) / zoom
-            page_height = float(selected_shape[0]) / zoom
-            scale_x = page_width / float(selected_shape[1])
-            scale_y = page_height / float(selected_shape[0])
-            lines: list[dict[str, Any]] = []
-            for index, word in enumerate(words):
-                text = str(word.get("text") or "").strip()
-                bbox = word.get("bbox")
-                confidence = float(word.get("confidence") or 0.0)
-                if not text or confidence < 0.45 or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                    continue
-                lines.append(
-                    {
-                        "text": text,
-                        "confidence": confidence,
-                        "bbox": [
-                            float(bbox[0]) * scale_x,
-                            float(bbox[1]) * scale_y,
-                            float(bbox[2]) * scale_x,
-                            float(bbox[3]) * scale_y,
-                        ],
-                        "evidence_ids": [f"personal_detail_supplemental_ocr:{supplemental_id}:w{index}"],
-                        "source": "personal_detail_supplemental_page_ocr",
-                    }
-                )
-            if not lines:
-                request["status"] = "ocr_empty"
-                continue
-            page = {
-                "supplemental_page_id": supplemental_id,
-                "printed_page": int(recovered.get("printed_page") or 0),
-                "printed_total": int(recovered.get("printed_total") or 0),
-                "source_page": int(recovered.get("source_page") or 0),
-                "segment_index": int(recovered.get("segment_index") or 0),
-                "selected_rotation": int(recovered.get("selected_rotation") or 0),
-                "page_rotation": page_rotation,
-                "deskew_angle": deskew_angle,
-                "orientation_score": orientation_score,
-                "split_confidence": float(recovered.get("split_confidence") or 0.0),
-                "split_ratio": float(recovered.get("split_ratio") or 0.5),
-                "split_consensus_boost": float(recovered.get("split_consensus_boost") or 0.0),
-                "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),
-                "page_width": page_width,
-                "page_height": page_height,
-                "reason": str(reason),
-                "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
-            }
-            request["status"] = "completed"
-            request["word_count"] = len(lines)
-            request["page_rotation"] = page_rotation
-            request["deskew_angle"] = deskew_angle
-            request["orientation_score"] = orientation_score
-            self._supplemental_ocr_cache[supplemental_id] = deepcopy(page)
-            output.append(page)
+            page = self._page_reocr_registry.resolve(
+                page_key=page_key,
+                logical_page=logical,
+                reason=str(reason),
+                producer=produce,
+            )
+            if page is not None:
+                output.append(page)
         return output
 
     def ocr_correction_audit(self) -> dict[str, Any]:
         """Return a detached audit snapshot for diagnostics and regression tests."""
+        registry = self._page_reocr_registry.audit()
+        requests = registry.pop("page_reocr_requests", [])
         return {
             **deepcopy(self._ocr_correction_overlay.audit()),
-            "full_page_ocr_requests": deepcopy(self._page_ocr_requests),
-            "full_page_ocr_request_count": len(self._page_ocr_requests),
+            **registry,
+            "business_repair": (
+                deepcopy(self.__dict__["_business_repair_plan"].audit())
+                if self.__dict__.get("_business_repair_plan") is not None
+                else {
+                    "architecture": "schema_triggered_page_repair_v1",
+                    "first_pass_uncertainty_count": 0,
+                    "affected_pages": [],
+                    "second_schema_pass_required": False,
+                }
+            ),
+            "page_reocr_failures": [
+                row
+                for row in requests
+                if isinstance(row, Mapping) and row.get("status") not in {"completed", "requested"}
+            ],
         }
 
     def page_topology_audit(self) -> dict[str, Any]:
         """Return the plugin's detached logical-page validation result."""
-        return deepcopy(self._page_image_resolver.audit())
+        audit = deepcopy(self._page_image_resolver.audit())
+        audit["issues"] = [*(audit.get("issues") or []), *deepcopy(self._topology_recovery_issues)]
+        audit["ocr_used_for_topology"] = False
+        audit["topology_frozen_before_reocr"] = True
+        return audit
 
     def canonical_layout_audit(self) -> dict[str, Any]:
         """Return the detached template-registration and fragment audit."""

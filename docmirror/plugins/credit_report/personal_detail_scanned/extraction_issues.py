@@ -207,18 +207,17 @@ def _ocr_audit_issues(context: Any) -> list[dict[str, Any]]:
                 reason_codes=anomaly.get("reason_codes") or (),
             )
         )
-    for request in audit.get("full_page_ocr_requests") or []:
-        if not isinstance(request, Mapping) or request.get("status") in {"completed", "requested"}:
+    for request in audit.get("page_reocr_failures") or []:
+        if not isinstance(request, Mapping):
             continue
-        supplemental = bool(request.get("supplemental_page_id"))
         result.append(
             make_issue(
-                category="page_continuation" if supplemental else "ocr_structure_correction",
-                issue_code=f"full_page_ocr_{request.get('status') or 'failed'}",
-                message="A bounded complete-page OCR fallback could not produce usable evidence; decoding continued.",
-                parser_stage="full_page_ocr",
+                category="ocr_structure_correction",
+                issue_code=f"page_reocr_{request.get('status') or 'failed'}",
+                message="The page's single re-OCR attempt could not produce usable evidence; decoding continued without retry.",
+                parser_stage="one_shot_page_reocr",
                 observed_value=dict(request),
-                reason_codes=("fallback_nonfatal", "human_review_available"),
+                reason_codes=("one_shot_terminal_result", "fallback_nonfatal", "human_review_available"),
             )
         )
     return result
@@ -252,26 +251,25 @@ def _topology_issues(context: Any) -> list[dict[str, Any]]:
                 reason_codes=("preserved_observed_pages", "no_page_position_invented"),
             )
         )
-    for recovery in audit.get("supplemental_spread_recoveries") or []:
+    for recovery in audit.get("static_split_recoveries") or []:
         if not isinstance(recovery, Mapping):
             continue
         result.append(
             make_issue(
                 category="page_continuation",
-                issue_code="split_result_subpage_recovered",
+                issue_code="static_split_subpage_constructed",
                 message=(
-                    "The plugin recovered a logical subpage from the core splitter's two-slice result without "
-                    "modifying the sealed ParseResult; printed footer evidence is optional corroboration."
+                    "The static validator constructed a logical subpage from exact split geometry without OCR "
+                    "or mutation of the sealed ParseResult."
                 ),
                 severity="info",
                 status="resolved",
-                parser_stage="supplemental_page_recovery",
+                parser_stage="static_topology_construction",
                 observed_value=dict(recovery),
                 reason_codes=(
-                    "parseresult_subpage_missing_or_unsplit",
-                    "core_splitter_recovery",
-                    "split_geometry_authoritative",
-                    *("printed_footer_corroborated" for _ in [0] if recovery.get("printed_confirmation")),
+                    "core_potential_split_signal",
+                    "static_split_confirmed",
+                    "exact_coordinate_transform",
                 ),
             )
         )

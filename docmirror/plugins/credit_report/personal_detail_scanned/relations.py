@@ -52,6 +52,24 @@ def _geometry_box(value: Any) -> list[float] | None:
     ]
 
 
+def _grid_months(grid: dict[str, Any]) -> set[tuple[int, int]]:
+    date_range = (grid.get("audit") or {}).get("date_range") or {}
+    try:
+        start_year = int(date_range.get("start_year") or 0)
+        start_month = int(date_range.get("start_month") or 0)
+        end_year = int(date_range.get("end_year") or 0)
+        end_month = int(date_range.get("end_month") or 0)
+    except (TypeError, ValueError):
+        return set()
+    if start_year < 1900 or end_year < start_year or not 1 <= start_month <= 12 or not 1 <= end_month <= 12:
+        return set()
+    start = start_year * 12 + start_month - 1
+    end = end_year * 12 + end_month - 1
+    if end < start or end - start > 120:
+        return set()
+    return {(value // 12, value % 12 + 1) for value in range(start, end + 1)}
+
+
 def link_candidate_b_repayments(
     repayments: list[dict[str, Any]],
     accounts: list[dict[str, Any]],
@@ -103,6 +121,12 @@ def link_candidate_b_repayments(
 
     linked: list[dict[str, Any]] = []
     reported_page_order_grids: set[str] = set()
+    owner_by_grid: dict[str, dict[str, Any] | None] = {}
+    accounts_by_id = {
+        str(account.get("account_id") or ""): account
+        for account in accounts
+        if isinstance(account, dict) and account.get("account_id")
+    }
     for record in repayments:
         item = dict(record)
         refs = item.get("source_cell_refs") if isinstance(item.get("source_cell_refs"), list) else []
@@ -127,18 +151,22 @@ def link_candidate_b_repayments(
             for account_page, bottom, account in ordered_accounts
             if account_page < ordered_page or (account_page == ordered_page and bottom <= grid_y + 8.0)
         ]
-        selected = (
-            max(
-                preceding,
-                key=lambda account: float(account_boxes[str(account.get("account_id") or "")][3]),
+        if grid_id in owner_by_grid:
+            selected = owner_by_grid[grid_id]
+        else:
+            explicit_owner = accounts_by_id.get(str(item.get("account_id") or ""))
+            selected = explicit_owner or (
+                max(
+                    preceding,
+                    key=lambda account: float(account_boxes[str(account.get("account_id") or "")][3]),
+                )
+                if preceding
+                else global_preceding[-1]
+                if global_preceding
+                else current[0]
+                if len(current) == 1
+                else None
             )
-            if preceding
-            else global_preceding[-1]
-            if global_preceding
-            else current[0]
-            if len(current) == 1
-            else None
-        )
         inferred_from_page_order = False
         if selected is None and current and not box_is_known:
             # A whole-page OCR pass can recover a canonical monthly table while
@@ -147,9 +175,20 @@ def link_candidate_b_repayments(
             # retain the required relation and report the weaker geometry.
             selected = current[0]
             inferred_from_page_order = True
+        if grid_id and grid_id not in owner_by_grid:
+            owner_by_grid[grid_id] = selected
         if selected is not None:
             item["account_id"] = selected.get("account_id")
-            item["account_identifier"] = selected.get("account_identifier")
+            identifier = selected.get("account_identifier")
+            if identifier:
+                from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+                    role_candidate_is_valid,
+                )
+
+                if role_candidate_is_valid(identifier, "account_identifier"):
+                    item["account_identifier"] = identifier
+                else:
+                    item.pop("account_identifier", None)
             if inferred_from_page_order:
                 item.setdefault("audit", {})["account_linkage"] = "inferred_page_order"
                 if issue_context is not None and grid_id not in reported_page_order_grids:
@@ -229,6 +268,109 @@ def link_candidate_b_repayments(
             selected["source_cell_refs"] = refs
         selected.setdefault("audit", {})["duplicate_month_candidates"] = 2
         output[existing] = selected
+    if issue_context is not None and len(output) < len(linked):
+        account_gaps = [
+            issue
+            for issue in getattr(issue_context, "_personal_detail_extraction_issues", ())
+            if isinstance(issue, dict)
+            and issue.get("issue_code") == "candidate_b_account_sequence_gap"
+            and str(issue.get("status") or "open") != "resolved"
+        ]
+        if account_gaps:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            record_issue(
+                issue_context,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="monthly_linkage_collision_from_account_gap",
+                    message=(
+                        "Monthly grid candidates collapsed onto duplicate account-month keys while account-family "
+                        "ordinals were unresolved; the final rows were deduplicated and the population loss was reported."
+                    ),
+                    parser_stage="candidate_b_relationship_schema",
+                    target_dataset="repayment_records",
+                    field_name="account_id",
+                    observed_value={"final_linked_row_count": len(output)},
+                    candidate_value={
+                        "pre_deduplication_row_count": len(linked),
+                        "collapsed_candidate_count": len(linked) - len(output),
+                        "missing_account_category_sequences": {
+                            str((issue.get("observed_value") or {}).get("account_type") or "unknown"): list(
+                                (issue.get("candidate_value") or {}).get("missing_category_sequences") or ()
+                            )
+                            for issue in account_gaps
+                        },
+                    },
+                    source_refs=(
+                        dict(ref)
+                        for issue in account_gaps
+                        for ref in issue.get("source_refs") or ()
+                        if isinstance(ref, dict)
+                    ),
+                    reason_codes=(
+                        "credit_account_population_incomplete",
+                        "duplicate_account_month_linkage",
+                        "final_population_loss_reported",
+                    ),
+                ),
+            )
+    if issue_context is not None:
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+        records_by_grid: dict[str, list[dict[str, Any]]] = {}
+        for record in output:
+            refs = record.get("source_cell_refs") if isinstance(record.get("source_cell_refs"), list) else []
+            first_ref = refs[0] if refs and isinstance(refs[0], dict) else {}
+            grid_id = str(record.get("grid_id") or first_ref.get("grid_id") or "")
+            if grid_id:
+                records_by_grid.setdefault(grid_id, []).append(record)
+        for grid_id, grid in grids.items():
+            expected_months = _grid_months(grid)
+            if not expected_months:
+                continue
+            observed_rows = records_by_grid.get(grid_id, [])
+            observed_months: set[tuple[int, int]] = set()
+            owners: set[str] = set()
+            for record in observed_rows:
+                try:
+                    year = int(record.get("year") or str(record.get("performance_month") or "")[:4])
+                    month = int(record.get("month") or str(record.get("performance_month") or "")[5:7])
+                except (TypeError, ValueError):
+                    continue
+                if year >= 1900 and 1 <= month <= 12:
+                    observed_months.add((year, month))
+                if record.get("account_id"):
+                    owners.add(str(record["account_id"]))
+            if observed_months == expected_months and len(owners) == 1:
+                continue
+            record_issue(
+                issue_context,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_contract_unresolved",
+                    message=(
+                        "A printed monthly grid did not yield exactly one observation for every printed month "
+                        "under exactly one account owner."
+                    ),
+                    parser_stage="candidate_b_relationship_schema",
+                    target_dataset="repayment_records",
+                    target_record_id=grid_id,
+                    observed_value={
+                        "month_count": len(observed_months),
+                        "account_owners": sorted(owners),
+                    },
+                    candidate_value={"printed_month_count": len(expected_months)},
+                    reason_codes=(
+                        "printed_date_range_contract",
+                        "single_account_grid_contract",
+                        "dataset_incomplete",
+                    ),
+                ),
+            )
     return output
 
 

@@ -30,16 +30,71 @@ from docmirror.plugins._base.projector import CommunityProjector, ProjectionData
 class _CreditReportCommunityBundle(CommunityBundle):
     """Publish compact Community JSON without weakening rich semantic bindings."""
 
+    def semantic_payload(self) -> dict[str, Any]:
+        payload = super().semantic_payload()
+        domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
+        facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
+        if facts.get("report_subtype") != "enterprise":
+            return payload
+        extraction = facts.pop("extraction_report", None)
+        if isinstance(extraction, dict):
+            payload["extraction"] = extraction
+        for key in tuple(facts):
+            if key.startswith("enterprise_expected_"):
+                facts.pop(key, None)
+        extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
+        extensions.pop("enterprise_dataset_completeness", None)
+        overrides = (
+            extensions.get("community_projection_overrides")
+            if isinstance(extensions.get("community_projection_overrides"), dict)
+            else {}
+        )
+        for key in ("internal_fields", "internal_facts"):
+            values = overrides.get(key)
+            if not isinstance(values, list):
+                continue
+            overrides[key] = [
+                value for value in values if not str(value).startswith("enterprise_expected_")
+            ]
+        return payload
+
     def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
         from docmirror.plugins.credit_report.projection import _compact_public_datasets
 
         payload = super().json_payload(semantic)
+        semantic_payload = self.domain if isinstance(self.domain, dict) else {}
+        domain = semantic_payload if isinstance(semantic_payload.get("facts"), dict) else {}
+        facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
+        enterprise = facts.get("report_subtype") == "enterprise"
+        extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
+        enterprise_completeness = (
+            extensions.get("enterprise_dataset_completeness", {}) if enterprise else {}
+        )
         for dataset in payload.get("datasets") or []:
             if not isinstance(dataset, dict):
                 continue
             dataset_id = str(dataset.get("id") or dataset.get("name") or "dataset")
             records = [record for record in (dataset.get("rows") or []) if isinstance(record, dict)]
             dataset["rows"] = _compact_public_datasets({dataset_id: records})[dataset_id]
+            if not enterprise:
+                continue
+            for record in dataset["rows"]:
+                record["raw"] = {}
+                record["canonical_raw"] = {}
+            details = enterprise_completeness.get(str(dataset.get("name") or ""))
+            if not isinstance(details, dict):
+                continue
+            dataset["completeness"] = {
+                key: details[key]
+                for key in (
+                    "expected_row_count",
+                    "emitted_row_count",
+                    "omitted_row_count",
+                    "verified",
+                    "basis",
+                )
+                if key in details
+            }
         return payload
 
 
@@ -73,6 +128,16 @@ class CreditReportPlugin(CommunityProjector):
         )
 
     def derive(self, parse_result, text: str = "") -> ProjectionData:
+        from docmirror.plugins.credit_report.report_profile import (
+            detect_credit_report_subtype,
+        )
+
+        if detect_credit_report_subtype(parse_result, text) == "enterprise":
+            from docmirror.plugins.credit_report.enterprise_native.projector import (
+                derive_enterprise_projection,
+            )
+
+            return derive_enterprise_projection(self, parse_result, text)
         from docmirror.plugins.credit_report.projection import derive_credit_report_projection
 
         return derive_credit_report_projection(self, parse_result, text)
