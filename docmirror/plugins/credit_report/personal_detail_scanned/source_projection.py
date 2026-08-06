@@ -32,7 +32,7 @@ PERSONAL_PROFILE_FIELDS = (
     "household_address",
 )
 
-PERSONAL_DETAIL_BUSINESS_DATASETS = (
+PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS = (
     "personal_profile",
     "personal_report_metadata",
     "identity_documents",
@@ -515,7 +515,7 @@ def _dataset_status_contract(
     explicit_states = facts.get("personal_detail_dataset_states")
     states = dict(explicit_states) if isinstance(explicit_states, Mapping) else {}
     rows: list[dict[str, Any]] = []
-    for dataset_name in PERSONAL_DETAIL_BUSINESS_DATASETS:
+    for dataset_name in PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS:
         local_rows = datasets.get(dataset_name)
         auxiliary_rows = auxiliary_business.get(dataset_name)
         final_count = final_dataset_counts.get(dataset_name)
@@ -559,6 +559,9 @@ def _dataset_status_contract(
         }
         if explicit_map.get("source_statement"):
             row["source_statement"] = str(explicit_map["source_statement"])
+        expected_count = explicit_map.get("expected_row_count")
+        if isinstance(expected_count, int) and not isinstance(expected_count, bool) and expected_count >= 0:
+            row["expected_row_count"] = expected_count
         confidence = explicit_map.get("confidence")
         if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
             row["confidence"] = max(0.0, min(1.0, float(confidence)))
@@ -574,14 +577,18 @@ def _issue_field_observations(datasets: Mapping[str, Any]) -> list[dict[str, Any
     """Project typed extraction failures into the field uncertainty ledger."""
     rows: list[dict[str, Any]] = []
     for issue in datasets.get("personal_detail_extraction_issues") or ():
-        if not isinstance(issue, Mapping) or issue.get("issue_code") != "pboc_cell_contract_unresolved":
+        if not isinstance(issue, Mapping):
+            continue
+        reason_codes = {str(value) for value in issue.get("reason_codes") or ()}
+        if issue.get("issue_code") != "pboc_cell_contract_unresolved" and not (
+            "normalized_value_withheld" in reason_codes or issue.get("observed_value") in (None, "", [])
+        ):
             continue
         dataset_name = str(issue.get("target_dataset") or "")
         field_name = str(issue.get("field_name") or "")
         if not dataset_name or not field_name:
             continue
         issue_id = str(issue.get("extraction_issue_id") or issue.get("record_id") or len(rows) + 1)
-        reason_codes = {str(value) for value in issue.get("reason_codes") or ()}
         withheld = "normalized_value_withheld" in reason_codes
         observation_id = f"field_extraction:{issue_id}"
         row: dict[str, Any] = {
@@ -609,7 +616,97 @@ def _issue_field_observations(datasets: Mapping[str, Any]) -> list[dict[str, Any
     return rows
 
 
-def apply_personal_detail_contract(
+def _sequence_evidence(rows: Any, *, grouped: bool = False) -> tuple[int, bool]:
+    sequences: dict[str, set[int]] = {}
+    for row in rows or ():
+        values = _record_values(row)
+        try:
+            sequence = int(values.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        if sequence <= 0:
+            continue
+        group = str(values.get("inquiry_type") or "unknown") if grouped else "all"
+        sequences.setdefault(group, set()).add(sequence)
+    if not sequences:
+        return 0, True
+    expected = sum(max(values) for values in sequences.values())
+    contiguous = all(values == set(range(1, max(values) + 1)) for values in sequences.values())
+    return expected, contiguous
+
+
+def _apply_source_completeness_ledger(
+    facts: dict[str, Any],
+    datasets: dict[str, Any],
+    final_dataset_counts: Mapping[str, int],
+) -> None:
+    """Turn independent sequence/count evidence into explicit partial states."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    ledger = facts.get("personal_detail_source_completeness_ledger")
+    ledger_map = dict(ledger) if isinstance(ledger, Mapping) else {}
+    endpoints = ledger_map.get("sequence_endpoints")
+    endpoint_map = dict(endpoints) if isinstance(endpoints, Mapping) else {}
+    states = facts.setdefault("personal_detail_dataset_states", {})
+    if not isinstance(states, dict):
+        states = {}
+        facts["personal_detail_dataset_states"] = states
+    issues = datasets.setdefault("personal_detail_extraction_issues", [])
+    if not isinstance(issues, list):
+        issues = []
+        datasets["personal_detail_extraction_issues"] = issues
+
+    checks: dict[str, tuple[int, int, bool]] = {}
+    for dataset_name in ("residence_records", "employment_records"):
+        local_rows = datasets.get(dataset_name) or ()
+        observed = sum(isinstance(row, Mapping) for row in local_rows)
+        sequence_expected, contiguous = _sequence_evidence(local_rows)
+        source_endpoint = endpoint_map.get(dataset_name)
+        expected = max(
+            sequence_expected,
+            int(source_endpoint) if isinstance(source_endpoint, int) and not isinstance(source_endpoint, bool) else 0,
+        )
+        checks[dataset_name] = (observed, expected, contiguous)
+
+    inquiry_rows = datasets.get("inquiry_records") or ()
+    inquiry_observed = sum(isinstance(row, Mapping) for row in inquiry_rows)
+    inquiry_expected, inquiry_contiguous = _sequence_evidence(inquiry_rows, grouped=True)
+    checks["inquiry_records"] = (inquiry_observed, inquiry_expected, inquiry_contiguous)
+
+    account_observed = int(final_dataset_counts.get("credit_accounts") or 0)
+    account_expected = ledger_map.get("credit_accounts")
+    if isinstance(account_expected, int) and not isinstance(account_expected, bool):
+        checks["credit_accounts"] = (account_observed, account_expected, True)
+
+    existing_ids = {
+        str(row.get("extraction_issue_id") or "")
+        for row in issues
+        if isinstance(row, Mapping)
+    }
+    for dataset_name, (observed, expected, contiguous) in checks.items():
+        if expected <= 0 or (observed >= expected and contiguous):
+            continue
+        issue = make_issue(
+            category="page_continuation",
+            issue_code="source_sequence_or_count_gap",
+            message="Printed sequence/count evidence exceeds the records projected for this dataset.",
+            parser_stage="source_completeness_ledger",
+            target_dataset=dataset_name,
+            observed_value={"observed_row_count": observed},
+            candidate_value={"source_expected_row_count": expected},
+            reason_codes=("independent_source_ledger", "dataset_incomplete", "no_missing_row_invented"),
+        )
+        if issue["extraction_issue_id"] not in existing_ids:
+            issues.append(issue)
+            existing_ids.add(issue["extraction_issue_id"])
+        states[dataset_name] = {
+            "presence_status": "partial",
+            "reason": "source_sequence_or_count_gap",
+            "expected_row_count": expected,
+        }
+
+
+def prepare_personal_detail_source_collections(
     content: dict[str, Any],
     auxiliary_business: Mapping[str, Any] | None = None,
     *,
@@ -625,15 +722,26 @@ def apply_personal_detail_contract(
     if not isinstance(datasets, dict):
         datasets = {}
         content["datasets"] = datasets
+    final_counts = final_dataset_counts or {}
 
     # Counts captured before the canonical business merge can be zero when a
     # scanned repayment grid is available only through the auxiliary path.
     # Reconcile that impossible zero/positive contradiction without replacing
     # any nonzero source count that could still expose a real omission.
-    for dataset_name, final_count in (final_dataset_counts or {}).items():
+    for dataset_name, final_count in final_counts.items():
         count_key = f"personal_detail_expected_{dataset_name}_count"
         if facts.get(count_key) == 0 and isinstance(final_count, int) and final_count > 0:
             facts[count_key] = final_count
+
+    _apply_source_completeness_ledger(facts, datasets, final_counts)
+
+    # The generic scanned summary count is not authoritative for a detailed
+    # report (category numbering restarts).  v2 uses its source ledger through
+    # dataset_status and keeps Community completeness for row conservation.
+    credit_summary = dict(auxiliary.get("credit_summary") or facts.get("credit_summary") or {})
+    credit_summary["account_population_comparable"] = False
+    credit_summary["projected_account_count"] = int(final_counts.get("credit_accounts") or 0)
+    facts["credit_summary"] = credit_summary
 
     profile_rows, field_observations = _profile_contract(facts, datasets)
     if profile_rows:
@@ -642,11 +750,28 @@ def apply_personal_detail_contract(
         *field_observations,
         *_issue_field_observations(datasets),
     ]
-    datasets["personal_detail_field_observations"] = [
-        row
-        for row in observations
-        if str(row.get("observation_status") or "") in _POTENTIALLY_FLAWED_OBSERVATION_STATUSES
-    ]
+    observation_rows: list[dict[str, Any]] = []
+    seen_observations: set[str] = set()
+    for row in observations:
+        if str(row.get("observation_status") or "") not in _POTENTIALLY_FLAWED_OBSERVATION_STATUSES:
+            continue
+        marker = json.dumps(
+            {
+                "dataset_name": row.get("dataset_name"),
+                "business_record_id": row.get("business_record_id"),
+                "field_name": row.get("field_name"),
+                "observation_status": row.get("observation_status"),
+                "raw_value": row.get("raw_value"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if marker in seen_observations:
+            continue
+        seen_observations.add(marker)
+        observation_rows.append(row)
+    datasets["personal_detail_field_observations"] = observation_rows
 
     summary_metrics = _summary_metric_contract(datasets)
     if summary_metrics:
@@ -685,13 +810,21 @@ def apply_personal_detail_contract(
         rows = datasets.get(dataset_name)
         if isinstance(rows, list):
             facts[f"personal_detail_expected_{dataset_name}_count"] = len(rows)
-    facts["canonical_dataset_schema"] = "personal_credit_report_detailed.v1.2"
+    facts["canonical_dataset_schema"] = "personal_credit_report_detailed.v2"
+    # Community dataset completeness now means lossless v2 row projection.
+    # Source-document completeness remains explicit in dataset_status, avoiding
+    # a duplicate generic warning for the same uncertainty.
+    from docmirror.plugins.credit_report.personal_detail_scanned.schema import project_personal_detail_datasets
+
+    preview = project_personal_detail_datasets(datasets)
+    for dataset_name, rows in preview.items():
+        facts[f"personal_detail_v2_expected_{dataset_name}_count"] = len(rows)
     return content
 
 
 __all__ = [
-    "PERSONAL_DETAIL_BUSINESS_DATASETS",
+    "PERSONAL_DETAIL_SOURCE_BUSINESS_DATASETS",
     "PERSONAL_PROFILE_FIELDS",
-    "apply_personal_detail_contract",
+    "prepare_personal_detail_source_collections",
     "project_typed_public_records",
 ]

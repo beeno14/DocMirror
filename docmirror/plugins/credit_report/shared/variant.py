@@ -38,6 +38,10 @@ class CreditReportVariantAdapter:
             names.insert(1, "credit_lines")
         return tuple(names)
 
+    def source_dataset_names(self) -> tuple[str, ...]:
+        """Return private assembled collections consumed by the public projection."""
+        return self.dataset_names()
+
     def business_dataset_copies(
         self,
         assembled: dict[str, Any],

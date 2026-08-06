@@ -34,7 +34,7 @@ _MONTH_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})(?![\d./-])"
 _DATETIME_DIGITS_RE = re.compile(r"(?<!\d)(20\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})(?!\d)")
 _CN_ID_RE = re.compile(r"^\d{17}[0-9X]$")
 _MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
-_ACCOUNT_IDENTIFIER_RE = re.compile(r"^[A-Z0-9]{8,64}$")
+_ACCOUNT_IDENTIFIER_RE = re.compile(r"^[A-Z0-9-]{8,80}$")
 _AMOUNT_RE = re.compile(r"^-?(?:0|[1-9]\d{0,14})(?:\.\d{1,2})?$")
 _INQUIRY_DATE_LIKE_RE = re.compile(r"20\d{2}(?:[.,/:;-]?\d{1,2}[.,/:;-]\d{1,2}|[.]\d{4})")
 _VALID_INQUIRY_REASONS = (
@@ -327,6 +327,8 @@ def _normalize_identifier(value: str) -> str:
 
 def _normalize_amount(value: str) -> str:
     text = _plain_text(value).replace("，", ",").replace(",", "")
+    if re.fullmatch(r"[+-]?0+(?:\.0+)?", text):
+        return "0"
     if text.startswith("+"):
         text = text[1:]
     if not _AMOUNT_RE.fullmatch(text):
@@ -403,6 +405,7 @@ def normalize_institution_name(value: str) -> str:
     for original, corrected in dict(_pack().get("institution_substitutions") or {}).items():
         text = text.replace(str(original), str(corrected))
     text = re.sub(r"^[中福装R$证芬心多离囍版真苏德会食守]\s+(?=.{2,})", "", text)
+    text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
     text = _TRAILING_INSTITUTION_NOISE_RE.sub("", text).strip()
     matches = list(_INSTITUTION_SUFFIX_RE.finditer(text))
     if matches:
@@ -476,7 +479,8 @@ def _is_valid_for_role(value: str, role: str) -> bool:
     if role == "integer_or_placeholder":
         return value in _PLACEHOLDERS or bool(re.fullmatch(r"\d{1,12}", value))
     if role == "institution_name":
-        return bool(_INSTITUTION_SUFFIX_RE.fullmatch(value) or value == "本人")
+        compact = re.sub(r"\s+", "", value)
+        return bool(_INSTITUTION_SUFFIX_RE.fullmatch(compact) or compact == "本人")
     if role == "repayment_status":
         return value in _REPAYMENT_STATUSES
     if role == "account_type_label":
@@ -491,6 +495,13 @@ def _is_valid_for_role(value: str, role: str) -> bool:
 
 
 def _normalize_role(value: str, role: str) -> str:
+    from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+        normalize_pboc_field,
+    )
+
+    controlled = normalize_pboc_field(value, role)
+    if controlled != str(value or "").strip():
+        return controlled
     if role == "date":
         return _normalize_date(value)
     if role == "date_or_month":
@@ -550,6 +561,15 @@ def _summary_cell_role(value: Mapping[str, Any]) -> str | None:
 
 
 def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
+    # These are plugin audit booleans, not PBOC count cells.  The suffix is
+    # descriptive and must not route ``True`` through the integer contract.
+    if key in {
+        "status_inferred_from_adjacent_months",
+        "normalized_value_withheld",
+        "is_primary",
+        "ocr_corrected",
+    }:
+        return None
     if key == "value":
         return _summary_cell_role(owner)
     if key == "reason" and any(name in owner for name in ("inquiry_date", "inquiry_type")):
@@ -787,75 +807,18 @@ class PersonalDetailOCRCorrectionOverlay:
             return None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
         self._targeted_requests += 1
-        if callable(self._full_page_ocr_loader):
-            repaired = self._repair_from_full_page(
-                original,
-                role=role,
-                ref=ref,
-                refs=refs,
-                logical_page=logical_page,
-            )
-            if repaired is not None:
-                return repaired
-        if self._page_image_resolver is None:
-            from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
-                PersonalDetailLogicalPageImageResolver,
-            )
-
-            self._page_image_resolver = PersonalDetailLogicalPageImageResolver(
-                self.parse_result,
-                zoom=3.0,
-            )
-        rendered = self._page_image_resolver(logical_page)
-        if not rendered:
+        if not callable(self._full_page_ocr_loader):
             return None
-        if self._repair_engine is None:
-            from docmirror.ocr.repair import LocalOCRRepairEngine
-
-            self._repair_engine = LocalOCRRepairEngine()
-        from docmirror.evidence.repair import RepairRequest
-
-        request_id = f"personal_detail:{logical_page}:{self._targeted_requests:04d}"
-        request = RepairRequest(
-            request_id=request_id,
-            domain="credit_report.personal_detail",
-            kind=role,
-            page_number=logical_page,
-            bbox=tuple(float(item) for item in ref["bbox"]),
-            constraints=(role, "typed_validation", "preserve_raw"),
-            evidence_ids=tuple(str(item) for item in ref.get("evidence_ids") or ()),
-            reason="invalid_or_ambiguous_typed_ocr",
-        )
-        candidates = self._repair_engine.repair_from_image(
-            request,
-            rendered["image"],
-            page_width=float(rendered["page_width"]),
-            page_height=float(rendered["page_height"]),
-            max_variants=8,
-            min_confidence=0.45,
-        )
-        valid: list[tuple[float, str]] = []
-        for candidate in candidates:
-            normalized = _normalize_role(candidate.text, role)
-            if _is_valid_for_role(normalized, role):
-                valid.append((float(candidate.confidence), normalized))
-        valid.sort(reverse=True)
-        if not valid or valid[0][0] < 0.72:
-            return None
-        if len(valid) > 1 and valid[0][1] != valid[1][1] and valid[0][0] - valid[1][0] < 0.08:
-            return None
-        selected = valid[0][1]
-        decision = self._record(
+        # Re-OCR the complete logical page once and cache it in the extraction
+        # context.  The bbox is only a schema-aware association hint; it never
+        # becomes the OCR input region.
+        return self._repair_from_full_page(
+            original,
             role=role,
-            original=original,
-            corrected=selected,
-            method="targeted_crop_ocr_consensus",
-            reason_codes=("source_region_rerendered", "typed_validation", "candidate_margin"),
-            confidence=valid[0][0],
+            ref=ref,
             refs=refs,
-            candidates=tuple(dict.fromkeys(value for _score, value in valid)),
+            logical_page=logical_page,
         )
-        return selected, decision
 
     def _repair_from_full_page(
         self,

@@ -17,7 +17,8 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, TypeVar, cast
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable, Mapping, TypeVar, cast
 
 from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
     PersonalDetailLogicalPageImageResolver,
@@ -111,14 +112,45 @@ def _finite(value: Any) -> float:
     return result if math.isfinite(result) else 0.0
 
 
-def _page_ocr_score(words: Iterable[dict[str, Any]]) -> float:
+def _page_ocr_score(words: Iterable[dict[str, Any]], *, image_shape: Any = None) -> float:
     texts = [str(word.get("text") or "").strip() for word in words if str(word.get("text") or "").strip()]
     joined = " ".join(texts)
     anchors = sum(joined.count(marker) for marker in _PAGE_OCR_ANCHORS)
     long_cjk = sum(1 for text in texts if len(re.findall(r"[\u3400-\u9fff]", text)) >= 2)
     confidences = [float(word.get("confidence") or 0.0) for word in words if word.get("text")]
     mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-    return float(len(joined) + anchors * 80 + long_cjk * 4 + mean_confidence * 30)
+    horizontal_chars = 0
+    vertical_chars = 0
+    for word in words:
+        text = str(word.get("text") or "").strip()
+        box = word.get("bbox")
+        if not text or not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        width = max(0.0, float(box[2]) - float(box[0]))
+        height = max(0.0, float(box[3]) - float(box[1]))
+        weight = max(1, len(text))
+        if width >= height * 1.15:
+            horizontal_chars += weight
+        elif height >= width * 1.5:
+            vertical_chars += weight
+    portrait_score = 0.0
+    if isinstance(image_shape, (list, tuple)) and len(image_shape) >= 2:
+        height = float(image_shape[0] or 0.0)
+        width = float(image_shape[1] or 0.0)
+        if height > 0 and width > 0:
+            # Canonical detailed-report logical pages are portrait.  This
+            # prior breaks dense-table ties where rotating an already upright
+            # page produces more, but vertically fragmented, OCR tokens.
+            portrait_score = 240.0 if height >= width else -240.0
+    return float(
+        len(joined)
+        + anchors * 80
+        + long_cjk * 4
+        + mean_confidence * 30
+        + horizontal_chars * 2.5
+        - vertical_chars * 3.0
+        + portrait_score
+    )
 
 
 def _complete_page_ocr(image: Any) -> tuple[list[dict[str, Any]], Any, int, float, float]:
@@ -142,7 +174,7 @@ def _complete_page_ocr(image: Any) -> tuple[list[dict[str, Any]], Any, int, floa
         else:
             oriented = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
         words = rapidocr_recognize(oriented, source="personal_detail_full_page_ocr")
-        candidates.append((_page_ocr_score(words), rotation, words, oriented))
+        candidates.append((_page_ocr_score(words, image_shape=getattr(oriented, "shape", None)), rotation, words, oriented))
     score, rotation, words, selected = max(candidates, key=lambda item: item[0])
     deskewed, deskew_angle = deskew_image(selected)
     if abs(float(deskew_angle or 0.0)) >= 0.5:
@@ -150,7 +182,7 @@ def _complete_page_ocr(image: Any) -> tuple[list[dict[str, Any]], Any, int, floa
             deskewed,
             source="personal_detail_full_page_ocr_deskewed",
         )
-        deskew_score = _page_ocr_score(deskew_words)
+        deskew_score = _page_ocr_score(deskew_words, image_shape=getattr(deskewed, "shape", None))
         if deskew_score > score:
             return deskew_words, deskewed, rotation, float(deskew_angle), deskew_score
     return words, selected, rotation, 0.0, score
@@ -727,6 +759,8 @@ class PersonalDetailExtractionContext:
         self._page_ocr_cache: dict[int, dict[str, Any] | None] = {}
         self._supplemental_ocr_cache: dict[str, dict[str, Any]] = {}
         self._page_ocr_requests: list[dict[str, Any]] = []
+        self._canonical_layout_projection_cache: Any | None = None
+        self._canonical_entity_context_ready = False
         self._page_ocr_max_requests = max(
             0, int(os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR_MAX_REQUESTS", "12"))
         )
@@ -747,6 +781,11 @@ class PersonalDetailExtractionContext:
     def __getattr__(self, name: str) -> Any:
         return getattr(self.parse_result, name)
 
+    @property
+    def pages(self) -> list[Any]:
+        """Return detached canonical pages, never the sealed ParseResult pages."""
+        return list(self._canonical_layout_projection().pages)
+
     def cached(self, key: str, factory: Callable[[], _T]) -> _T:
         if key not in self._cache:
             self._cache[key] = deepcopy(factory())
@@ -761,40 +800,47 @@ class PersonalDetailExtractionContext:
         )
 
     def native_business(self, full_text: str) -> dict[str, Any]:
-        from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
-            extract_personal_detail_native_business,
-        )
-
-        return self.cached(
-            "native_business",
-            lambda: self._ocr_correction_overlay.correct_business_candidates(
-                extract_personal_detail_native_business(self, full_text),
-                stage="native_business",
-            ),
-        )
+        """Compatibility view of the single Candidate B business result."""
+        return deepcopy(self.candidate_b_extraction(full_text).business)
 
     def scanned_business(self, full_text: str) -> dict[str, Any]:
-        from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_business
+        """Compatibility view; no shared scanned extractor is invoked."""
+        return deepcopy(self.candidate_b_extraction(full_text).business)
 
-        return self.cached(
-            "scanned_business",
-            lambda: self._ocr_correction_overlay.correct_business_candidates(
-                extract_scanned_credit_business(self, full_text),
-                stage="scanned_business",
-            ),
+    def candidate_b_extraction(self, full_text: str) -> Any:
+        """Build and retain the only business extraction for this document."""
+        key = "candidate_b_extraction"
+        if key not in self._cache:
+            from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
+                CandidateBPipeline,
+            )
+
+            self._cache[key] = CandidateBPipeline(self, full_text).run()
+        return self._cache[key]
+
+    def correct_candidate_b_business(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply the branch's correction and cross-field contracts exactly once."""
+        corrected = self._ocr_correction_overlay.correct_business_candidates(
+            payload,
+            stage="candidate_b_schema_extraction",
+        )
+        return self._ocr_correction_overlay.enforce_cross_field_contracts(
+            corrected,
+            stage="candidate_b_schema_extraction",
         )
 
     def correct_assembled_business(self, payload: dict[str, Any], *, stage: str) -> dict[str, Any]:
-        """Apply cross-field contracts after candidate collections are merged."""
-        return self._ocr_correction_overlay.enforce_cross_field_contracts(payload, stage=stage)
+        """Compatibility hook; Candidate B has already performed this pass."""
+        del stage
+        return deepcopy(payload)
 
     def corrected_repayment_records(self) -> list[dict[str, Any]]:
-        """Rebuild monthly cells from images using corrected document order.
+        """Rebuild monthly cells from the same canonical page evidence as all fields.
 
-        Parse-time micro-grids may contain ``unknown`` placeholders and may
-        have augmented a shuffled physical neighbor. Work on a detached copy,
-        force grid reconstruction, and enable typed one-cell OCR. The sealed
-        evidence plane remains unchanged.
+        No cell-level OCR is permitted here.  Complete-page OCR replay and
+        canonical fragment registration happen before the repayment grid is
+        materialized, so monthly performance cannot bypass the template layer.
+        The sealed evidence plane remains unchanged.
         """
 
         def rebuild() -> list[dict[str, Any]]:
@@ -815,48 +861,254 @@ class PersonalDetailExtractionContext:
             for bundle in detached.get("_page_evidence_bundles") or []:
                 if isinstance(bundle, dict):
                     bundle.pop("micro_grid_structures", None)
+
+            canonical_pages = {
+                int(page.get("page") or 0): page
+                for page in self.corrected_evidence_pages()
+                if isinstance(page, dict) and int(page.get("page") or 0) > 0
+            }
+            observed_pages: set[int] = set()
+            for bundle in detached.get("_page_evidence_bundles") or []:
+                if not isinstance(bundle, dict):
+                    continue
+                local = bundle.get("local_structure_evidence")
+                page = int(bundle.get("page") or (local or {}).get("page") or 0)
+                canonical = canonical_pages.get(page)
+                if canonical is None:
+                    continue
+                observed_pages.add(page)
+                lines = deepcopy(list(canonical.get("lines") or []))
+                if not isinstance(local, dict):
+                    local = {}
+                    bundle["local_structure_evidence"] = local
+                local.update(
+                    {
+                        "page": page,
+                        "source_page": int(canonical.get("source_page") or page),
+                        "page_width": canonical.get("page_width"),
+                        "page_height": canonical.get("page_height"),
+                        "lines": lines,
+                    }
+                )
+                grid_evidence = bundle.get("micro_grid_evidence")
+                if not isinstance(grid_evidence, dict):
+                    grid_evidence = {}
+                    bundle["micro_grid_evidence"] = grid_evidence
+                grid_evidence.update(
+                    {
+                        "page": page,
+                        "page_width": canonical.get("page_width"),
+                        "page_height": canonical.get("page_height"),
+                        "lines": deepcopy(lines),
+                        # Tokens from the sealed pre-registration page must not
+                        # outrank the canonical complete-page evidence.
+                        "tokens": deepcopy(lines),
+                    }
+                )
+            for page, canonical in canonical_pages.items():
+                if page in observed_pages:
+                    continue
+                lines = deepcopy(list(canonical.get("lines") or []))
+                detached.setdefault("_page_evidence_bundles", []).append(
+                    {
+                        "page": page,
+                        "source_page_number": int(canonical.get("source_page") or page),
+                        "local_structure_evidence": {
+                            "page": page,
+                            "source_page": int(canonical.get("source_page") or page),
+                            "page_width": canonical.get("page_width"),
+                            "page_height": canonical.get("page_height"),
+                            "lines": deepcopy(lines),
+                        },
+                        "micro_grid_evidence": {
+                            "page": page,
+                            "page_width": canonical.get("page_width"),
+                            "page_height": canonical.get("page_height"),
+                            "lines": lines,
+                            "tokens": deepcopy(lines),
+                        },
+                    }
+                )
             augment_credit_repayment_evidence_bundles(
                 detached,
                 reading_order_by_logical=dict(self.reading_order_by_logical),
             )
-            resolver = PersonalDetailLogicalPageImageResolver(
-                self.parse_result,
-                topology=self.page_topology,
+            materialize_credit_repayment_micro_grids_from_bundles(
+                detached,
+                page_image_resolver=None,
+                enable_cell_ocr=False,
+                extra_status_chars={"A"},
             )
-            try:
-                materialize_credit_repayment_micro_grids_from_bundles(
-                    detached,
-                    page_image_resolver=resolver,
-                    enable_cell_ocr=True,
-                    extra_status_chars={"A"},
-                )
-            finally:
-                resolver.clear()
             records = [
                 record
                 for grid in micro_grid_structures_from_domain_specific(detached)
                 for record in records_from_micro_grid_dict(grid)
             ]
-            return dedupe_repayment_records(records)
+            deduped = dedupe_repayment_records(records)
+
+            # Build an OCR-free structural witness from the detached sealed
+            # page evidence.  It is never returned and none of its cell values
+            # can enter the business projection; it only detects complete grid
+            # ranges that canonical registration may have missed.
+            source_baseline = deepcopy(_domain_specific(self.parse_result))
+            source_baseline.pop("credit_repayment_records", None)
+            for bundle in source_baseline.get("_page_evidence_bundles") or []:
+                if isinstance(bundle, dict):
+                    bundle.pop("micro_grid_structures", None)
+            augment_credit_repayment_evidence_bundles(
+                source_baseline,
+                reading_order_by_logical=dict(self.reading_order_by_logical),
+            )
+            materialize_credit_repayment_micro_grids_from_bundles(
+                source_baseline,
+                page_image_resolver=None,
+                enable_cell_ocr=False,
+                extra_status_chars={"A"},
+            )
+            source_structure_records = dedupe_repayment_records(
+                [
+                    record
+                    for grid in micro_grid_structures_from_domain_specific(source_baseline)
+                    for record in records_from_micro_grid_dict(grid)
+                ]
+            )
+            source_structure_count = len(source_structure_records)
+
+            months_by_series: dict[str, set[int]] = {}
+            for record in deduped:
+                account_id = str(record.get("account_id") or "").strip()
+                grid_id = str(record.get("grid_id") or "").strip()
+                if not grid_id:
+                    grid_id = next(
+                        (
+                            str(ref.get("grid_id") or "").strip()
+                            for ref in record.get("source_cell_refs") or []
+                            if isinstance(ref, dict) and str(ref.get("grid_id") or "").strip()
+                        ),
+                        "",
+                    )
+                month = str(record.get("performance_month") or "").strip()
+                if not month:
+                    year_value = int(record.get("year") or 0)
+                    month_value = int(record.get("month") or 0)
+                    if 2000 <= year_value <= 2099 and 1 <= month_value <= 12:
+                        month = f"{year_value:04d}-{month_value:02d}"
+                match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])", month)
+                series_id = account_id or grid_id
+                if not series_id or match is None:
+                    continue
+                month_index = int(match.group(1)) * 12 + int(match.group(2))
+                months_by_series.setdefault(series_id, set()).add(month_index)
+            # The schema requires one observation per account/month.  Once an
+            # account has observations on both sides of a month, a hole in
+            # that interval is direct structural evidence of missing or
+            # mis-linked cells.  This capacity check is independent of the
+            # retired typed-cell OCR result and of any fixture-specific count.
+            schema_implied_count = sum(
+                max(months) - min(months) + 1
+                for months in months_by_series.values()
+                if months
+            )
+            structural_expected_count = max(schema_implied_count, source_structure_count)
+            missing_month_count = max(0, structural_expected_count - len(deduped))
+            if missing_month_count:
+                from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                    make_issue,
+                    record_issue,
+                )
+
+                record_issue(
+                    self,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code="canonical_monthly_reconstruction_incomplete",
+                        message=(
+                            "The unified canonical-page pass reconstructed fewer account-month positions than "
+                            "the schema and detached source-structure witnesses; missing cells were not silently invented."
+                        ),
+                        parser_stage="canonical_monthly_grid_materialization",
+                        target_dataset="repayment_records",
+                        observed_value={"canonical_row_count": len(deduped)},
+                        candidate_value={
+                            "structural_expected_row_count": structural_expected_count,
+                            "schema_implied_row_count": schema_implied_count,
+                            "source_structure_row_count": source_structure_count,
+                            "missing_month_count": missing_month_count,
+                            "affected_account_or_grid_count": sum(
+                                1
+                                for months in months_by_series.values()
+                                if months and max(months) - min(months) + 1 > len(months)
+                            ),
+                        },
+                        reason_codes=(
+                            "cell_level_ocr_disabled",
+                            "canonical_page_evidence_only",
+                            "source_structure_is_audit_only",
+                            "dataset_incomplete",
+                        ),
+                    ),
+                )
+            return deduped
 
         return self.cached("corrected_repayment_records", rebuild)
 
     def section_content(self, full_text: str) -> dict[str, Any]:
-        from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
-            extract_personal_detail_section_content,
-        )
-
-        return self.cached(
-            "section_content",
-            lambda: self._ocr_correction_overlay.correct_business_candidates(
-                extract_personal_detail_section_content(self, full_text),
-                stage="section_content",
-            ),
-        )
+        """Return supplemental datasets from the same Candidate B result."""
+        return deepcopy(self.candidate_b_extraction(full_text).section_content)
 
     def corrected_evidence_pages(self) -> list[dict[str, Any]]:
-        """Return corrected copies of OCR lines while preserving sealed evidence."""
-        return self.cached("corrected_evidence_pages", self._build_corrected_evidence_pages)
+        """Return the registered canonical evidence shared by every extractor."""
+        return deepcopy(list(self._canonical_layout_projection().evidence_pages))
+
+    def _source_corrected_evidence_pages(self) -> list[dict[str, Any]]:
+        """Return detached pre-template evidence used only to register pages."""
+        return self.cached("source_corrected_evidence_pages", self._build_corrected_evidence_pages)
+
+    def _canonical_layout_projection(self) -> Any:
+        if self._canonical_layout_projection_cache is None:
+            from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
+                PBOCCanonicalTemplateAssembler,
+            )
+
+            assembler = PBOCCanonicalTemplateAssembler(
+                self.parse_result,
+                topology=self.page_topology,
+                reading_order_by_logical=self.reading_order_by_logical,
+                source_evidence_loader=self._source_corrected_evidence_pages,
+                full_page_ocr_loader=self.full_page_ocr_evidence,
+                issue_owner=self,
+            )
+            self._canonical_layout_projection_cache = assembler.build()
+            self._adopt_canonical_entity_context()
+        return self._canonical_layout_projection_cache
+
+    def _adopt_canonical_entity_context(self) -> None:
+        """Rebuild continuation identities over detached canonical pages."""
+        if self._canonical_entity_context_ready or self._canonical_layout_projection_cache is None:
+            return
+        adapter = SimpleNamespace(
+            pages=list(self._canonical_layout_projection_cache.pages),
+            entities=SimpleNamespace(domain_specific={}),
+        )
+        units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(
+            adapter,
+            topology=self.page_topology,
+        )
+        if units:
+            policy = PersonalDetailTransitionPolicy()
+            self.entity_context = decode_credit_report_units(
+                units,
+                report_family="personal_detail",
+                furniture_unit_ids=furniture,
+                transition_scorer=policy.score,
+                entity_prefix="personal_detail_canonical",
+            )
+            self.evidence_unit_ids = MappingProxyType(dict(evidence_units))
+            self.source_page_by_logical.clear()
+            self.source_page_by_logical.update(source_pages)
+            self.reading_order_by_logical.clear()
+            self.reading_order_by_logical.update(reading_order)
+        self._canonical_entity_context_ready = True
 
     def _build_corrected_evidence_pages(self) -> list[dict[str, Any]]:
         domain_specific = _domain_specific(self.parse_result)
@@ -960,6 +1212,29 @@ class PersonalDetailExtractionContext:
                     base_by_segment[int(geometry.segment_index)] = page
 
             replay_by_segment = {int(page.get("segment_index") or 0): page for page in replay_pages}
+            available_segments = set(base_by_segment) | set(replay_by_segment)
+            if available_segments != {0, 1}:
+                # Never replace an unsplit/core page with only one half of a
+                # splitter-confirmed spread. Preserve the original evidence
+                # and publish an explicit page-continuation uncertainty.
+                merged.extend(base_pages)
+                incomplete_id = f"source:{source}:split-pair"
+                if not any(
+                    str(item.get("supplemental_page_id") or "") == incomplete_id
+                    and item.get("status") == "pair_incomplete"
+                    for item in self._page_ocr_requests
+                ):
+                    self._page_ocr_requests.append(
+                        {
+                            "supplemental_page_id": incomplete_id,
+                            "source_page": source,
+                            "expected_segments": [0, 1],
+                            "observed_segments": sorted(available_segments),
+                            "reason": "split_result_topology_replay",
+                            "status": "pair_incomplete",
+                        }
+                    )
+                continue
             unsplit_logical = logicals[0] if len(logicals) == 1 and not geometries else 0
             for segment in (0, 1):
                 if segment in base_by_segment:
@@ -1021,6 +1296,7 @@ class PersonalDetailExtractionContext:
         if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_PAGE_OCR", "1") == "0":
             return []
         requested = sorted({int(page) for page in logical_pages if int(page) > 0})
+        canonical_registration = str(reason).startswith("canonical_template_registration")
         output: list[dict[str, Any]] = []
         for logical in requested:
             if logical in self._page_ocr_cache:
@@ -1028,7 +1304,10 @@ class PersonalDetailExtractionContext:
                 if cached:
                     output.append(deepcopy(cached))
                 continue
-            if len(self._page_ocr_requests) >= self._page_ocr_max_requests:
+            # Canonical registration is not an optional field probe.  Every
+            # unregistered page receives one complete-page retry even when an
+            # earlier field-repair budget has been consumed.
+            if not canonical_registration and len(self._page_ocr_requests) >= self._page_ocr_max_requests:
                 break
             request = {"logical_page": logical, "reason": str(reason), "status": "requested"}
             self._page_ocr_requests.append(request)
@@ -1114,9 +1393,18 @@ class PersonalDetailExtractionContext:
         """
         slices = self._page_image_resolver.supplemental_spread_slices(source_pages)
         output: list[dict[str, Any]] = []
+        requested_sources = {
+            int(item.get("source_page") or 0)
+            for item in self._page_ocr_requests
+            if item.get("supplemental_page_id") and item.get("status") != "budget_exhausted"
+        }
+        budget_exhausted_sources: set[int] = set()
         for recovered in slices:
             supplemental_id = str(recovered.get("supplemental_page_id") or "")
             if not supplemental_id:
+                continue
+            source_page = int(recovered.get("source_page") or 0)
+            if source_page in budget_exhausted_sources:
                 continue
             if supplemental_id in self._supplemental_ocr_cache:
                 output.append(deepcopy(self._supplemental_ocr_cache[supplemental_id]))
@@ -1124,13 +1412,24 @@ class PersonalDetailExtractionContext:
             # Splitter-confirmed subpages are part of the corrected document
             # topology, not optional anomaly probes. Count their budget
             # independently so earlier field-repair OCR cannot silently drop
-            # a later half of the document.
-            supplemental_request_count = sum(bool(item.get("supplemental_page_id")) for item in self._page_ocr_requests)
-            if supplemental_request_count >= self._page_ocr_max_requests:
-                break
+            # a later half of the document. A physical spread is one atomic
+            # budget unit, so both of its splitter slices are always attempted.
+            if source_page not in requested_sources and len(requested_sources) >= self._page_ocr_max_requests:
+                budget_exhausted_sources.add(source_page)
+                self._page_ocr_requests.append(
+                    {
+                        "supplemental_page_id": f"source:{source_page}:split-pair",
+                        "source_page": source_page,
+                        "expected_segments": [0, 1],
+                        "reason": str(reason),
+                        "status": "budget_exhausted",
+                    }
+                )
+                continue
+            requested_sources.add(source_page)
             request = {
                 "supplemental_page_id": supplemental_id,
-                "source_page": int(recovered.get("source_page") or 0),
+                "source_page": source_page,
                 "printed_page": int(recovered.get("printed_page") or 0),
                 "segment_index": int(recovered.get("segment_index") or 0),
                 "subpage_basis": str(recovered.get("subpage_basis") or "core_split_result"),
@@ -1213,6 +1512,10 @@ class PersonalDetailExtractionContext:
     def page_topology_audit(self) -> dict[str, Any]:
         """Return the plugin's detached logical-page validation result."""
         return deepcopy(self._page_image_resolver.audit())
+
+    def canonical_layout_audit(self) -> dict[str, Any]:
+        """Return the detached template-registration and fragment audit."""
+        return deepcopy(self._canonical_layout_projection().audit())
 
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)

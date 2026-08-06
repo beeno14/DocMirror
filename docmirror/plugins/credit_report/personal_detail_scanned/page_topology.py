@@ -1,14 +1,13 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validated logical-page geometry for scanned personal detailed reports.
+"""Validated source-fragment geometry for scanned personal detailed reports.
 
-The core extraction pipeline remains the authority for page splitting.  This
-module verifies that the resulting one-page or two-page topology is safe to
-reuse for plugin-owned OCR.  A bounded recovery reruns the core splitter only
-when a logical page's stored transform cannot be rendered, and only when the
-recovered slice can be matched to the existing logical page without changing
-its coordinate system.
+Core logical pages are immutable evidence fragments, not canonical PBOC page
+identities.  The plugin validates their transforms and may register any number
+of non-overlapping fragments onto one canonical page.  A bounded recovery
+reruns the core splitter only to recover source pixels; it never mutates the
+sealed ParseResult.
 """
 
 from __future__ import annotations
@@ -39,7 +38,7 @@ class LogicalPageGeometry:
 
 
 class PersonalDetailPageTopology:
-    """Validate the canonical single-page/two-page layouts owned by core."""
+    """Validate arbitrary core-produced source fragments without re-splitting them."""
 
     def __init__(self, parse_result: Any) -> None:
         self._pages: dict[int, Any] = {}
@@ -68,7 +67,7 @@ class PersonalDetailPageTopology:
 
     def _validate_source_group(self, source: int, logicals: list[int]) -> tuple[int, ...]:
         geometries = [self._geometry[logical] for logical in logicals]
-        if source <= 0 or not (1 <= len(geometries) <= 2):
+        if source <= 0 or not geometries:
             self._invalidate(source, f"unsupported_logical_page_count:{len(geometries)}")
             return tuple(sorted(logicals))
         if any(not geometry.transform_usable for geometry in geometries):
@@ -81,6 +80,28 @@ class PersonalDetailPageTopology:
             if geometry.split_kind == "two_page_spread" and geometry.segment_index not in {0, 1}:
                 self._invalidate(source, "spread_segment_missing")
             return (geometry.logical_page,)
+
+        if len(geometries) > 2:
+            crops = [geometry.source_crop_bbox for geometry in geometries]
+            if any(crop is None for crop in crops):
+                self._invalidate(source, "multi_fragment_source_crop_missing")
+            else:
+                for index, left in enumerate(crops):
+                    for right in crops[index + 1 :]:
+                        if left is not None and right is not None and _overlap_ratio(left, right) > 0.08:
+                            self._invalidate(source, "multi_fragment_crops_overlap")
+                            break
+            return tuple(
+                geometry.logical_page
+                for geometry in sorted(
+                    geometries,
+                    key=lambda item: (
+                        (item.source_crop_bbox or (0, 0, 0, 0))[1],
+                        (item.source_crop_bbox or (0, 0, 0, 0))[0],
+                        item.logical_page,
+                    ),
+                )
+            )
 
         if any(geometry.split_kind != "two_page_spread" for geometry in geometries):
             self._invalidate(source, "two_logical_pages_without_spread_metadata")
@@ -118,6 +139,13 @@ class PersonalDetailPageTopology:
     def logicals_for_source(self, source_page: int) -> tuple[int, ...]:
         return self._logicals_by_source.get(int(source_page or 0), ())
 
+    def ordered_fragments(self, source_page: int) -> tuple[int, ...]:
+        """Return every validated fragment for a physical source surface."""
+        source = int(source_page or 0)
+        if source in self._invalid_sources:
+            return ()
+        return self._logicals_by_source.get(source, ())
+
     def ordered_pair(self, logical_pages: Iterable[int]) -> tuple[int, int] | None:
         requested = {int(page) for page in logical_pages if int(page) > 0}
         if len(requested) != 2:
@@ -143,8 +171,11 @@ class PersonalDetailPageTopology:
         single_sources = 0
         double_sources = 0
         partial_spread_sources = 0
+        fragmented_sources = 0
         for logicals in self._logicals_by_source.values():
-            if len(logicals) == 2:
+            if len(logicals) > 2:
+                fragmented_sources += 1
+            elif len(logicals) == 2:
                 double_sources += 1
             elif logicals:
                 geometry = self._geometry[logicals[0]]
@@ -160,6 +191,7 @@ class PersonalDetailPageTopology:
             "single_page_sources": single_sources,
             "double_page_sources": double_sources,
             "partial_spread_sources": partial_spread_sources,
+            "fragmented_sources": fragmented_sources,
             "invalid_source_pages": sorted(self._invalid_sources),
             "issues": list(self._issues),
             "logical_pages_by_source": {

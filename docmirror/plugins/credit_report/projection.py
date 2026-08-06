@@ -343,7 +343,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         existing_summary=dict(scanned_business.get("credit_summary") or {}),
         variant_input=variant_input,
     )
-    dataset_names = variant.dataset_names()
+    dataset_names = variant.source_dataset_names()
     datasets = {name: rows for name in dataset_names if (rows := _records(name, assembled.get(name)))}
     for name, values in variant.business_dataset_copies(assembled).items():
         rows = _records(name, values)
@@ -389,23 +389,19 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
                                 ref.pop("node_ids", None)
                 datasets[str(dataset_name)] = _records(str(dataset_name), typed_records)
     variant.finalize_datasets(datasets)
-    semantic = variant.semantic_extensions()
     if variant.variant_id == "personal_detail_scanned":
-        from docmirror.plugins.credit_report.personal_detail_scanned.schema_v2 import (
-            personal_detail_v2_data_dictionary,
-            personal_detail_v2_enabled,
-            personal_detail_v2_semantic_extensions,
-            project_personal_detail_v2_datasets,
+        from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+            project_personal_detail_datasets,
         )
 
-        if personal_detail_v2_enabled():
-            datasets = project_personal_detail_v2_datasets(datasets)
-            domain_facts["data_dictionary"] = personal_detail_v2_data_dictionary()
-            semantic = personal_detail_v2_semantic_extensions()
-        else:
-            domain_facts["data_dictionary"] = variant.data_dictionary()
-    else:
-        domain_facts["data_dictionary"] = variant.data_dictionary()
+        datasets = project_personal_detail_datasets(datasets)
+        # Compute row-conservation facts only after every assembled source
+        # collection has entered v2. Source completeness remains explicit in
+        # dataset_status and is not inferred from these projection counts.
+        for dataset_name, rows in datasets.items():
+            domain_facts[f"personal_detail_v2_expected_{dataset_name}_count"] = len(rows)
+    semantic = variant.semantic_extensions()
+    domain_facts["data_dictionary"] = variant.data_dictionary()
     evidence_ids = tuple(
         dict.fromkeys(
             [

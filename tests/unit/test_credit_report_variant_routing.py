@@ -47,7 +47,8 @@ def test_credit_report_variant_dataset_contracts_preserve_existing_outputs() -> 
 
     assert "credit_lines" not in personal_brief.dataset_names()
     assert enterprise.dataset_names()[1] == "credit_lines"
-    assert personal_detail.dataset_names()[1] == "credit_lines"
+    assert "credit_agreements" in personal_detail.dataset_names()
+    assert "credit_lines" not in personal_detail.dataset_names()
     assert personal_brief.keep_query_institution is False
     assert enterprise.keep_query_institution is True
     assert personal_detail.keep_query_institution is True
@@ -59,9 +60,9 @@ def test_personal_detail_presentation_overrides_are_variant_local() -> None:
     personal_detail = resolve_credit_report_variant("personal_detail", "native_text")
 
     overrides = personal_detail.semantic_extensions()["community_projection_overrides"]
-    assert overrides["dataset_labels"]["personal_report_metadata"] == "个人信用报告信息"
-    assert overrides["dataset_labels"]["credit_accounts"] == "信贷交易账户明细"
-    assert overrides["section_markers"]["statements"] == ["statements", "notes"]
+    assert overrides["dataset_labels"]["report_metadata"] == "报告元数据"
+    assert overrides["dataset_labels"]["credit_accounts"] == "信贷交易账户"
+    assert overrides["section_markers"]["annotation_statements"] == ["statements", "annotations"]
     assert "community_projection_overrides" not in personal_brief.semantic_extensions()
     assert "community_projection_overrides" not in enterprise.semantic_extensions()
 

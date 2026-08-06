@@ -464,7 +464,7 @@ class _FakeCellRepairEngine:
         ]
 
 
-def test_targeted_crop_ocr_only_adopts_a_typed_valid_candidate() -> None:
+def test_schema_role_repair_does_not_fall_back_to_crop_ocr() -> None:
     overlay = PersonalDetailOCRCorrectionOverlay(
         SimpleNamespace(),
         page_image_resolver=_FakeResolver(),
@@ -479,9 +479,8 @@ def test_targeted_crop_ocr_only_adopts_a_typed_valid_candidate() -> None:
         allow_targeted_ocr=True,
     )
 
-    assert corrected == "11010519491231002X"
-    assert decision is not None
-    assert decision.method == "targeted_crop_ocr_consensus"
+    assert corrected == "1101051949123100?X"
+    assert decision is None
     assert overlay.audit()["targeted_ocr_requests"] == 1
 
 
@@ -525,7 +524,7 @@ def test_complete_page_ocr_precedes_crop_repair_for_schema_assigned_field() -> N
     assert overlay.audit()["targeted_ocr_requests"] == 1
 
 
-def test_damaged_inquiry_date_triggers_bounded_typed_crop_ocr() -> None:
+def test_damaged_inquiry_date_is_not_repaired_from_a_crop() -> None:
     overlay = PersonalDetailOCRCorrectionOverlay(
         SimpleNamespace(),
         page_image_resolver=_FakeResolver(),
@@ -550,13 +549,12 @@ def test_damaged_inquiry_date_triggers_bounded_typed_crop_ocr() -> None:
     corrected = overlay.corrected_evidence_pages(pages)
 
     line = corrected[0]["lines"][0]
-    assert line["text"] == "39 2024.11.21 深圳市华融融资担保有限公司 担保资格审查"
-    assert line["ocr_original_text"] == pages[0]["lines"][0]["text"]
-    assert line["ocr_correction"]["method"] == "targeted_crop_ocr_consensus"
+    assert line["text"] == pages[0]["lines"][0]["text"]
+    assert "ocr_correction" not in line
     assert overlay.audit()["targeted_ocr_requests"] == 1
 
 
-def test_invalid_summary_value_uses_only_cell_scoped_targeted_ocr() -> None:
+def test_invalid_summary_value_is_withheld_without_whole_page_replay() -> None:
     overlay = PersonalDetailOCRCorrectionOverlay(
         SimpleNamespace(),
         page_image_resolver=_FakeResolver(),
@@ -583,10 +581,10 @@ def test_invalid_summary_value_uses_only_cell_scoped_targeted_ocr() -> None:
     corrected = overlay.correct_business_candidates(payload, stage="native_business")
     audit = overlay.audit()
 
-    assert corrected["personal_detail_summary_cells"][0]["value"] == "2"
+    assert corrected["personal_detail_summary_cells"][0]["value"] is None
     assert audit["targeted_ocr_requests"] == 1
-    assert audit["abnormal_cell_count"] == 0
-    assert any(decision["method"] == "targeted_crop_ocr_consensus" for decision in audit["decisions"])
+    assert audit["abnormal_cell_count"] == 1
+    assert audit["decisions"] == []
 
 
 def test_repayment_linking_uses_global_predecessor_and_collapses_duplicate_months() -> None:
