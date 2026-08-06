@@ -91,12 +91,16 @@ def build_style_meta(
     expected_candidates: list[int] = []
     source = ""
     pipe_failed = False
+    expected_evidence_source = ""
+    expected_evidence_confidence = 0.0
     stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
     if reconstruction is not None:
         reconstruction_expected = int(getattr(reconstruction, "expected_primary_rows", 0) or 0)
         if stitched_continuation_rows > 0:
             reconstruction_expected = max(0, reconstruction_expected - stitched_continuation_rows)
         source = getattr(reconstruction, "source", "") or ""
+        expected_evidence_source = str(getattr(reconstruction, "expected_evidence_source", "") or "")
+        expected_evidence_confidence = float(getattr(reconstruction, "expected_evidence_confidence", 0.0) or 0.0)
         pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
         if (
             source
@@ -121,11 +125,26 @@ def build_style_meta(
     if canonical_expected > 0 and stitched_continuation_rows > 0:
         canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
     # A source-reported total is independent of every parser candidate and must
-    # remain the strongest denominator. Positioned blocks are stronger than a
-    # vertically aggregated physical-table estimate only when no such total exists.
+    # remain the strongest denominator. Positioned blocks and a selected evidence
+    # table are stronger than a sparse physical-table estimate when no such total exists.
     if source_reported_count > 0:
         expected = int(source_reported_count)
-    elif source == "positioned_record_block" and reconstruction_expected > 0:
+    elif (
+        expected_evidence_source
+        in {
+            "split_footer",
+            "header_total",
+            "page_footer",
+            "page_transaction_anchors",
+            "physical_rows",
+            "positioned_date_anchors",
+            "positioned_record_blocks",
+        }
+        and expected_evidence_confidence >= 0.85
+        and reconstruction_expected > 0
+    ):
+        expected = max(reconstruction_expected, canonical_expected)
+    elif source in {"positioned_record_block", "canonical_evidence_table"} and reconstruction_expected > 0:
         expected = max(reconstruction_expected, canonical_expected)
     elif canonical_expected > 0:
         expected = canonical_expected

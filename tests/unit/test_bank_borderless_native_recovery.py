@@ -18,6 +18,7 @@ from docmirror.plugins.bank_statement.wide_table_recovery import (
     _dedupe_tables,
     _recover_borderless_native_page,
     _recover_cross_page_wide_tables,
+    resolve_row_count_evidence,
 )
 
 
@@ -53,6 +54,153 @@ def test_borderless_recovery_preserves_dynamic_source_columns() -> None:
     assert table[1][:-2] == row_one
     assert table[2][:-2] == row_two
     assert table[1][-2] == "3"
+
+
+def test_borderless_recovery_accepts_unsigned_amount_when_direction_is_explicit() -> None:
+    starts = [10.0, 45.0, 120.0, 185.0, 250.0, 325.0, 405.0]
+    headers = ["序号", "交易日期", "收入/支出", "交易金额", "账户余额", "对方户名", "摘要"]
+    row_one = ["1", "2025-06-27", "支出", "198.87", "144.74", "测试商户", "消费"]
+    row_two = ["2", "2025-07-06", "收入", "25,000.00", "25,144.74", "测试用户", "转入"]
+    words = [
+        *[_word(value, starts[index], 10.0, 28.0) for index, value in enumerate(headers)],
+        *[_word(value, starts[index], 30.0, 28.0) for index, value in enumerate(row_one)],
+        *[_word(value, starts[index], 50.0, 28.0) for index, value in enumerate(row_two)],
+    ]
+
+    table = _recover_borderless_native_page(_Page(words), 1)
+    count = resolve_row_count_evidence(
+        "",
+        page_texts=[
+            (
+                1,
+                "序号 交易日期 收入/支出 交易金额 账户余额 对方户名 摘要\n"
+                "1 2025-06-27 支出 198.87 144.74 测试商户 消费\n"
+                "2 2025-07-06 收入 25,000.00 25,144.74 测试用户 转入",
+            )
+        ],
+    )
+
+    assert len(table) == 3
+    assert table[1][:-2] == row_one
+    assert table[2][:-2] == row_two
+    assert count.count == 2
+    assert count.source == "page_transaction_anchors"
+
+
+def test_negative_expense_reversal_uses_absolute_amount_and_balance_direction() -> None:
+    plugin = BankStatementCommunityPlugin()
+    previous_raw = {
+        "序号": "74",
+        "交易日期": "2025-09-19",
+        "收入/支出": "支出",
+        "交易金额": "2,496.00",
+        "账户余额": "3,883.31",
+    }
+    reversal_raw = {
+        "序号": "75",
+        "交易日期": "2025-09-19",
+        "收入/支出": "支出",
+        "交易金额": "-2,496.00",
+        "账户余额": "6,379.31",
+    }
+    records = [
+        {"raw": previous_raw, "normalized": grid_standard.normalize_record(previous_raw, plugin)},
+        {"raw": reversal_raw, "normalized": grid_standard.normalize_record(reversal_raw, plugin)},
+    ]
+
+    grid_standard.refine_missing_directions_from_balance_chain(records)
+
+    assert records[1]["normalized"]["amount"] == 2496.0
+    assert records[1]["normalized"]["direction"] == "income"
+
+
+def test_unsigned_rows_use_source_summary_semantics_and_forward_balance_chain() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw_rows = [
+        {
+            "序号": "1",
+            "交易日期": "20250407",
+            "发生额": "1000",
+            "账户余额": "1000.00",
+            "摘要描述": "小额跨行转入",
+            "备注": "附言:往来结算款。",
+        },
+        {
+            "序号": "5",
+            "交易日期": "20250910",
+            "发生额": "100",
+            "账户余额": "999.27",
+            "摘要描述": "小额跨行转入",
+        },
+        {
+            "序号": "6",
+            "交易日期": "20250921",
+            "发生额": "0.19",
+            "账户余额": "999.46",
+            "摘要描述": "入息",
+        },
+        {
+            "序号": "7",
+            "交易日期": "20251221",
+            "发生额": "0.2",
+            "账户余额": "999.66",
+            "摘要描述": "入息",
+        },
+    ]
+    records = [{"raw": raw, "normalized": grid_standard.normalize_record(raw, plugin)} for raw in raw_rows]
+
+    grid_standard.refine_missing_directions_from_balance_chain(records)
+
+    assert records[0]["normalized"]["direction"] == "income"
+    assert records[2]["normalized"]["direction"] == "income"
+
+
+def test_balance_chain_overrides_misleading_payment_word_in_summary() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw_rows = [
+        {
+            "序号": "29",
+            "交易日期": "2023-06-28",
+            "交易金额": "-504,025.00",
+            "账户余额": "8,033.18",
+            "摘要描述": "偿还贷款本金和利息",
+        },
+        {
+            "序号": "1",
+            "交易日期": "2023-07-03",
+            "交易金额": "600,000.00",
+            "账户余额": "608,033.18",
+            "摘要描述": "普通汇兑支付信息服务费",
+        },
+    ]
+    records = [{"raw": raw, "normalized": grid_standard.normalize_record(raw, plugin)} for raw in raw_rows]
+
+    grid_standard.refine_missing_directions_from_balance_chain(records)
+
+    assert records[1]["normalized"]["direction"] == "income"
+
+
+def test_explicit_summary_precedes_remark_and_wrapped_account_is_compacted() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "序号": "2",
+        "交易日期": "20250616",
+        "发生额": "-100",
+        "账户余额": "900.00",
+        "摘要描述": "单位他行非同客户转账",
+        "备注": "用途:往来款。",
+        "对方账号": "98010202900778158\n3",
+        "对方户名": "测试公司",
+    }
+
+    normalized = grid_standard.normalize_record(raw, plugin)
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["summary"] == "单位他行非同客户转账"
+    assert normalized["purpose"] == "用途:往来款。"
+    assert normalized["counter_account"] == "980102029007781583"
+    assert canonical_raw["summary"] == "单位他行非同客户转账"
+    assert canonical_raw["purpose"] == "用途:往来款。"
 
 
 def test_borderless_source_fields_normalize_without_losing_raw_columns() -> None:

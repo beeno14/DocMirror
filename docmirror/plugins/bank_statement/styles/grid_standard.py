@@ -130,7 +130,19 @@ def _normalize_source_counterparty_columns(
     raw_txn: dict[str, str],
     normalized: dict[str, Any],
 ) -> None:
-    """Prefer explicit source party/institution columns over fuzzy base matches."""
+    """Prefer explicit source columns over fuzzy base matches."""
+    summary = _explicit_source_column_value(raw_txn, ("摘要描述", "交易摘要", "摘要"))
+    if summary:
+        normalized["summary"] = _clean_wrapped_text(summary)
+
+    remark = _explicit_source_column_value(raw_txn, ("交易附言", "附言", "用途", "备注"))
+    if remark and re.match(r"^(?:用途|附言)\s*[:：]", remark):
+        normalized["purpose"] = _clean_wrapped_text(remark)
+
+    counter_account = _explicit_source_column_value(raw_txn, _COUNTER_ACCOUNT_KEYS)
+    if counter_account:
+        normalized["counter_account"] = _clean_account(counter_account)
+
     counter_party = _explicit_source_column_value(
         raw_txn,
         (
@@ -233,8 +245,8 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
 
     normalized = plugin._normalize(raw_txn)
     _normalize_source_counterparty_columns(raw_txn, normalized)
-    normalized["amount"] = float(amount)
-    normalized["amount_cny"] = float(amount)
+    normalized["amount"] = abs(float(amount))
+    normalized["amount_cny"] = abs(float(amount))
     normalized["direction"] = direction
     balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
     if balance is not None:
@@ -1232,29 +1244,76 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
 
 
 def refine_missing_directions_from_balance_chain(records: list[dict[str, Any]]) -> None:
-    """Infer only missing directions from adjacent balances in either row order."""
+    """Infer or correct directions when the source balance chain is unique."""
+    source_order = _record_source_order(records)
     for index, record in enumerate(records):
         normalized = record.get("normalized") or {}
-        if normalized.get("direction") in {"income", "expense"}:
-            continue
+        raw = record.get("raw") or {}
+        source_amount = _normalize_monetary_cell(_cell_value(raw, "交易金额", "金额", "发生额", "Amount"))
+        negative_reversal = source_amount is not None and source_amount < 0
         amount = _safe_float(normalized.get("amount"))
         balance = _safe_float(normalized.get("balance"))
-        if amount is None or amount <= 0 or balance is None:
-            continue
-
         candidates: set[str] = set()
-        if index > 0:
-            previous_balance = _safe_float((records[index - 1].get("normalized") or {}).get("balance"))
-            inferred = _direction_from_balance(previous_balance, amount, balance)
-            if inferred:
-                candidates.add(inferred)
-        if index + 1 < len(records):
-            next_balance = _safe_float((records[index + 1].get("normalized") or {}).get("balance"))
-            inferred = _direction_from_balance(next_balance, amount, balance)
-            if inferred:
-                candidates.add(inferred)
+        if amount is not None and amount > 0 and balance is not None:
+            if source_order != "reverse" and index > 0:
+                previous_balance = _safe_float((records[index - 1].get("normalized") or {}).get("balance"))
+                inferred = _direction_from_balance(previous_balance, amount, balance)
+                if inferred:
+                    candidates.add(inferred)
+            if source_order == "reverse" and index + 1 < len(records):
+                next_balance = _safe_float((records[index + 1].get("normalized") or {}).get("balance"))
+                inferred = _direction_from_balance(next_balance, amount, balance)
+                if inferred:
+                    candidates.add(inferred)
         if len(candidates) == 1:
             normalized["direction"] = candidates.pop()
+            continue
+        if normalized.get("direction") in {"income", "expense"} and not negative_reversal:
+            continue
+        if not negative_reversal:
+            semantic_direction = _direction_from_source_semantics(raw)
+            if semantic_direction:
+                normalized["direction"] = semantic_direction
+
+
+def _direction_from_source_semantics(raw: dict[str, Any]) -> str:
+    text = "".join(
+        _explicit_source_column_value(raw, aliases)
+        for aliases in (
+            ("摘要描述", "交易摘要", "摘要", "摘要/附言"),
+            ("交易附言", "附言", "用途", "备注"),
+        )
+    )
+    income = any(marker in text for marker in ("转入", "收入", "入账", "入息", "收款", "贷方"))
+    expense = any(marker in text for marker in ("转出", "支出", "出账", "付款", "支付", "借方"))
+    if income != expense:
+        return "income" if income else "expense"
+    return ""
+
+
+def _record_source_order(records: list[dict[str, Any]]) -> str:
+    dates = [str((record.get("normalized") or {}).get("date") or "") for record in records]
+    valid_dates = len(dates) >= 2 and all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in dates)
+    date_increases = valid_dates and any(current > previous for previous, current in zip(dates, dates[1:]))
+    date_decreases = valid_dates and any(current < previous for previous, current in zip(dates, dates[1:]))
+    sequence_values: list[int] = []
+    for record in records:
+        value = str((record.get("normalized") or {}).get("sequence_no") or "").strip()
+        if re.fullmatch(r"\d{1,9}", value):
+            sequence_values.append(int(value))
+    if len(sequence_values) == len(records) and len(sequence_values) >= 2:
+        deltas = [current - previous for previous, current in zip(sequence_values, sequence_values[1:])]
+        if all(delta > 0 for delta in deltas) and not date_decreases:
+            return "forward"
+        if all(delta < 0 for delta in deltas) and not date_increases:
+            return "reverse"
+
+    if valid_dates:
+        if all(current >= previous for previous, current in zip(dates, dates[1:])):
+            return "forward"
+        if all(current <= previous for previous, current in zip(dates, dates[1:])):
+            return "reverse"
+    return "forward"
 
 
 def _direction_from_balance(previous_balance: float | None, amount: float, balance: float) -> str:

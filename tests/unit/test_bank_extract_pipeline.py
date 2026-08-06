@@ -12,6 +12,7 @@ from docmirror.plugins.bank_statement.canonical import build_style_meta, records
 from docmirror.plugins.bank_statement.canonical_quality import audit_row_accounting
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.extract_pipeline import (
+    _physical_logical_row_mismatch_warning,
     enrich_identity_fields,
     run_bank_statement_extract,
 )
@@ -113,6 +114,28 @@ def test_row_accounting_rejects_canonical_dataset_mismatch() -> None:
     assert warnings == ["BANK_CANONICAL_EMITTED_ROW_MISMATCH:canonical=2:emitted=3"]
 
 
+def test_complete_evidence_recovery_supersedes_sparse_physical_row_estimate() -> None:
+    style_meta = SimpleNamespace(
+        reconstruction_source="canonical_evidence_table",
+        canonical_extracted=199,
+        expected_primary_rows=199,
+    )
+
+    assert _physical_logical_row_mismatch_warning(4, style_meta) == ""
+
+
+def test_incomplete_evidence_recovery_keeps_physical_row_mismatch_warning() -> None:
+    style_meta = SimpleNamespace(
+        reconstruction_source="canonical_evidence_table",
+        canonical_extracted=198,
+        expected_primary_rows=199,
+    )
+
+    assert _physical_logical_row_mismatch_warning(4, style_meta) == (
+        "BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:physical=4:canonical=198"
+    )
+
+
 def test_projection_row_accounting_checks_the_emitted_dataset(monkeypatch) -> None:
     plugin = BankStatementCommunityPlugin()
     original_sanitize = community_module._sanitize_bank_records
@@ -169,3 +192,42 @@ def test_source_reported_count_overrides_positioned_candidate_count() -> None:
     )
 
     assert meta.expected_primary_rows == 21
+
+
+def test_native_wide_table_uses_independent_positioned_date_count(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.canonical_quality as canonical_quality
+
+    monkeypatch.setattr(canonical_quality, "canonical_expected_from_parse_result", lambda _parse_result: 1)
+    records = [
+        {
+            "normalized": {
+                "date": f"2025-01-{index:02d}",
+                "amount": 1.0,
+                "direction": "income",
+            }
+        }
+        for index in range(1, 9)
+    ]
+    meta = build_style_meta(
+        SimpleNamespace(
+            primary_style="grid_standard",
+            confidence=1.0,
+            parser_chain=[],
+            institution_hint=None,
+            secondary_styles=[],
+            institution_authority="",
+        ),
+        reconstruction=ReconstructionMeta(
+            source="native_wide_table",
+            expected_primary_rows=8,
+            expected_evidence_source="positioned_date_anchors",
+            expected_evidence_confidence=0.95,
+        ),
+        parse_result=SimpleNamespace(),
+        records=records,
+        record_count=8,
+    )
+
+    assert meta.expected_primary_rows == 8
+    assert meta.canonical_extracted == 8
+    assert meta.coverage_ratio == 1.0

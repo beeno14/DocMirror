@@ -25,6 +25,8 @@ _GEOMETRY_FOOTER_MARKERS = (
     "总收入金额",
     "总支出笔数",
     "总支出金额",
+    "收入总额",
+    "支出总额",
     "当前账单借方发生数",
     "当前账单贷方发生数",
     "本月累计借方发生数",
@@ -32,11 +34,20 @@ _GEOMETRY_FOOTER_MARKERS = (
     "借方发生额汇总",
     "贷方发生额汇总",
     "回单编号",
+    "打印时间",
+    "打印日期",
+    "打印柜员",
+    "打印机构",
     "打印完毕",
     "友情提示",
+    "重要提示",
     "风险提示",
     "本回单",
+    "对账单专用章",
 )
+_COMMON_BANK_SUMMARY_OCR_CORRECTIONS = {
+    "网银路行互联": "网银跨行互联",
+}
 _OUTPUT_HEADER = [
     "序号",
     "交易日期",
@@ -813,20 +824,20 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
         None,
     )
     if composite_header is None or any(atom is None for atom in headers.values()):
-        _store_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
         return geometry_fallback
 
     composite_left = float(composite_header["bbox"][0])
     composite_right = float(composite_header["bbox"][2])
     endpoints = _money_column_endpoints(all_atoms, composite_left, composite_right)
     if len(endpoints) != 3:
-        _store_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
         return geometry_fallback
     expense_end, income_end, balance_end = endpoints
 
     anchors = {name: float(atom["bbox"][0]) for name, atom in headers.items() if atom is not None}
     if [anchors[name] for name in header_names] != sorted(anchors[name] for name in header_names):
-        _store_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
         return geometry_fallback
     sequence_right = (anchors["序号"] + anchors["交易日期"]) / 2
     date_x = anchors["交易日期"]
@@ -896,7 +907,7 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
         tables = [[_OUTPUT_HEADER, *rows]]
         _store_recovery_cache(parse_result, tables, row_sources, expected_rows)
         return tables
-    _store_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+    _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
     return geometry_fallback
 
 
@@ -913,6 +924,18 @@ def recovered_evidence_atom_expected_row_count(parse_result: Any) -> int:
     return int(cache.get("expected_row_count") or 0) if cache else 0
 
 
+def recovered_evidence_atom_expected_row_evidence(parse_result: Any) -> tuple[int, str, float]:
+    """Return count, source, and confidence for evidence-atom row anchors."""
+    cache = _recovery_cache(parse_result)
+    if not cache:
+        return 0, "", 0.0
+    return (
+        int(cache.get("expected_row_count") or 0),
+        str(cache.get("expected_row_source") or ""),
+        float(cache.get("expected_row_confidence") or 0.0),
+    )
+
+
 def _recover_geometry_bank_tables(
     parse_result: Any,
     atoms_by_page: dict[str, list[dict[str, Any]]],
@@ -921,6 +944,7 @@ def _recover_geometry_bank_tables(
     tables: list[list[list[str]]] = []
     row_sources: list[dict[str, Any]] = []
     expected_rows = 0
+    previous_balance: float | None = None
     for page_id in sorted(atoms_by_page):
         atoms = atoms_by_page[page_id]
         header = _geometry_header(atoms)
@@ -939,33 +963,47 @@ def _recover_geometry_bank_tables(
         date_idx = col_map.get("date", col_map.get("timestamp"))
         if date_idx is None:
             continue
-        date_left, date_right = bounds[date_idx], bounds[date_idx + 1]
         header_bottom = max(float(atom["bbox"][3]) for atom in header_atoms)
-        page_footer_y = min(
-            (
-                _y_center(atom)
+        footer_atoms = [
+            atom
+            for atom in atoms
+            if float(atom["bbox"][1]) > header_bottom and _is_geometry_footer_text(str(atom.get("text") or ""))
+        ]
+        first_footer_atom = min(footer_atoms, key=_y_center) if footer_atoms else None
+        page_footer_y = _y_center(first_footer_atom) if first_footer_atom is not None else float("inf")
+        typical_atom_height = median(
+            [
+                float(atom["bbox"][3]) - float(atom["bbox"][1])
                 for atom in atoms
-                if float(atom["bbox"][1]) > header_bottom and _is_geometry_footer_text(str(atom.get("text") or ""))
-            ),
-            default=float("inf"),
+                if float(atom["bbox"][3]) > float(atom["bbox"][1])
+            ]
+            or [0.0]
         )
-        date_anchors = sorted(
-            (
-                atom
-                for atom in atoms
-                if float(atom["bbox"][1]) > header_bottom
-                and _y_center(atom) < page_footer_y
-                and date_left <= _x_center(atom) < date_right
-                and _DATE_ANY_RE.search(str(atom.get("text") or "").strip())
-            ),
-            key=lambda atom: float(atom["bbox"][1]),
+        first_footer_text = str(first_footer_atom.get("text") or "") if first_footer_atom is not None else ""
+        footer_guard = (
+            max(typical_atom_height * 1.5, 8.0)
+            if "打印" in first_footer_text or re.search(r"第\s*\d+\s*页", first_footer_text)
+            else 0.0
         )
-        expected_rows += len(date_anchors)
+        footer_content_bottom = page_footer_y - footer_guard if page_footer_y < float("inf") else page_footer_y
+        table_bottom = max(
+            (rule for rule in horizontal_rules if header_bottom < rule < footer_content_bottom),
+            default=footer_content_bottom,
+        )
+        row_anchors, anchor_type = _geometry_row_anchors(
+            atoms,
+            bounds,
+            col_map,
+            header_bottom=header_bottom,
+            table_bottom=table_bottom,
+        )
+        expected_rows += len(row_anchors)
         rows: list[list[str]] = []
         row_atom_groups: list[list[dict[str, Any]]] = []
-        for idx, anchor in enumerate(date_anchors):
+        original_rows: list[list[str]] = []
+        for idx, anchor in enumerate(row_anchors):
             anchor_y = _y_center(anchor)
-            next_y = _y_center(date_anchors[idx + 1]) if idx + 1 < len(date_anchors) else float("inf")
+            next_y = _y_center(row_anchors[idx + 1]) if idx + 1 < len(row_anchors) else float("inf")
             footer_limit: float | None = None
             if next_y == float("inf"):
                 footer_starts = [
@@ -983,13 +1021,18 @@ def _recover_geometry_bank_tables(
                 row_top = previous_rule + 0.5
                 row_bottom = next_rule - 0.5
             else:
-                # Without vector rules, assign text to the closest preceding
-                # date anchor and stop at the next date/footer.
-                row_top = header_bottom if idx == 0 else anchor_y - 0.5
+                # Without vector rules, use Voronoi boundaries between date
+                # anchors. Wrapped cells can start above their own date
+                # baseline, so assigning everything to the preceding date
+                # leaks the next transaction into the previous row.
+                previous_y = _y_center(row_anchors[idx - 1]) if idx > 0 else None
+                row_top = header_bottom if previous_y is None else (previous_y + anchor_y) / 2
                 if next_y != float("inf"):
-                    row_bottom = next_y - 0.5
+                    row_bottom = (anchor_y + next_y) / 2
                 else:
                     row_bottom = footer_limit if footer_limit is not None else float("inf")
+            if footer_limit is not None:
+                row_bottom = min(row_bottom, footer_limit)
             row_atoms = [
                 atom
                 for atom in atoms
@@ -997,11 +1040,15 @@ def _recover_geometry_bank_tables(
             ]
             row: list[str] = []
             for col_idx in range(len(header_cells)):
-                selected = sorted(
-                    (atom for atom in row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]),
-                    key=lambda atom: (float(atom["bbox"][1]), float(atom["bbox"][0])),
+                selected = [
+                    atom for atom in row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]
+                ]
+                row.append(
+                    _join_geometry_atoms(
+                        selected,
+                        line_tolerance=1.5,
+                    )
                 )
-                row.append("".join(str(atom.get("text") or "").strip() for atom in selected))
             date_match = _DATE_ANY_RE.search(row[date_idx])
             if date_match:
                 sequence_idx = col_map.get("sequence_no")
@@ -1009,14 +1056,192 @@ def _recover_geometry_bank_tables(
                 if sequence_idx is not None and sequence_idx < len(row) and not row[sequence_idx] and prefix.isdigit():
                     row[sequence_idx] = prefix
                 row[date_idx] = row[date_idx][date_match.start() :]
+            original_row = list(row)
+            _repair_geometry_cell_spill(row, col_map)
             if _geometry_row_is_transaction(row):
                 rows.append(row)
                 row_atom_groups.append(row_atoms)
+                original_rows.append(original_row)
         if rows:
-            _repair_geometry_rows(rows, col_map)
-            row_sources.extend(_row_source(page_id, row_atoms, row) for row_atoms, row in zip(row_atom_groups, rows))
+            previous_balance = _repair_geometry_rows(rows, col_map, previous_balance=previous_balance)
+            for row_atoms, original_row, row in zip(row_atom_groups, original_rows, rows):
+                source = _row_source(page_id, row_atoms, row)
+                source["row_anchor_type"] = anchor_type
+                repairs = [
+                    {
+                        "field": header_cells[index],
+                        "ocr_raw": original,
+                        "reconstructed": repaired,
+                    }
+                    for index, (original, repaired) in enumerate(zip(original_row, row))
+                    if original != repaired
+                ]
+                if repairs:
+                    source["reconstruction_repairs"] = repairs
+                row_sources.append(source)
             tables.append([header_cells, *rows])
     return tables, row_sources, expected_rows
+
+
+def _geometry_row_anchors(
+    atoms: list[dict[str, Any]],
+    bounds: list[float],
+    col_map: dict[str, int],
+    *,
+    header_bottom: float,
+    table_bottom: float,
+) -> tuple[list[dict[str, Any]], str]:
+    """Return reliable physical-row spines, preferring issuer sequence cells."""
+    sequence_idx = col_map.get("sequence_no")
+    if sequence_idx is not None:
+        sequence_anchors = sorted(
+            (
+                atom
+                for atom in atoms
+                if float(atom["bbox"][1]) > header_bottom
+                and _y_center(atom) < table_bottom
+                and bounds[sequence_idx] <= _x_center(atom) < bounds[sequence_idx + 1]
+                and re.fullmatch(r"\d{1,6}", re.sub(r"\s+", "", str(atom.get("text") or "")))
+            ),
+            key=_y_center,
+        )
+        if _sequence_anchors_are_reliable(sequence_anchors):
+            return sequence_anchors, "sequence"
+
+    date_idx = col_map.get("date", col_map.get("timestamp"))
+    if date_idx is None:
+        return [], ""
+    return (
+        sorted(
+            (
+                atom
+                for atom in atoms
+                if float(atom["bbox"][1]) > header_bottom
+                and _y_center(atom) < table_bottom
+                and bounds[date_idx] <= _x_center(atom) < bounds[date_idx + 1]
+                and not _is_geometry_footer_text(str(atom.get("text") or ""))
+                and _DATE_ANY_RE.search(str(atom.get("text") or "").strip())
+            ),
+            key=_y_center,
+        ),
+        "date",
+    )
+
+
+def _sequence_anchors_are_reliable(anchors: list[dict[str, Any]]) -> bool:
+    """Return whether positioned sequence cells form one physical ledger spine."""
+    if len(anchors) < 2:
+        return False
+    values = [int(re.sub(r"\s+", "", str(atom.get("text") or ""))) for atom in anchors]
+    if len(values) != len(set(values)):
+        return False
+    continuity = sum(current - previous == 1 for previous, current in zip(values, values[1:]))
+    return continuity / max(len(values) - 1, 1) >= 0.8
+
+
+def _repair_geometry_cell_spill(row: list[str], col_map: dict[str, int]) -> None:
+    """Separate OCR atoms that combine balance, summary, or a malformed date."""
+    date_idx = col_map.get("date", col_map.get("timestamp"))
+    if date_idx is not None and date_idx < len(row):
+        row[date_idx] = _repair_malformed_date(row[date_idx])
+
+    balance_idx = col_map.get("balance")
+    summary_idx = next(
+        (index for key in ("summary", "purpose") if (index := col_map.get(key)) is not None),
+        None,
+    )
+    if balance_idx is None or summary_idx is None or max(balance_idx, summary_idx) >= len(row):
+        return
+
+    balance_money, balance_residue = _money_and_residue(row[balance_idx])
+    summary_money, summary_residue = _money_and_residue(row[summary_idx])
+    if balance_money:
+        row[balance_idx] = balance_money
+        if balance_residue:
+            row[summary_idx] = _merge_geometry_text(
+                _clean_geometry_residue(balance_residue, balance_money),
+                row[summary_idx],
+            )
+    elif summary_money:
+        row[balance_idx] = summary_money
+        row[summary_idx] = _clean_geometry_residue(summary_residue, summary_money)
+    _repair_geometry_summary_prefix(row, col_map, balance_idx, summary_idx)
+    row[summary_idx] = _repair_common_bank_summary_ocr(row[summary_idx])
+
+
+def _repair_common_bank_summary_ocr(value: str) -> str:
+    """Repair exact, stable OCR confusions in common interbank summary phrases."""
+    text = str(value or "").strip()
+    for malformed, corrected in _COMMON_BANK_SUMMARY_OCR_CORRECTIONS.items():
+        text = text.replace(malformed, corrected)
+    return text
+
+
+def _repair_malformed_date(value: str) -> str:
+    text = re.sub(r"\s+", "", str(value or ""))
+    match = re.fullmatch(r"(20\d{2})([-/])(\d{1,2})\2{2}(\d{1,2})", text)
+    if match:
+        return f"{match.group(1)}{match.group(2)}{match.group(3)}{match.group(2)}{match.group(4)}"
+    return text
+
+
+def _money_and_residue(value: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", "", str(value or ""))
+    match = _MONEY_ANY_RE.search(text)
+    if match is None:
+        return "", text
+    money = _repair_malformed_money(match.group(0))
+    return money, f"{text[: match.start()]}{text[match.end() :]}"
+
+
+def _clean_geometry_residue(residue: str, money: str) -> str:
+    """Remove a duplicated decimal digit before keeping source narrative text."""
+    text = str(residue or "").strip()
+    if len(text) >= 2 and text[0].isdigit() and re.match(r"[\u3400-\u9fff]", text[1:]):
+        decimal_digits = re.sub(r"\D", "", money.rsplit(".", 1)[-1])
+        if decimal_digits and text[0] == decimal_digits[-1]:
+            text = text[1:]
+    return text
+
+
+def _merge_geometry_text(left: str, right: str) -> str:
+    left = str(left or "").strip()
+    right = str(right or "").strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if left == right:
+        return left
+    if left.endswith(right):
+        return left
+    if right.startswith(left):
+        return right
+    return f"{left}{right}"
+
+
+def _repair_geometry_summary_prefix(
+    row: list[str],
+    col_map: dict[str, int],
+    balance_idx: int,
+    summary_idx: int,
+) -> None:
+    """Remove one OCR bleed digit before a strongly semantic summary phrase."""
+    sequence_idx = col_map.get("sequence_no")
+    if sequence_idx is None or max(sequence_idx, balance_idx, summary_idx) >= len(row):
+        return
+    if not re.fullmatch(r"\d{1,6}", str(row[sequence_idx] or "").strip()):
+        return
+    summary = str(row[summary_idx] or "").strip()
+    match = re.fullmatch(r"(\d)([\u3400-\u9fff].+)", summary)
+    if match is None:
+        return
+    balance_digits = re.sub(r"\D", "", str(row[balance_idx] or ""))
+    semantic_summary = match.group(2).startswith(
+        ("电子银行", "网银", "城商行", "普通汇兑", "税费", "转账", "付息", "代扣", "现金")
+    )
+    if (balance_digits and match.group(1) == balance_digits[-1]) or semantic_summary:
+        row[summary_idx] = match.group(2)
 
 
 def _page_horizontal_rules(
@@ -1148,6 +1373,7 @@ def _rotated_atom(
 def _expand_composite_header_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Split common OCR-merged labels into virtual geometry-only header cells."""
     patterns = {
+        "余额摘要": ("余额", "摘要"),
         "序号交易日期": ("序号", "交易日期"),
         "序号交易日期交易类型": ("序号", "交易日期", "交易类型"),
         "收入/支出交易金额": ("收入/支出", "交易金额"),
@@ -1242,7 +1468,11 @@ def _orientation_score(atoms: list[dict[str, Any]]) -> float:
             continue
         xs = [_x_center(atom) for atom, _roles in group]
         spread = max(xs, default=0.0) - min(xs, default=0.0)
-        score = len(roles) * 10.0 + min(spread / 20.0, 20.0)
+        following_dates = sum(
+            bool(_DATE_ANY_RE.search(str(atom.get("text") or ""))) and _y_center(atom) > baseline
+            for atom in atoms
+        )
+        score = len(roles) * 10.0 + min(spread / 20.0, 20.0) + min(following_dates, 20) * 2.0
         best = max(best, score)
     return best
 
@@ -1252,11 +1482,11 @@ def _header_roles(text: str) -> set[str]:
     roles: set[str] = set()
     if any(marker in normalized for marker in ("交易日期", "记账日期", "交易时间", "日期")):
         roles.add("date")
-    if any(marker in normalized for marker in ("交易金额", "发生额", "支出金额", "收入金额")):
+    if any(marker in normalized for marker in ("交易金额", "发生额", "支出金额", "收入金额", "借方", "贷方")):
         roles.add("amount")
     if "余额" in normalized:
         roles.add("balance")
-    if any(marker in normalized for marker in ("收入/支出", "收/支", "借贷", "借/贷")):
+    if any(marker in normalized for marker in ("收入/支出", "收/支", "借贷", "借/贷", "借方", "贷方")):
         roles.add("direction")
     if "序号" in normalized:
         roles.add("sequence")
@@ -1317,6 +1547,9 @@ def _store_recovery_cache(
     tables: list[list[list[str]]],
     row_sources: list[dict[str, Any]],
     expected_row_count: int,
+    *,
+    expected_row_source: str = "positioned_date_anchors",
+    expected_row_confidence: float = 0.80,
 ) -> None:
     domain = _domain_specific(parse_result)
     if domain is None:
@@ -1326,8 +1559,29 @@ def _store_recovery_cache(
         "table_count": len(tables),
         "row_count": sum(max(len(table) - 1, 0) for table in tables),
         "expected_row_count": max(int(expected_row_count or 0), 0),
+        "expected_row_source": expected_row_source,
+        "expected_row_confidence": max(0.0, min(float(expected_row_confidence), 1.0)),
         "row_sources": deepcopy(row_sources),
     }
+
+
+def _store_geometry_recovery_cache(
+    parse_result: Any,
+    tables: list[list[list[str]]],
+    row_sources: list[dict[str, Any]],
+    expected_row_count: int,
+) -> None:
+    sequence_complete = bool(expected_row_count) and len(row_sources) == expected_row_count and all(
+        source.get("row_anchor_type") == "sequence" for source in row_sources
+    )
+    _store_recovery_cache(
+        parse_result,
+        tables,
+        row_sources,
+        expected_row_count,
+        expected_row_source="page_transaction_anchors" if sequence_complete else "positioned_date_anchors",
+        expected_row_confidence=0.97 if sequence_complete else 0.80,
+    )
 
 
 def _recovery_cache(parse_result: Any) -> dict[str, Any]:
@@ -1341,7 +1595,11 @@ def _geometry_header(
 ) -> tuple[list[dict[str, Any]], dict[str, int]] | None:
     from docmirror.plugins._base.column_registry import ColumnMatcher
     from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY
-    from docmirror.plugins.bank_statement.header_resolve import normalize_header_cell
+    from docmirror.plugins.bank_statement.header_resolve import (
+        has_split_debit_credit_headers,
+        normalize_header_cell,
+        prefer_explicit_direction_column,
+    )
 
     matcher = ColumnMatcher(BANK_COLUMN_REGISTRY)
     best: tuple[list[dict[str, Any]], dict[str, int]] | None = None
@@ -1351,20 +1609,32 @@ def _geometry_header(
         joined = "".join(cells)
         if not any(marker in joined for marker in ("交易日期", "记账日期", "交易时间", "日期")):
             continue
-        if not any(marker in joined for marker in ("交易金额", "发生额", "支出金额", "收入金额")):
+        split_debit_credit = has_split_debit_credit_headers([[cells]])
+        if not split_debit_credit and not any(
+            marker in joined for marker in ("交易金额", "发生额", "支出金额", "收入金额")
+        ):
             continue
         if "余额" not in joined:
             continue
         col_map = matcher.match(cells)
+        col_map = prefer_explicit_direction_column(cells, col_map)
         fields = set(col_map)
-        valid = {"amount", "balance"}.issubset(fields) and bool(fields.intersection({"date", "timestamp"}))
+        valid = (
+            "balance" in fields
+            and ("amount" in fields or split_debit_credit)
+            and bool(fields.intersection({"date", "timestamp"}))
+        )
         if valid and (best is None or len(col_map) > len(best[1])):
             expanded = _expand_staggered_header(atoms, ordered)
             expanded_cells = [normalize_header_cell(str(atom.get("text") or "")) for atom in expanded]
             expanded_map = matcher.match(expanded_cells)
+            expanded_map = prefer_explicit_direction_column(expanded_cells, expanded_map)
             expanded_fields = set(expanded_map)
-            expanded_valid = {"amount", "balance"}.issubset(expanded_fields) and bool(
-                expanded_fields.intersection({"date", "timestamp"})
+            expanded_split_debit_credit = has_split_debit_credit_headers([[expanded_cells]])
+            expanded_valid = (
+                "balance" in expanded_fields
+                and ("amount" in expanded_fields or expanded_split_debit_credit)
+                and bool(expanded_fields.intersection({"date", "timestamp"}))
             )
             best = (
                 (expanded, expanded_map) if expanded_valid and len(expanded_map) >= len(col_map) else (ordered, col_map)
@@ -1397,6 +1667,16 @@ def _baseline_groups(atoms: list[dict[str, Any]], tolerance: float = 3.0) -> lis
     return groups
 
 
+def _join_geometry_atoms(atoms: list[dict[str, Any]], *, line_tolerance: float) -> str:
+    """Join atoms in visual reading order without letting font baselines reorder characters."""
+    lines = _baseline_groups(atoms, tolerance=line_tolerance)
+    return "".join(
+        str(atom.get("text") or "").strip()
+        for line in lines
+        for atom in sorted(line, key=lambda item: float(item["bbox"][0]))
+    )
+
+
 def _geometry_row_is_transaction(row: list[str]) -> bool:
     from docmirror.plugins.bank_statement.row_extract import row_has_transaction_data
     from docmirror.plugins.bank_statement.wide_table_recovery import is_footer_or_total_row
@@ -1410,7 +1690,12 @@ def _is_geometry_footer_text(text: str) -> bool:
     )
 
 
-def _repair_geometry_rows(rows: list[list[str]], col_map: dict[str, int]) -> None:
+def _repair_geometry_rows(
+    rows: list[list[str]],
+    col_map: dict[str, int],
+    *,
+    previous_balance: float | None = None,
+) -> float | None:
     sequence_idx = col_map.get("sequence_no")
     direction_idx = col_map.get("direction")
     amount_idx = col_map.get("amount")
@@ -1425,40 +1710,52 @@ def _repair_geometry_rows(rows: list[list[str]], col_map: dict[str, int]) -> Non
                 row[index] = _repair_malformed_money(row[index])
     if sequence_idx is not None:
         _repair_sequence_values(rows, sequence_idx)
-    if direction_idx is None or amount_idx is None or balance_idx is None:
-        return
+    if amount_idx is None or balance_idx is None:
+        return previous_balance
 
-    previous_balance: float | None = None
     for row in rows:
-        if max(direction_idx, amount_idx, balance_idx) >= len(row):
+        required_indexes = [amount_idx, balance_idx, *([direction_idx] if direction_idx is not None else [])]
+        if max(required_indexes) >= len(row):
             continue
-        direction_text = str(row[direction_idx] or "")
-        if any(marker in direction_text for marker in ("收入", "收人", "转入", "贷")):
-            direction = "收入"
-            inferred_direction = False
-        elif any(marker in direction_text for marker in ("支出", "支山", "攴出", "转出", "借")):
-            direction = "支出"
-            inferred_direction = False
+        direction_text = str(row[direction_idx] or "") if direction_idx is not None else ""
+        if direction_idx is not None and any(marker in direction_text for marker in ("收入", "收人", "转入", "贷")):
+            direction, inferred_direction = "收入", False
+        elif direction_idx is not None and any(
+            marker in direction_text for marker in ("支出", "支山", "攴出", "转出", "借")
+        ):
+            direction, inferred_direction = "支出", False
         else:
             inferred_direction = True
             context = "".join(row[index] for index in summary_indexes if index < len(row))
-            if any(marker in context for marker in ("转入", "收入")):
+            if any(marker in context for marker in ("转入", "收入", "入账", "利息")):
                 direction = "收入"
-            elif any(marker in context for marker in ("转出", "支出")):
+            elif any(marker in context for marker in ("转出", "支出", "出账", "支取", "消费", "付款")):
                 direction = "支出"
             else:
                 direction = ""
         amount = _money_float(row[amount_idx])
         balance = _money_float(row[balance_idx])
-        if not direction and previous_balance is not None and amount is not None and balance is not None:
-            income_error = abs(previous_balance + amount - balance)
-            expense_error = abs(previous_balance - amount - balance)
-            if min(income_error, expense_error) <= 0.05:
-                direction = "收入" if income_error < expense_error else "支出"
-        if direction and inferred_direction:
+        balance_direction = ""
+        if previous_balance is not None and amount is not None and balance is not None:
+            absolute_amount = abs(amount)
+            income_error = abs(previous_balance + absolute_amount - balance)
+            expense_error = abs(previous_balance - absolute_amount - balance)
+            if min(income_error, expense_error) <= 0.05 < max(income_error, expense_error):
+                balance_direction = "收入" if income_error < expense_error else "支出"
+        if balance_direction and (not direction or balance_direction != direction):
+            direction = balance_direction
+            inferred_direction = True
+        if direction_idx is not None and direction and inferred_direction:
             row[direction_idx] = direction
+        elif direction_idx is None and balance_direction and amount is not None:
+            amount_text = str(row[amount_idx] or "").strip()
+            if balance_direction == "支出" and amount > 0 and not amount_text.startswith("-"):
+                row[amount_idx] = f"-{amount_text.lstrip('+')}"
+            elif balance_direction == "收入" and amount < 0:
+                row[amount_idx] = amount_text.lstrip("-")
         if balance is not None:
             previous_balance = balance
+    return previous_balance
 
 
 def _repair_sequence_values(rows: list[list[str]], sequence_idx: int) -> None:
@@ -1605,11 +1902,8 @@ def _money_at_endpoint(atoms: list[dict[str, Any]], endpoint: float) -> str:
 
 
 def _column_text(atoms: list[dict[str, Any]], left: float, right: float) -> str:
-    selected = sorted(
-        (atom for atom in atoms if left <= float(atom["bbox"][0]) < right),
-        key=lambda atom: (float(atom["bbox"][1]), float(atom["bbox"][0])),
-    )
-    return "".join(str(atom.get("text") or "").strip() for atom in selected)
+    selected = [atom for atom in atoms if left <= float(atom["bbox"][0]) < right]
+    return _join_geometry_atoms(selected, line_tolerance=1.5)
 
 
 __all__ = [
@@ -1617,5 +1911,6 @@ __all__ = [
     "recover_evidence_atom_bank_tables",
     "recover_positioned_record_block_bank_tables",
     "recovered_evidence_atom_expected_row_count",
+    "recovered_evidence_atom_expected_row_evidence",
     "recovered_evidence_atom_row_sources",
 ]

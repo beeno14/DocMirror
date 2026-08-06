@@ -49,6 +49,8 @@ class ReconstructionMeta:
     pages_scanned: int = 0
     spe_primary: str | None = None
     spe_table_extraction: str | None = None
+    expected_evidence_source: str = ""
+    expected_evidence_confidence: float = 0.0
 
 
 def reconstruct_tables(

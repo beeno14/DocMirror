@@ -34,6 +34,7 @@ from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     recover_evidence_atom_bank_tables,
     recover_positioned_record_block_bank_tables,
     recovered_evidence_atom_expected_row_count,
+    recovered_evidence_atom_expected_row_evidence,
     recovered_evidence_atom_row_sources,
 )
 from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
@@ -294,6 +295,7 @@ class BankTableCandidate:
     source_page_coverage: float = 0.0
     extraction_confidence: float = 0.0
     source_column_width: float = 0.0
+    sequence_continuity: float = 0.0
 
 
 def _candidate_expected_rows(
@@ -308,6 +310,25 @@ def _candidate_expected_rows(
     if count > 0:
         return RowCountEvidence(count=count, source=source, confidence=confidence)
     return source_evidence if source_evidence.count > 0 else None
+
+
+def _evidence_atom_expected_rows(
+    parse_result: Any,
+    atom_tables: list[list[list[str]]],
+) -> RowCountEvidence | None:
+    """Return independent page-anchor evidence when recovery can prove it."""
+    table_rows = sum(max(len(table) - 1, 0) for table in atom_tables)
+    evidence_count, evidence_source, evidence_confidence = recovered_evidence_atom_expected_row_evidence(parse_result)
+    expected = max(table_rows, evidence_count)
+    if expected <= 0:
+        return None
+    if evidence_count == expected and evidence_source:
+        return RowCountEvidence(
+            count=expected,
+            source=evidence_source,
+            confidence=evidence_confidence,
+        )
+    return RowCountEvidence(count=expected, source="candidate_rows", confidence=0.55)
 
 
 def _candidate_balance_chain_score(normalized_rows: list[dict[str, Any]]) -> float:
@@ -333,6 +354,23 @@ def _candidate_balance_chain_score(normalized_rows: list[dict[str, Any]]) -> flo
         return matches / comparisons if comparisons else 0.5
 
     return max(score(normalized_rows), score(list(reversed(normalized_rows))))
+
+
+def _candidate_sequence_continuity(normalized_rows: list[dict[str, Any]]) -> float:
+    """Return source-order sequence coverage, uniqueness, and continuity."""
+    numbers: list[int] = []
+    for row in normalized_rows:
+        value = str(row.get("sequence_no") or "").strip()
+        if re.fullmatch(r"\d{1,9}", value):
+            numbers.append(int(value))
+    if len(numbers) < 2:
+        return 0.0
+    coverage = len(numbers) / max(len(normalized_rows), 1)
+    uniqueness = len(set(numbers)) / len(numbers)
+    continuity = sum(abs(current - previous) == 1 for previous, current in zip(numbers, numbers[1:])) / (
+        len(numbers) - 1
+    )
+    return coverage * uniqueness * continuity
 
 
 def _candidate_source_page_coverage(transactions: list[dict[str, Any]]) -> float:
@@ -384,6 +422,7 @@ def _candidate_from_batch(
     source_column_width = _batch_raw_width(transactions)
     source_page_coverage = _candidate_source_page_coverage(transactions)
     balance_chain_score = _candidate_balance_chain_score(normalized_rows)
+    sequence_continuity = _candidate_sequence_continuity(normalized_rows)
     score = (
         0.35 * canonical_coverage
         + 0.25 * source_page_coverage
@@ -407,6 +446,7 @@ def _candidate_from_batch(
         source_page_coverage=source_page_coverage,
         extraction_confidence=extraction_confidence,
         source_column_width=source_column_width,
+        sequence_continuity=sequence_continuity,
     )
 
 
@@ -441,6 +481,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
             1.0 if reliable_coverage is not None else 0.0,
             reliable_coverage if reliable_coverage is not None else 0.0,
             candidate.canonical_coverage,
+            candidate.sequence_continuity,
             candidate.source_page_coverage,
             candidate.field_completeness,
             candidate.balance_chain_score,
@@ -488,6 +529,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         selected = legacy
     reason = (
         f"score={selected.score:.3f}:canonical_coverage={selected.canonical_coverage:.3f}:"
+        f"sequence_continuity={selected.sequence_continuity:.3f}:"
         f"source_coverage={selected.source_page_coverage:.3f}:"
         f"balance_chain={selected.balance_chain_score:.3f}"
     )
@@ -511,6 +553,11 @@ def _collect_table_candidates(
         ctx.full_text,
         page_texts=page_texts_from_parse_result(ctx.parse_result),
     )
+    atom_tables = recover_evidence_atom_bank_tables(ctx.parse_result)
+    atom_row_evidence = _evidence_atom_expected_rows(ctx.parse_result, atom_tables)
+    atom_expected = atom_row_evidence.count if atom_row_evidence is not None else 0
+    if source_evidence.count <= 0 and atom_row_evidence is not None:
+        source_evidence = atom_row_evidence
     candidates: list[BankTableCandidate] = []
 
     def add(
@@ -612,15 +659,10 @@ def _collect_table_candidates(
             confidence=0.95,
         )
 
-    atom_tables = recover_evidence_atom_bank_tables(ctx.parse_result)
     if atom_tables:
         atom_ctx = replace(ctx, tables=atom_tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", atom_ctx, plugin)
         _attach_recovered_sources(batch, recovered_evidence_atom_row_sources(ctx.parse_result))
-        atom_expected = max(
-            sum(max(len(table) - 1, 0) for table in atom_tables),
-            recovered_evidence_atom_expected_row_count(ctx.parse_result),
-        )
         add(
             "evidence_atom",
             batch,
@@ -629,8 +671,8 @@ def _collect_table_candidates(
             _candidate_expected_rows(
                 source_evidence,
                 count=atom_expected,
-                source="positioned_date_anchors",
-                confidence=0.95,
+                source=(atom_row_evidence.source if atom_row_evidence is not None else "candidate_rows"),
+                confidence=(atom_row_evidence.confidence if atom_row_evidence is not None else 0.55),
             ),
             confidence=0.90,
         )
@@ -647,8 +689,8 @@ def _collect_table_candidates(
             _candidate_expected_rows(
                 source_evidence,
                 count=len(batch),
-                source="page_transaction_anchors",
-                confidence=0.93,
+                source="native_wide_rows",
+                confidence=0.70,
             ),
             confidence=0.85,
         )
@@ -981,6 +1023,16 @@ class BankStyleParserRegistry:
                         selected_expected.count
                         if selected_expected is not None and selected_expected.confidence >= 0.85
                         else ctx.reconstruction.expected_primary_rows
+                    ),
+                    expected_evidence_source=(
+                        selected_expected.source
+                        if selected_expected is not None and selected_expected.confidence >= 0.85
+                        else ctx.reconstruction.expected_evidence_source
+                    ),
+                    expected_evidence_confidence=(
+                        selected_expected.confidence
+                        if selected_expected is not None and selected_expected.confidence >= 0.85
+                        else ctx.reconstruction.expected_evidence_confidence
                     ),
                     pipe_parse_failed=False,
                 )

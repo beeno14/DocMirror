@@ -96,13 +96,57 @@ def _header_text(full_text: str) -> str:
     anchor_positions = [text.find(anchor) for anchor in identity_anchors if text.find(anchor) >= 0]
     if anchor_positions:
         start = max(min(anchor_positions) - 300, 0)
-        return text[start : start + _HEADER_LIMIT]
+        text = text[start : start + _HEADER_LIMIT]
+        table_start = _transaction_header_start(text)
+        return text[:table_start] if table_start is not None else text
     ledger_start = text.find("|序号|")
     if ledger_start < 0:
         ledger_start = text.find("|No.")
     if ledger_start > 0:
         return text[:ledger_start]
-    return text[:_HEADER_LIMIT]
+    text = text[:_HEADER_LIMIT]
+    table_start = _transaction_header_start(text)
+    return text[:table_start] if table_start is not None else text
+
+
+def _transaction_header_start(text: str) -> int | None:
+    """Return the start of a multi-line transaction header cluster."""
+    role_patterns = {
+        "sequence": re.compile(r"^(?:序号|Serial|Num)$", re.I),
+        "date": re.compile(r"^(?:交易日期|记账日期|Trans\s*Date)$", re.I),
+        "amount": re.compile(
+            r"^(?:交易金额|发生额|借方(?:\s*[（(]出账[）)])?|贷方(?:\s*[（(]入账[）)])?|Trans\s*Amt|Amount)$",
+            re.I,
+        ),
+        "balance": re.compile(r"^(?:余额(?:摘要)?|账户余额|Balance)$", re.I),
+        "direction": re.compile(
+            r"^(?:借贷|借贷标志|借方(?:\s*[（(]出账[）)])?|贷方(?:\s*[（(]入账[）)])?|收/支|收入/支出|Dc\s*Flg)$",
+            re.I,
+        ),
+    }
+    matches: list[tuple[int, str]] = []
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        compact = re.sub(r"\s+", "", stripped)
+        line_roles = {role for role, pattern in role_patterns.items() if pattern.fullmatch(stripped)}
+        if not line_roles:
+            if (
+                any(marker in compact for marker in ("交易日期", "记账日期"))
+                and (
+                    any(marker in compact for marker in ("交易金额", "发生额"))
+                    or ("借方" in compact and "贷方" in compact)
+                )
+                and "余额" in compact
+            ):
+                return offset
+        else:
+            matches.extend((offset, role) for role in line_roles)
+        offset += len(line)
+    roles = {role for _, role in matches}
+    if {"date", "amount", "balance"}.issubset(roles) and roles.intersection({"sequence", "direction"}):
+        return min(position for position, _ in matches)
+    return None
 
 
 def _header_bank_name(full_text: str) -> str | None:
@@ -111,7 +155,7 @@ def _header_bank_name(full_text: str) -> str | None:
         m = pat.search(header)
         if m:
             name = m.group(1).strip()
-            if name and "银行" in name:
+            if _looks_like_institution(name):
                 return name
     return None
 
@@ -209,7 +253,7 @@ def _looks_like_institution(value: str) -> bool:
         return False
     if any(token in text for token in _NON_INSTITUTION_TOKENS):
         return False
-    return "银行" in text
+    return any(marker in text for marker in ("银行", "信用社", "信用合作联社", "农村信用联社"))
 
 
 def extract_identity_from_header(full_text: str) -> dict[str, str]:
@@ -260,7 +304,15 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         if holder and not re.fullmatch(r"[0-9*＊\s]{6,}", holder):
             out["account_holder"] = holder
     if not out.get("account_holder"):
-        out["account_holder"] = _nearby_holder_after_label(header)
+        for label in ("户名", "客户名称", "客户姓名"):
+            holder = _previous_line_before_label(lines, label)
+            if holder and _looks_like_holder_name(holder):
+                out["account_holder"] = holder
+                break
+    if not out.get("account_holder"):
+        nearby_holder = _nearby_holder_after_label(header)
+        if nearby_holder:
+            out["account_holder"] = nearby_holder
 
     m = re.search(
         r"(?<!贷款)(?<!对方)(?:客户)?(?:账号|账户|账\s*号|账\s*户)(?:\s*Account\s+Number)?"
@@ -296,6 +348,8 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         if "-" not in e:
             e = f"{e[:4]}-{e[4:6]}-{e[6:8]}"
         out["query_period"] = f"{s} ~ {e}"
+    elif vertical_period := _vertical_query_period(lines):
+        out["query_period"] = vertical_period
     elif query_period := _extract_query_period(header):
         out["query_period"] = query_period
     elif period := _extract_year_month_period(header):
@@ -309,6 +363,23 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
         out["bank_name"] = bank
 
     return out
+
+
+def _vertical_query_period(lines: list[str]) -> str:
+    """Read a query range when values precede bilingual labels in text flow."""
+    start = ""
+    end = ""
+    for label in ("查询起日", "查询开始日期", "起始日期"):
+        if value := _previous_line_before_label(lines, label):
+            start = _normalize_date_token(value)
+            if start:
+                break
+    for label in ("查询止日", "查询结束日期", "终止日期", "截止日期"):
+        if value := _previous_line_before_label(lines, label):
+            end = _normalize_date_token(value)
+            if end:
+                break
+    return f"{start} ~ {end}" if start and end else ""
 
 
 def _previous_line_before_label(lines: list[str], label: str) -> str:

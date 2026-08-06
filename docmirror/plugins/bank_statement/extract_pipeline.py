@@ -16,6 +16,7 @@ Key exports: ``BankExtractResult``, ``run_bank_statement_extract``,
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,7 +63,8 @@ def enrich_identity_fields(
 ) -> dict[str, dict]:
     """Merge header KV identity into registry identity fields (EIP)."""
     fields = dict(identity_fields)
-    for field_name, value in extract_identity_from_header(full_text).items():
+    header_identity = extract_identity_from_header(full_text)
+    for field_name, value in header_identity.items():
         if not value:
             continue
         fields[field_name] = {
@@ -71,6 +73,17 @@ def enrich_identity_fields(
             "normalized_value": value,
             "data_type": "string",
             "source": "header.kv",
+        }
+    explicit_page_period = _explicit_query_period_from_pages(parse_result)
+    if explicit_page_period is not None:
+        period_value, source_refs = explicit_page_period
+        fields["query_period"] = {
+            "raw_name": "起始日期/截止日期",
+            "raw_value": period_value,
+            "normalized_value": period_value,
+            "data_type": "string",
+            "source": "page_headers",
+            "source_refs": source_refs,
         }
     if parse_result is not None:
         entities = getattr(parse_result, "entities", None)
@@ -84,6 +97,8 @@ def enrich_identity_fields(
                 "currency",
             ):
                 value = metadata.get(field_name)
+                if field_name == "account_number" and full_text.strip() and not header_identity.get("account_number"):
+                    continue
                 if value and field_name not in fields:
                     fields[field_name] = {
                         "raw_name": field_name,
@@ -95,6 +110,8 @@ def enrich_identity_fields(
         if entities is not None:
             for field_name in ("account_holder", "account_number", "bank_name"):
                 value = getattr(entities, field_name, None)
+                if field_name == "account_number" and full_text.strip() and not header_identity.get("account_number"):
+                    continue
                 if value and field_name not in fields:
                     fields[field_name] = {
                         "raw_name": field_name,
@@ -104,7 +121,11 @@ def enrich_identity_fields(
                         "source": "entities",
                     }
             subject_id = getattr(entities, "subject_id", None)
-            if subject_id and "account_number" not in fields:
+            if (
+                subject_id
+                and "account_number" not in fields
+                and (not full_text.strip() or bool(header_identity.get("account_number")))
+            ):
                 fields["account_number"] = {
                     "raw_name": "subject_id",
                     "raw_value": str(subject_id),
@@ -135,6 +156,45 @@ def enrich_identity_fields(
                     "source": authority or "institution_authority",
                 }
     return fields
+
+
+def _explicit_query_period_from_pages(parse_result: Any) -> tuple[str, list[dict[str, Any]]] | None:
+    """Aggregate explicit issuer periods from every page header."""
+    if parse_result is None:
+        return None
+    periods: list[tuple[str, str, int]] = []
+    for page_number, page_text in page_texts_from_parse_result(parse_result):
+        start_match = re.search(r"起始日期\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
+        end_match = re.search(r"(?:截止日期|终止日期)\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
+        if start_match is None or end_match is None:
+            continue
+        periods.append(
+            (
+                _normalize_period_date(start_match.group(1)),
+                _normalize_period_date(end_match.group(1)),
+                int(page_number),
+            )
+        )
+    if not periods:
+        return None
+    return (
+        f"{min(period[0] for period in periods)} ~ {max(period[1] for period in periods)}",
+        [
+            {
+                "source": "page_header_text",
+                "source_page": period[2],
+                "page_range": [period[2], period[2]],
+            }
+            for period in periods
+        ],
+    )
+
+
+def _normalize_period_date(value: str) -> str:
+    text = str(value or "").strip().replace("/", "-")
+    if re.fullmatch(r"20\d{6}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text
 
 
 def _currency_from_source_table(parse_result: Any) -> dict[str, Any]:
@@ -211,6 +271,42 @@ def collect_extract_warnings(ctx: StyleContext, style_meta: StyleMeta) -> list[s
     return warnings
 
 
+def _apply_source_reported_transaction_count(
+    identity_fields: dict[str, dict],
+    source_reported_count: int,
+) -> None:
+    """Keep the identity aggregate aligned with the independently counted source rows."""
+    if source_reported_count <= 0:
+        return
+    identity_fields["total_transactions"] = {
+        "raw_name": "page_footer_transaction_count",
+        "raw_value": str(source_reported_count),
+        "normalized_value": str(source_reported_count),
+        "data_type": "integer",
+        "source": "page_footer.sum",
+    }
+
+
+def _physical_logical_row_mismatch_warning(physical_expected: int, style_meta: StyleMeta) -> str:
+    """Return a row mismatch warning unless a complete recovery supersedes a sparse table."""
+    if physical_expected <= 0 or physical_expected == style_meta.canonical_extracted:
+        return ""
+    recovery_supersedes_sparse_physical = (
+        style_meta.reconstruction_source
+        in {
+            "canonical_evidence_table",
+            "positioned_record_block",
+            "native_wide_table",
+            "ocr_implicit_table",
+        }
+        and style_meta.canonical_extracted > physical_expected
+        and style_meta.canonical_extracted == style_meta.expected_primary_rows
+    )
+    if recovery_supersedes_sparse_physical:
+        return ""
+    return f"BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:physical={physical_expected}:canonical={style_meta.canonical_extracted}"
+
+
 def run_bank_statement_extract(
     parse_result: Any,
     full_text: str,
@@ -260,6 +356,7 @@ def run_bank_statement_extract(
         ctx.full_text,
         page_texts=page_texts,
     )
+    _apply_source_reported_transaction_count(identity_fields, source_reported_count)
     style_meta = build_style_meta(
         detection,
         reconstruction=ctx.reconstruction,
@@ -271,11 +368,8 @@ def run_bank_statement_extract(
     )
     warnings = collect_extract_warnings(ctx, style_meta)
     physical_expected = physical_transaction_row_estimate(parse_result)
-    if physical_expected > 0 and physical_expected != style_meta.canonical_extracted:
-        warnings.append(
-            "BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:"
-            f"physical={physical_expected}:canonical={style_meta.canonical_extracted}"
-        )
+    if mismatch_warning := _physical_logical_row_mismatch_warning(physical_expected, style_meta):
+        warnings.append(mismatch_warning)
     if style_meta.expected_primary_rows > 0 and style_meta.canonical_extracted < style_meta.expected_primary_rows:
         warnings.append(
             "BANK_CANONICAL_ROW_COVERAGE_LOW:"

@@ -15,11 +15,15 @@ from docmirror.plugins.bank_statement.community_plugin import BankStatementCommu
 from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     _column_aggregate_source_raw,
     _infer_positioned_block_directions,
+    _is_geometry_footer_text,
+    _join_geometry_atoms,
     _positioned_block_counter_account,
+    _repair_geometry_rows,
     _sort_positioned_block_records,
     recover_evidence_atom_bank_tables,
     recover_positioned_record_block_bank_tables,
     recovered_evidence_atom_expected_row_count,
+    recovered_evidence_atom_expected_row_evidence,
     recovered_evidence_atom_row_sources,
 )
 from docmirror.plugins.bank_statement.style_registry import BankTableCandidate, _select_candidate
@@ -73,6 +77,7 @@ def _candidate(
     expected_rows: RowCountEvidence | None = None,
     source_column_width: float = 0.0,
     extraction_confidence: float = 0.0,
+    sequence_continuity: float = 0.0,
 ) -> BankTableCandidate:
     return BankTableCandidate(
         candidate_id=candidate_id,
@@ -89,6 +94,7 @@ def _candidate(
         source_page_coverage=source_page_coverage,
         source_column_width=source_column_width,
         extraction_confidence=extraction_confidence,
+        sequence_continuity=sequence_continuity,
     )
 
 
@@ -103,6 +109,98 @@ def test_candidate_selection_rejects_larger_ocr_result_without_page_provenance()
     assert selected is not None
     assert selected.candidate_id == "physical_table"
     assert diagnostics["selected_candidate"] == "physical_table"
+
+
+def test_candidate_selection_prefers_continuous_source_sequence_over_noisy_extra_rows():
+    selected, diagnostics = _select_candidate(
+        [
+            _candidate("evidence_atom", rows=199, sequence_continuity=1.0, score=0.88),
+            _candidate("ocr_implicit_table", rows=211, sequence_continuity=0.0, score=0.92),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "evidence_atom"
+    assert diagnostics["selected_candidate"] == "evidence_atom"
+
+
+def test_geometry_direction_repair_uses_summary_and_cross_page_balance() -> None:
+    columns = {"direction": 0, "amount": 1, "balance": 2, "summary": 3}
+    first_page = [["转账", "198.87", "144.74", "出账网联"]]
+    second_page = [["转账", "3,000.00", "36,914.33", "微信转账"]]
+
+    previous_balance = _repair_geometry_rows(first_page, columns)
+    _repair_geometry_rows(second_page, columns, previous_balance=39_914.33)
+
+    assert previous_balance == 144.74
+    assert first_page[0][0] == "支出"
+    assert second_page[0][0] == "支出"
+
+
+def test_geometry_direction_repair_corrects_explicit_direction_when_balance_uniquely_disagrees() -> None:
+    columns = {"direction": 0, "amount": 1, "balance": 2, "summary": 3}
+    rows = [["收入", "2.00", "3,641.74", "短信收费"]]
+
+    _repair_geometry_rows(rows, columns, previous_balance=3_643.74)
+
+    assert rows[0][0] == "支出"
+
+
+def test_geometry_atom_join_preserves_visual_account_order_across_font_baselines() -> None:
+    atoms = [
+        _atom("prefix", "00000000000000", 340.0, 160.2, 380.0),
+        _atom("suffix", "864", 380.0, 160.0, 400.0),
+    ]
+
+    assert _join_geometry_atoms(atoms, line_tolerance=1.5) == "00000000000000864"
+
+
+def test_geometry_footer_recognizes_issuer_important_notice() -> None:
+    assert _is_geometry_footer_text("重要提示：请仔细核对账户余额，客服电话：95588") is True
+
+
+def test_geometry_recovery_prefers_sequence_spine_and_repairs_glued_cells() -> None:
+    atoms = [
+        _atom("hs", "序号", 20.0, 80.0, 40.0),
+        _atom("hd", "记账日期", 55.0, 80.0, 100.0),
+        _atom("ha", "交易金额", 145.0, 80.0, 200.0),
+        _atom("hb", "账户余额", 225.0, 80.0, 280.0),
+        _atom("hm", "摘要描述", 300.0, 80.0, 370.0),
+        _atom("hp", "对方户名", 430.0, 80.0, 500.0),
+        _atom("s1", "1", 25.0, 110.0, 32.0),
+        _atom("d1", "2025-01-02", 55.0, 110.0, 100.0),
+        _atom("a1", "-10.00", 160.0, 110.0, 195.0),
+        _atom("b1", "90.00税费社保", 230.0, 110.0, 330.0),
+        _atom("p1", "待报解预算收入", 430.0, 110.0, 500.0),
+        _atom("s2", "2", 25.0, 130.0, 32.0),
+        _atom("d2", "2025-01--03", 55.0, 130.0, 105.0),
+        _atom("a2", "5.00", 165.0, 130.0, 195.0),
+        _atom("b2", "85.00电子银行转账", 230.0, 130.0, 335.0),
+        _atom("p2", "测试公司", 430.0, 130.0, 480.0),
+        _atom("s3", "3", 25.0, 150.0, 32.0),
+        _atom("d3", "2025-01-04", 55.0, 150.0, 100.0),
+        _atom("a3", "10.00", 165.0, 150.0, 195.0),
+        _atom("b3", "75.00", 230.0, 150.0, 275.0),
+        _atom("m3", "0网银路行互联", 300.0, 150.0, 370.0),
+        _atom("p3", "另一公司", 430.0, 150.0, 480.0),
+        _atom("footer-in", "收入总额:0.00", 25.0, 175.0, 120.0),
+        _atom("footer-out", "支出总额:25.00", 230.0, 175.0, 330.0),
+        _atom("print-date", "打印日期:2025-02-01", 55.0, 190.0, 180.0),
+    ]
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert recovered_evidence_atom_expected_row_count(parse_result) == 3
+    assert recovered_evidence_atom_expected_row_evidence(parse_result) == (3, "page_transaction_anchors", 0.97)
+    assert len(tables) == 1
+    assert len(tables[0]) == 4
+    assert tables[0][1] == ["1", "2025-01-02", "-10.00", "90.00", "税费社保", "待报解预算收入"]
+    assert tables[0][2] == ["2", "2025-01-03", "-5.00", "85.00", "电子银行转账", "测试公司"]
+    assert tables[0][3] == ["3", "2025-01-04", "-10.00", "75.00", "网银跨行互联", "另一公司"]
+    assert all(source["row_anchor_type"] == "sequence" for source in sources)
+    assert any(source.get("reconstruction_repairs") for source in sources)
 
 
 def test_candidate_selection_rejects_balance_chain_weaker_near_tie():
@@ -723,6 +821,64 @@ def test_recovers_borderless_date_anchored_split_columns():
     assert tables[0][1][4].startswith("363,693.02")
 
 
+def test_recovers_parenthetical_split_columns_and_glued_balance_summary_header():
+    atoms = [
+        _atom("hd", "交易日期", 17.0, 106.0, 53.0),
+        _atom("hdebit", "借方(出账)", 107.0, 106.0, 152.0),
+        _atom("hcredit", "贷方(入账)", 193.0, 106.0, 238.0),
+        _atom("hbalance_summary", "余额摘要", 305.0, 106.0, 344.0),
+        _atom("hparty", "收(付)方名称", 394.0, 106.0, 449.0),
+        _atom("haccount", "收(付)方账号", 463.0, 106.0, 517.0),
+        _atom("htype", "交易类型", 531.0, 106.0, 568.0),
+        _atom("d1", "2025-01-02", 17.0, 124.0, 62.0),
+        _atom("debit1", "25.00", 129.0, 129.0, 152.0),
+        _atom("balance1", "5,000,888.02", 269.0, 129.0, 324.0),
+        _atom("summary1", "服务费", 326.0, 124.0, 370.0),
+        _atom("party1", "测试有限公司", 394.0, 124.0, 449.0),
+        _atom("account1", "123917394110001", 463.0, 124.0, 527.0),
+        _atom("type1", "对公转账", 531.0, 124.0, 568.0),
+        _atom("d2", "2025-01-03", 17.0, 156.0, 62.0),
+        _atom("credit2", "200.00", 210.0, 161.0, 238.0),
+        _atom("balance2", "5,001,088.02", 269.0, 161.0, 324.0),
+        _atom("summary2", "往来款", 326.0, 156.0, 370.0),
+        _atom("party2", "第二有限公司", 394.0, 156.0, 449.0),
+        _atom("account2", "123917394110002", 463.0, 156.0, 527.0),
+        _atom("type2", "提回收款", 531.0, 156.0, 568.0),
+    ]
+    vector_atoms = [
+        {"id": f"rule-{index}", "page_id": "page:0001", "bbox": [17.0, y, 568.0, y]}
+        for index, y in enumerate((116.0, 149.0, 182.0), start=1)
+    ]
+    parse_result = _result(atoms, vector_atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert tables[0][0] == [
+        "交易日期",
+        "借方(出账)",
+        "贷方(入账)",
+        "余额",
+        "摘要",
+        "收(付)方名称",
+        "收(付)方账号",
+        "交易类型",
+    ]
+    assert tables[0][1] == [
+        "2025-01-02",
+        "25.00",
+        "",
+        "5,000,888.02",
+        "服务费",
+        "测试有限公司",
+        "123917394110001",
+        "对公转账",
+    ]
+    assert tables[0][2][2:6] == ["200.00", "5,001,088.02", "往来款", "第二有限公司"]
+    assert recovered_evidence_atom_expected_row_count(parse_result) == 2
+    assert [source["source_page"] for source in sources] == [1, 1]
+
+
 def test_recovers_borderless_embedded_direction_amount_rows():
     atoms = [
         _atom("hd", "交易日期", 36.0, 80.0, 72.0),
@@ -1025,6 +1181,38 @@ def test_evidence_identity_stays_within_selected_source_pages():
     assert fields["account_holder"]["normalized_value"] == "测试科技有限公司"
 
 
+def test_evidence_identity_stops_holder_before_account_card_label():
+    atoms = [
+        _atom("holder", "户名：吴文坤", 10.0, 60.0, 90.0),
+        _atom("account_label", "账号/卡号：", 100.0, 60.0, 165.0),
+        _atom("account", "6230361108033553943", 175.0, 60.0, 310.0),
+        _atom("currency", "币种：人民币", 320.0, 60.0, 400.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["account_holder"]["normalized_value"] == "吴文坤"
+    assert fields["account_number"]["normalized_value"] == "6230361108033553943"
+
+
+def test_evidence_identity_ignores_account_reference_below_transaction_header() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 17.0, 106.0, 53.0),
+        _atom("hdebit", "借方(出账)", 107.0, 106.0, 152.0),
+        _atom("hcredit", "贷方(入账)", 193.0, 106.0, 238.0),
+        _atom("hbalance_summary", "余额摘要", 305.0, 106.0, 344.0),
+        _atom("hparty", "收(付)方名称", 394.0, 106.0, 449.0),
+        _atom("haccount", "收(付)方账号", 463.0, 106.0, 517.0),
+        _atom("htype", "交易类型", 531.0, 106.0, 568.0),
+        _atom("date", "2025-03-21", 17.0, 130.0, 62.0),
+        _atom("summary", "收息，结息账号:999019305110001", 326.0, 130.0, 450.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert "account_number" not in fields
+
+
 def test_evidence_identity_recovers_split_header_values_and_directional_totals():
     atoms = [
         _atom("title", "交通银行某分行明细对账单", 180.0, 20.0, 390.0),
@@ -1052,6 +1240,29 @@ def test_evidence_identity_recovers_split_header_values_and_directional_totals()
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["query_period"]["normalized_value"] == "2025-07-01 至 2025-07-31"
     assert fields["total_transactions"]["normalized_value"] == "11"
+
+
+def test_evidence_identity_pairs_parallel_label_value_columns_by_geometry():
+    atoms = [
+        _atom("account_label", "银行账号：", 20.0, 50.0, 80.0),
+        _atom("account", "120023710020000001988", 90.0, 50.0, 230.0),
+        _atom("currency_label", "币种：", 430.0, 50.0, 470.0),
+        _atom("currency", "人民币", 480.0, 50.0, 530.0),
+        _atom("holder_label", "账户名称：", 20.0, 70.0, 80.0),
+        _atom("holder", "测试信用管理有限公司", 90.0, 70.0, 250.0),
+        _atom("deposit_label", "存款种类：", 430.0, 70.0, 490.0),
+        _atom("deposit", "单位活期存款", 500.0, 70.0, 580.0),
+        _atom("print_bank_label", "打印机构：", 350.0, 780.0, 420.0),
+        _atom("print_bank", "富滇银行", 430.0, 780.0, 490.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["account_number"]["normalized_value"] == "120023710020000001988"
+    assert fields["account_holder"]["normalized_value"] == "测试信用管理有限公司"
+    assert fields["currency"]["raw_value"] == "人民币"
+    assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["bank_name"]["normalized_value"] == "富滇银行"
 
 
 def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():
@@ -1117,6 +1328,7 @@ def test_geometry_recovery_keeps_wrapped_cells_with_preceding_date_and_stops_at_
         _atom("income_value", "1", 100.0, 205.0, 110.0),
         _atom("income_total", "总收入金额", 180.0, 205.0, 250.0),
         _atom("income_amount", "0.03", 260.0, 205.0, 300.0),
+        _atom("print_date", "2026/02/24", 20.0, 390.0, 90.0),
         _atom("page", "第1页/共1页", 280.0, 400.0, 350.0),
     ]
 
@@ -1138,6 +1350,48 @@ def test_geometry_recovery_keeps_wrapped_cells_with_preceding_date_and_stops_at_
     assert all("总收入" not in "".join(row) for row in tables[0][1:])
     assert all("第1页" not in "".join(row) for row in tables[0][1:])
     assert recovered_evidence_atom_expected_row_count(parse_result) == 2
+
+
+def test_geometry_recovery_assigns_leading_wrapped_cells_to_nearest_date_anchor():
+    atoms = [
+        _atom("h0", "序号", 10.0, 80.0, 30.0),
+        _atom("h1", "交易日期", 40.0, 80.0, 90.0),
+        _atom("h2", "交易时间", 100.0, 80.0, 150.0),
+        _atom("h3", "交易类型", 160.0, 80.0, 210.0),
+        _atom("h4", "借贷", 220.0, 80.0, 250.0),
+        _atom("h5", "交易金额", 260.0, 80.0, 320.0),
+        _atom("h6", "余额", 330.0, 80.0, 370.0),
+        _atom("h7", "对方账号", 380.0, 80.0, 440.0),
+        _atom("h8", "对方户名", 450.0, 80.0, 510.0),
+        _atom("h9", "摘要", 520.0, 80.0, 560.0),
+        _atom("s1", "1", 10.0, 110.0, 20.0),
+        _atom("d1", "2022-08-05", 40.0, 110.0, 90.0),
+        _atom("t1", "14:05:18", 100.0, 110.0, 150.0),
+        _atom("type1", "跨行汇款", 160.0, 110.0, 210.0),
+        _atom("dir1", "贷 Cr", 220.0, 110.0, 250.0),
+        _atom("a1", "40.00", 260.0, 110.0, 320.0),
+        _atom("b1", "41.06", 330.0, 110.0, 370.0),
+        _atom("cp1", "周深", 450.0, 110.0, 510.0),
+        _atom("s2", "2", 10.0, 140.0, 20.0),
+        _atom("d2", "2022-08-06", 40.0, 140.0, 90.0),
+        _atom("t2", "16:14:05", 100.0, 140.0, 150.0),
+        _atom("type2", "网上支付", 160.0, 140.0, 210.0),
+        _atom("dir2", "借 Dr", 220.0, 140.0, 250.0),
+        _atom("a2", "37.98", 260.0, 140.0, 320.0),
+        _atom("b2", "3.08", 330.0, 140.0, 370.0),
+        _atom("cp2a", "江苏欧飞电子商务有限", 450.0, 126.0, 510.0),
+        _atom("cp2b", "公司", 450.0, 145.0, 480.0),
+        _atom("summary2", "有限公司", 520.0, 145.0, 560.0),
+        _atom("footer", "打印完毕", 380.0, 165.0, 440.0),
+    ]
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert len(tables) == 1
+    assert tables[0][1][4] == "贷 Cr"
+    assert tables[0][1][8] == "周深"
+    assert tables[0][2][4] == "借 Dr"
+    assert tables[0][2][8] == "江苏欧飞电子商务有限公司"
 
 
 def test_evidence_identity_stops_at_branch_and_ignores_transaction_loan_account():

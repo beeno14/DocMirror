@@ -27,14 +27,23 @@ logger = logging.getLogger(__name__)
 
 _DEBIT_CREDIT_REQUIRED = ("借方发生额", "贷方发生额", "余额")
 _INCOME_EXPENSE_REQUIRED = ("支出金额", "收入金额", "余额")
-_AMOUNT_HEADERS = ("交易金额", "发生额", "借方/贷方金额", "支/收交易金额")
+_AMOUNT_HEADERS = (
+    "交易金额",
+    "发生额",
+    "借方/贷方金额",
+    "收入/支出金额",
+    "支出/收入金额",
+    "收/支金额",
+    "支/收交易金额",
+)
 _ROW_ANCHOR_HEADERS = ("序号", "交易日期", "交易时间", "记账日期", "会计日期", "日期")
 _BORDERLESS_DATE_RE = re.compile(r"(?:20\d{6}|20\d{2}[-/.]\d{2}[-/.]\d{2})")
 _BORDERLESS_SIGNED_AMOUNT_RE = re.compile(r"[+-]\d[\d,]*(?:\.\d{1,2})?")
 _BORDERLESS_BALANCE_RE = re.compile(r"-?\d[\d,]*(?:\.\d{1,2})?")
 _BORDERLESS_ROW_RE = re.compile(
-    r"^\s*(?:20\d{6}|20\d{2}[-/.]\d{2}[-/.]\d{2})(?:\s+(?:\d{6}|\d{1,2}:\d{2}:\d{2}))?.*?"
-    r"[+-]\d[\d,]*(?:\.\d{1,2})?\s+"
+    r"^\s*(?:\d{1,6}\s+)?(?:20\d{6}|20\d{2}[-/.]\d{2}[-/.]\d{2})"
+    r"(?:\s+(?:\d{6}|\d{1,2}:\d{2}:\d{2}))?.*?"
+    r"[+-]?\d[\d,]*(?:\.\d{1,2})?\s+"
     r"-?\d[\d,]*(?:\.\d{1,2})?(?:\s|$)"
 )
 _BORDERLESS_FOOTER_MARKERS = ("数据缺失", "明细内容仅供参考", "本页合计")
@@ -58,6 +67,10 @@ _FOOTER_MARKERS = (
 _COUNT_PATTERNS = (re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),)
 _PAGE_COUNT_PATTERN = re.compile(r"本页交易笔数\s*[:：]\s*(?P<count>\d+)")
 _SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*(?:[/／-]\s*)?共\s*(?P<total>\d+)\s*页")
+_NATIVE_DATETIME_RE = re.compile(r"(?P<date>20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\s+(?P<time>\d{1,2}:\d{2}:\d{2})")
+_NATIVE_SIGNED_MONEY_RE = re.compile(r"[+-](?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}")
+_NATIVE_UNSIGNED_MONEY_RE = re.compile(r"(?<![\d,])(?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}(?!\d)")
+_COMBINED_SIGNED_AMOUNT_HEADERS = ("收入/支出金额", "支出/收入金额", "收/支金额", "支/收交易金额")
 _SPLIT_COUNT_PATTERNS = (
     re.compile(
         r"借方合计笔数[:：]\s*(?P<debit>\d+)\s*笔?.*?"
@@ -235,15 +248,36 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
         return []
 
     page_tables: list[list[list[str]]] = []
+    native_money_hints = _native_money_hints(pdf_path)
     try:
         with pdfplumber.open(str(pdf_path)) as pdf:
             for page_number, page in enumerate(pdf.pages, start=1):
                 native_tables_found = False
-                for table in page.extract_tables() or []:
-                    normalized = _normalize_table(table)
+                try:
+                    native_tables = page.find_tables() or []
+                except Exception:
+                    native_tables = []
+                for table_index, table in enumerate(native_tables):
+                    normalized = _normalize_native_grid_table(
+                        table,
+                        page_number=page_number,
+                        table_index=table_index,
+                        money_hints=native_money_hints.get(page_number, {}),
+                    )
                     if normalized:
                         page_tables.append(normalized)
-                        native_tables_found = True
+                        native_tables_found = native_tables_found or bool(_select_wide_bank_table(normalized))
+                if not native_tables:
+                    for table_index, table in enumerate(page.extract_tables() or []):
+                        normalized = _annotate_native_grid_matrix(
+                            _normalize_table(table),
+                            page_number=page_number,
+                            table_index=table_index,
+                            money_hints=native_money_hints.get(page_number, {}),
+                        )
+                        if normalized:
+                            page_tables.append(normalized)
+                            native_tables_found = native_tables_found or bool(_select_wide_bank_table(normalized))
                 if not native_tables_found:
                     borderless = _recover_borderless_native_page(page, page_number)
                     if borderless:
@@ -262,6 +296,184 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
     if candidates:
         logger.info("[BankWideTableRecovery] recovered %d native wide table(s)", len(candidates))
     return candidates
+
+
+def _native_money_hints(pdf_path: Path) -> dict[int, dict[tuple[str, str], list[tuple[str, str]]]]:
+    """Extract page-local signed amount and balance hints from native reading order."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return {}
+
+    hints: dict[int, dict[tuple[str, str], list[tuple[str, str]]]] = {}
+    try:
+        reader = PdfReader(str(pdf_path))
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = str(page.extract_text() or "")
+            anchors = list(_NATIVE_DATETIME_RE.finditer(text))
+            page_hints: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for index, anchor in enumerate(anchors):
+                end = anchors[index + 1].start() if index + 1 < len(anchors) else len(text)
+                fragment = text[anchor.end() : end]
+                signed = _NATIVE_SIGNED_MONEY_RE.search(fragment)
+                if signed is None:
+                    continue
+                balance = _NATIVE_UNSIGNED_MONEY_RE.search(fragment, signed.end())
+                if balance is None:
+                    continue
+                key = (_normalize_native_date(anchor.group("date")), _normalize_native_time(anchor.group("time")))
+                page_hints.setdefault(key, []).append((signed.group(0), balance.group(0)))
+            if page_hints:
+                hints[page_number] = page_hints
+    except Exception as exc:
+        logger.debug("[BankWideTableRecovery] native text amount hints unavailable: %s", exc)
+        return {}
+    return hints
+
+
+def _normalize_native_grid_table(
+    table: Any,
+    *,
+    page_number: int,
+    table_index: int,
+    money_hints: dict[tuple[str, str], list[tuple[str, str]]],
+) -> list[list[str]]:
+    """Normalize a pdfplumber grid and retain page-local row provenance."""
+    try:
+        matrix = _normalize_table(table.extract() or [])
+    except Exception:
+        return []
+    row_bboxes = [_native_table_row_bbox(row) for row in getattr(table, "rows", []) or []]
+    return _annotate_native_grid_matrix(
+        matrix,
+        page_number=page_number,
+        table_index=table_index,
+        money_hints=money_hints,
+        row_bboxes=row_bboxes,
+    )
+
+
+def _annotate_native_grid_matrix(
+    matrix: list[list[str]],
+    *,
+    page_number: int,
+    table_index: int,
+    money_hints: dict[tuple[str, str], list[tuple[str, str]]],
+    row_bboxes: list[tuple[float, float, float, float]] | None = None,
+) -> list[list[str]]:
+    """Attach source facts and clean only a confirmed combined signed-amount column."""
+    if not matrix:
+        return []
+    header_index = next((index for index, row in enumerate(matrix[:8]) if is_wide_bank_header(row)), -1)
+    if header_index < 0:
+        return matrix
+    headers = matrix[header_index]
+    date_column = _source_date_column(headers)
+    balance_column = _source_balance_column(headers)
+    signed_amount_column = _combined_signed_amount_column(headers)
+    if date_column < 0 or balance_column < 0 or signed_amount_column < 0:
+        return matrix
+
+    source_headers = [*headers, "_source_page", "_source_bbox", "_source_table_id", "_source_row_index"]
+    out = [*matrix[:header_index], source_headers]
+    hint_queues = {key: list(values) for key, values in money_hints.items()}
+    table_id = f"native:p{page_number}:t{table_index}"
+    for row_index, source_row in enumerate(matrix[header_index + 1 :], start=header_index + 1):
+        row = list(source_row)
+        key = _native_row_datetime_key(row, date_column)
+        if key is None or not hint_queues.get(key):
+            row_time = _native_row_time(row, date_column)
+            matching_keys = [
+                candidate for candidate, values in hint_queues.items() if values and candidate[1] == row_time
+            ]
+            if len(matching_keys) == 1:
+                key = matching_keys[0]
+        queue = hint_queues.get(key) if key is not None else None
+        if queue:
+            amount, balance = queue.pop(0)
+            row[date_column] = f"{key[0]} {key[1]}"
+            row[signed_amount_column] = amount
+            row[balance_column] = balance
+        else:
+            cleaned_amount = _extract_native_signed_money(row[signed_amount_column])
+            cleaned_balance = _extract_native_balance(row[balance_column])
+            if cleaned_amount:
+                row[signed_amount_column] = cleaned_amount
+            if cleaned_balance:
+                row[balance_column] = cleaned_balance
+        bbox = row_bboxes[row_index] if row_bboxes and row_index < len(row_bboxes) else (0.0, 0.0, 0.0, 0.0)
+        out.append(
+            [
+                *row,
+                str(page_number),
+                ",".join(f"{value:.3f}" for value in bbox),
+                table_id,
+                str(row_index),
+            ]
+        )
+    return out
+
+
+def _combined_signed_amount_column(headers: list[str]) -> int:
+    for index, header in enumerate(headers):
+        normalized = normalize_header_cell(header)
+        if any(marker in normalized for marker in _COMBINED_SIGNED_AMOUNT_HEADERS):
+            return index
+    return -1
+
+
+def _native_row_datetime_key(row: list[str], date_column: int) -> tuple[str, str] | None:
+    if date_column < 0 or date_column >= len(row):
+        return None
+    match = _NATIVE_DATETIME_RE.search(str(row[date_column] or ""))
+    if match is None:
+        return None
+    return _normalize_native_date(match.group("date")), _normalize_native_time(match.group("time"))
+
+
+def _native_row_time(row: list[str], date_column: int) -> str:
+    if date_column < 0 or date_column >= len(row):
+        return ""
+    match = re.search(r"(?<!\d)(?P<time>\d{1,2}:\d{2}:\d{2})(?!\d)", str(row[date_column] or ""))
+    return _normalize_native_time(match.group("time")) if match else ""
+
+
+def _normalize_native_date(value: str) -> str:
+    parts = re.split(r"[-/.]", str(value or "").strip())
+    if len(parts) != 3:
+        return str(value or "").strip()
+    return f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+
+
+def _normalize_native_time(value: str) -> str:
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 3:
+        return str(value or "").strip()
+    return f"{int(parts[0]):02d}:{int(parts[1]):02d}:{int(parts[2]):02d}"
+
+
+def _extract_native_signed_money(value: str) -> str:
+    compact = re.sub(r"\s+", "", str(value or ""))
+    match = _NATIVE_SIGNED_MONEY_RE.search(compact)
+    return match.group(0) if match else ""
+
+
+def _extract_native_balance(value: str) -> str:
+    compact = re.sub(r"\s+", "", str(value or ""))
+    match = _NATIVE_UNSIGNED_MONEY_RE.search(compact)
+    return match.group(0) if match else ""
+
+
+def _native_table_row_bbox(row: Any) -> tuple[float, float, float, float]:
+    cells = [cell for cell in (getattr(row, "cells", []) or []) if isinstance(cell, (list, tuple)) and len(cell) == 4]
+    if not cells:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (
+        min(float(cell[0]) for cell in cells),
+        min(float(cell[1]) for cell in cells),
+        max(float(cell[2]) for cell in cells),
+        max(float(cell[3]) for cell in cells),
+    )
 
 
 def _count_borderless_transaction_anchors(text: str) -> int:
@@ -438,6 +650,10 @@ def _source_amount_columns(headers: list[str]) -> list[int]:
         "支出",
         "收入金额",
         "支出金额",
+        "收入/支出金额",
+        "支出/收入金额",
+        "收/支金额",
+        "支/收交易金额",
         "借方",
         "贷方",
         "借方发生额",
@@ -450,7 +666,19 @@ def _source_amount_columns(headers: list[str]) -> list[int]:
         normalized = normalize_header_cell(header)
         if normalized in exact_amount_headers or any(
             marker in normalized
-            for marker in ("交易金额", "借方发生额", "贷方发生额", "收入金额", "支出金额", "转入金额", "转出金额")
+            for marker in (
+                "交易金额",
+                "借方发生额",
+                "贷方发生额",
+                "收入金额",
+                "支出金额",
+                "收入/支出金额",
+                "支出/收入金额",
+                "收/支金额",
+                "支/收交易金额",
+                "转入金额",
+                "转出金额",
+            )
         ):
             indexes.append(index)
     return indexes
@@ -477,8 +705,7 @@ def _join_native_cell_words(words: list[dict[str, Any]]) -> str:
     lines = _group_native_words_by_line(words)
     return "\n".join(
         "".join(
-            str(word.get("text") or "").strip()
-            for word in sorted(line, key=lambda item: float(item.get("x0") or 0.0))
+            str(word.get("text") or "").strip() for word in sorted(line, key=lambda item: float(item.get("x0") or 0.0))
         )
         for line in lines
     )
@@ -498,12 +725,10 @@ def _valid_borderless_row(
         and date_column < len(cells)
         and balance_column < len(cells)
         and _BORDERLESS_DATE_RE.search(cells[date_column])
-        and (
-            any(_BORDERLESS_SIGNED_AMOUNT_RE.fullmatch(value) for value in amount_values if value)
-            or (
-                len(amount_columns) > 1
-                and any(_BORDERLESS_BALANCE_RE.fullmatch(value) for value in amount_values if value)
-            )
+        and any(
+            _BORDERLESS_SIGNED_AMOUNT_RE.fullmatch(value) or _BORDERLESS_BALANCE_RE.fullmatch(value)
+            for value in amount_values
+            if value
         )
         and _BORDERLESS_BALANCE_RE.fullmatch(cells[balance_column].replace(" ", ""))
     )
