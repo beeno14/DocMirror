@@ -144,6 +144,9 @@ def page_texts_from_parse_result(parse_result: Any) -> list[tuple[int, str]]:
             for block in getattr(page, "texts", []) or []
         ]
         for table in getattr(page, "tables", []) or []:
+            headers = [str(header or "").strip() for header in getattr(table, "headers", []) or []]
+            if any(headers):
+                parts.append(" ".join(headers))
             for row in getattr(table, "rows", []) or []:
                 cells = [str(getattr(cell, "text", "") or "").strip() for cell in getattr(row, "cells", []) or []]
                 if any(cells):
@@ -478,11 +481,51 @@ def _native_table_row_bbox(row: Any) -> tuple[float, float, float, float]:
 
 def _count_borderless_transaction_anchors(text: str) -> int:
     """Count validated source rows from a page-local borderless ledger."""
-    return sum(1 for line in str(text or "").splitlines() if _BORDERLESS_ROW_RE.search(line))
+    lines = [str(line or "").strip() for line in str(text or "").splitlines()]
+    inline_count = sum(1 for line in lines if _BORDERLESS_ROW_RE.search(line))
+    stacked_count = 0
+    for index, line in enumerate(lines):
+        if not _BORDERLESS_DATE_RE.fullmatch(line):
+            continue
+        lookahead = lines[index + 1 : index + 5]
+        money_values = [value for value in lookahead if _BORDERLESS_BALANCE_RE.fullmatch(re.sub(r"\s+", "", value))]
+        compact_date = re.sub(r"\s+", "", line)
+        inline_duplicate = any(
+            compact_date in re.sub(r"\s+", "", candidate)
+            and all(re.sub(r"\s+", "", value) in re.sub(r"\s+", "", candidate) for value in money_values[:2])
+            for candidate in lines[index + 1 :]
+        )
+        if len(money_values) >= 2 and not inline_duplicate:
+            stacked_count += 1
+    return inline_count + stacked_count
 
 
 def _has_borderless_source_header(text: str) -> bool:
     return any(_looks_like_borderless_header_text(line) for line in str(text or "").splitlines())
+
+
+def _is_header_continuation_line(words: list[dict[str, Any]]) -> bool:
+    """Return whether a line after a source header is still bilingual header text."""
+    raw = re.sub(r"\s+", "", "".join(str(word.get("text") or "") for word in words)).lower()
+    normalized = re.sub(r"\s+", "", normalize_header_cell(raw))
+    markers = (
+        "date",
+        "currency",
+        "transaction",
+        "amount",
+        "balance",
+        "type",
+        "counter",
+        "party",
+        "日期",
+        "币种",
+        "金额",
+        "余额",
+        "摘要",
+        "对方",
+        "对手",
+    )
+    return any(marker in raw or marker in normalized for marker in markers)
 
 
 def _recover_borderless_native_page(page: Any, page_number: int) -> list[list[str]]:
@@ -516,11 +559,22 @@ def _recover_borderless_native_page(page: Any, page_number: int) -> list[list[st
     if header_spec is None:
         return []
     header_words, (source_headers, starts) = header_spec
+    header_index = next((index for index, line in enumerate(lines) if line == header_words), -1)
     date_column = _source_date_column(source_headers)
     amount_columns = _source_amount_columns(source_headers)
     balance_column = _source_balance_column(source_headers)
 
     header_bottom = max(float(word.get("bottom") or word.get("top") or 0.0) for word in header_words)
+    if header_index >= 0:
+        for continuation in lines[header_index + 1 :]:
+            if any(_BORDERLESS_DATE_RE.fullmatch(str(word.get("text") or "").strip()) for word in continuation):
+                break
+            if not _is_header_continuation_line(continuation):
+                break
+            header_bottom = max(
+                header_bottom,
+                max(float(word.get("bottom") or word.get("top") or 0.0) for word in continuation),
+            )
     column_words = [
         (word, _column_index(float(word.get("x0") or 0.0), starts))
         for word in words

@@ -680,7 +680,8 @@ def _collect_table_candidates(
     wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text)
     if wide_tables:
         wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
-        batch, normalize_fn = _run_parser("grid_standard", wide_ctx, plugin)
+        wide_parser_id = "signed_amount" if detection.primary_style == "signed_amount" else "grid_standard"
+        batch, normalize_fn = _run_parser(wide_parser_id, wide_ctx, plugin)
         add(
             "native_wide_table",
             batch,
@@ -932,7 +933,8 @@ class BankStyleParserRegistry:
             wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text)
             if wide_tables:
                 wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
-                wide_batch, wide_norm = _run_parser("grid_standard", wide_ctx, plugin)
+                wide_parser_id = "signed_amount" if detection.primary_style == "signed_amount" else "grid_standard"
+                wide_batch, wide_norm = _run_parser(wide_parser_id, wide_ctx, plugin)
                 wide_score, wide_coverage = _parser_score(wide_batch, wide_norm, plugin, expected)
                 if wide_score > primary_score:
                     transactions = wide_batch

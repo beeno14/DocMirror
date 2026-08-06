@@ -157,6 +157,9 @@ def _normalize_source_counterparty_columns(
     )
     if counter_party:
         cleaned_party = _clean_wrapped_text(counter_party)
+        cleaned_party, embedded_account = _split_embedded_counter_account(cleaned_party)
+        if embedded_account and not normalized.get("counter_account"):
+            normalized["counter_account"] = embedded_account
         compact_party = re.sub(r"\s+", "", cleaned_party)
         if re.fullmatch(r"[0-9*＊]{6,32}", compact_party):
             normalized["counter_account"] = compact_party
@@ -319,6 +322,27 @@ def _clean_account(value: str) -> str:
     if re.fullmatch(r"[0-9*\s＊]+", text):
         return re.sub(r"\s+", "", text)
     return re.sub(r"\s+", " ", text)
+
+
+def _split_embedded_counter_account(value: str) -> tuple[str, str]:
+    """Split a trailing counterparty account from a collapsed source cell."""
+    text = _clean_wrapped_text(value)
+    compact = re.sub(r"\s+", "", text)
+    match = re.search(r"(?<!\d)([0-9*＊]{8,32})$", compact)
+    if match is None:
+        return text, ""
+
+    account = match.group(1)
+    prefix_length = match.start(1)
+    compact_seen = 0
+    prefix_chars: list[str] = []
+    for char in text:
+        if not char.isspace():
+            if compact_seen >= prefix_length:
+                break
+            compact_seen += 1
+        prefix_chars.append(char)
+    return "".join(prefix_chars).rstrip(), account
 
 
 def _extract_split_grid_records(

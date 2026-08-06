@@ -327,8 +327,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 evidence_ids=period_evidence_ids,
             )
             detail["source_refs"] = [
-                {"source": "canonical_evidence_atoms", "page_id": source_page_id}
-                for source_page_id in period_page_ids
+                {"source": "canonical_evidence_atoms", "page_id": source_page_id} for source_page_id in period_page_ids
             ]
             recovered["query_period"] = detail
 
@@ -711,7 +710,7 @@ def _sanitize_bank_value_pool(pool: dict) -> None:
         text = _clean_footer_text(value)
         if key_text in {"balance", "amount", "amount_cny", "余额", "交易金额"}:
             text = _clean_money_text(text)
-        if key_text in {"counter_party", "对方户名", "对方名称", "交易对手"}:
+        if key_text in {"counter_party", "对方户名", "对方名称", "对手信息", "对手名称", "交易对手"}:
             text = _clean_counterparty_text(text)
         pool[key] = text
 

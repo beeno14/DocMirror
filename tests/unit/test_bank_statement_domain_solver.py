@@ -330,6 +330,40 @@ def test_page_local_borderless_transaction_anchors_are_an_independent_count() ->
     assert evidence.confidence >= 0.9
 
 
+def test_page_local_borderless_count_accepts_stacked_first_row_cells() -> None:
+    header = "记账日期 货币 交易金额 余额 交易摘要 对手信息"
+    evidence = resolve_row_count_evidence(
+        "",
+        page_texts=[
+            (
+                1,
+                "\n".join(
+                    [
+                        header,
+                        "2024-01-01",
+                        "CNY",
+                        "0.07",
+                        "0.07",
+                        "结息",
+                    ]
+                ),
+            ),
+            (
+                2,
+                "\n".join(
+                    [
+                        header,
+                        "2024-01-02 CNY -1.00 9.00 付款 测试有限公司 123456789012345",
+                    ]
+                ),
+            ),
+        ],
+    )
+
+    assert evidence.count == 2
+    assert evidence.source == "page_transaction_anchors"
+
+
 def test_page_footer_transaction_counts_are_summed_across_pages() -> None:
     text = "\n".join(
         [

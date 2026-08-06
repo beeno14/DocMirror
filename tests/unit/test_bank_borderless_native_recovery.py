@@ -56,6 +56,37 @@ def test_borderless_recovery_preserves_dynamic_source_columns() -> None:
     assert table[1][-2] == "3"
 
 
+def test_borderless_recovery_skips_bilingual_header_continuation_before_first_row() -> None:
+    starts = [10.0, 80.0, 140.0, 210.0, 280.0, 350.0]
+    headers = ["交易日期", "币种", "交易金额", "余额", "交易摘要", "对手信息"]
+    words = [*[_word(value, starts[index], 10.0) for index, value in enumerate(headers)]]
+    words.extend(
+        [
+            _word("Date", starts[0], 20.0),
+            _word("Currency", starts[1], 20.0),
+            _word("Transaction", starts[2], 20.0),
+            _word("Amount", starts[2], 26.0),
+            _word("Balance", starts[3], 20.0),
+            _word("Transaction", starts[4], 20.0),
+            _word("Type", starts[4], 26.0),
+            _word("Counter", starts[5], 20.0),
+            _word("Party", starts[5], 26.0),
+            _word("测试有限公司", starts[5], 35.0, 60.0),
+            _word("2024-01-01", starts[0], 40.0, 52.0),
+            _word("CNY", starts[1], 40.0),
+            _word("-10.00", starts[2], 40.0),
+            _word("90.00", starts[3], 40.0),
+            _word("付款", starts[4], 40.0),
+            _word("123456789012345", starts[5], 40.0, 70.0),
+        ]
+    )
+
+    table = _recover_borderless_native_page(_Page(words), 1)
+
+    assert [row[0] for row in table[1:]] == ["2024-01-01"]
+    assert table[1][5] == "测试有限公司\n123456789012345"
+
+
 def test_borderless_recovery_accepts_unsigned_amount_when_direction_is_explicit() -> None:
     starts = [10.0, 45.0, 120.0, 185.0, 250.0, 325.0, 405.0]
     headers = ["序号", "交易日期", "收入/支出", "交易金额", "账户余额", "对方户名", "摘要"]
@@ -336,6 +367,22 @@ def test_borderless_recovery_supports_iso_dates_split_amounts_and_wrapped_cells(
     assert normalized[2]["balance"] == 765306.09
     assert raw_records[0]["_source"]["source_page"] == 1
     assert raw_records[0]["_source"]["bbox"]
+
+
+def test_source_counterparty_cell_splits_trailing_account() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "交易日期": "2024-01-01",
+        "交易金额": "-10.00",
+        "余额": "90.00",
+        "交易摘要": "付款",
+        "对手信息": "测试有限公司 123456789012345",
+    }
+
+    normalized = grid_standard.normalize_record(raw, plugin)
+
+    assert normalized["counter_party"] == "测试有限公司"
+    assert normalized["counter_account"] == "123456789012345"
 
 
 def test_wrapped_counterparty_parentheses_do_not_create_a_synthetic_space() -> None:
