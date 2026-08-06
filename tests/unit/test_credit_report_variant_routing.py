@@ -143,6 +143,7 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "enterprise_exchange_rates",
         "enterprise_report_identity",
     ]
+    assert enterprise_order[4] == "enterprise_section_presence"
     assert (
         enterprise_order.index("enterprise_current_credit_summary")
         < enterprise_order.index("enterprise_facility_summary")
@@ -160,7 +161,7 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     )
     assert "enterprise_extraction_audit" not in enterprise_order
     assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
-    assert enterprise_dictionary["version"] == "2.0.0"
+    assert enterprise_dictionary["version"] == "3.0.0"
     assert "identity_documents" not in enterprise_dictionary["datasets"]
     assert "enterprise_credit_accounts" in enterprise_dictionary["datasets"]
 
@@ -170,7 +171,7 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
     dictionary = enterprise.data_dictionary()
     dataset_layouts = enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"]
 
-    assert dictionary["fields"]["public_record_type_counts"]["map_key_enum"] == "record_type"
+    assert dictionary["fields"]["extracted_public_record_type_counts"]["map_key_enum"] == "record_type"
     assert "public_records" not in dictionary["datasets"]
     assert "public_records" not in dataset_layouts
     assert list(dictionary["datasets"]["enterprise_public_license_records"]["columns"]) == [

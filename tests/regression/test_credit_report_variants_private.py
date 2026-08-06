@@ -27,6 +27,39 @@ _DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
 _KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
 _PERSONAL_BRIEF_DISPLAY_SAMPLE = _FIXTURE_DIR / "个人信用报告（本人简版）展示样本.pdf"
 
+_DIGITAL_ENTERPRISE_ACCURACY_EXPECTED = {
+    "征信报告_本报告由中国人民银行_20250311.pdf": {
+        "first_credit_year_status": "not_reported",
+        "extracted_public_record_count": 3,
+        "extracted_public_record_type_counts": {"license": 3},
+        "attachment_history_row_count": 0,
+        "profile_source_field": "industry_source_institution",
+        "profile_source_value": "中国建设银行股份有限公司广东省分行",
+        "profile_missing_field": "operating_status",
+        "public_section_status": "present_with_records",
+    },
+    "身份标识类型身份标识_征信报告_本报告由中国人民银行_20250224.PDF": {
+        "first_credit_year_status": "not_reported",
+        "extracted_public_record_count": 0,
+        "extracted_public_record_type_counts": {},
+        "attachment_history_row_count": 0,
+        "profile_source_field": "industry_source_institution",
+        "profile_source_value": "中国民生银行股份有限公司上海杨浦支行",
+        "profile_missing_field": "establishment_year",
+        "public_section_status": "absent_from_report",
+    },
+    "雯玥轩企业征信(1).pdf": {
+        "first_credit_year_status": "reported",
+        "extracted_public_record_count": 0,
+        "extracted_public_record_type_counts": {},
+        "attachment_history_row_count": 34,
+        "profile_source_field": "establishment_year_source_institution",
+        "profile_source_value": "中国工商银行股份有限公司厦门市分行",
+        "profile_missing_field": None,
+        "public_section_status": "absent_from_report",
+    },
+}
+
 _DIGITAL_PERSONAL_BRIEF_EXPECTED = {
     "人行征信报告-2025-04-14.pdf": (18, 0, 82, 10, 1),
     "人行征信报告-2026-06-24 08-52-53(1).pdf": (39, 0, 100, 13, 0),
@@ -107,6 +140,101 @@ def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
         "type": "string",
         "sensitive": True,
     }
+
+
+@pytest.mark.parametrize(
+    "fixture_name,expected",
+    list(_DIGITAL_ENTERPRISE_ACCURACY_EXPECTED.items()),
+)
+def test_digital_enterprise_accuracy_schema_contract(
+    fixture_name: str,
+    expected: dict[str, object],
+) -> None:
+    fixture = _DIGITAL_ENTERPRISE_DIR / fixture_name
+    if not fixture.exists():
+        pytest.skip(f"digital-enterprise accuracy fixture is unavailable: {fixture_name}")
+
+    sealed = asyncio.run(
+        perceive_document(
+            fixture,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    dictionary = semantic["domain"]["data_dictionary"]
+    summary = semantic["domain"]["facts"]["credit_summary"]
+    profile = datasets["enterprise_profile"]["rows"][0]["normalized"]
+    section_rows = datasets["enterprise_section_presence"]["rows"]
+    section_by_key = {
+        row["normalized"]["section_key"]: row["normalized"] for row in section_rows
+    }
+
+    assert dictionary["version"] == "3.0.0"
+    assert semantic["extraction"]["status"] == "complete"
+    assert semantic["extraction"]["failures"] == []
+    assert len(section_rows) == 10
+    assert datasets["enterprise_section_presence"]["completeness"]["verified"] is True
+    assert section_by_key["public_records"]["presence_status"] == expected[
+        "public_section_status"
+    ]
+    assert summary["first_credit_year_status"] == expected["first_credit_year_status"]
+    assert summary["extracted_public_record_count"] == expected[
+        "extracted_public_record_count"
+    ]
+    assert summary["extracted_public_record_type_counts"] == expected[
+        "extracted_public_record_type_counts"
+    ]
+    assert summary["extracted_public_record_count_scope"] == "public_record_detail_rows"
+    assert summary["public_record_overview_count_scope"] == (
+        "information_overview_fixed_categories"
+    )
+    assert summary["attachment_history_row_count"] == expected[
+        "attachment_history_row_count"
+    ]
+    assert profile[str(expected["profile_source_field"])] == expected[
+        "profile_source_value"
+    ]
+    missing_field = expected["profile_missing_field"]
+    if isinstance(missing_field, str):
+        assert profile[missing_field] is None
+        assert profile[f"{missing_field}_status"] == "not_reported"
+        assert profile[f"{missing_field}_source_institution"] is None
+        assert profile[f"{missing_field}_source_institution_status"] == "not_reported"
+    assert "field_info" not in profile
+    assert "public_record_count" not in summary
+    assert "public_record_counts" not in summary
+    assert "public_record_type_counts" not in summary
+    assert "attachment_credit_detail_count" not in summary
+
+    for dataset in payload["datasets"]:
+        columns = dictionary["datasets"].get(dataset["name"], {}).get("columns", {})
+        for row in dataset["rows"]:
+            assert {"normalized", "raw", "canonical_raw"} <= set(row)
+            assert not any(
+                isinstance(value, (dict, list))
+                for value in row["normalized"].values()
+            ), (dataset["name"], row["record_id"])
+            for field, metadata in columns.items():
+                value = row["normalized"].get(field)
+                if value is None:
+                    continue
+                field_type = metadata.get("type")
+                if field_type in {"money", "number", "percentage", "decimal"}:
+                    assert isinstance(value, str), (dataset["name"], field, value)
+                elif field_type == "integer":
+                    assert isinstance(value, int) and not isinstance(value, bool)
+                elif field_type == "boolean":
+                    assert isinstance(value, bool)
+                elif field_type in {"string", "text", "date", "datetime", "long_id"}:
+                    assert isinstance(value, str)
 
 
 def test_personal_brief_display_sample_projects_complete_business_schema() -> None:
@@ -223,12 +351,21 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     report_metadata = [row["normalized"] for row in datasets["enterprise_report_metadata"]["rows"]]
     exchange_rates = [row["normalized"] for row in datasets["enterprise_exchange_rates"]["rows"]]
     report_notes = [row["normalized"] for row in datasets["report_notes"]["rows"]]
+    profile = datasets["enterprise_profile"]["rows"][0]["normalized"]
+    section_presence = [
+        row["normalized"] for row in datasets["enterprise_section_presence"]["rows"]
+    ]
 
     assert len(accounts) == 3
     assert len({account["account_identifier"] for account in accounts}) == 3
     assert [account["balance"] for account in accounts] == ["34.88", "4.67", "25.87"]
     assert [account["loan_amount"] for account in accounts] == ["62.99", "5.6", None]
     assert [account["credit_limit"] for account in accounts] == [None, None, "34.1"]
+    assert accounts[0]["loan_amount_status"] == "reported"
+    assert accounts[0]["credit_limit_status"] == "not_applicable"
+    assert accounts[0]["discount_amount_status"] == "not_applicable"
+    assert accounts[2]["credit_limit_status"] == "reported"
+    assert accounts[2]["loan_amount_status"] == "not_applicable"
     assert len(credit_lines) == 1
     assert (credit_lines[0]["total_limit"], credit_lines[0]["used_limit"]) == ("34.33", "25.87")
     assert credit_lines[0]["available_limit"] is None
@@ -269,6 +406,30 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert exchange_rates[0]["source_page"] == 2
     assert [note["sequence"] for note in report_notes] == list(range(1, 21))
     assert all(note["source_page"] == 2 for note in report_notes)
+    assert profile["industry_source_institution"] == "深圳前海微众银行股份有限公司"
+    assert profile["establishment_year_source_institution"] == "中国工商银行股份有限公司厦门市分行"
+    assert profile["industry_source_institution_status"] == "reported"
+    assert all(
+        profile[f"{field}_status"] in {"reported", "not_reported"}
+        for field in (
+            "economic_type",
+            "organization_type",
+            "enterprise_scale",
+            "industry",
+            "establishment_year",
+            "registration_certificate_valid_through",
+            "registered_address",
+            "operating_address",
+            "operating_status",
+        )
+    )
+    assert "field_info" not in profile
+    assert len(section_presence) == 10
+    assert {row["presence_status"] for row in section_presence} <= {
+        "present_with_records",
+        "present_no_records",
+        "absent_from_report",
+    }
     assert [account["current_overdue_status"] for account in accounts] == [
         "not_overdue",
         "not_reported",
@@ -351,8 +512,12 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "credit_extraction_audit" not in facts
     assert "account_balance_reconciliation_tolerance" not in semantic["domain"]["data_dictionary"]["fields"]
     assert facts["credit_summary"]["first_credit_year"] == 2021
+    assert facts["credit_summary"]["first_credit_year_status"] == "reported"
     assert facts["credit_summary"]["first_repayment_responsibility_year_status"] == "not_reported"
-    assert facts["credit_summary"]["public_record_counts"]["administrative_penalties"] == 0
+    assert facts["credit_summary"]["public_record_overview_counts"]["administrative_penalties"] == 0
+    assert facts["credit_summary"]["attachment_history_row_count"] == 34
+    assert facts["credit_summary"]["attachment_detail_card_count"] == 0
+    assert "attachment_credit_detail_count" not in facts["credit_summary"]
 
     _task_id, written = write_outputs(
         sealed,
@@ -376,6 +541,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "enterprise_report_metadata": 1,
         "enterprise_exchange_rates": 1,
         "enterprise_report_identity": 1,
+        "enterprise_section_presence": 10,
         "enterprise_credit_overview": 1,
         "enterprise_public_record_counts": 5,
         "enterprise_profile": 1,
@@ -547,7 +713,8 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     summary = facts["credit_summary"]
     assert summary["source_display_limited"] is True
     assert summary["attachment_account_count"] == 201
-    assert summary["attachment_credit_detail_count"] == 109
+    assert summary["attachment_history_row_count"] == 477
+    assert summary["attachment_detail_card_count"] == 109
     assert summary["attachment_special_transaction_count"] == 23
     assert datasets["enterprise_credit_accounts"]["status"] == "complete"
 
@@ -740,14 +907,14 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert "**信息截至日期:** 2025-07-20" in liability_preview
 
     summary = facts["credit_summary"]
-    assert summary["public_record_counts"] == {
+    assert summary["public_record_overview_counts"] == {
         "non_credit_accounts": 0,
         "tax_arrears": 0,
         "civil_judgments": 0,
         "enforcements": 0,
         "administrative_penalties": 0,
     }
-    assert summary["public_record_type_counts"] == {
+    assert summary["extracted_public_record_type_counts"] == {
         "license": 2,
         "certification": 1,
     }
@@ -795,7 +962,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     facts = semantic["domain"]["facts"]
 
     assert data_dictionary["schema_id"] == "enterprise_credit_report"
-    assert data_dictionary["version"] == "2.0.0"
+    assert data_dictionary["version"] == "3.0.0"
     assert "identity_documents" not in data_dictionary["datasets"]
     assert "enterprise_credit_accounts" in data_dictionary["datasets"]
     assert len(accounts) == 9

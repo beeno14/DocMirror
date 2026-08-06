@@ -947,8 +947,16 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
                 number = _number(value)
                 if number is not None:
                     summary[field] = int(number)
-                elif field == "first_repayment_responsibility_year" and value == "--":
-                    summary["first_repayment_responsibility_year_status"] = "not_reported"
+                    if field in {
+                        "first_credit_year",
+                        "first_repayment_responsibility_year",
+                    }:
+                        summary[f"{field}_status"] = "reported"
+                elif field in {
+                    "first_credit_year",
+                    "first_repayment_responsibility_year",
+                } and _compact(value) in _MISSING_MARKERS:
+                    summary[f"{field}_status"] = "not_reported"
         if len(rows) >= 2 and all(any(label in header for header in headers) for label in public_labels):
             values = rows[1]
             counts: dict[str, int] = {}
@@ -958,7 +966,10 @@ def extract_enterprise_overview(parse_result: Any) -> dict[str, Any]:
                 if field and number is not None:
                     counts[field] = int(number)
             if counts:
-                summary["public_record_counts"] = counts
+                summary["public_record_overview_counts"] = counts
+                summary["public_record_overview_count_scope"] = (
+                    "information_overview_fixed_categories"
+                )
         signature = "".join(headers)
         if "借贷交易" not in signature or "担保交易" not in signature:
             continue
@@ -1959,7 +1970,11 @@ def extract_enterprise_overview_datasets(
     page_texts = _page_texts(parse_result)
     overview = extract_enterprise_overview(parse_result)
     if overview:
-        public_record_counts = overview.pop("public_record_counts", None)
+        public_record_counts = overview.pop("public_record_overview_counts", None)
+        public_record_count_scope = overview.pop(
+            "public_record_overview_count_scope",
+            None,
+        )
         record = {
             "enterprise_credit_overview_id": _stable_id(
                 "enterprise_credit_overview",
@@ -1991,6 +2006,7 @@ def extract_enterprise_overview_datasets(
                     "sequence": index,
                     "record_type": count_type_aliases.get(record_type, record_type),
                     "record_count": int(count),
+                    "count_scope": public_record_count_scope,
                     "source_page": 3,
                     "source": "enterprise_information_overview",
                     "source_refs": [
@@ -2256,6 +2272,7 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
     profile: dict[str, Any] = {
         "enterprise_profile_id": "enterprise_profile:r000001",
         "sequence": 1,
+        "field_info": {},
         "source_refs": [],
         "confidence": 1.0,
     }
@@ -2274,11 +2291,42 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                 if len(row) < 2 or row[0] not in _PROFILE_LABELS:
                     continue
                 field = _PROFILE_FIELDS[row[0]]
-                value: Any = row[1]
+                raw_value = row[1]
+                source_state = (
+                    "not_reported"
+                    if _compact(raw_value) in _MISSING_MARKERS
+                    else "reported"
+                )
+                value: Any = raw_value
                 if field == "establishment_year":
                     number = _number(value)
                     value = int(number) if number is not None else value
                 profile[field] = value
+                profile[f"{field}_status"] = source_state
+                field_source: dict[str, Any] = {
+                    "source_state": source_state,
+                    "source_page": page,
+                    "source_table_id": table_id,
+                    "source_row": row_index,
+                }
+                if len(row) >= 4 and "信息来源机构" in _compact(row[2]):
+                    source_institution = _compact(row[3])
+                    if source_institution in _MISSING_MARKERS:
+                        field_source["source_institution"] = None
+                        field_source["source_institution_status"] = "not_reported"
+                    else:
+                        field_source["source_institution"] = source_institution
+                        field_source["source_institution_status"] = "reported"
+                else:
+                    field_source["source_institution"] = None
+                    field_source["source_institution_status"] = "unresolved"
+                profile[f"{field}_source_institution"] = field_source[
+                    "source_institution"
+                ]
+                profile[f"{field}_source_institution_status"] = field_source[
+                    "source_institution_status"
+                ]
+                profile["field_info"][field] = field_source
                 profile["source_refs"].append(_source_ref(page, table_id, row_index))
             continue
         if all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
