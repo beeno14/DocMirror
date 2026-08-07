@@ -1046,6 +1046,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         dataset_layout = dataset_layouts.get(str(dataset.get("name") or ""))
         if not isinstance(dataset_layout, dict):
             dataset_layout = {}
+        if dataset_layout.get("placement") == "before_partition_rows" and not dataset.get("rows"):
+            continue
         if dataset_layout.get("placement") == "appendix":
             deferred_appendix_datasets.append((dataset, table, dataset_layout))
             continue
