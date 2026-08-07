@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
+    PBOCCanonicalTemplateAssembler,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailExtractionContext,
     _page_ocr_score,
-)
-from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
-    PBOCCanonicalTemplateAssembler,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _canonical_inquiry_line_rows,
@@ -30,18 +30,17 @@ def _page(logical: int, *, source: int, width: float = 600, height: float = 800,
     )
 
 
-def _assembler(result, evidence, retries, topology=None, owner=None):
+def _assembler(result, evidence, _retries=None, topology=None, owner=None):
     return PBOCCanonicalTemplateAssembler(
         result,
         topology=topology or SimpleNamespace(geometry=lambda _logical: None),
         reading_order_by_logical={page.page_number: index for index, page in enumerate(result.pages, start=1)},
         source_evidence_loader=lambda: evidence,
-        full_page_ocr_loader=lambda pages, *, reason: [retries[page] for page in pages if page in retries],
         issue_owner=owner or SimpleNamespace(),
     )
 
 
-def test_unknown_layout_retries_complete_page_and_rebuilds_table_cells() -> None:
+def test_unknown_layout_is_reported_without_registration_ocr_or_table_rewrite() -> None:
     table = SimpleNamespace(
         table_id="account",
         bbox=[10, 100, 590, 220],
@@ -73,12 +72,10 @@ def test_unknown_layout_retries_complete_page_and_rebuilds_table_cells() -> None
 
     projection = _assembler(result, initial, {1: replay}).build()
 
-    assert projection.retried_pages == (1,)
-    assert projection.unresolved_pages == ()
-    assert projection.registrations[0]["basis"] == "full_page_reocr"
-    rows = projection.pages[0].tables[0].metadata["raw_rows"]
-    assert rows == [["账户标识", "管理机构"], ["B12345678", "样例银行"]]
-    assert projection.pages[0].tables[0].metadata["canonical_full_page_ocr_retried"] is True
+    assert projection.unresolved_pages == (1,)
+    assert projection.pages == ()
+    assert projection.registrations[0]["basis"] == "canonical_registration_exhausted"
+    assert projection.audit()["template_registration_ocr_used"] is False
 
 
 def test_fragments_with_same_printed_page_join_one_canonical_canvas() -> None:
@@ -105,7 +102,7 @@ def test_fragments_with_same_printed_page_join_one_canonical_canvas() -> None:
             "page_width": 300,
             "page_height": 800,
             "source_crop_bbox": [300, 0, 600, 800],
-            "plugin_replayed_subpage": True,
+                    "plugin_static_subpage": True,
             "lines": [
                 _line("个人基本信息", [10, 20, 200, 60]),
             ],

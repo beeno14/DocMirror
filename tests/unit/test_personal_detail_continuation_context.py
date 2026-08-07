@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
@@ -24,80 +23,6 @@ from docmirror.plugins.credit_report.scanned_business import (
 )
 from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_accounts
 from docmirror.plugins.credit_report.shared.entity_decoder import CreditReportUnit
-
-
-def test_split_replay_has_an_independent_full_page_ocr_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = object.__new__(PersonalDetailExtractionContext)
-    context._page_ocr_max_requests = 1
-    context._page_ocr_requests = [{"logical_page": 1, "status": "completed"}]
-    context._supplemental_ocr_cache = {}
-    context._page_image_resolver = SimpleNamespace(
-        supplemental_spread_slices=lambda _pages: [
-            {
-                "supplemental_page_id": "source:2:segment:1:split",
-                "source_page": 2,
-                "segment_index": 1,
-                "image": np.zeros((100, 80, 3), dtype=np.uint8),
-                "zoom": 1.0,
-                "subpage_basis": "core_split_result",
-            }
-        ]
-    )
-    monkeypatch.setattr(
-        "docmirror.plugins.credit_report.personal_detail_scanned.context._complete_page_ocr",
-        lambda image: (
-            [{"text": "查询记录", "confidence": 0.99, "bbox": [1, 2, 70, 20]}],
-            image,
-            0,
-            0.0,
-            1.0,
-        ),
-    )
-
-    pages = context.supplemental_page_ocr_evidence([2], reason="split_result_topology_replay")
-
-    assert len(pages) == 1
-    assert pages[0]["source_page"] == 2
-    assert len(context._page_ocr_requests) == 2
-
-
-def test_split_replay_budget_is_atomic_per_physical_spread(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = object.__new__(PersonalDetailExtractionContext)
-    context._page_ocr_max_requests = 1
-    context._page_ocr_requests = []
-    context._supplemental_ocr_cache = {}
-    image = np.zeros((100, 80, 3), dtype=np.uint8)
-    context._page_image_resolver = SimpleNamespace(
-        supplemental_spread_slices=lambda _pages: [
-            {
-                "supplemental_page_id": f"source:{source}:segment:{segment}:split",
-                "source_page": source,
-                "segment_index": segment,
-                "image": image,
-                "zoom": 1.0,
-                "subpage_basis": "core_split_result",
-            }
-            for source, segment in ((2, 0), (2, 1), (3, 0), (3, 1))
-        ]
-    )
-    monkeypatch.setattr(
-        "docmirror.plugins.credit_report.personal_detail_scanned.context._complete_page_ocr",
-        lambda candidate: (
-            [{"text": "evidence", "confidence": 0.99, "bbox": [1, 2, 70, 20]}],
-            candidate,
-            0,
-            0.0,
-            1.0,
-        ),
-    )
-
-    pages = context.supplemental_page_ocr_evidence([2, 3], reason="split_result_topology_replay")
-
-    assert [(page["source_page"], page["segment_index"]) for page in pages] == [(2, 0), (2, 1)]
-    assert any(
-        request.get("source_page") == 3 and request.get("status") == "budget_exhausted"
-        for request in context._page_ocr_requests
-    )
 
 
 def _unit(
@@ -594,6 +519,61 @@ def test_residence_provider_continuation_uses_entity_and_sequence_not_page_numbe
     assert records[0]["data_provider"] == "样例银行"
 
 
+def test_employment_fragments_join_by_header_columns_and_printed_sequence() -> None:
+    basic = SimpleNamespace(
+        table_id="employment-basic",
+        metadata={
+            "raw_rows": [
+                ["编号", "工作单位", "单位性质", "单位地址", "单位电话"],
+                ["2", "样例科技有限公司", "私营企业", "样例路2号", "010-12345678"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 180],
+    )
+    detail = SimpleNamespace(
+        table_id="employment-detail",
+        metadata={
+            "raw_rows": [
+                ["编号", "职业", "行业", "职务", "职称", "进入本单位年份", "信息更新日期"],
+                ["2", "工程技术人员", "信息技术业", "一般员工", "工程师", "2020", "2025.01.02"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 180],
+    )
+    provider = SimpleNamespace(
+        table_id="employment-provider",
+        metadata={"raw_rows": [["2", "样例银行股份有限公司"]]},
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 80],
+    )
+    continuations = {
+        ("employment-basic", "employment-detail"),
+        ("employment-detail", "employment-provider"),
+    }
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[basic]),
+            SimpleNamespace(page_number=2, source_page_number=2, tables=[detail]),
+            SimpleNamespace(page_number=3, source_page_number=3, tables=[provider]),
+        ],
+        tables_continue=lambda left, right: (left, right) in continuations,
+    )
+
+    records = _extract_employment_records(result)
+
+    assert len(records) == 1
+    assert records[0]["sequence"] == 2
+    assert records[0]["employer"] == "样例科技有限公司"
+    assert records[0]["occupation"] == "工程技术人员"
+    assert records[0]["entry_year"] == 2020
+    assert records[0]["data_provider"] == "样例银行股份有限公司"
+
+
 def test_scanned_residence_unknown_continuation_does_not_use_structural_fallback() -> None:
     residence = SimpleNamespace(
         table_id="residence",
@@ -760,20 +740,18 @@ def test_native_profile_tables_preserve_empty_cells_and_embedded_subtables() -> 
     employments = _extract_employment_records(result)
     details = _extract_profile_detail_records(result)
 
-    assert [(row["address"], row.get("residential_phone"), row["data_provider"]) for row in residences] == [
+    assert [(row["address"], row.get("residential_phone"), row.get("data_provider")) for row in residences] == [
         ("某市某区一号", None, "示例银行一"),
-        ("某市某区二号", "13800138000", "示例银行二"),
+        ("某市某区二号", "13800138000", None),
     ]
-    assert employments[0]["employer"] == "示例粮油有限公司"
-    assert employments[0]["employer_type"] == "国有企业"
-    assert employments[0]["employer_address"] == "某市某路60号"
-    assert employments[0]["employer_phone"] == "059100000000"
-    assert employments[0]["occupation"] == "商业、服务业人员"
-    assert employments[0]["industry"] == "批发和零售业"
-    assert employments[0]["data_provider"] == "示例银行"
-    assert details["mobile_phone_records"][0]["mobile_phone"] == "13799911561"
+    assert employments == []
+    assert details["mobile_phone_records"] == []
     assert details["spouse_records"][0]["name"] == "林航"
     assert details["spouse_records"][0]["phone"] == "13763822211"
+    assert details["spouse_records"][0]["data_provider"] == "示例消费金融有限公司"
+    issue_codes = {row["issue_code"] for row in result._personal_detail_extraction_issues}
+    assert "candidate_b_canonical_header_graph_unresolved" in issue_codes
+    assert "candidate_b_continuation_sequence_unresolved" in issue_codes
 
 
 def test_native_employment_preserves_separated_phone_after_empty_columns() -> None:

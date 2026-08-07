@@ -18,7 +18,7 @@ from docmirror.plugins.credit_report.scanned_business import (
 
 
 def _overlay(**kwargs) -> PersonalDetailOCRCorrectionOverlay:
-    return PersonalDetailOCRCorrectionOverlay(SimpleNamespace(), enable_targeted_ocr=False, **kwargs)
+    return PersonalDetailOCRCorrectionOverlay(SimpleNamespace(), **kwargs)
 
 
 def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
@@ -465,31 +465,24 @@ class _FakeCellRepairEngine:
 
 
 def test_schema_role_repair_does_not_fall_back_to_crop_ocr() -> None:
-    overlay = PersonalDetailOCRCorrectionOverlay(
-        SimpleNamespace(),
-        page_image_resolver=_FakeResolver(),
-        repair_engine=_FakeRepairEngine(),
-        enable_targeted_ocr=True,
-    )
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
 
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
         source_refs=({"logical_page": 1, "bbox": [1, 1, 20, 10]},),
-        allow_targeted_ocr=True,
     )
 
     assert corrected == "1101051949123100?X"
     assert decision is None
-    assert overlay.audit()["targeted_ocr_requests"] == 1
+    assert overlay.audit()["repair_evidence_reparse_attempt_count"] == 0
+    assert overlay.audit()["ocr_started_by_correction_overlay"] is False
 
 
-def test_complete_page_ocr_precedes_crop_repair_for_schema_assigned_field() -> None:
-    calls: list[tuple[set[int], str]] = []
-
-    def full_page_loader(pages: set[int], *, reason: str):
-        calls.append((pages, reason))
-        return [
+def test_schema_assigned_field_uses_only_coordinator_installed_page_evidence() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
             {
                 "page": 1,
                 "lines": [
@@ -500,37 +493,25 @@ def test_complete_page_ocr_precedes_crop_repair_for_schema_assigned_field() -> N
                     }
                 ],
             }
-        ]
-
-    overlay = PersonalDetailOCRCorrectionOverlay(
-        SimpleNamespace(),
-        page_image_resolver=_FakeResolver(),
-        full_page_ocr_loader=full_page_loader,
-        repair_engine=_FakeRepairEngine(),
-        enable_targeted_ocr=True,
+        ],
+        affected_pages={1},
     )
 
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
         source_refs=({"logical_page": 1, "bbox": [1, 1, 20, 10]},),
-        allow_targeted_ocr=True,
     )
 
     assert corrected == "11010519491231002X"
     assert decision is not None
-    assert decision.method == "full_page_ocr_role_reparse"
-    assert calls == [({1}, "schema_role_repair:identity_document_number")]
-    assert overlay.audit()["targeted_ocr_requests"] == 1
+    assert decision.method == "schema_bound_page_evidence_reparse"
+    assert overlay.audit()["repair_evidence_reparse_attempt_count"] == 1
+    assert overlay.audit()["ocr_started_by_correction_overlay"] is False
 
 
 def test_damaged_inquiry_date_is_not_repaired_from_a_crop() -> None:
-    overlay = PersonalDetailOCRCorrectionOverlay(
-        SimpleNamespace(),
-        page_image_resolver=_FakeResolver(),
-        repair_engine=_FakeInquiryRepairEngine(),
-        enable_targeted_ocr=True,
-    )
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
     pages = [
         {
             "page": 1,
@@ -551,16 +532,11 @@ def test_damaged_inquiry_date_is_not_repaired_from_a_crop() -> None:
     line = corrected[0]["lines"][0]
     assert line["text"] == pages[0]["lines"][0]["text"]
     assert "ocr_correction" not in line
-    assert overlay.audit()["targeted_ocr_requests"] == 1
+    assert overlay.audit()["repair_evidence_reparse_attempt_count"] == 0
 
 
 def test_invalid_summary_value_is_withheld_without_whole_page_replay() -> None:
-    overlay = PersonalDetailOCRCorrectionOverlay(
-        SimpleNamespace(),
-        page_image_resolver=_FakeResolver(),
-        repair_engine=_FakeCellRepairEngine(),
-        enable_targeted_ocr=True,
-    )
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
     payload = {
         "personal_detail_summary_cells": [
             {
@@ -582,7 +558,8 @@ def test_invalid_summary_value_is_withheld_without_whole_page_replay() -> None:
     audit = overlay.audit()
 
     assert corrected["personal_detail_summary_cells"][0]["value"] is None
-    assert audit["targeted_ocr_requests"] == 1
+    assert audit["repair_evidence_reparse_attempt_count"] == 0
+    assert audit["ocr_started_by_correction_overlay"] is False
     assert audit["abnormal_cell_count"] == 1
     assert audit["decisions"] == []
 

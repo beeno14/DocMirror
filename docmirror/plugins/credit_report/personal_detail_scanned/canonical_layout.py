@@ -5,9 +5,9 @@
 
 The sealed :class:`ParseResult` is source evidence, not the document model used
 by the detailed-report extractors.  This module projects its arbitrary logical
-fragments onto the fixed PBOC page family, retries a complete logical page when
-the template cannot be identified, and exposes detached pages and tables that
-all downstream extractors share.
+fragments onto the fixed PBOC page family using static source evidence and
+exposes detached pages and tables that all downstream extractors share.  OCR
+acquisition is forbidden here; schema-triggered page repair happens later.
 
 Templates describe semantic page roles and dynamic tables.  They deliberately
 do not encode subject names, institution names, account identifiers, or any
@@ -22,12 +22,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-
 _PRINTED_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*[,，]?\s*共\s*(?P<total>\d+)\s*页")
 _MONTHLY_GRID_RE = re.compile(
     r"20\d{2}\s*年\s*\d{1,2}\s*月\s*[-—一至到~～]\s*20\d{2}\s*年\s*\d{1,2}\s*月.*(?:还款|缴费)记录"
 )
-_DATE_CELL_RE = re.compile(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}")
 
 
 @dataclass(frozen=True)
@@ -43,20 +41,21 @@ class CanonicalLayoutProjection:
     evidence_pages: tuple[dict[str, Any], ...]
     registrations: tuple[dict[str, Any], ...]
     fragment_groups: tuple[dict[str, Any], ...]
-    retried_pages: tuple[int, ...]
     unresolved_pages: tuple[int, ...]
 
     def audit(self) -> dict[str, Any]:
         return {
-            "architecture": "canonical_template_registration_v1",
+            "architecture": "canonical_template_registration_v3_static",
             "parse_result_mutated": False,
             "page_count": len(self.pages),
             "registrations": deepcopy(list(self.registrations)),
             "fragment_groups": deepcopy(list(self.fragment_groups)),
-            "retried_pages": list(self.retried_pages),
             "unresolved_pages": list(self.unresolved_pages),
             "all_extractors_share_canonical_evidence": True,
             "cell_level_ocr_enabled": False,
+            "topology_ocr_free": True,
+            "template_registration_ocr_used": False,
+            "business_repair_after_schema": True,
         }
 
 
@@ -310,65 +309,15 @@ def _line_in_box(line: Mapping[str, Any], box: Sequence[float]) -> bool:
     ) or _overlap_ratio(candidate, box) >= 0.35
 
 
-def _words_for_cell(lines: Iterable[Mapping[str, Any]], box: Sequence[float]) -> list[Mapping[str, Any]]:
-    width = max(1.0, float(box[2]) - float(box[0]))
-    selected: list[Mapping[str, Any]] = []
-    for line in lines:
-        candidate = _bbox(line)
-        if candidate is None or not _line_in_box(line, box):
-            continue
-        # A full OCR line spanning several cells cannot safely repair any one
-        # cell.  The original table value is retained for the schema audit.
-        if candidate[2] - candidate[0] > width * 1.65:
-            continue
-        selected.append(line)
-    return sorted(selected, key=lambda item: ((_bbox(item) or (0, 0, 0, 0))[1], (_bbox(item) or (0, 0, 0, 0))[0]))
-
-
 def _project_table(
     table: Any,
     *,
-    evidence_lines: Sequence[Mapping[str, Any]],
     template_id: str,
-    retried: bool,
     transform: Callable[[Sequence[float]], list[float]],
 ) -> Any:
     metadata = deepcopy(dict(getattr(table, "metadata", None) or {}))
     rows = _raw_rows(table)
     cell_boxes = metadata.get("cell_bboxes")
-    replacements = 0
-    unresolved_cells = 0
-    if retried and rows and isinstance(cell_boxes, list):
-        corrected = deepcopy(rows)
-        for row_index, row in enumerate(rows):
-            if row_index >= len(cell_boxes) or not isinstance(cell_boxes[row_index], list):
-                continue
-            for column, original in enumerate(row):
-                if column >= len(cell_boxes[row_index]):
-                    continue
-                if template_id == "annotations_and_inquiries" and (
-                    (column == 0 and re.fullmatch(r"\d{1,4}", str(original or "").strip()))
-                    or (column == 1 and _DATE_CELL_RE.search(str(original or "")))
-                ):
-                    # Sequence/date cells already satisfying the canonical
-                    # contract outrank unconstrained OCR replay.  In dense
-                    # tables a neighboring watermark or row number can easily
-                    # turn a valid ``89`` into a high-confidence ``789``.
-                    continue
-                box = cell_boxes[row_index][column]
-                if not isinstance(box, (list, tuple)) or len(box) != 4:
-                    continue
-                words = _words_for_cell(evidence_lines, box)
-                if not words:
-                    if original:
-                        unresolved_cells += 1
-                    continue
-                candidate = "".join(str(word.get("text") or "").strip() for word in words).strip()
-                confidence = min((_finite(word.get("confidence")) for word in words), default=0.0)
-                if candidate and confidence >= 0.55 and candidate != original:
-                    corrected[row_index][column] = candidate
-                    replacements += 1
-        rows = corrected
     if rows:
         metadata["raw_rows"] = rows
     if isinstance(cell_boxes, list):
@@ -379,9 +328,6 @@ def _project_table(
             for row in cell_boxes
         ]
     metadata["canonical_template_id"] = template_id
-    metadata["canonical_full_page_ocr_retried"] = retried
-    metadata["canonical_cell_replacements"] = replacements
-    metadata["canonical_unresolved_original_cells"] = unresolved_cells
     table_box = _bbox(table)
     return SimpleNamespace(
         table_id=str(getattr(table, "table_id", "") or ""),
@@ -403,24 +349,30 @@ class PBOCCanonicalTemplateAssembler:
         topology: Any,
         reading_order_by_logical: Mapping[int, int],
         source_evidence_loader: Callable[[], list[dict[str, Any]]],
-        full_page_ocr_loader: Callable[..., list[dict[str, Any]]],
         issue_owner: Any,
+        source_page_loader: Callable[[], Iterable[Any]] | None = None,
     ) -> None:
         self.parse_result = parse_result
         self.topology = topology
         self.reading_order = {int(key): int(value) for key, value in reading_order_by_logical.items()}
         self.source_evidence_loader = source_evidence_loader
-        self.full_page_ocr_loader = full_page_ocr_loader
         self.issue_owner = issue_owner
+        self.source_page_loader = source_page_loader
 
     def build(self) -> CanonicalLayoutProjection:
+        source_evidence = self.source_evidence_loader()
+        source_pages = (
+            list(self.source_page_loader())
+            if callable(self.source_page_loader)
+            else list(getattr(self.parse_result, "pages", None) or [])
+        )
         raw_pages = {
             int(getattr(page, "page_number", 0) or index): page
-            for index, page in enumerate(getattr(self.parse_result, "pages", None) or [], start=1)
+            for index, page in enumerate(source_pages, start=1)
         }
         evidence = {
             int(page.get("page") or 0): deepcopy(page)
-            for page in self.source_evidence_loader()
+            for page in source_evidence
             if isinstance(page, Mapping) and int(page.get("page") or 0) > 0
         }
         for logical, page in raw_pages.items():
@@ -442,15 +394,13 @@ class PBOCCanonicalTemplateAssembler:
                 ],
             }
         registrations: dict[int, dict[str, Any]] = {}
-        retried: set[int] = set()
-
         for logical, page_evidence in evidence.items():
             page = raw_pages.get(logical, SimpleNamespace(tables=[], texts=[]))
             result = _classify(_page_text(page, page_evidence))
             if result is not None:
                 template_id, confidence, signals = result
                 registrations[logical] = self._registration(
-                    logical, template_id, confidence, "initial_full_page_evidence", signals, page_evidence
+                    logical, template_id, confidence, "source_page_evidence", signals, page_evidence
                 )
                 continue
             if len(_compact(_page_text(page, page_evidence))) < 8:
@@ -464,36 +414,10 @@ class PBOCCanonicalTemplateAssembler:
                     status="blank",
                 )
 
-        retry_pages = sorted(set(evidence) - set(registrations), key=lambda value: self.reading_order.get(value, value))
-        for logical in retry_pages:
-            replay = self.full_page_ocr_loader(
-                [logical],
-                reason="canonical_template_registration_failed",
-            )
-            candidate = next((page for page in replay if int(page.get("page") or 0) == logical), None)
-            if not candidate:
-                continue
-            retried.add(logical)
-            result = _classify(_page_text(raw_pages.get(logical, SimpleNamespace(tables=[], texts=[])), candidate))
-            if result is None:
-                evidence[logical] = deepcopy(candidate)
-                continue
-            template_id, confidence, signals = result
-            evidence[logical] = deepcopy(candidate)
-            registrations[logical] = self._registration(
-                logical,
-                template_id,
-                confidence,
-                "full_page_reocr",
-                signals,
-                candidate,
-                retried=True,
-            )
-
         # Canonical pages often start in the middle of an account or repeated
-        # table.  After re-OCR, a remaining fragment may inherit only from the
-        # nearest registered page in document order, which is template-flow
-        # continuation rather than generic layout reconstruction.
+        # table. A remaining fragment may inherit only from the nearest
+        # registered page in document order, which is template-flow
+        # continuation rather than generic layout reconstruction or OCR.
         ordered = sorted(evidence, key=lambda value: self.reading_order.get(value, value))
         active_template = ""
         for logical in ordered:
@@ -513,7 +437,6 @@ class PBOCCanonicalTemplateAssembler:
                     "canonical_flow_continuation",
                     ("preceding_template_role", "no_conflicting_section_anchor"),
                     evidence[logical],
-                    retried=logical in retried,
                 )
 
         unresolved = tuple(
@@ -529,7 +452,6 @@ class PBOCCanonicalTemplateAssembler:
                 "canonical_registration_exhausted",
                 ("no_generic_layout_fallback",),
                 evidence[logical],
-                retried=logical in retried,
                 status="unresolved",
             )
             self._record_registration_failure(logical, registrations[logical])
@@ -554,7 +476,6 @@ class PBOCCanonicalTemplateAssembler:
             evidence_pages=tuple(canonical_evidence),
             registrations=tuple(registrations[key] for key in sorted(registrations, key=lambda v: self.reading_order.get(v, v))),
             fragment_groups=tuple(group_audits),
-            retried_pages=tuple(sorted(retried)),
             unresolved_pages=unresolved,
         )
 
@@ -567,7 +488,6 @@ class PBOCCanonicalTemplateAssembler:
         signals: Iterable[str],
         evidence: Mapping[str, Any],
         *,
-        retried: bool = False,
         status: str = "registered",
     ) -> dict[str, Any]:
         printed = _printed_identity(evidence)
@@ -580,7 +500,6 @@ class PBOCCanonicalTemplateAssembler:
             "confidence": round(float(confidence), 4),
             "basis": basis,
             "signals": list(signals),
-            "full_page_reocr": retried,
             **({"printed_page": printed[0], "printed_total": printed[1]} if printed else {}),
             **({"affected_source_datasets": list(spec.datasets)} if spec else {}),
         }
@@ -602,7 +521,7 @@ class PBOCCanonicalTemplateAssembler:
         for logical in sorted(evidence, key=lambda value: self.reading_order.get(value, value)):
             registration = registrations[logical]
             printed_page = int(registration.get("printed_page") or 0)
-            if not printed_page and evidence[logical].get("plugin_replayed_subpage"):
+            if not printed_page and evidence[logical].get("plugin_static_subpage"):
                 source_page = int(registration.get("source_page") or evidence[logical].get("source_page") or 0)
                 template_id = str(registration.get("template_id") or "")
                 compatible = {
@@ -662,9 +581,7 @@ class PBOCCanonicalTemplateAssembler:
                 for table in getattr(raw_page, "tables", None) or []:
                     projected = _project_table(
                         table,
-                        evidence_lines=local_lines,
                         template_id=template_id,
-                        retried=bool(registrations[logical].get("full_page_reocr")),
                         transform=transform,
                     )
                     tables.append(projected)
@@ -809,8 +726,8 @@ class PBOCCanonicalTemplateAssembler:
                 category="ocr_structure_correction",
                 issue_code="canonical_page_registration_failed",
                 message=(
-                    "The logical page could not be registered to a canonical PBOC layout after complete-page "
-                    "OCR retry; generic reconstruction was not used."
+                    "The logical page could not be registered to a canonical PBOC layout from static source "
+                    "evidence; generic reconstruction was not used and business repair may retry the page."
                 ),
                 parser_stage="canonical_template_registration",
                 observed_value={
@@ -827,7 +744,8 @@ class PBOCCanonicalTemplateAssembler:
                     },
                 ),
                 reason_codes=(
-                    "canonical_layout_unknown_after_reocr",
+                    "canonical_layout_unresolved_from_source_evidence",
+                    "schema_triggered_page_repair_eligible",
                     "no_generic_layout_fallback",
                     "normalized_values_withheld_for_page",
                 ),

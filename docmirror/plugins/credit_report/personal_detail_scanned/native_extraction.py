@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
+from difflib import SequenceMatcher
 from typing import Any
 
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
@@ -162,7 +163,7 @@ def _identifier(value: Any) -> str | None:
 
 def _typed_identifier(value: Any) -> str | None:
     identifier = _identifier(value)
-    if not identifier or not re.fullmatch(r"[A-Z0-9-]{8,}", identifier, re.IGNORECASE):
+    if not identifier or not re.fullmatch(r"[A-Z0-9-]{8,80}", identifier, re.IGNORECASE):
         return None
     if not re.search(r"[A-Z]", identifier, re.IGNORECASE) or not re.search(r"\d", identifier):
         return None
@@ -424,7 +425,7 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
     raw = _compact(raw_status)
     if not raw:
         return {}
-    status = {
+    status_labels = {
         "正常": "active",
         "逾期": "active",
         "呆账": "active",
@@ -433,7 +434,27 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
         "转出": "transferred_out",
         "结束": "closed",
         "未激活": "inactive",
-    }.get(raw, raw)
+        "冻结": "frozen",
+        "止付": "suspended",
+        "银行止付": "suspended",
+        "司法追偿": "recovery",
+        "担保物不足": "collateral_shortfall",
+        "强制平仓": "forced_liquidation",
+        "催收": "collection",
+    }
+    source_label = raw
+    status = status_labels.get(raw)
+    repaired_noise = False
+    if status is None:
+        matches = [label for label in status_labels if label in raw]
+        if len(matches) == 1:
+            remaining = raw.replace(matches[0], "", 1)
+            if len(remaining) <= 2:
+                source_label = matches[0]
+                status = status_labels[source_label]
+                repaired_noise = True
+    if status is None:
+        status = raw
     lifecycle = {
         "active": "open",
         "inactive": "open",
@@ -444,17 +465,20 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "account_status": status,
         "account_status_raw": raw,
+        "account_status_resolution": "ocr_noise_normalized" if repaired_noise else "resolved"
+        if status in status_labels.values()
+        else "unresolved",
     }
     if lifecycle:
         result["account_lifecycle_state"] = lifecycle
-    if raw == "未激活":
+    if source_label == "未激活":
         result["card_activation_state"] = "not_activated"
-    elif raw == "呆账":
+    elif source_label == "呆账":
         result["credit_quality_status"] = "bad_debt"
-    if raw == "逾期":
+    if source_label == "逾期":
         result["current_overdue"] = True
         result["current_overdue_status"] = "overdue"
-    elif raw in {"正常", "结清", "销户", "转出"}:
+    elif source_label in {"正常", "结清", "销户", "转出"}:
         result["current_overdue"] = False
         result["current_overdue_status"] = "not_overdue"
     return result
@@ -518,6 +542,7 @@ def _apply_account_facts(account: dict[str, Any], rows: list[list[str]]) -> None
     raw_status = _field(facts, "账户状态", "状态")
     if raw_status:
         account.update(_status_fields(raw_status))
+        account.setdefault("canonical_raw", {})["account_status"] = raw_status
 
     for row in rows:
         text = _clean(" ".join(row))
@@ -901,14 +926,6 @@ def _extract_table_accounts(
     return accounts, list(deduped.values()), account_events
 
 
-_ACCOUNT_SECTION_TYPES: tuple[tuple[str, str], ...] = (
-    ("非循环贷账户", "non_revolving_loan"),
-    ("循环贷账户一", "revolving_loan_subaccount"),
-    ("循环贷账户二", "revolving_loan_account"),
-    ("循环贷账户", "revolving_loan_subaccount"),
-    ("准贷记卡账户", "quasi_credit_card"),
-    ("贷记卡账户", "credit_card"),
-)
 _ACCOUNT_SECTION_END = (
     "授信协议信息",
     "相关还款责任信息",
@@ -917,6 +934,24 @@ _ACCOUNT_SECTION_END = (
     "查询记录",
     "报告说明",
 )
+
+
+def _account_family_from_heading(value: Any) -> tuple[str, str] | None:
+    """Resolve the printed PBOC family without collapsing R1 and R2."""
+    compact = re.sub(r"[\s（）()：:、，,。._-]+", "", str(value or ""))
+    if "非循环贷账户" in compact:
+        return "non_revolving_loan", "exact"
+    if "循环贷账户一" in compact:
+        return "revolving_loan_subaccount", "exact"
+    if "循环贷账户二" in compact:
+        return "revolving_loan_account", "exact"
+    if "准贷记卡账户" in compact:
+        return "quasi_credit_card", "exact"
+    if "贷记卡账户" in compact:
+        return "credit_card", "exact"
+    if "循环贷账户" in compact:
+        return "revolving_loan_subaccount", "ambiguous_missing_variant"
+    return None
 _ACCOUNT_ANCHOR_RE = re.compile(
     r"^[^\u3400-\u9fff0-9]*账户\s*(\d{1,3})?\s*(?:[：:(（]|$|\s)"
 )
@@ -983,6 +1018,7 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
         return []
     flattened: list[dict[str, Any]] = []
     active_type = ""
+    active_family_quality = ""
     for page in evidence_loader():
         lines = [line for line in page.get("lines") or () if isinstance(line, dict)]
         for index, line in enumerate(lines):
@@ -990,12 +1026,12 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             compact = _compact(text)
             if active_type and any(marker in compact for marker in _ACCOUNT_SECTION_END):
                 active_type = ""
-            marker = next(
-                (account_type for label, account_type in _ACCOUNT_SECTION_TYPES if label in compact),
-                None,
-            )
+                active_family_quality = ""
+            family = _account_family_from_heading(compact)
+            marker = family[0] if family else None
             if marker is not None:
                 active_type = marker
+                active_family_quality = family[1]
             flattened.append(
                 {
                     **line,
@@ -1003,6 +1039,7 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
                     "page": int(page.get("page") or 0),
                     "source_page": int(page.get("source_page") or 0),
                     "account_type": active_type,
+                    "account_family_quality": active_family_quality,
                     "line_index": index,
                 }
             )
@@ -1038,6 +1075,7 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
                 "sequence": len(skeletons) + 1,
                 "category_sequence": ordinal,
                 "account_type": account_type,
+                "account_family_quality": str(anchor.get("account_family_quality") or ""),
                 "account_state": "unknown",
                 "source": "candidate_b_account_anchor",
                 "page": int(anchor.get("page") or 0),
@@ -1192,6 +1230,7 @@ def _extract_accounts(
                 "sequence",
                 "category_sequence",
                 "account_type",
+                "account_family_quality",
                 "page",
                 "source_page",
                 "bbox",
@@ -1273,6 +1312,85 @@ def _extract_accounts(
             ),
         )
 
+    for account in emitted:
+        if account.get("account_family_quality") != "ambiguous_missing_variant":
+            continue
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_family_variant_unresolved",
+                message=(
+                    "The printed revolving-loan family heading did not preserve its one/two variant; "
+                    "the conservative R1 family was retained and explicitly marked uncertain."
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=str(account.get("account_id") or ""),
+                field_name="account_type",
+                observed_value="循环贷账户",
+                candidate_value=account.get("account_type"),
+                source_refs=account.get("source_refs") or (),
+                reason_codes=("account_family_variant_missing", "normalized_value_requires_review"),
+            ),
+        )
+
+    emitted_by_family: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for account in emitted:
+        account_type = str(account.get("account_type") or "")
+        try:
+            ordinal = int(account.get("category_sequence") or 0)
+        except (TypeError, ValueError):
+            ordinal = 0
+        if account_type and ordinal > 0:
+            emitted_by_family[account_type].append(account)
+    for account_type, family_accounts in emitted_by_family.items():
+        observed = sorted({int(account["category_sequence"]) for account in family_accounts})
+        if not observed:
+            continue
+        # PBOC category ordinals start at one and are dense. Bound the gap
+        # expansion so a single OCR-joined outlier cannot manufacture hundreds
+        # of supposed missing records; the outlier is still reported below.
+        credible_ceiling = max(12, len(observed) * 3)
+        bounded_endpoint = min(max(observed), credible_ceiling)
+        missing = sorted(set(range(1, bounded_endpoint + 1)) - set(observed))
+        outliers = [ordinal for ordinal in observed if ordinal > credible_ceiling]
+        if not missing and not outliers:
+            continue
+        refs = [
+            dict(ref)
+            for account in family_accounts
+            for ref in account.get("source_refs") or ()
+            if isinstance(ref, dict)
+        ]
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="candidate_b_account_sequence_gap",
+                message=(
+                    "Printed account ordinals in one PBOC account family were not dense; no missing records "
+                    "were invented and the ordinal ambiguity was retained for downstream review."
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                observed_value={
+                    "account_type": account_type,
+                    "observed_category_sequences": observed,
+                },
+                candidate_value={
+                    "missing_category_sequences": missing,
+                    "outlier_category_sequences": outliers,
+                },
+                source_refs=refs,
+                reason_codes=(
+                    "printed_category_ordinals_not_dense",
+                    "missing_records_not_invented",
+                    "business_population_uncertain",
+                ),
+            ),
+        )
+
     account_identifiers = {
         str(account.get("account_id") or ""): account.get("account_identifier")
         for account in emitted
@@ -1290,10 +1408,10 @@ def _extract_accounts(
 
 
 def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
-    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
     records: list[dict[str, Any]] = []
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("credit_lines"):
@@ -1317,9 +1435,34 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
             continue
         due_raw = _field(facts, "到期日期")
         currency = _currency(_field(facts, "币种")) or "CNY"
+        printed_sequence_raw = _field(facts, "__printed_sequence")
+        printed_sequence = int(printed_sequence_raw) if str(printed_sequence_raw).isdigit() else None
+        raw_limit_identifier = _field(facts, "授信限额编号")
+        limit_identifier = _typed_identifier(raw_limit_identifier)
+        if raw_limit_identifier and not limit_identifier:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_credit_limit_identifier_unresolved",
+                    message="The credit-limit identifier cell contained multiple or invalid identifier tokens and was withheld.",
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=stable_record_id("credit_line", identifier),
+                    field_name="limit_identifier",
+                    observed_value=raw_limit_identifier,
+                    source_refs=candidate.source_refs,
+                    reason_codes=(
+                        "canonical_credit_agreement_card",
+                        "typed_identifier_failed",
+                        "normalized_value_withheld",
+                    ),
+                ),
+            )
         records.append(
             {
                 "credit_line_id": stable_record_id("credit_line", identifier),
+                "_printed_sequence": printed_sequence,
                 "account_identifier": identifier,
                 "institution": _clean(_field(facts, "管理机构")),
                 "facility_type": _clean(_field(facts, "授信额度用途")),
@@ -1328,7 +1471,7 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
                 "validity_type": "perpetual" if _compact(due_raw) == "长期" else "fixed_term",
                 "total_limit": _number(_field(facts, "授信额度")),
                 "used_limit": _number(_field(facts, "已用额度")),
-                "limit_identifier": _identifier(_field(facts, "授信限额编号")),
+                "limit_identifier": limit_identifier,
                 "currency": currency,
                 "account_currency": currency,
                 "reporting_amount_currency": "CNY",
@@ -1343,6 +1486,66 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
     return _dedupe_prefixed_identifiers(records, "account_identifier")
 
 
+def _agreement_identifier_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _agreement_identifier_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    sequence = SequenceMatcher(None, left, right).ratio()
+    left_counts = Counter(left)
+    right_counts = Counter(right)
+    shared = sum((left_counts & right_counts).values())
+    multiset = 2.0 * shared / max(1, len(left) + len(right))
+    return max(sequence, multiset)
+
+
+def _agreement_strong_field_matches(left: Mapping[str, Any], right: Mapping[str, Any]) -> int:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import normalize_institution_name
+
+    matches = 0
+    for field_name in (
+        "institution",
+        "facility_type",
+        "effective_date",
+        "due_date",
+        "total_limit",
+        "used_limit",
+        "currency",
+    ):
+        left_value = left.get(field_name)
+        right_value = right.get(field_name)
+        if left_value in (None, "") or right_value in (None, ""):
+            continue
+        if field_name == "institution":
+            equal = normalize_institution_name(str(left_value)) == normalize_institution_name(str(right_value))
+        elif field_name in {"total_limit", "used_limit"}:
+            equal = str(left_value).replace(",", "") == str(right_value).replace(",", "")
+        else:
+            equal = _compact(left_value) == _compact(right_value)
+        matches += int(equal)
+    return matches
+
+
+def _agreement_source_pages(record: Mapping[str, Any]) -> set[int]:
+    return {
+        int(ref.get("logical_page") or ref.get("page") or 0)
+        for ref in record.get("source_refs") or ()
+        if isinstance(ref, dict) and (ref.get("logical_page") or ref.get("page"))
+    }
+
+
+def _agreement_printed_sequences_compatible(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_sequence = left.get("_printed_sequence")
+    right_sequence = right.get("_printed_sequence")
+    return (
+        left_sequence in (None, "")
+        or right_sequence in (None, "")
+        or int(left_sequence) == int(right_sequence)
+    )
+
+
 def reconcile_candidate_b_credit_lines(
     parse_result: Any,
     records: list[dict[str, Any]],
@@ -1352,20 +1555,47 @@ def reconcile_candidate_b_credit_lines(
 
     groups: dict[str, list[dict[str, Any]]] = {}
     order: list[str] = []
+    prototypes: dict[str, dict[str, Any]] = {}
     for index, source in enumerate(records):
         record = dict(source)
+        raw_identifier = _agreement_identifier_text(record.get("account_identifier"))
         identifier = _typed_identifier(record.get("account_identifier"))
         if identifier:
             record["account_identifier"] = identifier
             record["credit_line_id"] = stable_record_id("credit_line", identifier)
         identity = str(record.get("credit_line_id") or f"candidate_b_credit_line_row:{index + 1}")
+        if identity not in groups and raw_identifier:
+            compatible = [
+                candidate_identity
+                for candidate_identity, prototype in prototypes.items()
+                if _agreement_identifier_similarity(
+                    raw_identifier, _agreement_identifier_text(prototype.get("account_identifier"))
+                )
+                >= 0.90
+                and _agreement_strong_field_matches(record, prototype) >= 3
+                and _agreement_printed_sequences_compatible(record, prototype)
+                and (
+                    not identifier
+                    or bool(_agreement_source_pages(record) & _agreement_source_pages(prototype))
+                )
+            ]
+            if len(compatible) == 1:
+                identity = compatible[0]
         if identity not in groups:
             groups[identity] = []
             order.append(identity)
+            prototypes[identity] = record
         groups[identity].append(record)
 
     reconciled: list[dict[str, Any]] = []
-    ignored_fields = {"source", "source_refs", "confidence", "credit_line_id"}
+    ignored_fields = {
+        "source",
+        "source_refs",
+        "confidence",
+        "credit_line_id",
+        "sequence",
+        "_printed_sequence",
+    }
     for identity in order:
         observations = groups[identity]
         ranked = sorted(
@@ -1378,6 +1608,14 @@ def reconcile_candidate_b_credit_lines(
             reverse=True,
         )
         selected = dict(ranked[0])
+        printed_sequences = {
+            int(observation["_printed_sequence"])
+            for observation in observations
+            if observation.get("_printed_sequence") not in (None, "")
+        }
+        if len(printed_sequences) == 1:
+            selected["sequence"] = next(iter(printed_sequences))
+        selected.pop("_printed_sequence", None)
         conflicts: set[str] = set()
         merged_refs: list[dict[str, Any]] = []
         seen_refs: set[str] = set()
@@ -1395,7 +1633,13 @@ def reconcile_candidate_b_credit_lines(
                 retained = selected.get(key)
                 if retained in (None, "", [], {}):
                     selected[key] = deepcopy(value)
-                elif retained != value:
+                elif retained != value and not (
+                    key == "account_identifier"
+                    and _agreement_identifier_similarity(
+                        _agreement_identifier_text(retained), _agreement_identifier_text(value)
+                    )
+                    >= 0.90
+                ):
                     conflicts.add(key)
         if merged_refs:
             selected["source_refs"] = merged_refs
@@ -1425,14 +1669,52 @@ def reconcile_candidate_b_credit_lines(
                     ),
                 ),
             )
+    sequence_counts = Counter(
+        int(record["sequence"])
+        for record in reconciled
+        if record.get("sequence") not in (None, "")
+    )
+    for record in reconciled:
+        sequence = record.get("sequence")
+        reason_codes: tuple[str, ...]
+        if sequence not in (None, "") and sequence_counts[int(sequence)] == 1:
+            continue
+        if sequence not in (None, ""):
+            record.pop("sequence", None)
+            reason_codes = (
+                "printed_sequence_collision",
+                "row_order_not_used",
+                "normalized_value_withheld",
+            )
+        else:
+            reason_codes = (
+                "printed_sequence_unreadable",
+                "row_order_not_used",
+                "normalized_value_withheld",
+            )
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="candidate_b_credit_agreement_sequence_unresolved",
+                message="The printed credit-agreement ordinal was missing or non-unique; encounter order was not emitted as business data.",
+                parser_stage="candidate_b_credit_agreement_schema",
+                target_dataset="credit_lines",
+                target_record_id=str(record.get("credit_line_id") or "") or None,
+                field_name="sequence",
+                observed_value=sequence,
+                source_refs=record.get("source_refs") or (),
+                reason_codes=reason_codes,
+            ),
+        )
     return reconciled
 
 
 def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
     from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
         PBOCPersonalDetailNativeParser,
     )
-    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
     records: list[dict[str, Any]] = []
     for candidate in PBOCPersonalDetailNativeParser(parse_result).records("repayment_liability_records"):
@@ -1674,6 +1956,82 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalized_inquiry_field(field_name: str, value: Any) -> str:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        normalize_institution_name,
+        normalize_role_candidate,
+    )
+
+    if field_name == "institution":
+        normalized = normalize_institution_name(str(value or ""))
+        compact = re.sub(r"\s+", "", normalized)
+        # PBOC personal-query rows use 本人 as the institution.  Permit only a
+        # tiny amount of surrounding OCR debris so bank names cannot collapse
+        # into this special value.
+        if "本人" in compact and len(compact.replace("本人", "")) <= 2:
+            return "本人"
+        return normalized
+
+    if field_name == "reason":
+        normalized = normalize_role_candidate(value, "inquiry_reason")
+        compact = re.sub(r"\s+", "", normalized)
+        for canonical in (
+            "本人查询",
+            "贷后管理",
+            "贷款审批",
+            "信用卡审批",
+            "担保资格审查",
+            "融资审批",
+            "保前审查",
+            "保后管理",
+            "客户准入资格审查",
+            "资信审查",
+            "法人代表、负责人、高管",
+        ):
+            if canonical in compact:
+                return canonical
+        return normalized
+
+    role = {
+        "inquiry_date": "date",
+    }[field_name]
+    return normalize_role_candidate(value, role)
+
+
+def _inquiry_business_equivalent(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    if any(
+        _normalized_inquiry_field(field, left.get(field))
+        != _normalized_inquiry_field(field, right.get(field))
+        for field in ("inquiry_date", "reason")
+    ):
+        return False
+    left_institution = re.sub(r"\s+", "", _normalized_inquiry_field("institution", left.get("institution")))
+    right_institution = re.sub(r"\s+", "", _normalized_inquiry_field("institution", right.get("institution")))
+    if left_institution == right_institution:
+        return True
+    return (
+        abs(len(left_institution) - len(right_institution)) <= 2
+        and bool(left_institution)
+        and bool(right_institution)
+        and (left_institution in right_institution or right_institution in left_institution)
+    )
+
+
+def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, float]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import role_candidate_is_valid
+
+    valid = sum(
+        role_candidate_is_valid(record.get(field), role)
+        for field, role in (
+            ("inquiry_date", "date"),
+            ("institution", "institution_name"),
+            ("reason", "inquiry_reason"),
+        )
+    )
+    populated = sum(record.get(field) not in (None, "") for field in ("inquiry_date", "institution", "reason"))
+    return valid, populated, float(record.get("confidence") or 0.0)
+
+
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     active_canonical_table = False
@@ -1758,7 +2116,10 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             continue
         current_values = tuple(current.get(field) for field in ("inquiry_date", "institution", "reason"))
         candidate_values = tuple(record.get(field) for field in ("inquiry_date", "institution", "reason"))
-        if current_values != candidate_values:
+        current_score = _inquiry_observation_score(current)
+        candidate_score = _inquiry_observation_score(record)
+        equivalent = _inquiry_business_equivalent(current, record)
+        if not equivalent and current_score[:2] == candidate_score[:2]:
             record_issue(
                 parse_result,
                 make_issue(
@@ -1773,7 +2134,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     reason_codes=("canonical_observation_conflict", "requires_review"),
                 ),
             )
-        if float(record.get("confidence") or 0.0) > float(current.get("confidence") or 0.0):
+        if candidate_score > current_score:
             best[key] = record
     # Full-page OCR occasionally prefixes a row number with a neighbouring
     # watermark digit (89 -> 789).  If the suffix row already exists in the
@@ -2016,115 +2377,280 @@ def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
     return records
 
 
+def _canonical_header_slots(
+    row: tuple[str, ...], aliases: Mapping[str, tuple[str, ...]]
+) -> dict[str, int]:
+    """Map semantic roles to distinct physical columns in a printed header."""
+    candidates: dict[str, int] = {}
+    by_column: defaultdict[int, list[str]] = defaultdict(list)
+    for role, labels in aliases.items():
+        for column, cell in enumerate(row):
+            text = _compact(cell)
+            if text and any(_compact(label) in text for label in labels):
+                candidates[role] = column
+                by_column[column].append(role)
+                break
+    # A single OCR blob containing several labels is not a column graph.
+    duplicate_columns = {column for column, roles in by_column.items() if len(roles) > 1}
+    return {role: column for role, column in candidates.items() if column not in duplicate_columns}
+
+
+def _slot_value(row: tuple[str, ...], slots: Mapping[str, int], role: str) -> str:
+    column = slots.get(role)
+    return _clean(row[column]) if column is not None and column < len(row) else ""
+
+
+def _sequence_value(row: tuple[str, ...], slots: Mapping[str, int]) -> int | None:
+    value = _slot_value(row, slots, "sequence")
+    match = re.fullmatch(r"\D*(\d{1,3})\D*", value)
+    return int(match.group(1)) if match else None
+
+
+def _report_required_row_failure(
+    parse_result: Any,
+    *,
+    issue_code: str,
+    dataset: str,
+    sequence: int,
+    field_name: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code=issue_code,
+            message="A canonical table row was observed but a required business cell could not be assigned to its printed column.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            target_record_id=f"{dataset}:{sequence}",
+            field_name=field_name,
+            observed_value={"sequence": sequence, "physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("canonical_column_graph", "required_cell_unresolved", "normalized_value_withheld"),
+        ),
+    )
+
+
+def _report_header_graph_failure(
+    parse_result: Any,
+    *,
+    dataset: str,
+    page: Any,
+    table: Any,
+    row_index: int,
+    row: tuple[str, ...],
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_canonical_header_graph_unresolved",
+            message="Canonical header labels were observed, but OCR did not preserve distinct physical columns.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            observed_value={"physical_header_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("merged_header_cells", "column_roles_unresolved", "page_ocr_eligible"),
+        ),
+    )
+
+
+def _report_unkeyed_fragment(
+    parse_result: Any,
+    *,
+    dataset: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="page_continuation",
+            issue_code="candidate_b_continuation_sequence_unresolved",
+            message="A continued provider fragment lacked a trustworthy printed sequence and was not attached by row order.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            field_name="sequence",
+            observed_value={"physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("continuation_fragment", "printed_sequence_unreadable", "row_order_not_used"),
+        ),
+    )
+
+
 def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
+    aliases = {
+        "sequence": ("编号",),
+        "address": ("居住地址",),
+        "residential_phone": ("住宅电话",),
+        "residence_status": ("居住状况",),
+        "information_updated_date": ("信息更新日期",),
+    }
     records: dict[int, dict[str, Any]] = {}
-    provider_rows: dict[int, tuple[str, dict[str, Any]]] = {}
-    residence_table_id = ""
+    providers: dict[int, tuple[str, dict[str, Any]]] = {}
+    active_slots: dict[str, int] = {}
+    mode = ""
+    previous_table_id = ""
     continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "page_number", 0) or 0)
         source_page = int(getattr(page, "source_page_number", 0) or page_number)
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            if not rows:
-                continue
-            header_index = next(
-                (
-                    index
-                    for index, row in enumerate(rows)
-                    if all(
-                        marker in _compact("".join(row))
-                        for marker in ("编号", "居住地址", "住宅电话", "居住状况", "信息更新日期")
-                    )
-                ),
-                None,
+            table_id = str(getattr(table, "table_id", "") or "")
+            table_text = _compact(" ".join(cell for row in rows for cell in row))
+            continues = bool(
+                previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
             )
-            if header_index is not None:
-                residence_table_id = str(getattr(table, "table_id", "") or residence_table_id)
-                provider_header = next(
-                    (
-                        index
-                        for index, row in enumerate(rows[header_index + 1 :], start=header_index + 1)
-                        if "数据发生机构名称" in _compact("".join(row))
-                    ),
-                    len(rows),
-                )
-                for row_index, row in enumerate(rows[header_index + 1 : provider_header], start=header_index + 1):
-                    sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                    if sequence_match is None:
-                        break
-                    sequence = int(sequence_match.group(0))
-                    address = _clean(row[1] if len(row) > 1 else "")
-                    phone = _clean(row[2] if len(row) > 2 else "")
-                    status = _clean(row[3] if len(row) > 3 else "")
-                    updated = _date(row[4] if len(row) > 4 else "")
-                    if not address:
-                        continue
-                    residence_id = stable_record_id("credit_residence", sequence, address, updated)
-                    records[sequence] = {
-                        "record_id": residence_id,
-                        "residence_record_id": residence_id,
+            residence_schema_markers = ("居住地址", "住宅电话", "居住状况")
+            other_section_markers = ("学历", "学位", "电子邮箱", "通讯地址", "户籍地址", "工作单位", "职业")
+            if (
+                mode in {"residence", "provider"}
+                and not any(marker in table_text for marker in residence_schema_markers)
+                and any(marker in table_text for marker in other_section_markers)
+            ):
+                continues = False
+            if not continues:
+                active_slots = {}
+                mode = ""
+            if not continues and not any(marker in table_text for marker in residence_schema_markers):
+                previous_table_id = table_id or previous_table_id
+                continue
+            if continues and mode == "residence" and rows:
+                nonempty_columns = [
+                    [index for index, value in enumerate(row) if _clean(value)] for row in rows
+                ]
+                if nonempty_columns and all(len(columns) == 2 and columns[0] == 0 for columns in nonempty_columns):
+                    active_slots = {"sequence": 0, "data_provider": nonempty_columns[0][1]}
+                    mode = "provider"
+            for row_index, row in enumerate(rows):
+                residence_slots = _canonical_header_slots(row, aliases)
+                compact_header = _compact("".join(row))
+                if all(marker in compact_header for marker in ("编号", "居住地址", "信息更新日期")) and not {
+                    "sequence",
+                    "address",
+                    "information_updated_date",
+                } <= set(residence_slots):
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="residence_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
+                    )
+                    active_slots = {}
+                    mode = ""
+                    continue
+                if {"sequence", "address", "information_updated_date"} <= set(residence_slots):
+                    active_slots = residence_slots
+                    mode = "residence"
+                    continue
+                if "数据发生机构名称" in _compact("".join(row)) and mode in {"residence", "provider"}:
+                    provider_slots = _canonical_header_slots(
+                        row, {"sequence": ("编号",), "data_provider": ("数据发生机构名称",)}
+                    )
+                    active_slots = provider_slots
+                    mode = "provider"
+                    continue
+                if not active_slots or mode not in {"residence", "provider"}:
+                    continue
+                sequence = _sequence_value(row, active_slots)
+                if sequence is None and mode == "provider":
+                    first = _clean(row[0] if row else "")
+                    sequence = int(first) if first.isdigit() else None
+                if sequence is None:
+                    nonempty = _nonempty(row)
+                    if (
+                        mode == "provider"
+                        and continues
+                        and 0 < len(nonempty) <= 2
+                        and any(
+                            re.search(r"(?:银行|信用社|有限公司|管理中心|征信中心)", value)
+                            for value in nonempty
+                        )
+                    ):
+                        _report_unkeyed_fragment(
+                            parse_result,
+                            dataset="residence_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    continue
+                ref = _source_ref(page, table, row=row_index)
+                if mode == "provider":
+                    provider = _slot_value(row, active_slots, "data_provider")
+                    if not provider or provider.isdigit():
+                        provider = next(
+                            (_clean(value) for index, value in enumerate(row) if index > 0 and _clean(value)), ""
+                        )
+                    if provider:
+                        providers[sequence] = (provider, ref)
+                    continue
+                address = _slot_value(row, active_slots, "address")
+                updated_raw = _slot_value(row, active_slots, "information_updated_date")
+                updated = _date(updated_raw)
+                record = records.setdefault(
+                    sequence,
+                    {
                         "sequence": sequence,
-                        "address": address,
-                        **({"residential_phone": phone} if phone and phone != "--" else {}),
-                        **({"residence_status": status} if status and status != "--" else {}),
-                        **({"information_updated_date": updated} if updated and updated != "--" else {}),
                         "page": page_number,
                         "source_page": source_page,
                         "source": "native_personal_detail_residence_table",
-                        "source_refs": [_source_ref(page, table, row=row_index)],
+                        "source_refs": [],
                         "confidence": 1.0,
-                    }
-                available_sequences = iter(sorted(records))
-                used_provider_sequences: set[int] = set()
-                for row_index, row in enumerate(rows[provider_header + 1 :], start=provider_header + 1):
-                    nonempty = [(index, _clean(value)) for index, value in enumerate(row) if _clean(value)]
-                    if not nonempty:
-                        continue
-                    sequence_match = re.search(r"\d+", nonempty[0][1]) if nonempty[0][0] == 0 else None
-                    sequence = int(sequence_match.group(0)) if sequence_match else None
-                    institution_parts = [
-                        value
-                        for index, value in nonempty
-                        if not (index == 0 and (sequence_match is not None or (len(value) <= 2 and len(nonempty) > 1)))
-                    ]
-                    institution = " ".join(institution_parts).strip()
-                    if sequence not in records:
-                        sequence = next(
-                            (
-                                candidate
-                                for candidate in available_sequences
-                                if candidate not in used_provider_sequences
-                            ),
-                            None,
-                        )
-                    if sequence is None or sequence not in records or not institution:
-                        continue
-                    institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
-                    provider_rows[sequence] = (institution, _source_ref(page, table, row=row_index))
-                    used_provider_sequences.add(sequence)
-            table_id = str(getattr(table, "table_id", "") or "")
-            if (
-                records
-                and residence_table_id
-                and table_id
-                and callable(continuation_check)
-                and continuation_check(residence_table_id, table_id) is True
-            ):
-                candidates: dict[int, tuple[str, dict[str, Any]]] = {}
-                for row_index, row in enumerate(rows):
-                    values = _nonempty(row)
-                    if len(values) != 2 or not values[0].isdigit():
-                        candidates = {}
-                        break
-                    candidates[int(values[0])] = (values[1], _source_ref(page, table, row=row_index))
-                if candidates and set(candidates) <= set(records):
-                    provider_rows.update(candidates)
+                    },
+                )
+                record["source_refs"].append(ref)
+                if address and address != "--":
+                    record["address"] = address
+                else:
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_residence_required_cell_unresolved",
+                        dataset="residence_records",
+                        sequence=sequence,
+                        field_name="address",
+                        row=row,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                    )
+                phone = _slot_value(row, active_slots, "residential_phone")
+                status = _slot_value(row, active_slots, "residence_status")
+                if phone and phone != "--":
+                    record["residential_phone"] = phone
+                if status and status != "--":
+                    record["residence_status"] = status
+                if updated and updated != "--":
+                    record["information_updated_date"] = updated
+            previous_table_id = table_id or previous_table_id
     for sequence, record in records.items():
-        provider = provider_rows.get(sequence)
-        if provider:
-            record["data_provider"] = provider[0]
-            record["source_refs"].append(provider[1])
+        if sequence in providers:
+            record["data_provider"] = providers[sequence][0]
+            record["source_refs"].append(providers[sequence][1])
+        residence_id = stable_record_id(
+            "credit_residence", sequence, record.get("address"), record.get("information_updated_date")
+        )
+        record["record_id"] = residence_id
+        record["residence_record_id"] = residence_id
     return [records[key] for key in sorted(records)]
 
 
@@ -2191,121 +2717,163 @@ def _split_employment_basic_row(row: tuple[str, ...]) -> dict[str, Any]:
 
 
 def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
+    basic_aliases = {
+        "sequence": ("编号",),
+        "employer": ("工作单位",),
+        "employer_type": ("单位性质",),
+        "employer_address": ("单位地址",),
+        "employer_phone": ("单位电话",),
+    }
+    detail_aliases = {
+        "sequence": ("编号",),
+        "occupation": ("职业",),
+        "industry": ("行业",),
+        "position": ("职务",),
+        "professional_title": ("职称",),
+        "entry_year": ("进入本单位年份",),
+        "information_updated_date": ("信息更新日期",),
+    }
     records: dict[int, dict[str, Any]] = {}
+    active_slots: dict[str, int] = {}
+    mode = ""
+    previous_table_id = ""
+    continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "page_number", 0) or 0)
         source_page = int(getattr(page, "source_page_number", 0) or page_number)
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            basic_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows)
-                    if all(marker in _compact("".join(row)) for marker in ("编号", "工作单位", "单位性质", "单位电话"))
-                ),
-                None,
+            table_id = str(getattr(table, "table_id", "") or "")
+            continues = bool(
+                previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
             )
-            if basic_header is None:
+            if not continues:
+                active_slots = {}
+                mode = ""
+            table_text = _compact(" ".join(cell for row in rows for cell in row))
+            table_has_employment_schema = any(
+                marker in table_text for marker in ("工作单位", "单位性质", "单位电话", "职业", "职务", "职称")
+            )
+            if not table_has_employment_schema and not continues:
+                previous_table_id = table_id or previous_table_id
                 continue
-            detail_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows[basic_header + 1 :], start=basic_header + 1)
-                    if all(marker in _compact("".join(row)) for marker in ("编号", "职业", "行业", "职务", "职称"))
-                ),
-                None,
-            )
-            if detail_header is None:
-                continue
-            institution_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows[detail_header + 1 :], start=detail_header + 1)
-                    if "数据发生机构名称" in _compact("".join(row))
-                ),
-                len(rows),
-            )
-            for row_index, row in enumerate(rows[basic_header + 1 : detail_header], start=basic_header + 1):
-                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                if sequence_match is None:
-                    continue
-                sequence = int(sequence_match.group(0))
-                parsed = _split_employment_basic_row(row)
-                records[sequence] = {
-                    "employment_record_id": stable_record_id("credit_employment", sequence, parsed),
-                    "sequence": sequence,
-                    **{key: value for key, value in parsed.items() if value and value != "--"},
-                    "page": page_number,
-                    "source_page": source_page,
-                    "source": "native_personal_detail_employment_table",
-                    "source_refs": [_source_ref(page, table, row=row_index)],
-                    "confidence": 1.0,
-                }
-            for row_index, row in enumerate(rows[detail_header + 1 : institution_header], start=detail_header + 1):
-                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                if sequence_match is None:
-                    continue
-                sequence = int(sequence_match.group(0))
-                if sequence not in records:
-                    continue
-                cells = [_clean(value) for value in row]
-                if len(cells) >= 7 and _date(cells[6]):
-                    entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", cells[5])
-                    detail = {
-                        "occupation": cells[1],
-                        "industry": cells[2],
-                        "position": cells[3],
-                        "professional_title": cells[4],
-                        "entry_year": int(entry_match.group(0)) if entry_match else None,
-                        "information_updated_date": _date(cells[6]),
-                    }
-                    records[sequence].update({key: value for key, value in detail.items() if value and value != "--"})
-                    records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
-                    continue
-                role_text = _clean(row[1] if len(row) > 1 else "")
-                industry = "批发和零售业" if "批发和零售业" in role_text else ""
-                occupation = role_text.replace(industry, "").strip(" #*-.")
-                trailing = re.sub(
-                    r"\s+",
-                    " ",
-                    " ".join(_clean(value) for value in row[3:] if _clean(value)),
-                ).strip()
-                date_match = re.search(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", trailing)
-                updated = _date(date_match.group(0)) if date_match else None
-                before_date = trailing[: date_match.start()].strip() if date_match else trailing
-                entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", before_date)
-                detail = {
-                    "occupation": occupation,
-                    "industry": industry,
-                    "position": _clean(row[2] if len(row) > 2 else ""),
-                    "professional_title": re.sub(r"[\s#*\-.]+", "", before_date),
-                    "entry_year": int(entry_match.group(0)) if entry_match else None,
-                    "information_updated_date": updated,
-                }
-                records[sequence].update({key: value for key, value in detail.items() if value and value != "--"})
-                records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
-            used_provider_sequences: set[int] = set()
-            for row_index, row in enumerate(rows[institution_header + 1 :], start=institution_header + 1):
-                cells = [_clean(value) for value in row]
-                first = cells[0] if cells else ""
-                sequence_match = re.search(r"\d+", first)
-                sequence = int(sequence_match.group(0)) if sequence_match else None
-                institution = " ".join(
-                    value
-                    for index, value in enumerate(cells)
-                    if value and not (index == 0 and sequence_match is not None)
-                ).strip()
-                if sequence not in records:
-                    sequence = next(
-                        (candidate for candidate in sorted(records) if candidate not in used_provider_sequences),
-                        None,
+            if continues and mode in {"basic", "detail"} and rows:
+                nonempty_columns = [
+                    [index for index, value in enumerate(row) if _clean(value)] for row in rows
+                ]
+                if nonempty_columns and all(len(columns) == 2 and columns[0] == 0 for columns in nonempty_columns):
+                    active_slots = {"sequence": 0, "data_provider": nonempty_columns[0][1]}
+                    mode = "provider"
+            for row_index, row in enumerate(rows):
+                basic_slots = _canonical_header_slots(row, basic_aliases)
+                detail_slots = _canonical_header_slots(row, detail_aliases)
+                compact_header = _compact("".join(row))
+                broken_basic = all(
+                    marker in compact_header for marker in ("编号", "工作单位", "单位性质", "单位电话")
+                ) and not {"sequence", "employer", "employer_type", "employer_phone"} <= set(basic_slots)
+                broken_detail = all(
+                    marker in compact_header for marker in ("编号", "职业", "行业", "职务", "职称")
+                ) and not {"sequence", "occupation", "industry", "position", "professional_title"} <= set(
+                    detail_slots
+                )
+                if broken_basic or broken_detail:
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="employment_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
                     )
-                if sequence is None or sequence not in records or not institution:
+                    active_slots = {}
+                    mode = ""
                     continue
-                institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
-                records[sequence]["data_provider"] = institution
-                records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
-                used_provider_sequences.add(sequence)
+                if {"sequence", "employer", "employer_type", "employer_phone"} <= set(basic_slots):
+                    active_slots = basic_slots
+                    mode = "basic"
+                    continue
+                if {"sequence", "occupation", "industry", "position", "professional_title"} <= set(detail_slots):
+                    active_slots = detail_slots
+                    mode = "detail"
+                    continue
+                if "数据发生机构名称" in _compact("".join(row)):
+                    active_slots = _canonical_header_slots(
+                        row, {"sequence": ("编号",), "data_provider": ("数据发生机构名称",)}
+                    )
+                    mode = "provider"
+                    continue
+                if not active_slots:
+                    continue
+                sequence = _sequence_value(row, active_slots)
+                if sequence is None and mode == "provider":
+                    first = _clean(row[0] if row else "")
+                    sequence = int(first) if first.isdigit() else None
+                if sequence is None:
+                    if mode == "provider" and _nonempty(row):
+                        _report_unkeyed_fragment(
+                            parse_result,
+                            dataset="employment_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    continue
+                record = records.setdefault(
+                    sequence,
+                    {
+                        "sequence": sequence,
+                        "page": page_number,
+                        "source_page": source_page,
+                        "source": "native_personal_detail_employment_table",
+                        "source_refs": [],
+                        "confidence": 1.0,
+                    },
+                )
+                record["source_refs"].append(_source_ref(page, table, row=row_index))
+                if mode == "provider":
+                    provider = _slot_value(row, active_slots, "data_provider")
+                    if not provider or provider.isdigit():
+                        provider = next(
+                            (_clean(value) for index, value in enumerate(row) if index > 0 and _clean(value)), ""
+                        )
+                    if provider:
+                        record["data_provider"] = provider
+                    continue
+                roles = basic_aliases if mode == "basic" else detail_aliases
+                for role in roles:
+                    if role == "sequence":
+                        continue
+                    raw = _slot_value(row, active_slots, role)
+                    if not raw or raw == "--":
+                        continue
+                    if role == "entry_year":
+                        match = re.fullmatch(r"\D*((?:19|20)\d{2})\D*", raw)
+                        if match:
+                            record[role] = int(match.group(1))
+                    elif role == "information_updated_date":
+                        converted = _date(raw)
+                        if converted:
+                            record[role] = converted
+                    else:
+                        record[role] = raw
+                required_role = "employer" if mode == "basic" else "occupation"
+                if not record.get(required_role):
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_employment_required_cell_unresolved",
+                        dataset="employment_records",
+                        sequence=sequence,
+                        field_name=required_role,
+                        row=row,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                    )
+            previous_table_id = table_id or previous_table_id
     for sequence, record in records.items():
         record["employment_record_id"] = stable_record_id(
             "credit_employment",
@@ -2356,7 +2924,7 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
     # Account numbers restart for each PBOC account family, so count the
     # maximum printed endpoint within each observed family instead of taking
     # one document-wide maximum.
-    family = "non_revolving_loan"
+    family = ""
     family_sequences: defaultdict[str, set[int]] = defaultdict(set)
     loader = getattr(parse_result, "corrected_evidence_pages", None)
     pages = loader() if callable(loader) else []
@@ -2365,18 +2933,11 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
             if not isinstance(line, dict):
                 continue
             text = _compact(line.get("text") or line.get("content") or "")
-            if "非循环贷账户" in text:
-                family = "non_revolving_loan"
-            elif "循环贷账户一" in text:
-                family = "revolving_loan_subaccount"
-            elif "循环贷账户二" in text:
-                family = "revolving_loan_account"
-            elif "准贷记卡账户" in text:
-                family = "quasi_credit_card"
-            elif "贷记卡账户" in text:
-                family = "credit_card"
+            heading = _account_family_from_heading(text)
+            if heading is not None:
+                family = heading[0]
             match = re.match(r"^(?:账户|业务)[（(]?(\d{1,3})(?:[）)]|\D|$)", text)
-            if match:
+            if match and family:
                 family_sequences[family].add(int(match.group(1)))
 
     endpoints: dict[str, int] = {}
@@ -2401,81 +2962,138 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
 
 
 def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
-    mobile_records: list[dict[str, Any]] = []
-    spouse_records: list[dict[str, Any]] = []
+    mobile_aliases = {
+        "sequence": ("编号",),
+        "mobile_phone": ("手机号码",),
+        "information_updated_date": ("信息更新日期",),
+        "data_provider": ("数据发生机构名称",),
+    }
+    spouse_aliases = {
+        "name": ("姓名",),
+        "document_type": ("证件类型",),
+        "document_number": ("证件号码",),
+        "employer": ("工作单位",),
+        "phone": ("联系电话",),
+    }
+    mobile_records: dict[tuple[int, str, str], dict[str, Any]] = {}
+    spouse_records: dict[tuple[str, str], dict[str, Any]] = {}
+    active_slots: dict[str, int] = {}
+    mode = ""
+    last_spouse_key: tuple[str, str] | None = None
     for page in getattr(parse_result, "pages", None) or []:
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
+            active_slots = {}
+            mode = ""
+            last_spouse_key = None
             for row_index, row in enumerate(rows):
-                compact = _compact("".join(row))
-                if all(marker in compact for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")):
-                    for ordinal, (data_index, data_row) in enumerate(
-                        enumerate(rows[row_index + 1 :], start=row_index + 1),
-                        start=1,
-                    ):
-                        cells = [_clean(value) for value in data_row]
-                        phone = next(
-                            (re.sub(r"\D", "", value) for value in cells if len(re.sub(r"\D", "", value)) == 11), ""
-                        )
-                        updated = next(
-                            (value for value in cells if re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", value)), ""
-                        )
-                        if not phone or not updated:
-                            break
-                        sequence_match = re.fullmatch(r"\d{1,3}", cells[0] if cells else "")
-                        sequence = int(sequence_match.group(0)) if sequence_match else ordinal
-                        provider = next(
-                            (
-                                value
-                                for value in reversed(cells)
-                                if value and value not in {phone, updated} and re.search(r"[\u3400-\u9fff]", value)
-                            ),
-                            None,
-                        )
-                        mobile_id = stable_record_id("personal_mobile_phone", sequence, phone, updated)
-                        mobile_records.append(
-                            {
-                                "record_id": mobile_id,
-                                "mobile_phone_record_id": mobile_id,
-                                "sequence": sequence,
-                                "mobile_phone": phone,
-                                "information_updated_date": _date(updated),
-                                "data_provider": provider,
-                                "source": "native_personal_detail_profile_table",
-                                "source_refs": [_source_ref(page, table, row=data_index)],
-                                "confidence": 1.0,
-                            }
-                        )
-                if all(marker in compact for marker in ("姓名", "证件类型", "证件号码", "工作单位", "联系电话")):
-                    if row_index + 1 >= len(rows):
-                        continue
-                    values = [_clean(value) for value in rows[row_index + 1]]
-                    if not values or not values[0]:
-                        continue
-                    provider = None
-                    if row_index + 3 < len(rows) and "数据发生机构名称" in _compact("".join(rows[row_index + 2])):
-                        provider_values = _nonempty(rows[row_index + 3])
-                        provider = provider_values[0] if provider_values else None
-                    values.extend([""] * (5 - len(values)))
-                    spouse_id = stable_record_id("personal_spouse", values[0], values[2])
-                    spouse_records.append(
-                        {
-                            "record_id": spouse_id,
-                            "spouse_record_id": spouse_id,
-                            "name": values[0],
-                            **({"document_type": values[1]} if values[1] and values[1] != "--" else {}),
-                            **({"document_number": values[2]} if values[2] and values[2] != "--" else {}),
-                            **({"employer": values[3]} if values[3] and values[3] != "--" else {}),
-                            **({"phone": values[4]} if values[4] and values[4] != "--" else {}),
-                            "data_provider": provider,
-                            "source": "native_personal_detail_profile_table",
-                            "source_refs": [_source_ref(page, table, row=row_index + 1)],
-                            "confidence": 1.0,
-                        }
+                mobile_slots = _canonical_header_slots(row, mobile_aliases)
+                spouse_slots = _canonical_header_slots(row, spouse_aliases)
+                compact_header = _compact("".join(row))
+                broken_mobile = all(
+                    marker in compact_header
+                    for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")
+                ) and not set(mobile_aliases) <= set(mobile_slots)
+                broken_spouse = all(
+                    marker in compact_header for marker in ("姓名", "证件类型", "证件号码", "工作单位", "联系电话")
+                ) and not set(spouse_aliases) <= set(spouse_slots)
+                if broken_mobile or broken_spouse:
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="mobile_phone_records" if broken_mobile else "spouse_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
                     )
+                    active_slots = {}
+                    mode = ""
+                    continue
+                if set(mobile_aliases) <= set(mobile_slots):
+                    active_slots = mobile_slots
+                    mode = "mobile"
+                    continue
+                if set(spouse_aliases) <= set(spouse_slots):
+                    active_slots = spouse_slots
+                    mode = "spouse"
+                    continue
+                if "数据发生机构名称" in _compact("".join(row)) and last_spouse_key is not None:
+                    active_slots = _canonical_header_slots(
+                        row, {"sequence": ("编号",), "data_provider": ("数据发生机构名称",)}
+                    )
+                    mode = "spouse_provider"
+                    continue
+                if not active_slots:
+                    continue
+                if mode == "mobile":
+                    sequence = _sequence_value(row, active_slots)
+                    phone = re.sub(r"\D", "", _slot_value(row, active_slots, "mobile_phone"))
+                    updated = _date(_slot_value(row, active_slots, "information_updated_date"))
+                    if sequence is None:
+                        continue
+                    if not re.fullmatch(r"1[3-9]\d{9}", phone) or not updated:
+                        _report_required_row_failure(
+                            parse_result,
+                            issue_code="candidate_b_mobile_row_unresolved",
+                            dataset="mobile_phone_records",
+                            sequence=sequence,
+                            field_name="mobile_phone" if not re.fullmatch(r"1[3-9]\d{9}", phone) else "information_updated_date",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                        continue
+                    key = (sequence, phone, str(updated))
+                    mobile_id = stable_record_id("personal_mobile_phone", *key)
+                    mobile_records[key] = {
+                        "record_id": mobile_id,
+                        "mobile_phone_record_id": mobile_id,
+                        "sequence": sequence,
+                        "mobile_phone": phone,
+                        "information_updated_date": updated,
+                        **(
+                            {"data_provider": provider}
+                            if (provider := _slot_value(row, active_slots, "data_provider")) and provider != "--"
+                            else {}
+                        ),
+                        "source": "native_personal_detail_profile_table",
+                        "source_refs": [_source_ref(page, table, row=row_index)],
+                        "confidence": 1.0,
+                    }
+                elif mode == "spouse":
+                    name = _slot_value(row, active_slots, "name")
+                    if not name or name == "--":
+                        continue
+                    document_number = _slot_value(row, active_slots, "document_number")
+                    key = (name, document_number)
+                    spouse_id = stable_record_id("personal_spouse", *key)
+                    spouse_records[key] = {
+                        "record_id": spouse_id,
+                        "spouse_record_id": spouse_id,
+                        "name": name,
+                        **{
+                            role: value
+                            for role in ("document_type", "document_number", "employer", "phone")
+                            if (value := _slot_value(row, active_slots, role)) and value != "--"
+                        },
+                        "source": "native_personal_detail_profile_table",
+                        "source_refs": [_source_ref(page, table, row=row_index)],
+                        "confidence": 1.0,
+                    }
+                    last_spouse_key = key
+                elif mode == "spouse_provider" and last_spouse_key in spouse_records:
+                    provider = _slot_value(row, active_slots, "data_provider")
+                    if not provider:
+                        provider = next((_clean(value) for value in row if _clean(value)), "")
+                    if provider and provider != "--":
+                        spouse_records[last_spouse_key]["data_provider"] = provider
+                        spouse_records[last_spouse_key]["source_refs"].append(
+                            _source_ref(page, table, row=row_index)
+                        )
     return {
-        "mobile_phone_records": mobile_records,
-        "spouse_records": spouse_records,
+        "mobile_phone_records": list(mobile_records.values()),
+        "spouse_records": list(spouse_records.values()),
     }
 
 
@@ -2952,40 +3570,6 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
         if candidate_valid("primary_id_type", value)
     }
     selected_id_type = next(iter(provisional_id_types)) if len(provisional_id_types) == 1 else None
-    trigger_replay = report_time is None or report_number is None
-    for key in (
-        "subject_name",
-        "primary_id_type",
-        "primary_id_number",
-        "query_institution",
-        "query_reason",
-        "report_number",
-        "report_time",
-    ):
-        valid_values = {
-            value.strip()
-            for value in field_candidates.get(key, [])
-            if candidate_valid(key, value, selected_id_type)
-        }
-        if len(valid_values) != 1:
-            trigger_replay = True
-    if trigger_replay:
-        replay, _refs, _confidence = parser._full_page_fields({1}, dataset_name="report_header")
-        for label, key in label_to_key.items():
-            value = replay.get(label)
-            if value not in (None, ""):
-                if key == "report_time":
-                    match = re.search(
-                        r"(20\d{2})[.年/-](\d{1,2})[.月/-](\d{1,2})日?\s*(\d{1,2}):(\d{2}):(\d{2})",
-                        str(value),
-                    )
-                    if match:
-                        value = (
-                            f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-                            f"T{int(match.group(4)):02d}:{match.group(5)}:{match.group(6)}+08:00"
-                        )
-                field_candidates[key].append(str(value))
-
     def select(key: str, selected_type: str | None = None) -> str | None:
         observed = tuple(dict.fromkeys(value.strip() for value in field_candidates.get(key, []) if value.strip()))
         valid = tuple(value for value in observed if candidate_valid(key, value, selected_type))
@@ -3002,6 +3586,14 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
                 target_record_id="personal_report_metadata:primary",
                 field_name=key,
                 observed_value=list(observed),
+                source_refs=(
+                    {
+                        "source": "candidate_b_page_one_business_fields",
+                        "logical_page": 1,
+                        "source_page": 1,
+                        "geometry_scope": "logical_page",
+                    },
+                ),
                 reason_codes=("page_one_consensus", "schema_field_validation", "normalized_value_withheld"),
             ),
         )

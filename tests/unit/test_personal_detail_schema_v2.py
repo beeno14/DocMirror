@@ -22,6 +22,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     personal_detail_semantic_extensions,
     project_personal_detail_datasets,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    prepare_personal_detail_source_collections,
+)
 
 
 def _record(record_id: str, **values: Any) -> dict[str, Any]:
@@ -271,6 +274,7 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
         "dataset_status",
         "field_observations",
         "extraction_issues",
+        "extraction_issue_evidence",
         "annotation_statements",
         "annotation_statement_groups",
         "pboc_extension_fields",
@@ -283,7 +287,7 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
     ):
         assert statuses[dataset_name]["presence_status"] == "partial"
     assert all(
-        row["presence_status"] == "not_observed"
+        row["presence_status"] == "unknown"
         for name, row in statuses.items()
         if name not in {
             "credit_account_latest_repayments",
@@ -309,7 +313,7 @@ def test_v2_routes_account_events_and_builds_schema_native_dataset_status() -> N
         )
         for row in projected[name]
     )
-    assert statuses["credit_card_large_installments"]["presence_status"] == "not_observed"
+    assert statuses["credit_card_large_installments"]["presence_status"] == "unknown"
     assert "source_dataset_name" not in statuses["fraud_warnings"]
     assert not any(row["dataset_name"].startswith("personal_detail_") for row in statuses.values())
 
@@ -422,7 +426,7 @@ def test_v2_preserves_sparse_uncertainty_as_typed_control_datasets() -> None:
     )
     issue = projected["extraction_issues"][0]
     assert observation["dataset_name"] == "subject_profile"
-    assert observation["observation_status"] == "not_observed"
+    assert observation["observation_status"] == "unreadable"
     assert unresolved["dataset_name"] == "unknown"
     assert unresolved["source_dataset_name"] == "datasets"
     assert issue["target_dataset"] == "credit_agreements"
@@ -613,6 +617,20 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
                 observed_row_count=1,
             ),
         ],
+        "personal_detail_extraction_issues": [
+            _record(
+                "issue:community-structured",
+                extraction_issue_id="issue:community-structured",
+                category="page_continuation",
+                issue_code="source_sequence_or_count_gap",
+                severity="warning",
+                status="requires_review",
+                target_dataset="employment_records",
+                observed_value={"observed_row_count": 1},
+                candidate_value={"missing_sequences": [2]},
+                reason_codes=["dataset_incomplete"],
+            )
+        ],
     }
     semantic = personal_detail_semantic_extensions()
     projected_datasets = project_personal_detail_datasets(source)
@@ -658,6 +676,30 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert v2_validation.valid, v2_validation.errors
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    issue = datasets["extraction_issues"]["rows"][0]["normalized"]
+    evidence = [row["normalized"] for row in datasets["extraction_issue_evidence"]["rows"]]
+    assert issue["observed_value_type"] == "object"
+    assert issue["candidate_value_type"] == "object"
+    assert any(
+        row["evidence_kind"] == "observed"
+        and row["evidence_path"] == "observed_row_count"
+        and row["integer_value"] == 1
+        for row in evidence
+    )
+    assert any(
+        row["evidence_kind"] == "candidate"
+        and row["evidence_path"] == "missing_sequences[0]"
+        and row["integer_value"] == 2
+        for row in evidence
+    )
+    assert any(
+        row["evidence_kind"] == "reason" and row["string_value"] == "dataset_incomplete"
+        for row in evidence
+    )
+    assert not any(
+        isinstance(value, str) and value.lstrip().startswith(("{", "["))
+        for value in issue.values()
+    )
     observation = datasets["field_observations"]["rows"][0]["normalized"]
     assert observation["dataset_name"] == "subject_profile"
     assert observation["source_dataset_name"] is None
@@ -668,7 +710,7 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     )
     # The incomplete header/profile copies are now explicitly partial instead
     # of silently passing because each contained some optional data.
-    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 7
+    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 8
     assert not {
         warning["code"]
         for warning in payload["warnings"]
@@ -890,3 +932,127 @@ def test_v2_links_unambiguous_source_issue_to_projected_business_record() -> Non
         if row.get("field_name") == "institution"
     )
     assert issue["target_record_id"] == "inquiry:1"
+
+
+def test_v2_withholds_unknown_account_status_and_removes_raw_detail_blob() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:1",
+                    account_id="account:1",
+                    account_type="credit_card",
+                    account_status="正常结清",
+                    raw_detail_lines=[{"text": "账户状态 正常结清"}, {"text": "余额 100"}],
+                )
+            ]
+        }
+    )
+
+    row = projected["credit_accounts"][0]
+    assert row["account_status"] is None
+    assert "raw_detail_lines" not in row
+    assert "raw_detail_lines" not in row.get("normalized", {})
+    assert any(
+        issue.get("field_name") == "account_status"
+        and issue["issue_code"] == "canonical_field_contract_failed"
+        for issue in projected["extraction_issues"]
+    )
+
+
+def test_summary_scalar_failure_is_unknown_and_reported_without_text_fallback() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {},
+            "datasets": {
+                "personal_detail_summary_cells": [
+                    _record(
+                        "cell:bad",
+                        summary_cell_id="cell:bad",
+                        summary_record_id="summary:1",
+                        summary_type="逾期（透支）",
+                        row_index=1,
+                        column_index=2,
+                        column_label="月份数",
+                        value="二O个月",
+                    )
+                ]
+            },
+        }
+    )
+
+    metric = content["datasets"]["personal_detail_credit_summary_metrics"][0]
+    assert metric["reporting_status"] == "unknown"
+    assert metric["value_type"] == "unknown"
+    assert "numeric_value" not in metric
+    assert "text_value" not in metric
+    issue = next(
+        issue
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+        if issue["issue_code"] == "candidate_b_summary_scalar_unresolved"
+    )
+    assert issue["observed_value"] == "二O个月"
+
+
+def test_source_endpoint_does_not_report_missing_population_when_row_count_is_met() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "sequence_endpoints": {"residence_records": 3}
+                }
+            },
+            "datasets": {
+                "residence_records": [
+                    _record("residence:1", sequence=1, address="一号"),
+                    _record("residence:3a", sequence=3, address="三号甲"),
+                    _record("residence:3b", sequence=3, address="三号乙"),
+                ]
+            },
+        },
+        final_dataset_counts={"residence_records": 3},
+    )
+
+    assert not any(
+        issue.get("issue_code") == "source_sequence_or_count_gap"
+        for issue in content["datasets"].get("personal_detail_extraction_issues", [])
+    )
+
+
+def test_v2_issue_evidence_stays_native_and_machine_readable() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:structured",
+                    extraction_issue_id="issue:structured",
+                    category="page_continuation",
+                    issue_code="source_sequence_or_count_gap",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="employment_records",
+                    observed_value={"observed_row_count": 2},
+                    candidate_value={"missing_sequences": [3, 4]},
+                    reason_codes=["dataset_incomplete", "no_missing_row_invented"],
+                )
+            ]
+        }
+    )
+
+    issue = projected["extraction_issues"][0]
+    evidence = projected["extraction_issue_evidence"]
+    assert issue["observed_value_type"] == "object"
+    assert issue["candidate_value_type"] == "object"
+    assert {
+        (row["evidence_kind"], row["evidence_path"], row.get("integer_value"), row.get("string_value"))
+        for row in evidence
+    } >= {
+        ("observed", "observed_row_count", 2, None),
+        ("candidate", "missing_sequences[0]", 3, None),
+        ("candidate", "missing_sequences[1]", 4, None),
+        ("reason", "reason_codes[0]", None, "dataset_incomplete"),
+    }
+    assert issue["reason_code_count"] == 2
+    assert "observed_value" not in issue
+    assert "candidate_value" not in issue
+    assert all(not isinstance(value, (dict, list)) for value in issue.values())

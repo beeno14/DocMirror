@@ -174,6 +174,8 @@ _MONEY_METRIC_CODES = frozenset(
         "enterprise_other_liability_balance",
     }
 )
+_TEXT_METRIC_CODES = frozenset({"business_type", "account_type", "information_type"})
+_DATE_METRIC_CODES = frozenset({"first_business_issue_month"})
 
 _PUBLIC_RECORD_SPECS: dict[str, tuple[str, str, dict[str, str]]] = {
     "tax_arrears": (
@@ -302,6 +304,8 @@ def _profile_contract(
     all_refs: list[dict[str, Any]] = []
     for field_name in PERSONAL_PROFILE_FIELDS:
         entry = profile.get(field_name)
+        if entry is None:
+            continue
         entry_map = dict(entry) if isinstance(entry, Mapping) else {}
         normalized = entry_map.get("normalized_value", entry_map.get("value")) if entry_map else entry
         raw = entry_map.get("canonical_raw", entry_map.get("raw", normalized)) if entry_map else entry
@@ -310,10 +314,17 @@ def _profile_contract(
         refs = _source_refs(entry_map)
         all_refs.extend(refs)
         explicit_status = str(entry_map.get("observation_status") or "")
-        if explicit_status in _OBSERVATION_STATUSES:
+        absence_proven = bool(entry_map.get("source_statement") or entry_map.get("absence_evidence"))
+        if explicit_status == "not_observed" and not absence_proven:
+            if raw in (None, "") and not refs:
+                continue
+            status = "unreadable"
+        elif explicit_status in _OBSERVATION_STATUSES:
             status = explicit_status
         elif normalized in (None, ""):
-            status = "not_observed"
+            if raw in (None, "") and not refs:
+                continue
+            status = "unreadable"
         elif entry_map.get("ocr_corrected") is True:
             status = "ocr_corrected"
         elif raw not in (None, "") and str(raw) != str(normalized):
@@ -343,7 +354,7 @@ def _profile_contract(
             observation["confidence_status"] = "not_available"
             observation["confidence_basis"] = "source_did_not_report_field_confidence"
         if status == "not_observed":
-            observation["reason"] = "no_field_observation_emitted"
+            observation["reason"] = str(entry_map.get("source_statement") or "source_proved_field_absence")
         elif entry_map.get("reason"):
             observation["reason"] = str(entry_map["reason"])
         if refs:
@@ -368,6 +379,54 @@ def _summary_value(value: Any) -> tuple[str, str | None, str]:
     if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%", compact):
         return "percentage", compact[:-1], "reported"
     return "text", None, "reported"
+
+
+def _validate_summary_scalar_cells(datasets: dict[str, Any]) -> None:
+    """Withhold mapped scalar cells whose OCR text violates the metric type."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    issues = datasets.setdefault("personal_detail_extraction_issues", [])
+    if not isinstance(issues, list):
+        issues = []
+        datasets["personal_detail_extraction_issues"] = issues
+    existing = {
+        str(issue.get("extraction_issue_id") or "")
+        for issue in issues
+        if isinstance(issue, Mapping)
+    }
+    for index, source_row in enumerate(datasets.get("personal_detail_summary_cells") or (), start=1):
+        if not isinstance(source_row, dict):
+            continue
+        cell = _record_values(source_row)
+        metric_code = _METRIC_CODES.get(_compact_label(str(cell.get("column_label") or "")))
+        if not metric_code or metric_code in _TEXT_METRIC_CODES:
+            continue
+        value_type, _numeric, reporting_status = _summary_value(cell.get("value"))
+        valid = reporting_status == "not_reported" or (
+            value_type == "date" if metric_code in _DATE_METRIC_CODES else value_type in {"integer", "decimal"}
+        )
+        if valid:
+            continue
+        cell["value_status"] = "unreadable"
+        if isinstance(source_row.get("normalized"), dict):
+            source_row["normalized"] = cell
+        else:
+            source_row.update(cell)
+        issue = make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_summary_scalar_unresolved",
+            message="A mapped summary metric contained non-scalar OCR text; no normalized business value was emitted.",
+            parser_stage="candidate_b_summary_schema",
+            target_dataset="personal_detail_summary_cells",
+            target_record_id=str(cell.get("summary_cell_id") or f"summary_cell:{index}"),
+            field_name="value",
+            observed_value=cell.get("value"),
+            source_refs=_source_refs(source_row),
+            reason_codes=("mapped_scalar_metric", "typed_cell_contract_failed", "normalized_value_withheld"),
+        )
+        if issue["extraction_issue_id"] not in existing:
+            issues.append(issue)
+            existing.add(issue["extraction_issue_id"])
 
 
 def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -402,6 +461,8 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         column_index = int(cell.get("column_index") or 0)
         source_value = cell.get("value")
         value_type, numeric_value, reporting_status = _summary_value(source_value)
+        if cell.get("value_status") == "unreadable":
+            value_type, numeric_value, reporting_status = "unknown", None, "unknown"
         source_id = str(cell.get("summary_cell_id") or f"summary_cell:{index}")
         metric_id = f"credit_summary_metric:{source_id}"
         dimension_name, dimension_value = dimensions.get((summary_record_id, row_index), ("", ""))
@@ -425,7 +486,6 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
             "mapping_status": "mapped" if summary_code and metric_code else "unmapped",
             "row_dimension_name": dimension_name,
             "row_dimension_value": dimension_value,
-            "source_value": source_value,
             "value_type": value_type,
             "reporting_status": reporting_status,
         }
@@ -541,12 +601,17 @@ def _dataset_status_contract(
         elif observed_count:
             presence_status = "observed_nonempty"
             reason = "records_projected"
+        elif explicit_status == "not_observed" and not (
+            explicit_map.get("source_statement") or explicit_map.get("absence_evidence")
+        ):
+            presence_status = "unknown"
+            reason = "source_presence_not_established"
         elif explicit_status in _DATASET_PRESENCE_STATUSES:
             presence_status = explicit_status
             reason = str(explicit_map.get("reason") or "source_state_reported")
         else:
-            presence_status = "not_observed"
-            reason = "no_explicit_absence_evidence"
+            presence_status = "unknown"
+            reason = "source_presence_not_established"
         status_id = f"personal_detail_dataset_status:{dataset_name}"
         row: dict[str, Any] = {
             "record_id": status_id,
@@ -684,7 +749,10 @@ def _apply_source_completeness_ledger(
         if isinstance(row, Mapping)
     }
     for dataset_name, (observed, expected, contiguous) in checks.items():
-        if expected <= 0 or (observed >= expected and contiguous):
+        # A source endpoint can prove missing population only when it exceeds
+        # the projected population. Non-contiguous ordinals with the same row
+        # count are a row-identity concern, not evidence that rows are absent.
+        if expected <= 0 or observed >= expected:
             continue
         issue = make_issue(
             category="page_continuation",
@@ -734,6 +802,7 @@ def prepare_personal_detail_source_collections(
             facts[count_key] = final_count
 
     _apply_source_completeness_ledger(facts, datasets, final_counts)
+    _validate_summary_scalar_cells(datasets)
 
     # The generic scanned summary count is not authoritative for a detailed
     # report (category numbering restarts).  v2 uses its source ledger through

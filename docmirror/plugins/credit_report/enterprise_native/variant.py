@@ -23,23 +23,15 @@ _ENTERPRISE_DOCUMENT_DATASET_ORDER = (
     "enterprise_repayment_responsibility_summary",
     "enterprise_closed_credit_summary",
     "enterprise_profile",
-    "enterprise_profile_fields",
     "enterprise_capital_summary",
     "enterprise_contributors",
     "enterprise_key_personnel",
-    "enterprise_stakeholders",
     "enterprise_relationships",
     "enterprise_credit_accounts",
-    "credit_accounts",
     "enterprise_interest_arrears",
     "enterprise_displayed_credit_summary",
     "enterprise_credit_facilities",
-    "credit_lines",
     "enterprise_repayment_responsibility_accounts",
-    "repayment_liability_records",
-    "enterprise_repayment_responsibility_groups",
-    "repayment_records",
-    "overdue_records",
     "enterprise_public_utility_payment_records",
     "enterprise_public_tax_arrears_records",
     "enterprise_public_civil_judgment_records",
@@ -59,14 +51,12 @@ _ENTERPRISE_DOCUMENT_DATASET_ORDER = (
     "enterprise_public_credit_bureau_statement_records",
     "enterprise_public_subject_statement_records",
     "enterprise_public_dispute_annotation_records",
-    "inquiry_records",
     "enterprise_attachment_accounts",
     "enterprise_credit_supplement",
     "enterprise_attachment_credit_details",
     "enterprise_special_transactions",
     "enterprise_utility_payment_history",
     "enterprise_housing_fund_history",
-    "enterprise_extraction_audit",
 )
 
 
@@ -81,204 +71,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             include_credit_lines=True,
         )
 
-    def use_generic_credit_accounts(self) -> bool:
-        """Enterprise stacked cards replace generic row-shaped candidates."""
-        return False
-
     def dataset_names(self) -> tuple[str, ...]:
         """Publish public records through typed business tables, not content rows."""
-        return tuple(name for name in super().dataset_names() if name != "public_records")
-
-    def business_dataset_copies(
-        self,
-        assembled: dict[str, Any],
-    ) -> dict[str, list[dict[str, Any]]]:
-        """Publish enterprise-owned canonical names beside compatibility views."""
-        return {
-            "enterprise_credit_accounts": list(assembled.get("credit_accounts") or []),
-            "enterprise_credit_facilities": list(assembled.get("credit_lines") or []),
-            "enterprise_repayment_responsibility_accounts": list(
-                assembled.get("repayment_liability_records") or []
-            ),
-        }
-
-    def prepare_extraction(self, parse_result: Any, full_text: str) -> Any:
-        """Build reusable enterprise page and table indexes once."""
-        del full_text
-        from docmirror.plugins.credit_report.enterprise_native.extraction import (
-            build_enterprise_extraction_context,
-        )
-
-        return build_enterprise_extraction_context(parse_result)
-
-    def extract_native_business(
-        self,
-        parse_result: Any,
-        full_text: str,
-        *,
-        content_mode: str,
-    ) -> dict[str, Any]:
-        """Extract only native enterprise business records."""
-        if content_mode not in self.expected_content_modes:
-            return {}
-        from docmirror.plugins.credit_report.enterprise_native.extraction import (
-            extract_enterprise_native_business,
-        )
-
-        return extract_enterprise_native_business(parse_result, full_text)
-
-    def assemble_business(
-        self,
-        parse_result: Any,
-        full_text: str,
-        *,
-        content_mode: str,
-        existing_collections: dict[str, list[Any]] | None,
-        existing_summary: dict[str, Any] | None,
-        variant_input: Any,
-    ) -> dict[str, Any]:
-        """Assemble enterprise business records without personal normalizers."""
-        from docmirror.plugins.credit_report.enterprise_native.pipeline import (
-            assemble_enterprise_business,
-        )
-
-        return assemble_enterprise_business(
-            parse_result,
-            full_text,
-            content_mode=content_mode,
-            existing_collections=existing_collections,
-            existing_summary=existing_summary,
-            variant=self,
-            variant_input=variant_input,
-        )
-
-    def build_section_content(
-        self,
-        parse_result: Any,
-        full_text: str,
-        *,
-        auxiliary_business: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Return enterprise profile datasets without entering personal extractors."""
-        del auxiliary_business
-        from docmirror.plugins.credit_report.enterprise_native.extraction import (
-            extract_enterprise_attachment_datasets,
-            extract_enterprise_capital_summary,
-            extract_enterprise_continuation_audit,
-            extract_enterprise_facility_summary,
-            extract_enterprise_identity_facts,
-            extract_enterprise_interest_arrears,
-            extract_enterprise_non_credit_history_datasets,
-            extract_enterprise_overview_datasets,
-            extract_enterprise_profile_datasets,
-            extract_enterprise_public_record_datasets,
-            extract_enterprise_report_identity_records,
-            extract_enterprise_report_metadata_records,
-            extract_enterprise_report_notes,
-            extract_enterprise_summary_datasets,
-        )
-
-        datasets = extract_enterprise_profile_datasets(parse_result)
-        public_record_datasets = extract_enterprise_public_record_datasets(parse_result)
-        if public_record_datasets:
-            # The public API is the set of typed business tables.
-            datasets.update(public_record_datasets)
-        datasets.update(extract_enterprise_report_metadata_records(parse_result, full_text))
-        datasets["enterprise_report_identity"] = extract_enterprise_report_identity_records(
-            parse_result,
-            full_text,
-        )
-        datasets.update(extract_enterprise_overview_datasets(parse_result))
-        datasets.update(extract_enterprise_summary_datasets(parse_result))
-        datasets["enterprise_interest_arrears"] = extract_enterprise_interest_arrears(
-            parse_result
-        )
-        datasets.update(extract_enterprise_attachment_datasets(parse_result))
-        datasets.update(extract_enterprise_non_credit_history_datasets(parse_result))
-        datasets["enterprise_extraction_audit"] = extract_enterprise_continuation_audit(
-            parse_result,
-            datasets=datasets,
-        )
-        datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(parse_result)
-        datasets["enterprise_facility_summary"] = extract_enterprise_facility_summary(parse_result)
-        profile_rows = list(datasets.get("enterprise_profile_fields") or [])
-        if profile_rows:
-            profile_field_names = {
-                "经济类型": "economic_type",
-                "组织机构类型": "organization_type",
-                "企业规模": "enterprise_scale",
-                "所属行业": "industry",
-                "成立年份": "establishment_year",
-                "登记证书有效截止日期": "registration_certificate_valid_through",
-                "登记地址": "registered_address",
-                "办公/经营地址": "operating_address",
-                "存续状态": "operating_status",
-            }
-            profile_record: dict[str, Any] = {
-                "enterprise_profile_id": "enterprise_profile:r000001",
-                "sequence": 1,
-                "source": "enterprise_profile_fields",
-                "source_refs": [],
-                "confidence": 1.0,
-            }
-            for row in profile_rows:
-                field = profile_field_names.get(str(row.get("field") or ""))
-                if not field:
-                    continue
-                value: Any = row.get("value")
-                if field == "establishment_year":
-                    try:
-                        value = int(str(value))
-                    except (TypeError, ValueError):
-                        pass
-                profile_record[field] = value
-                profile_record["source_refs"].extend(row.get("source_refs") or [])
-            datasets["enterprise_profile"] = [profile_record]
-        stakeholders = list(datasets.get("enterprise_stakeholders") or [])
-        datasets["enterprise_contributors"] = [
-            {**row, "sequence": index}
-            for index, row in enumerate(
-                (
-                    row
-                    for row in stakeholders
-                    if "股东" in str(row.get("role") or "")
-                    or row.get("ownership_percentage") not in (None, "")
-                ),
-                start=1,
-            )
-        ]
-        datasets["enterprise_key_personnel"] = [
-            {**row, "sequence": index}
-            for index, row in enumerate(
-                (
-                    row
-                    for row in stakeholders
-                    if "股东" not in str(row.get("role") or "")
-                    and row.get("ownership_percentage") in (None, "")
-                ),
-                start=1,
-            )
-        ]
-        return {
-            "facts": extract_enterprise_identity_facts(parse_result),
-            "report_notes": extract_enterprise_report_notes(parse_result),
-            "datasets": datasets,
-        }
-
-    def refine_domain_facts(
-        self,
-        domain_facts: dict[str, Any],
-        field_details: dict[str, Any],
-    ) -> None:
-        """Remove personal-only artifacts from the enterprise identity view."""
-        for field_name in ("id_type", "id_number", "subject_id", "marital_status", "company_name"):
-            domain_facts.pop(field_name, None)
-            field_details.pop(field_name, None)
-
-    def refine_entity_fields(self, entity_fields: dict[str, Any]) -> None:
-        """Do not leak a personal subject identifier into enterprise entities."""
-        for field_name in ("id_type", "id_number", "subject_id", "marital_status"):
-            entity_fields.pop(field_name, None)
+        return _ENTERPRISE_DOCUMENT_DATASET_ORDER
 
     def data_dictionary(self) -> dict[str, Any]:
         """Return an enterprise-owned dictionary with no personal inheritance."""
@@ -793,7 +588,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "transaction_detail": {"label": "交易明细信息", "type": "string"},
             }
         )
-        credit_accounts = dictionary.setdefault("datasets", {}).setdefault("credit_accounts", {})
+        credit_accounts = dictionary.setdefault("datasets", {}).setdefault(
+            "enterprise_credit_accounts", {}
+        )
         credit_accounts["definition"] = "一行对应企业报告信贷记录明细中的一个当前或已结清账户卡片。"
         credit_accounts["aggregation"] = "金额必须按币种和金额单位分组；不得与授信额度或概要合计相加。"
         account_columns = credit_accounts.setdefault("columns", {})
@@ -847,9 +644,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "payoff_state",
         ):
             account_columns[key] = fields[key]
-        credit_lines = dictionary["datasets"].setdefault("credit_lines", {})
+        credit_lines = dictionary["datasets"].setdefault("enterprise_credit_facilities", {})
         credit_lines["definition"] = "一行对应企业报告中的一份授信信息明细卡片；概要额度不作为记录导出。"
-        credit_lines["non_additive_with"] = ["credit_accounts", "credit_summary.facility_summary"]
+        credit_lines["non_additive_with"] = [
+            "enterprise_credit_accounts",
+            "credit_summary.facility_summary",
+        ]
         line_columns = credit_lines.setdefault("columns", {})
         line_columns.update(
             {
@@ -892,7 +692,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             }
         )
         repayment_liabilities = dictionary["datasets"].setdefault(
-            "repayment_liability_records",
+            "enterprise_repayment_responsibility_accounts",
             {},
         )
         repayment_liabilities["definition"] = "一行对应企业报告相关还款责任信息明细中的一个账户；跨页续表合并为同一行。"
@@ -1072,12 +872,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
-        dictionary["datasets"]["enterprise_profile_fields"] = {
-            "definition": "企业基本信息源表中的一个字段一行。",
-            "columns": {
-                key: fields[key] for key in ("sequence", "field", "value", "source_institution") if key in fields
-            },
-        }
         dictionary["datasets"]["enterprise_profile"] = {
             "definition": "一行对应一个企业基本信息快照；字段来源另保留在长表中。",
             "columns": {
@@ -1118,35 +912,28 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 )
             },
         }
-        dictionary["datasets"]["enterprise_stakeholders"] = {
-            "definition": "企业出资人或主要人员表中的一个角色一行。",
-            "columns": {
-                key: fields[key]
-                for key in (
-                    "sequence",
-                    "role",
-                    "name",
-                    "identity_type",
-                    "identity_number",
-                    "ownership_percentage",
-                    "page",
-                    "source_institution",
-                    "update_date",
-                )
-                if key in fields
-            },
+        stakeholder_columns = {
+            key: fields[key]
+            for key in (
+                "sequence",
+                "role",
+                "name",
+                "identity_type",
+                "identity_number",
+                "ownership_percentage",
+                "page",
+                "source_institution",
+                "update_date",
+            )
+            if key in fields
         }
         dictionary["datasets"]["enterprise_contributors"] = {
             "definition": "注册资本及主要出资人表中的一个出资方一行。",
-            "columns": deepcopy(
-                dictionary["datasets"]["enterprise_stakeholders"]["columns"]
-            ),
+            "columns": deepcopy(stakeholder_columns),
         }
         dictionary["datasets"]["enterprise_key_personnel"] = {
             "definition": "主要组成人员表中的一个职位/人员一行。",
-            "columns": deepcopy(
-                dictionary["datasets"]["enterprise_stakeholders"]["columns"]
-            ),
+            "columns": deepcopy(stakeholder_columns),
         }
         dictionary["datasets"]["enterprise_relationships"] = {
             "definition": "企业关联关系表中的一个关系一行。",
@@ -1230,7 +1017,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             ),
             "aggregation": "仅用于复现源报告明细分组汇总，不得与账户明细、附件明细或信息概要相加。",
             "non_additive_with": [
-                "credit_accounts",
+                "enterprise_credit_accounts",
                 "enterprise_attachment_credit_details",
                 "enterprise_current_credit_summary",
                 "enterprise_closed_credit_summary",
@@ -1445,24 +1232,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "definition": "附件中一个住房公积金统计月份的缴费记录一行。",
             "columns": deepcopy(history_columns),
         }
-        dictionary["datasets"]["enterprise_credit_accounts"] = deepcopy(
-            dictionary["datasets"]["credit_accounts"]
-        )
-        dictionary["datasets"]["enterprise_credit_accounts"]["definition"] = (
-            "企业专用规范账户表；credit_accounts 为兼容副本。"
-        )
-        dictionary["datasets"]["enterprise_credit_facilities"] = deepcopy(
-            dictionary["datasets"]["credit_lines"]
-        )
-        dictionary["datasets"]["enterprise_credit_facilities"]["definition"] = (
-            "企业专用授信协议表；credit_lines 为兼容副本。"
-        )
-        dictionary["datasets"]["enterprise_repayment_responsibility_accounts"] = deepcopy(
-            dictionary["datasets"]["repayment_liability_records"]
-        )
-        dictionary["datasets"]["enterprise_repayment_responsibility_accounts"][
-            "definition"
-        ] = "企业专用相关还款责任账户表；repayment_liability_records 为兼容副本。"
         enums = dictionary.setdefault("enums", {})
         enums.setdefault("account_type", {})["enterprise_credit"] = "企业信贷账户"
         enums["facility_type"] = {
@@ -1490,26 +1259,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "credit_bureau_statement": "征信中心说明",
             "subject_statement": "信息主体声明",
             "dispute_annotation": "异议标注",
-        }
-        dictionary["datasets"]["enterprise_extraction_audit"] = {
-            "definition": (
-                "每行核对一种企业报告连续记录的源合同数量与逻辑记录数量；不通过相邻表或列数相同进行推断合并。"
-            ),
-            "columns": {
-                key: fields[key]
-                for key in (
-                    "sequence",
-                    "audit_id",
-                    "continuation_family",
-                    "business_category",
-                    "account_status",
-                    "expected_record_count",
-                    "extracted_record_count",
-                    "unresolved_record_count",
-                    "unexpected_record_count",
-                    "reconciliation_status",
-                )
-            },
         }
         enums["amount_unit"] = {
             "CNY_10K": "万元（人民币）",
@@ -1623,6 +1372,82 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "settled": "已结清",
             "inactive": "非活动",
         }
+        datasets = dictionary.setdefault("datasets", {})
+        datasets["enterprise_credit_accounts"]["definition"] = (
+            "一行对应企业报告信贷记录明细中的一个当前或已结清账户卡片。"
+        )
+        datasets["enterprise_credit_facilities"]["definition"] = (
+            "一行对应企业报告中的一份授信信息明细卡片；概要额度不作为记录导出。"
+        )
+        datasets["enterprise_credit_facilities"]["non_additive_with"] = [
+            "enterprise_credit_accounts",
+            "credit_summary.facility_summary",
+        ]
+        datasets["enterprise_repayment_responsibility_accounts"]["definition"] = (
+            "一行对应企业报告相关还款责任信息明细中的一个账户；跨页续表合并为同一行。"
+        )
+        datasets["enterprise_profile"]["definition"] = (
+            "一行对应一个企业基本信息快照；字段级状态明确区分源缺失值。"
+        )
+        datasets["enterprise_displayed_credit_summary"]["non_additive_with"] = [
+            "enterprise_credit_accounts",
+            "enterprise_attachment_credit_details",
+            "enterprise_current_credit_summary",
+            "enterprise_closed_credit_summary",
+        ]
+        maturity_column = {
+            "label": "到期日期",
+            "type": "date",
+            "definition": "合同或授信协议的到期日；不是许可或证书有效期。",
+        }
+        for name in (
+            "enterprise_credit_accounts",
+            "enterprise_credit_facilities",
+            "enterprise_repayment_responsibility_accounts",
+            "enterprise_attachment_credit_details",
+        ):
+            columns = datasets[name]["columns"]
+            columns.pop("due_date", None)
+            columns["maturity_date"] = dict(maturity_column)
+        liability_columns = datasets["enterprise_repayment_responsibility_accounts"]["columns"]
+        liability_columns.pop("due_date_status", None)
+        liability_columns["maturity_date_status"] = {
+            "label": "到期日报告状态",
+            "type": "string",
+        }
+        datasets["enterprise_report_identity"]["columns"].pop("enterprise_name", None)
+        for name in (
+            "account_population_comparable",
+            "audit_id",
+            "canonical_table_account_count",
+            "continuation_family",
+            "credit_line_count",
+            "due_date",
+            "due_date_status",
+            "enterprise_name",
+            "expected_record_count",
+            "extracted_account_count",
+            "extracted_record_count",
+            "projected_account_count",
+            "reconciliation_status",
+            "source_display_limited",
+            "unexpected_record_count",
+            "unresolved_record_count",
+        ):
+            fields.pop(name, None)
+        fields.update(
+            {
+                "displayed_credit_account_card_count": {"label": "正文展示账户卡片数", "type": "integer"},
+                "displayed_credit_facility_count": {"label": "正文展示授信协议数", "type": "integer"},
+                "reported_account_count_basis": {"label": "概要账户数口径", "type": "string"},
+                "source_limited_scopes": {"label": "源报告受限范围", "type": "array"},
+                "source_scope_status": {"label": "源报告范围状态", "type": "string"},
+                "maturity_date_status": {"label": "到期日报告状态", "type": "string"},
+            }
+        )
+        for name in ("account_population_comparable", "due_date_status", "source_display_limited"):
+            enums.pop(name, None)
+        enums["maturity_date_status"] = {"reported": "已报告", "not_reported": "未报告"}
         return dictionary
 
     def semantic_extensions(self) -> dict[str, Any]:
@@ -1647,41 +1472,24 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "business_registration_number",
         ]
         semantic["dataset_relationships"] = {
-            "credit_lines": {
+            "enterprise_credit_facilities": {
                 "relationship": "independent_enterprise_facility_records",
                 "additive": False,
-                "non_additive_with": ["credit_accounts", "credit_summary.facility_summary"],
+                "non_additive_with": ["enterprise_credit_accounts", "credit_summary.facility_summary"],
             },
             "enterprise_displayed_credit_summary": {
                 "relationship": "source_reported_displayed_detail_groups",
                 "additive": False,
                 "non_additive_with": [
-                    "credit_accounts",
+                    "enterprise_credit_accounts",
                     "enterprise_attachment_credit_details",
                     "enterprise_current_credit_summary",
                     "enterprise_closed_credit_summary",
                 ],
             },
         }
-        semantic["audit_csv"] = {
-            "reconciliations": [
-                {
-                    "name": "credit_account_balance",
-                    "fields": [
-                        "expected",
-                        "actual",
-                        "difference",
-                        "tolerance",
-                        "currency",
-                        "amount_unit",
-                        "matched",
-                        "status",
-                    ],
-                }
-            ]
-        }
         semantic["dataset_reading_columns"] = {
-            "repayment_liability_records": [
+            "enterprise_repayment_responsibility_accounts": [
                 "sequence",
                 "account_identifier",
                 "responsibility_type",
@@ -1729,18 +1537,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "amount_unit",
                         "contributor_count",
                         "contributor_status",
-                        "source_institution",
-                        "update_date",
-                    ],
-                },
-                "enterprise_stakeholders": {
-                    "mode": "record_cards",
-                    "title_fields": ["role"],
-                    "columns": [
-                        "name",
-                        "identity_type",
-                        "identity_number",
-                        "ownership_percentage",
                         "source_institution",
                         "update_date",
                     ],
@@ -1838,18 +1634,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "amount_unit",
                     ],
                 },
-                "enterprise_extraction_audit": {
-                    "placement": "appendix",
-                    "columns": [
-                        "continuation_family",
-                        "expected_record_count",
-                        "extracted_record_count",
-                        "unresolved_record_count",
-                        "unexpected_record_count",
-                        "reconciliation_status",
-                    ],
-                },
-                "repayment_liability_records": {
+                "enterprise_repayment_responsibility_accounts": {
                     "mode": "record_cards",
                     "title_fields": ["sequence", "responsibility_type"],
                     "title_separator": ". ",
@@ -1861,7 +1646,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "business_type",
                         "open_date",
                         "maturity_date",
-                        "due_date_status",
+                        "maturity_date_status",
                         "currency",
                         "amount_unit",
                         "responsibility_amount",
@@ -1877,7 +1662,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "continuation_complete",
                     ],
                 },
-                "credit_accounts": {
+                "enterprise_credit_accounts": {
                     "mode": "table",
                     "columns": [
                         "sequence",
@@ -1910,7 +1695,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "history_status",
                     ],
                 },
-                "credit_lines": {
+                "enterprise_credit_facilities": {
                     "mode": "record_cards",
                     "title_fields": ["facility_type"],
                     "columns": [
@@ -2003,7 +1788,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "business_type",
                         "account_status",
                         "open_date",
-                        "due_date",
+                        "maturity_date",
                         "currency",
                         "amount",
                         "amount_unit",
@@ -2107,46 +1892,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     ],
                 },
             },
-            "appendix": {
-                "title": "附录：文档来源与审计信息",
-                "audit_reconciliations": [
-                    {
-                        "name": "credit_account_balance",
-                        "title": "账户余额可比性检查（审计信息）",
-                        "fields": [
-                            {"key": "expected", "label": "源报告账户余额合计"},
-                            {"key": "actual", "label": "账户明细余额计算合计"},
-                            {"key": "difference", "label": "两者差额"},
-                            {"key": "tolerance", "label": "审计舍入容差"},
-                            {"key": "currency", "label": "币种"},
-                            {"key": "amount_unit", "label": "金额单位"},
-                            {
-                                "key": "status",
-                                "label": "审计结论",
-                                "value_labels": {
-                                    "exact": "原文数值一致",
-                                    "within_rounding_tolerance": "存在差异，但在舍入容差内",
-                                    "mismatch": "存在超出舍入容差的差异",
-                                    "not_comparable": "不可比",
-                                },
-                            },
-                        ],
-                        "note": ("源报告概要值与账户明细值均按原文保留；审计计算不改写任何业务数据。"),
-                    }
-                ],
-                "document_fields": [
-                    {
-                        "path": "source_file.name",
-                        "key": "source_file_name",
-                        "label": "源文件",
-                    },
-                    {
-                        "path": "page_count",
-                        "key": "page_count",
-                        "label": "页数",
-                    },
-                ],
-            },
         }
         from docmirror.plugins.credit_report.enterprise_native.extraction import (
             enterprise_public_record_dataset_specs,
@@ -2158,70 +1903,32 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "mode": "table",
                 "columns": ["sequence", *spec["columns"]],
             }
+        dataset_layouts["enterprise_contributors"] = {
+            "mode": "record_cards",
+            "title_fields": ["role"],
+            "columns": [
+                "name", "identity_type", "identity_number", "ownership_percentage",
+                "source_institution", "update_date",
+            ],
+        }
+        dataset_layouts["enterprise_key_personnel"] = deepcopy(dataset_layouts["enterprise_contributors"])
+        enhanced = semantic["enhanced_markdown"]
+        summary_groups = enhanced["section_layouts"]["credit_summary"]["groups"]
+        summary_groups[1]["fields"] = [
+            "reported_account_count", "reported_account_count_basis",
+            "displayed_credit_account_card_count", "reported_account_balance",
+            "reported_credit_line_count", "displayed_credit_facility_count",
+            "facility_summary_record_count", "public_record_count", "attachment_account_count",
+            "attachment_credit_detail_count", "attachment_special_transaction_count",
+            "first_credit_year", "credit_institution_count", "active_credit_institution_count",
+            "first_repayment_responsibility_year", "first_repayment_responsibility_year_status",
+        ]
+        summary_groups[2]["fields"] = [
+            "account_dataset_scope", "account_dataset_scope_note", "source_scope_status",
+            "source_limited_scopes", "available_limit_status",
+        ]
         return semantic
 
-    def build_sections(self, parse_result: Any, full_text: str) -> tuple[dict[str, Any], ...]:
-        """Keep enterprise sections and skip table-of-contents occurrences."""
-        sections = [dict(section) for section in super().build_sections(parse_result, full_text)]
-        page_texts: list[tuple[int, int, str]] = []
-        for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
-            parts = [str(getattr(block, "content", "") or "") for block in getattr(page, "texts", None) or []]
-            for table in getattr(page, "tables", None) or []:
-                parts.extend(str(value or "") for value in getattr(table, "headers", None) or [])
-                for row in getattr(table, "rows", None) or []:
-                    parts.extend(str(getattr(cell, "text", "") or "") for cell in getattr(row, "cells", None) or [])
-            page_texts.append(
-                (
-                    int(getattr(page, "page_number", 0) or index),
-                    int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or index),
-                    "\n".join(parts),
-                )
-            )
-        source_sections: list[dict[str, Any]] = []
-        cover_page = next(
-            ((logical_page, source_page) for logical_page, source_page, text in page_texts if "自主查询版" in text),
-            None,
-        )
-        if cover_page is not None:
-            source_sections.append(
-                {
-                    "id": "sec_enterprise_report_metadata",
-                    "title": "报告信息",
-                    "type": "report_metadata",
-                    "page_start": cover_page[0],
-                    "source_page_start": cover_page[1],
-                }
-            )
-        notes_page = next(
-            ((logical_page, source_page) for logical_page, source_page, text in page_texts if "报告说明" in text),
-            None,
-        )
-        if notes_page is not None:
-            source_sections.append(
-                {
-                    "id": "sec_enterprise_report_notes",
-                    "title": "说明",
-                    "type": "notes",
-                    "page_start": notes_page[0],
-                    "source_page_start": notes_page[1],
-                }
-            )
-        for section in sections:
-            title = str(section.get("title") or "")
-            if title not in {"身份标识", "信息概要", "基本信息", "信贷记录明细", "公共记录明细", "信用记录补充信息"}:
-                continue
-            page_start = next(
-                (
-                    (logical_page, source_page)
-                    for logical_page, source_page, text in page_texts
-                    if source_page >= 3 and title in text
-                ),
-                None,
-            )
-            if page_start is not None:
-                section["page_start"] = page_start[0]
-                section["source_page_start"] = page_start[1]
-        return tuple([*source_sections, *sections])
 
 
 variant = EnterpriseNativeVariant()

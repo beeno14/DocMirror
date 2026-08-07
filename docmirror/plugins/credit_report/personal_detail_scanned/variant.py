@@ -24,6 +24,28 @@ _SECTION_CLASSIFIERS = (
     ("sec_report_explanation", "报告说明与编制说明", "report_explanation", ("报告说明", "编制说明")),
 )
 
+_FINAL_V2_SECTION_FIELD_SOURCES: dict[str, tuple[tuple[str, str], ...]] = {
+    "subject_name": (
+        ("report_metadata", "subject_name"),
+        ("subject_profile", "subject_name"),
+        ("subject_identity_documents", "holder_name"),
+    ),
+    "id_number": (
+        ("subject_identity_documents", "document_number"),
+        ("report_metadata", "primary_id_number"),
+        ("subject_profile", "primary_id_number"),
+    ),
+    "id_type": (
+        ("subject_identity_documents", "document_type"),
+        ("report_metadata", "primary_id_type"),
+        ("subject_profile", "primary_id_type"),
+    ),
+    "marital_status": (("subject_profile", "marital_status"),),
+    "query_institution": (("report_query", "query_institution"),),
+    "report_time": (("report_metadata", "report_time"),),
+    "report_number": (("report_metadata", "report_number"),),
+}
+
 
 def _page_source_text(page: Any) -> str:
     values = [str(getattr(block, "content", "") or "") for block in getattr(page, "texts", None) or ()]
@@ -214,8 +236,66 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                     status_row["presence_status"] = "observed_nonempty"
                     status_row["reason"] = "records_projected"
             elif status_row.get("presence_status") == "observed_nonempty":
-                status_row["presence_status"] = "not_observed"
-                status_row["reason"] = "no_explicit_absence_evidence"
+                status_row["presence_status"] = "unknown"
+                status_row["reason"] = "source_presence_not_established"
+
+    def reconcile_final_v2_section_fields(
+        self,
+        domain_facts: dict[str, Any],
+        field_details: dict[str, Any],
+        datasets: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Make Community section scalars a view of the finalized PBOC v2 rows."""
+        resolved: dict[str, Any] = {}
+        resolved_details: dict[str, dict[str, Any]] = {}
+        for target_field, candidates in _FINAL_V2_SECTION_FIELD_SOURCES.items():
+            value: Any = None
+            detail: dict[str, Any] | None = None
+            for dataset_name, source_field in candidates:
+                for record in datasets.get(dataset_name) or []:
+                    values = record.get("normalized") if isinstance(record.get("normalized"), dict) else record
+                    candidate = values.get(source_field)
+                    if candidate in (None, ""):
+                        continue
+                    value = deepcopy(candidate)
+                    raw_values = (
+                        record.get("canonical_raw")
+                        if isinstance(record.get("canonical_raw"), dict)
+                        else record.get("raw") if isinstance(record.get("raw"), dict) else {}
+                    )
+                    detail = {
+                        "source": "personal_detail_final_v2",
+                        "source_dataset": dataset_name,
+                        "source_record_id": record.get("record_id"),
+                        "raw": deepcopy(raw_values.get(source_field, candidate)),
+                    }
+                    if record.get("confidence") is not None:
+                        detail["confidence"] = record["confidence"]
+                    break
+                if detail is not None:
+                    break
+            resolved[target_field] = value
+            domain_facts[target_field] = value
+            if detail is None:
+                field_details.pop(target_field, None)
+            else:
+                field_details[target_field] = detail
+                resolved_details[target_field] = detail
+
+        # Community's entity vocabulary calls the same finalized identifier
+        # ``subject_id``. Keep the alias authoritative too, including None,
+        # so a stale sealed/generic identity cannot repopulate the section.
+        resolved["subject_id"] = resolved.get("id_number")
+        domain_facts["subject_id"] = resolved["subject_id"]
+        if "id_number" in resolved_details:
+            field_details["subject_id"] = {
+                **deepcopy(resolved_details["id_number"]),
+                "source": "personal_detail_final_v2_alias",
+            }
+        else:
+            field_details.pop("subject_id", None)
+        domain_facts["field_details"] = field_details
+        return resolved
 
     def refine_domain_facts(
         self,
@@ -277,7 +357,7 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         if classified:
             sections = classified
         elif page_count < 13:
-            return super().build_sections(parse_result, "")
+            sections = super().build_sections(parse_result, "")
         else:
             sections = (
                 {
@@ -336,6 +416,17 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
                     "page_start": 13,
                     "page_end": 13,
                 },
+            )
+        if not any(section.get("type") in {"basic_information", "identity"} for section in sections):
+            sections = (
+                {
+                    "id": "sec_personal_basic",
+                    "title": "个人基本信息",
+                    "type": "basic_information",
+                    "page_start": 1,
+                    "page_end": max(1, min(2, page_count or 1)),
+                },
+                *sections,
             )
         if not classified and page_count >= 15:
             sections += (

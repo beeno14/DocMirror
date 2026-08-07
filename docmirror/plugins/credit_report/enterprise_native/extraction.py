@@ -11,10 +11,8 @@ physical tables without changing or supplementing ``ParseResult``.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterator
 from datetime import date
-from types import MappingProxyType
 from typing import Any
 
 from docmirror.plugins.credit_report.currency_codes import (
@@ -29,9 +27,8 @@ from docmirror.plugins.credit_report.enterprise_native.continuation import (
     EnterpriseContinuationResolver,
     TableFragment,
 )
-from docmirror.plugins.credit_report.shared.entity_decoder import (
-    CreditReportEntityContext,
-    decode_credit_report_entities,
+from docmirror.plugins.credit_report.enterprise_native.ir import (
+    CanonicalEnterpriseDocumentIR,
 )
 from docmirror.plugins.credit_report.value_utils import (
     compact_text as _compact,
@@ -145,7 +142,7 @@ def _raw_table_rows(table: Any) -> list[list[str]]:
 
 
 def _table_stream(parse_result: Any):
-    if isinstance(parse_result, EnterpriseExtractionContext):
+    if isinstance(parse_result, CanonicalEnterpriseDocumentIR):
         for page, table_id, rows in parse_result.table_rows:
             yield page, table_id, [list(row) for row in rows]
         return
@@ -159,7 +156,7 @@ def _table_stream(parse_result: Any):
 
 def _table_headings(parse_result: Any) -> dict[str, str]:
     """Return the closest preceding page heading for each physical table."""
-    if isinstance(parse_result, EnterpriseExtractionContext):
+    if isinstance(parse_result, CanonicalEnterpriseDocumentIR):
         return dict(parse_result.table_headings)
     headings: dict[str, str] = {}
     for page in getattr(parse_result, "pages", None) or []:
@@ -183,7 +180,7 @@ def _table_headings(parse_result: Any) -> dict[str, str]:
 
 def _page_texts(parse_result: Any) -> dict[int, str]:
     """Return compact source text by page for enterprise metadata recovery."""
-    if isinstance(parse_result, EnterpriseExtractionContext):
+    if isinstance(parse_result, CanonicalEnterpriseDocumentIR):
         return dict(parse_result.page_texts)
     values: dict[int, str] = {}
     for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
@@ -194,96 +191,6 @@ def _page_texts(parse_result: Any) -> dict[int, str]:
             if getattr(block, "content", None)
         )
     return values
-
-
-@dataclass(frozen=True)
-class EnterpriseExtractionContext:
-    """Immutable indexes reused by every enterprise extractor in one projection."""
-
-    parse_result: Any
-    table_rows: tuple[tuple[int, str, tuple[tuple[str, ...], ...]], ...]
-    page_texts: Mapping[int, str]
-    table_headings: Mapping[str, str]
-    page_flow: tuple[tuple[int, str, Any], ...]
-    continuation_fragments: tuple[TableFragment, ...]
-    entity_context: CreditReportEntityContext
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.parse_result, name)
-
-
-def build_enterprise_extraction_context(parse_result: Any) -> EnterpriseExtractionContext:
-    """Index immutable page/table views once without altering the sealed result."""
-    if isinstance(parse_result, EnterpriseExtractionContext):
-        return parse_result
-
-    entity_context = decode_credit_report_entities(
-        parse_result,
-        report_family="enterprise",
-    )
-    table_rows: list[tuple[int, str, tuple[tuple[str, ...], ...]]] = []
-    page_texts: dict[int, str] = {}
-    table_headings: dict[str, str] = {}
-    fragments: list[TableFragment] = []
-
-    def normalized_bbox(value: Any) -> tuple[float, float, float, float] | None:
-        raw_bbox = list(getattr(value, "bbox", None) or [])
-        if len(raw_bbox) < 4:
-            return None
-        try:
-            x0, y0, x1, y1 = (float(item) for item in raw_bbox[:4])
-        except (TypeError, ValueError):
-            return None
-        return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
-
-    for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
-        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or page_index)
-        blocks = list(getattr(page, "texts", None) or [])
-        page_texts[page_number] = "\n".join(
-            str(getattr(block, "content", "") or "") for block in blocks if getattr(block, "content", None)
-        )
-        positioned_text = [
-            (
-                float((list(getattr(block, "bbox", None) or [0, 0, 0, 0]))[3]),
-                _compact(getattr(block, "content", "")),
-            )
-            for block in blocks
-            if len(list(getattr(block, "bbox", None) or [])) >= 4 and _compact(getattr(block, "content", ""))
-        ]
-        for table_index, table in enumerate(getattr(page, "tables", None) or []):
-            rows = _raw_table_rows(table)
-            if not rows:
-                continue
-            table_id = str(getattr(table, "table_id", "") or "")
-            immutable_rows = tuple(tuple(value for value in row) for row in rows)
-            table_rows.append((page_number, table_id, immutable_rows))
-            fragments.append(
-                TableFragment(
-                    index=len(fragments),
-                    page=page_number,
-                    table_id=table_id,
-                    rows=immutable_rows,
-                    bbox=normalized_bbox(table),
-                    page_width=float(getattr(page, "width", 0) or 0),
-                    page_height=float(getattr(page, "height", 0) or 0),
-                    first_on_page=table_index == 0,
-                    last_on_page=table_index == len(list(getattr(page, "tables", None) or [])) - 1,
-                )
-            )
-            bbox = list(getattr(table, "bbox", None) or [])
-            if table_id and len(bbox) >= 2:
-                preceding = [(bottom, content) for bottom, content in positioned_text if bottom <= float(bbox[1])]
-                if preceding:
-                    table_headings[table_id] = max(preceding, key=lambda item: item[0])[1]
-    return EnterpriseExtractionContext(
-        parse_result=parse_result,
-        table_rows=tuple(table_rows),
-        page_texts=MappingProxyType(page_texts),
-        table_headings=MappingProxyType(table_headings),
-        page_flow=entity_context.ordered_page_flow(),
-        continuation_fragments=tuple(fragments),
-        entity_context=entity_context,
-    )
 
 
 def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
@@ -950,6 +857,17 @@ _PROFILE_LABELS = frozenset(
         "存续状态",
     }
 )
+_PROFILE_FIELDS = {
+    "经济类型": "economic_type",
+    "组织机构类型": "organization_type",
+    "企业规模": "enterprise_scale",
+    "所属行业": "industry",
+    "成立年份": "establishment_year",
+    "登记证书有效截止日期": "registration_certificate_valid_through",
+    "登记地址": "registered_address",
+    "办公/经营地址": "operating_address",
+    "存续状态": "operating_status",
+}
 
 _IDENTITY_LABELS = {
     "企业名称": "subject_name",
@@ -1742,8 +1660,10 @@ def extract_enterprise_continuation_audit(
         )
     ):
         resolved.update(extract_enterprise_summary_datasets(parse_result))
-    if "repayment_liability_records" not in resolved:
-        resolved["repayment_liability_records"] = extract_enterprise_repayment_liability_records(parse_result)
+    if "enterprise_repayment_responsibility_accounts" not in resolved:
+        resolved["enterprise_repayment_responsibility_accounts"] = (
+            extract_enterprise_repayment_liability_records(parse_result)
+        )
     if "enterprise_attachment_accounts" not in resolved or "enterprise_attachment_credit_details" not in resolved:
         attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
         for name, records in attachment_datasets.items():
@@ -1752,7 +1672,9 @@ def extract_enterprise_continuation_audit(
         "current_credit_summary": len(resolved.get("enterprise_current_credit_summary") or []),
         "closed_credit_summary": len(resolved.get("enterprise_closed_credit_summary") or []),
         "repayment_responsibility_summary": len(resolved.get("enterprise_repayment_responsibility_summary") or []),
-        "repayment_liability": len(resolved.get("repayment_liability_records") or []),
+        "repayment_liability": len(
+            resolved.get("enterprise_repayment_responsibility_accounts") or []
+        ),
         "attachment_account": len(resolved.get("enterprise_attachment_accounts") or []),
     }
     audits: list[dict[str, Any]] = []
@@ -2005,7 +1927,6 @@ def extract_enterprise_report_identity_records(
     identity.update(metadata)
     if not identity:
         return []
-    identity["enterprise_name"] = identity.get("subject_name")
     identity["sequence"] = 1
     identity["enterprise_identity_id"] = _stable_id(
         "enterprise_report_identity",
@@ -2331,9 +2252,15 @@ def extract_enterprise_report_notes(parse_result: Any) -> list[dict[str, Any]]:
 
 
 def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
-    """Extract enterprise-only profile and related-party tables."""
-    profile: list[dict[str, Any]] = []
-    stakeholders: list[dict[str, Any]] = []
+    """Extract the canonical wide profile and disjoint related-party tables."""
+    profile: dict[str, Any] = {
+        "enterprise_profile_id": "enterprise_profile:r000001",
+        "sequence": 1,
+        "source_refs": [],
+        "confidence": 1.0,
+    }
+    contributors: list[dict[str, Any]] = []
+    key_personnel: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
     headings = _table_headings(parse_result)
     for page, table_id, rows in _table_stream(parse_result):
@@ -2346,26 +2273,21 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
             for row_index, row in enumerate(rows):
                 if len(row) < 2 or row[0] not in _PROFILE_LABELS:
                     continue
-                profile.append(
-                    {
-                        "sequence": len(profile) + 1,
-                        "field": row[0],
-                        "value": row[1],
-                        "source_institution": row[3] if len(row) > 3 else "",
-                        "page": page,
-                        "source": "canonical_enterprise_profile_table",
-                        "source_refs": [_source_ref(page, table_id, row_index)],
-                        "confidence": 1.0,
-                    }
-                )
+                field = _PROFILE_FIELDS[row[0]]
+                value: Any = row[1]
+                if field == "establishment_year":
+                    number = _number(value)
+                    value = int(number) if number is not None else value
+                profile[field] = value
+                profile["source_refs"].append(_source_ref(page, table_id, row_index))
             continue
         if all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
             for row_index, row in enumerate(rows[1:], start=1):
                 if len(row) < 4 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
                     continue
-                stakeholders.append(
+                contributors.append(
                     {
-                        "sequence": len(stakeholders) + 1,
+                        "sequence": len(contributors) + 1,
                         "role": row[0],
                         "name": row[1],
                         "identity_type": row[2],
@@ -2389,9 +2311,9 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
             for row_index, row in enumerate(rows[start_index:], start=start_index):
                 if len(row) < 4 or not row[0] or row[0].startswith("信息来源"):
                     continue
-                stakeholders.append(
+                key_personnel.append(
                     {
-                        "sequence": len(stakeholders) + 1,
+                        "sequence": len(key_personnel) + 1,
                         "role": row[0],
                         "name": row[1],
                         "identity_type": row[2],
@@ -2433,8 +2355,9 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                     }
                 )
     return {
-        "enterprise_profile_fields": profile,
-        "enterprise_stakeholders": stakeholders,
+        "enterprise_profile": [profile] if profile["source_refs"] else [],
+        "enterprise_contributors": contributors,
+        "enterprise_key_personnel": key_personnel,
         "enterprise_relationships": relationships,
     }
 
@@ -2463,7 +2386,7 @@ def _vertical_position(value: Any, fallback: float) -> float:
 
 def _page_flow(parse_result: Any) -> Iterator[tuple[int, str, Any]]:
     """Yield page text and tables in visual order, preserving continuations."""
-    if isinstance(parse_result, EnterpriseExtractionContext):
+    if isinstance(parse_result, CanonicalEnterpriseDocumentIR):
         yield from parse_result.page_flow
         return
     for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
@@ -2574,7 +2497,6 @@ def _attachment_contexts_and_records(
                 and _date(row[open_date_index])
                 and _number(row[amount_index]) is not None
             )
-
         for candidate in resolver.following_fragments(
             fragment,
             candidate_validator=valid_detail_row,
@@ -3687,395 +3609,9 @@ def _reported_account_summary(parse_result: Any) -> dict[str, Any]:
                         }
     return {}
 
-
-def _merge_accounts(
-    original: list[dict[str, Any]],
-    canonical: list[dict[str, Any]],
-    expected: int | None,
-) -> list[dict[str, Any]]:
-    if not canonical:
-        return original
-
-    def identifier(record: dict[str, Any]) -> str:
-        return _identifier(record.get("account_identifier"))
-
-    def compatible(candidate: dict[str, Any]) -> bool:
-        """Require main-account identity evidence before filling a gap."""
-        return bool(
-            len(identifier(candidate)) >= _MIN_ENTERPRISE_ACCOUNT_IDENTIFIER_LENGTH
-            and _compact(candidate.get("management_institution"))
-            and _compact(candidate.get("business_type"))
-            and (_date(candidate.get("open_date")) or _date(candidate.get("due_date")))
-        )
-
-    def merge_record(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
-        merged = dict(primary)
-        for key, value in secondary.items():
-            if key == "source_refs":
-                refs = list(merged.get("source_refs") or [])
-                for ref in value or []:
-                    if ref not in refs:
-                        refs.append(ref)
-                merged["source_refs"] = refs
-            elif merged.get(key) in (None, "", [], {}) and value not in (None, "", [], {}):
-                merged[key] = value
-        return merged
-
-    original_by_id = {
-        identifier(record): record
-        for record in original
-        if isinstance(record, dict) and compatible(record)
-    }
-    merged: list[dict[str, Any]] = []
-    consumed_original: set[str] = set()
-    for record in canonical:
-        canonical_id = identifier(record)
-        exact = original_by_id.get(canonical_id)
-        prefix_id = next(
-            (
-                candidate_id
-                for candidate_id in original_by_id
-                if candidate_id != canonical_id
-                and (candidate_id.startswith(canonical_id) or canonical_id.startswith(candidate_id))
-            ),
-            "",
-        )
-        fallback = exact or original_by_id.get(prefix_id)
-        if fallback is not None:
-            consumed_original.add(identifier(fallback))
-            record = merge_record(record, fallback)
-            fallback_id = identifier(fallback)
-            if len(fallback_id) > len(canonical_id) and fallback_id.startswith(canonical_id):
-                record["account_identifier"] = fallback_id
-                record["account_id"] = f"credit_account:{fallback_id}"
-        merged.append(record)
-
-    if expected is None or len(merged) == expected:
-        return merged
-
-    candidates = [
-        record
-        for candidate_id, record in original_by_id.items()
-        if candidate_id not in consumed_original
-        and not any(
-            candidate_id.startswith(identifier(item)) or identifier(item).startswith(candidate_id)
-            for item in merged
-        )
-    ]
-    reconciled = [*merged, *candidates]
-    if len(reconciled) == expected:
-        return reconciled
-    if len(original_by_id) == expected:
-        # The fallback population exactly reconciles with the report total and
-        # every row passed the main-account evidence guard.
-        return list(original_by_id.values())
-    # Do not guess which extra appendix/history candidate belongs to the main
-    # account population.  Returning the strongest canonical population keeps
-    # the mismatch visible to the extraction reconciliation audit.
-    return merged
-
-
-def _enterprise_source_display_limited(text: str) -> bool:
-    compact = _compact(text)
-    partial_credit = bool(
-        re.search(
-            r"(?:受?篇幅(?:所限|限制)?.{0,30})?"
-            r"(?:只|仅)?(?:展示|列示|显示|提供).{0,12}部分.{0,12}(?:信贷|信用)记录",
-            compact,
-        )
-        or re.search(r"部分(?:信贷|信用)记录.{0,12}(?:展示|列示|显示|提供)", compact)
-    )
-    limited_period = bool(
-        re.search(r"(?:仅|只)?展示.{0,12}(?:期限|期间|年限|时间范围).{0,20}已结清信贷信息", compact)
-        and any(marker in compact for marker in ("非信贷信息", "公共信息", "公共记录"))
-    )
-    return partial_credit or limited_period
-
-
-def refine_enterprise_business(
-    parse_result: Any,
-    business: dict[str, Any],
-) -> dict[str, Any]:
-    """Replace heuristic enterprise candidates when canonical cards reconcile."""
-    refined = dict(business)
-    summary = dict(refined.get("credit_summary") or {})
-    summary.update(extract_enterprise_overview(parse_result))
-    reported = _reported_account_summary(parse_result)
-    summary.update(reported)
-    expected = reported.get("reported_account_count")
-    canonical_accounts = extract_enterprise_accounts_from_tables(parse_result)
-    accounts = _merge_accounts(
-        list(refined.get("credit_accounts") or []),
-        canonical_accounts,
-        int(expected) if isinstance(expected, int) else None,
-    )
-    credit_lines = extract_enterprise_credit_lines_from_tables(parse_result, accounts)
-    repayment_liabilities = extract_enterprise_repayment_liability_records(parse_result)
-    public_records = extract_enterprise_public_records_from_tables(parse_result)
-    refined["credit_lines"] = credit_lines
-    if repayment_liabilities:
-        refined["repayment_liability_records"] = repayment_liabilities
-    reported_credit_lines = _reported_credit_line_count(parse_result)
-    if reported_credit_lines is not None:
-        summary["reported_credit_line_count"] = reported_credit_lines
-    if public_records:
-        refined["public_records"] = public_records
-        summary["public_record_count"] = len(public_records)
-        public_record_counts: dict[str, int] = {}
-        for record in public_records:
-            record_type = str(record.get("record_type") or "unknown")
-            public_record_counts[record_type] = public_record_counts.get(record_type, 0) + 1
-        summary["public_record_type_counts"] = public_record_counts
-    refined["credit_accounts"] = accounts
-    summary["account_population_comparable"] = bool(isinstance(expected, int) and expected == len(accounts))
-    summary["account_population_reconciliation_status"] = (
-        "complete"
-        if isinstance(expected, int) and expected == len(accounts)
-        else "not_reported"
-        if not isinstance(expected, int)
-        else "unresolved"
-    )
-    attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
-    attachment_accounts = attachment_datasets["enterprise_attachment_accounts"]
-    attachment_details = attachment_datasets["enterprise_attachment_credit_details"]
-    attachment_transactions = attachment_datasets["enterprise_special_transactions"]
-    source_display_limited = any(
-        _enterprise_source_display_limited(text)
-        for text in _page_texts(parse_result).values()
-    )
-    summary.update(
-        {
-            "account_dataset_scope": "main_report_account_cards",
-            "account_dataset_scope_note": (
-                "信贷账户数据集对应报告正文展示的账户卡片；"
-                + ("源报告明确说明信息展示范围受限。" if source_display_limited else "")
-                + "附件账户、月度历史、信贷明细及特定交易分别在企业附件数据集中列示。"
-            ),
-            "source_display_limited": source_display_limited,
-            "attachment_account_count": len(attachment_accounts),
-            "attachment_credit_detail_count": len(attachment_details),
-            "attachment_special_transaction_count": len(attachment_transactions),
-        }
-    )
-    facility_summaries = _facility_summary_lines(parse_result)
-    if facility_summaries:
-        summary["facility_summary"] = {
-            str(line["facility_type"]): {
-                key: line.get(key)
-                for key in ("total_limit", "used_limit", "available_limit", "currency", "amount_unit")
-            }
-            for line in facility_summaries
-        }
-        summary["facility_summary_record_count"] = len(facility_summaries)
-    summary.update(
-        {
-            "extracted_account_count": len(accounts),
-            "canonical_table_account_count": len(canonical_accounts),
-            "credit_line_count": len(refined.get("credit_lines") or []),
-        }
-    )
-    refined["credit_summary"] = summary
-    return refined
-
-
-def _enterprise_text_fallback(full_text: str, parse_result: Any) -> dict[str, Any]:
-    """Extract text-only enterprise records without entering the personal pipeline."""
-    text = str(full_text or "")
-    compact = re.sub(r"\s+", "", text)
-    summary: dict[str, Any] = {}
-    overview_match = re.search(
-        r"首次有相关还款责任的年份\s*(\d{4})\s+(\d+)\s+(\d+)\s+(\d{4})",
-        text,
-    )
-    if overview_match:
-        summary.update(
-            {
-                "first_credit_year": int(overview_match.group(1)),
-                "credit_institution_count": int(overview_match.group(2)),
-                "active_credit_institution_count": int(overview_match.group(3)),
-                "first_repayment_responsibility_year": int(overview_match.group(4)),
-            }
-        )
-    balance_match = re.search(
-        r"借贷交易担保交易余额([0-9,.]+)余额([0-9,.]+)其中[：:]?被追偿余额([0-9,.]+)",
-        compact,
-    )
-    if balance_match:
-        summary.update(
-            {
-                "credit_balance": _number(balance_match.group(1)),
-                "guarantee_balance": _number(balance_match.group(2)),
-                "recovered_debt_balance": _number(balance_match.group(3)),
-            }
-        )
-
-    page_texts = _page_texts(parse_result)
-
-    def source_page(value: str) -> int | None:
-        needle = _compact(value)
-        return next(
-            (page for page, page_text in page_texts.items() if needle and needle in _compact(page_text)),
-            None,
-        )
-
-    accounts: list[dict[str, Any]] = []
-    account_matches = list(
-        re.finditer(r"未结清账户编号[：:]\s*([0-9A-Z]{6,})", text, flags=re.IGNORECASE)
-    )
-    for index, match in enumerate(account_matches):
-        end = account_matches[index + 1].start() if index + 1 < len(account_matches) else len(text)
-        segment = text[match.end() : end]
-        account_identifier = _identifier(match.group(1))
-        institution_match = re.search(r"授信机构[：:]\s*([^\r\n]+)", segment)
-        business_match = re.search(r"业务种类[：:]\s*([^\r\n]+)", segment)
-        page = source_page(account_identifier)
-        accounts.append(
-            {
-                "account_id": _stable_id("enterprise_credit_account", account_identifier),
-                "account_identifier": account_identifier,
-                "account_status": "active",
-                "status": "active",
-                "institution": _compact(institution_match.group(1)) if institution_match else "",
-                "business_type": _compact(business_match.group(1)) if business_match else "",
-                "source_page": page,
-                "source": "enterprise_native_text_fallback",
-                "source_refs": (
-                    [{"source": "native_text_enterprise_account", "page": page}]
-                    if page is not None
-                    else []
-                ),
-                "confidence": 0.95,
-            }
-        )
-
-    public_records: list[dict[str, Any]] = []
-    public_match = re.search(
-        r"公共记录明细(.*?)(?:附件\s*\d*[：:]|信用记录补充信息|\Z)",
-        text,
-        flags=re.DOTALL,
-    )
-    public_text = public_match.group(1) if public_match else ""
-    date_token = r"(?:19|20)\d{2}-\d{2}-\d{2}"
-
-    def append_public_record(
-        *,
-        record_type: str,
-        authority: str,
-        category: str,
-        start_date: str,
-        end_date: str,
-        content: str,
-    ) -> None:
-        page = source_page(authority)
-        public_records.append(
-            {
-                "public_record_id": _stable_id(
-                    "enterprise_public_record",
-                    record_type,
-                    authority,
-                    start_date,
-                    end_date,
-                    content,
-                ),
-                "record_type": record_type,
-                "authority": authority,
-                "category": category,
-                "start_date": "" if start_date == "--" else start_date,
-                "end_date": "" if end_date == "--" else end_date,
-                "content": content,
-                "source_page": page,
-                "source": "enterprise_native_text_fallback",
-                "source_refs": (
-                    [{"source": "native_text_enterprise_public_record", "page": page}]
-                    if page is not None
-                    else []
-                ),
-                "confidence": 0.9,
-            }
-        )
-
-    license_match = re.search(
-        r"许可部门.*?许可内容(.*?)(?=认证部门|资质部门|\Z)",
-        public_text,
-        flags=re.DOTALL,
-    )
-    if license_match:
-        license_body = re.sub(r"\s+", "", license_match.group(1))
-        license_pattern = re.compile(
-            rf"(?P<authority>.+?)(?P<category>普通)(?P<start>{date_token})"
-            rf"(?P<end>{date_token})(?P<content>.+?)(?=(?:.+?普通{date_token})|\Z)"
-        )
-        for match in license_pattern.finditer(license_body):
-            authority = re.sub(
-                r"^.*?许可(?=[^许可]*(?:省|市|县|区))",
-                "",
-                match.group("authority"),
-            )
-            append_public_record(
-                record_type="license",
-                authority=authority,
-                category=match.group("category"),
-                start_date=match.group("start"),
-                end_date=match.group("end"),
-                content=match.group("content"),
-            )
-
-    certification_match = re.search(
-        r"认证部门.*?认证内容(.*?)(?=资质部门|附件\s*\d*[：:]|\Z)",
-        public_text,
-        flags=re.DOTALL,
-    )
-    if certification_match:
-        certification_body = re.sub(r"\s+", "", certification_match.group(1))
-        certification_pattern = re.compile(
-            rf"(?P<authority>.+?)(?P<category>纳税信用A(?:级)?纳税人)"
-            rf"(?P<start>{date_token}|--)(?P<end>{date_token}|--)"
-            rf"(?P<content>.+?)(?=(?:.+?纳税信用A(?:级)?纳税人(?:{date_token}|--))|\Z)"
-        )
-        for match in certification_pattern.finditer(certification_body):
-            append_public_record(
-                record_type="certification",
-                authority=match.group("authority"),
-                category=match.group("category"),
-                start_date=match.group("start"),
-                end_date=match.group("end"),
-                content=match.group("content"),
-            )
-
-    if public_records:
-        summary["public_record_count"] = len(public_records)
-        counts: dict[str, int] = {}
-        for record in public_records:
-            record_type = str(record["record_type"])
-            counts[record_type] = counts.get(record_type, 0) + 1
-        summary["public_record_type_counts"] = counts
-    return {
-        "credit_accounts": accounts,
-        "credit_lines": [],
-        "repayment_liability_records": [],
-        "repayment_records": [],
-        "overdue_records": [],
-        "inquiry_records": [],
-        "public_records": public_records,
-        "credit_summary": summary,
-    }
-
-
-def extract_enterprise_native_business(
-    parse_result: Any,
-    full_text: str,
-) -> dict[str, Any]:
-    """Transform a ParseResult into enterprise-native business candidates."""
-    candidates = _enterprise_text_fallback(full_text, parse_result)
-    return refine_enterprise_business(parse_result, candidates)
-
-
 __all__ = [
-    "EnterpriseExtractionContext",
-    "build_enterprise_extraction_context",
     "extract_enterprise_accounts_from_tables",
     "extract_enterprise_credit_lines_from_tables",
-    "extract_enterprise_native_business",
     "extract_enterprise_facility_summary",
     "extract_enterprise_identity_facts",
     "extract_enterprise_interest_arrears",
@@ -4093,5 +3629,4 @@ __all__ = [
     "extract_enterprise_report_identity_records",
     "extract_enterprise_report_notes",
     "extract_enterprise_supplement_rows",
-    "refine_enterprise_business",
 ]

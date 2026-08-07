@@ -3,7 +3,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
-    PersonalDetailExtractionContext,
     _printed_reading_order,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
@@ -293,28 +292,8 @@ def test_duplicate_issue_stages_merge_evidence_instead_of_repeating() -> None:
     assert {ref["evidence_id"] for ref in issues[0]["source_refs"]} == {"native", "projection"}
 
 
-def test_header_consensus_replays_the_whole_page_when_fields_are_missing(monkeypatch) -> None:
-    replay_calls: list[tuple[set[int], str]] = []
-
+def test_header_consensus_reports_missing_fields_for_coordinated_page_repair(monkeypatch) -> None:
     monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
-
-    def replay(self, pages: set[int], *, dataset_name: str):
-        replay_calls.append((pages, dataset_name))
-        return (
-            {
-                "被查询者姓名": "张三",
-                "被查询者证件类型": "鑫",
-                "被查询者证件号码": "11010519491231002X",
-                "查询机构": "本人",
-                "查询原因": "本人查询",
-                "报告编号": "2025052510051518624525",
-                "报告时间": "2025年5月25日 10:05:15",
-            },
-            [],
-            0.98,
-        )
-
-    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "_full_page_fields", replay)
     result = SimpleNamespace(
         pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[])],
         _personal_detail_extraction_issues=[],
@@ -323,13 +302,15 @@ def test_header_consensus_replays_the_whole_page_when_fields_are_missing(monkeyp
     datasets = _extract_header_datasets(result, "")
 
     metadata = datasets["personal_report_metadata"][0]
-    assert replay_calls == [({1}, "report_header")]
-    assert metadata["subject_name"] == "张三"
-    assert metadata["primary_id_type"] == "身份证"
-    assert metadata["primary_id_number"] == "11010519491231002X"
-    assert metadata["report_time"] == "2025-05-25T10:05:15+08:00"
-    assert len(result._personal_detail_extraction_issues) == 1
-    assert result._personal_detail_extraction_issues[0]["status"] == "resolved"
+    assert metadata["subject_name"] is None
+    assert metadata["primary_id_type"] is None
+    assert metadata["primary_id_number"] is None
+    assert metadata["report_time"] is None
+    assert len(result._personal_detail_extraction_issues) == 7
+    assert all(
+        issue["source_refs"][0]["logical_page"] == 1
+        for issue in result._personal_detail_extraction_issues
+    )
 
 
 def test_withheld_typed_value_is_partial_and_has_field_observation() -> None:
@@ -386,7 +367,7 @@ def test_tolerant_native_parser_accepts_unique_high_margin_label_damage() -> Non
     assert records[0].fields["授信协议标识"] == "AGREEMENT0001"
 
 
-def test_native_parser_uses_whole_page_ocr_when_cell_structure_is_incomplete() -> None:
+def test_native_parser_defers_incomplete_cells_to_coordinated_page_evidence() -> None:
     table = _table(
         "credit-line-incomplete",
         [
@@ -397,34 +378,19 @@ def test_native_parser_uses_whole_page_ocr_when_cell_structure_is_incomplete() -
     page = SimpleNamespace(page_number=1, source_page_number=1, tables=[table])
     recorded: list[dict[str, object]] = []
 
-    def full_page_ocr(_pages: set[int], *, reason: str) -> list[dict[str, object]]:
-        assert "missing_required_value" in reason
-        return [
-            {
-                "page": 1,
-                "source_page": 1,
-                "lines": [
-                    {"text": "授信协议标识", "bbox": [20, 100, 180, 125]},
-                    {"text": "授信额度用途", "bbox": [300, 100, 450, 125]},
-                    {"text": "AGREEMENT0002", "bbox": [20, 145, 180, 170]},
-                    {"text": "循环额度", "bbox": [300, 145, 450, 170]},
-                ],
-            }
-        ]
-
     context = SimpleNamespace(
         pages=[page],
         reading_order_by_logical={1: 1},
         tables_continue=lambda _left, _right: None,
-        full_page_ocr_evidence=full_page_ocr,
+        corrected_evidence_pages=lambda: [],
         _personal_detail_extraction_issues=recorded,
     )
 
     records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
 
-    assert len(records) == 1
-    assert records[0].fields["授信协议标识"] == "AGREEMENT0002"
-    assert context._personal_detail_extraction_issues[0]["status"] == "resolved"
+    assert records == []
+    assert context._personal_detail_extraction_issues[0]["issue_code"] == "recognized_native_section_missing_required_value"
+    assert not hasattr(context, "full_page_ocr_evidence")
 
 
 def test_native_parser_segments_repeated_liabilities_from_corrected_page_rows() -> None:
@@ -588,62 +554,6 @@ def test_section_roots_do_not_promote_summary_labels_or_report_explanations() ->
     assert by_type["statements"]["page_end"] == 6
     assert by_type["annotations"]["page_end"] == 13
     assert by_type["report_explanation"]["page_end"] == 15
-
-
-def test_split_replay_replaces_unsplit_evidence_and_inserts_dense_order() -> None:
-    context = object.__new__(PersonalDetailExtractionContext)
-    unsplit_geometry = SimpleNamespace(split_kind="none", segment_index=0)
-    context.page_topology = SimpleNamespace(
-        audit=lambda: {"logical_pages_by_source": {"1": [1], "2": [2]}},
-        logicals_for_source=lambda source: (source,),
-        geometry=lambda logical: unsplit_geometry if logical in {1, 2} else None,
-    )
-    context.source_page_by_logical = {1: 1, 2: 2}
-    context.reading_order_by_logical = {1: 1, 2: 2}
-    context.supplemental_page_ocr_evidence = lambda _sources, **_kwargs: [
-        {"source_page": 1, "segment_index": 0, "lines": [{"text": "left"}]},
-        {"source_page": 1, "segment_index": 1, "lines": [{"text": "right"}]},
-    ]
-    context._ocr_correction_overlay = SimpleNamespace(
-        corrected_evidence_pages=lambda pages: pages,
-    )
-
-    merged = context._merge_split_replay_pages(
-        [
-            {"page": 1, "source_page": 1, "lines": [{"text": "unsplit"}]},
-            {"page": 2, "source_page": 2, "lines": [{"text": "next"}]},
-        ]
-    )
-
-    assert [page["lines"][0]["text"] for page in merged] == ["left", "right", "next"]
-    assert [page["page"] for page in merged] == [1, 3, 2]
-    assert context.source_page_by_logical == {1: 1, 2: 2, 3: 1}
-    assert context.reading_order_by_logical == {1: 1, 3: 2, 2: 3}
-
-
-def test_split_replay_preserves_unsplit_evidence_when_pair_is_incomplete() -> None:
-    context = object.__new__(PersonalDetailExtractionContext)
-    unsplit_geometry = SimpleNamespace(split_kind="none", segment_index=0)
-    context.page_topology = SimpleNamespace(
-        audit=lambda: {"logical_pages_by_source": {"1": [1]}},
-        logicals_for_source=lambda _source: (1,),
-        geometry=lambda _logical: unsplit_geometry,
-    )
-    context.source_page_by_logical = {1: 1}
-    context.reading_order_by_logical = {1: 1}
-    context._page_ocr_requests = []
-    context.supplemental_page_ocr_evidence = lambda _sources, **_kwargs: [
-        {"source_page": 1, "segment_index": 0, "lines": [{"text": "left-only"}]},
-    ]
-    context._ocr_correction_overlay = SimpleNamespace(corrected_evidence_pages=lambda pages: pages)
-
-    merged = context._merge_split_replay_pages(
-        [{"page": 1, "source_page": 1, "lines": [{"text": "unsplit"}]}]
-    )
-
-    assert [page["lines"][0]["text"] for page in merged] == ["unsplit"]
-    assert context._page_ocr_requests[-1]["status"] == "pair_incomplete"
-    assert context._page_ocr_requests[-1]["observed_segments"] == [0]
 
 
 def test_identifier_only_liability_rows_are_redundant_not_business_records() -> None:

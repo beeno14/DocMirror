@@ -79,12 +79,19 @@ PBOC_DATASET_ORDER = (
     "inquiries",
     "field_observations",
     "extraction_issues",
+    "extraction_issue_evidence",
     "pboc_extension_fields",
     "dataset_status",
 )
 
 _CONTROL_DATASETS = frozenset(
-    {"field_observations", "extraction_issues", "pboc_extension_fields", "dataset_status"}
+    {
+        "field_observations",
+        "extraction_issues",
+        "extraction_issue_evidence",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
 )
 
 _PBOC_DATASET_LABELS = {
@@ -137,6 +144,7 @@ _PBOC_DATASET_LABELS = {
     "inquiries": "查询记录",
     "field_observations": "字段观测与不确定性",
     "extraction_issues": "提取问题与人工复核队列",
+    "extraction_issue_evidence": "提取问题结构化证据",
     "pboc_extension_fields": "人行业务扩展字段",
     "dataset_status": "业务数据集状态",
 }
@@ -350,6 +358,16 @@ def _subject_profile(values: dict[str, Any]) -> dict[str, Any]:
 
 def _credit_account(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
+    for internal_field in (
+        "raw_detail_lines",
+        "raw_detail_text",
+        "account_identifier_candidates",
+        "account_family_quality",
+        "account_status_resolution",
+        "account_status_raw",
+        "_repayment_context",
+    ):
+        values.pop(internal_field, None)
     account_type = str(values.get("account_type") or "")
     type_code, type_label = _ACCOUNT_TYPE_CODES.get(account_type, (None, None))
     if type_code:
@@ -690,11 +708,16 @@ def _project_dataset_status(
         elif source_presence and source_presence <= {"explicitly_empty"}:
             presence_status = "explicitly_empty"
             reason = "source_explicitly_empty"
+        elif source_values and source_presence <= {"not_observed"} and all(
+            values.get("source_statement") or values.get("absence_evidence") for values in source_values
+        ):
+            presence_status = "not_observed"
+            reason = "source_proved_absence"
         elif source_values:
-            presence_status = "not_observed"
-            reason = "no_records_for_projected_dataset"
+            presence_status = "unknown"
+            reason = "source_presence_not_established"
         else:
-            presence_status = "not_observed"
+            presence_status = "unknown"
             reason = "no_source_status_mapping"
 
         if presence_status not in {"not_observed", "partial", "extraction_failed", "unknown"}:
@@ -758,6 +781,11 @@ def _canonical_dataset_name(source_name: Any) -> str:
 
 def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
+    if values.get("observation_status") == "not_observed" and not (
+        values.get("source_statement") or values.get("absence_evidence")
+    ):
+        values["observation_status"] = "unreadable"
+        values.setdefault("reason", "source_presence_not_established")
     source_name = str(values.get("dataset_name") or "")
     if source_name == "unknown" and values.get("source_dataset_name"):
         return values
@@ -768,6 +796,10 @@ def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
         values["dataset_name"] = "unknown"
         if source_name:
             values["source_dataset_name"] = source_name
+    raw_value = values.get("raw_value")
+    if isinstance(raw_value, (dict, list, tuple)):
+        values.pop("raw_value", None)
+        values["raw_value_type"] = "object" if isinstance(raw_value, dict) else "array"
     return values
 
 
@@ -897,6 +929,60 @@ def _extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+def _issue_evidence_rows(issue_records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize nested issue evidence into a compact typed child relation."""
+    evidence: list[dict[str, Any]] = []
+    compact_issues: list[dict[str, Any]] = []
+
+    def emit_leaves(issue_id: str, kind: str, path: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for key in sorted(value, key=str):
+                child = f"{path}.{key}" if path else str(key)
+                emit_leaves(issue_id, kind, child, value[key])
+            return
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                emit_leaves(issue_id, kind, f"{path}[{index}]", item)
+            return
+        if value is None:
+            return
+        evidence_id = f"extraction_issue_evidence:{issue_id}:{len(evidence) + 1}"
+        row: dict[str, Any] = {
+            "record_id": evidence_id,
+            "extraction_issue_evidence_id": evidence_id,
+            "extraction_issue_id": issue_id,
+            "evidence_kind": kind,
+            "evidence_path": path or "value",
+        }
+        if isinstance(value, bool):
+            row.update({"value_type": "boolean", "boolean_value": value})
+        elif isinstance(value, int):
+            row.update({"value_type": "integer", "integer_value": value})
+        elif isinstance(value, float):
+            row.update({"value_type": "number", "number_value": value})
+        else:
+            row.update({"value_type": "string", "string_value": str(value)})
+        evidence.append(row)
+
+    for record in issue_records:
+        values = _extraction_issue(_normalized(record))
+        issue_id = str(values.get("extraction_issue_id") or record.get("record_id") or "unresolved_issue")
+        for field_name, kind in (("observed_value", "observed"), ("candidate_value", "candidate")):
+            value = values.get(field_name)
+            if isinstance(value, (dict, list, tuple)):
+                values.pop(field_name, None)
+                values[f"{field_name}_type"] = "object" if isinstance(value, dict) else "array"
+                emit_leaves(issue_id, kind, "", value)
+        reason_codes = values.pop("reason_codes", ())
+        if isinstance(reason_codes, (list, tuple, set)):
+            codes = tuple(dict.fromkeys(str(code) for code in reason_codes if str(code)))
+            values["reason_code_count"] = len(codes)
+            for index, code in enumerate(codes):
+                emit_leaves(issue_id, "reason", f"reason_codes[{index}]", code)
+        compact_issues.append(_replace_normalized(record, values))
+    return compact_issues, evidence
+
+
 def _issue_role(field_name: str) -> str | None:
     if field_name in {"currency", "account_currency", "reporting_amount_currency"}:
         return "currency"
@@ -914,6 +1000,8 @@ def _issue_role(field_name: str) -> str | None:
         return "inquiry_reason"
     if field_name == "nationality":
         return "country_or_region_code"
+    if field_name == "account_status":
+        return "account_status_code"
     return None
 
 
@@ -1048,6 +1136,9 @@ def _canonical_quality_gate(
 ) -> dict[str, list[dict[str, Any]]]:
     """Withhold invalid v2 values and publish one deduplicated uncertainty."""
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        _is_valid_for_role,
+    )
 
     issues = [
         record
@@ -1179,6 +1270,13 @@ def _canonical_quality_gate(
                 elif field_name in {"mailing_address", "household_address", "address", "employer_address"}:
                     if _address_suspicious(value):
                         invalid.append((field_name, value, "canonical_address_suspicious"))
+                # The post-projection gate owns canonical business enums.  Other
+                # role-sensitive text has already passed through the field-aware
+                # correction overlay; replaying its broad role inference here
+                # duplicates a parent account failure on every monthly child.
+                role = _issue_role(field_name)
+                if role and not _is_valid_for_role(str(value), role):
+                    invalid.append((field_name, value, "canonical_field_contract_failed"))
 
             seen_fields: set[str] = set()
             for field_name, observed, issue_code in invalid:
@@ -1273,7 +1371,7 @@ def _canonical_quality_gate(
             "dataset_name": target,
             "business_record_id": str(values.get("target_record_id") or "unresolved_record"),
             "field_name": field_name,
-            "observation_status": "not_observed" if observed in (None, "", []) else "unreadable",
+            "observation_status": "unreadable",
             "reason": str(values.get("issue_code") or "extraction_uncertain"),
             **({"raw_value": observed} if observed not in (None, "", []) else {}),
         }
@@ -1480,6 +1578,11 @@ def project_personal_detail_datasets(
         projected["dataset_status"] = _project_dataset_status(status_rows, projected)
 
     projected = _canonical_quality_gate(projected)
+    if projected.get("extraction_issues"):
+        compact_issues, evidence_rows = _issue_evidence_rows(projected["extraction_issues"])
+        projected["extraction_issues"] = compact_issues
+        if evidence_rows:
+            projected["extraction_issue_evidence"] = evidence_rows
     # Candidate B rows may retain a canonical_raw evidence pool beside their
     # flat compatibility fields. Community serialization treats such a pool
     # as authoritative when no explicit normalized pool exists, which would
@@ -1680,6 +1783,27 @@ def personal_detail_data_dictionary() -> dict[str, Any]:
     datasets["extraction_issues"] = deepcopy(
         source_datasets["personal_detail_extraction_issues"]
     )
+    datasets["extraction_issues"]["columns"].update(
+        {
+            "observed_value_type": _descriptor("观测证据容器类型", "enum"),
+            "candidate_value_type": _descriptor("候选证据容器类型", "enum"),
+            "reason_code_count": _descriptor("原因代码数", "integer"),
+        }
+    )
+    datasets["extraction_issue_evidence"] = {
+        "definition": "Typed scalar leaves of nested extraction-issue evidence, keyed to one extraction issue.",
+        "columns": {
+            "extraction_issue_evidence_id": _descriptor("问题证据ID"),
+            "extraction_issue_id": _descriptor("提取问题ID"),
+            "evidence_kind": _descriptor("证据类别", "enum"),
+            "evidence_path": _descriptor("证据路径"),
+            "value_type": _descriptor("值类型", "enum"),
+            "string_value": _descriptor("字符串值", "text"),
+            "integer_value": _descriptor("整数值", "integer"),
+            "number_value": _descriptor("数值", "number"),
+            "boolean_value": _descriptor("布尔值", "boolean"),
+        },
+    }
     datasets["pboc_extension_fields"] = {
         "definition": "Lossless scalar fallback for PBOC business fields not yet represented by a typed v2 column.",
         "columns": {
@@ -1886,6 +2010,16 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "confidence",
             "message",
         ],
+        "extraction_issue_evidence": [
+            "extraction_issue_id",
+            "evidence_kind",
+            "evidence_path",
+            "value_type",
+            "string_value",
+            "integer_value",
+            "number_value",
+            "boolean_value",
+        ],
     }
     dictionary = personal_detail_data_dictionary()
     foreign_keys = {
@@ -1925,6 +2059,13 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "reference_columns": ["record_id"],
         },
     ]
+    foreign_keys["extraction_issue_evidence"] = [
+        {
+            "columns": ["extraction_issue_id"],
+            "reference_dataset": "extraction_issues",
+            "reference_columns": ["record_id"],
+        }
+    ]
     semantic["community_projection_overrides"] = {
         "dataset_labels": dict(_PBOC_DATASET_LABELS),
         "dataset_representation_roles": {
@@ -1960,6 +2101,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "pboc_extension_fields": ["unmapped_source_business_fields"],
             "field_observations": ["assessed_source_fields"],
             "extraction_issues": ["ocr_audit", "page_topology_audit", "native_parser"],
+            "extraction_issue_evidence": ["extraction_issues"],
             "dataset_status": ["final_v2_business_datasets"],
         },
         "section_markers": {
@@ -1984,6 +2126,7 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             "inquiries": ["inquiries"],
             "field_observations": ["extraction_review"],
             "extraction_issues": ["extraction_review"],
+            "extraction_issue_evidence": ["extraction_review"],
             "pboc_extension_fields": ["extraction_review"],
             "dataset_status": ["extraction_review"],
         },

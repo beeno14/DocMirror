@@ -134,7 +134,8 @@
         "administrative_penalty_records", "housing_fund_records", "social_assistance_records",
         "professional_qualification_records", "administrative_award_records",
         "annotation_statement_groups", "annotation_statements", "inquiries",
-        "field_observations", "extraction_issues", "pboc_extension_fields", "dataset_status"
+        "field_observations", "extraction_issues", "extraction_issue_evidence",
+        "pboc_extension_fields", "dataset_status"
       ]
     },
     "canonicalDataset": {
@@ -313,6 +314,16 @@
           }}}}}}
         },
         {
+          "if": {"properties": {"name": {"const": "extraction_issue_evidence"}}, "required": ["name"]},
+          "then": {"properties": {"rows": {"items": {"properties": {"normalized": {
+            "required": ["extraction_issue_evidence_id", "extraction_issue_id", "evidence_kind", "evidence_path", "value_type"],
+            "properties": {
+              "evidence_kind": {"enum": ["observed", "candidate", "reason"]},
+              "value_type": {"enum": ["string", "integer", "number", "boolean"]}
+            }
+          }}}}}}
+        },
+        {
           "if": {"properties": {"name": {"const": "pboc_extension_fields"}}, "required": ["name"]},
           "then": {"properties": {"rows": {"items": {"properties": {"normalized": {
             "required": ["pboc_extension_field_id", "namespace", "source_dataset", "source_record_id", "field_name", "value"]
@@ -325,7 +336,7 @@
             "properties": {
               "dataset_name": {
                 "$ref": "#/$defs/datasetName",
-                "not": {"enum": ["field_observations", "extraction_issues", "pboc_extension_fields", "dataset_status"]}
+                "not": {"enum": ["field_observations", "extraction_issues", "extraction_issue_evidence", "pboc_extension_fields", "dataset_status"]}
               },
               "source_dataset_name": {"type": ["string", "null"]},
               "presence_status": {"enum": ["not_observed", "partial", "extraction_failed", "unknown"]},

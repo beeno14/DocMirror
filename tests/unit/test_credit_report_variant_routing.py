@@ -5,7 +5,6 @@
 
 from types import SimpleNamespace
 
-from docmirror.plugins.credit_report.enterprise_native import extraction as enterprise_extraction
 from docmirror.plugins.credit_report.personal_brief_native import extraction as personal_brief_extraction
 from docmirror.plugins.credit_report.variant_router import (
     registered_credit_report_variants,
@@ -46,7 +45,8 @@ def test_credit_report_variant_dataset_contracts_preserve_existing_outputs() -> 
     personal_detail = resolve_credit_report_variant("personal_detail", "scanned_ocr")
 
     assert "credit_lines" not in personal_brief.dataset_names()
-    assert enterprise.dataset_names()[1] == "credit_lines"
+    assert "enterprise_credit_facilities" in enterprise.dataset_names()
+    assert "credit_lines" not in enterprise.dataset_names()
     assert "credit_agreements" in personal_detail.dataset_names()
     assert "credit_lines" not in personal_detail.dataset_names()
     assert personal_brief.keep_query_institution is False
@@ -75,7 +75,7 @@ def test_unknown_credit_report_variant_preserves_legacy_fallback_shape() -> None
     assert "credit_lines" in unknown.dataset_names()
 
 
-def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatch) -> None:
+def test_native_business_extraction_is_owned_by_non_enterprise_variants(monkeypatch) -> None:
     parse_result = SimpleNamespace()
     personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
     enterprise = resolve_credit_report_variant("enterprise", "native_text")
@@ -85,22 +85,12 @@ def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatc
         "extract_personal_brief_native_business",
         lambda _result, _text: {"owner": "personal_brief_native"},
     )
-    monkeypatch.setattr(
-        enterprise_extraction,
-        "extract_enterprise_native_business",
-        lambda _result, _text: {"owner": "enterprise_native"},
-    )
-
     assert personal_brief.extract_native_business(
         parse_result,
         "",
         content_mode="native_text",
     ) == {"owner": "personal_brief_native"}
-    assert enterprise.extract_native_business(
-        parse_result,
-        "",
-        content_mode="native_text",
-    ) == {"owner": "enterprise_native"}
+    assert "extract_native_business" not in type(enterprise).__dict__
     assert (
         personal_detail.extract_native_business(
             parse_result,
@@ -132,10 +122,10 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "sensitive": True,
     }
     assert "个人简版" in personal_dictionary["datasets"]["credit_accounts"]["definition"]
-    assert "个人简版" not in enterprise_dictionary["datasets"]["credit_accounts"]["definition"]
+    assert "个人简版" not in enterprise_dictionary["datasets"]["enterprise_credit_accounts"]["definition"]
     assert personal_semantic["presentation_policy"]["classification"] == ("highly_sensitive_personal_financial_data")
     assert enterprise_semantic["presentation_policy"]["classification"] == ("sensitive_enterprise_credit_data")
-    assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
+    assert enterprise_semantic["dataset_relationships"]["enterprise_credit_facilities"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
     assert personal_semantic["dataset_document_order"][:5] == [
@@ -159,16 +149,16 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         < enterprise_order.index("enterprise_closed_credit_summary")
     )
     assert (
-        enterprise_order.index("enterprise_profile_fields")
+        enterprise_order.index("enterprise_profile")
         < enterprise_order.index("enterprise_capital_summary")
-        < enterprise_order.index("enterprise_stakeholders")
+        < enterprise_order.index("enterprise_contributors")
     )
     assert (
-        enterprise_order.index("credit_accounts")
+        enterprise_order.index("enterprise_credit_accounts")
         < enterprise_order.index("enterprise_displayed_credit_summary")
-        < enterprise_order.index("credit_lines")
+        < enterprise_order.index("enterprise_credit_facilities")
     )
-    assert enterprise_order[-1] == "enterprise_extraction_audit"
+    assert "enterprise_extraction_audit" not in enterprise_order
     assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
     assert enterprise_dictionary["version"] == "2.0.0"
     assert "identity_documents" not in enterprise_dictionary["datasets"]

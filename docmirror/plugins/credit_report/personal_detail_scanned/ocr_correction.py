@@ -13,7 +13,6 @@ independent from OCR policy.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import unicodedata
 from collections import Counter
@@ -102,6 +101,22 @@ _ACCOUNT_STATES = frozenset(
         "unknown",
     }
 )
+_ACCOUNT_STATUS_CODES = frozenset(
+    {
+        "active",
+        "settled",
+        "closed",
+        "transferred_out",
+        "inactive",
+        "frozen",
+        "suspended",
+        "recovery",
+        "collateral_shortfall",
+        "forced_liquidation",
+        "collection",
+        "unknown",
+    }
+)
 _FIVE_TIER_CLASSES = frozenset({"正常", "关注", "次级", "可疑", "损失", "违约", "未分类", "unknown"})
 
 _FIELD_ROLES: dict[str, str] = {
@@ -139,6 +154,7 @@ _FIELD_ROLES: dict[str, str] = {
     "overdue_amount": "amount",
     "repayment_status": "repayment_status",
     "account_state": "account_state",
+    "account_status": "account_status_code",
     "account_lifecycle_state": "account_state",
     "five_tier_class": "five_tier_class",
     "current_overdue_periods": "nonnegative_integer",
@@ -487,6 +503,8 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         return value in _ACCOUNT_TYPE_LABELS
     if role == "account_state":
         return value in _ACCOUNT_STATES
+    if role == "account_status_code":
+        return value in _ACCOUNT_STATUS_CODES
     if role == "five_tier_class":
         return value in _FIVE_TIER_CLASSES
     if role == "inquiry_row":
@@ -532,13 +550,31 @@ def _normalize_role(value: str, role: str) -> str:
         return _normalize_business_enum(value, _ACCOUNT_TYPE_LABELS)
     if role == "account_state":
         return _normalize_business_enum(value, _ACCOUNT_STATES)
+    if role == "account_status_code":
+        return _normalize_business_enum(value, _ACCOUNT_STATUS_CODES)
     if role == "five_tier_class":
         return _normalize_business_enum(value, _FIVE_TIER_CLASSES)
     if role == "inquiry_row":
         return _normalize_inquiry_line(value)
+    if role == "inquiry_reason":
+        text = _plain_text(value)
+        for original, corrected in dict(_pack().get("inquiry_reason_substitutions") or {}).items():
+            text = text.replace(str(original), str(corrected))
+        return _normalize_business_enum(text, _VALID_INQUIRY_REASONS)
     if role == "account_line":
         return _normalize_account_line(value)
     return _plain_text(value)
+
+
+def normalize_role_candidate(value: Any, role: str) -> str:
+    """Expose the field-specific normalizer to the page repair coordinator."""
+    return _normalize_role(str(value or ""), str(role or ""))
+
+
+def role_candidate_is_valid(value: Any, role: str) -> bool:
+    """Return whether one candidate is admissible for a PBOC semantic role."""
+    normalized = normalize_role_candidate(value, role)
+    return bool(normalized) and _is_valid_for_role(normalized, str(role or ""))
 
 
 def _source_refs(value: Any) -> tuple[dict[str, Any], ...]:
@@ -628,29 +664,20 @@ def _boxes_associate(
 
 
 class PersonalDetailOCRCorrectionOverlay:
-    """Schema-independent corrected view over one sealed personal report."""
+    """Schema-aware corrected view over one sealed personal report.
+
+    This object never starts OCR.  The business-repair coordinator may install
+    complete-page evidence after first-pass validation; typed correction then
+    selects candidates from that fixed evidence plane.
+    """
 
     def __init__(
         self,
         parse_result: Any,
-        *,
-        page_image_resolver: Any | None = None,
-        full_page_ocr_loader: Any | None = None,
-        repair_engine: Any | None = None,
-        enable_targeted_ocr: bool | None = None,
-        max_targeted_requests: int = 8,
     ) -> None:
         self.parse_result = parse_result
-        self._page_image_resolver = page_image_resolver
-        self._full_page_ocr_loader = full_page_ocr_loader
-        self._repair_engine = repair_engine
-        self.enable_targeted_ocr = (
-            os.environ.get("DOCMIRROR_PERSONAL_DETAIL_TARGETED_OCR", "1") != "0"
-            if enable_targeted_ocr is None
-            else bool(enable_targeted_ocr)
-        )
-        self.max_targeted_requests = max(0, int(max_targeted_requests))
-        self._targeted_requests = 0
+        self._repair_evidence_by_page: dict[int, dict[str, Any]] = {}
+        self._repair_evidence_reparse_attempts = 0
         self._decisions: list[PersonalDetailCorrectionDecision] = []
         self._decision_keys: set[tuple[str, str, str, str]] = set()
         self._audited_cells: set[tuple[str, str, str, str]] = set()
@@ -669,11 +696,28 @@ class PersonalDetailOCRCorrectionOverlay:
             "decision_count": len(self._decisions),
             "applied_count": counts.get("applied", 0),
             "suggested_count": counts.get("suggested", 0),
-            "targeted_ocr_requests": self._targeted_requests,
+            "repair_evidence_page_count": len(self._repair_evidence_by_page),
+            "repair_evidence_reparse_attempt_count": self._repair_evidence_reparse_attempts,
+            "ocr_started_by_correction_overlay": False,
             "audited_cell_count": len(self._audited_cells),
             "abnormal_cell_count": len(self._cell_anomalies),
             "cell_anomalies": [anomaly.to_dict() for anomaly in self._cell_anomalies],
             "decisions": [decision.to_dict() for decision in self._decisions],
+        }
+
+    def install_business_repair_evidence(
+        self,
+        pages: Iterable[Mapping[str, Any]],
+        *,
+        affected_pages: Iterable[int],
+    ) -> None:
+        """Install the coordinator's fixed evidence without acquiring any OCR."""
+        allowed = {int(page) for page in affected_pages if int(page) > 0}
+        self._repair_evidence_by_page = {
+            int(page.get("page") or 0): deepcopy(dict(page))
+            for page in pages
+            if isinstance(page, Mapping)
+            and int(page.get("page") or 0) in allowed
         }
 
     def _audit_cell(
@@ -763,7 +807,6 @@ class PersonalDetailOCRCorrectionOverlay:
         role: str,
         source_refs: Iterable[dict[str, Any]] = (),
         confidence: float | None = None,
-        allow_targeted_ocr: bool = False,
     ) -> tuple[str, PersonalDetailCorrectionDecision | None]:
         original = str(value or "")
         refs = _source_refs(source_refs)
@@ -778,21 +821,19 @@ class PersonalDetailOCRCorrectionOverlay:
                 confidence=max(0.98, float(confidence or 0.0)),
                 refs=refs,
             )
-        if allow_targeted_ocr and not _is_valid_for_role(corrected, role):
-            repaired = self._targeted_repair(original, role=role, refs=refs)
+        if not _is_valid_for_role(corrected, role):
+            repaired = self._repair_from_installed_page_evidence(original, role=role, refs=refs)
             if repaired is not None:
                 return repaired
         return original, None
 
-    def _targeted_repair(
+    def _repair_from_installed_page_evidence(
         self,
         original: str,
         *,
         role: str,
         refs: tuple[dict[str, Any], ...],
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
-        if not self.enable_targeted_ocr or self._targeted_requests >= self.max_targeted_requests:
-            return None
         ref = next(
             (
                 item
@@ -806,67 +847,53 @@ class PersonalDetailOCRCorrectionOverlay:
         if ref is None:
             return None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
-        self._targeted_requests += 1
-        if not callable(self._full_page_ocr_loader):
+        evidence = self._repair_evidence_by_page.get(logical_page)
+        if evidence is None:
             return None
-        # Re-OCR the complete logical page once and cache it in the extraction
-        # context.  The bbox is only a schema-aware association hint; it never
-        # becomes the OCR input region.
-        return self._repair_from_full_page(
+        self._repair_evidence_reparse_attempts += 1
+        return self._repair_from_page_evidence(
             original,
             role=role,
             ref=ref,
             refs=refs,
-            logical_page=logical_page,
+            page=evidence,
         )
 
-    def _repair_from_full_page(
+    def _repair_from_page_evidence(
         self,
         original: str,
         *,
         role: str,
         ref: dict[str, Any],
         refs: tuple[dict[str, Any], ...],
-        logical_page: int,
+        page: Mapping[str, Any],
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
-        """Select a typed value from one cached complete-page OCR pass.
-
-        The source bbox is used only to associate the already page-wide OCR
-        result with its schema-assigned field.  OCR itself is never rerun on a
-        crop here.
-        """
-        pages = self._full_page_ocr_loader(
-            {logical_page},
-            reason=f"schema_role_repair:{role}",
-        )
+        """Select a typed value from already-acquired complete-page evidence."""
         target = tuple(float(item) for item in ref.get("bbox") or ())
         if len(target) != 4:
             return None
         candidates: list[tuple[float, str]] = []
-        for page in pages or ():
-            if int(page.get("page") or 0) != logical_page:
+        selected: list[tuple[float, float, str, float]] = []
+        for line in page.get("lines") or ():
+            if not isinstance(line, dict):
                 continue
-            selected: list[tuple[float, float, str, float]] = []
-            for line in page.get("lines") or ():
-                if not isinstance(line, dict):
-                    continue
-                bbox = line.get("bbox")
-                text = str(line.get("text") or line.get("content") or "").strip()
-                if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                    continue
-                candidate_box = tuple(float(item) for item in bbox)
-                if not _boxes_associate(target, candidate_box):
-                    continue
-                confidence = float(line.get("confidence") or 0.0)
-                selected.append((candidate_box[1], candidate_box[0], text, confidence))
-                normalized = _normalize_role(text, role)
-                if _is_valid_for_role(normalized, role):
-                    candidates.append((confidence, normalized))
-            if selected:
-                joined = " ".join(item[2] for item in sorted(selected))
-                normalized = _normalize_role(joined, role)
-                if _is_valid_for_role(normalized, role):
-                    candidates.append((min(item[3] for item in selected), normalized))
+            bbox = line.get("bbox")
+            text = str(line.get("text") or line.get("content") or "").strip()
+            if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            candidate_box = tuple(float(item) for item in bbox)
+            if not _boxes_associate(target, candidate_box):
+                continue
+            confidence = float(line.get("confidence") or 0.0)
+            selected.append((candidate_box[1], candidate_box[0], text, confidence))
+            normalized = _normalize_role(text, role)
+            if _is_valid_for_role(normalized, role):
+                candidates.append((confidence, normalized))
+        if selected:
+            joined = " ".join(item[2] for item in sorted(selected))
+            normalized = _normalize_role(joined, role)
+            if _is_valid_for_role(normalized, role):
+                candidates.append((min(item[3] for item in selected), normalized))
         valid = sorted(candidates, reverse=True)
         if not valid or valid[0][0] < 0.72:
             return None
@@ -877,8 +904,8 @@ class PersonalDetailOCRCorrectionOverlay:
             role=role,
             original=original,
             corrected=selected,
-            method="full_page_ocr_role_reparse",
-            reason_codes=("complete_logical_page_rerendered", "schema_role_validation", "candidate_margin"),
+            method="schema_bound_page_evidence_reparse",
+            reason_codes=("business_uncertainty_trigger", "schema_role_validation", "candidate_margin"),
             confidence=valid[0][0],
             refs=refs,
             candidates=tuple(dict.fromkeys(value for _score, value in valid)),
@@ -919,7 +946,6 @@ class PersonalDetailOCRCorrectionOverlay:
                             },
                         ),
                         confidence=float(line.get("confidence") or 0.0),
-                        allow_targeted_ocr=role == "inquiry_row",
                     )
                     if decision is not None:
                         line["ocr_original_text"] = original
@@ -1013,32 +1039,11 @@ class PersonalDetailOCRCorrectionOverlay:
             field_path = f"{base_path}.{key}".lstrip(".")
             role = _mapping_role(value, str(key))
             if role and item not in (None, "") and not isinstance(item, (dict, list)):
-                cell_target = (
-                    stage == "native_business"
-                    and _cell_scoped(local_refs)
-                    and role
-                    in {
-                        "account_type_label",
-                        "amount_or_placeholder",
-                        "integer_or_placeholder",
-                    }
-                )
                 updated, decision = self.correct_text(
                     item,
                     role=role,
                     source_refs=local_refs,
                     confidence=float(confidence or 0.0),
-                    allow_targeted_ocr=len(local_refs) == 1
-                    and (
-                        cell_target
-                        or role
-                        in {
-                            "identity_document_number",
-                            "report_datetime",
-                            "date",
-                            "date_or_month",
-                        }
-                    ),
                 )
                 if decision is not None:
                     value[key] = updated
@@ -1068,7 +1073,6 @@ class PersonalDetailOCRCorrectionOverlay:
                     role=role,
                     source_refs=nested_refs,
                     confidence=float(item.get("confidence") or confidence or 0.0),
-                    allow_targeted_ocr=role in {"identity_document_number", "report_datetime", "date", "date_or_month"},
                 )
                 if decision is not None:
                     item.setdefault("raw", item["value"])
@@ -1182,4 +1186,6 @@ __all__ = [
     "PersonalDetailCorrectionDecision",
     "PersonalDetailOCRCorrectionOverlay",
     "normalize_institution_name",
+    "normalize_role_candidate",
+    "role_candidate_is_valid",
 ]
