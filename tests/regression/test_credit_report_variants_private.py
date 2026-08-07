@@ -1232,15 +1232,27 @@ def test_credit_report_subtype_projects_complete_v3(
             assert [row["over_90_days_months"] for row in normalized_overdue] == [1, 3, 2, 2, 2, 1, 2, 1, 0]
             assert all(row["current_overdue_status"] == "overdue" for row in normalized_overdue)
             assert sum(row["over_90_days"] is True for row in normalized_overdue) == 8
-            overdue_markdown = enhanced_preview.split("### 逾期记录", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+            for overdue_type, heading in {
+                "credit_card": "信用卡账户",
+                "loan": "贷款账户",
+                "credit_line": "贷款授信",
+            }.items():
+                if not any(row["account_type"] == overdue_type for row in normalized_overdue):
+                    continue
+                account_preview = enhanced_preview.split(f"#### {heading}", maxsplit=1)[1].split(
+                    "\n#### ",
+                    maxsplit=1,
+                )[0]
+                assert "##### 逾期记录" in account_preview
             assert (
                 "| 组内序号 | 账户类型 | 管理机构 | 业务类型 | 卡片尾号 | 开立日期 | "
                 "最近5年逾期月数 | 其中超过90天月数 | 当前逾期状态 |"
-            ) in overdue_markdown
-            assert "account id" not in overdue_markdown
-            assert "overdue id" not in overdue_markdown
-            assert "last_5_years" not in overdue_markdown
-            assert "当前有逾期" in overdue_markdown
+            ) in enhanced_preview
+            assert "\n### 逾期记录\n" not in enhanced_preview
+            assert "account id" not in enhanced_preview
+            assert "overdue id" not in enhanced_preview
+            assert "last_5_years" not in enhanced_preview
+            assert "当前有逾期" in enhanced_preview
         if (expected_accounts, expected_liabilities, expected_inquiries) == (45, 4, 124):
             semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
             summary = semantic["domain"]["facts"]["credit_summary"]

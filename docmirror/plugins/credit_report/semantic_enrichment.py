@@ -1127,7 +1127,13 @@ def credit_report_semantic_extensions(*, report_subtype: str) -> dict[str, Any]:
                             ],
                         },
                     ],
-                }
+                },
+                "overdue_records": {
+                    "placement": "before_partition_rows",
+                    "target_dataset": "credit_accounts",
+                    "partition_by": "account_type",
+                    "title": "逾期记录",
+                },
             },
             "appendix": {
                 "title": "附录：文档来源与提取信息",

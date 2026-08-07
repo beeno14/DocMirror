@@ -874,6 +874,22 @@ def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> No
             "institution": "其他机构",
         },
     ]
+    candidate["data"]["overdue_records"] = [
+        {
+            "overdue_id": "overdue:card:1",
+            "sequence": 1,
+            "account_type": "credit_card",
+            "institution": "发卡银行",
+            "overdue_months": 2,
+        },
+        {
+            "overdue_id": "overdue:loan:1",
+            "sequence": 1,
+            "account_type": "loan",
+            "institution": "贷款银行",
+            "overdue_months": 1,
+        },
+    ]
     candidate["data"]["data_dictionary"]["datasets"]["credit_accounts"] = {
         "columns": {
             "sequence": {"label": "组内序号", "type": "integer"},
@@ -881,6 +897,14 @@ def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> No
             "institution": {"label": "管理机构", "type": "string"},
             "credit_limit": {"label": "信用额度", "type": "money"},
             "loan_amount": {"label": "贷款发放金额", "type": "money"},
+        }
+    }
+    candidate["data"]["data_dictionary"]["datasets"]["overdue_records"] = {
+        "columns": {
+            "sequence": {"label": "组内序号", "type": "integer"},
+            "account_type": {"label": "账户类型", "type": "enum"},
+            "institution": {"label": "管理机构", "type": "string"},
+            "overdue_months": {"label": "逾期月数", "type": "integer"},
         }
     }
     candidate["data"]["data_dictionary"]["enums"] = {
@@ -912,7 +936,13 @@ def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> No
                             "columns": ["sequence", "institution", "loan_amount"],
                         },
                     ],
-                }
+                },
+                "overdue_records": {
+                    "placement": "before_partition_rows",
+                    "target_dataset": "credit_accounts",
+                    "partition_by": "account_type",
+                    "title": "逾期记录",
+                },
             }
         }
     }
@@ -923,11 +953,18 @@ def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> No
 
     assert enhanced.index("#### 信用卡账户") < enhanced.index("#### 贷款账户")
     assert "| 组内序号 | 管理机构 | 信用额度 |" in card_table
+    assert card_table.index("##### 逾期记录") < card_table.index("| 组内序号 | 管理机构 | 信用额度 |")
+    assert "| 1 | 信用卡 | 发卡银行 | 2 |" in card_table
+    assert "贷款银行" not in card_table
     assert "贷款发放金额" not in card_table
     assert "| 1 | 发卡银行 | 2240000 |" in card_table
     assert "| 组内序号 | 管理机构 | 贷款发放金额 |" in loan_table
+    assert loan_table.index("##### 逾期记录") < loan_table.index("| 组内序号 | 管理机构 | 贷款发放金额 |")
+    assert "| 1 | 贷款 | 贷款银行 | 1 |" in loan_table
+    assert "发卡银行" not in loan_table
     assert "信用额度" not in loan_table
     assert "| 1 | 贷款银行 | 315000 |" in loan_table
+    assert "\n### 逾期记录\n" not in enhanced
     assert "#### 其他账户" in enhanced
     assert "其他机构" in enhanced
     assert "2,240,000" not in enhanced

@@ -66,6 +66,24 @@ def test_personal_detail_presentation_overrides_are_variant_local() -> None:
     assert "community_projection_overrides" not in enterprise.semantic_extensions()
 
 
+def test_personal_brief_overdue_markdown_placement_is_variant_local() -> None:
+    personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    personal_detail = resolve_credit_report_variant("personal_detail", "scanned_ocr")
+
+    brief_layouts = personal_brief.semantic_extensions()["enhanced_markdown"]["dataset_layouts"]
+    assert brief_layouts["overdue_records"] == {
+        "placement": "before_partition_rows",
+        "target_dataset": "credit_accounts",
+        "partition_by": "account_type",
+        "title": "逾期记录",
+    }
+    assert "overdue_records" not in enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"]
+    assert "overdue_records" not in (
+        personal_detail.semantic_extensions().get("enhanced_markdown", {}).get("dataset_layouts", {})
+    )
+
+
 def test_unknown_credit_report_variant_preserves_legacy_fallback_shape() -> None:
     unknown = resolve_credit_report_variant("unknown", "native_text")
 

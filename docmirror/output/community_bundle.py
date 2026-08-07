@@ -786,6 +786,11 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         privacy_mode = "full"
     sections = {str(section.get("id") or ""): section for section in payload.get("sections") or []}
     datasets = {str(dataset.get("id") or ""): dataset for dataset in payload.get("datasets") or []}
+    datasets_by_name = {
+        str(dataset.get("name") or ""): dataset
+        for dataset in datasets.values()
+        if dataset.get("name")
+    }
     reading = payload.get("reading") or {}
     tables = {str(table.get("dataset_id") or ""): table for table in reading.get("tables") or []}
     parts = [
@@ -885,6 +890,86 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     dataset_layouts = (
         presentation.get("dataset_layouts") if isinstance(presentation.get("dataset_layouts"), dict) else {}
     )
+    partition_preludes: dict[
+        str,
+        list[tuple[dict[str, Any], dict[str, Any], dict[str, Any], str]],
+    ] = {}
+    embedded_dataset_ids: set[str] = set()
+    for source_name, source_layout in dataset_layouts.items():
+        if (
+            not isinstance(source_layout, dict)
+            or source_layout.get("placement") != "before_partition_rows"
+        ):
+            continue
+        target_name = str(source_layout.get("target_dataset") or "")
+        target_layout = dataset_layouts.get(target_name)
+        source_dataset = datasets_by_name.get(str(source_name))
+        target_dataset = datasets_by_name.get(target_name)
+        if (
+            not target_name
+            or not isinstance(target_layout, dict)
+            or target_layout.get("mode") != "partitioned_tables"
+            or source_dataset is None
+            or target_dataset is None
+        ):
+            continue
+        target_partition_by = str(target_layout.get("partition_by") or "")
+        source_partition_by = str(source_layout.get("partition_by") or target_partition_by)
+        source_table = tables.get(str(source_dataset.get("id") or ""))
+        if not target_partition_by or not source_partition_by or source_table is None:
+            continue
+
+        def partition_value(row: dict[str, Any], key: str) -> str:
+            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+            return str(normalized.get(key, canonical_raw.get(key)) or "unknown")
+
+        target_values = {
+            partition_value(row, target_partition_by)
+            for row in target_dataset.get("rows") or []
+            if isinstance(row, dict)
+        }
+        source_values = {
+            partition_value(row, source_partition_by)
+            for row in source_dataset.get("rows") or []
+            if isinstance(row, dict)
+        }
+        if not source_values.issubset(target_values):
+            continue
+        partition_preludes.setdefault(target_name, []).append(
+            (source_dataset, source_table, source_layout, source_partition_by)
+        )
+        embedded_dataset_ids.add(str(source_dataset.get("id") or ""))
+
+    def row_value(row: dict[str, Any], key: str) -> Any:
+        normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+        canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+        return normalized.get(key, canonical_raw.get(key))
+
+    def render_dataset_rows(
+        rows: list[dict[str, Any]],
+        keys: list[str],
+        column_by_key: dict[str, dict[str, Any]],
+    ) -> str:
+        labels = [_markdown_text(column_by_key[key].get("label") or key) for key in keys]
+        lines = [
+            "| " + " | ".join(labels) + " |",
+            "| " + " | ".join("---" for _ in keys) + " |",
+        ]
+        for row in rows:
+            values = [
+                _markdown_display(
+                    row_value(row, key),
+                    key=key,
+                    descriptor=column_by_key[key],
+                    dictionary=dictionary,
+                    privacy_mode=privacy_mode,
+                )
+                for key in keys
+            ]
+            lines.append("| " + " | ".join(values) + " |")
+        return "\n".join(lines)
+
     deferred_appendix_datasets: list[
         tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
     ] = []
@@ -956,6 +1041,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         table = tables.get(ref_id)
         if dataset is None or table is None:
             continue
+        if ref_id in embedded_dataset_ids:
+            continue
         dataset_layout = dataset_layouts.get(str(dataset.get("name") or ""))
         if not isinstance(dataset_layout, dict):
             dataset_layout = {}
@@ -972,11 +1059,6 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         if not keys:
             parts.append("_No displayable columns._")
             continue
-        def row_value(row: dict[str, Any], key: str) -> Any:
-            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
-            canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
-            return normalized.get(key, canonical_raw.get(key))
-
         def display_value(row: dict[str, Any], key: str) -> str:
             return _markdown_display(
                 row_value(row, key),
@@ -988,18 +1070,44 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
 
         def render_rows(rows: list[dict[str, Any]], row_keys: list[str] | None = None) -> str:
             active_keys = row_keys or keys
-            active_labels = [
-                _markdown_text(column_by_key[key].get("label") or key)
-                for key in active_keys
-            ]
-            lines = [
-                "| " + " | ".join(active_labels) + " |",
-                "| " + " | ".join("---" for _ in active_keys) + " |",
-            ]
-            for row in rows:
-                values = [display_value(row, key) for key in active_keys]
-                lines.append("| " + " | ".join(values) + " |")
-            return "\n".join(lines)
+            return render_dataset_rows(rows, active_keys, column_by_key)
+
+        def render_partition_prelude(partition_value: str) -> None:
+            for prelude_dataset, prelude_table, prelude_layout, prelude_partition_by in (
+                partition_preludes.get(str(dataset.get("name") or ""), [])
+            ):
+                prelude_rows = [
+                    row
+                    for row in prelude_dataset.get("rows") or []
+                    if isinstance(row, dict)
+                    and str(row_value(row, prelude_partition_by) or "unknown") == partition_value
+                ]
+                if not prelude_rows:
+                    continue
+                prelude_columns = {
+                    str(column.get("key") or ""): column
+                    for column in prelude_dataset.get("columns") or []
+                    if column.get("key")
+                }
+                configured_prelude_keys = (
+                    prelude_layout.get("columns")
+                    or prelude_table.get("column_keys")
+                    or []
+                )
+                prelude_keys = [
+                    str(key)
+                    for key in configured_prelude_keys
+                    if str(key) in prelude_columns
+                ]
+                if not prelude_keys:
+                    continue
+                if not prelude_layout.get("hide_title", False):
+                    parts.append(
+                        f"##### {_markdown_text(prelude_layout.get('title') or prelude_table.get('title') or prelude_dataset.get('label'))}"
+                    )
+                parts.append(
+                    render_dataset_rows(prelude_rows, prelude_keys, prelude_columns)
+                )
 
         dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
         if dataset_layout.get("mode") == "partitioned_tables":
@@ -1030,6 +1138,7 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                 parts.append(
                     f"#### {_markdown_text(spec.get('title') or partition_value)}"
                 )
+                render_partition_prelude(partition_value)
                 parts.append(render_rows(rows, partition_keys or keys))
                 rendered_values.add(partition_value)
             for partition_value in sorted(set(grouped) - rendered_values):
@@ -1041,6 +1150,7 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                     privacy_mode=privacy_mode,
                 )
                 parts.append(f"#### {_markdown_text(shown_partition)}")
+                render_partition_prelude(partition_value)
                 parts.append(render_rows(grouped[partition_value]))
         elif dataset_layout.get("mode") == "record_cards":
             configured_title_separator = dataset_layout.get("title_separator")
