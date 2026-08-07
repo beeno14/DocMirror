@@ -946,6 +946,20 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
         return normalized.get(key, canonical_raw.get(key))
 
+    def has_overdue_signal(row: dict[str, Any]) -> bool:
+        for key in ("overdue_months", "over_90_days_months"):
+            value = row_value(row, key)
+            try:
+                if not isinstance(value, bool) and float(str(value).replace(",", "")) > 0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return (
+            row_value(row, "current_overdue") is True
+            or row_value(row, "over_90_days") is True
+            or row_value(row, "current_overdue_status") == "overdue"
+        )
+
     def render_dataset_rows(
         rows: list[dict[str, Any]],
         keys: list[str],
@@ -1083,6 +1097,10 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                     for row in prelude_dataset.get("rows") or []
                     if isinstance(row, dict)
                     and str(row_value(row, prelude_partition_by) or "unknown") == partition_value
+                    and (
+                        prelude_dataset.get("name") != "overdue_records"
+                        or has_overdue_signal(row)
+                    )
                 ]
                 if not prelude_rows:
                     continue
