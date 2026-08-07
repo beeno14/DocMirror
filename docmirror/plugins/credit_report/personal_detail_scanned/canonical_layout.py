@@ -132,8 +132,8 @@ _TEMPLATES: tuple[CanonicalTemplateSpec, ...] = (
         "credit_agreement",
         (
             ("授信协议信息",),
-            ("授信协议标识", "授信额度用途"),
-            ("授信额度", "已用额度", "币种"),
+            ("管理机构", "授信协议标识", "生效日期", "到期日期", "授信额度用途"),
+            ("授信额度", "授信限额", "授信限额编号", "已用额度", "币种"),
         ),
         ("credit_lines",),
     ),
@@ -255,6 +255,16 @@ def _classify(text: str) -> tuple[str, float, tuple[str, ...]] | None:
         if matched:
             return template_id, min(0.99, 0.92 + 0.03 * len(matched)), matched
 
+    # A physical page may begin between account cards and therefore omit the
+    # enclosing section heading.  The numbered card heading plus its printed
+    # agreement-id label is a canonical account-detail signature, not a
+    # footer-based or generic previous-page guess.
+    if re.search(
+        r"\u8d26\u6237\s*\d{1,3}\s*[\uff08(][^\uff09)]{0,40}\u6388\u4fe1\u534f\u8bae\u6807\u8bc6",
+        compact,
+    ):
+        return "credit_account_detail", 0.94, ("canonical_numbered_account_heading",)
+
     if len(compact) < 8:
         return None
 
@@ -321,6 +331,7 @@ def _project_table(
     if rows:
         metadata["raw_rows"] = rows
     if isinstance(cell_boxes, list):
+        metadata["source_cell_bboxes"] = deepcopy(cell_boxes)
         metadata["cell_bboxes"] = [
             [transform(box) if isinstance(box, (list, tuple)) and len(box) == 4 else box for box in row]
             if isinstance(row, list)
@@ -415,29 +426,76 @@ class PBOCCanonicalTemplateAssembler:
                 )
 
         # Canonical pages often start in the middle of an account or repeated
-        # table. A remaining fragment may inherit only from the nearest
-        # registered page in document order, which is template-flow
-        # continuation rather than generic layout reconstruction or OCR.
+        # table. A remaining fragment may inherit only when an explicit
+        # canonical continuation relation is present; document proximity or
+        # page shape alone is not sufficient.
         ordered = sorted(evidence, key=lambda value: self.reading_order.get(value, value))
         active_template = ""
+        active_logical = 0
         for logical in ordered:
             registration = registrations.get(logical)
             if registration and registration["status"] == "registered":
                 active_template = str(registration["template_id"])
+                active_logical = logical
                 continue
             if registration:
                 continue
             text = _compact(_page_text(raw_pages.get(logical, SimpleNamespace(tables=[], texts=[])), evidence[logical]))
-            has_structure = bool(getattr(raw_pages.get(logical), "tables", None)) or bool(_MONTHLY_GRID_RE.search(text))
-            if active_template and (has_structure or len(text) >= 20):
+            continuation_signals: list[str] = []
+            continuation_check = getattr(self.issue_owner, "tables_continue", None)
+            previous_page = raw_pages.get(active_logical)
+            current_page = raw_pages.get(logical)
+            if active_template and callable(continuation_check) and previous_page is not None and current_page is not None:
+                previous_ids = [
+                    str(getattr(table, "table_id", "") or "")
+                    for table in getattr(previous_page, "tables", None) or ()
+                ]
+                current_ids = [
+                    str(getattr(table, "table_id", "") or "")
+                    for table in getattr(current_page, "tables", None) or ()
+                ]
+                if any(
+                    left and right and continuation_check(left, right) is True
+                    for left in previous_ids
+                    for right in current_ids
+                ):
+                    continuation_signals.append("explicit_table_continuation")
+            if active_template == "credit_account_detail" and _MONTHLY_GRID_RE.search(text):
+                continuation_signals.append("canonical_monthly_grid_continuation")
+            if active_template == "annotations_and_inquiries" and re.search(
+                r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}.*(?:贷后管理|贷款审批|信用卡审批|本人查询)",
+                text,
+            ):
+                continuation_signals.append("canonical_inquiry_row_continuation")
+            if active_template == "postpaid_detail" and (
+                "缴费记录" in text
+                or bool(re.search(r"20\d{2}[N1-7*]{4,}", text))
+            ):
+                continuation_signals.append("canonical_postpaid_history_continuation")
+            if active_template == "report_explanation" and re.search(
+                r"(?:N-正常|C-结清|G-结束|#-账户|1-逾期)",
+                text,
+            ):
+                continuation_signals.append("canonical_explanation_continuation")
+            # A table merely existing, or a page merely containing enough
+            # text, is not proof that it continues the preceding section.
+            # Under the closed canonical catalog an unproven page stays
+            # unresolved and becomes eligible for the one business-repair
+            # OCR pass instead of being silently registered to the wrong role.
+            if active_template and continuation_signals:
                 registrations[logical] = self._registration(
                     logical,
                     active_template,
                     0.78,
                     "canonical_flow_continuation",
-                    ("preceding_template_role", "no_conflicting_section_anchor"),
+                    (
+                        "preceding_template_role",
+                        *continuation_signals,
+                        "no_conflicting_section_anchor",
+                    ),
                     evidence[logical],
                 )
+                active_logical = logical
 
         unresolved = tuple(
             logical
@@ -584,6 +642,8 @@ class PBOCCanonicalTemplateAssembler:
                         template_id=template_id,
                         transform=transform,
                     )
+                    projected.metadata["source_logical_page"] = logical
+                    projected.metadata["source_page"] = int(local_evidence.get("source_page") or logical)
                     tables.append(projected)
                     if (box := _bbox(projected)) is not None:
                         table_boxes.append(box)
@@ -594,6 +654,7 @@ class PBOCCanonicalTemplateAssembler:
                 output_lines.append(
                     {
                         **deepcopy(dict(line)),
+                        "source_bbox": list(box),
                         "bbox": transform(box),
                         "page": representative,
                         "source_logical_page": logical,

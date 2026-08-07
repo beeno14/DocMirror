@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -120,3 +121,44 @@ def test_credit_report_public_json_compacts_private_source_provenance(
     assert not (written["community"].parent / "001_community_semantic.json").exists()
     assert not (_keys(persisted) & _PRIVATE_SOURCE_KEYS)
     assert validate_community_artifacts(written["community"]) == []
+
+    if subtype == "enterprise":
+        semantic_names = {dataset["name"] for dataset in semantic["datasets"]}
+        public_names = {dataset["name"] for dataset in persisted["datasets"]}
+        assert {"report_notes", "enterprise_section_presence"} <= semantic_names
+        assert not ({"report_notes", "enterprise_section_presence"} & public_names)
+        assert all(
+            "confidence" not in row and "review" not in row
+            for dataset in persisted["datasets"]
+            for row in dataset["rows"]
+        )
+        assert all(
+            set(row["normalized"]) == set(row["canonical_raw"]) == set(row["raw"])
+            for dataset in persisted["datasets"]
+            for row in dataset["rows"]
+        )
+        assert all(
+            column["raw_available"]
+            == any(
+                column["key"] in row["canonical_raw"] or column["key"] in row["raw"]
+                for row in dataset["rows"]
+            )
+            for dataset in persisted["datasets"]
+            for column in dataset["columns"]
+        )
+        csv_names = {
+            path.stem
+            for path in written["datasets"].glob("*.csv")
+            if path.name != "_audit_cells.csv"
+        }
+        assert csv_names == public_names
+        with (written["datasets"] / "_audit_cells.csv").open(
+            encoding="utf-8-sig",
+            newline="",
+        ) as stream:
+            audit_dataset_ids = {
+                row["dataset_id"]
+                for row in csv.DictReader(stream)
+                if not row["dataset_id"].startswith("_audit_")
+            }
+        assert audit_dataset_ids <= {dataset["id"] for dataset in persisted["datasets"]}

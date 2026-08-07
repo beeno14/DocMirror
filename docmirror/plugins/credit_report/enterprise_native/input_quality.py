@@ -11,7 +11,7 @@ from docmirror.plugins.credit_report.enterprise_native.quality import Enterprise
 
 
 def _page_number(page: Any, fallback: int) -> int:
-    for key in ("page_number", "number", "page"):
+    for key in ("source_page_number", "page_number", "number", "page"):
         try:
             value = int(getattr(page, key, 0) or 0)
         except (TypeError, ValueError):
@@ -29,17 +29,60 @@ def _has_page_content(page: Any) -> bool:
         rows = metadata.get("raw_rows") if isinstance(metadata, dict) else None
         if rows or getattr(table, "rows", None) or getattr(table, "headers", None):
             return True
+        if str(getattr(table, "caption", "") or "").strip():
+            return True
+    if any(
+        str(getattr(pair, "key", "") or "").strip()
+        or str(getattr(pair, "value", "") or "").strip()
+        for pair in (getattr(page, "key_values", None) or ())
+    ):
+        return True
     return bool(getattr(page, "images", None))
 
 
 def _page_strings(page: Any) -> tuple[str, ...]:
     values = [str(getattr(block, "content", "") or "") for block in (getattr(page, "texts", None) or ())]
     for table in getattr(page, "tables", None) or ():
+        caption = str(getattr(table, "caption", "") or "")
+        if caption:
+            values.append(caption)
         metadata = getattr(table, "metadata", None) or {}
         rows = metadata.get("raw_rows") if isinstance(metadata, dict) else None
         for row in rows or getattr(table, "rows", None) or ():
-            values.extend(str(value or "") for value in row)
+            cells = getattr(row, "cells", None)
+            if cells is not None:
+                values.extend(str(getattr(value, "text", value) or "") for value in cells)
+            else:
+                values.extend(str(value or "") for value in row)
+    for pair in getattr(page, "key_values", None) or ():
+        values.append(str(getattr(pair, "key", "") or ""))
+        values.append(str(getattr(pair, "value", "") or ""))
     return tuple(values)
+
+
+def _logical_table_strings(parse_result: Any) -> tuple[str, ...]:
+    values: list[str] = []
+    for table in getattr(parse_result, "logical_tables", None) or ():
+        values.extend(str(value or "") for value in (getattr(table, "headers", None) or ()))
+        for row in getattr(table, "rows", None) or ():
+            values.extend(
+                str(getattr(cell, "text", cell) or "")
+                for cell in (getattr(row, "cells", None) or ())
+            )
+    return tuple(values)
+
+
+def _flow_strings(parse_result: Any) -> tuple[str, ...]:
+    graph = getattr(parse_result, "document_flow", None)
+    return tuple(
+        str(getattr(node, "text", "") or "")
+        for node in (getattr(graph, "nodes", None) or ())
+        if str(getattr(node, "text", "") or "")
+    )
+
+
+def _has_alternate_content(parse_result: Any) -> bool:
+    return bool(_logical_table_strings(parse_result) or _flow_strings(parse_result))
 
 
 def _suspicious_glyphs(value: str) -> bool:
@@ -54,14 +97,24 @@ def assess_enterprise_parse_result(parse_result: Any) -> tuple[EnterpriseQuality
     flags: list[EnterpriseQualityFlag] = []
     pages = list(getattr(parse_result, "pages", None) or ())
     if not pages:
-        return (
+        if not _has_alternate_content(parse_result):
+            return (
+                EnterpriseQualityFlag(
+                    code="ENTERPRISE_INPUT_NO_PAGES",
+                    severity="error",
+                    category="parseresult_input",
+                    status="bad_input",
+                    message="ParseResult contains no business-bearing source view; enterprise fields cannot be reconstructed.",
+                ),
+            )
+        flags.append(
             EnterpriseQualityFlag(
-                code="ENTERPRISE_INPUT_NO_PAGES",
-                severity="error",
+                code="ENTERPRISE_INPUT_NO_PHYSICAL_PAGES",
+                severity="warning",
                 category="parseresult_input",
-                status="bad_input",
-                message="ParseResult contains no pages; enterprise fields cannot be reconstructed.",
-            ),
+                status="alternate_source_views_available",
+                message="Physical pages are absent; reconstruction is using logical tables and/or document flow.",
+            )
         )
 
     page_numbers = [_page_number(page, index) for index, page in enumerate(pages, start=1)]
@@ -70,15 +123,22 @@ def assess_enterprise_parse_result(parse_result: Any) -> tuple[EnterpriseQuality
         flags.append(
             EnterpriseQualityFlag(
                 code="ENTERPRISE_INPUT_DUPLICATE_PAGE_NUMBERS",
-                severity="error",
+                severity="warning",
                 category="parseresult_input",
-                status="bad_input",
-                message="ParseResult contains duplicate positive page numbers.",
+                status="logical_page_instances_reconstructed",
+                message="Multiple logical page containers reference the same source page; unique page-instance identifiers were assigned.",
                 source_pages=tuple(duplicates),
+                details={
+                    "logical_page_instances": [
+                        index
+                        for index, number in enumerate(page_numbers, start=1)
+                        if number in duplicates
+                    ]
+                },
             )
         )
-    expected = set(range(min(page_numbers), max(page_numbers) + 1))
-    missing = tuple(sorted(expected.difference(page_numbers)))
+    expected = set(range(min(page_numbers), max(page_numbers) + 1)) if page_numbers else set()
+    missing = tuple(sorted(expected.difference(set(page_numbers))))
     if missing:
         flags.append(
             EnterpriseQualityFlag(
@@ -116,6 +176,38 @@ def assess_enterprise_parse_result(parse_result: Any) -> tuple[EnterpriseQuality
                 status="possibly_misdecoded",
                 message="ParseResult contains replacement, private-use, or unexpected Hangul glyphs; affected fields may need targeted re-extraction.",
                 source_pages=suspicious_pages,
+            )
+        )
+
+    alternate_suspicious = any(
+        _suspicious_glyphs(value)
+        for value in (*_logical_table_strings(parse_result), *_flow_strings(parse_result))
+    )
+    if alternate_suspicious and not suspicious_pages:
+        flags.append(
+            EnterpriseQualityFlag(
+                code="ENTERPRISE_INPUT_SUSPICIOUS_GLYPHS",
+                severity="warning",
+                category="parseresult_input",
+                status="possibly_misdecoded",
+                message="Logical-table or document-flow source content contains suspicious glyphs.",
+            )
+        )
+
+    rejected_logical = tuple(
+        str(getattr(table, "logical_id", "") or getattr(table, "table_id", "") or index)
+        for index, table in enumerate(getattr(parse_result, "logical_tables", None) or (), start=1)
+        if not bool(getattr(table, "quality_passed", True))
+    )
+    if rejected_logical:
+        flags.append(
+            EnterpriseQualityFlag(
+                code="ENTERPRISE_INPUT_LOGICAL_TABLES_REJECTED",
+                severity="warning",
+                category="parseresult_input",
+                status="physical_fallback_required",
+                message="One or more composed logical tables failed ParseResult quality gates; physical evidence remains available.",
+                details={"logical_table_ids": list(rejected_logical)},
             )
         )
 

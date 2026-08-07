@@ -16,6 +16,10 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docmirror.plugins.credit_report.enterprise_native.canonical_records import (
+    RECOVERED_BUSINESS_DATASET,
+    extract_canonical_enterprise_record_families,
+)
 from docmirror.plugins.credit_report.enterprise_native.extraction import (
     _reported_account_summary,
     _reported_credit_line_count,
@@ -49,6 +53,11 @@ from docmirror.plugins.credit_report.enterprise_native.ir import (
 from docmirror.plugins.credit_report.enterprise_native.source_quality import (
     assess_enterprise_source_information,
 )
+from docmirror.plugins.credit_report.enterprise_native.subset_contract import (
+    CANONICAL_ENTERPRISE_SECTIONS,
+    CanonicalEnterpriseSubset,
+    build_canonical_enterprise_subset,
+)
 from docmirror.plugins.credit_report.value_utils import parse_number
 
 _META_FIELDS = frozenset(
@@ -80,6 +89,7 @@ _ACCOUNT_FIELDS = (
     "special_transaction",
     "credit_agreement_identifier",
     "history_status",
+    "creditor_institution",
     "open_date",
     "close_date",
     "currency",
@@ -94,11 +104,10 @@ _ACCOUNT_FIELDS = (
     "snapshot_date",
     "remaining_periods",
     "scheduled_payment",
-    "actual_payment",
     "scheduled_payment_date",
     "last_repayment_date",
-    "current_overdue_periods",
-    "current_overdue_amount",
+    "last_repayment_amount",
+    "last_repayment_amount_status",
     "overdue_principal",
     "overdue_total",
     "five_tier_class",
@@ -107,12 +116,14 @@ _ACCOUNT_FIELDS = (
     "overdue_months",
     "original_creditor_name",
     "original_claim_type",
+    "original_debt_type",
+    "original_debt_type_status",
     "receive_date",
 )
 _LINE_FIELDS = (
     "credit_line_id",
     "account_id",
-    "account_identifier",
+    "credit_agreement_identifier",
     "facility_type",
     "facility_product",
     "revolving_flag",
@@ -141,7 +152,13 @@ _LIABILITY_FIELDS = (
     "responsibility_amount_reported",
     "responsibility_amount_status",
     "contract_number",
+    "guarantee_contract_identifier",
     "contract_number_status",
+    "responsibility_currency",
+    "responsibility_amount_unit",
+    "obligation_currency",
+    "obligation_amount_unit",
+    "open_or_receive_date",
     "loan_or_credit_amount",
     "snapshot_date",
     "balance",
@@ -173,9 +190,7 @@ _NUMBER_FIELDS = frozenset(
         "facility_limit",
         "remaining_periods",
         "scheduled_payment",
-        "actual_payment",
-        "current_overdue_periods",
-        "current_overdue_amount",
+        "last_repayment_amount",
         "overdue_months",
     }
 )
@@ -190,138 +205,6 @@ _SOURCE_STATES = frozenset(
         "unresolved",
     }
 )
-_SECTION_SPECS = (
-    ("sec_enterprise_report_metadata", "报告信息", "report_metadata", ("企业信用报告（自主查询版）", "企业信用报告(自主查询版)")),
-    ("sec_enterprise_report_notes", "说明", "notes", ("报告说明",)),
-    ("sec_enterprise_identity", "身份标识", "identity", ("身份标识",)),
-    ("sec_enterprise_summary", "信息概要", "credit_summary", ("信息概要",)),
-    ("sec_enterprise_profile", "基本信息", "basic_information", ("基本信息",)),
-    ("sec_enterprise_credit", "信贷记录明细", "credit_details", ("信贷记录明细",)),
-    (
-        "sec_enterprise_non_credit",
-        "非信贷记录明细",
-        "non_credit_records",
-        ("非信贷记录明细",),
-    ),
-    ("sec_enterprise_public", "公共记录明细", "public_records", ("公共记录明细",)),
-    (
-        "sec_enterprise_statements",
-        "声明及异议标注信息",
-        "statements_and_disputes",
-        ("声明及异议标注信息",),
-    ),
-    (
-        "sec_enterprise_supplement",
-        "信用记录补充信息",
-        "credit_supplement",
-        ("信用记录补充信息", "附件1：信用记录补充信息", "附件1:信用记录补充信息"),
-    ),
-)
-_CANONICAL_SECTION_DATASETS: tuple[
-    tuple[str, str, str, tuple[str, ...]],
-    ...,
-] = (
-    ("report_metadata", "报告信息", "report_metadata", ("enterprise_report_metadata",)),
-    ("report_notes", "说明", "notes", ("report_notes", "enterprise_exchange_rates")),
-    (
-        "identity",
-        "身份标识",
-        "identity",
-        ("enterprise_report_identity", "enterprise_dispute_overview"),
-    ),
-    (
-        "information_overview",
-        "信息概要",
-        "credit_summary",
-        (
-            "enterprise_credit_overview",
-            "enterprise_public_record_counts",
-            "enterprise_recovery_summary",
-            "enterprise_overdue_summary",
-            "enterprise_current_credit_summary",
-            "enterprise_facility_summary",
-            "enterprise_repayment_responsibility_summary",
-            "enterprise_closed_credit_summary",
-        ),
-    ),
-    (
-        "basic_information",
-        "基本信息",
-        "basic_information",
-        (
-            "enterprise_profile",
-            "enterprise_capital_summary",
-            "enterprise_contributors",
-            "enterprise_key_personnel",
-            "enterprise_relationships",
-        ),
-    ),
-    (
-        "credit_details",
-        "信贷记录明细",
-        "credit_details",
-        (
-            "enterprise_credit_accounts",
-            "enterprise_interest_arrears",
-            "enterprise_displayed_credit_summary",
-            "enterprise_credit_facilities",
-            "enterprise_repayment_responsibility_accounts",
-        ),
-    ),
-    (
-        "non_credit_records",
-        "非信贷记录明细",
-        "non_credit_records",
-        ("enterprise_public_utility_payment_records",),
-    ),
-    (
-        "public_records",
-        "公共记录明细",
-        "public_records",
-        (
-            "enterprise_public_tax_arrears_records",
-            "enterprise_public_civil_judgment_records",
-            "enterprise_public_enforcement_records",
-            "enterprise_public_administrative_penalty_records",
-            "enterprise_public_social_security_payment_records",
-            "enterprise_public_license_records",
-            "enterprise_public_certification_records",
-            "enterprise_public_qualification_records",
-            "enterprise_public_award_records",
-            "enterprise_public_export_quality_records",
-            "enterprise_public_inspection_exemption_records",
-            "enterprise_public_regulatory_supervision_records",
-            "enterprise_public_patent_records",
-            "enterprise_public_financing_restriction_records",
-        ),
-    ),
-    (
-        "statements_and_disputes",
-        "声明及异议标注信息",
-        "statements_and_disputes",
-        (
-            "enterprise_public_data_provider_statement_records",
-            "enterprise_public_credit_bureau_statement_records",
-            "enterprise_public_subject_statement_records",
-            "enterprise_public_dispute_annotation_records",
-        ),
-    ),
-    (
-        "attachment",
-        "附件",
-        "credit_supplement",
-        (
-            "enterprise_attachment_accounts",
-            "enterprise_credit_supplement",
-            "enterprise_attachment_credit_details",
-            "enterprise_special_transactions",
-            "enterprise_utility_payment_history",
-            "enterprise_housing_fund_history",
-        ),
-    ),
-)
-
-
 @dataclass(frozen=True)
 class EnterpriseSemanticDocument:
     facts: dict[str, Any]
@@ -436,7 +319,7 @@ def _normalized_value(field: str, value: Any) -> Any:
     number = parse_number(value)
     if number is None:
         return None
-    if field in {"sequence", "remaining_periods", "current_overdue_periods", "overdue_months"}:
+    if field in {"sequence", "remaining_periods", "overdue_months"}:
         return int(number)
     return number
 
@@ -687,63 +570,20 @@ def _canonicalize_summary_types(
     return canonical
 
 
-def _heading_lines(document: CanonicalEnterpriseDocumentIR) -> list[tuple[int, int, str]]:
-    lines: list[tuple[int, int, str]] = []
-    order = 0
-    for component in sorted(document.components, key=lambda item: item.global_order):
-        for segment in component.segments:
-            if str(segment.get("kind") or "") == "table":
-                continue
-            page = int(segment.get("source_page") or 0)
-            for raw_line in str(segment.get("text") or "").splitlines():
-                line = "".join(raw_line.split()).strip()
-                if not line:
-                    continue
-                order += 1
-                lines.append((order, page, line))
-    return lines
-
-
-def _is_heading(line: str, aliases: tuple[str, ...]) -> bool:
-    candidate = re.sub(
-        r"^(?:(?:附件\d+[:：])|(?:[一二三四五六七八九十]+[、.．])|(?:[（(][一二三四五六七八九十0-9]+[）)]))",
-        "",
-        line,
-    )
-    return line in aliases or candidate in aliases
-
-
-def _sections(document: CanonicalEnterpriseDocumentIR) -> tuple[dict[str, Any], ...]:
-    headings = _heading_lines(document)
-    anchored: list[tuple[int, int, str, str, str]] = []
-    for section_id, title, section_type, markers in _SECTION_SPECS:
-        if section_type == "report_metadata":
-            match = next(((order, page) for order, page, line in headings if _is_heading(line, markers)), None)
-            if match is None:
-                match = next(
-                    (
-                        (order, page)
-                        for index, (order, page, line) in enumerate(headings[:-1])
-                        if line == "企业信用报告" and headings[index + 1][2] == "（自主查询版）"
-                    ),
-                    None,
-                )
-        else:
-            match = next(((order, page) for order, page, line in headings if _is_heading(line, markers)), None)
-        if match is not None:
-            anchored.append((match[0], match[1], section_id, title, section_type))
-    anchored.sort(key=lambda item: item[0])
+def _sections(subset: CanonicalEnterpriseSubset) -> tuple[dict[str, Any], ...]:
+    """Project only sections present in the monotonic canonical subset."""
     sections: list[dict[str, Any]] = []
-    last_page = max((page.page_number for page in document.pages), default=document.source_page_count)
-    for index, (_order, source_page, section_id, title, section_type) in enumerate(anchored):
-        next_page = anchored[index + 1][1] if index + 1 < len(anchored) else last_page
-        source_page_end = max(source_page, next_page if next_page == source_page else next_page - 1)
+    for section in subset.sections:
+        if not section.present:
+            continue
+        source_page = min(section.source_pages, default=0)
+        source_page_end = max(section.source_pages, default=source_page)
         sections.append(
             {
-                "id": section_id,
-                "title": title,
-                "name": title,
-                "type": section_type,
+                "id": section.spec.section_id,
+                "title": section.spec.title,
+                "name": section.spec.title,
+                "type": section.spec.section_type,
                 "page_start": source_page,
                 "source_page_start": source_page,
                 "source_page_end": source_page_end,
@@ -753,19 +593,15 @@ def _sections(document: CanonicalEnterpriseDocumentIR) -> tuple[dict[str, Any], 
 
 
 def _section_presence_records(
-    sections: tuple[dict[str, Any], ...],
+    subset: CanonicalEnterpriseSubset,
     datasets: dict[str, list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """Represent every canonical business section independently of pagination."""
-    by_type = {str(section.get("type") or ""): section for section in sections}
     records: list[dict[str, Any]] = []
-    for sequence, (section_key, title, section_type, dataset_names) in enumerate(
-        _CANONICAL_SECTION_DATASETS,
-        start=1,
-    ):
-        section = by_type.get(section_type)
-        record_count = sum(len(datasets.get(name) or ()) for name in dataset_names)
-        heading_detected = section is not None
+    for sequence, section in enumerate(subset.sections, start=1):
+        spec = section.spec
+        record_count = sum(len(datasets.get(name) or ()) for name in spec.datasets)
+        heading_detected = section.heading_detected
         presence_status = (
             "present_with_records"
             if record_count
@@ -774,11 +610,11 @@ def _section_presence_records(
             else "absent_from_report"
         )
         record: dict[str, Any] = {
-            "record_id": f"enterprise_section_presence:{section_key}",
-            "section_presence_id": f"enterprise_section_presence:{section_key}",
+            "record_id": f"enterprise_section_presence:{spec.key}",
+            "section_presence_id": f"enterprise_section_presence:{spec.key}",
             "sequence": sequence,
-            "section_key": section_key,
-            "section_title": title,
+            "section_key": spec.key,
+            "section_title": spec.title,
             "presence_status": presence_status,
             "source_state": "section_absent" if not heading_detected else "reported",
             "heading_detected": heading_detected,
@@ -786,9 +622,9 @@ def _section_presence_records(
             "source": "canonical_enterprise_section_contract",
             "confidence": 1.0,
         }
-        if section is not None:
-            source_page = int(section.get("source_page_start") or 0)
-            source_page_end = int(section.get("source_page_end") or source_page)
+        if section.present:
+            source_page = min(section.source_pages, default=0)
+            source_page_end = max(section.source_pages, default=source_page)
             record["source_page"] = source_page
             record["source_page_end"] = source_page_end
             record["source_refs"] = [
@@ -835,7 +671,7 @@ def _dataset_completeness(
     output: dict[str, dict[str, Any]] = {}
     for dataset, rows in datasets.items():
         if dataset == "enterprise_section_presence":
-            expected = len(_CANONICAL_SECTION_DATASETS)
+            expected = len(CANONICAL_ENTERPRISE_SECTIONS)
             verified = len(rows) == expected and all(
                 str((row.get("normalized") or row).get("presence_status") or "")
                 in {
@@ -899,41 +735,79 @@ def extract_enterprise_semantic_document(
     document: CanonicalEnterpriseDocumentIR,
     *,
     content_mode: str = "native_text",
+    subset: CanonicalEnterpriseSubset | None = None,
 ) -> EnterpriseSemanticDocument:
     """Apply the complete enterprise schema exactly once to the canonical IR."""
     if not isinstance(document, CanonicalEnterpriseDocumentIR):
         raise TypeError("enterprise schema extraction requires CanonicalEnterpriseDocumentIR")
 
-    attachment_datasets = extract_enterprise_attachment_datasets(document)
-    facility_summary = extract_enterprise_facility_summary(document)
-    overview = extract_enterprise_overview(document)
-    reported = _reported_account_summary(document)
-    accounts = extract_enterprise_accounts_from_tables(document)
-    credit_lines = extract_enterprise_credit_lines_from_tables(document, accounts)
-    liabilities = extract_enterprise_repayment_liability_records(document)
-    public_records = extract_enterprise_public_records_from_tables(document)
+    subset = subset or build_canonical_enterprise_subset(document)
+    metadata_view = subset.view("report_metadata")
+    notes_view = subset.view("report_notes")
+    identity_view = subset.view("identity")
+    overview_view = subset.view("information_overview")
+    profile_view = subset.view("basic_information")
+    credit_view = subset.view("credit_details")
+    non_credit_view = subset.view("non_credit_records")
+    public_view = subset.view("public_records")
+    statement_view = subset.view("statements_and_disputes")
+    attachment_view = subset.view("attachment")
+
+    attachment_datasets = extract_enterprise_attachment_datasets(attachment_view)
+    facility_summary = extract_enterprise_facility_summary(overview_view)
+    overview = extract_enterprise_overview(overview_view)
+    reported = _reported_account_summary(overview_view)
+    canonical_families = extract_canonical_enterprise_record_families(credit_view)
+    recovered_accounts = canonical_families.pop(RECOVERED_BUSINESS_DATASET, [])
+    for record in recovered_accounts:
+        record["account_type"] = "enterprise_recovered_business"
+        record["original_claim_type"] = record.get("original_debt_type")
+    accounts = [
+        *recovered_accounts,
+        *extract_enterprise_accounts_from_tables(credit_view),
+    ]
+    for sequence, account in enumerate(accounts, start=1):
+        account["sequence"] = sequence
+    credit_lines = extract_enterprise_credit_lines_from_tables(credit_view, accounts)
+    liabilities = extract_enterprise_repayment_liability_records(credit_view)
+    public_records = [
+        *extract_enterprise_public_records_from_tables(non_credit_view),
+        *extract_enterprise_public_records_from_tables(public_view),
+        *extract_enterprise_public_records_from_tables(statement_view),
+    ]
 
     summary = {**overview, **reported}
     summary["reported_account_count_basis"] = "information_summary_current_account_population"
     summary["displayed_credit_account_card_count"] = len(accounts)
-    reported_credit_lines = _reported_credit_line_count(document)
+    reported_credit_lines = _reported_credit_line_count(overview_view)
     if reported_credit_lines is not None:
         summary["reported_credit_line_count"] = reported_credit_lines
     public_counts: dict[str, int] = {}
     for record in public_records:
+        type_info = (
+            (record.get("field_info") or {}).get("record_type")
+            if isinstance(record.get("field_info"), dict)
+            else None
+        )
+        if isinstance(type_info, dict) and type_info.get("source_state") == "unresolved":
+            continue
         record_type = str(record.get("record_type") or "unknown")
         public_counts[record_type] = public_counts.get(record_type, 0) + 1
-    summary["extracted_public_record_count"] = len(public_records)
+    summary["extracted_public_record_count"] = sum(public_counts.values())
     summary["extracted_public_record_type_counts"] = public_counts
     summary["extracted_public_record_count_scope"] = "public_record_detail_rows"
     summary.update(
         {
             "account_dataset_scope": "main_report_account_cards",
             "account_dataset_scope_note": "信贷账户数据集对应报告正文展示的账户卡片；附件业务字段在独立规范数据集中列示。",
-            "attachment_account_count": len(attachment_datasets["enterprise_attachment_accounts"]),
-            "attachment_history_row_count": len(attachment_datasets["enterprise_credit_supplement"]),
-            "attachment_detail_card_count": len(attachment_datasets["enterprise_attachment_credit_details"]),
-            "attachment_special_transaction_count": len(attachment_datasets["enterprise_special_transactions"]),
+            "attachment_account_count": len(attachment_datasets.get("enterprise_attachment_accounts", [])),
+            "attachment_history_row_count": len(attachment_datasets.get("enterprise_credit_supplement", [])),
+            "attachment_detail_card_count": len(
+                attachment_datasets.get("enterprise_attachment_credit_details", [])
+            ),
+            "attachment_special_transaction_count": len(
+                attachment_datasets.get("enterprise_special_transactions", [])
+            ),
             "displayed_credit_facility_count": len(credit_lines),
         }
     )
@@ -943,21 +817,38 @@ def extract_enterprise_semantic_document(
         "enterprise_credit_facilities": credit_lines,
         "enterprise_repayment_responsibility_accounts": liabilities,
     }
-    datasets.update(extract_enterprise_profile_datasets(document))
+    datasets.update(canonical_families)
+    datasets.update(extract_enterprise_profile_datasets(profile_view))
     datasets.update(project_enterprise_public_record_datasets(public_records))
-    datasets.update(extract_enterprise_report_metadata_records(document, document.full_text))
+    # Cover edition and report-note exchange rates occupy two canonical
+    # sections.  Decode each section through the same schema and merge their
+    # disjoint datasets; using the cover slice alone silently lost the rate.
+    for source_view in (metadata_view, notes_view):
+        for dataset_name, rows in extract_enterprise_report_metadata_records(
+            source_view,
+            source_view.full_text,
+        ).items():
+            datasets.setdefault(dataset_name, []).extend(rows)
     datasets["enterprise_report_identity"] = extract_enterprise_report_identity_records(document, document.full_text)
-    datasets.update(extract_enterprise_overview_datasets(document))
-    datasets.update(extract_enterprise_summary_datasets(document))
-    datasets["enterprise_interest_arrears"] = extract_enterprise_interest_arrears(document)
+    for source_view in (identity_view, overview_view):
+        for dataset_name, rows in extract_enterprise_overview_datasets(source_view).items():
+            datasets.setdefault(dataset_name, []).extend(rows)
+    overview_summaries = extract_enterprise_summary_datasets(overview_view)
+    detail_summaries = extract_enterprise_summary_datasets(credit_view)
+    for dataset_name in set(overview_summaries) | set(detail_summaries):
+        datasets[dataset_name] = [
+            *overview_summaries.get(dataset_name, []),
+            *detail_summaries.get(dataset_name, []),
+        ]
+    datasets["enterprise_interest_arrears"] = extract_enterprise_interest_arrears(credit_view)
     datasets.update(attachment_datasets)
-    datasets.update(extract_enterprise_non_credit_history_datasets(document))
-    datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(document)
+    datasets.update(extract_enterprise_non_credit_history_datasets(attachment_view))
+    datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(profile_view)
     datasets["enterprise_facility_summary"] = facility_summary
-    datasets["report_notes"] = extract_enterprise_report_notes(document)
+    datasets["report_notes"] = extract_enterprise_report_notes(notes_view)
 
-    sections = _sections(document)
-    datasets["enterprise_section_presence"] = _section_presence_records(sections, datasets)
+    sections = _sections(subset)
+    datasets["enterprise_section_presence"] = _section_presence_records(subset, datasets)
     continuation_audit = extract_enterprise_continuation_audit(document, datasets=datasets)
     datasets = _normalize_all_datasets(datasets)
 
@@ -983,12 +874,15 @@ def extract_enterprise_semantic_document(
     summary = _canonicalize_summary_types(summary, data_dictionary)
 
     facts = extract_enterprise_identity_facts(document)
-    identity_records = datasets.get("enterprise_report_identity") or []
-    if identity_records:
+    fact_records = [
+        *(datasets.get("enterprise_report_metadata") or []),
+        *(datasets.get("enterprise_report_identity") or []),
+    ]
+    for fact_record in fact_records:
         facts.update(
             {
                 key: value
-                for key, value in identity_records[0].items()
+                for key, value in fact_record.items()
                 if key
                 not in frozenset(
                     {
@@ -1032,6 +926,7 @@ def extract_enterprise_semantic_document(
         continuation_audit=continuation_audit,
         dataset_completeness=completeness,
         data_dictionary=data_dictionary,
+        public_records=public_records,
     ).to_payload()
     return EnterpriseSemanticDocument(
         facts=facts,
@@ -1053,11 +948,18 @@ def run_enterprise_pipeline(
 ) -> EnterprisePipelineArtifacts:
     """Reconstruct the canonical IR, decode once, and retain private debug JSON."""
     document = build_canonical_enterprise_document(parse_result)
-    semantic_document = extract_enterprise_semantic_document(document, content_mode=content_mode)
+    subset = build_canonical_enterprise_subset(document)
+    semantic_document = extract_enterprise_semantic_document(
+        document,
+        content_mode=content_mode,
+        subset=subset,
+    )
+    ir_debug_payload = document.to_debug_payload()
+    ir_debug_payload["canonical_subset"] = subset.debug_payload()
     return EnterprisePipelineArtifacts(
         document_ir=document,
         semantic_document=semantic_document,
-        ir_debug_json=document.to_debug_json(),
+        ir_debug_json=json.dumps(ir_debug_payload, ensure_ascii=False, sort_keys=True),
         semantic_debug_json=semantic_document.to_debug_json(),
     )
 

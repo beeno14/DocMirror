@@ -77,6 +77,92 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
 
         return personal_brief_semantic_extensions()
 
+    def build_sections(self, parse_result: Any, full_text: str) -> tuple[dict[str, Any], ...]:
+        """Project the canonical source order instead of parser page headings."""
+        from docmirror.plugins.credit_report.personal_brief_native.ir import (
+            CanonicalPersonalBriefDocumentIR,
+        )
+
+        if not isinstance(parse_result, CanonicalPersonalBriefDocumentIR):
+            return super().build_sections(parse_result, full_text)
+
+        section_specs = (
+            ("report_header", "报告信息", "report_header", ("report_header",)),
+            (
+                "credit_details",
+                "信贷记录",
+                "credit_details",
+                (
+                    "credit_summary",
+                    "asset_disposition",
+                    "guarantor_compensation",
+                    "credit_cards",
+                    "loans",
+                    "other_business",
+                    "repayment_liability",
+                ),
+            ),
+            (
+                "non_credit_transactions",
+                "非信贷交易记录",
+                "non_credit_transactions",
+                ("non_credit_transactions",),
+            ),
+            (
+                "public_records",
+                "公共记录",
+                "public_records",
+                (
+                    "public_records",
+                    "tax_arrears",
+                    "civil_judgments",
+                    "enforcements",
+                    "administrative_penalties",
+                ),
+            ),
+            (
+                "institution_statements",
+                "机构说明",
+                "institution_statements",
+                ("institution_statements",),
+            ),
+            (
+                "inquiries",
+                "查询记录",
+                "inquiries",
+                ("institution_inquiries", "personal_inquiries"),
+            ),
+            ("notes", "说明", "notes", ("report_notes",)),
+        )
+        sections: list[dict[str, Any]] = []
+        for section_id, title, section_type, canonical_keys in section_specs:
+            components = [
+                component
+                for key in canonical_keys
+                for component in parse_result.components_for(key)
+            ]
+            if not components:
+                continue
+            source_pages = sorted(
+                {
+                    page
+                    for component in components
+                    for page in component.source_pages
+                    if page > 0
+                }
+            )
+            sections.append(
+                {
+                    "id": f"sec_personal_brief_{section_id}",
+                    "title": title,
+                    "name": title,
+                    "type": section_type,
+                    "page_start": source_pages[0] if source_pages else 1,
+                    "page_end": source_pages[-1] if source_pages else 1,
+                }
+            )
+        return tuple(sections)
+
     def strip_supplemental_node_bindings(self) -> bool:
         """Personal supplemental views copy source rows into several datasets."""
         return True

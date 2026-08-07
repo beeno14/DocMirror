@@ -17,27 +17,31 @@ _ENTERPRISE_DOCUMENT_DATASET_ORDER = (
     "enterprise_dispute_overview",
     "enterprise_credit_overview",
     "enterprise_public_record_counts",
-    "enterprise_recovery_summary",
-    "enterprise_overdue_summary",
     "enterprise_current_credit_summary",
     "enterprise_facility_summary",
     "enterprise_repayment_responsibility_summary",
     "enterprise_closed_credit_summary",
+    "enterprise_recovery_summary",
+    "enterprise_overdue_summary",
     "enterprise_profile",
     "enterprise_capital_summary",
     "enterprise_contributors",
     "enterprise_key_personnel",
     "enterprise_relationships",
-    "enterprise_credit_accounts",
-    "enterprise_interest_arrears",
+    "enterprise_credit_detail_groups",
     "enterprise_displayed_credit_summary",
+    "enterprise_credit_accounts",
+    "enterprise_account_annotations",
+    "enterprise_interest_arrears",
     "enterprise_credit_facilities",
+    "enterprise_repayment_responsibility_group_details",
     "enterprise_repayment_responsibility_accounts",
     "enterprise_public_utility_payment_records",
     "enterprise_public_tax_arrears_records",
     "enterprise_public_civil_judgment_records",
     "enterprise_public_enforcement_records",
     "enterprise_public_administrative_penalty_records",
+    "enterprise_public_housing_fund_payment_records",
     "enterprise_public_social_security_payment_records",
     "enterprise_public_license_records",
     "enterprise_public_certification_records",
@@ -145,7 +149,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "source_page_end": {"label": "源结束页码", "type": "integer"},
                 "enterprise_dispute_overview_id": {"label": "异议概要ID", "type": "string"},
                 "in_progress_dispute_count": {"label": "处理中异议笔数", "type": "integer"},
-                "dispute_status": {"label": "异议状态", "type": "string"},
+                "dispute_status": {
+                    "label": "异议状态",
+                    "type": "string",
+                    "enum_ref": "dispute_status",
+                },
                 "enterprise_credit_overview_id": {"label": "信用概要ID", "type": "string"},
                 "enterprise_public_record_count_id": {
                     "label": "公共记录计数ID",
@@ -202,11 +210,35 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "credit_limit": {"label": "信用额度", "type": "money"},
                 "loan_amount": {"label": "借款金额", "type": "money"},
                 "discount_amount": {"label": "贴现金额", "type": "money"},
+                "instrument_amount": {"label": "票据/信用证金额", "type": "money"},
                 "guarantee_amount": {"label": "担保金额", "type": "money"},
                 "risk_exposure_amount": {"label": "风险敞口", "type": "money"},
                 "deposit_ratio": {"label": "保证金比例", "type": "percentage"},
-                "credit_limit_status": {"label": "信用额度报告状态", "type": "string"},
-                "loan_amount_status": {"label": "借款金额报告状态", "type": "string"},
+                "credit_limit_status": {
+                    "label": "信用额度报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "loan_amount_status": {
+                    "label": "借款金额报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "discount_amount_status": {
+                    "label": "贴现金额报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "instrument_amount_status": {
+                    "label": "票据/信用证金额报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "guarantee_amount_status": {
+                    "label": "担保金额报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
                 "balance_status": {"label": "余额报告状态", "type": "string"},
                 "credit_balance": {"label": "借贷交易余额", "type": "money"},
                 "guarantee_balance": {"label": "担保交易余额", "type": "money"},
@@ -495,22 +527,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "guarantee_type": {"label": "担保方式", "type": "string"},
                 "counter_guarantee_type": {"label": "反担保方式", "type": "string"},
                 "status": {"label": "账户状态", "type": "string"},
-                "current_overdue_amount": {
-                    "label": "当前逾期总额",
-                    "type": "money",
-                    "definition": "源报告明确展示0时保留0；仅未报告时为空。",
-                },
-                "current_overdue_periods": {
-                    "label": "当前逾期月数",
-                    "type": "integer",
-                    "definition": "源报告明确展示0时保留0；仅未报告时为空。",
-                },
                 "current_overdue_status": {
                     "label": "当前逾期报告状态",
                     "type": "string",
                 },
                 "last_repayment_date": {"label": "最近还款日期", "type": "date"},
-                "actual_payment": {"label": "最近实还总额", "type": "money"},
                 "special_transaction": {"label": "特定交易提示", "type": "string"},
                 "credit_agreement_identifier": {
                     "label": "授信协议编号",
@@ -538,7 +559,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "source_group_account_count": {"label": "源分组账户总数", "type": "integer"},
                 "source_account_count": {"label": "源汇总行账户数", "type": "integer"},
                 "source_reported_amount": {"label": "源报告金额", "type": "money"},
-                "amount_kind": {"label": "源报告金额口径", "type": "string"},
+                "amount_kind": {
+                    "label": "源报告金额口径",
+                    "type": "string",
+                    "enum_ref": "amount_kind",
+                },
                 "summary_scope": {"label": "汇总口径", "type": "string"},
                 "is_total": {"label": "是否合计行", "type": "boolean"},
                 "responsibility_summary_id": {
@@ -616,7 +641,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "attachment_record_type": {"label": "附件记录类型", "type": "string"},
                 "account_status": {"label": "结清状态", "type": "string"},
                 "attachment_detail_id": {"label": "附件信贷明细ID", "type": "string"},
-                "amount": {"label": "金额", "type": "money"},
+                "amount": {
+                    "label": "金额",
+                    "type": "money",
+                    "definition": "源报告中的业务金额；具体口径由所在数据集及 amount_kind（如有）确定。",
+                },
                 "advance_flag": {"label": "垫款标志", "type": "string"},
                 "special_transaction_id": {"label": "特定交易ID", "type": "string"},
                 "transaction_type": {"label": "交易类型", "type": "string"},
@@ -629,6 +658,130 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "transaction_detail": {"label": "交易明细信息", "type": "string"},
             }
         )
+        fields.update(
+            {
+                "cover_subject_name": {"label": "封面企业名称", "type": "string"},
+                "identity_subject_name": {"label": "身份标识企业名称", "type": "string"},
+                "cover_zhongzheng_code": {
+                    "label": "封面中征码",
+                    "type": "long_id",
+                    "sensitive": True,
+                },
+                "cover_unified_social_credit_code": {
+                    "label": "封面统一社会信用代码",
+                    "type": "long_id",
+                    "sensitive": True,
+                },
+                "subject_name_assertion_status": {
+                    "label": "封面与身份标识名称一致性",
+                    "type": "string",
+                },
+                "creditor_institution": {"label": "债权机构", "type": "string"},
+                "receive_date": {"label": "接收日期", "type": "date"},
+                "last_repayment_amount": {"label": "最近一次还款总额", "type": "money"},
+                "last_repayment_amount_status": {
+                    "label": "最近一次还款总额报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "original_creditor_name": {"label": "初始债权人名称", "type": "string"},
+                "original_claim_type": {"label": "原债权种类", "type": "string"},
+                "original_debt_type": {"label": "源原债权种类", "type": "string"},
+                "original_debt_type_status": {
+                    "label": "源原债权种类报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "disposal_completion_date": {"label": "处置完成日期", "type": "date"},
+                "settlement_date": {"label": "结清日期", "type": "date"},
+                "guarantee_contract_identifier": {
+                    "label": "保证合同编号",
+                    "type": "long_id",
+                    "sensitive": True,
+                },
+                "responsibility_currency": {"label": "还款责任金额币种", "type": "string"},
+                "responsibility_amount_unit": {"label": "还款责任金额单位", "type": "string"},
+                "obligation_currency": {"label": "借款/授信金额币种", "type": "string"},
+                "obligation_amount_unit": {"label": "借款/授信金额单位", "type": "string"},
+                "open_or_receive_date": {"label": "开立/接收日期", "type": "date"},
+                "account_annotation_id": {"label": "账户标注ID", "type": "string"},
+                "annotation_type": {
+                    "label": "标注类型",
+                    "type": "string",
+                    "enum_ref": "account_annotation_type",
+                },
+                "annotation_type_label": {"label": "标注类型名称", "type": "string"},
+                "issuer": {"label": "说明/声明主体", "type": "string"},
+                "annotation_date": {"label": "说明/声明日期", "type": "date"},
+                "annotation_date_status": {
+                    "label": "说明/声明日期报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+                "annotation_content": {"label": "账户标注内容", "type": "text"},
+                "responsibility_group_detail_id": {
+                    "label": "分组还款责任明细ID",
+                    "type": "string",
+                },
+                "transaction_group": {"label": "交易分组", "type": "string"},
+                "source_group_account_count": {"label": "源分组业务笔数", "type": "integer"},
+                "credit_detail_group_id": {"label": "信贷明细分组ID", "type": "string"},
+                "group_phase": {"label": "信贷明细阶段", "type": "string"},
+                "group_kind": {"label": "信贷明细分组类型", "type": "string"},
+                "represented_dataset": {"label": "承载业务记录的数据集", "type": "string"},
+                "reported_record_count": {"label": "源报告声明笔数", "type": "integer"},
+                "reported_record_count_status": {
+                    "label": "源报告声明笔数状态",
+                    "type": "string",
+                },
+                "reported_record_count_conflicts": {
+                    "label": "冲突的源报告声明笔数",
+                    "type": "array",
+                },
+            }
+        )
+        for status_field, label in {
+            "receive_date_status": "接收日期报告状态",
+            "original_creditor_name_status": "初始债权人名称报告状态",
+            "original_claim_type_status": "原债权种类报告状态",
+            "loan_amount_status": "借款金额报告状态",
+            "guarantee_amount_status": "担保金额报告状态",
+            "balance_status": "余额报告状态",
+            "overdue_total_status": "逾期总额报告状态",
+            "overdue_principal_status": "逾期本金报告状态",
+        }.items():
+            fields.setdefault(
+                status_field,
+                {
+                    "label": label,
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
+            )
+        dictionary.setdefault("datasets", {})["enterprise_credit_detail_groups"] = {
+            "definition": (
+                "一行对应信贷记录明细中的一个‘共N笔’业务分组标题；"
+                "物理分页和重复表示不产生重复业务分组。"
+            ),
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "credit_detail_group_id",
+                    "sequence",
+                    "group_phase",
+                    "business_category",
+                    "group_kind",
+                    "represented_dataset",
+                    "reported_record_count",
+                    "reported_record_count_status",
+                    "reported_record_count_conflicts",
+                    "source_page",
+                    "source_page_end",
+                    "source_table_id",
+                    "source_table_id_end",
+                )
+            },
+        }
         credit_accounts = dictionary.setdefault("datasets", {}).setdefault(
             "enterprise_credit_accounts", {}
         )
@@ -650,6 +803,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "due_date",
             "maturity_date",
             "close_date",
+            "receive_date",
             "snapshot_date",
             "currency",
             "amount_unit",
@@ -670,19 +824,31 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "issuance_form",
             "guarantee_type",
             "five_tier_class",
-            "current_overdue_amount",
+            "overdue_total",
             "current_overdue",
             "overdue_principal",
-            "current_overdue_periods",
+            "overdue_months",
             "current_overdue_status",
             "last_repayment_date",
-            "actual_payment",
             "repayment_method",
             "remaining_periods",
             "special_transaction",
             "credit_agreement_identifier",
             "history_status",
+            "original_creditor_name",
+            "original_claim_type",
+            "creditor_institution",
+            "last_repayment_amount",
+            "last_repayment_amount_status",
+            "original_debt_type",
+            "original_debt_type_status",
             "payoff_state",
+        ):
+            account_columns[key] = fields[key]
+        for key in (
+            "receive_date_status",
+            "original_creditor_name_status",
+            "original_claim_type_status",
         ):
             account_columns[key] = fields[key]
         credit_lines = dictionary["datasets"].setdefault("enterprise_credit_facilities", {})
@@ -698,11 +864,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "credit_line_id": fields["credit_line_id"],
                 "facility_type": fields["facility_type"],
                 "account_state": fields["account_state"],
-                "account_identifier": {
-                    "label": "授信协议编号",
-                    "type": "long_id",
-                    "sensitive": True,
-                },
+                "credit_agreement_identifier": fields["credit_agreement_identifier"],
                 "facility_product": {"label": "授信额度类型", "type": "string"},
                 "revolving_flag": {"label": "额度循环标志", "type": "boolean"},
                 "effective_date": {"label": "生效日期", "type": "date"},
@@ -759,11 +921,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "enum_ref": "source_state",
                 "display": "hidden",
             }
-        fields["discount_amount_status"] = {
-            "label": "贴现金额报告状态",
-            "type": "string",
-            "enum_ref": "source_state",
-        }
         account_columns["discount_amount_status"] = fields["discount_amount_status"]
         repayment_liabilities = dictionary["datasets"].setdefault(
             "enterprise_repayment_responsibility_accounts",
@@ -776,12 +933,18 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "account_identifier",
             "responsibility_type",
             "contract_number",
+            "guarantee_contract_identifier",
             "currency",
             "amount_unit",
+            "responsibility_currency",
+            "responsibility_amount_unit",
+            "obligation_currency",
+            "obligation_amount_unit",
             "responsibility_amount",
             "institution",
             "business_type",
             "open_date",
+            "open_or_receive_date",
             "due_date",
             "loan_or_credit_amount",
             "balance",
@@ -798,11 +961,79 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         ):
             if key in fields:
                 repayment_liability_columns[key] = fields[key]
+        dictionary["datasets"]["enterprise_account_annotations"] = {
+            "definition": (
+                "一行对应正文中绑定到一个账户的数据提供机构说明、信息主体声明、"
+                "征信中心说明或异议处理状态。"
+            ),
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "account_annotation_id",
+                    "sequence",
+                    "account_id",
+                    "account_identifier",
+                    "annotation_type",
+                    "annotation_type_label",
+                    "issuer",
+                    "annotation_date",
+                    "annotation_date_status",
+                    "annotation_content",
+                    "dispute_status",
+                    "source_page",
+                    "source_page_end",
+                )
+            },
+        }
+        dictionary["datasets"]["enterprise_repayment_responsibility_group_details"] = {
+            "definition": (
+                "一行对应相关还款责任中没有独立账户编号的一条源分组明细；"
+                "跨页拆开的文字单元在同一行重建。"
+            ),
+            "columns": {
+                key: fields[key]
+                for key in (
+                    "responsibility_group_detail_id",
+                    "sequence",
+                    "transaction_group",
+                    "responsibility_type",
+                    "contract_number",
+                    "contract_number_status",
+                    "responsibility_amount",
+                    "responsibility_amount_status",
+                    "institution",
+                    "business_type",
+                    "five_tier_class",
+                    "account_count",
+                    "loan_amount",
+                    "loan_amount_status",
+                    "guarantee_amount",
+                    "guarantee_amount_status",
+                    "amount_kind",
+                    "balance",
+                    "balance_status",
+                    "overdue_total",
+                    "overdue_total_status",
+                    "overdue_principal",
+                    "overdue_principal_status",
+                    "source_group_account_count",
+                    "currency",
+                    "amount_unit",
+                    "source_page",
+                    "source_page_end",
+                    "source_table_id",
+                    "source_table_id_end",
+                )
+            },
+        }
         dictionary["datasets"]["enterprise_report_metadata"] = {
-            "definition": "一行对应企业信用报告封面标示的报告版本。",
+            "definition": "一行对应企业信用报告封面的报告版本、编号、查询机构和报告时间。",
             "columns": {
                 "sequence": fields["sequence"],
                 "report_edition": fields["report_edition"],
+                "report_number": fields["report_number"],
+                "query_institution": fields["query_institution"],
+                "report_time": fields["report_time"],
                 "source_page": fields["source_page"],
             },
         }
@@ -822,20 +1053,20 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 for key in (
                     "enterprise_identity_id",
                     "sequence",
-                    "report_edition",
-                    "exchange_rate_usd_cny",
-                    "exchange_rate_effective_period",
                     "enterprise_name",
                     "subject_name",
+                    "cover_subject_name",
+                    "identity_subject_name",
+                    "subject_name_assertion_status",
                     "zhongzheng_code",
+                    "cover_zhongzheng_code",
                     "unified_social_credit_code",
+                    "cover_unified_social_credit_code",
                     "organization_code",
                     "institution_credit_code",
                     "national_tax_id",
                     "local_tax_id",
                     "business_registration_number",
-                    "query_institution",
-                    "report_time",
                     "source_page",
                     "source_page_end",
                 )
@@ -926,8 +1157,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "recovery_type",
                     "account_count",
                     "balance",
+                    "amount",
                     "latest_disposal_date",
                     "latest_repayment_date",
+                    "disposal_completion_date",
+                    "settlement_date",
                     "currency",
                     "amount_unit",
                     "source_page",
@@ -1275,6 +1509,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "due_date",
                     "currency",
                     "amount",
+                    "amount_kind",
+                    "credit_limit",
+                    "credit_limit_status",
+                    "loan_amount",
+                    "loan_amount_status",
+                    "discount_amount",
+                    "discount_amount_status",
+                    "instrument_amount",
+                    "instrument_amount_status",
+                    "guarantee_amount",
+                    "guarantee_amount_status",
                     "amount_unit",
                     "close_date",
                     "guarantee_type",
@@ -1372,7 +1617,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "civil_judgment": "民事判决",
             "enforcement": "强制执行",
             "administrative_penalty": "行政处罚",
-            "social_security_payment": "住房公积金缴费记录",
+            "housing_fund_payment": "住房公积金缴费记录",
+            "social_security_payment": "社会保险缴费记录",
             "license": "许可记录",
             "certification": "认证记录",
             "qualification": "资质记录",
@@ -1387,13 +1633,31 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "subject_statement": "信息主体声明",
             "dispute_annotation": "异议标注",
         }
+        enums["account_annotation_type"] = {
+            "data_provider_statement": "数据提供机构说明",
+            "subject_statement": "信息主体声明",
+            "credit_bureau_statement": "征信中心说明",
+            "dispute_processing": "异议处理中",
+        }
+        enums["dispute_status"] = {
+            "in_progress": "处理中",
+            "resolved": "已处理",
+            "not_applicable": "不适用",
+        }
         enums["amount_unit"] = {
+            "CNY_1": "元（人民币）",
+            "USD_1": "美元",
+            "EUR_1": "欧元",
+            "HKD_1": "港币",
             "CNY_10K": "万元（人民币）",
             "USD_10K": "万美元",
             "EUR_10K": "万欧元",
             "HKD_10K": "万港币",
+            "1": "元（源币种）",
             "10K": "万（源币种）",
         }
+        enums["responsibility_amount_unit"] = dict(enums["amount_unit"])
+        enums["obligation_amount_unit"] = dict(enums["amount_unit"])
         enums["currency"] = {
             "CNY": "人民币",
             "USD": "美元",
@@ -1486,9 +1750,28 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "active": "未结清",
             "settled": "已结清",
         }
+        enums["group_phase"] = {
+            "active": "未结清信贷",
+            "recovered": "被追偿",
+            "settled": "已结清信贷",
+            "repayment_responsibility": "相关还款责任",
+        }
+        enums["recovery_type"] = {
+            "asset_management_disposed_debt": "资产管理公司处置债务",
+            "advance": "垫款",
+        }
+        enums["transaction_group"] = {
+            "discount": "贴现",
+            "guarantee": "担保交易",
+        }
         enums["amount_kind"] = {
+            "amount": "未分类金额",
             "balance": "余额",
+            "credit_limit": "信用额度",
+            "loan_amount": "借款金额",
             "discount_amount": "贴现金额",
+            "instrument_amount": "票据/信用证金额",
+            "guarantee_amount": "担保金额",
             "not_applicable": "不适用",
         }
         enums["summary_scope"] = {
@@ -1643,14 +1926,19 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "privacy_mode": "full",
             "show_top_document_metadata": False,
             "suppress_empty_sections": True,
+            "suppress_empty_columns": True,
             "dataset_layouts": {
                 "enterprise_report_metadata": {
                     "hide_title": True,
-                    "columns": ["report_edition"],
+                    "columns": [
+                        "report_edition",
+                        "report_number",
+                        "query_institution",
+                        "report_time",
+                    ],
                 },
                 "report_notes": {
-                    "hide_title": True,
-                    "columns": ["sequence", "content"],
+                    "hidden": True,
                 },
                 "enterprise_exchange_rates": {
                     "columns": [
@@ -1658,13 +1946,56 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "exchange_rate_effective_period",
                     ],
                 },
+                "enterprise_report_identity": {
+                    "hidden": True,
+                },
+                "enterprise_credit_overview": {
+                    "hidden": True,
+                },
+                "enterprise_public_record_counts": {
+                    "columns": [
+                        "record_type",
+                        "record_count",
+                    ],
+                },
+                "enterprise_dispute_overview": {
+                    "columns": [
+                        "in_progress_dispute_count",
+                        "dispute_status",
+                    ],
+                },
+                "enterprise_recovery_summary": {
+                    "columns": [
+                        "settlement_status",
+                        "recovery_type",
+                        "account_count",
+                        "balance",
+                        "amount",
+                        "latest_disposal_date",
+                        "latest_repayment_date",
+                        "disposal_completion_date",
+                        "settlement_date",
+                        "currency",
+                        "amount_unit",
+                    ],
+                },
+                "enterprise_overdue_summary": {
+                    "columns": [
+                        "overdue_principal",
+                        "overdue_interest_and_other",
+                        "overdue_total",
+                        "currency",
+                        "amount_unit",
+                    ],
+                },
                 "enterprise_capital_summary": {
+                    "mode": "record_cards",
+                    "hide_record_titles": True,
                     "columns": [
                         "registered_capital_amount",
                         "currency",
                         "amount_unit",
                         "contributor_count",
-                        "contributor_status",
                         "source_institution",
                         "update_date",
                     ],
@@ -1687,7 +2018,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "total_limit",
                         "used_limit",
                         "available_limit",
-                        "utilization_rate",
                         "currency",
                         "amount_unit",
                     ],
@@ -1731,7 +2061,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "institution",
                         "business_type",
                         "five_tier_class",
-                        "source_group_account_count",
                         "source_account_count",
                         "source_reported_amount",
                         "amount_kind",
@@ -1764,21 +2093,23 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "enterprise_repayment_responsibility_accounts": {
                     "mode": "record_cards",
-                    "title_fields": ["sequence", "responsibility_type"],
-                    "title_separator": ". ",
+                    "title_fields": ["responsibility_type", "account_identifier"],
                     "columns": [
                         "account_identifier",
                         "contract_number",
-                        "contract_number_status",
+                        "guarantee_contract_identifier",
                         "institution",
                         "business_type",
                         "open_date",
+                        "open_or_receive_date",
                         "maturity_date",
-                        "maturity_date_status",
                         "currency",
                         "amount_unit",
+                        "responsibility_currency",
+                        "responsibility_amount_unit",
+                        "obligation_currency",
+                        "obligation_amount_unit",
                         "responsibility_amount",
-                        "responsibility_amount_status",
                         "loan_or_credit_amount",
                         "balance",
                         "five_tier_class",
@@ -1787,40 +2118,47 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "overdue_months_or_repayment_status",
                         "remaining_periods",
                         "snapshot_date",
-                        "continuation_complete",
                     ],
                 },
                 "enterprise_credit_accounts": {
-                    "mode": "table",
+                    "mode": "record_cards",
+                    "title_fields": ["business_category", "account_identifier"],
                     "columns": [
-                        "sequence",
-                        "business_category",
                         "account_identifier",
                         "institution",
                         "business_type",
                         "status",
                         "open_date",
                         "maturity_date",
+                        "close_date",
+                        "receive_date",
                         "snapshot_date",
                         "currency",
                         "amount_unit",
                         "loan_amount",
                         "credit_limit",
+                        "discount_amount",
+                        "guarantee_amount",
                         "balance",
+                        "risk_exposure_amount",
+                        "deposit_ratio",
                         "issuance_form",
                         "guarantee_type",
                         "five_tier_class",
-                        "current_overdue_amount",
+                        "overdue_total",
                         "overdue_principal",
-                        "current_overdue_periods",
-                        "current_overdue_status",
+                        "overdue_months",
                         "last_repayment_date",
-                        "actual_payment",
+                        "last_repayment_amount",
                         "repayment_method",
                         "remaining_periods",
                         "special_transaction",
                         "credit_agreement_identifier",
                         "history_status",
+                        "original_creditor_name",
+                        "original_claim_type",
+                        "creditor_institution",
+                        "original_debt_type",
                     ],
                 },
                 "enterprise_credit_facilities": {
@@ -1828,7 +2166,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "title_fields": ["facility_type"],
                     "columns": [
                         "facility_product",
-                        "account_identifier",
+                        "credit_agreement_identifier",
                         "institution",
                         "revolving_flag",
                         "effective_date",
@@ -1893,18 +2231,16 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     ],
                 },
                 "enterprise_attachment_accounts": {
-                    "mode": "grouped_table",
-                    "group_by": "business_category",
+                    "mode": "record_cards",
+                    "hide_title": True,
+                    "title_fields": ["business_category", "account_identifier"],
                     "columns": [
-                        "source_sequence",
-                        "attachment_record_type",
                         "account_identifier",
                         "institution",
                         "business_type",
+                        "business_category",
                         "account_status",
                         "five_tier_class",
-                        "source_page",
-                        "source_page_end",
                     ],
                 },
                 "enterprise_attachment_credit_details": {
@@ -1918,7 +2254,12 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "open_date",
                         "maturity_date",
                         "currency",
-                        "amount",
+                        "amount_kind",
+                        "credit_limit",
+                        "loan_amount",
+                        "discount_amount",
+                        "instrument_amount",
+                        "guarantee_amount",
                         "amount_unit",
                         "close_date",
                         "guarantee_type",
@@ -1927,9 +2268,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "balance",
                         "risk_exposure_amount",
                         "five_tier_class",
-                        "five_tier_class_source",
                         "credit_agreement_identifier",
-                        "credit_agreement_status",
                         "snapshot_date",
                         "last_repayment_date",
                         "repayment_method",
@@ -1957,21 +2296,35 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             },
             "section_layouts": {
                 "identity": {
-                    "omit_unlisted": False,
-                    "hidden_fields": [
-                        "report_subtype",
-                        "content_mode",
+                    "omit_unlisted": True,
+                    "groups": [
+                        {
+                            "hide_title": True,
+                            "fields": [
+                                "subject_name",
+                                "zhongzheng_code",
+                                "unified_social_credit_code",
+                                "organization_code",
+                                "business_registration_number",
+                                "institution_credit_code",
+                                "national_tax_id",
+                                "local_tax_id",
+                            ],
+                        },
                     ],
                 },
                 "credit_summary": {
-                    "omit_unlisted": False,
-                    "hidden_fields": [
-                        "facility_summary",
-                        "source_account_summary_table_id",
-                        "source_account_summary_page",
-                    ],
-                    "hidden_groups": ["facility_summary"],
+                    "omit_unlisted": True,
                     "groups": [
+                        {
+                            "title": "信贷概况",
+                            "fields": [
+                                "first_credit_year",
+                                "credit_institution_count",
+                                "active_credit_institution_count",
+                                "first_repayment_responsibility_year",
+                            ],
+                        },
                         {
                             "title": "余额概览",
                             "fields": [
@@ -1983,39 +2336,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                                 "guarantee_adverse_balance",
                                 "recovered_debt_balance",
                                 "amount_unit",
-                            ],
-                        },
-                        {
-                            "title": "账户与授信概览",
-                            "fields": [
-                                "reported_account_count",
-                                "reported_account_balance",
-                                "reported_credit_line_count",
-                                "facility_summary_record_count",
-                                "extracted_public_record_count",
-                                "attachment_account_count",
-                                "attachment_history_row_count",
-                                "attachment_detail_card_count",
-                                "attachment_special_transaction_count",
-                                "first_credit_year",
-                                "credit_institution_count",
-                                "active_credit_institution_count",
-                                "first_repayment_responsibility_year",
-                                "first_repayment_responsibility_year_status",
-                            ],
-                            "nested_groups": [
-                                "reported_account_counts",
-                                "reported_account_balances",
-                                "public_record_overview_counts",
-                                "extracted_public_record_type_counts",
-                            ],
-                        },
-                        {
-                            "title": "数据范围说明",
-                            "fields": [
-                                "account_dataset_scope",
-                                "source_display_limited",
-                                "account_dataset_scope_note",
                             ],
                         },
                     ],
@@ -2030,33 +2350,104 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         for spec in enterprise_public_record_dataset_specs().values():
             dataset_layouts[spec["dataset_id"]] = {
                 "mode": "table",
-                "columns": ["sequence", *spec["columns"]],
+                "columns": list(spec["columns"]),
             }
         dataset_layouts["enterprise_profile"] = {
             "mode": "record_cards",
-            "title_fields": ["enterprise_name"],
+            "hide_title": True,
+            "hide_record_titles": True,
             "columns": [
                 "economic_type",
+                "economic_type_source_institution",
                 "organization_type",
+                "organization_type_source_institution",
                 "enterprise_scale",
+                "enterprise_scale_source_institution",
                 "industry",
+                "industry_source_institution",
                 "establishment_year",
+                "establishment_year_source_institution",
                 "registration_certificate_valid_through",
+                "registration_certificate_valid_through_source_institution",
                 "registered_address",
+                "registered_address_source_institution",
                 "operating_address",
+                "operating_address_source_institution",
                 "operating_status",
+                "operating_status_source_institution",
             ],
         }
         dataset_layouts["enterprise_section_presence"] = {
-            "mode": "table",
+            "hidden": True,
+        }
+        dataset_layouts["enterprise_credit_detail_groups"] = {
+            "mode": "record_cards",
+            "hide_title": True,
+            "title_fields": ["group_phase", "business_category"],
+            "columns": ["reported_record_count"],
+        }
+        dataset_layouts["enterprise_account_annotations"] = {
+            "mode": "record_cards",
+            "title_fields": ["annotation_type_label", "account_identifier"],
             "columns": [
-                "sequence",
-                "section_title",
-                "presence_status",
-                "heading_detected",
-                "record_count",
+                "account_identifier",
+                "annotation_type_label",
+                "issuer",
+                "annotation_date",
+                "annotation_content",
+                "dispute_status",
             ],
         }
+        dataset_layouts["enterprise_interest_arrears"] = {
+            "mode": "record_cards",
+            "title_fields": ["arrears_type", "institution"],
+            "columns": [
+                "institution",
+                "arrears_type",
+                "arrears_balance",
+                "balance_change_date",
+                "snapshot_date",
+                "currency",
+                "amount_unit",
+            ],
+        }
+        dataset_layouts["enterprise_repayment_responsibility_group_details"] = {
+            "mode": "record_cards",
+            "title_fields": ["transaction_group", "responsibility_type"],
+            "columns": [
+                "responsibility_type",
+                "contract_number",
+                "responsibility_amount",
+                "institution",
+                "business_type",
+                "five_tier_class",
+                "account_count",
+                "loan_amount",
+                "guarantee_amount",
+                "amount_kind",
+                "balance",
+                "overdue_total",
+                "overdue_principal",
+                "currency",
+                "amount_unit",
+            ],
+        }
+        for history_dataset in (
+            "enterprise_utility_payment_history",
+            "enterprise_housing_fund_history",
+        ):
+            dataset_layouts[history_dataset] = {
+                "mode": "table",
+                "columns": [
+                    "statistics_month",
+                    "payment_status",
+                    "amount_due",
+                    "amount_paid",
+                    "cumulative_arrears",
+                    "currency",
+                    "amount_unit",
+                ],
+            }
         dataset_layouts["enterprise_contributors"] = {
             "mode": "record_cards",
             "title_fields": ["role"],
@@ -2066,24 +2457,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             ],
         }
         dataset_layouts["enterprise_key_personnel"] = deepcopy(dataset_layouts["enterprise_contributors"])
-        enhanced = semantic["enhanced_markdown"]
-        summary_groups = enhanced["section_layouts"]["credit_summary"]["groups"]
-        summary_groups[1]["fields"] = [
-            "reported_account_count", "reported_account_count_basis",
-            "displayed_credit_account_card_count", "reported_account_balance",
-            "reported_credit_line_count", "displayed_credit_facility_count",
-            "facility_summary_record_count", "extracted_public_record_count", "attachment_account_count",
-            "attachment_history_row_count", "attachment_detail_card_count",
-            "attachment_special_transaction_count",
-            "first_credit_year", "first_credit_year_status",
-            "credit_institution_count", "active_credit_institution_count",
-            "first_repayment_responsibility_year", "first_repayment_responsibility_year_status",
-        ]
-        summary_groups[2]["fields"] = [
-            "account_dataset_scope", "account_dataset_scope_note", "source_scope_status",
-            "source_limited_scopes", "available_limit_status",
-            "public_record_overview_count_scope", "extracted_public_record_count_scope",
-        ]
         return semantic
 
 

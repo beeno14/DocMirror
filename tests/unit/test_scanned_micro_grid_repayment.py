@@ -21,6 +21,7 @@ from docmirror.plugins.credit_report.micro_grid_materialize import (
     materialize_credit_repayment_micro_grids_from_bundles,
 )
 from docmirror.plugins.credit_report.repayment_grid import (
+    dedupe_repayment_records,
     extract_credit_repayment_records,
     records_from_micro_grid_dict,
 )
@@ -204,6 +205,94 @@ def test_credit_repayment_micro_grid_prefers_ocr_tokens_when_available():
     assert _record_tuples(out["repayment_records"]) == _expected_repayment_tuples()
 
 
+def test_zero_status_preserves_contradictory_nonzero_amount_evidence_for_review():
+    lines = [dict(line) for line in _credit_page4_lines()[:-1]]
+    # This is a common OCR merge: the calendar-year label and four amount
+    # cells arrive as one line. The final nonzero amount must not be replaced
+    # by the semantic zero implied by status N.
+    lines[-1] = {
+        "content": "2020 0005",
+        "bbox": [75.0, 315.12, 733.57, 332.76],
+        "confidence": 1.0,
+    }
+
+    out = extract_credit_repayment_records(lines, page=4)
+    direct = next(
+        record
+        for record in out["repayment_records"]
+        if record["year"] == 2020 and record["month"] == 12
+    )
+    projected = next(
+        record
+        for record in records_from_micro_grid_dict(out["micro_grid"])
+        if record["year"] == 2020 and record["month"] == 12
+    )
+
+    for record in (direct, projected):
+        assert record["status"] == "N"
+        assert record["overdue_amount"] == "5"
+        assert record["extraction_status"] == "review"
+        assert record["audit"]["reason"] == "zero_status_conflicts_with_observed_nonzero_amount"
+
+
+def test_grid_dedupe_preserves_conflicting_months_for_relationship_reporting():
+    records = [
+        {
+            "grid_id": "grid:1",
+            "year": 2024,
+            "month": 1,
+            "status": "N",
+            "overdue_amount": "0",
+            "confidence": 0.8,
+            "source_cell_refs": [{"grid_id": "grid:1", "cell": "a"}],
+        },
+        {
+            "grid_id": "grid:1",
+            "year": 2024,
+            "month": 1,
+            "status": "1",
+            "overdue_amount": "100",
+            "confidence": 0.9,
+            "source_cell_refs": [{"grid_id": "grid:1", "cell": "b"}],
+        },
+    ]
+
+    assert dedupe_repayment_records(records) == records
+
+
+def test_grid_dedupe_silently_merges_normalized_identical_months():
+    records = [
+        {
+            "grid_id": "grid:1",
+            "year": 2024,
+            "month": 1,
+            "status": "N",
+            "overdue_amount": "0.00",
+            "confidence": 0.8,
+            "source_cell_refs": [{"grid_id": "grid:1", "cell": "a"}],
+        },
+        {
+            "grid_id": "grid:1",
+            "year": 2024,
+            "month": 1,
+            "status": "N",
+            "overdue_amount": "0",
+            "confidence": 0.9,
+            "source_cell_refs": [{"grid_id": "grid:1", "cell": "b"}],
+        },
+    ]
+
+    deduped = dedupe_repayment_records(records)
+
+    assert len(deduped) == 1
+    assert deduped[0]["confidence"] == 0.9
+    assert deduped[0]["source_cell_refs"] == [
+        {"grid_id": "grid:1", "cell": "a"},
+        {"grid_id": "grid:1", "cell": "b"},
+    ]
+    assert "audit" not in deduped[0]
+
+
 def test_micro_grid_candidate_detector_is_anchor_gated():
     candidates = detect_micro_grid_candidates(_credit_page4_tokens(), lines=_credit_page4_lines(), page=4)
     assert candidates
@@ -268,6 +357,72 @@ def test_visually_confirmed_numeric_status_is_not_quarantined():
 
     assert records[0]["status"] == "2"
     assert records[0]["recognition_source"] == "cell_crop_consensus"
+
+
+def test_candidate_b_exact_row_numeric_status_is_kept_without_false_zero_amount():
+    status_ref = {
+        "page": 3,
+        "logical_page": 3,
+        "bbox": [100, 200, 120, 220],
+        "geometry_scope": "cell",
+        "field_name": "status",
+    }
+    amount_ref = {
+        "page": 3,
+        "logical_page": 3,
+        "bbox": [100, 220, 120, 240],
+        "geometry_scope": "cell",
+        "field_name": "overdue_amount",
+    }
+    grid = {
+        "grid_id": "mg_p3_repayment_0",
+        "page": 3,
+        "anchor_text": "2024年01月-2024年01月的还款记录",
+        "audit": {
+            "date_range": {"start_year": 2024, "start_month": 1, "end_year": 2024, "end_month": 1},
+            "zero_overdue_statuses": ["*", "/", "N", "C", "A"],
+        },
+        "col_bands": [{"index": 1, "header": "1"}],
+        "cells": [
+            [
+                {"row_index": 2, "col_index": 0, "text": "2024", "role": "year"},
+                {
+                    "row_index": 2,
+                    "col_index": 1,
+                    "bbox": [100, 200, 120, 220],
+                    "text": "2",
+                    "role": "status",
+                    "recognition_source": "canonical_row_sequence",
+                    "recognition_audit": {
+                        "alignment_status": "exact",
+                        "expected_cell_count": 1,
+                        "observed_status_count": 1,
+                        "source_ref": status_ref,
+                    },
+                },
+            ],
+            [
+                {
+                    "row_index": 3,
+                    "col_index": 1,
+                    "bbox": [100, 220, 120, 240],
+                    "text": "",
+                    "role": "overdue_amount",
+                    "recognition_audit": {"source_ref": amount_ref},
+                }
+            ],
+        ],
+    }
+
+    shared_default = records_from_micro_grid_dict(grid)
+    candidate_b = records_from_micro_grid_dict(grid, accept_exact_row_numeric_status=True)
+
+    assert shared_default[0]["status"] == "unknown"
+    assert candidate_b[0]["status"] == "2"
+    assert candidate_b[0]["repayment_id"] == "mg_p3_repayment_0:2024-01"
+    assert candidate_b[0]["grid_id"] == "mg_p3_repayment_0"
+    assert candidate_b[0]["overdue_amount"] is None
+    assert candidate_b[0]["source_cell_refs"] == [status_ref, amount_ref]
 
 
 def test_repayment_projection_binds_amount_to_same_year_row():
@@ -356,6 +511,183 @@ def test_cell_crop_ocr_fills_missing_target_cell(monkeypatch):
         if cell["role"] == "status" and cell["col_index"] == 1
     ]
     assert status_cells[0]["recognition_source"] == "cell_crop_ocr"
+
+
+def test_static_n_star_classifier_separates_canonical_glyph_shapes() -> None:
+    import cv2
+    import numpy as np
+
+    def rendered(glyph: str):
+        image = np.full((80, 80, 3), 255, dtype=np.uint8)
+        (width, height), _baseline = cv2.getTextSize(
+            glyph, cv2.FONT_HERSHEY_DUPLEX, 0.72, 1
+        )
+        cv2.putText(
+            image,
+            glyph,
+            ((80 - width) // 2, (80 + height) // 2),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.72,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        return repayment_mod.extract_micro_cell_glyph_template(
+            image, (0, 0, 80, 80), page_width=80, page_height=80
+        )
+
+    n_glyph = rendered("N")
+    star_glyph = rendered("*")
+    hash_glyph = rendered("#")
+    one_glyph = rendered("1")
+
+    assert n_glyph is not None
+    assert star_glyph is not None
+    assert repayment_mod._static_n_star_glyph_classification(n_glyph)[0] == "N"
+    assert repayment_mod._static_n_star_glyph_classification(star_glyph)[0] == "*"
+    assert repayment_mod._static_n_star_glyph_classification(hash_glyph) is None
+    assert repayment_mod._static_n_star_glyph_classification(one_glyph) is None
+
+
+def test_static_n_star_classifier_rejects_other_status_and_noise_glyphs() -> None:
+    import cv2
+    import numpy as np
+
+    for glyph in "HMBAZGC1234567#+.X/":
+        image = np.full((64, 64, 3), 255, dtype=np.uint8)
+        (width, height), _baseline = cv2.getTextSize(
+            glyph, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2
+        )
+        cv2.putText(
+            image,
+            glyph,
+            ((64 - width) // 2, (64 + height) // 2),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.9,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        template = repayment_mod.extract_micro_cell_glyph_template(
+            image,
+            (0, 0, 64, 64),
+            page_width=64,
+            page_height=64,
+        )
+        assert template is not None
+        assert repayment_mod._static_n_star_glyph_classification(template) is None, glyph
+
+
+def test_static_status_validation_corrects_n_star_without_calling_ocr(monkeypatch) -> None:
+    import cv2
+    import numpy as np
+
+    lines = [
+        {
+            "content": "2024年01月-2024年01月的还款记录",
+            "bbox": [280.0, 194.0, 510.0, 217.0],
+            "confidence": 1.0,
+        },
+        {
+            "content": "1 2 3 4 5 6 7 8 9 10 11 12",
+            "bbox": [130.0, 222.0, 730.0, 241.0],
+            "confidence": 1.0,
+        },
+        {"content": "N", "bbox": [130.0, 249.0, 180.0, 267.0], "confidence": 1.0},
+        {"content": "2024", "bbox": [75.0, 270.0, 112.0, 288.0], "confidence": 1.0},
+    ]
+    star_image = np.full((80, 80, 3), 255, dtype=np.uint8)
+    (star_width, star_height), _baseline = cv2.getTextSize(
+        "*", cv2.FONT_HERSHEY_DUPLEX, 0.72, 1
+    )
+    cv2.putText(
+        star_image,
+        "*",
+        ((80 - star_width) // 2, (80 + star_height) // 2),
+        cv2.FONT_HERSHEY_DUPLEX,
+        0.72,
+        (0, 0, 0),
+        1,
+        cv2.LINE_AA,
+    )
+    star_glyph = repayment_mod.extract_micro_cell_glyph_template(
+        star_image, (0, 0, 80, 80), page_width=80, page_height=80
+    )
+    assert star_glyph is not None
+
+    monkeypatch.setattr(
+        repayment_mod,
+        "extract_micro_cell_glyph_template",
+        lambda *_args, **_kwargs: star_glyph,
+    )
+
+    def forbidden_ocr(*_args, **_kwargs):
+        raise AssertionError("static status validation must not invoke OCR")
+
+    monkeypatch.setattr(repayment_mod, "recognize_micro_cell_from_image", forbidden_ocr)
+    page_image = np.full((1207, 834, 3), 255, dtype=np.uint8)
+
+    out = extract_credit_repayment_records(
+        lines,
+        page=4,
+        page_width=834,
+        page_height=1207,
+        page_image=page_image,
+        enable_cell_ocr=False,
+        enable_static_status_validation=True,
+    )
+
+    assert [(row["year"], row["month"], row["status"]) for row in out["repayment_records"]] == [
+        (2024, 1, "*"),
+    ]
+    audit = out["micro_grid"]["audit"]
+    assert audit["cell_crop_ocr"] == {"enabled": False, "attempts": 0, "hits": 0}
+    assert audit["static_status_validation"]["corrections"] == 1
+    status_cell = next(
+        cell
+        for row in out["micro_grid"]["cells"]
+        for cell in row
+        if cell.get("role") == "status" and cell.get("col_index") == 1
+    )
+    assert status_cell["recognition_source"] == "static_glyph_shape_validation"
+
+
+def test_static_status_validation_quarantines_when_page_image_is_unavailable() -> None:
+    lines = [
+        {
+            "content": "2024年01月-2024年01月的还款记录",
+            "bbox": [280.0, 194.0, 510.0, 217.0],
+            "confidence": 1.0,
+        },
+        {
+            "content": "1 2 3 4 5 6 7 8 9 10 11 12",
+            "bbox": [130.0, 222.0, 730.0, 241.0],
+            "confidence": 1.0,
+        },
+        {"content": "N", "bbox": [130.0, 249.0, 180.0, 267.0], "confidence": 1.0},
+        {"content": "2024", "bbox": [75.0, 270.0, 112.0, 288.0], "confidence": 1.0},
+    ]
+
+    out = extract_credit_repayment_records(
+        lines,
+        page=4,
+        page_width=834,
+        page_height=1207,
+        enable_cell_ocr=False,
+        enable_static_status_validation=True,
+    )
+
+    assert out["repayment_records"] == []
+    projected = records_from_micro_grid_dict(out["micro_grid"])
+    assert len(projected) == 1
+    assert projected[0]["status"] == "unknown"
+    assert projected[0]["extraction_status"] == "review"
+    assert projected[0]["source_cell_refs"][0]["field_name"] == "status"
+    assert projected[0]["source_cell_refs"][0]["geometry_scope"] == "cell"
+    audit = out["micro_grid"]["audit"]["static_status_validation"]
+    assert audit["attempts"] == 1
+    assert audit["unresolved"] == 1
+    assert audit["unavailable"] == 1
 
 
 def test_forensic_api_exports_micro_grids_without_domain_semantics():

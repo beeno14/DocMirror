@@ -1008,8 +1008,9 @@ class PersonalDetailExtractionContext:
             )
             materialize_credit_repayment_micro_grids_from_bundles(
                 detached,
-                page_image_resolver=None,
+                page_image_resolver=getattr(self, "_page_image_resolver", None),
                 enable_cell_ocr=False,
+                enable_static_status_validation=True,
                 extra_status_chars={"A"},
             )
             corrected_grids = micro_grid_structures_from_domain_specific(detached)
@@ -1017,7 +1018,10 @@ class PersonalDetailExtractionContext:
             records = [
                 record
                 for grid in corrected_grids
-                for record in records_from_micro_grid_dict(grid)
+                for record in records_from_micro_grid_dict(
+                    grid,
+                    accept_exact_row_numeric_status=True,
+                )
             ]
             deduped = dedupe_repayment_records(records)
 
@@ -1087,6 +1091,17 @@ class PersonalDetailExtractionContext:
             structural_expected_count = max(schema_implied_count, source_structure_count)
             missing_month_count = max(0, structural_expected_count - len(deduped))
             if missing_month_count:
+                interval_gap_series_count = sum(
+                    1
+                    for months in months_by_series.values()
+                    if months and max(months) - min(months) + 1 > len(months)
+                )
+                within_series_missing_position_count = max(
+                    0, schema_implied_count - len(deduped)
+                )
+                unlocalized_source_structure_delta = max(
+                    0, source_structure_count - max(schema_implied_count, len(deduped))
+                )
                 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
                     make_issue,
                     record_issue,
@@ -1109,10 +1124,15 @@ class PersonalDetailExtractionContext:
                             "schema_implied_row_count": schema_implied_count,
                             "source_structure_row_count": source_structure_count,
                             "missing_month_count": missing_month_count,
-                            "affected_account_or_grid_count": sum(
-                                1
-                                for months in months_by_series.values()
-                                if months and max(months) - min(months) + 1 > len(months)
+                            "within_series_missing_position_count": within_series_missing_position_count,
+                            "unlocalized_source_structure_delta": unlocalized_source_structure_delta,
+                            "affected_account_or_grid_count": (
+                                interval_gap_series_count or None
+                            ),
+                            "localization_status": (
+                                "localized_to_account_or_grid_intervals"
+                                if interval_gap_series_count
+                                else "unresolved_from_detached_source_structure"
                             ),
                         },
                         reason_codes=(

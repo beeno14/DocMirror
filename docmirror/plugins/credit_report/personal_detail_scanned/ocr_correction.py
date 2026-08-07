@@ -68,7 +68,9 @@ _INSTITUTION_SUFFIX_RE = re.compile(
 )
 _LEADING_ROW_NOISE_RE = re.compile(r"^[\s\W_]*(?:[A-Za-z\u3400-\u9fff]{1,2}\s+)?(?=\d{0,3}\s*20\d{2})")
 _TRAILING_INSTITUTION_NOISE_RE = re.compile(r"(?:\s+[A-Za-z0-9￥¥?$]{1,3})+$")
-_REPAYMENT_STATUSES = frozenset({"*", "/", "N", "A", "C", "M", "B", "D", "Z", "G", "#", *"1234567"})
+_REPAYMENT_STATUSES = frozenset(
+    {"*", "/", "N", "A", "C", "M", "B", "D", "Z", "G", "unknown", *"1234567"}
+)
 _PLACEHOLDERS = frozenset({"-", "--"})
 _ACCOUNT_TYPE_LABELS = (
     "非循环贷账户",
@@ -76,6 +78,13 @@ _ACCOUNT_TYPE_LABELS = (
     "循环贷账户二",
     "贷记卡账户",
     "准贷记卡账户",
+)
+_SUMMARY_BUSINESS_CATEGORIES = (
+    "个人住房贷款",
+    "个人商用房贷款",
+    "其他类贷款",
+    "贷记卡",
+    "准贷记卡",
 )
 _ACCOUNT_STATES = frozenset(
     {
@@ -120,6 +129,8 @@ _ACCOUNT_STATUS_CODES = frozenset(
 _FIVE_TIER_CLASSES = frozenset({"正常", "关注", "次级", "可疑", "损失", "违约", "未分类", "unknown"})
 
 _FIELD_ROLES: dict[str, str] = {
+    "subject_name": "person_name",
+    "holder_name": "person_name",
     "report_time": "report_datetime",
     "query_time": "report_datetime",
     "primary_id_number": "identity_document_number",
@@ -172,6 +183,21 @@ _FIELD_ROLES: dict[str, str] = {
     "responsible_person_type": "responsibility_type",
     "query_reason": "inquiry_reason",
     "residence_status": "residence_status",
+    "address": "address",
+    "mailing_address": "address",
+    "household_address": "address",
+    "communication_address": "address",
+    "employer": "employer_name",
+    "work_unit": "employer_name",
+    "facility_type": "facility_type",
+    "repayment_method": "repayment_method",
+    "position": "employment_descriptor",
+    "job_title": "employment_descriptor",
+    "occupation": "employment_descriptor",
+    "primary_id_type": "identity_document_type",
+    "document_type": "identity_document_type",
+    "related_party_id_type": "identity_document_type",
+    "co_borrower_flag": "boolean_flag",
     "postal_code": "postal_code",
     "organization_code": "organization_code",
     "nationality": "country_or_region_code",
@@ -329,6 +355,12 @@ def _normalize_identity(value: str) -> str:
 def _normalize_phone(value: str, *, mobile: bool) -> str:
     text = _plain_text(value)
     digits = re.sub(r"\D", "", text)
+    digit_groups = re.findall(r"\d+", text)
+    if len(digit_groups) > 1 and re.search(r"\d\s+\d", text) and len(digits) > 12:
+        # A common table-collapse failure joins a telephone number to a
+        # neighbouring numeric cell.  Flattening that sequence would turn
+        # structure damage into a plausible-looking telephone number.
+        return text
     if mobile and _MOBILE_RE.fullmatch(digits):
         return digits
     if not mobile and 5 <= len(digits) <= 16 and not re.search(r"[A-Za-z\u3400-\u9fff]", text):
@@ -415,12 +447,56 @@ def _normalize_business_enum(value: str, candidates: Iterable[str]) -> str:
     return text
 
 
+def _normalize_summary_business_category(value: str) -> str:
+    text = re.sub(r"\s+", "", _plain_text(value)).strip("-_:：,，;；")
+    if text in _PLACEHOLDERS or text in _SUMMARY_BUSINESS_CATEGORIES:
+        return text
+    embedded = [option for option in _SUMMARY_BUSINESS_CATEGORIES if option in text]
+    if len(embedded) == 1:
+        residual = text.replace(embedded[0], "", 1)
+        if re.fullmatch(r"[0-9A-Za-z#*?]*", residual):
+            return embedded[0]
+    same_length = [
+        option
+        for option in _SUMMARY_BUSINESS_CATEGORIES
+        if len(option) == len(text)
+        and sum(left != right for left, right in zip(text, option, strict=True)) <= 1
+    ]
+    return same_length[0] if len(same_length) == 1 else text
+
+
 def normalize_institution_name(value: str) -> str:
     """Return a conservative institution-name correction."""
     text = re.sub(r"\s+", " ", _plain_text(value)).strip(" -_:：,，;；")
     for original, corrected in dict(_pack().get("institution_substitutions") or {}).items():
         text = text.replace(str(original), str(corrected))
+    for field_label in (
+        "开立日期",
+        "账户授信额度",
+        "共享授信额度",
+        "币种",
+        "业务种类",
+        "担保方式",
+    ):
+        if field_label not in text:
+            continue
+        tail = text.rsplit(field_label, 1)[-1].strip()
+        if _INSTITUTION_SUFFIX_RE.search(tail):
+            text = tail
+    isolated_suffix_fragment = re.fullmatch(
+        r"(?:[A-Za-z]|[有限责任股份公司])\s+(.{4,}(?:有限公司|股份有限公司|有限责任公司|公司))",
+        text,
+    )
+    if isolated_suffix_fragment:
+        # A separated single glyph copied from a neighbouring legal suffix is
+        # OCR boundary debris, not part of the individualized institution.
+        text = isolated_suffix_fragment.group(1)
     text = re.sub(r"^[中福装R$证芬心多离囍版真苏德会食守]\s+(?=.{2,})", "", text)
+    text = re.sub(
+        r"^[导务]\s*(?=.{2,}(?:银行|公司|中心|支行|分行|营业部))",
+        "",
+        text,
+    )
     text = re.sub(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])", "", text)
     text = _TRAILING_INSTITUTION_NOISE_RE.sub("", text).strip()
     matches = list(_INSTITUTION_SUFFIX_RE.finditer(text))
@@ -437,7 +513,6 @@ def normalize_institution_name(value: str) -> str:
         )
         if specialized_tail:
             selected += specialized_tail.group(0)
-        selected = re.sub(r"^[证芬心多离囍版真苏德会食守](?=[\u3400-\u9fff]{4,})", "", selected)
         text = selected
     return text
 
@@ -483,7 +558,12 @@ def _is_valid_for_role(value: str, role: str) -> bool:
     if role == "mobile_phone":
         return bool(_MOBILE_RE.fullmatch(value))
     if role == "phone":
-        return 5 <= len(re.sub(r"\D", "", value)) <= 16
+        digits = re.sub(r"\D", "", value)
+        if re.search(r"[A-Za-z\u3400-\u9fff]", value):
+            return False
+        if len(re.findall(r"\d+", value)) > 1 and re.search(r"\d\s+\d", value) and len(digits) > 12:
+            return False
+        return 5 <= len(digits) <= 16
     if role == "account_identifier":
         return bool(_ACCOUNT_IDENTIFIER_RE.fullmatch(value))
     if role == "amount":
@@ -498,15 +578,20 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         compact = re.sub(r"\s+", "", value)
         return bool(_INSTITUTION_SUFFIX_RE.fullmatch(compact) or compact == "本人")
     if role == "repayment_status":
-        return value in _REPAYMENT_STATUSES
+        # ``unknown`` is an extraction state, never a printed PBOC monthly
+        # symbol.  Treating it as valid prevented the only permitted page
+        # repair from being selected and made a silent miss look complete.
+        return value != "unknown" and value in _REPAYMENT_STATUSES
     if role == "account_type_label":
         return value in _ACCOUNT_TYPE_LABELS
+    if role == "summary_business_category":
+        return value in _PLACEHOLDERS or value in _SUMMARY_BUSINESS_CATEGORIES
     if role == "account_state":
-        return value in _ACCOUNT_STATES
+        return value != "unknown" and value in _ACCOUNT_STATES
     if role == "account_status_code":
-        return value in _ACCOUNT_STATUS_CODES
+        return value != "unknown" and value in _ACCOUNT_STATUS_CODES
     if role == "five_tier_class":
-        return value in _FIVE_TIER_CLASSES
+        return value != "unknown" and value in _FIVE_TIER_CLASSES
     if role == "inquiry_row":
         return bool(_DATE_TOKEN_RE.search(value) and any(marker in value for marker in _VALID_INQUIRY_REASONS))
     return bool(value)
@@ -544,10 +629,14 @@ def _normalize_role(value: str, role: str) -> str:
         return _normalize_nonnegative_integer(value, allow_placeholder=True)
     if role == "institution_name":
         return normalize_institution_name(value)
+    if role == "employer_name":
+        return normalize_institution_name(value)
     if role == "repayment_status":
         return _plain_text(value).upper()
     if role == "account_type_label":
         return _normalize_business_enum(value, _ACCOUNT_TYPE_LABELS)
+    if role == "summary_business_category":
+        return _normalize_summary_business_category(value)
     if role == "account_state":
         return _normalize_business_enum(value, _ACCOUNT_STATES)
     if role == "account_status_code":
@@ -589,6 +678,8 @@ def _summary_cell_role(value: Mapping[str, Any]) -> str | None:
         return None
     if "账户类型" in label:
         return "account_type_label"
+    if "业务类型" in label or "业务类别" in label:
+        return "summary_business_category"
     if any(marker in label for marker in ("金额", "余额", "额度", "总额", "本金")):
         return "amount_or_placeholder"
     if any(marker in label for marker in ("账户数", "月份数", "月数", "笔数", "次数", "机构数", "记录数")):
@@ -610,6 +701,22 @@ def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
         return _summary_cell_role(owner)
     if key == "reason" and any(name in owner for name in ("inquiry_date", "inquiry_type")):
         return "inquiry_reason"
+    if key == "business_type" and any(
+        name in owner
+        for name in (
+            "account_id",
+            "account_number",
+            "credit_limit",
+            "loan_amount",
+            "balance",
+            "institution_name",
+        )
+    ):
+        return "account_business_type"
+    if key == "status_code" and any(
+        name in owner for name in ("performance_month", "year", "month")
+    ):
+        return "repayment_status"
     role = _FIELD_ROLES.get(key)
     if role:
         return role
@@ -841,6 +948,10 @@ class PersonalDetailOCRCorrectionOverlay:
                 if isinstance(item.get("bbox"), (list, tuple))
                 and len(item["bbox"]) == 4
                 and int(item.get("logical_page") or item.get("page") or 0) > 0
+                and (
+                    item.get("geometry_scope") == "cell"
+                    or item.get("binding") == "canonical_field_slot"
+                )
             ),
             None,
         )
@@ -960,9 +1071,11 @@ class PersonalDetailOCRCorrectionOverlay:
 
     def correct_business_candidates(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
         corrected = deepcopy(dict(payload))
+        # Institution names are individualized values.  Repetition elsewhere
+        # in the report is not evidence for this cell; only the same canonical
+        # field slot on the one-shot page observation may correct it.
         self._walk(corrected, parent="", refs=(), stage=stage)
         self._enforce_cross_field_contracts(corrected, stage=stage)
-        self._apply_institution_consensus(corrected)
         self._promote_account_identifier_candidates(corrected)
         return corrected
 
@@ -974,47 +1087,81 @@ class PersonalDetailOCRCorrectionOverlay:
 
     def _enforce_cross_field_contracts(self, payload: dict[str, Any], *, stage: str) -> None:
         """Withhold individually valid values that violate the dataset schema."""
-        for index, record in enumerate(payload.get("credit_lines") or [], start=1):
+        for index, record in enumerate(payload.get("credit_accounts") or [], start=1):
             if not isinstance(record, dict):
                 continue
-            pools = [record]
-            if isinstance(record.get("normalized"), dict):
-                pools.append(record["normalized"])
-            original: Any | None = None
-            for pool in pools:
-                try:
-                    total_limit = Decimal(str(pool.get("total_limit")))
-                    used_limit = Decimal(str(pool.get("used_limit")))
-                except (InvalidOperation, TypeError, ValueError):
-                    continue
-                if total_limit < 0 or used_limit < 0 or used_limit <= total_limit:
-                    continue
-                if original is None:
-                    original = pool.get("used_limit")
-                pool["used_limit"] = None
-                if "used_limit_status" in pool:
-                    pool["used_limit_status"] = "unknown"
-            if original is None:
+            values = record.get("normalized") if isinstance(record.get("normalized"), dict) else record
+            if values.get("account_identifier") not in (None, ""):
                 continue
-            refs = _source_refs(record.get("source_refs"))
-            record_id = str(record.get("record_id") or record.get("credit_line_id") or f"row:{index}")
+            refs_by_field = record.get("source_refs_by_field")
+            field_refs = (
+                _source_refs(refs_by_field.get("account_identifier"))
+                if isinstance(refs_by_field, Mapping)
+                else ()
+            )
+            cell_refs = _source_refs(record.get("source_cell_refs"))
+            field_refs = field_refs or tuple(
+                ref
+                for ref in cell_refs
+                if not ref.get("field_name") or ref.get("field_name") == "account_identifier"
+            ) or _source_refs(record.get("source_refs"))
+            record_id = str(
+                values.get("account_id")
+                or record.get("record_id")
+                or f"credit_accounts:{index}"
+            )
             self._audit_cell(
                 stage=stage,
-                path=f"credit_lines[{record_id}].used_limit",
-                role="amount",
-                dataset_name="credit_lines",
+                path=f"credit_accounts[{record_id}].account_identifier",
+                role="account_identifier",
+                dataset_name="credit_accounts",
                 record_id=record_id,
-                field_name="used_limit",
-                value=original,
-                refs=refs,
+                field_name="account_identifier",
+                value=None,
+                refs=field_refs,
                 valid=False,
-                normalized_value_withheld=True,
                 reason_codes=(
-                    "cross_field_contract_failed",
-                    "used_limit_exceeds_total_limit",
-                    "normalized_value_withheld",
+                    "required_field_missing",
+                    "canonical_account_identifier_unresolved",
+                    "preserved_unknown_value",
                 ),
             )
+        for index, record in enumerate(payload.get("repayment_records") or [], start=1):
+            if not isinstance(record, dict):
+                continue
+            values = record.get("normalized") if isinstance(record.get("normalized"), dict) else record
+            status = str(values.get("status") or values.get("status_code") or "").strip()
+            if status not in {"1", "2", "3", "4", "5", "6", "7"}:
+                continue
+            if values.get("overdue_amount") not in (None, ""):
+                continue
+            refs = _source_refs(record.get("source_cell_refs")) or _source_refs(record.get("source_refs"))
+            amount_refs = tuple(ref for ref in refs if ref.get("field_name") == "overdue_amount") or refs
+            record_id = str(
+                record.get("repayment_id")
+                or record.get("record_id")
+                or f"repayment_records:{index}"
+            )
+            self._audit_cell(
+                stage=stage,
+                path=f"repayment_records[{record_id}].overdue_amount",
+                role="amount",
+                dataset_name="repayment_records",
+                record_id=record_id,
+                field_name="overdue_amount",
+                value=None,
+                refs=amount_refs,
+                valid=False,
+                reason_codes=(
+                    "monthly_status_amount_unresolved",
+                    "numeric_overdue_status_requires_amount_evidence",
+                    "preserved_unknown_value",
+                ),
+            )
+        # PBOC agreement cards can legitimately report 已用额度 above the
+        # printed 授信额度 (for example after limit changes or shared-limit
+        # accounting).  Column provenance, not an invented inequality, is the
+        # authority for these two independent source fields.
 
     def _walk(
         self,
@@ -1030,19 +1177,53 @@ class PersonalDetailOCRCorrectionOverlay:
             return
         if not isinstance(value, dict):
             return
-        local_refs = _source_refs(value.get("source_refs")) or refs
+        row_refs = _source_refs(value.get("source_refs"))
+        cell_refs = _source_refs(value.get("source_cell_refs"))
+        local_refs = row_refs or cell_refs or refs
+        refs_by_field = value.get("source_refs_by_field")
         confidence = value.get("confidence")
-        node_id = str(value.get("record_id") or value.get("summary_cell_id") or value.get("account_id") or "")
+        raw_node_id = (
+            value.get("record_id")
+            or value.get("summary_cell_id")
+            or next(
+                (
+                    item
+                    for key, item in value.items()
+                    if str(key).endswith("_id")
+                    and str(key) != "account_id"
+                    and item not in (None, "")
+                    and not isinstance(item, (dict, list))
+                ),
+                "",
+            )
+            or value.get("account_id")
+        )
+        node_id = str(raw_node_id or "")
         base_path = f"{parent}[{node_id}]" if node_id else str(parent or "")
         dataset_name = str(parent or "").split(".", 1)[0].split("[", 1)[0]
         for key, item in list(value.items()):
             field_path = f"{base_path}.{key}".lstrip(".")
             role = _mapping_role(value, str(key))
+            configured_field_refs = (
+                _source_refs(refs_by_field.get(str(key)))
+                if isinstance(refs_by_field, Mapping)
+                else ()
+            )
+            tagged_cell_refs = tuple(
+                ref
+                for ref in cell_refs
+                if not ref.get("field_name") or ref.get("field_name") == str(key)
+            )
+            field_refs = configured_field_refs or tagged_cell_refs or tuple(
+                ref
+                for ref in local_refs
+                if not ref.get("field_name") or ref.get("field_name") == str(key)
+            ) or local_refs
             if role and item not in (None, "") and not isinstance(item, (dict, list)):
                 updated, decision = self.correct_text(
                     item,
                     role=role,
-                    source_refs=local_refs,
+                    source_refs=field_refs,
                     confidence=float(confidence or 0.0),
                 )
                 if decision is not None:
@@ -1050,9 +1231,20 @@ class PersonalDetailOCRCorrectionOverlay:
                 final_value = value[key]
                 valid = _is_valid_for_role(str(final_value), role)
                 withhold_invalid = bool(
-                    not valid and stage == "native_business" and len(local_refs) == 1 and _cell_scoped(local_refs)
+                    not valid
+                    and (
+                        stage == "candidate_b_final_validation"
+                        or (
+                            stage == "native_business"
+                            and len(field_refs) == 1
+                            and _cell_scoped(field_refs)
+                        )
+                    )
                 )
                 if withhold_invalid:
+                    raw_values = value.setdefault("canonical_raw", {})
+                    if isinstance(raw_values, dict):
+                        raw_values.setdefault(str(key), final_value)
                     value[key] = None
                 self._audit_cell(
                     stage=stage,
@@ -1062,7 +1254,7 @@ class PersonalDetailOCRCorrectionOverlay:
                     record_id=node_id,
                     field_name=str(key),
                     value=final_value,
-                    refs=local_refs,
+                    refs=field_refs,
                     valid=valid,
                     normalized_value_withheld=withhold_invalid,
                 )
@@ -1080,7 +1272,15 @@ class PersonalDetailOCRCorrectionOverlay:
                 final_value = item["value"]
                 valid = _is_valid_for_role(str(final_value), role)
                 withhold_invalid = bool(
-                    not valid and stage == "native_business" and len(nested_refs) == 1 and _cell_scoped(nested_refs)
+                    not valid
+                    and (
+                        stage == "candidate_b_final_validation"
+                        or (
+                            stage == "native_business"
+                            and len(nested_refs) == 1
+                            and _cell_scoped(nested_refs)
+                        )
+                    )
                 )
                 if withhold_invalid:
                     item.setdefault("raw", final_value)
@@ -1099,55 +1299,6 @@ class PersonalDetailOCRCorrectionOverlay:
                 )
             if isinstance(item, (dict, list)) and str(key) not in _RAW_OR_PROVENANCE_KEYS:
                 self._walk(item, parent=field_path, refs=local_refs, stage=stage)
-
-    def _apply_institution_consensus(self, payload: dict[str, Any]) -> None:
-        fields: list[tuple[dict[str, Any], str, str]] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                for key, item in value.items():
-                    if _FIELD_ROLES.get(str(key)) == "institution_name" and isinstance(item, str) and item:
-                        fields.append((value, str(key), item))
-                    collect(item)
-
-        collect(payload)
-        counts = Counter(normalize_institution_name(item) for _owner, _key, item in fields)
-        references = [
-            name for name, count in counts.items() if count >= 1 and _is_valid_for_role(name, "institution_name")
-        ]
-        for owner, key, original in fields:
-            current = normalize_institution_name(original)
-            scored = sorted(
-                (
-                    (SequenceMatcher(None, current, candidate).ratio(), counts[candidate], candidate)
-                    for candidate in references
-                ),
-                reverse=True,
-            )
-            if not scored:
-                continue
-            best_score, best_count, best = scored[0]
-            runner_score = scored[1][0] if len(scored) > 1 else 0.0
-            if (
-                best != current
-                and best_score >= 0.94
-                and best_score - runner_score >= 0.015
-                and best_count >= counts[current]
-            ):
-                owner[key] = best
-                self._record(
-                    role="institution_name",
-                    original=original,
-                    corrected=best,
-                    method="document_internal_consensus",
-                    reason_codes=("typed_legal_suffix", "document_candidate_match", "candidate_margin"),
-                    confidence=best_score,
-                    refs=(),
-                    candidates=tuple(item[2] for item in scored[:3]),
-                )
 
     def _promote_account_identifier_candidates(self, payload: dict[str, Any]) -> None:
         accounts = payload.get("credit_accounts")

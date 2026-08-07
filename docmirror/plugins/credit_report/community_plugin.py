@@ -26,9 +26,72 @@ from typing import Any
 from docmirror.output.community_bundle import CommunityBundle
 from docmirror.plugins._base.projector import CommunityProjector, ProjectionData
 
+_PERSONAL_DETAIL_SOURCE_COMPLETE = frozenset(
+    {"observed_nonempty", "explicitly_empty", "not_applicable"}
+)
+
+
+def _apply_personal_detail_dataset_status(payload: dict[str, Any]) -> None:
+    """Make public dataset envelopes agree with the v2 source-status ledger.
+
+    Community's ordinary completeness calculation proves only that projected
+    rows were conserved during serialization.  It must not turn a source-
+    partial scanned dataset into ``complete`` merely because all rows that
+    reached the projector were written successfully.
+    """
+
+    datasets = [item for item in payload.get("datasets") or () if isinstance(item, dict)]
+    status_dataset = next(
+        (item for item in datasets if str(item.get("name") or "") == "dataset_status"),
+        None,
+    )
+    if status_dataset is None:
+        return
+    status_by_name: dict[str, dict[str, Any]] = {}
+    for wrapper in status_dataset.get("rows") or ():
+        if not isinstance(wrapper, dict):
+            continue
+        values = wrapper.get("normalized") if isinstance(wrapper.get("normalized"), dict) else wrapper
+        name = str(values.get("dataset_name") or "")
+        if name:
+            status_by_name[name] = values
+
+    for dataset in datasets:
+        name = str(dataset.get("name") or "")
+        control = status_by_name.get(name)
+        if control is None:
+            continue
+        presence = str(control.get("presence_status") or "unknown")
+        source_complete = presence in _PERSONAL_DETAIL_SOURCE_COMPLETE
+        dataset["status"] = "complete" if source_complete else "partial"
+        emitted = int(dataset.get("row_count") or len(dataset.get("rows") or ()))
+        expected_raw = control.get("expected_row_count")
+        expected = (
+            int(expected_raw)
+            if isinstance(expected_raw, (int, float)) and not isinstance(expected_raw, bool)
+            else None
+        )
+        completeness = dict(dataset.get("completeness") or {})
+        completeness.update(
+            {
+                "expected_row_count": expected,
+                "emitted_row_count": emitted,
+                "omitted_row_count": max(expected - emitted, 0) if expected is not None else None,
+                "verified": bool(source_complete),
+                "basis": f"personal_detail_dataset_status:{presence}",
+            }
+        )
+        dataset["completeness"] = completeness
+
 
 class _CreditReportCommunityBundle(CommunityBundle):
     """Publish compact Community JSON without weakening rich semantic bindings."""
+
+    @staticmethod
+    def _is_enterprise_semantic(payload: dict[str, Any]) -> bool:
+        domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
+        facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
+        return facts.get("report_subtype") == "enterprise"
 
     def semantic_payload(self) -> dict[str, Any]:
         payload = super().semantic_payload()
@@ -61,11 +124,19 @@ class _CreditReportCommunityBundle(CommunityBundle):
     def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
         from docmirror.plugins.credit_report.projection import _compact_public_datasets
 
-        payload = super().json_payload(semantic)
-        semantic_payload = self.domain if isinstance(self.domain, dict) else {}
-        domain = semantic_payload if isinstance(semantic_payload.get("facts"), dict) else {}
+        semantic_payload = semantic or self.semantic_payload()
+        payload = super().json_payload(semantic_payload)
+        domain = (
+            semantic_payload.get("domain")
+            if isinstance(semantic_payload.get("domain"), dict)
+            else {}
+        )
         facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
         enterprise = facts.get("report_subtype") == "enterprise"
+        scanned_personal_detail = bool(
+            facts.get("report_subtype") == "personal_detailed"
+            and facts.get("content_mode") in {"scanned_ocr", "mixed"}
+        )
         extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
         enterprise_completeness = (
             extensions.get("enterprise_dataset_completeness", {}) if enterprise else {}
@@ -78,9 +149,6 @@ class _CreditReportCommunityBundle(CommunityBundle):
             dataset["rows"] = _compact_public_datasets({dataset_id: records})[dataset_id]
             if not enterprise:
                 continue
-            for record in dataset["rows"]:
-                record["raw"] = {}
-                record["canonical_raw"] = {}
             details = enterprise_completeness.get(str(dataset.get("name") or ""))
             if not isinstance(details, dict):
                 continue
@@ -95,7 +163,44 @@ class _CreditReportCommunityBundle(CommunityBundle):
                 )
                 if key in details
             }
+        if enterprise:
+            from docmirror.plugins.credit_report.enterprise_native.projector import (
+                project_enterprise_community_json,
+            )
+
+            payload = project_enterprise_community_json(payload)
+        elif scanned_personal_detail:
+            _apply_personal_detail_dataset_status(payload)
         return payload
+
+    def _enterprise_artifact_semantic(
+        self,
+        semantic: dict[str, Any],
+    ) -> dict[str, Any]:
+        from docmirror.plugins.credit_report.enterprise_native.projector import (
+            project_enterprise_artifact_semantic,
+        )
+
+        return project_enterprise_artifact_semantic(
+            semantic,
+            self.json_payload(semantic),
+        )
+
+    def render_dataset_csvs(self, semantic: dict[str, Any] | None = None) -> dict[str, str]:
+        semantic_payload = semantic or self.semantic_payload()
+        if not self._is_enterprise_semantic(semantic_payload):
+            return super().render_dataset_csvs(semantic_payload)
+        return super().render_dataset_csvs(
+            self._enterprise_artifact_semantic(semantic_payload)
+        )
+
+    def render_audit_csv(self, semantic: dict[str, Any] | None = None) -> str:
+        semantic_payload = semantic or self.semantic_payload()
+        if not self._is_enterprise_semantic(semantic_payload):
+            return super().render_audit_csv(semantic_payload)
+        return super().render_audit_csv(
+            self._enterprise_artifact_semantic(semantic_payload)
+        )
 
 
 class CreditReportPlugin(CommunityProjector):
@@ -132,12 +237,19 @@ class CreditReportPlugin(CommunityProjector):
             detect_credit_report_subtype,
         )
 
-        if detect_credit_report_subtype(parse_result, text) == "enterprise":
+        report_subtype = detect_credit_report_subtype(parse_result, text)
+        if report_subtype == "enterprise":
             from docmirror.plugins.credit_report.enterprise_native.projector import (
                 derive_enterprise_projection,
             )
 
             return derive_enterprise_projection(self, parse_result, text)
+        if report_subtype == "personal_brief":
+            from docmirror.plugins.credit_report.personal_brief_native.projector import (
+                derive_personal_brief_projection,
+            )
+
+            return derive_personal_brief_projection(self, parse_result, text)
         from docmirror.plugins.credit_report.projection import derive_credit_report_projection
 
         return derive_credit_report_projection(self, parse_result, text)

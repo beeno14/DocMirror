@@ -65,6 +65,46 @@ def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -
         "新疆样例银行股份有限公司乌鲁木齐分行"
     )
     assert normalize_institution_name("云南省农村信用社联合社") == "云南省农村信用社联合社"
+    assert normalize_institution_name(
+        "开立日期账户授信额度共享授信额度币种业务种类担保方式中国建设银行股份有限公司"
+    ) == "中国建设银行股份有限公司"
+
+
+def test_institution_correction_removes_isolated_legal_suffix_debris() -> None:
+    assert normalize_institution_name("S 福建海峡粮油购销有限公司") == "福建海峡粮油购销有限公司"
+    assert normalize_institution_name("限 福建省国资粮食发展有限公司") == "福建省国资粮食发展有限公司"
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    corrected = overlay.correct_business_candidates(
+        {
+            "public_records": [
+                {
+                    "public_record_id": "housing:1",
+                    "employer": "限 福建省国资粮食发展有限公司",
+                    "source_refs": [
+                        {
+                            "logical_page": 13,
+                            "bbox": [10, 20, 100, 40],
+                            "geometry_scope": "cell",
+                            "field_name": "employer",
+                        }
+                    ],
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+    assert corrected["public_records"][0]["employer"] == "福建省国资粮食发展有限公司"
+
+
+def test_institution_correction_preserves_legitimate_leading_legal_name_glyphs() -> None:
+    assert normalize_institution_name("苏银凯基消费金融 有限公司") == (
+        "苏银凯基消费金融有限公司"
+    )
+    assert normalize_institution_name("中信消费金融有限公司") == "中信消费金融有限公司"
+    assert normalize_institution_name("福州奇富网络小额贷款有限公司") == (
+        "福州奇富网络小额贷款有限公司"
+    )
+    assert normalize_institution_name("德州银行股份有限公司") == "德州银行股份有限公司"
 
 
 def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() -> None:
@@ -124,7 +164,29 @@ def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() 
     assert audit["cell_anomalies"][0]["normalized_value_withheld"] is True
 
 
-def test_credit_line_cross_field_contract_withholds_impossible_used_limit() -> None:
+def test_summary_business_category_correction_is_field_scoped() -> None:
+    overlay = _overlay()
+    corrected = overlay.correct_business_candidates(
+        {
+            "personal_detail_summary_cells": [
+                {"record_id": "summary:1", "column_label": "业务类型", "value": "其馆类贷款"},
+                {"record_id": "summary:2", "column_label": "业务类型", "value": "贯记卡"},
+                {"record_id": "summary:3", "column_label": "业务类型", "value": "2 贷记卡 n"},
+            ],
+            "other_rows": [{"record_id": "other:1", "value": "贯记卡"}],
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    assert [row["value"] for row in corrected["personal_detail_summary_cells"]] == [
+        "其他类贷款",
+        "贷记卡",
+        "贷记卡",
+    ]
+    assert corrected["other_rows"][0]["value"] == "贯记卡"
+
+
+def test_credit_line_contract_does_not_invent_used_not_above_agreement_limit_rule() -> None:
     overlay = _overlay()
 
     corrected = overlay.correct_business_candidates(
@@ -146,13 +208,94 @@ def test_credit_line_cross_field_contract_withholds_impossible_used_limit() -> N
         stage="native_business",
     )
 
-    assert corrected["credit_lines"][0]["used_limit"] is None
-    assert corrected["credit_lines"][0]["normalized"]["used_limit"] is None
-    assert corrected["credit_lines"][0]["normalized"]["used_limit_status"] == "unknown"
-    anomaly = next(item for item in overlay.audit()["cell_anomalies"] if item["field_name"] == "used_limit")
-    assert anomaly["value"] == "108000"
-    assert "used_limit_exceeds_total_limit" in anomaly["reason_codes"]
+    assert corrected["credit_lines"][0]["used_limit"] == 108000
+    assert corrected["credit_lines"][0]["normalized"]["used_limit"] == "108000"
+    assert corrected["credit_lines"][0]["normalized"]["used_limit_status"] == "reported"
+    assert not any(
+        item["field_name"] == "used_limit"
+        and "used_limit_exceeds_total_limit" in item["reason_codes"]
+        for item in overlay.audit()["cell_anomalies"]
+    )
+
+
+def test_unknown_monthly_status_is_repair_eligible_and_reported_if_unresolved() -> None:
+    overlay = _overlay()
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "repayment_records": [
+                {
+                    "repayment_id": "repayment:1",
+                    "year": 2024,
+                    "month": 1,
+                    "status": "unknown",
+                    "source_refs_by_field": {
+                        "status": [
+                            {
+                                "logical_page": 3,
+                                "bbox": [10, 10, 20, 20],
+                                "geometry_scope": "cell",
+                                "binding": "canonical_field_slot",
+                            }
+                        ]
+                    },
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    assert corrected["repayment_records"][0]["status"] is None
+    anomaly = next(item for item in overlay.audit()["cell_anomalies"] if item["field_name"] == "status")
+    assert anomaly["value"] == "unknown"
     assert anomaly["normalized_value_withheld"] is True
+
+
+def test_missing_account_identifier_is_an_explicit_required_field_anomaly() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "credit_accounts": [
+            {
+                "account_id": "credit_account:loan:6",
+                "account_identifier": None,
+                "source_cell_refs": [
+                    {
+                        "logical_page": 4,
+                        "bbox": [10, 20, 100, 40],
+                        "geometry_scope": "cell",
+                        "field_name": "account_identifier",
+                    }
+                ],
+            }
+        ]
+    }
+
+    overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
+
+    anomaly = overlay.audit()["cell_anomalies"][0]
+    assert anomaly["dataset_name"] == "credit_accounts"
+    assert anomaly["record_id"] == "credit_account:loan:6"
+    assert anomaly["field_name"] == "account_identifier"
+    assert anomaly["reason_codes"] == (
+        "required_field_missing",
+        "canonical_account_identifier_unresolved",
+        "preserved_unknown_value",
+    )
+    assert anomaly["source_refs"][0]["geometry_scope"] == "cell"
+
+
+def test_anonymous_correction_observation_does_not_invent_none_record_id() -> None:
+    overlay = _overlay()
+
+    overlay._walk(
+        {"total_limit": "not-an-amount"},
+        parent="credit_lines",
+        refs=(),
+        stage="candidate_b_final_validation",
+    )
+
+    anomaly = overlay.audit()["cell_anomalies"][0]
+    assert anomaly["record_id"] == ""
 
 
 def test_count_roles_remove_only_canonical_display_units() -> None:
@@ -171,9 +314,10 @@ def test_account_open_date_accepts_pboc_month_precision() -> None:
     overlay = _overlay()
     payload = {
         "credit_accounts": [
-            {
-                "record_id": "account:1",
-                "open_date": "2018.10",
+                {
+                    "record_id": "account:1",
+                    "account_identifier": "ACCOUNT0001",
+                    "open_date": "2018.10",
                 "source_refs": [{"logical_page": 2, "bbox": [1, 2, 3, 4]}],
             }
         ]
@@ -470,7 +614,14 @@ def test_schema_role_repair_does_not_fall_back_to_crop_ocr() -> None:
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
-        source_refs=({"logical_page": 1, "bbox": [1, 1, 20, 10]},),
+        source_refs=(
+            {
+                "logical_page": 1,
+                "bbox": [1, 1, 20, 10],
+                "geometry_scope": "cell",
+                "binding": "canonical_field_slot",
+            },
+        ),
     )
 
     assert corrected == "1101051949123100?X"
@@ -500,7 +651,14 @@ def test_schema_assigned_field_uses_only_coordinator_installed_page_evidence() -
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
-        source_refs=({"logical_page": 1, "bbox": [1, 1, 20, 10]},),
+        source_refs=(
+            {
+                "logical_page": 1,
+                "bbox": [1, 1, 20, 10],
+                "geometry_scope": "cell",
+                "binding": "canonical_field_slot",
+            },
+        ),
     )
 
     assert corrected == "11010519491231002X"
@@ -600,3 +758,70 @@ def test_repayment_linking_uses_global_predecessor_and_collapses_duplicate_month
     assert linked[0]["account_identifier"] == "ACCOUNT0001"
     assert linked[0]["status"] == "N"
     assert linked[0]["audit"]["duplicate_month_candidates"] == 2
+
+
+def test_final_validation_withholds_cross_cell_employer_text_and_preserves_raw_value() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "employment_records": [
+            {
+                "employment_id": "employment:1",
+                "employer": "2024-01-01 示例公司 13800138000",
+                "source_refs": [
+                    {
+                        "logical_page": 2,
+                        "bbox": [10, 20, 100, 40],
+                        "geometry_scope": "cell",
+                        "field_name": "employer",
+                    }
+                ],
+            }
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
+    record = corrected["employment_records"][0]
+
+    assert record["employer"] is None
+    assert record["canonical_raw"]["employer"] == "2024-01-01 示例公司 13800138000"
+    assert overlay.audit()["cell_anomalies"][0]["field_name"] == "employer"
+
+
+def test_document_consensus_never_rewrites_valid_individual_institution_names() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "credit_lines": [
+            {"credit_line_id": "line:1", "institution": "中国银行股份有限公司"},
+            {"credit_line_id": "line:2", "institution": "中国银行股份有限公司上海分行"},
+            {"credit_line_id": "line:3", "institution": "中国银行股份有限公司上海分行"},
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
+
+    assert corrected["credit_lines"][0]["institution"] == "中国银行股份有限公司"
+
+
+def test_explicit_unknown_monthly_status_is_withheld_and_reported() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "repayment_records": [
+            {
+                "repayment_id": "grid:1:2024-01",
+                "year": 2024,
+                "month": 1,
+                "status": "unknown",
+                "overdue_amount": None,
+            }
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
+
+    assert corrected["repayment_records"][0]["status"] is None
+    anomaly = next(
+        item for item in overlay.audit()["cell_anomalies"]
+        if item["field_name"] == "status"
+    )
+    assert anomaly["value"] == "unknown"
+    assert anomaly["normalized_value_withheld"] is True

@@ -438,6 +438,7 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         if (values := _record_values(row)).get("summary_record_id")
     }
     dimensions: dict[tuple[str, int], tuple[str, str]] = {}
+    preferred_dimensions: dict[tuple[str, int], tuple[str, str]] = {}
     for cell in sorted(
         cells,
         key=lambda item: (
@@ -447,11 +448,15 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         ),
     ):
         key = (str(cell.get("summary_record_id") or ""), int(cell.get("row_index") or 0))
+        label = str(cell.get("column_label") or "").strip()
+        if any(marker in label for marker in ("账户类型", "业务类型", "业务类别", "责任类型")):
+            preferred_dimensions.setdefault(key, (label, str(cell.get("value") or "").strip()))
         if key not in dimensions and str(cell.get("value") or "").strip() not in _PLACEHOLDERS:
             dimensions[key] = (
-                str(cell.get("column_label") or "").strip(),
+                label,
                 str(cell.get("value") or "").strip(),
             )
+    dimensions.update(preferred_dimensions)
 
     metrics: list[dict[str, Any]] = []
     for index, source_row in enumerate(datasets.get("personal_detail_summary_cells") or [], start=1):
@@ -556,6 +561,10 @@ def project_typed_public_records(
                 continue
             if value not in (None, ""):
                 projected[target] = value
+            elif candidates.get(f"{key}_status") == "not_reported":
+                # Preserve the canonical distinction between an explicitly
+                # printed "--" and a field that silently disappeared.
+                projected[target] = None
         if any(key.endswith("_amount") or key == "monthly_contribution" for key in projected):
             projected.setdefault("reporting_amount_currency", reporting_currency)
             projected.setdefault("reporting_amount_unit", reporting_amount_unit)
@@ -735,13 +744,26 @@ def _apply_source_completeness_ledger(
 
     inquiry_rows = datasets.get("inquiry_records") or ()
     inquiry_observed = sum(isinstance(row, Mapping) for row in inquiry_rows)
-    inquiry_expected, inquiry_contiguous = _sequence_evidence(inquiry_rows, grouped=True)
+    emitted_inquiry_expected, inquiry_contiguous = _sequence_evidence(inquiry_rows, grouped=True)
+    source_inquiry_expected = ledger_map.get("inquiry_records")
+    inquiry_expected = max(
+        emitted_inquiry_expected,
+        int(source_inquiry_expected)
+        if isinstance(source_inquiry_expected, int) and not isinstance(source_inquiry_expected, bool)
+        else 0,
+    )
     checks["inquiry_records"] = (inquiry_observed, inquiry_expected, inquiry_contiguous)
 
     account_observed = int(final_dataset_counts.get("credit_accounts") or 0)
     account_expected = ledger_map.get("credit_accounts")
     if isinstance(account_expected, int) and not isinstance(account_expected, bool):
         checks["credit_accounts"] = (account_observed, account_expected, True)
+
+    agreement_rows = datasets.get("credit_lines") or ()
+    agreement_observed = sum(isinstance(row, Mapping) for row in agreement_rows)
+    agreement_expected = ledger_map.get("credit_agreements")
+    if isinstance(agreement_expected, int) and not isinstance(agreement_expected, bool):
+        checks["credit_lines"] = (agreement_observed, agreement_expected, True)
 
     existing_ids = {
         str(row.get("extraction_issue_id") or "")
@@ -761,7 +783,26 @@ def _apply_source_completeness_ledger(
             parser_stage="source_completeness_ledger",
             target_dataset=dataset_name,
             observed_value={"observed_row_count": observed},
-            candidate_value={"source_expected_row_count": expected},
+            candidate_value={
+                "source_expected_row_count": expected,
+                **(
+                    {
+                        "source_sequence_endpoints": ledger_map.get(
+                            "inquiry_sequence_endpoints", {}
+                        ),
+                        "unclassified_sequence_endpoints": ledger_map.get(
+                            "inquiry_unclassified_sequence_endpoints", []
+                        ),
+                    }
+                    if dataset_name == "inquiry_records"
+                    else {}
+                ),
+            },
+            source_refs=(
+                (ledger_map.get("source_refs") or {}).get(dataset_name) or ()
+                if isinstance(ledger_map.get("source_refs"), Mapping)
+                else ()
+            ),
             reason_codes=("independent_source_ledger", "dataset_incomplete", "no_missing_row_invented"),
         )
         if issue["extraction_issue_id"] not in existing_ids:
@@ -842,9 +883,25 @@ def prepare_personal_detail_source_collections(
         observation_rows.append(row)
     datasets["personal_detail_field_observations"] = observation_rows
 
-    summary_metrics = _summary_metric_contract(datasets)
+    all_summary_metrics = _summary_metric_contract(datasets)
+    summary_metrics = [
+        row
+        for row in all_summary_metrics
+        if str(row.get("mapping_status") or "") == "mapped"
+    ]
     if summary_metrics:
         datasets["personal_detail_credit_summary_metrics"] = summary_metrics
+    else:
+        datasets.pop("personal_detail_credit_summary_metrics", None)
+    if len(summary_metrics) < len(all_summary_metrics):
+        states = facts.setdefault("personal_detail_dataset_states", {})
+        if isinstance(states, dict):
+            states["personal_detail_credit_summary_metrics"] = {
+                "presence_status": "partial",
+                "reason": "unmapped_summary_cells_quarantined",
+                "expected_row_count": len(all_summary_metrics),
+                "observed_row_count": len(summary_metrics),
+            }
 
     reporting_currency, reporting_amount_unit = _reporting_context(datasets)
     public_records = datasets.get("public_records") or auxiliary.get("public_records") or []

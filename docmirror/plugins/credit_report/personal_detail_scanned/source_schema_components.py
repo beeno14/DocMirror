@@ -557,6 +557,7 @@ def personal_detail_source_dictionary_components() -> dict[str, Any]:
             "amount_unit": {"yuan": "元"},
             "repayment_status_code": {
                 "*": "本月没有还款历史",
+                "/": "账户尚未开立",
                 "N": "正常",
                 "1": "逾期1至30天",
                 "2": "逾期31至60天",

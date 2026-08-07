@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Any, cast
 
 from docmirror.ocr.micro_grid.cell_recognition import (
@@ -155,6 +157,40 @@ def _normalize_amount_text(text: str) -> str:
     return str(normalized)
 
 
+def _repayment_business_signature(record: dict[str, Any]) -> tuple[str, str | None]:
+    """Return the normalized business values that define one monthly result."""
+    status = str(record.get("status_code") or record.get("status") or "").strip().upper()
+    raw_amount = record.get("overdue_amount")
+    if raw_amount in (None, ""):
+        raw_amount = record.get("status_amount")
+    if raw_amount in (None, ""):
+        amount = None
+    else:
+        compact = re.sub(r"[,，\s]", "", str(raw_amount))
+        try:
+            amount = format(Decimal(compact).normalize(), "f")
+            if amount == "-0":
+                amount = "0"
+        except (InvalidOperation, TypeError, ValueError):
+            amount = f"raw:{compact}"
+    return status, amount
+
+
+def _merged_source_cell_refs(*records: dict[str, Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    markers: set[str] = set()
+    for record in records:
+        for ref in record.get("source_cell_refs") or ():
+            if not isinstance(ref, dict):
+                continue
+            marker = repr(sorted(ref.items()))
+            if marker in markers:
+                continue
+            markers.add(marker)
+            refs.append(dict(ref))
+    return refs
+
+
 def _strong_visual_status(recognition: Any) -> bool:
     """Return whether crop evidence is strong enough to override row OCR."""
     if not str(getattr(recognition, "text", "") or ""):
@@ -182,6 +218,190 @@ def _strong_visual_status(recognition: Any) -> bool:
         ):
             return True
     return False
+
+
+@lru_cache(maxsize=1)
+def _static_status_reference_bank() -> tuple[Any, tuple[str, ...]]:
+    """Build a compact OCR-free status bank from OpenCV's bundled fonts."""
+
+    try:
+        import cv2
+        import numpy as np
+
+        labels: list[str] = []
+        vectors: list[Any] = []
+        characters = "N*HMBAZGCHX0123456789#+./"
+        fonts = (
+            cv2.FONT_HERSHEY_SIMPLEX,
+            cv2.FONT_HERSHEY_PLAIN,
+            cv2.FONT_HERSHEY_DUPLEX,
+            cv2.FONT_HERSHEY_COMPLEX,
+            cv2.FONT_HERSHEY_TRIPLEX,
+            cv2.FONT_HERSHEY_COMPLEX_SMALL,
+            cv2.FONT_HERSHEY_SCRIPT_SIMPLEX,
+            cv2.FONT_HERSHEY_SCRIPT_COMPLEX,
+        )
+        for character in characters:
+            for font in fonts:
+                for font_scale in (0.72, 0.98):
+                    for thickness in (1, 2):
+                        image = np.full((80, 80), 255, dtype=np.uint8)
+                        (width, height), _baseline = cv2.getTextSize(
+                            character, font, font_scale, thickness
+                        )
+                        cv2.putText(
+                            image,
+                            character,
+                            ((80 - width) // 2, (80 + height) // 2),
+                            font,
+                            font_scale,
+                            0,
+                            thickness,
+                            cv2.LINE_AA,
+                        )
+                        template = _normalize_static_reference_glyph(image, np=np, cv2=cv2)
+                        vector = _static_status_feature_vector(template, np=np, cv2=cv2)
+                        if vector is None:
+                            continue
+                        labels.append(character)
+                        vectors.append(vector)
+        if not vectors:
+            return None, ()
+        return np.stack(vectors), tuple(labels)
+    except Exception:
+        return None, ()
+
+
+def _normalize_static_reference_glyph(image: Any, *, np: Any, cv2: Any) -> Any | None:
+    ys, xs = np.where(image < 128)
+    if not len(xs):
+        return None
+    glyph = image[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+    ink_full = (glyph < 128).astype(np.float32)
+    dense_cols = np.where(
+        ink_full.mean(axis=0) >= max(0.12, 2.0 / max(ink_full.shape[0], 1))
+    )[0]
+    dense_rows = np.where(
+        ink_full.mean(axis=1) >= max(0.12, 2.0 / max(ink_full.shape[1], 1))
+    )[0]
+    if len(dense_cols) and len(dense_rows):
+        x0 = max(0, int(dense_cols.min()) - 1)
+        x1 = min(glyph.shape[1], int(dense_cols.max()) + 2)
+        y0 = max(0, int(dense_rows.min()) - 1)
+        y1 = min(glyph.shape[0], int(dense_rows.max()) + 2)
+        glyph = glyph[y0:y1, x0:x1]
+    height, width = glyph.shape[:2]
+    scale = min(22.0 / max(width, 1), 22.0 / max(height, 1))
+    resized = cv2.resize(
+        glyph,
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_NEAREST,
+    )
+    canvas = np.zeros((32, 32), dtype=np.float32)
+    ink = (resized < 128).astype(np.float32)
+    y0 = (32 - ink.shape[0]) // 2
+    x0 = (32 - ink.shape[1]) // 2
+    canvas[y0 : y0 + ink.shape[0], x0 : x0 + ink.shape[1]] = ink
+    return canvas
+
+
+def _static_status_feature_vector(template: Any, *, np: Any, cv2: Any) -> Any | None:
+    if template is None:
+        return None
+    normalized = np.asarray(template, dtype=np.float32)
+    if normalized.size == 0:
+        return None
+    blurred = cv2.GaussianBlur(normalized, (3, 3), 0.7)
+    compact = cv2.resize(blurred, (16, 16), interpolation=cv2.INTER_AREA)
+    vector = compact.reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else None
+
+
+def _static_status_reference_scores(template: Any, *, np: Any) -> dict[str, float]:
+    import cv2
+
+    bank, labels = _static_status_reference_bank()
+    if bank is None or not labels:
+        return {}
+    vector = _static_status_feature_vector(template, np=np, cv2=cv2)
+    if vector is None or vector.size != int(bank.shape[1]):
+        return {}
+    similarities = bank @ vector
+    scores: dict[str, float] = {}
+    for index, label in enumerate(labels):
+        scores[label] = max(scores.get(label, 0.0), float(similarities[index]))
+    return scores
+
+
+def _static_n_star_glyph_classification(
+    template: Any,
+) -> tuple[str, float, dict[str, Any]] | None:
+    """Classify the two OCR-confusable zero-status glyphs without invoking OCR.
+
+    PBOC monthly grids use a tall two-stem ``N`` and a centre-heavy asterisk.
+    The normalized bitmap is produced from the already rendered page crop, so
+    this check is deterministic, field-specific, and CPU-cheap.  Deliberately
+    ambiguous shapes are not guessed.
+    """
+
+    try:
+        import cv2
+        import numpy as np
+
+        ink = np.asarray(template, dtype=np.float32) >= 0.5
+        ys, xs = np.where(ink)
+        if not len(xs):
+            return None
+        compact = ink[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
+        height, width = compact.shape[:2]
+        if height < 6 or width < 5:
+            return None
+        ink_density = float(compact.mean())
+        reference_scores = _static_status_reference_scores(template, np=np)
+        ranked = sorted(
+            ((score, label) for label, score in reference_scores.items()),
+            reverse=True,
+        )
+        if not ranked:
+            return None
+        winning_score, winning_label = ranked[0]
+        competitor_score = ranked[1][0] if len(ranked) > 1 else 0.0
+        margin = winning_score - competitor_score
+        contours = cv2.findContours(
+            compact.astype(np.uint8) * 255,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )[-2]
+        solidity = 1.0
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            contour_area = float(cv2.contourArea(contour))
+            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+            if hull_area > 0:
+                solidity = contour_area / hull_area
+        audit: dict[str, Any] = {
+            "ink_density": round(ink_density, 4),
+            "reference_winner": winning_label,
+            "reference_similarity": round(winning_score, 4),
+            "reference_margin": round(margin, 4),
+            "solidity": round(solidity, 4),
+            "classification_basis": "conservative_reference_bank",
+        }
+        if winning_label == "N" and winning_score >= 0.90 and margin >= 0.020:
+            confidence = min(0.98, 0.68 + winning_score * 0.3)
+            return "N", confidence, audit
+        if (
+            winning_label == "*"
+            and winning_score >= 0.90
+            and margin >= 0.030
+            and solidity <= 0.75
+        ):
+            confidence = min(0.98, 0.68 + winning_score * 0.3)
+            return "*", confidence, audit
+    except Exception:
+        return None
+    return None
 
 
 def _neighbor_status_fallback(
@@ -225,14 +445,41 @@ def _find_anchor(lines: list[dict[str, Any]]) -> tuple[dict[str, Any], tuple[int
     return None
 
 
-def _nearest_year_lines(lines: list[dict[str, Any]], anchor: dict[str, Any]) -> list[dict[str, Any]]:
+def _nearest_year_lines(
+    lines: list[dict[str, Any]],
+    anchor: dict[str, Any],
+    *,
+    start_year: int,
+    end_year: int,
+) -> list[dict[str, Any]]:
     ax0, ay0, ax1, ay1 = anchor["bbox"]
-    candidates = [
+    expected_years = set(range(start_year, end_year + 1))
+    candidates = sorted(
+        [
         line
         for line in lines
-        if _YEAR_RE.match(line["text"].strip()) and line["bbox"][1] > ay1 and line["bbox"][1] < ay1 + 300
-    ]
-    return candidates[:4]
+        if (match := _YEAR_RE.match(line["text"].strip()))
+        and int(match.group(0)) in expected_years
+        and line["bbox"][1] > ay1
+        and line["bbox"][1] < ay1 + 300
+        ],
+        key=lambda line: (float(line["bbox"][1]), float(line["bbox"][0])),
+    )
+    # Select one physical row for each year in the printed date range.  The
+    # former four-row slice could silently include an unrelated year or omit a
+    # valid row when OCR duplicated a year label.
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for line in candidates:
+        match = _YEAR_RE.match(line["text"].strip())
+        if match is None:
+            continue
+        year = int(match.group(0))
+        if year in seen:
+            continue
+        seen.add(year)
+        selected.append(line)
+    return selected
 
 
 def _month_col_bands(header_line: dict[str, Any], *, n_months: int = 12) -> list[dict[str, Any]]:
@@ -271,6 +518,21 @@ def _visual_page_context(
         y0 -= shift
         y1 -= shift
     return image, (x0, y0, x1, y1), width, height, logical_page
+
+
+def _local_page_bbox(
+    bbox: BBox,
+    *,
+    logical_page: int,
+    base_page: int,
+    base_page_height: float | None,
+) -> list[float]:
+    """Undo the one-page continuation shift used by joined evidence rows."""
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    if logical_page != base_page and base_page_height:
+        y0 -= float(base_page_height)
+        y1 -= float(base_page_height)
+    return [x0, y0, x1, y1]
 
 
 def _visual_month_col_bands(
@@ -454,6 +716,7 @@ def reconstruct_repayment_micro_grid_from_lines(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
     grid_index: int = 0,
 ) -> RepaymentExtraction:
@@ -488,7 +751,12 @@ def reconstruct_repayment_micro_grid_from_lines(
     if header_line is None:
         return RepaymentExtraction(None, [], {"reason": "month_header_not_found", "anchor": anchor})
 
-    years = _nearest_year_lines(line_items, anchor)
+    years = _nearest_year_lines(
+        line_items,
+        anchor,
+        start_year=start_year,
+        end_year=end_year,
+    )
     if not years:
         return RepaymentExtraction(None, [], {"reason": "year_rows_not_found", "anchor": anchor})
 
@@ -593,6 +861,11 @@ def reconstruct_repayment_micro_grid_from_lines(
     record_months = set(_months_between(start_year, start_month, end_year, end_month))
     crop_ocr_attempts = 0
     crop_ocr_hits = 0
+    static_status_attempts = 0
+    static_status_resolved = 0
+    static_status_corrections = 0
+    static_status_unresolved = 0
+    static_status_unavailable = 0
     status_templates: dict[str, list[Any]] = {}
 
     for year_line in years:
@@ -671,15 +944,19 @@ def reconstruct_repayment_micro_grid_from_lines(
         active_months = [month for yy, month in sorted(record_months) if yy == year]
         if year == end_year and len(status_chars) == 2 and set(status_chars) == {"N", "C"}:
             status_by_month = {active_months[0]: "N", active_months[1]: "C"} if len(active_months) == 2 else {}
+            row_alignment_exact = False
         elif len(status_chars) == 12:
             status_by_month = dict(zip(range(1, 13), status_chars))
+            row_alignment_exact = "#" not in status_chars
         elif len(status_chars) == len(active_months):
             status_by_month = dict(zip(active_months, status_chars))
+            row_alignment_exact = "#" not in status_chars
         # Domain correction: closed credit-report rows commonly render the final
         # month as C. If OCR collapsed a two-month N/C row into "CN", use the
         # anchor date range and visual convention to place C on the final month.
         else:
             status_by_month = {}
+            row_alignment_exact = False
 
         status_row_tokens = _expand_line_to_char_tokens(
             {**status_line, "text": normalized_status_text},
@@ -710,6 +987,16 @@ def reconstruct_repayment_micro_grid_from_lines(
             status_crop = None
             status_recognition_source = "tokens"
             status_recognition_audit: dict[str, Any] = {}
+            static_status_failed = False
+            if row_alignment_exact and month in status_by_month:
+                status_recognition_source = "canonical_row_sequence"
+                status_recognition_audit = {
+                    "alignment_status": "exact",
+                    "expected_cell_count": len(active_months),
+                    "observed_status_count": len(status_chars),
+                    "active_months": list(active_months),
+                    "logical_page": int(status_line.get("source_logical_page") or page),
+                }
             neighbor_status = (
                 _neighbor_status_fallback(
                     status_by_month,
@@ -728,7 +1015,10 @@ def reconstruct_repayment_micro_grid_from_lines(
                 }
             visual_status_bbox = _cell_bbox(status_band, year_visual_cols_by_month.get(month, col))
             visual = None
-            if enable_cell_ocr and (year, month) in record_months:
+            if (
+                (enable_cell_ocr or (enable_static_status_validation and status in {"N", "*"}))
+                and (year, month) in record_months
+            ):
                 visual = _visual_page_context(
                     source_line=status_line,
                     bbox=visual_status_bbox,
@@ -764,7 +1054,66 @@ def reconstruct_repayment_micro_grid_from_lines(
                         )
                         if (weak_cell and (_strong_visual_status(rec) or template_confirmed)) or consensus_count >= 2:
                             status = rec.text
-            if not status:
+            static_template = None
+            if (
+                enable_static_status_validation
+                and status in {"N", "*"}
+                and (year, month) in record_months
+            ):
+                static_status_attempts += 1
+                observed_row_status = status
+                if visual is None:
+                    status = ""
+                    static_status_failed = True
+                    static_status_unresolved += 1
+                    static_status_unavailable += 1
+                    status_recognition_source = "static_glyph_shape_unavailable"
+                    status_recognition_audit = {
+                        "reason": "page_image_or_cell_crop_unavailable",
+                        "observed_row_status": observed_row_status,
+                        "logical_page": int(status_line.get("source_logical_page") or page),
+                    }
+                else:
+                    visual_image, visual_bbox, visual_width, visual_height, visual_page = visual
+                    static_template = extract_micro_cell_glyph_template(
+                        visual_image,
+                        visual_bbox,
+                        page_width=visual_width,
+                        page_height=visual_height,
+                    )
+                    classification = (
+                        _static_n_star_glyph_classification(static_template)
+                        if static_template is not None
+                        else None
+                    )
+                if visual is not None and classification is None:
+                    # Keep the month as a typed uncertainty candidate so the
+                    # final schema gate can report the exact affected month.
+                    status = ""
+                    static_status_failed = True
+                    static_status_unresolved += 1
+                    status_recognition_source = "static_glyph_shape_unresolved"
+                    status_recognition_audit = {
+                        "reason": "n_star_glyph_not_decisive",
+                        "observed_row_status": observed_row_status,
+                        "logical_page": visual_page,
+                    }
+                elif visual is not None and classification is not None:
+                    visual_status, visual_confidence, visual_audit = classification
+                    static_status_resolved += 1
+                    if visual_status != observed_row_status:
+                        static_status_corrections += 1
+                    status = visual_status
+                    status_recognition_source = "static_glyph_shape_validation"
+                    status_recognition_audit = {
+                        "reason": "field_specific_n_star_shape_validation",
+                        "observed_row_status": observed_row_status,
+                        "visual_status": visual_status,
+                        "visual_confidence": round(float(visual_confidence), 4),
+                        "logical_page": visual_page,
+                        **visual_audit,
+                    }
+            if not status and not static_status_failed:
                 neighbor_status = _neighbor_status_fallback(
                     status_by_month,
                     month,
@@ -777,18 +1126,40 @@ def reconstruct_repayment_micro_grid_from_lines(
                         "reason": "unreadable_cell_with_matching_adjacent_statuses",
                         "logical_page": int(status_line.get("source_logical_page") or page),
                     }
-            if status and not status.isdigit() and visual is not None:
+            if status and status != "#" and not status.isdigit() and visual is not None:
                 visual_image, visual_bbox, visual_width, visual_height, _visual_page = visual
-                template = extract_micro_cell_glyph_template(
-                    visual_image,
-                    visual_bbox,
-                    page_width=visual_width,
-                    page_height=visual_height,
-                )
+                template = static_template
+                if template is None:
+                    template = extract_micro_cell_glyph_template(
+                        visual_image,
+                        visual_bbox,
+                        page_width=visual_width,
+                        page_height=visual_height,
+                    )
                 if template is not None:
                     status_templates.setdefault(status, []).append(template)
             if len(status) > 1:
                 status = status[0]
+            status_logical_page = int(status_line.get("source_logical_page") or page)
+            status_evidence_bbox = (
+                visual_status_bbox if visual is not None else _cell_bbox(status_band, col)
+            )
+            status_recognition_audit["source_ref"] = {
+                "page": status_logical_page,
+                "logical_page": status_logical_page,
+                "bbox": _local_page_bbox(
+                    status_evidence_bbox,
+                    logical_page=status_logical_page,
+                    base_page=page,
+                    base_page_height=page_height,
+                ),
+                "geometry_scope": "cell",
+                "coordinate_system": "pdf_points_top_left",
+                "grid_id": f"mg_p{page}_repayment_{grid_index}",
+                "row": status_band["index"],
+                "col": month,
+                "field_name": "status",
+            }
             st_cell = build_cell(
                 row_band=status_band,
                 col_band=col,
@@ -802,23 +1173,34 @@ def reconstruct_repayment_micro_grid_from_lines(
             status_cells.append(st_cell)
 
             amount = ""
+            status_amount_conflict = False
             amount_bbox = None
             if amount_band is not None:
                 amt_tokens = amount_assignments.get(month, [])
                 amount = _normalize_amount_text(_token_text(amt_tokens))
                 status_implies_zero = status in zero_overdue_statuses
-                if status_implies_zero:
-                    # These status codes explicitly mean no overdue balance.
-                    # Do not let the calendar-year prefix, a neighbouring
-                    # month digit, or a table rule become an overdue amount.
+                status_amount_conflict = status_implies_zero and amount not in {"", "0"}
+                if status_implies_zero and not status_amount_conflict:
+                    # Infer semantic zero only when the amount cell is empty or
+                    # already zero. A nonzero token is retained below because
+                    # this layer cannot prove whether it is noise or business data.
                     amount = "0"
                 amount_bbox = _cell_bbox(amount_band, col)
                 visual_amount_bbox = _cell_bbox(amount_band, year_visual_cols_by_month.get(month, col))
                 amount_crop = None
-                amount_recognition_source = "status_semantic_zero" if status_implies_zero else "tokens"
-                amount_recognition_audit: dict[str, Any] = (
-                    {"reason": "non_overdue_status_semantics"} if status_implies_zero else {}
-                )
+                if status_amount_conflict:
+                    amount_recognition_source = "status_amount_conflict"
+                    amount_recognition_audit = {
+                        "reason": "zero_status_conflicts_with_observed_nonzero_amount",
+                        "status": status,
+                        "observed_amount": amount,
+                    }
+                elif status_implies_zero:
+                    amount_recognition_source = "status_semantic_zero"
+                    amount_recognition_audit = {"reason": "non_overdue_status_semantics"}
+                else:
+                    amount_recognition_source = "tokens"
+                    amount_recognition_audit = {}
                 if (
                     (not amount or status_recognition_source == "cell_crop_consensus")
                     and not status_implies_zero
@@ -851,6 +1233,23 @@ def reconstruct_repayment_micro_grid_from_lines(
                         if rec.text:
                             crop_ocr_hits += 1
                             amount = _normalize_amount_text(rec.text)
+                amount_logical_page = int(amount_line.get("source_logical_page") or page)
+                amount_recognition_audit["source_ref"] = {
+                    "page": amount_logical_page,
+                    "logical_page": amount_logical_page,
+                    "bbox": _local_page_bbox(
+                        amount_bbox,
+                        logical_page=amount_logical_page,
+                        base_page=page,
+                        base_page_height=page_height,
+                    ),
+                    "geometry_scope": "cell",
+                    "coordinate_system": "pdf_points_top_left",
+                    "grid_id": f"mg_p{page}_repayment_{grid_index}",
+                    "row": amount_band["index"],
+                    "col": month,
+                    "field_name": "overdue_amount",
+                }
                 amount_cells.append(
                     build_cell(
                         row_band=amount_band,
@@ -886,11 +1285,23 @@ def reconstruct_repayment_micro_grid_from_lines(
                         "year": year,
                         "month": month,
                         "status": status,
-                        "overdue_amount": amount or "0",
+                        "overdue_amount": amount if amount else ("0" if status in zero_overdue_statuses else None),
                         "status_bbox": list(st_cell.bbox),
                         **({"amount_bbox": list(amount_bbox)} if amount_bbox else {}),
                         "source_cell_refs": refs,
                         "confidence": st_cell.confidence or 0.7,
+                        **(
+                            {
+                                "extraction_status": "review",
+                                "audit": {
+                                    "reason": "zero_status_conflicts_with_observed_nonzero_amount",
+                                    "status": status,
+                                    "observed_amount": amount,
+                                },
+                            }
+                            if status_amount_conflict
+                            else {}
+                        ),
                     }
                 )
         cell_rows.append(status_cells)
@@ -924,12 +1335,21 @@ def reconstruct_repayment_micro_grid_from_lines(
                 "end_year": end_year,
                 "end_month": end_month,
             },
+            "zero_overdue_statuses": sorted(zero_overdue_statuses),
             "token_count": len(synthetic_tokens),
             "source_token_count": len(evidence_tokens),
             "cell_crop_ocr": {
                 "enabled": bool(enable_cell_ocr),
                 "attempts": crop_ocr_attempts,
                 "hits": crop_ocr_hits,
+            },
+            "static_status_validation": {
+                "enabled": bool(enable_static_status_validation),
+                "attempts": static_status_attempts,
+                "resolved": static_status_resolved,
+                "corrections": static_status_corrections,
+                "unresolved": static_status_unresolved,
+                "unavailable": static_status_unavailable,
             },
             "visual_month_geometry": visual_geometry_audit,
         },
@@ -951,6 +1371,7 @@ def extract_credit_repayment_records(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
     grid_index: int = 0,
 ) -> dict[str, Any]:
@@ -963,6 +1384,7 @@ def extract_credit_repayment_records(
         page_image=page_image,
         page_image_resolver=page_image_resolver,
         enable_cell_ocr=enable_cell_ocr,
+        enable_static_status_validation=enable_static_status_validation,
         extra_status_chars=extra_status_chars,
         grid_index=grid_index,
     )
@@ -1013,7 +1435,11 @@ def _years_by_status_row_index(grid: dict[str, Any]) -> dict[int, int]:
     return out
 
 
-def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
+def records_from_micro_grid_dict(
+    grid: dict[str, Any],
+    *,
+    accept_exact_row_numeric_status: bool = False,
+) -> list[dict[str, Any]]:
     """Project finance repayment records from a persisted micro_grid structure."""
     if not isinstance(grid, dict):
         return []
@@ -1024,6 +1450,10 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     start_year, start_month, end_year, end_month = date_range
     valid_months = set(_months_between(start_year, start_month, end_year, end_month))
+    zero_overdue_statuses = {
+        str(value)
+        for value in ((grid.get("audit") or {}).get("zero_overdue_statuses") or _ZERO_OVERDUE_STATUSES)
+    }
 
     col_map: dict[int, int] = {}
     for band in grid.get("col_bands") or []:
@@ -1045,6 +1475,7 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
             amount_rows.append([cell for cell in row if isinstance(cell, dict)])
 
     amount_by_row_col: dict[tuple[int, int], str] = {}
+    amount_cell_by_row_col: dict[tuple[int, int], dict[str, Any]] = {}
     amount_row_indices: list[int] = []
     for row in amount_rows:
         row_idx = next(
@@ -1054,10 +1485,12 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
         amount_row_indices.append(row_idx)
         for cell in row:
             text = str(cell.get("text") or "").strip()
+            amount_cell_by_row_col[(row_idx, int(cell.get("col_index") or 0))] = cell
             if text:
                 amount_by_row_col[(row_idx, int(cell.get("col_index") or 0))] = text
 
     years_by_row = _years_by_status_row_index(grid)
+    status_cell_by_year_month: dict[tuple[int, int], dict[str, Any]] = {}
     records: list[dict[str, Any]] = []
     for status_row in status_rows:
         row_idx = next(
@@ -1071,6 +1504,8 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             col_idx = int(cell.get("col_index") or 0)
             month = col_map.get(col_idx)
+            if row_year is not None and month and (row_year, month) in valid_months:
+                status_cell_by_year_month[(row_year, month)] = cell
             status = str(cell.get("text") or "").strip()
             if not month or not status:
                 continue
@@ -1079,31 +1514,83 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
                 year = next((y for y, m in valid_months if m == month), None)
             if year is None or (year, month) not in valid_months:
                 continue
+            amount_cell = (
+                amount_cell_by_row_col.get((amount_row_idx, col_idx))
+                if amount_row_idx is not None
+                else None
+            )
             amount = (
-                amount_by_row_col.get((amount_row_idx, col_idx), "0") if amount_row_idx is not None else "0"
-            ) or "0"
+                amount_by_row_col.get((amount_row_idx, col_idx))
+                if amount_row_idx is not None
+                else None
+            )
+            if amount in (None, "") and status in zero_overdue_statuses:
+                amount = "0"
             bbox = cell.get("bbox")
+            recognition_audit = dict(cell.get("recognition_audit") or {})
+            persisted_status_ref = recognition_audit.get("source_ref")
+            logical_page = int(recognition_audit.get("logical_page") or page)
+            source_refs: list[dict[str, Any]] = [
+                dict(persisted_status_ref)
+                if isinstance(persisted_status_ref, dict)
+                else {
+                    "page": logical_page,
+                    "logical_page": logical_page,
+                    "grid_id": grid_id,
+                    "row": cell.get("row_index"),
+                    "col": month,
+                    "field_name": "status",
+                    "geometry_scope": "cell",
+                    **({"bbox": list(bbox)} if isinstance(bbox, list) and len(bbox) == 4 else {}),
+                }
+            ]
+            amount_bbox = amount_cell.get("bbox") if isinstance(amount_cell, dict) else None
+            amount_audit: dict[str, Any] = {}
+            if isinstance(amount_cell, dict):
+                amount_audit = dict(amount_cell.get("recognition_audit") or {})
+                persisted_amount_ref = amount_audit.get("source_ref")
+                amount_page = int(amount_audit.get("logical_page") or logical_page)
+                source_refs.append(
+                    dict(persisted_amount_ref)
+                    if isinstance(persisted_amount_ref, dict)
+                    else {
+                        "page": amount_page,
+                        "logical_page": amount_page,
+                        "grid_id": grid_id,
+                        "row": amount_cell.get("row_index"),
+                        "col": month,
+                        "field_name": "overdue_amount",
+                        "geometry_scope": "cell",
+                        **(
+                            {"bbox": list(amount_bbox)}
+                            if isinstance(amount_bbox, list) and len(amount_bbox) == 4
+                            else {}
+                        ),
+                    }
+                )
             record: dict[str, Any] = {
+                "repayment_id": f"{grid_id}:{year:04d}-{month:02d}",
+                "grid_id": grid_id,
                 "year": year,
                 "month": month,
                 "status": status,
                 "overdue_amount": amount,
-                "source_cell_refs": [
-                    {
-                        "page": page,
-                        "grid_id": grid_id,
-                        "row": cell.get("row_index"),
-                        "col": month,
-                    }
-                ],
+                "source_cell_refs": source_refs,
                 "confidence": float(cell.get("confidence") or 0.7),
             }
             recognition_source = str(cell.get("recognition_source") or "tokens")
-            recognition_audit = dict(cell.get("recognition_audit") or {})
             if recognition_source != "tokens":
                 record["recognition_source"] = recognition_source
             if recognition_audit:
                 record["audit"] = recognition_audit
+            if amount_audit.get("reason") == "zero_status_conflicts_with_observed_nonzero_amount":
+                record["extraction_status"] = "review"
+                record["audit"] = {
+                    **recognition_audit,
+                    "reason": "zero_status_conflicts_with_observed_nonzero_amount",
+                    "status": status,
+                    "observed_amount": amount,
+                }
             if cell.get("crop_ocr_text") is not None:
                 record["raw_status"] = str(cell.get("crop_ocr_text") or "")
             if isinstance(bbox, list) and len(bbox) == 4:
@@ -1131,6 +1618,10 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
         visually_confirmed = (
             str(record.get("recognition_source") or "") == "cell_crop_consensus"
             and int((record.get("audit") or {}).get("consensus_count") or 0) >= 2
+        ) or (
+            accept_exact_row_numeric_status
+            and str(record.get("recognition_source") or "") == "canonical_row_sequence"
+            and str((record.get("audit") or {}).get("alignment_status") or "") == "exact"
         )
         if status.isdigit() and not visually_confirmed:
             record["raw_status"] = status
@@ -1141,6 +1632,9 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
             record["audit"] = {"reason": "numeric_status_requires_cell_ocr_confirmation"}
     existing_months = {(int(record.get("year") or 0), int(record.get("month") or 0)) for record in records}
     for year, month in sorted(valid_months - existing_months):
+        empty_cell = status_cell_by_year_month.get((year, month))
+        empty_audit = dict(empty_cell.get("recognition_audit") or {}) if isinstance(empty_cell, dict) else {}
+        empty_ref = empty_audit.get("source_ref")
         records.append(
             {
                 "repayment_id": f"{grid_id}:{year:04d}-{month:02d}",
@@ -1151,11 +1645,16 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
                 "overdue_amount": None,
                 "source": "repayment_grid_date_range_placeholder",
                 "source_cell_refs": [
-                    {
+                    dict(empty_ref)
+                    if isinstance(empty_ref, dict)
+                    else {
                         "page": page,
+                        "logical_page": page,
                         "grid_id": grid_id,
                         "row": 0,
                         "col": month,
+                        "field_name": "status",
+                        "geometry_scope": "logical_page",
                         "geometry_status": "unresolved",
                     }
                 ],
@@ -1167,19 +1666,36 @@ def records_from_micro_grid_dict(grid: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def dedupe_repayment_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep one record per (grid_id, year, month), preferring higher confidence."""
-    best: dict[tuple[str, int, int], dict[str, Any]] = {}
-    order: list[tuple[str, int, int]] = []
+    """Collapse only business-equivalent detector replays.
+
+    Conflicting observations must reach the Candidate B relationship layer,
+    where the selected value can be accompanied by a structured issue.
+    """
+    output: list[dict[str, Any]] = []
+    equivalent_positions: dict[tuple[str, int, int, str, str | None], int] = {}
     for record in records:
         if not isinstance(record, dict):
             continue
         refs = record.get("source_cell_refs") or [{}]
-        grid_id = str((refs[0] or {}).get("grid_id") or "")
-        key = (grid_id, int(record.get("year") or 0), int(record.get("month") or 0))
-        if key not in best:
-            order.append(key)
-            best[key] = record
+        grid_id = str(record.get("grid_id") or (refs[0] or {}).get("grid_id") or "")
+        status, amount = _repayment_business_signature(record)
+        key = (
+            grid_id,
+            int(record.get("year") or 0),
+            int(record.get("month") or 0),
+            status,
+            amount,
+        )
+        existing = equivalent_positions.get(key)
+        if existing is None:
+            equivalent_positions[key] = len(output)
+            output.append(record)
             continue
-        if float(record.get("confidence") or 0.0) > float(best[key].get("confidence") or 0.0):
-            best[key] = record
-    return [best[key] for key in order]
+        current = output[existing]
+        selected = record if float(record.get("confidence") or 0.0) > float(current.get("confidence") or 0.0) else current
+        selected = dict(selected)
+        merged_refs = _merged_source_cell_refs(current, record)
+        if merged_refs:
+            selected["source_cell_refs"] = merged_refs
+        output[existing] = selected
+    return output

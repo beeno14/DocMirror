@@ -83,7 +83,7 @@ def test_enterprise_facility_detail_emits_every_declared_row_pair() -> None:
 
     rows = extract_enterprise_credit_lines_from_tables(result, [])
 
-    assert [row["account_identifier"] for row in rows] == [
+    assert [row["credit_agreement_identifier"] for row in rows] == [
         "B11215800H0001N24044608",
         "B11215800H0001N25027358",
     ]
@@ -371,13 +371,13 @@ def test_enterprise_public_overview_and_detail_type_counts_are_both_preserved() 
                 page_number=3,
                 source_page_number=3,
                 tables=[overview],
-                texts=[],
+                texts=[_native_text("信息概要", top=0)],
             ),
             SimpleNamespace(
                 page_number=10,
                 source_page_number=10,
                 tables=[license_record],
-                texts=[],
+                texts=[_native_text("公共记录明细", top=0)],
             ),
         ]
     )
@@ -1096,7 +1096,15 @@ def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=1, tables=[table, balances])])
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="信息概要")],
+                tables=[table, balances],
+            )
+        ]
+    )
 
     semantic = _enterprise_semantic(result)
 
@@ -1214,8 +1222,16 @@ def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility
     )
     result = SimpleNamespace(
         pages=[
-            PageContent(page_number=3, tables=[summary, facilities]),
-            PageContent(page_number=4, tables=[first_page]),
+            PageContent(
+                page_number=3,
+                texts=[TextBlock(content="信息概要")],
+                tables=[summary, facilities],
+            ),
+            PageContent(
+                page_number=4,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[first_page],
+            ),
             PageContent(page_number=5, tables=[continuation, revolving, facility_detail]),
         ]
     )
@@ -1293,7 +1309,15 @@ def test_enterprise_settled_cards_keep_closed_status_and_do_not_absorb_later_tab
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=8, tables=[settled, unrelated])])
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=8,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[settled, unrelated],
+            )
+        ]
+    )
 
     semantic = _enterprise_semantic(result)
     accounts = semantic.datasets["enterprise_credit_accounts"]

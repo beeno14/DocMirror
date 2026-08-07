@@ -144,6 +144,76 @@ def record_issue(context: Any, issue: Mapping[str, Any]) -> None:
     rows.append(deepcopy(dict(issue)))
 
 
+def register_issue_target_remap(context: Any, source_record_id: Any, target_record_id: Any) -> None:
+    """Register a plugin-local identity change for later diagnostic linkage."""
+    source = str(source_record_id or "").strip()
+    target = str(target_record_id or "").strip()
+    if not source or not target or source == target:
+        return
+    registry = getattr(context, "_personal_detail_issue_target_remaps", None)
+    if not isinstance(registry, dict):
+        registry = {}
+        setattr(context, "_personal_detail_issue_target_remaps", registry)
+    targets = registry.get(source)
+    if not isinstance(targets, set):
+        targets = {str(value) for value in targets or () if value} if targets else set()
+        registry[source] = targets
+    targets.add(target)
+
+
+def _resolve_issue_target(
+    registry: Mapping[str, Any], source_record_id: str
+) -> tuple[str | None, bool]:
+    """Return one terminal remap, or mark a branching/cyclic remap ambiguous."""
+    frontier = [source_record_id]
+    expanded: set[str] = set()
+    terminals: set[str] = set()
+    while frontier:
+        current = frontier.pop()
+        if current in expanded:
+            continue
+        expanded.add(current)
+        raw_targets = registry.get(current)
+        if isinstance(raw_targets, str):
+            targets = {raw_targets}
+        else:
+            targets = {str(value) for value in raw_targets or () if value}
+        targets.discard(current)
+        if not targets:
+            terminals.add(current)
+            continue
+        frontier.extend(target for target in targets if target not in expanded)
+    if len(terminals) == 1:
+        terminal = next(iter(terminals))
+        return (terminal if terminal != source_record_id else None), False
+    return None, bool(expanded - {source_record_id})
+
+
+def _remap_issue_target(context: Any, issue: Mapping[str, Any]) -> dict[str, Any]:
+    row = deepcopy(dict(issue))
+    registry = getattr(context, "_personal_detail_issue_target_remaps", None)
+    source = str(row.get("target_record_id") or "").strip()
+    if source and isinstance(registry, Mapping):
+        target, ambiguous = _resolve_issue_target(registry, source)
+        if target:
+            row["target_record_id"] = target
+        elif ambiguous:
+            row.pop("target_record_id", None)
+            row["reason_codes"] = list(
+                dict.fromkeys(
+                    (
+                        *(str(value) for value in row.get("reason_codes") or () if value),
+                        "issue_target_identity_ambiguous",
+                        "diagnostic_left_unlinked",
+                    )
+                )
+            )
+    issue_id = _issue_id(row)
+    row["extraction_issue_id"] = issue_id
+    row["record_id"] = issue_id
+    return row
+
+
 def liability_record_is_substantive(record: Mapping[str, Any]) -> bool:
     """Reject identifier-only compatibility rows, not valid empty-valued cells."""
     values = record.get("normalized")
@@ -278,11 +348,74 @@ def _topology_issues(context: Any) -> list[dict[str, Any]]:
 
 def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
     """Return deduplicated plugin diagnostics accumulated by every stage."""
-    rows = [
+    source_rows = [
         *[dict(row) for row in getattr(context, "_personal_detail_extraction_issues", []) if isinstance(row, Mapping)],
         *_ocr_audit_issues(context),
         *_topology_issues(context),
     ]
+    rows = [_remap_issue_target(context, row) for row in source_rows]
+    precise_by_agreement_field: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        observed = row.get("observed_value")
+        if (
+            row.get("issue_code") == "pboc_cell_contract_unresolved"
+            and observed not in (None, "", [], {})
+        ):
+            key = (
+                str(row.get("target_dataset") or ""),
+                str(row.get("target_record_id") or ""),
+                str(row.get("field_name") or ""),
+            )
+            if all(key):
+                precise_by_agreement_field[key] = row
+    consolidated_rows: list[dict[str, Any]] = []
+    for row in rows:
+        key = (
+            str(row.get("target_dataset") or ""),
+            str(row.get("target_record_id") or ""),
+            str(row.get("field_name") or ""),
+        )
+        precise = precise_by_agreement_field.get(key)
+        if (
+            row.get("issue_code")
+            == "candidate_b_credit_agreement_required_field_unresolved"
+            and precise is not None
+        ):
+            refs = [
+                *[dict(value) for value in precise.get("source_refs") or () if isinstance(value, Mapping)],
+                *[dict(value) for value in row.get("source_refs") or () if isinstance(value, Mapping)],
+            ]
+            if refs:
+                seen_refs: set[str] = set()
+                precise["source_refs"] = [
+                    value
+                    for value in refs
+                    if not (
+                        (
+                            marker := json.dumps(
+                                value,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                default=str,
+                            )
+                        )
+                        in seen_refs
+                        or seen_refs.add(marker)
+                    )
+                ]
+            precise["reason_codes"] = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in (
+                        *precise.get("reason_codes", ()),
+                        *row.get("reason_codes", ()),
+                    )
+                    if value
+                )
+            )
+            continue
+        consolidated_rows.append(row)
+    rows = consolidated_rows
     unique: dict[str, dict[str, Any]] = {}
     for row in rows:
         issue_id = str(row.get("extraction_issue_id") or _issue_id(row))
@@ -357,4 +490,5 @@ __all__ = [
     "liability_record_is_substantive",
     "make_issue",
     "record_issue",
+    "register_issue_target_remap",
 ]

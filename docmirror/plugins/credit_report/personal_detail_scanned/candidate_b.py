@@ -60,6 +60,7 @@ class CandidateBPipeline:
             _extract_residence_records,
             _extract_source_rows,
             _extract_summary_datasets,
+            _record_pre_repair_source_gaps,
             _source_completeness_ledger,
             reconcile_candidate_b_credit_lines,
         )
@@ -91,7 +92,14 @@ class CandidateBPipeline:
             )
             business: dict[str, Any] = {
                 "credit_accounts": accounts,
-                "credit_lines": _extract_credit_lines(self.context),
+                # Reconciliation is part of schema extraction, not a release-
+                # only cleanup.  Running it in the discovery pass exposes
+                # field conflicts/missing slots early enough to select the
+                # one permitted complete-page OCR repair.
+                "credit_lines": reconcile_candidate_b_credit_lines(
+                    self.context,
+                    _extract_credit_lines(self.context),
+                ),
                 "repayment_liability_records": _extract_liabilities(self.context),
                 "repayment_records": repayments,
                 "overdue_records": derive_candidate_b_overdue_records(accounts, repayments),
@@ -124,6 +132,7 @@ class CandidateBPipeline:
                 "personal_detail_source_rows": _extract_source_rows(self.context),
                 **_extract_profile_detail_records(self.context),
             }
+            _record_pre_repair_source_gaps(self.context, datasets)
             return business, datasets
 
         first_business, first_datasets = extract_source_pass()
