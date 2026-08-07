@@ -16,6 +16,7 @@ from docmirror.plugins.bank_statement.semantic_solver import BankStatementSemant
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     audit_bank_statement_invariants,
     count_expected_rows_from_bank_footer,
+    resolve_row_count_evidence,
 )
 
 VERTICAL_LEDGER_TEXT = """
@@ -261,6 +262,106 @@ def test_bank_header_total_record_count_is_an_independent_expected_count() -> No
     text = "打印日期：2026-02-24 交易时段：2025-01-01 至 2025-12-31 总条数：38"
 
     assert count_expected_rows_from_bank_footer(text) == 38
+
+
+def test_flattened_text_does_not_treat_page_numbers_as_total_rows() -> None:
+    text = "\u603b\u7b14\u6570:\n3\n\u603b\u7b14\u6570\n:\n2"
+
+    evidence = resolve_row_count_evidence(text)
+
+    assert evidence.count == 0
+    assert evidence.source == "none"
+
+
+def test_page_local_count_evidence_accepts_a_bounded_total() -> None:
+    evidence = resolve_row_count_evidence("", page_texts=[(5, "\u603b\u7b14\u6570: 90")])
+
+    assert evidence.count == 90
+    assert evidence.source == "header_total"
+    assert evidence.page == 5
+    assert evidence.confidence >= 0.9
+
+
+def test_page_local_count_evidence_accepts_label_value_line_break() -> None:
+    evidence = resolve_row_count_evidence("", page_texts=[(5, "总笔数:\n90")])
+
+    assert evidence.count == 90
+    assert evidence.source == "header_total"
+    assert evidence.page == 5
+
+
+def test_sparse_page_text_uses_safe_flattened_count_fallback() -> None:
+    evidence = resolve_row_count_evidence("总条数: 38", page_texts=[(1, "银行流水首页")])
+
+    assert evidence.count == 38
+    assert evidence.source == "header_total"
+    assert evidence.page is None
+
+
+def test_page_local_borderless_transaction_anchors_are_an_independent_count() -> None:
+    header = "交易日期 交易时间 交易摘要 交易金额 本次余额 对手信息 日志号 交易渠道 交易附言"
+    evidence = resolve_row_count_evidence(
+        "",
+        page_texts=[
+            (
+                1,
+                "\n".join(
+                    [
+                        header,
+                        "20230622 195925 微信支付 -500.00 10705.87 243300133 457272650 电子商务 二维码付款",
+                        "20230622 200122 网银在线 -9807.58 898.29 210401293 458045033 电子商务 企业主贷还款",
+                    ]
+                ),
+            ),
+            (
+                2,
+                "\n".join(
+                    [
+                        header,
+                        "20231221 084535 转存 +29000 31953.2 239278739 超级网银 工资",
+                    ]
+                ),
+            ),
+        ],
+    )
+
+    assert evidence.count == 3
+    assert evidence.source == "page_transaction_anchors"
+    assert evidence.confidence >= 0.9
+
+
+def test_page_local_borderless_count_accepts_stacked_first_row_cells() -> None:
+    header = "记账日期 货币 交易金额 余额 交易摘要 对手信息"
+    evidence = resolve_row_count_evidence(
+        "",
+        page_texts=[
+            (
+                1,
+                "\n".join(
+                    [
+                        header,
+                        "2024-01-01",
+                        "CNY",
+                        "0.07",
+                        "0.07",
+                        "结息",
+                    ]
+                ),
+            ),
+            (
+                2,
+                "\n".join(
+                    [
+                        header,
+                        "2024-01-02 CNY -1.00 9.00 付款 测试有限公司 123456789012345",
+                    ]
+                ),
+            ),
+        ],
+    )
+
+    assert evidence.count == 2
+    assert evidence.source == "page_transaction_anchors"
 
 
 def test_page_footer_transaction_counts_are_summed_across_pages() -> None:

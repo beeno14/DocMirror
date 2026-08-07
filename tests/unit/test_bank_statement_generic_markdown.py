@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
+    _raw_statement_after_table_lines,
+    _raw_statement_header_lines,
     _render_bank_statement_content_markdown,
     _sanitize_bank_records,
 )
@@ -114,6 +116,258 @@ def test_bank_statement_summary_markdown_compacts_wrapped_numeric_counter_accoun
 
     assert "83010078801300000220" in markdown
     assert "830100788013000002 20" not in markdown
+
+
+def test_source_markdown_keeps_dynamic_raw_columns_without_normalized_fallback() -> None:
+    headers = ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额", "对手信息", "日志号", "交易渠道", "交易附言"]
+    records = [
+        {
+            "raw": dict(
+                zip(
+                    headers,
+                    [
+                        "20230622",
+                        "195925",
+                        "微信支付",
+                        "-500.00",
+                        "10705.87",
+                        "243300133",
+                        "457272650",
+                        "电子商务",
+                        "二维码付款",
+                    ],
+                    strict=True,
+                )
+            ),
+            "normalized": {"date": "2023-06-22", "timestamp": "2023-06-22T19:59:25", "amount": 500.0},
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "raw": dict(
+                zip(
+                    headers,
+                    ["20231221", "", "利息税", "+0.00", "2953.20", "--", "1", "", "个人活期结息"],
+                    strict=True,
+                )
+            ),
+            "normalized": {"date": "2023-12-21", "timestamp": "2023-12-21T00:00:00", "amount": 0.0},
+            "source": {"source_page": 2, "page_range": [2, 2]},
+        },
+    ]
+    page_one = "\n".join(
+        [
+            "中国农业银行账户活期交易明细清单",
+            "户名：徐雪 账户：6228481048429419672",
+            "币种：人民币 钞汇标识：本币",
+            "起止日期：20230622-20231221 电子流水号：2312211530229831551",
+            " ".join(headers),
+        ]
+    )
+    disclaimer = "该交易明细因不可预测的非人控技术原因可能导致数据缺失，明细内容仅供参考。"
+    page_two = "\n".join([" ".join(headers), disclaimer])
+
+    markdown = _render_bank_statement_content_markdown(
+        records,
+        {"account_holder": "徐雪", "account_number": "6228481048429419672", "currency": "CNY"},
+        {"start": "2023-06-22", "end": "2023-12-21"},
+        page_one,
+        source_pages={1: page_one, 2: page_two},
+    )
+
+    assert "币种：人民币 钞汇标识：本币" in markdown
+    assert "电子流水号：2312211530229831551" in markdown
+    assert markdown.count("户名：徐雪") == 1
+    assert "| 20230622 | 195925 | 微信支付 | -500.00 |" in markdown
+    assert "| 20231221 |  | 利息税 | +0.00 |" in markdown
+    assert "2023-12-21T00:00:00" not in markdown
+    assert markdown.rfind(disclaimer) > markdown.rfind("| 20231221 |")
+
+
+def test_source_header_stops_before_individually_positioned_table_labels() -> None:
+    source_text = "\n".join(
+        [
+            "中国农业银行账户活期交易明细清单",
+            "户名：徐雪",
+            "账户：6228481048429419672",
+            "币种：人民币",
+            "起止日期：20230622-20231221",
+            "交易日期",
+            "交易时间",
+            "交易摘要",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "起止日期：20230622-20231221"
+    assert "交易日期" not in lines
+
+
+def test_source_header_stops_before_concatenated_table_label_fragments() -> None:
+    source_text = "\n".join(
+        [
+            "交易明细清单",
+            "户名：测试用户",
+            "账号/卡号：6230000000000000000",
+            "币种：人民币",
+            "开户机构：测试农村信用社",
+            "起止日期：2025-01-01至2025-12-31",
+            "钞汇标志：本币",
+            "序号交易日期",
+            "收入/支出交易金额账户余额",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "钞汇标志：本币"
+    assert "序号交易日期" not in lines
+
+
+def test_source_header_stops_before_split_partial_table_labels() -> None:
+    source_text = "\n".join(
+        [
+            "测试银行公司账户交易明细清单",
+            "户名:测试企业有限公司",
+            "账号:727150100100143834",
+            "起止日期:2022/05/18-2023/05/17",
+            "账户号:000001",
+            "借贷标",
+            "交易口",
+            "志",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "账户号:000001"
+    assert "借贷标" not in lines
+    assert "交易口" not in lines
+    assert "志" not in lines
+
+    interleaved_lines = _raw_statement_header_lines(
+        {},
+        {},
+        "\n".join(
+            [
+                "测试银行公司账户交易明细清单",
+                "户名:测试企业有限公司",
+                "账号:727150100100143834",
+                "交易口借贷标",
+                "志",
+            ]
+        ),
+    )
+    assert interleaved_lines[-1] == "账号:727150100100143834"
+
+
+def test_source_header_stops_before_isolated_table_row_ordinals() -> None:
+    source_text = "\n".join(
+        [
+            "测试银行账户交易明细表",
+            "（代回单）",
+            "打印日期：2026-02-24",
+            "交易时段：2025-01-01 至 2025-12-31",
+            "总条数：38",
+            "户名：测试企业有限公司",
+            "账号：0111014170000993",
+            "币种：人民币",
+            "2.",
+            "3.",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "币种：人民币"
+
+
+def test_source_header_repairs_two_character_kv_labels_split_by_ocr() -> None:
+    source_text = "\n".join(
+        [
+            "账户明细对账单",
+            "客户名称:测试企业",
+            "种:人民币",
+            "起始日期:20230601",
+            "币",
+            "位:元",
+            "开户机构:测试银行",
+            "截止日期:20230630",
+            "单",
+            "序号",
+            "记账日期",
+            "交易金额",
+            "账户余额",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert "币种:人民币" in lines
+    assert "单位:元" in lines
+    assert "种:人民币" not in lines
+    assert "币" not in lines
+    assert "单" not in lines
+    assert "位:元" not in lines
+    assert "2." not in lines
+    assert "3." not in lines
+
+
+def test_source_header_keeps_split_source_page_number() -> None:
+    source_text = "\n".join(
+        [
+            "测试银行账户交易明细表",
+            "户名：测试用户",
+            "账号：6230000000000000000",
+            "第 2",
+            "/",
+            "4 页",
+            "序号",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert "第 2 / 4 页" in lines
+
+
+def test_source_header_stops_before_numbered_hyphenated_transaction_line() -> None:
+    source_text = "\n".join(
+        [
+            "测试银行账户交易明细表",
+            "户名：测试用户",
+            "账号：6230000000000000000",
+            "1 2025-01-24 14:23:24 100.00 900.00",
+        ]
+    )
+
+    lines = _raw_statement_header_lines({}, {}, source_text)
+
+    assert lines[-1] == "账号：6230000000000000000"
+
+
+def test_source_footer_furniture_moves_out_of_header_and_stays_complete() -> None:
+    legal_notice = "本回单被伪造、变造、篡改的，不具有法律效力；"
+    source_text = "\n".join(
+        [
+            "测试银行账户交易明细表",
+            "打印日期：2026-02-24",
+            "户名：测试企业有限公司",
+            "账号：0111014170000993",
+            "风险提示：",
+            legal_notice,
+            "测试银行代回单第",
+            "页",
+            "4页 / 共4",
+        ]
+    )
+
+    header_lines = _raw_statement_header_lines({}, {}, source_text)
+    footer_lines = _raw_statement_after_table_lines(source_text, 4)
+
+    assert header_lines[-1] == "账号：0111014170000993"
+    assert "风险提示：" not in header_lines
+    assert footer_lines == ["测试银行代回单第4页 / 共4", "风险提示：", legal_notice]
 
 
 def test_source_first_markdown_fills_split_header_values_and_keeps_footer_outside_table() -> None:
@@ -553,6 +807,48 @@ def test_bank_statement_markdown_infers_generic_raw_headers_and_transaction_type
         in markdown
     )
     assert "| 2 | 工资 | 人民币 | 20230830 | 收入 | 296.00 | 299.69 | 70070188000077841 |  |" in markdown
+
+
+def test_bank_statement_markdown_omits_empty_schema_padding_columns() -> None:
+    records = [
+        {
+            "raw": {
+                "交易时间": "2022-05-20",
+                "收/支": "支出",
+                "交易金额": "13567.84",
+                "账户余额": "22564.73",
+                "摘要": "财税库行联网划缴税款",
+                "对方账号": "081010143711000196",
+                "对方账号与户名": "待报解预算收入",
+                "机构": "",
+                "柜员": "",
+                "备注": "",
+            },
+            "normalized": {
+                "date": "2022-05-20",
+                "direction": "expense",
+                "amount": 13567.84,
+                "balance": 22564.73,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    source_text = "\n".join(
+        [
+            "测试银行公司账户交易明细清单",
+            "户名:测试企业有限公司",
+            "账号:727150100100143834",
+            "借贷标",
+            "志",
+        ]
+    )
+
+    markdown = _render_bank_statement_content_markdown(records, {}, {}, source_text)
+
+    assert "| 交易时间 | 收/支 | 交易金额 | 账户余额 | 摘要 | 对方账号 | 对方账号与户名 |" in markdown
+    assert "| 机构 |" not in markdown
+    assert "| 柜员 |" not in markdown
+    assert "| 备注 |" not in markdown
 
 
 def test_bank_statement_markdown_preserves_unusual_source_columns_and_order() -> None:

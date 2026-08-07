@@ -177,12 +177,14 @@ def audit_cqf(
         canonical_ratio = coverage_ratio
     else:
         coverage_ratio = min(canonical_extracted / expected, 1.0)
-        canonical_ratio = canonical_extracted / expected
+        canonical_ratio = min(canonical_extracted / expected, 1.0)
 
     status = resolve_extract_status(
         coverage_ratio=coverage_ratio,
         canonical_ratio=canonical_ratio,
     )
+    if expected > 0 and canonical_extracted != expected and status == "success":
+        status = "low_coverage"
     return CQFResult(
         canonical_expected=expected,
         canonical_extracted=canonical_extracted,
@@ -192,9 +194,23 @@ def audit_cqf(
     )
 
 
+def audit_row_accounting(*, parsed_rows: int, canonical_rows: int, emitted_rows: int) -> list[str]:
+    """Validate the plugin-local row lifecycle before records reach a Dataset."""
+    parsed = max(int(parsed_rows or 0), 0)
+    canonical = max(int(canonical_rows or 0), 0)
+    emitted = max(int(emitted_rows or 0), 0)
+    warnings: list[str] = []
+    if canonical != emitted:
+        warnings.append(f"BANK_CANONICAL_EMITTED_ROW_MISMATCH:canonical={canonical}:emitted={emitted}")
+    if emitted > parsed:
+        warnings.append(f"BANK_EMITTED_ROWS_EXCEED_PARSED:parsed={parsed}:emitted={emitted}")
+    return warnings
+
+
 __all__ = [
     "CQFResult",
     "audit_cqf",
+    "audit_row_accounting",
     "canonical_expected_from_parse_result",
     "is_canonical_row",
     "physical_transaction_row_estimate",

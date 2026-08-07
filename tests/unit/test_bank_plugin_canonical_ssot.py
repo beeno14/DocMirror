@@ -91,6 +91,20 @@ def test_build_style_meta_prefers_independent_source_count_over_weak_mirror_esti
     assert meta.extract_status == "success"
 
 
+def test_build_style_meta_prefers_complete_evidence_table_over_sparse_mirror_estimate():
+    pr = _parse_result_with_ltqg(4)
+
+    meta = build_style_meta(
+        _detection(),
+        reconstruction=ReconstructionMeta(source="canonical_evidence_table", expected_primary_rows=199),
+        record_count=199,
+        parse_result=pr,
+    )
+
+    assert meta.expected_primary_rows == 199
+    assert meta.coverage_ratio == 1.0
+
+
 def test_style_registry_expected_rows_from_parse_result():
     pr = _parse_result_with_ltqg(47)
     ctx = StyleContext(

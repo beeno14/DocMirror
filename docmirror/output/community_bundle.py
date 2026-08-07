@@ -596,16 +596,38 @@ def _dataset_completeness(
             }
     policy = (projection.get("completeness") or {}).get(key) or {}
     if policy.get("basis") == "domain_fact_count":
-        count_key = str(policy.get("count_key") or "")
-        count_value = data.get(count_key)
-        if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
-            expected = int(count_value)
+        configured_candidates = policy.get("count_candidates") or []
+        count_candidates = [candidate for candidate in configured_candidates if isinstance(candidate, dict)]
+        if not count_candidates:
+            count_candidates = [
+                {
+                    "key": policy.get("count_key"),
+                    "public_basis": policy.get("public_basis"),
+                }
+            ]
+        selected_count: tuple[int, str] | None = None
+        for candidate in count_candidates:
+            count_key = str(candidate.get("key") or "")
+            count_value = data.get(count_key)
+            if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
+                selected_count = (
+                    int(count_value),
+                    str(candidate.get("public_basis") or policy.get("public_basis") or "domain_fact_count"),
+                )
+                break
+        if selected_count is not None:
+            expected, public_basis = selected_count
+            verified = expected == emitted
+            status_key = str(policy.get("verification_status_key") or "")
+            if status_key and data.get(status_key) not in (None, ""):
+                allowed_statuses = {str(value) for value in policy.get("verified_statuses") or ["success"]}
+                verified = verified and str(data.get(status_key) or "") in allowed_statuses
             return {
                 "expected_row_count": expected,
                 "emitted_row_count": emitted,
                 "omitted_row_count": max(0, expected - emitted),
-                "verified": expected == emitted,
-                "basis": str(policy.get("public_basis") or "domain_fact_count"),
+                "verified": verified,
+                "basis": public_basis,
             }
     if policy.get("basis") == "physical_marker_rows":
         markers = {re.sub(r"\s+", "", str(value)) for value in policy.get("first_column_values") or []}
@@ -2649,16 +2671,29 @@ def project_community_bundle(
             expected = completeness.get("expected_row_count")
             independently_counted = completeness.get("basis") != "emitted_records_only"
             if independently_counted:
-                warnings.append(
-                    {
-                        "code": "DATASET_ROW_COUNT_MISMATCH",
-                        "level": "error",
-                        "message": (
-                            f"dataset {dataset.public.get('id')} emitted {emitted} of {expected} expected records"
-                        ),
-                        "dataset_id": str(dataset.public.get("id") or ""),
-                    }
-                )
+                if emitted == expected:
+                    warnings.append(
+                        {
+                            "code": "DATASET_VERIFICATION_BLOCKED",
+                            "level": "error",
+                            "message": (
+                                f"dataset {dataset.public.get('id')} emitted the expected {expected} records "
+                                "but domain quality did not permit verification"
+                            ),
+                            "dataset_id": str(dataset.public.get("id") or ""),
+                        }
+                    )
+                else:
+                    warnings.append(
+                        {
+                            "code": "DATASET_ROW_COUNT_MISMATCH",
+                            "level": "error",
+                            "message": (
+                                f"dataset {dataset.public.get('id')} emitted {emitted} of {expected} expected records"
+                            ),
+                            "dataset_id": str(dataset.public.get("id") or ""),
+                        }
+                    )
             else:
                 warnings.append(
                     {

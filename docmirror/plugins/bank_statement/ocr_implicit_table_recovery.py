@@ -696,7 +696,7 @@ def _choose_amount_balance(
 def _repair_balance_chain_rows(rows: list[list[str]]) -> list[list[str]]:
     """Choose amount/balance orientation that minimizes page-local chain breaks."""
     if len(rows) < 2:
-        return rows
+        return [_clear_repair_marker(row) for row in rows]
     candidate_rows: list[list[list[str]]] = []
     for row in rows:
         candidates = [row]

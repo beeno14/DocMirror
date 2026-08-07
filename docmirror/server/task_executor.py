@@ -79,7 +79,7 @@ async def execute_parse_task(
     *,
     output_root: Path,
     task_id: str,
-    timeout_s: float = 300.0,
+    timeout_s: float = 1800.0,
 ) -> TaskResult:
     """Parse one or more files and atomically publish a terminal manifest.
 
@@ -146,6 +146,7 @@ async def execute_parse_task(
                     ),
                     timeout=timeout_s,
                 )
+            result_view = result.to_read_view() if callable(getattr(result, "to_read_view", None)) else result
             artifact_dir = task_dir / "files" / file_id if batch else task_dir
             _written_task_id, written = write_outputs(
                 result,
@@ -189,13 +190,13 @@ async def execute_parse_task(
             }
             from docmirror.evidence.quality import build_quality_summary
 
-            quality_summary = build_quality_summary(result)
-            document_type = str(getattr(getattr(result, "entities", None), "document_type", "") or "generic")
+            quality_summary = build_quality_summary(result_view)
+            document_type = str(getattr(getattr(result_view, "entities", None), "document_type", "") or "generic")
             entry.update(
                 {
                     "status": "success",
                     "document_type": document_type,
-                    "page_count": int(getattr(result, "page_count", 0) or 0),
+                    "page_count": int(getattr(result_view, "page_count", 0) or 0),
                     "quality_summary": quality_summary,
                     "artifacts": input_artifacts,
                     "edition_availability": public_availability,

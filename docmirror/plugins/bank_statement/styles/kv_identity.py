@@ -25,6 +25,21 @@ PARSER_ID = "kv_identity"
 _KV_IN_CELL_RE = re.compile(r"^([^:：]+)[:：]\s*(.+)$")
 
 
+def _matches_identity_key(key: str, candidate: str) -> bool:
+    """Match a leading identity label without accepting transaction prose."""
+    normalized_key = re.sub(r"\s+", " ", key).strip()
+    normalized_candidate = re.sub(r"\s+", " ", candidate).strip()
+    if normalized_key.casefold() == normalized_candidate.casefold():
+        return True
+    return bool(
+        re.match(
+            rf"^{re.escape(normalized_candidate)}(?:\s|[/／]|[（(])",
+            normalized_key,
+            re.I,
+        )
+    )
+
+
 def enrich_identity_fields(
     ctx: StyleContext,
     identity_fields: dict[str, dict],
@@ -50,7 +65,7 @@ def enrich_identity_fields(
                         if field_name in fields:
                             continue
                         for ck in candidate_keys:
-                            if ck in key:
+                            if _matches_identity_key(key, ck):
                                 fields[field_name] = {
                                     "raw_name": key,
                                     "raw_value": val,
