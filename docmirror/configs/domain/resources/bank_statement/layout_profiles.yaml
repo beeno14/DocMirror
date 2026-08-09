@@ -63,8 +63,6 @@ profiles:
         - 余额
       摘要:
         - 交易摘要
-      对方账号与户名:
-        - 对方户名
     institution_variants:
       - id: cmb
         display_name: 招行流水
@@ -78,7 +76,6 @@ profiles:
         keywords: ["中国建设银行"]
         column_map:
           交易日期: 交易时间
-          对方户名: 对方账号与户名
       - id: icbc
         display_name: 工行流水
         keywords: ["中国工商银行"]
@@ -121,7 +118,6 @@ profiles:
           借方发生额: 交易金额
           贷方发生额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: spdb
         display_name: 浦发银行
@@ -132,7 +128,6 @@ profiles:
           交易金额（收入）: 交易金额
           交易金额（支出）: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: comm
         display_name: 交通银行
@@ -143,7 +138,6 @@ profiles:
           借方发生额: 交易金额
           贷方发生额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: ceb
         display_name: 光大银行
@@ -154,7 +148,6 @@ profiles:
           借方金额: 交易金额
           贷方金额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: cmbc
         display_name: 民生银行
@@ -165,7 +158,6 @@ profiles:
           借方发生额: 交易金额
           贷方发生额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: hxb
         display_name: 华夏银行
@@ -176,7 +168,6 @@ profiles:
           借方发生额: 交易金额
           贷方发生额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: cib
         display_name: 兴业银行
@@ -187,7 +178,6 @@ profiles:
           借方发生额: 交易金额
           贷方发生额: 交易金额
           余额: 账户余额
-          对方户名: 对方账号与户名
         amount_sign_rule: split
       - id: cgb
         display_name: 广发银行

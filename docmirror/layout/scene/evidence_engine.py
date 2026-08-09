@@ -426,6 +426,10 @@ class EvidenceEngine(BaseMiddleware):
                     )
                 ]
 
+        flattened_evidence = self._flattened_bank_ledger_evidence(result, title_text)
+        if flattened_evidence is not None:
+            return [flattened_evidence]
+
         nonempty_rows = [
             row
             for table in tables
@@ -465,6 +469,68 @@ class EvidenceEngine(BaseMiddleware):
                 ),
             )
         ]
+
+    def _flattened_bank_ledger_evidence(
+        self,
+        result: ParseResult,
+        _title_text: str,
+    ) -> Evidence | None:
+        """Recognize bank ledgers whose physical columns collapsed during reconstruction."""
+        if not result.pages:
+            return None
+
+        header_candidates = [
+            self._normalized_match_text(str(block.content or ""))
+            for block in result.pages[0].texts
+            if block.content
+        ]
+        marker_groups = (
+            ("交易日期", "交易时间", "记账日期"),
+            ("借方(出账)", "借方（出账）", "借方发生额", "转出金额"),
+            ("贷方(入账)", "贷方（入账）", "贷方发生额", "转入金额"),
+            ("余额", "账户余额"),
+            ("收(付)方名称", "收（付）方名称", "对方户名", "交易对手"),
+            ("收(付)方账号", "收（付）方账号", "对方账号", "对方账户"),
+        )
+        if not any(
+            all(
+                any(self._normalized_match_text(marker) in candidate for marker in group)
+                for group in marker_groups
+            )
+            for candidate in header_candidates
+        ):
+            return None
+
+        transaction_rows = 0
+        for page in result.pages[:2]:
+            transaction_rows += sum(
+                self._is_flattened_bank_transaction_text(str(block.content or ""))
+                for block in page.texts
+            )
+        if transaction_rows < 5:
+            return None
+
+        return Evidence(
+            source="bank_ledger_structure",
+            category="bank_statement",
+            weight=0.82,
+            direction=1,
+            detail=(
+                "flattened bank ledger header with debit, credit, balance and counterparty fields; "
+                f"transaction_rows={transaction_rows}"
+            ),
+        )
+
+    @staticmethod
+    def _is_flattened_bank_transaction_text(text: str) -> bool:
+        """Return whether a flattened text row still has a date and two monetary values."""
+        normalized = unicodedata.normalize("NFKC", str(text or ""))
+        has_date = re.search(
+            r"(?:19|20)\d{2}(?:[-/.年]\d{1,2})(?:[-/.月]\d{1,2})",
+            normalized,
+        )
+        amounts = re.findall(r"(?<![\d,])[+-]?\d[\d,]*\.\s*\d{2}(?!\d)", normalized)
+        return bool(has_date) and len(amounts) >= 2
 
     def _bank_reconciliation_title_evidence(
         self,

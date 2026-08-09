@@ -19,6 +19,7 @@ from docmirror.models.entities.parse_result import (
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
+    _repair_balance_chain_rows,
     recover_ocr_implicit_ledger_tables,
     recovered_ocr_implicit_row_count,
 )
@@ -31,6 +32,26 @@ def _table_result(rows: list[list[str]]) -> ParseResult:
         rows=[TableRow(cells=[CellValue(text=text) for text in row]) for row in rows[1:]],
     )
     return ParseResult(pages=[PageContent(page_number=1, tables=[table])])
+
+
+def test_single_recovered_row_does_not_expose_internal_repair_metadata() -> None:
+    row = [
+        "2024-01-01",
+        "收入",
+        "100.00",
+        "100.00",
+        "转账",
+        "6222000000000000",
+        "测试用户",
+        "",
+        "",
+        "__docmirror_repair_meta__:signed=1",
+        "1",
+    ]
+
+    repaired = _repair_balance_chain_rows([row])
+
+    assert repaired[0][9] == ""
 
 
 def test_recover_ocr_implicit_table_keeps_valid_rows_with_page_noise() -> None:
@@ -474,7 +495,7 @@ def test_recover_native_corporate_detail_with_transaction_occurrence_amount_head
     )
     raw_records = grid_standard.extract_transactions(ctx, BankStatementCommunityPlugin())
     assert len(raw_records) == 5
-    assert raw_records[1]["对方账号与户名"] == "企网汇划手续费收入"
+    assert raw_records[1]["对方户名"] == "企网汇划手续费收入"
 
 
 def test_recover_borderless_page_emitted_as_one_ocr_text_block() -> None:

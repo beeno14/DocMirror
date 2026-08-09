@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import io
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,13 +25,21 @@ from docmirror.models.entities.parse_result import (
 from docmirror.models.sealed import seal_parse_result
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
 from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
-from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
+from docmirror.plugins.bank_statement.extract_pipeline import (
+    _apply_source_reported_transaction_count,
+    run_bank_statement_extract,
+)
+from docmirror.plugins.bank_statement.header_resolve import detect_headers
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
 from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.styles.grid_standard import normalize_record, normalize_split_debit_credit
-from docmirror.plugins.bank_statement.wide_table_recovery import _select_wide_bank_table, is_wide_bank_header
+from docmirror.plugins.bank_statement.wide_table_recovery import (
+    _normalize_native_grid_table,
+    _select_wide_bank_table,
+    is_wide_bank_header,
+)
 
 
 def test_match_institution_ccb():
@@ -42,9 +51,15 @@ def test_match_institution_ccb():
 
 def test_normalize_table_headers_ccb_alias():
     variant = match_institution("中国建设银行")
-    tables = [[["交易日期", "摘要", "余额"], ["2024-01-01", "转账", "100.00"]]]
+    tables = [
+        [
+            ["交易日期", "摘要", "余额", "对方账号", "对方户名"],
+            ["2024-01-01", "转账", "100.00", "6210000000000000", "测试公司"],
+        ]
+    ]
     normalized = normalize_table_headers(tables, variant=variant)
     assert normalized[0][0][0] == "交易时间"
+    assert normalized[0][0][-2:] == ["对方账号", "对方户名"]
 
 
 def test_split_debit_credit_style_detection():
@@ -960,6 +975,68 @@ def test_wide_table_accepts_direction_embedded_amount_header():
     ]
     assert is_wide_bank_header(table[0]) is True
     assert len(_select_wide_bank_table(table)) == 3
+
+
+def test_explicit_counter_account_header_overrides_earlier_own_account_column() -> None:
+    table = [
+        ["交易日期", "账号", "摘要", "收入/支出金额", "余额", "对方户名", "对方账号"],
+        ["2023-03-03", "1910213201003000000", "转账", "-10.00", "90.00", "测试对方", "6222000000000000"],
+    ]
+
+    header = detect_headers([table], BankStatementCommunityPlugin().column_registry)
+
+    assert header is not None
+    assert header.col_map["counter_account"] == 6
+
+
+def test_source_reported_total_overrides_single_page_identity_count() -> None:
+    identity = {
+        "total_transactions": {
+            "raw_value": "25",
+            "normalized_value": "25",
+            "source": "header.kv",
+        }
+    }
+
+    _apply_source_reported_transaction_count(identity, 146)
+
+    assert identity["total_transactions"] == {
+        "raw_name": "page_footer_transaction_count",
+        "raw_value": "146",
+        "normalized_value": "146",
+        "data_type": "integer",
+        "source": "page_footer.sum",
+    }
+
+
+def test_native_grid_recovers_watermarked_combined_amount_header_with_provenance() -> None:
+    matrix = [
+        ["交易日期", "摘要", "2 C 9 收入/支出金额", "余额", "对方户名"],
+        ["2023-03-03 12:43:17", "开户", "8 4 +0.00", "0.00", "（空）"],
+        ["行 20银23-03-03 12:51:10", "卡存", "9 2 +60,000.00", "6 2 60,000.00", "（空）"],
+    ]
+    rows = [
+        SimpleNamespace(cells=[(10.0, float(index * 20), 20.0, float(index * 20 + 10))] * len(matrix[0]))
+        for index in range(len(matrix))
+    ]
+    table = SimpleNamespace(extract=lambda: matrix, rows=rows)
+
+    recovered = _normalize_native_grid_table(
+        table,
+        page_number=3,
+        table_index=1,
+        money_hints={
+            ("2023-03-03", "12:43:17"): [("+0.00", "0.00")],
+            ("2023-03-03", "12:51:10"): [("+60,000.00", "60,000.00")],
+        },
+    )
+
+    assert is_wide_bank_header(recovered[0]) is True
+    assert recovered[1][2:4] == ["+0.00", "0.00"]
+    assert recovered[2][0] == "2023-03-03 12:51:10"
+    assert recovered[2][2:4] == ["+60,000.00", "60,000.00"]
+    assert recovered[1][-4:] == ["3", "10.000,20.000,20.000,30.000", "native:p3:t1", "1"]
+    assert len(_select_wide_bank_table(recovered)) == 3
 
 
 _SHANGRAO_HEADERS = [

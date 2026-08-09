@@ -45,3 +45,5 @@ def test_header_aliases_resolve():
     profile = get_profile("borderless_ledger_bank")
     assert resolve_header_aliases(profile, "交易日期") == "交易时间"
     assert resolve_header_aliases(profile, "交易日") == "交易时间"
+    assert resolve_header_aliases(profile, "对方户名") == "对方户名"
+    assert resolve_header_aliases(profile, "对方账号与户名") == "对方账号与户名"

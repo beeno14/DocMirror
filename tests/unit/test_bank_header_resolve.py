@@ -34,6 +34,15 @@ def test_detect_headers_succeeds_on_ocr_aliases():
     assert len(header.col_map) >= 3
 
 
+def test_explicit_debit_credit_flag_wins_over_transaction_type_alias():
+    headers = ["序号", "交易日期", "交易时间", "交易类型", "借贷", "交易金额", "余额"]
+
+    header = detect_headers([[headers]], BANK_COLUMN_REGISTRY, prefer_strict=True)
+
+    assert header is not None
+    assert header.col_map["direction"] == 4
+
+
 def test_compact_date_row_detection():
     from docmirror.plugins.bank_statement.row_extract import row_has_transaction_data
 

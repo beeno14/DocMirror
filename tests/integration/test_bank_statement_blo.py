@@ -10,9 +10,10 @@ from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement
 from tests.unit.test_pipe_text_table_builder import _synthetic_boc_text
 
 
-def test_blo_pipe_text_cqf_success():
+def test_blo_pipe_text_cqf_requires_source_page_provenance():
     plugin = BankStatementCommunityPlugin()
     result = run_bank_statement_extract(None, _synthetic_boc_text(), plugin)
-    assert result.style_meta.extract_status == "success"
+    assert result.style_meta.extract_status == "degraded"
     assert result.style_meta.canonical_extracted >= 1
     assert result.records
+    assert any(warning.startswith("BANK_SOURCE_PAGE_COVERAGE_LOW:") for warning in result.warnings)

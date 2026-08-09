@@ -89,6 +89,20 @@ def test_extract_identity_from_header():
     assert "2022-04-01" in identity["query_period"]
 
 
+def test_extract_identity_accepts_rural_credit_cooperative_as_institution():
+    text = (
+        "交易明细清单\n"
+        "户名：吴文坤\n"
+        "账号/卡号：6230361108033553943\n"
+        "开户机构：东山县农村信用合作联社陈城信用社\n"
+        "序号 交易日期 收入/支出 交易金额 账户余额 对方户名\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["bank_name"] == "东山县农村信用合作联社陈城信用社"
+
+
 def test_extract_identity_from_header_when_holder_is_nearby_line():
     text = (
         "账号: 6230 **** 3462 开户行: 江苏镇江农村商业银行 起止日期: 2024-07-14 — 2025-01-14\n"
@@ -170,3 +184,60 @@ def test_horizontal_header_supports_hyphenated_account_and_chinese_dates():
     assert identity["account_holder"] == "测试农业科技有限公司"
     assert identity["currency"] == "CNY"
     assert identity["query_period"] == "2025-11-01 ~ 2025-12-31"
+
+
+def test_header_transaction_time_range_is_an_explicit_query_period() -> None:
+    text = (
+        "银行交易明细\n"
+        "账号:651204680300015 账户名:测试科技有限公司 币种:人民币\n"
+        "交易时间:2025-07-01 至 2025-12-31\n"
+        "日期 支出 收入 余额 对方账户 对方户名 摘要/附言\n"
+        "2025-09-21 0.04 306.09 结息\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["query_period"] == "2025-07-01 ~ 2025-12-31"
+
+
+def test_vertical_bilingual_header_stops_before_counterparty_labels() -> None:
+    text = (
+        "交通银行个人客户交易清单\n"
+        "6222620640011272413\n"
+        "账号/卡号Account/Card No:\n"
+        "周深\n"
+        "户名Account Name:\n"
+        "2022-05-26\n"
+        "查询起日Query Starting Date:\n"
+        "2023-05-26\n"
+        "查询止日Query Ending Date:\n"
+        "人民币 CNY\n"
+        "币种Currency:\n"
+        "Serial\n"
+        "交易日期\n"
+        "交易时间\n"
+        "交易类型\n"
+        "借贷\n"
+        "交易金额\n"
+        "余额\n"
+        "对方账号\n"
+        "对方户名\n"
+        "序号\n"
+        "1\n2022-08-05\n"
+    )
+
+    identity = extract_identity_from_header(text)
+
+    assert identity["account_holder"] == "周深"
+    assert identity["account_number"] == "6222620640011272413"
+    assert identity["query_period"] == "2022-05-26 ~ 2023-05-26"
+
+
+def test_split_debit_credit_table_at_document_start_does_not_promote_summary_account() -> None:
+    text = (
+        "交易日期\n借方(出账)\n贷方(入账)\n余额摘要\n收(付)方名称\n收(付)方账号\n交易类型\n"
+        "2025-03-21 31.55 27,486.46 收息，结息账号:999019305110001 "
+        "应付利息-单位活期存款利息 912351220611001810 账户结息\n"
+    )
+
+    assert extract_identity_from_header(text) == {}

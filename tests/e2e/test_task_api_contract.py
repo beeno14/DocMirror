@@ -10,7 +10,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from docmirror.models.entities.parse_result import DocumentEntities, ParseResult, ResultStatus
+from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult, ResultStatus
+from docmirror.models.sealed import seal_parse_result
 from docmirror.server.api import app
 
 
@@ -56,6 +57,32 @@ def test_task_api_wait_writes_artifacts(tmp_path: Path, monkeypatch):
     assert dataset["row_count"] == len(dataset["rows"]) == 2
     assert [row["record_id"] for row in dataset["rows"]] == ["api:001", "api:002"]
     assert dataset["rows"][0]["raw"]["value"] == "原值A"
+
+
+def test_task_api_routes_cjk_pdf_upload(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DOCMIRROR_TASK_OUTPUT_DIR", str(tmp_path))
+    parsed_names: list[str] = []
+
+    async def fake_perceive(path, _options):
+        parsed_names.append(Path(path).name)
+        result = _mirror()
+        result.pages = [PageContent(page_number=1)]
+        return seal_parse_result(result)
+
+    monkeypatch.setattr("docmirror.server.task_executor.perceive_document", fake_perceive)
+    client = TestClient(app)
+    original_name = "赵思雯个人征信.pdf"
+    response = client.post(
+        "/v1/tasks?wait=true",
+        files={"file": (original_name, b"PDF", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    task = response.json()
+    assert task["status"] == "success"
+    assert parsed_names == ["001_upload.pdf"]
+    assert task["inputs"][0]["document_type"] == "business_license"
+    assert task["inputs"][0]["page_count"] == 1
 
 
 def test_task_api_always_uses_fixed_delivery(tmp_path: Path, monkeypatch):

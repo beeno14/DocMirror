@@ -148,9 +148,56 @@ def _match_row(
     matcher = ColumnMatcher(registry)
     normalized_row = [normalize_header_cell(c) for c in row]
     col_map = matcher.match(normalized_row)
+    col_map = prefer_explicit_counterparty_columns(normalized_row, col_map, registry)
+    col_map = prefer_explicit_direction_column(normalized_row, col_map)
     if len(col_map) >= min_columns:
         return [str(c or "").strip() for c in row], col_map
     return None
+
+
+def prefer_explicit_counterparty_columns(
+    header_cells: list[str],
+    col_map: dict[str, int],
+    registry: dict[str, Any],
+) -> dict[str, int]:
+    """Let an exact counterparty header override an earlier fuzzy account match."""
+    resolved = dict(col_map)
+    for field_name in ("counter_account", "counter_party"):
+        variants: set[str] = set()
+        for canonical_name, mapping in registry.items():
+            if getattr(mapping, "field", "") != field_name:
+                continue
+            variants.add(normalize_header_cell(canonical_name))
+            variants.update(normalize_header_cell(alias) for alias in (getattr(mapping, "aliases", None) or []))
+        exact_index = next((index for index, cell in enumerate(header_cells) if cell in variants), None)
+        if exact_index is not None:
+            resolved[field_name] = exact_index
+    return resolved
+
+
+def prefer_explicit_direction_column(header_cells: list[str], col_map: dict[str, int]) -> dict[str, int]:
+    """Prefer a dedicated debit/credit flag over a transaction-type column."""
+    explicit_markers = {
+        "借贷",
+        "借/贷",
+        "借贷标志",
+        "收/支",
+        "收入/支出",
+        "方向",
+        "交易方向",
+        "dcflg",
+    }
+    explicit_index = next(
+        (
+            index
+            for index, cell in enumerate(header_cells)
+            if re.sub(r"\s+", "", str(cell or "")).lower() in explicit_markers
+        ),
+        None,
+    )
+    if explicit_index is None:
+        return col_map
+    return {**col_map, "direction": explicit_index}
 
 
 def best_header_match(

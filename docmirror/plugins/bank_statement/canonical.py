@@ -91,12 +91,16 @@ def build_style_meta(
     expected_candidates: list[int] = []
     source = ""
     pipe_failed = False
+    expected_evidence_source = ""
+    expected_evidence_confidence = 0.0
     stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
     if reconstruction is not None:
         reconstruction_expected = int(getattr(reconstruction, "expected_primary_rows", 0) or 0)
         if stitched_continuation_rows > 0:
             reconstruction_expected = max(0, reconstruction_expected - stitched_continuation_rows)
         source = getattr(reconstruction, "source", "") or ""
+        expected_evidence_source = str(getattr(reconstruction, "expected_evidence_source", "") or "")
+        expected_evidence_confidence = float(getattr(reconstruction, "expected_evidence_confidence", 0.0) or 0.0)
         pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
         if (
             source
@@ -105,6 +109,7 @@ def build_style_meta(
                 "canonical_physical_tables",
                 "canonical_evidence_table",
                 "native_wide_table",
+                "positioned_record_block",
                 "ocr_implicit_table",
             }
             and reconstruction_expected > 0
@@ -119,8 +124,28 @@ def build_style_meta(
     canonical_expected = canonical_expected_from_parse_result(parse_result)
     if canonical_expected > 0 and stitched_continuation_rows > 0:
         canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
+    # A source-reported total is independent of every parser candidate and must
+    # remain the strongest denominator. Positioned blocks and a selected evidence
+    # table are stronger than a sparse physical-table estimate when no such total exists.
     if source_reported_count > 0:
         expected = int(source_reported_count)
+    elif (
+        expected_evidence_source
+        in {
+            "split_footer",
+            "header_total",
+            "page_footer",
+            "page_transaction_anchors",
+            "physical_rows",
+            "positioned_date_anchors",
+            "positioned_record_blocks",
+        }
+        and expected_evidence_confidence >= 0.85
+        and reconstruction_expected > 0
+    ):
+        expected = max(reconstruction_expected, canonical_expected)
+    elif source in {"positioned_record_block", "canonical_evidence_table"} and reconstruction_expected > 0:
+        expected = max(reconstruction_expected, canonical_expected)
     elif canonical_expected > 0:
         expected = canonical_expected
     else:
@@ -270,7 +295,8 @@ def records_from_raw_transactions(
         raw = dict(raw_txn)
         raw.setdefault("_style_id", style_id)
         normalized = normalize_fn(raw_txn)
-        raw_public = public_record_raw(raw)
+        source_raw = raw_txn.get("_source_raw")
+        raw_public = public_record_raw(dict(source_raw)) if isinstance(source_raw, dict) else public_record_raw(raw)
         record = {
             "row_index": idx,
             "raw": raw_public,
@@ -279,6 +305,22 @@ def records_from_raw_transactions(
         if callable(canonical_raw_fn):
             record["canonical_raw"] = canonical_raw_fn(raw_public, normalized)
         source = raw_txn.get("_source")
+        if not isinstance(source, dict):
+            try:
+                source_page = int(str(raw_txn.get("_source_page") or "").strip())
+            except (TypeError, ValueError):
+                source_page = 0
+            if source_page > 0:
+                source = {
+                    "source_page": source_page,
+                    "page_range": [source_page, source_page],
+                }
+                table_id = str(raw_txn.get("_source_table_id") or "").strip()
+                row_index = str(raw_txn.get("_source_row_index") or "").strip()
+                if table_id:
+                    source["table_id"] = table_id
+                if row_index.isdigit():
+                    source["source_row_index"] = int(row_index)
         if isinstance(source, dict):
             record["source"] = dict(source)
         records.append(record)
