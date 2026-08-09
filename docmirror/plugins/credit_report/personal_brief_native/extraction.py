@@ -185,9 +185,18 @@ def _personal_header_datasets(
         compact,
     )
     if not marital_status_match:
+        # Unlabelled marital status is printed next to the primary identity,
+        # so constrain the fallback to that metadata tail.  Searching the
+        # whole header incorrectly matched words such as ``其他用途`` in the
+        # confidentiality notice before reaching the actual ``已婚`` value.
+        identity_tail_start = id_number_match.end() if id_number_match else 0
+        identity_tail_end = compact.find("其他证件信息", identity_tail_start)
+        identity_tail = compact[
+            identity_tail_start : identity_tail_end if identity_tail_end >= 0 else None
+        ]
         marital_status_match = re.search(
             r"(未婚|已婚|初婚|再婚|离婚|丧偶|其他|未说明|未知)",
-            compact,
+            identity_tail,
         )
     report_time = (
         f"{int(report_time_match.group(1)):04d}-{int(report_time_match.group(2)):02d}-"
@@ -358,8 +367,32 @@ def _personal_summary_records(
         "personal_repayment_liability_count": summary.get("source_personal_liability_count"),
         "enterprise_repayment_liability_count": summary.get("source_enterprise_liability_count"),
     }
+    present_singletons: set[str] = set()
+    for source_page in getattr(parse_result, "pages", None) or []:
+        for source_table in getattr(source_page, "tables", None) or []:
+            headers = {
+                re.sub(r"\s+", "", str(value or ""))
+                for value in (getattr(source_table, "headers", None) or [])
+            }
+            raw_rows = (getattr(source_table, "metadata", None) or {}).get("raw_rows") or []
+            for raw_row in raw_rows:
+                cells = [re.sub(r"\s+", "", str(cell or "")) for cell in raw_row]
+                if cells[:1] == ["账户数"] and len(cells) >= 3 and {
+                    "资产处置信息",
+                    "垫款信息",
+                } <= headers:
+                    present_singletons.update(
+                        {"asset_disposition_count", "guarantor_compensation_count"}
+                    )
+                elif cells[:1] == ["相关还款责任账户数"] and len(cells) >= 3:
+                    present_singletons.update(
+                        {
+                            "personal_repayment_liability_count",
+                            "enterprise_repayment_liability_count",
+                        }
+                    )
     for metric, value in singleton_metrics.items():
-        if value is None:
+        if value is None and metric not in present_singletons:
             continue
         sequence += 1
         records.append(
@@ -370,7 +403,7 @@ def _personal_summary_records(
                 "metric": metric,
                 "business_category": "all",
                 "value": value,
-                "reporting_status": "reported",
+                "reporting_status": "reported" if value is not None else "not_reported",
                 "source_anchor": source_anchors[metric],
                 "source": "personal_brief_summary_table",
                 "source_refs": [dict(ref) for ref in summary_refs],

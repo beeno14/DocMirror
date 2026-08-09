@@ -48,9 +48,9 @@ def test_jiangsu_yuanyou_preserves_reported_zeroes_and_display_scope() -> None:
         for row in datasets["enterprise_credit_accounts"]["rows"]
         if row["normalized"]["account_identifier"] == _ACTIVE_LOAN_ACCOUNT
     )
-    assert account["current_overdue_amount"] == "0"
+    assert account["overdue_total"] == "0"
     assert account["overdue_principal"] == "0"
-    assert account["current_overdue_periods"] == 0
+    assert account["overdue_months"] == 0
     assert account["current_overdue"] is False
     assert account["current_overdue_status"] == "not_overdue"
 

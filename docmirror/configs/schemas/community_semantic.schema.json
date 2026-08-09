@@ -6,6 +6,30 @@
   "type": "object",
   "additionalProperties": true,
   "not": {"required": ["public_records"]},
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema": {
+            "properties": {
+              "document_type": {"const": "enterprise_credit_report"}
+            },
+            "required": ["document_type"]
+          }
+        },
+        "required": ["schema"]
+      },
+      "then": {
+        "required": ["extraction"],
+        "properties": {
+          "extraction": {"$ref": "#/$defs/enterpriseExtraction"}
+        }
+      },
+      "else": {
+        "not": {"required": ["extraction"]}
+      }
+    }
+  ],
   "required": [
     "schema",
     "source",
@@ -139,7 +163,6 @@
       "type": "object",
       "additionalProperties": true,
       "required": [
-        "semantic_json",
         "content_md",
         "enhanced_reading_md",
         "datasets_dir",
@@ -156,6 +179,21 @@
     }
   },
   "$defs": {
+    "enterpriseExtraction": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["protocol", "version", "status", "summary", "failures"],
+      "properties": {
+        "protocol": {"const": "pboc-enterprise-extraction-failure"},
+        "version": {"const": "1.0.0"},
+        "status": {"enum": ["complete", "partial", "failed"]},
+        "summary": {"type": "object", "additionalProperties": true},
+        "failures": {
+          "type": "array",
+          "items": {"type": "object", "additionalProperties": true}
+        }
+      }
+    },
     "semanticBlock": {
       "type": "object",
       "additionalProperties": true,

@@ -14,14 +14,85 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
-from typing import Any
+from collections import Counter, defaultdict
+from copy import deepcopy
+from datetime import date, datetime
+from typing import Any, Iterable, Mapping
 
+from docmirror.plugins.credit_report.currency_codes import (
+    CURRENCY_CODE_BY_ALIAS,
+    ISO_4217_CURRENT_CODES,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.collapsed_clusters import (
+    decode_employment_basic_cluster,
+    decode_labeled_cluster,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+    is_explicit_source_absence,
+    normalize_pboc_field,
+    pboc_controlled_vocabulary,
+    validate_pboc_field,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.quality import (
+    cn_identity_number_valid,
+    header_field_valid,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.summary_fallback import (
+    decode_credit_business_overview_text_line,
+    decode_credit_business_overview_text_lines,
+    is_credit_business_overview_text_header,
+)
 from docmirror.plugins.credit_report.value_utils import stable_record_id
 
-_DATE_RE = re.compile(r"(20\d{2})[.年/-]\s*(\d{1,2})(?:[.月/-]\s*(\d{1,2}))?")
-_AS_OF_RE = re.compile(r"截至\s*(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
-_STATUS_CODES = frozenset({"*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#"})
+_DATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*[.年/-]\s*(\d{1,2})"
+    r"(?:\s*[.月/-]\s*(\d{1,2})\s*日?)?(?!\d)"
+)
+_FULL_DATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*[.年/-]\s*(\d{1,2})"
+    r"\s*[.月/-]\s*(\d{1,2})\s*日?(?!\d)"
+)
+_CANONICAL_FULL_DATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*[.,年/-]\s*(\d{1,2})"
+    r"\s*[.,月/-]\s*(\d{1,2})\s*日?(?!\d)"
+)
+_MONTH_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})\s*[.年/-]\s*(\d{1,2})(?:\s*月)?"
+    r"(?!\s*[.月/-]\s*\d)(?!\d)"
+)
+_AS_OF_RE = re.compile(r"截至\s*((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_STATUS_CODES = frozenset(
+    {"*", "/", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#"}
+)
+_INQUIRY_REASONS = (
+    "本人查询",
+    "贷后管理",
+    "贷款审批",
+    "信用卡审批",
+    "担保资格审查",
+    "融资审批",
+    "保前审查",
+    "保后管理",
+    "客户准入资格审查",
+    "资信审查",
+    "法人代表、负责人、高管等资信审查",
+    "特约商户实名审查",
+    "异议处理",
+    "司法调查",
+)
+_INQUIRY_REASON_REPAIRS = {
+    "货后管理": "贷后管理",
+    "贷后智理": "贷后管理",
+    "货款审批": "贷款审批",
+    "资款审批": "贷款审批",
+    "信用卡审抛": "信用卡审批",
+}
+
+_CURRENCY_TOKEN_ALIASES = {
+    **CURRENCY_CODE_BY_ALIAS,
+    **{code: code for code in ISO_4217_CURRENT_CODES},
+    "RMB": "CNY",
+}
 
 _ACCOUNT_LABELS = frozenset(
     {
@@ -126,9 +197,131 @@ def _business_text(value: Any) -> str:
     return _compact(value)
 
 
+_ACCOUNT_SCALAR_CONTRACT_ROLES = {
+    "business_type": "account_business_type",
+    "guarantee_type": "guarantee_type",
+    "repayment_frequency": "repayment_frequency",
+    "repayment_method": "repayment_method",
+}
+
+
+def _account_institution(
+    value: Any,
+    *,
+    independently_corroborated: bool = False,
+) -> str | None:
+    """Normalize one exact institution slot without completing a legal name.
+
+    Whitespace removal and the plugin's bounded glyph/debris corrections are
+    permitted.  A visibly broken legal-name shape (for example ``银行股份分行``)
+    is not completed from a document-wide institution catalogue: that would
+    silently choose an individualized business value which the source cell did
+    not establish.
+    """
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        institution_name_has_separated_leading_han,
+        institution_slot_is_unambiguous,
+        normalize_institution_name,
+    )
+
+    raw = _clean(value)
+    if not institution_slot_is_unambiguous(raw):
+        return None
+    if institution_name_has_separated_leading_han(raw) and not independently_corroborated:
+        return None
+    normalized = normalize_institution_name(raw)
+    compact = _compact(normalized)
+    if not compact or compact == "本人":
+        return compact or None
+    if not re.search(r"[\u3400-\u9fffA-Za-z]", compact):
+        return None
+    if any(label in compact for label in _ACCOUNT_LABELS):
+        return None
+    if _DATE_RE.search(compact) or re.search(r"[A-Z][A-Z0-9-]{7,}\d", compact, re.IGNORECASE):
+        return None
+    # Legal-form fragments cannot jump directly into a branch suffix.  In
+    # particular, ``家 广发银行股份 分行`` used to pass the broad ``分行``
+    # suffix test and became silently wrong business data.
+    if re.search(r"(?:银行)?股份(?:支行|分行|营业部|$)", compact):
+        return None
+    if re.search(r"有限(?:支行|分行|营业部|$)", compact):
+        return None
+    return normalized
+
+
 def _identifier(value: Any) -> str | None:
     compact = re.sub(r"\s+", "", str(value or "")).strip()
     return compact if compact and compact != "--" else None
+
+
+def _typed_identifier(value: Any) -> str | None:
+    identifier = _identifier(value)
+    if not identifier or not re.fullmatch(r"[A-Z0-9-]{8,80}", identifier, re.IGNORECASE):
+        return None
+    if not re.search(r"[A-Z]", identifier, re.IGNORECASE) or not re.search(r"\d", identifier):
+        return None
+    return identifier
+
+
+_LIABILITY_CANONICAL_FIELDS = (
+    "institution",
+    "business_type",
+    "open_date",
+    "due_date",
+    "responsibility_type",
+    "responsibility_amount",
+    "currency",
+    "contract_number",
+    "related_party_name",
+    "related_party_id_type",
+    "related_party_id_number",
+    "snapshot_date",
+    "balance",
+    "five_tier_class",
+    "overdue_months",
+    "repayment_status_code",
+)
+
+
+def _liability_exact_replay_key(record: Mapping[str, Any]) -> tuple[str, ...] | None:
+    """Return an exact business fingerprint, never a fuzzy record identity."""
+
+    contract_number = _compact(record.get("contract_number"))
+    if not contract_number:
+        return None
+    return (
+        contract_number,
+        *(
+            _compact(record.get(field_name))
+            for field_name in _LIABILITY_CANONICAL_FIELDS
+            if field_name != "contract_number"
+        ),
+    )
+
+
+def _dedupe_liability_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Suppress only byte-equivalent canonical liability observations.
+
+    A former implementation merged identifier prefixes or any observations
+    sharing three business fields.  Different guarantee contracts commonly do
+    share borrower, dates, and amounts, so that policy could silently erase a
+    real record.  Candidate B now reconciles only exact contract/ordinal
+    identities; this compatibility helper removes exact replays only.
+    """
+
+    kept: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    for record in records:
+        replay_key = _liability_exact_replay_key(record)
+        if replay_key is not None and replay_key in seen:
+            continue
+        if replay_key is not None:
+            seen.add(replay_key)
+        kept.append(record)
+    for sequence, record in enumerate(kept, start=1):
+        record["sequence"] = sequence
+    return kept
 
 
 def _number(value: Any) -> int | str | None:
@@ -140,30 +333,174 @@ def _number(value: Any) -> int | str | None:
     return raw
 
 
+def _valid_date_spans(value: Any) -> list[tuple[tuple[int, int], str]]:
+    """Return every independently valid date/month span in one scalar slot."""
+
+    raw = str(value or "").strip()
+    dated_spans: list[tuple[tuple[int, int], str]] = []
+    occupied: list[tuple[int, int]] = []
+    for match in _CANONICAL_FULL_DATE_RE.finditer(raw):
+        year, month, day = match.groups()
+        normalized_year = int(year)
+        normalized_month = int(month)
+        if not 1 <= normalized_month <= 12:
+            continue
+        normalized_day = int(day)
+        try:
+            date(normalized_year, normalized_month, normalized_day)
+        except ValueError:
+            continue
+        occupied.append(match.span())
+        dated_spans.append(
+            (match.span(), f"{normalized_year:04d}-{normalized_month:02d}-{normalized_day:02d}")
+        )
+    for match in _MONTH_RE.finditer(raw):
+        if any(match.start() < end and match.end() > start for start, end in occupied):
+            continue
+        year, month = match.groups()
+        normalized_year = int(year)
+        normalized_month = int(month)
+        if 1 <= normalized_month <= 12:
+            dated_spans.append(
+                (match.span(), f"{normalized_year:04d}-{normalized_month:02d}")
+            )
+    return sorted(dated_spans)
+
+
+def _short_ascii_date_residue(value: Any) -> str | None:
+    """Return bounded non-business OCR debris, never a second field value.
+
+    A recurring scan watermark contributes one isolated ASCII glyph beside a
+    date cell.  Digits, non-ASCII text, and longer words can carry business
+    meaning and therefore cannot be discarded by this correction.
+    """
+
+    residue = re.sub(r"\s+", "", str(value or ""))
+    if not residue:
+        return ""
+    if not residue.isascii() or len(residue) > 3 or any(character.isdigit() for character in residue):
+        return None
+    if not all(character.isalpha() or character in r"!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~" for character in residue):
+        return None
+    # More than two letters is a short word/label, not an isolated watermark
+    # glyph.  Punctuation may accompany either one or two glyphs.
+    if sum(character.isalpha() for character in residue) > 2:
+        return None
+    return residue
+
+
+def _canonical_date_slot(value: Any) -> tuple[str | None, str, str]:
+    """Decode one exact date/month slot and classify any surviving residue."""
+
+    raw = str(value or "").strip()
+    if _compact(raw) in {"", "--", "长期"}:
+        return None, "", "absent"
+    spans = _valid_date_spans(raw)
+    if len(spans) != 1:
+        return None, raw, "multiple" if spans else "invalid"
+    (start, end), normalized = spans[0]
+    residue = raw[:start] + raw[end:]
+    compact_residue = _short_ascii_date_residue(residue)
+    if compact_residue is None:
+        return None, residue, "business_residue"
+    return normalized, compact_residue, "ascii_residue" if compact_residue else "exact"
+
+
 def _date(value: Any) -> str | None:
-    raw = _compact(value)
-    if raw in {"", "--", "长期"}:
-        return None
-    match = _DATE_RE.search(raw)
-    if not match:
-        return None
-    year, month, day = match.groups()
-    return f"{int(year):04d}-{int(month):02d}" + (f"-{int(day):02d}" if day else "")
+    normalized, _residue, resolution = _canonical_date_slot(value)
+    # Callers without issue/evidence context may consume only an exact scalar.
+    # Bounded watermark residue is recoverable exclusively through the
+    # canonical-slot merger below, which also emits the required audit row.
+    return normalized if resolution == "exact" else None
+
+
+def _currency_token(value: Any) -> tuple[str | None, str, str]:
+    """Decode one finite currency token and preserve any surrounding residue."""
+
+    raw = _compact(value).upper()
+    if not raw or raw in {"-", "--"}:
+        return None, "", "absent"
+    exact = _CURRENCY_TOKEN_ALIASES.get(raw)
+    if exact is not None:
+        return exact, "", "exact"
+
+    matches: list[tuple[int, int, str]] = []
+    for token, code in sorted(_CURRENCY_TOKEN_ALIASES.items(), key=lambda item: -len(item[0])):
+        start = 0
+        while True:
+            index = raw.find(token, start)
+            if index < 0:
+                break
+            end = index + len(token)
+            if token.isascii() and (
+                (index > 0 and raw[index - 1].isascii() and raw[index - 1].isalnum())
+                or (end < len(raw) and raw[end].isascii() and raw[end].isalnum())
+            ):
+                start = index + 1
+                continue
+            matches.append((index, end, code))
+            start = index + 1
+
+    maximal = [
+        match
+        for match in matches
+        if not any(
+            other[0] <= match[0]
+            and match[1] <= other[1]
+            and (other[0], other[1]) != (match[0], match[1])
+            for other in matches
+        )
+    ]
+    if len(maximal) != 1:
+        return None, raw, "multiple" if maximal else "unknown"
+    start, end, code = maximal[0]
+    residue = raw[:start] + raw[end:]
+    return (code, residue, "residue") if residue else (code, "", "exact")
 
 
 def _currency(value: Any) -> str | None:
-    raw = _compact(value)
-    if not raw or raw == "--":
-        return None
-    if "人民币" in raw:
-        return "CNY"
-    if "美元" in raw:
-        return "USD"
-    if "欧元" in raw:
-        return "EUR"
-    if "港" in raw and "元" in raw:
-        return "HKD"
-    return raw
+    return _currency_token(value)[0]
+
+
+def _report_currency_residue(
+    parse_result: Any,
+    *,
+    dataset: str,
+    target_record_id: str,
+    raw: Any,
+    currency: str,
+    residue: str,
+    source_refs: Iterable[Mapping[str, Any]],
+    parser_stage: str,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_currency_token_residue_corrected",
+            message="A unique finite currency token was retained, but non-currency OCR or structure residue remained in its field.",
+            severity="info",
+            status="resolved",
+            parser_stage=parser_stage,
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name="currency",
+            observed_value={"raw": raw, "residue": residue},
+            candidate_value={"currency": currency},
+            source_refs=tuple(source_refs),
+            reason_codes=(
+                "finite_currency_vocabulary",
+                "unique_currency_token",
+                "non_currency_residue_reported",
+                "professional_field_correction",
+            ),
+        ),
+    )
 
 
 def _table_rows(table: Any) -> list[list[str]]:
@@ -199,7 +536,10 @@ def _source_ref(
     metadata = getattr(table, "metadata", None) or {}
     bbox = None
     if row is not None and column is not None and isinstance(metadata, dict):
-        cell_bboxes = metadata.get("cell_bboxes")
+        # Canonical projection keeps both registered-page coordinates and the
+        # originating source-page coordinates.  A business-field repair must
+        # point at the originating cell, never at the enclosing table.
+        cell_bboxes = metadata.get("source_cell_bboxes") or metadata.get("cell_bboxes")
         if (
             isinstance(cell_bboxes, list)
             and 0 <= row < len(cell_bboxes)
@@ -220,7 +560,16 @@ def _source_ref(
             and isinstance(cell_evidence_ids[row][column], list)
         ):
             ref["evidence_ids"] = [str(item) for item in cell_evidence_ids[row][column] if item]
-    if bbox is None:
+        ref["binding_quality"] = "canonical_header_column"
+        ref["binding"] = "canonical_field_slot"
+        ref["canonical_row"] = row
+        ref["canonical_column"] = column
+        if bbox is None:
+            # Row/column identity is still exact even when a synthetic fixture
+            # has no pixel geometry.  Do not substitute a table-sized bbox:
+            # that would falsely authorize a broad field-level correction.
+            ref["geometry_scope"] = "canonical_field_slot"
+    if bbox is None and (row is None or column is None):
         bbox = getattr(table, "bbox", None)
         if bbox and len(bbox) == 4:
             ref["geometry_scope"] = "table"
@@ -233,44 +582,40 @@ def _nonempty(row: list[str]) -> list[str]:
     return [_clean(cell) for cell in row if _clean(cell)]
 
 
-def _pairs(rows: list[list[str]]) -> dict[str, str]:
-    """Return labelled values from adjacent rows without collapsing grid columns."""
-    out: dict[str, str] = {}
+def _exact_label_observations(
+    rows: list[list[str]],
+) -> tuple[dict[str, list[tuple[str, int, int]]], set[tuple[str, int, int]]]:
+    """Bind canonical labels only to the value in the same physical column.
+
+    Missing cells are not allowed to shift later values left/right, and two
+    equally plausible rows are retained as separate observations so the
+    field-level reconciler can report a conflict instead of overwriting it.
+    """
+
+    observations: defaultdict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    unresolved: set[tuple[str, int, int]] = set()
     for index in range(len(rows) - 1):
-        label_cells = [
-            (column, _compact(cell)) for column, cell in enumerate(rows[index]) if _compact(cell) in _ACCOUNT_LABELS
-        ]
-        value_cells = [
-            (column, _clean(cell))
-            for column, cell in enumerate(rows[index + 1])
-            if _clean(cell) and _compact(cell) not in _ACCOUNT_LABELS
-        ]
-        if not value_cells:
-            continue
-        if not label_cells:
-            labels = _nonempty(rows[index])
-            values = _nonempty(rows[index + 1])
-            if labels and len(labels) == len(values):
-                for label, value in zip(labels, values, strict=True):
-                    out.setdefault(_compact(label), value)
-            continue
-        if len(label_cells) == len(value_cells):
-            for (_label_column, label), (_value_column, value) in zip(label_cells, value_cells, strict=True):
-                out.setdefault(label, value)
-            continue
-        unused = set(range(len(value_cells)))
-        for label_column, label in label_cells:
-            if not unused:
-                break
-            value_index = min(unused, key=lambda item: abs(value_cells[item][0] - label_column))
-            value_column, value = value_cells[value_index]
-            # A value belongs to the closest visual label. This prevents a
-            # missing cell from shifting every value that follows it.
-            closest_label = min(label_cells, key=lambda item: abs(item[0] - value_column))
-            if closest_label[0] != label_column:
+        for column, cell in enumerate(rows[index]):
+            label = _compact(cell)
+            if label not in _ACCOUNT_LABELS:
                 continue
-            out.setdefault(label, value)
-            unused.remove(value_index)
+            value = _clean(rows[index + 1][column]) if column < len(rows[index + 1]) else ""
+            if not value or _compact(value) in _ACCOUNT_LABELS:
+                unresolved.add((label, index, column))
+                continue
+            observations[label].append((value, index + 1, column))
+    return dict(observations), unresolved
+
+
+def _pairs(rows: list[list[str]]) -> dict[str, str]:
+    """Return only unambiguous exact-column label/value bindings."""
+
+    observations, _unresolved = _exact_label_observations(rows)
+    out: dict[str, str] = {}
+    for label, values in observations.items():
+        distinct = {_compact(value) for value, _row, _column in values}
+        if len(distinct) == 1:
+            out[label] = values[0][0]
     return out
 
 
@@ -326,7 +671,7 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
     raw = _compact(raw_status)
     if not raw:
         return {}
-    status = {
+    status_labels = {
         "正常": "active",
         "逾期": "active",
         "呆账": "active",
@@ -335,7 +680,27 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
         "转出": "transferred_out",
         "结束": "closed",
         "未激活": "inactive",
-    }.get(raw, raw)
+        "冻结": "frozen",
+        "止付": "suspended",
+        "银行止付": "suspended",
+        "司法追偿": "recovery",
+        "担保物不足": "collateral_shortfall",
+        "强制平仓": "forced_liquidation",
+        "催收": "collection",
+    }
+    source_label = raw
+    status = status_labels.get(raw)
+    repaired_noise = False
+    if status is None:
+        matches = [label for label in status_labels if label in raw]
+        if len(matches) == 1:
+            remaining = raw.replace(matches[0], "", 1)
+            if len(remaining) <= 2:
+                source_label = matches[0]
+                status = status_labels[source_label]
+                repaired_noise = True
+    if status is None:
+        status = raw
     lifecycle = {
         "active": "open",
         "inactive": "open",
@@ -346,26 +711,1250 @@ def _status_fields(raw_status: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
         "account_status": status,
         "account_status_raw": raw,
+        "account_status_resolution": "ocr_noise_normalized" if repaired_noise else "resolved"
+        if status in status_labels.values()
+        else "unresolved",
     }
     if lifecycle:
         result["account_lifecycle_state"] = lifecycle
-    if raw == "未激活":
+    if source_label == "未激活":
         result["card_activation_state"] = "not_activated"
-    elif raw == "呆账":
+    elif source_label == "呆账":
         result["credit_quality_status"] = "bad_debt"
-    if raw == "逾期":
+    if source_label == "逾期":
         result["current_overdue"] = True
         result["current_overdue_status"] = "overdue"
-    elif raw in {"正常", "结清", "销户", "转出"}:
+    elif source_label in {"正常", "结清", "销户", "转出"}:
         result["current_overdue"] = False
         result["current_overdue_status"] = "not_overdue"
     return result
 
 
-def _apply_account_facts(account: dict[str, Any], rows: list[list[str]]) -> None:
-    facts = _pairs(rows)
+def _append_internal_field(record: dict[str, Any], key: str, field_name: str) -> None:
+    values = record.setdefault(key, [])
+    if field_name not in values:
+        values.append(field_name)
+
+
+def _mark_source_absent(record: dict[str, Any], field_name: str, raw: str = "--") -> None:
+    _append_internal_field(record, "_source_absent_fields", field_name)
+    record.setdefault("canonical_raw", {})[field_name] = raw
+
+
+def _merge_exact_observation(
+    parse_result: Any,
+    record: dict[str, Any],
+    *,
+    dataset: str,
+    target_record_id: str,
+    field_name: str,
+    value: Any,
+    raw: str,
+    source_ref: Mapping[str, Any],
+    parser_stage: str,
+) -> None:
+    """Merge one exact-slot observation without last-write-wins behavior."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    ref = {**dict(source_ref), "field_name": field_name}
+    refs = record.setdefault("source_refs_by_field", {}).setdefault(field_name, [])
+    if ref not in refs:
+        refs.append(ref)
+    observations = record.setdefault("_field_observations", {}).setdefault(field_name, [])
+    marker = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    if not any(item.get("marker") == marker for item in observations):
+        observations.append({"marker": marker, "value": value, "raw": raw, "source_refs": [ref]})
+    else:
+        prior = next(item for item in observations if item.get("marker") == marker)
+        if ref not in prior.setdefault("source_refs", []):
+            prior["source_refs"].append(ref)
+    distinct = {str(item.get("marker") or "") for item in observations}
+    if len(distinct) == 1 and field_name not in record.get("_invalid_observation_fields", []):
+        record[field_name] = value
+        record.setdefault("canonical_raw", {})[field_name] = raw
+        return
+
+    record.pop(field_name, None)
+    _append_internal_field(record, "_unresolved_fields", field_name)
+    prior_raw = record.setdefault("canonical_raw", {}).get(field_name)
+    raw_values = prior_raw if isinstance(prior_raw, list) else ([prior_raw] if prior_raw not in (None, "") else [])
+    for item in observations:
+        candidate_raw = str(item.get("raw") or "")
+        if candidate_raw not in raw_values:
+            raw_values.append(candidate_raw)
+    record.setdefault("canonical_raw", {})[field_name] = raw_values
+    reported = record.setdefault("_reported_field_conflicts", [])
+    if field_name in reported:
+        return
+    reported.append(field_name)
+    conflict_refs = [
+        candidate_ref
+        for item in observations
+        for candidate_ref in item.get("source_refs") or ()
+        if isinstance(candidate_ref, Mapping)
+    ]
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_exact_slot_value_conflict",
+            message="Canonical observations for one business field disagreed; the normalized value was withheld.",
+            parser_stage=parser_stage,
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            observed_value=raw_values,
+            source_refs=conflict_refs,
+            reason_codes=("canonical_field_slot", "conflicting_exact_observations", "normalized_value_withheld"),
+        ),
+    )
+
+
+def _reject_exact_observation(
+    parse_result: Any,
+    record: dict[str, Any],
+    *,
+    dataset: str,
+    target_record_id: str,
+    field_name: str,
+    raw: str,
+    source_ref: Mapping[str, Any],
+    parser_stage: str,
+) -> None:
+    """Retain an invalid exact cell as issue evidence, never as business data."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    ref = {**dict(source_ref), "field_name": field_name}
+    refs = record.setdefault("source_refs_by_field", {}).setdefault(field_name, [])
+    if ref not in refs:
+        refs.append(ref)
+    record.pop(field_name, None)
+    _append_internal_field(record, "_unresolved_fields", field_name)
+    _append_internal_field(record, "_invalid_observation_fields", field_name)
+    prior = record.setdefault("canonical_raw", {}).get(field_name)
+    raw_values = prior if isinstance(prior, list) else ([prior] if prior not in (None, "") else [])
+    if raw not in raw_values:
+        raw_values.append(raw)
+    record["canonical_raw"][field_name] = raw_values
+    reported = record.setdefault("_reported_invalid_fields", [])
+    if field_name in reported:
+        return
+    reported.append(field_name)
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_exact_slot_value_invalid",
+            message="A value was present in the canonical field slot but failed its field contract and was withheld.",
+            parser_stage=parser_stage,
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            observed_value=raw_values,
+            source_refs=(ref,),
+            reason_codes=("canonical_field_slot", "field_contract_failed", "normalized_value_withheld"),
+        ),
+    )
+
+
+def _merge_canonical_date_observation(
+    parse_result: Any,
+    record: dict[str, Any],
+    *,
+    dataset: str,
+    target_record_id: str,
+    field_name: str,
+    raw: str,
+    source_ref: Mapping[str, Any],
+    parser_stage: str,
+) -> str | None:
+    """Validate, retain, and audit one canonical date-slot observation."""
+
+    normalized, residue, resolution = _canonical_date_slot(raw)
+    if normalized is None:
+        _reject_exact_observation(
+            parse_result,
+            record,
+            dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            raw=raw,
+            source_ref=source_ref,
+            parser_stage=parser_stage,
+        )
+        return None
+
+    _merge_exact_observation(
+        parse_result,
+        record,
+        dataset=dataset,
+        target_record_id=target_record_id,
+        field_name=field_name,
+        value=normalized,
+        raw=raw,
+        source_ref=source_ref,
+        parser_stage=parser_stage,
+    )
+    if resolution != "ascii_residue":
+        return normalized
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_date_ascii_residue_corrected",
+            message=(
+                "One independently valid calendar date was retained from its canonical slot; "
+                "bounded non-business ASCII OCR residue was preserved and reported."
+            ),
+            severity="info",
+            status="resolved",
+            parser_stage=parser_stage,
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            observed_value={"raw": raw, "residue": residue},
+            candidate_value={"normalized_date": normalized},
+            source_refs=(source_ref,),
+            reason_codes=(
+                "canonical_exact_date_slot",
+                "single_independently_valid_calendar_date",
+                "bounded_ascii_watermark_residue",
+                "full_raw_preserved",
+                "professional_field_correction",
+            ),
+        ),
+    )
+    return normalized
+
+
+def _institution_refs_are_independent(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Require two distinct source-bound field observations."""
+
+    if dict(left) == dict(right):
+        return False
+    left_evidence = {str(value) for value in left.get("evidence_ids") or () if value}
+    right_evidence = {str(value) for value in right.get("evidence_ids") or () if value}
+    if left_evidence and right_evidence and left_evidence.isdisjoint(right_evidence):
+        return True
+    left_table = str(left.get("table_id") or "")
+    right_table = str(right.get("table_id") or "")
+    return bool(left_table and right_table and left_table != right_table)
+
+
+def _merge_account_institution_observation(
+    parse_result: Any,
+    account: dict[str, Any],
+    *,
+    raw: str,
+    source_ref: Mapping[str, Any],
+    parser_stage: str,
+) -> None:
+    """Merge an institution without guessing across a leading Han boundary."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        institution_name_has_separated_leading_han,
+        normalize_institution_name,
+    )
+
+    target_record_id = str(account.get("account_id") or "")
+    if not institution_name_has_separated_leading_han(raw):
+        value = _account_institution(raw)
+        if value is None:
+            _reject_exact_observation(
+                parse_result,
+                account,
+                dataset="credit_accounts",
+                target_record_id=target_record_id,
+                field_name="management_institution",
+                raw=raw,
+                source_ref=source_ref,
+                parser_stage=parser_stage,
+            )
+            return
+        _merge_exact_observation(
+            parse_result,
+            account,
+            dataset="credit_accounts",
+            target_record_id=target_record_id,
+            field_name="management_institution",
+            value=value,
+            raw=raw,
+            source_ref=source_ref,
+            parser_stage=parser_stage,
+        )
+        pending = account.get("_pending_institution_observations")
+        if not isinstance(pending, list):
+            return
+        matched = [
+            item
+            for item in pending
+            if item.get("value") == value
+            and _institution_refs_are_independent(item.get("source_ref") or {}, source_ref)
+        ]
+        if matched:
+            for item in matched:
+                _merge_exact_observation(
+                    parse_result,
+                    account,
+                    dataset="credit_accounts",
+                    target_record_id=target_record_id,
+                    field_name="management_institution",
+                    value=value,
+                    raw=str(item.get("raw") or ""),
+                    source_ref=item.get("source_ref") or {},
+                    parser_stage=parser_stage,
+                )
+            account["_pending_institution_observations"] = [
+                item for item in pending if item not in matched
+            ]
+        return
+
+    value = _account_institution(raw, independently_corroborated=True)
+    if value is None:
+        _reject_exact_observation(
+            parse_result,
+            account,
+            dataset="credit_accounts",
+            target_record_id=target_record_id,
+            field_name="management_institution",
+            raw=raw,
+            source_ref=source_ref,
+            parser_stage=parser_stage,
+        )
+        return
+    pending = account.setdefault("_pending_institution_observations", [])
+    candidate = {
+        "raw": raw,
+        "value": normalize_institution_name(raw),
+        "source_ref": dict(source_ref),
+    }
+    if candidate not in pending:
+        pending.append(candidate)
+    corroborating_refs = [
+        item.get("source_ref") or {}
+        for item in pending
+        if item.get("value") == value
+        and _institution_refs_are_independent(item.get("source_ref") or {}, source_ref)
+    ]
+    existing = account.get("_field_observations", {}).get("management_institution", [])
+    for observation in existing:
+        if observation.get("value") != value:
+            continue
+        corroborating_refs.extend(
+            ref
+            for ref in observation.get("source_refs") or ()
+            if _institution_refs_are_independent(ref, source_ref)
+        )
+    if not corroborating_refs:
+        return
+    matched = [item for item in pending if item.get("value") == value]
+    for item in matched:
+        _merge_exact_observation(
+            parse_result,
+            account,
+            dataset="credit_accounts",
+            target_record_id=target_record_id,
+            field_name="management_institution",
+            value=value,
+            raw=str(item.get("raw") or ""),
+            source_ref=item.get("source_ref") or {},
+            parser_stage=parser_stage,
+        )
+    account["_pending_institution_observations"] = [
+        item for item in pending if item not in matched
+    ]
+
+
+def _flush_pending_account_institution_observations(
+    parse_result: Any,
+    account: dict[str, Any],
+    *,
+    boundary: str,
+) -> None:
+    pending = account.pop("_pending_institution_observations", [])
+    if not pending:
+        return
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    field_name = "management_institution"
+    if account.get(field_name) in (None, ""):
+        account.pop(field_name, None)
+        _append_internal_field(account, "_unresolved_fields", field_name)
+    refs = [
+        dict(item.get("source_ref") or {})
+        for item in pending
+        if isinstance(item, Mapping) and item.get("source_ref")
+    ]
+    raw_values = [str(item.get("raw") or "") for item in pending if isinstance(item, Mapping)]
+    account.setdefault("canonical_raw", {})[field_name] = raw_values
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_institution_leading_boundary_ambiguous",
+            message=(
+                "A separated leading Han glyph could be either intra-name OCR whitespace or cross-cell debris; "
+                "the joined institution was not silently selected without independent source evidence."
+            ),
+            parser_stage="candidate_b_account_canonical_slots",
+            target_dataset="credit_accounts",
+            target_record_id=str(account.get("account_id") or ""),
+            field_name=field_name,
+            observed_value=raw_values,
+            candidate_value={
+                "joined_values": sorted({str(item.get("value") or "") for item in pending}),
+                "boundary": boundary,
+            },
+            source_refs=refs,
+            reason_codes=(
+                "separated_leading_han_boundary",
+                "independent_source_corroboration_missing",
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+
+
+_ACCOUNT_CLUSTER_TOKEN_RE = re.compile(
+    r"(?:19|20)\d{2}[.,/-]\d{1,2}[.,/-]\d{1,2}|"
+    r"正常|逾期|呆账|结清|销户|转出|未激活|冻结|止付|"
+    r"[-*#]+|(?<![A-Za-z0-9])\d[\d,.]*(?![A-Za-z0-9])"
+)
+
+
+def _single_business_cell(row: list[str]) -> tuple[int, str] | None:
+    """Return one populated cell for event clusters that are canonically singular."""
+
+    values = [(index, _clean(value)) for index, value in enumerate(row) if _clean(value)]
+    return values[0] if len(values) == 1 else None
+
+
+_ACCOUNT_CELL_FIRST_LOAN = frozenset({"管理机构", "账户标识", "开立日期"})
+_ACCOUNT_CELL_FIRST_CARD = frozenset({"发卡机构", "账户标识", "开立日期"})
+_ACCOUNT_CELL_LOAN_TERMS = frozenset({"到期日期", "借款金额", "账户币种"})
+_ACCOUNT_CELL_CARD_TERMS = frozenset(
+    {"账户授信额度", "币种", "业务种类", "担保方式"}
+)
+_ACCOUNT_CELL_LOAN_CLASSIFICATION = frozenset(
+    {"业务种类", "担保方式", "还款期数"}
+)
+_ACCOUNT_CELL_REPAYMENT_TERMS = frozenset(
+    {"还款频率", "还款方式", "共同借款标志"}
+)
+_ACCOUNT_CELL_CLUSTER_LABEL_SETS = frozenset(
+    {
+        _ACCOUNT_CELL_FIRST_LOAN,
+        _ACCOUNT_CELL_FIRST_CARD,
+        _ACCOUNT_CELL_LOAN_TERMS,
+        _ACCOUNT_CELL_CARD_TERMS,
+        _ACCOUNT_CELL_LOAN_CLASSIFICATION,
+        _ACCOUNT_CELL_REPAYMENT_TERMS,
+        _ACCOUNT_CELL_FIRST_LOAN | _ACCOUNT_CELL_LOAN_TERMS,
+        _ACCOUNT_CELL_FIRST_CARD | _ACCOUNT_CELL_CARD_TERMS,
+        _ACCOUNT_CELL_LOAN_CLASSIFICATION | _ACCOUNT_CELL_REPAYMENT_TERMS,
+    }
+)
+_ACCOUNT_CELL_CLUSTER_LABELS = tuple(
+    sorted(
+        {label for labels in _ACCOUNT_CELL_CLUSTER_LABEL_SETS for label in labels},
+        key=len,
+        reverse=True,
+    )
+)
+_ACCOUNT_CELL_LABEL_FIELDS = {
+    "管理机构": "management_institution",
+    "发卡机构": "management_institution",
+    "账户标识": "account_identifier",
+    "开立日期": "open_date",
+    "到期日期": "due_date",
+    "借款金额": "loan_amount",
+    "账户授信额度": "credit_limit",
+    "账户币种": "currency",
+    "币种": "currency",
+    "业务种类": "business_type",
+    "担保方式": "guarantee_type",
+    "还款期数": "repayment_periods",
+    "还款频率": "repayment_frequency",
+    "还款方式": "repayment_method",
+    "共同借款标志": "co_borrower_flag",
+}
+_ACCOUNT_CELL_FINITE_ROLES = {
+    "business_type": "account_business_type",
+    "guarantee_type": "guarantee_type",
+    "repayment_frequency": "repayment_frequency",
+    "repayment_method": "repayment_method",
+    "co_borrower_flag": "boolean_flag",
+}
+
+
+def _exact_account_cell_header_labels(value: Any) -> frozenset[str] | None:
+    """Return one closed canonical header-label set, independent of order."""
+
+    residue = _compact(value)
+    observed: list[str] = []
+    for label in _ACCOUNT_CELL_CLUSTER_LABELS:
+        marker = _compact(label)
+        count = residue.count(marker)
+        if count > 1:
+            return None
+        if count == 1:
+            observed.append(label)
+            residue = residue.replace(marker, "", 1)
+    labels = frozenset(observed)
+    return labels if not residue and labels in _ACCOUNT_CELL_CLUSTER_LABEL_SETS else None
+
+
+def _account_cluster_signature(value: Any) -> str:
+    return re.sub(
+        r"[\s,，.。;；:：|/()（）_\-]",
+        "",
+        str(value or ""),
+    )
+
+
+def _account_cluster_residue(value: Any, consumed_values: Iterable[Any]) -> str:
+    residue = _account_cluster_signature(value)
+    for consumed in consumed_values:
+        signature = _account_cluster_signature(consumed)
+        if signature and signature in residue:
+            residue = residue.replace(signature, "", 1)
+    return residue
+
+
+def _unique_account_finite_span(
+    value: Any,
+    *,
+    contract_role: str,
+) -> tuple[str, str, int, int] | None:
+    """Find one unique maximal exact finite-vocabulary span."""
+
+    marker = _clean(value).translate(str.maketrans({"（": "(", "）": ")"}))
+    matches: list[tuple[str, str, int, int]] = []
+    for candidate in pboc_controlled_vocabulary(contract_role):
+        candidate_marker = _clean(candidate).translate(
+            str.maketrans({"（": "(", "）": ")"})
+        )
+        start = 0
+        while candidate_marker and (index := marker.find(candidate_marker, start)) >= 0:
+            end = index + len(candidate_marker)
+            business_before = bool(
+                index > 0 and re.match(r"[0-9A-Za-z\u3400-\u9fff]", marker[index - 1])
+            )
+            business_after = bool(
+                end < len(marker)
+                and re.match(r"[0-9A-Za-z\u3400-\u9fff]", marker[end])
+            )
+            if business_before or business_after:
+                start = index + 1
+                continue
+            matches.append(
+                (
+                    normalize_pboc_field(candidate, contract_role),
+                    candidate_marker,
+                    index,
+                    end,
+                )
+            )
+            start = index + 1
+    maximal = [
+        match
+        for match in matches
+        if not any(
+            match[2] >= other[2]
+            and match[3] <= other[3]
+            and len(match[1]) < len(other[1])
+            for other in matches
+        )
+    ]
+    if not maximal:
+        return None
+    longest = max(len(match[1]) for match in maximal)
+    longest_matches = [match for match in maximal if len(match[1]) == longest]
+    return longest_matches[0] if len(longest_matches) == 1 else None
+
+
+def _account_cluster_number_tokens(value: Any) -> list[str]:
+    return [
+        token
+        for token in _ACCOUNT_CLUSTER_TOKEN_RE.findall(str(value or ""))
+        if _date(token) is None
+        and isinstance(_number(token), int)
+        and not isinstance(_number(token), bool)
+    ]
+
+
+def _unique_account_money_token(value: Any) -> str | None:
+    tokens = list(dict.fromkeys(_account_cluster_number_tokens(value)))
+    if len(tokens) == 1:
+        return tokens[0]
+    comma_grouped = [
+        token for token in tokens if re.fullmatch(r"\d{1,3}(?:,\d{3})+", token)
+    ]
+    return comma_grouped[0] if len(comma_grouped) == 1 else None
+
+
+def _account_currency_observation(value: Any) -> tuple[str, str] | None:
+    """Return one exact currency token, excluding substrings of business prose."""
+
+    raw = str(value or "")
+    matches: list[tuple[int, int, str, str, int]] = []
+    for alias, code in _CURRENCY_TOKEN_ALIASES.items():
+        marker = _compact(alias)
+        if not marker:
+            continue
+        pattern = re.compile(r"\s*".join(re.escape(char) for char in marker), re.IGNORECASE)
+        for match in pattern.finditer(raw):
+            before = raw[: match.start()].rstrip()[-1:]
+            after = raw[match.end() :].lstrip()[:1]
+            if marker.isascii() and (
+                (before and before.isascii() and before.isalnum())
+                or (after and after.isascii() and after.isalnum())
+            ):
+                continue
+            if len(marker) == 1 and re.fullmatch(r"[\u3400-\u9fff]", marker) and (
+                re.fullmatch(r"[\u3400-\u9fff]", before or "")
+                or re.fullmatch(r"[\u3400-\u9fff]", after or "")
+            ):
+                continue
+            matches.append(
+                (match.start(), match.end(), code, match.group(), len(marker))
+            )
+
+    maximal = [
+        match
+        for match in matches
+        if not any(
+            other[0] <= match[0]
+            and match[1] <= other[1]
+            and other[4] > match[4]
+            for other in matches
+        )
+    ]
+    currencies = {match[2] for match in maximal}
+    if len(currencies) != 1:
+        return None
+    currency = next(iter(currencies))
+    longest = max(match[4] for match in maximal)
+    source_tokens = list(
+        dict.fromkeys(match[3] for match in maximal if match[4] == longest)
+    )
+    return (currency, source_tokens[0]) if len(source_tokens) == 1 else None
+
+
+def _decode_account_cell_cluster(
+    labels: frozenset[str],
+    raw: str,
+) -> tuple[dict[str, tuple[Any, str]], tuple[str, ...], str]:
+    """Decode fields invariant under the OCR traversal of one closed cell."""
+
+    expected_fields = {
+        _ACCOUNT_CELL_LABEL_FIELDS[label]
+        for label in labels
+        if label in _ACCOUNT_CELL_LABEL_FIELDS
+    }
+    fields: dict[str, tuple[Any, str]] = {}
+    consumed: list[str] = []
+
+    date_fields = [field for field in ("open_date", "due_date") if field in expected_fields]
+    full_dates = [
+        (raw[start:end], normalized)
+        for (start, end), normalized in _valid_date_spans(raw)
+        if len(normalized) == 10
+    ]
+    if len(date_fields) == 1 and len(full_dates) == 1:
+        date_raw, normalized = full_dates[0]
+        fields[date_fields[0]] = (normalized, date_raw)
+        consumed.append(date_raw)
+
+    money_fields = [
+        field for field in ("loan_amount", "credit_limit") if field in expected_fields
+    ]
+    if len(money_fields) == 1 and (money_raw := _unique_account_money_token(raw)):
+        fields[money_fields[0]] = (int(_number(money_raw) or 0), money_raw)
+        consumed.append(money_raw)
+
+    if "currency" in expected_fields and (
+        currency_observation := _account_currency_observation(raw)
+    ):
+        currency, currency_raw = currency_observation
+        fields["currency"] = (currency, currency_raw)
+        consumed.append(currency_raw)
+
+    finite_candidates = {
+        field_name: candidate
+        for field_name, contract_role in _ACCOUNT_CELL_FINITE_ROLES.items()
+        if field_name in expected_fields
+        and (candidate := _unique_account_finite_span(raw, contract_role=contract_role))
+        is not None
+    }
+    shared_spans = {
+        candidate[2:]
+        for candidate in finite_candidates.values()
+        if sum(other[2:] == candidate[2:] for other in finite_candidates.values()) > 1
+    }
+    for field_name, candidate in finite_candidates.items():
+        normalized, source_token, start, end = candidate
+        if (start, end) in shared_spans:
+            continue
+        fields[field_name] = (normalized, source_token)
+        consumed.append(source_token)
+
+    if "repayment_periods" in expected_fields:
+        remaining_numbers = [
+            token
+            for token in _account_cluster_number_tokens(raw)
+            if _account_cluster_signature(token)
+            not in {_account_cluster_signature(value) for value in consumed}
+        ]
+        if len(remaining_numbers) == 1:
+            periods = int(_number(remaining_numbers[0]) or 0)
+            if 0 <= periods <= 1200:
+                fields["repayment_periods"] = (periods, remaining_numbers[0])
+                consumed.append(remaining_numbers[0])
+
+    unresolved = tuple(
+        field_name for field_name in sorted(expected_fields) if field_name not in fields
+    )
+    return fields, unresolved, _account_cluster_residue(raw, consumed)
+
+
+def _account_header_suffix_institution(
+    value: Any,
+) -> tuple[str, str | None] | None:
+    """Decode one exact institution suffix attached to its canonical label."""
+
+    raw = _clean(value)
+    for label in ("管理机构", "发卡机构"):
+        match = re.fullmatch(rf"\s*{label}(?:\s+|\s*[:：]\s*)(.+)", raw)
+        if match is None:
+            continue
+        suffix = _clean(match.group(1))
+        if any(_compact(other) in _compact(suffix) for other in _ACCOUNT_LABELS):
+            return None
+        normalized = _account_institution(suffix)
+        if normalized is None:
+            return (label, None)
+        source_signature = re.sub(r"\s+", "", suffix)
+        normalized_signature = re.sub(r"\s+", "", normalized)
+        independently_valid = bool(
+            source_signature == normalized_signature
+            and len(re.findall(r"[\u3400-\u9fff]", normalized_signature)) >= 3
+            and re.search(
+                r"(?:银行|公司|中心|信用社|信托|分行|支行|营业部)$",
+                normalized_signature,
+            )
+        )
+        return (label, normalized if independently_valid else None)
+    return None
+
+
+def _report_account_cluster_residue(
+    parse_result: Any,
+    account: dict[str, Any],
+    *,
+    target_record_id: str,
+    field_names: Iterable[str],
+    raw: str,
+    residue: str,
+    source_ref: dict[str, Any],
+) -> None:
+    """Keep typed values while exposing residue in their physical cell."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    account["extraction_status"] = "review"
+    for field_name in dict.fromkeys(field_names):
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_cluster_residue_unresolved",
+                message=(
+                    "A closed canonical account cell retained a uniquely typed field "
+                    "but also contained unassigned OCR residue."
+                ),
+                parser_stage="candidate_b_account_closed_cell_cluster",
+                target_dataset="credit_accounts",
+                target_record_id=target_record_id,
+                field_name=field_name,
+                observed_value={
+                    "raw_cluster": raw,
+                    "unconsumed_residue": residue,
+                },
+                source_refs=(source_ref,),
+                reason_codes=(
+                    "closed_canonical_header_label_set",
+                    "uniquely_typed_value_retained",
+                    "cell_residue_reported",
+                ),
+            ),
+        )
+
+
+def _report_account_cell_cluster_unresolved(
+    parse_result: Any,
+    account: dict[str, Any],
+    *,
+    target_record_id: str,
+    field_names: Iterable[str],
+    raw: str,
+    source_ref: dict[str, Any],
+) -> None:
+    """Report fields ambiguous inside one cluster without poisoning later evidence."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    for field_name in dict.fromkeys(field_names):
+        if account.get(field_name) not in (None, ""):
+            continue
+        _append_internal_field(account, "_unresolved_fields", field_name)
+        account["extraction_status"] = "review"
+        raw_values = account.setdefault("canonical_raw", {}).get(field_name)
+        if not isinstance(raw_values, list):
+            raw_values = [raw_values] if raw_values not in (None, "") else []
+        if raw not in raw_values:
+            raw_values.append(raw)
+        account["canonical_raw"][field_name] = raw_values
+        reported = account.setdefault("_reported_account_cluster_fields", [])
+        if field_name in reported:
+            continue
+        reported.append(field_name)
+        ref = {**source_ref, "field_name": field_name}
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_cluster_field_unresolved",
+                message=(
+                    "A closed canonical account cell did not uniquely assign one "
+                    "of its declared business fields."
+                ),
+                parser_stage="candidate_b_account_closed_cell_cluster",
+                target_dataset="credit_accounts",
+                target_record_id=target_record_id,
+                field_name=field_name,
+                observed_value=raw_values,
+                source_refs=(ref,),
+                reason_codes=(
+                    "closed_canonical_header_label_set",
+                    "field_not_uniquely_typed",
+                    "normalized_value_withheld",
+                ),
+            ),
+        )
+
+
+def _report_collapsed_cluster_fields(
+    parse_result: Any,
+    record: dict[str, Any],
+    *,
+    dataset: str,
+    target_record_id: str,
+    raw: str,
+    source_ref: dict[str, Any],
+    unresolved_fields: Iterable[str],
+    parser_stage: str,
+) -> None:
+    """Retain every unresolved canonical role from one collapsed source cell."""
+
+    for field_name in dict.fromkeys(str(value) for value in unresolved_fields if value):
+        if record.get(field_name) not in (None, ""):
+            continue
+        _reject_exact_observation(
+            parse_result,
+            record,
+            dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            raw=raw,
+            source_ref=source_ref,
+            parser_stage=parser_stage,
+        )
+
+
+def _apply_collapsed_account_clusters(
+    parse_result: Any,
+    account: dict[str, Any],
+    rows: list[list[str]],
+    *,
+    page: Any,
+    table: Any,
+    physical_row_indices: list[int | None] | None,
+) -> None:
+    """Decode only closed PBOC clusters whose role assignment is unique."""
+
+    target_record_id = str(account.get("account_id") or "")
+
+    def physical(index: int) -> int | None:
+        if physical_row_indices is None:
+            return index
+        return physical_row_indices[index] if 0 <= index < len(physical_row_indices) else None
+
+    def bind(
+        field_name: str,
+        value: Any,
+        raw: str,
+        row_index: int,
+        column: int,
+        *,
+        binding: str = "closed_canonical_account_cluster",
+    ) -> None:
+        source_row = physical(row_index)
+        if source_row is None:
+            return
+        ref = _source_ref(page, table, row=source_row, column=column)
+        ref["binding"] = binding
+        ref["binding_quality"] = binding
+        _merge_exact_observation(
+            parse_result,
+            account,
+            dataset="credit_accounts",
+            target_record_id=target_record_id,
+            field_name=field_name,
+            value=value,
+            raw=raw,
+            source_ref=ref,
+            parser_stage="candidate_b_account_closed_cluster",
+        )
+
+    def bind_status(raw: str, row_index: int, column: int) -> None:
+        for field_name, value in _status_fields(raw).items():
+            bind(field_name, value, raw, row_index, column)
+
+    for header_index in range(len(rows) - 1):
+        for value_column, raw_header in enumerate(rows[header_index]):
+            header_raw = _clean(raw_header)
+            if not header_raw:
+                continue
+            value_raw = _clean(
+                rows[header_index + 1][value_column]
+                if value_column < len(rows[header_index + 1])
+                else ""
+            )
+
+            suffix_institution = _account_header_suffix_institution(header_raw)
+            if suffix_institution is not None:
+                _label, institution = suffix_institution
+                if institution is not None:
+                    bind(
+                        "management_institution",
+                        institution,
+                        header_raw,
+                        header_index,
+                        value_column,
+                        binding="closed_canonical_account_header_suffix",
+                    )
+                else:
+                    cluster_ref = _source_ref(
+                        page,
+                        table,
+                        row=physical(header_index),
+                        column=value_column,
+                    )
+                    _report_collapsed_cluster_fields(
+                        parse_result,
+                        account,
+                        dataset="credit_accounts",
+                        target_record_id=target_record_id,
+                        raw=header_raw,
+                        source_ref=cluster_ref,
+                        unresolved_fields=("management_institution",),
+                        parser_stage="candidate_b_account_header_suffix",
+                    )
+                continue
+
+            labels = _exact_account_cell_header_labels(header_raw)
+            if labels is not None:
+                fields, unresolved_fields, residue = _decode_account_cell_cluster(
+                    labels,
+                    value_raw,
+                )
+                cluster_row_index = header_index + 1 if value_raw else header_index
+                cluster_ref = _source_ref(
+                    page,
+                    table,
+                    row=physical(cluster_row_index),
+                    column=value_column,
+                )
+                cluster_ref["binding"] = "closed_canonical_account_cell_cluster"
+                cluster_ref["binding_quality"] = (
+                    "closed_canonical_account_cell_cluster"
+                )
+                for field_name, (value, _source_token) in fields.items():
+                    bind(
+                        field_name,
+                        value,
+                        value_raw,
+                        header_index + 1,
+                        value_column,
+                        binding="closed_canonical_account_cell_cluster",
+                    )
+                    if field_name == "currency":
+                        bind(
+                            "account_currency",
+                            value,
+                            value_raw,
+                            header_index + 1,
+                            value_column,
+                            binding="closed_canonical_account_cell_cluster",
+                        )
+                _report_account_cell_cluster_unresolved(
+                    parse_result,
+                    account,
+                    target_record_id=target_record_id,
+                    raw=value_raw,
+                    source_ref=cluster_ref,
+                    field_names=unresolved_fields,
+                )
+                if residue and fields:
+                    _report_account_cluster_residue(
+                        parse_result,
+                        account,
+                        target_record_id=target_record_id,
+                        field_names=fields,
+                        raw=value_raw,
+                        residue=residue,
+                        source_ref=cluster_ref,
+                    )
+                continue
+
+            header = _compact(header_raw)
+            tokens = _ACCOUNT_CLUSTER_TOKEN_RE.findall(value_raw)
+
+            # Non-revolving status block.  Two identical finite statuses and
+            # two shape-distinct numbers make every role unique even when OCR
+            # merged the physical columns into one cell.
+            if all(
+                marker in header
+                for marker in ("五级分类", "账户状态", "余额", "剩余还款期数")
+            ):
+                status_tokens = [
+                    token
+                    for token in tokens
+                    if token in {"正常", "逾期", "呆账", "结清", "销户", "转出"}
+                ]
+                number_tokens = [
+                    token
+                    for token in tokens
+                    if isinstance(_number(token), int)
+                    and not isinstance(_number(token), bool)
+                ]
+                balance_tokens = [
+                    token
+                    for token in number_tokens
+                    if "," in token or int(_number(token) or 0) >= 1000
+                ]
+                remaining_tokens = [
+                    token
+                    for token in number_tokens
+                    if 0 <= int(_number(token) or 0) <= 600
+                    and token not in balance_tokens
+                ]
+                if len(status_tokens) == 2 and len(set(status_tokens)) == 1:
+                    bind(
+                        "five_tier_class",
+                        status_tokens[0],
+                        status_tokens[0],
+                        header_index + 1,
+                        value_column,
+                    )
+                    bind_status(status_tokens[0], header_index + 1, value_column)
+                if len(balance_tokens) == 1 and len(remaining_tokens) == 1:
+                    bind(
+                        "balance",
+                        int(_number(balance_tokens[0]) or 0),
+                        balance_tokens[0],
+                        header_index + 1,
+                        value_column,
+                    )
+                    bind(
+                        "remaining_periods",
+                        int(_number(remaining_tokens[0]) or 0),
+                        remaining_tokens[0],
+                        header_index + 1,
+                        value_column,
+                    )
+                continue
+
+            # Known merged card summary traversal.  The signature is the
+            # canonical seven-column PBOC block; other token counts/orders are
+            # withheld.
+            card_signature = (
+                "未出单的大额" in header
+                and "最近6个月" in header
+                and "剩余分期期数" in header
+                and "最大使用额度" in header
+                and "账户状态" in header
+                and "余额" in header
+                and "已用额度" in header
+                and "平均使用额度" in header
+                and "专项分期余额" in header
+            )
+            if card_signature and len(tokens) == 7:
+                numeric = [_number(token) for token in tokens]
+                if (
+                    isinstance(numeric[0], int)
+                    and 0 <= numeric[0] <= 600
+                    and all(
+                        isinstance(numeric[index], int) for index in (1, 2, 3, 5)
+                    )
+                    and tokens[4]
+                    in {
+                        "正常",
+                        "逾期",
+                        "呆账",
+                        "结清",
+                        "销户",
+                        "转出",
+                        "未激活",
+                        "冻结",
+                        "止付",
+                    }
+                    and numeric[3] >= max(int(numeric[1]), int(numeric[2]))
+                    and re.fullmatch(r"[-*#]+", tokens[6]) is not None
+                ):
+                    for field_name, index in (
+                        ("remaining_periods", 0),
+                        ("used_amount", 1),
+                        ("recent_6_month_average_used_amount", 2),
+                        ("maximum_used_amount", 3),
+                        ("balance", 5),
+                    ):
+                        bind(
+                            field_name,
+                            int(numeric[index]),
+                            tokens[index],
+                            header_index + 1,
+                            value_column,
+                        )
+                    bind_status(tokens[4], header_index + 1, value_column)
+                continue
+
+            # Non-revolving payment row: value shapes alternate exactly with
+            # the four canonical roles after the split label is restored.
+            if all(
+                marker in header
+                for marker in (
+                    "最近一次",
+                    "本月应还款",
+                    "应还款日",
+                    "本月实还款",
+                    "还款日期",
+                )
+            ):
+                if len(tokens) == 4:
+                    first_date, first_amount, second_date, second_amount = tokens
+                    parsed = (
+                        _date(first_date),
+                        _number(first_amount),
+                        _date(second_date),
+                        _number(second_amount),
+                    )
+                    if (
+                        isinstance(parsed[1], int)
+                        and isinstance(parsed[3], int)
+                        and parsed[0]
+                        and parsed[2]
+                    ):
+                        for field_name, value, raw in (
+                            ("last_repayment_date", parsed[0], first_date),
+                            ("scheduled_payment", parsed[1], first_amount),
+                            ("scheduled_payment_date", parsed[2], second_date),
+                            ("actual_payment", parsed[3], second_amount),
+                        ):
+                            bind(
+                                field_name,
+                                value,
+                                raw,
+                                header_index + 1,
+                                value_column,
+                            )
+                continue
+
+            # Card payment rows can be merged in a different traversal.  The
+            # dates are distinguished by the source-visible snapshot date.
+            if all(
+                marker in header
+                for marker in (
+                    "当前逾期期数",
+                    "最近一次还款日期",
+                    "当前逾期总额",
+                    "账单日",
+                    "本月应还款",
+                    "本月实还款",
+                )
+            ):
+                dates = [(token, _date(token)) for token in tokens if _date(token)]
+                numbers = [
+                    (token, _number(token))
+                    for token in tokens
+                    if isinstance(_number(token), int)
+                ]
+                snapshot = str(account.get("snapshot_date") or "")
+                billing = [item for item in dates if item[1] == snapshot]
+                prior_dates = [item for item in dates if item[1] != snapshot]
+                nonzero = [item for item in numbers if int(item[1]) > 0]
+                zeros = [item for item in numbers if int(item[1]) == 0]
+                if (
+                    len(billing) == 1
+                    and len(prior_dates) == 1
+                    and len(nonzero) == 2
+                    and nonzero[0][1] == nonzero[1][1]
+                    and len(zeros) == 2
+                ):
+                    for field_name, value, raw in (
+                        ("billing_date", billing[0][1], billing[0][0]),
+                        ("last_repayment_date", prior_dates[0][1], prior_dates[0][0]),
+                        ("scheduled_payment", int(nonzero[0][1]), nonzero[0][0]),
+                        ("actual_payment", int(nonzero[1][1]), nonzero[1][0]),
+                        ("current_overdue_periods", 0, zeros[0][0]),
+                        ("current_overdue_amount", 0, zeros[1][0]),
+                    ):
+                        bind(
+                            field_name,
+                            value,
+                            raw,
+                            header_index + 1,
+                            value_column,
+                        )
+
+
+def _apply_account_facts(
+    parse_result: Any,
+    account: dict[str, Any],
+    rows: list[list[str]],
+    *,
+    page: Any,
+    table: Any,
+    physical_row_indices: list[int | None] | None = None,
+    defer_trailing_labels: bool = True,
+) -> None:
+    observations, unresolved = _exact_label_observations(rows)
     mappings: tuple[tuple[str, tuple[str, ...], Any], ...] = (
-        ("management_institution", ("管理机构", "发卡机构"), _business_text),
+        ("management_institution", ("管理机构", "发卡机构"), _account_institution),
         ("account_identifier", ("账户标识",), _identifier),
         ("open_date", ("开立日期",), _date),
         ("due_date", ("到期日期",), _date),
@@ -401,25 +1990,198 @@ def _apply_account_facts(account: dict[str, Any], rows: list[list[str]]) -> None
         ("close_date", ("账户关闭日期", "销户日期"), _date),
         ("transfer_out_date", ("转出月份",), _date),
     )
+    dataset = "credit_accounts"
+    target_record_id = str(account.get("account_id") or "")
+    parser_stage = "candidate_b_account_canonical_slots"
+
+    def physical_row(row_index: int) -> int | None:
+        if physical_row_indices is None:
+            return row_index
+        if 0 <= row_index < len(physical_row_indices):
+            return physical_row_indices[row_index]
+        return None
+
     for target, labels, converter in mappings:
-        raw = _field(facts, *labels)
-        if raw is None:
+        values = [item for label in labels for item in observations.get(_compact(label), ())]
+        for raw, value_row_index, column in values:
+            source_row = physical_row(value_row_index)
+            if source_row is None:
+                continue
+            ref = _source_ref(page, table, row=source_row, column=column)
+            if is_explicit_source_absence(raw):
+                _mark_source_absent(account, target, raw)
+                continue
+            if target == "management_institution":
+                _merge_account_institution_observation(
+                    parse_result,
+                    account,
+                    raw=raw,
+                    source_ref=ref,
+                    parser_stage=parser_stage,
+                )
+                continue
+            if converter is _date:
+                _merge_canonical_date_observation(
+                    parse_result,
+                    account,
+                    dataset=dataset,
+                    target_record_id=target_record_id,
+                    field_name=target,
+                    raw=raw,
+                    source_ref=ref,
+                    parser_stage=parser_stage,
+                )
+                continue
+            value = converter(raw)
+            valid = value not in (None, "")
+            if converter is _number:
+                valid = isinstance(value, int) and not isinstance(value, bool)
+            elif converter in {_business_text, _account_institution}:
+                compact_value = _compact(value)
+                valid = bool(value) and not any(label in compact_value for label in _ACCOUNT_LABELS)
+                if target == "management_institution":
+                    valid = valid and not bool(
+                        _DATE_RE.search(compact_value)
+                        or re.search(r"[A-Z][A-Z0-9-]{7,}\d", compact_value, re.IGNORECASE)
+                    )
+                contract_role = _ACCOUNT_SCALAR_CONTRACT_ROLES.get(target)
+                if contract_role:
+                    value = normalize_pboc_field(str(value), contract_role)
+                    valid = valid and validate_pboc_field(str(value), contract_role).valid
+            elif target == "account_identifier":
+                typed_value = _typed_identifier(value)
+                valid = typed_value is not None
+                value = typed_value
+            if not valid:
+                _reject_exact_observation(
+                    parse_result,
+                    account,
+                    dataset=dataset,
+                    target_record_id=target_record_id,
+                    field_name=target,
+                    raw=raw,
+                    source_ref=ref,
+                    parser_stage=parser_stage,
+                )
+                continue
+            _merge_exact_observation(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name=target,
+                value=value,
+                raw=raw,
+                source_ref=ref,
+                parser_stage=parser_stage,
+            )
+
+    for raw_currency, value_row_index, column in [
+        item for label in ("账户币种", "币种") for item in observations.get(label, ())
+    ]:
+        source_row = physical_row(value_row_index)
+        if source_row is None:
             continue
-        value = converter(raw)
-        if value not in (None, ""):
-            account[target] = value
-            account.setdefault("canonical_raw", {})[target] = raw
+        ref = _source_ref(page, table, row=source_row, column=column)
+        if _compact(raw_currency) in {"-", "--"}:
+            _mark_source_absent(account, "currency", raw_currency)
+            _mark_source_absent(account, "account_currency", raw_currency)
+            continue
+        currency, residue, resolution = _currency_token(raw_currency)
+        if not currency:
+            _reject_exact_observation(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name="currency",
+                raw=raw_currency,
+                source_ref=ref,
+                parser_stage=parser_stage,
+            )
+            continue
+        for field_name in ("currency", "account_currency"):
+            _merge_exact_observation(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name=field_name,
+                value=currency,
+                raw=raw_currency,
+                source_ref=ref,
+                parser_stage=parser_stage,
+            )
+        if resolution == "residue":
+            _report_currency_residue(
+                parse_result,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                raw=raw_currency,
+                currency=currency,
+                residue=residue,
+                source_refs=(ref,),
+                parser_stage=parser_stage,
+            )
 
-    raw_currency = _field(facts, "账户币种", "币种")
-    currency = _currency(raw_currency)
-    if currency:
-        account["currency"] = currency
-        account["account_currency"] = currency
-        account.setdefault("canonical_raw", {})["currency"] = raw_currency
+    for raw_status, value_row_index, column in [
+        item for label in ("账户状态", "状态") for item in observations.get(label, ())
+    ]:
+        source_row = physical_row(value_row_index)
+        if source_row is None:
+            continue
+        ref = _source_ref(page, table, row=source_row, column=column)
+        if _compact(raw_status) in {"-", "--"}:
+            _mark_source_absent(account, "account_status", raw_status)
+            continue
+        status_values = _status_fields(raw_status)
+        if status_values.get("account_status_resolution") == "unresolved":
+            _reject_exact_observation(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name="account_status",
+                raw=raw_status,
+                source_ref=ref,
+                parser_stage=parser_stage,
+            )
+            continue
+        for field_name, value in status_values.items():
+            _merge_exact_observation(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name=field_name,
+                value=value,
+                raw=raw_status,
+                source_ref=ref,
+                parser_stage=parser_stage,
+            )
 
-    raw_status = _field(facts, "账户状态", "状态")
-    if raw_status:
-        account.update(_status_fields(raw_status))
+    # Do not report the final label row yet: it may be a verified continuation
+    # whose value row begins the next logical page.  Internal missing cells are
+    # immediately repair-eligible.
+    for label, label_row_index, column in unresolved:
+        if defer_trailing_labels and label_row_index == len(rows) - 1:
+            continue
+        target = next((field for field, labels, _converter in mappings if label in labels), None)
+        if target is None:
+            target = {"账户币种": "currency", "币种": "currency", "账户状态": "account_status", "状态": "account_status"}.get(label)
+        source_row = physical_row(label_row_index)
+        if not target or source_row is None:
+            continue
+        _reject_exact_observation(
+            parse_result,
+            account,
+            dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=target,
+            raw="",
+            source_ref=_source_ref(page, table, row=source_row, column=column),
+            parser_stage=parser_stage,
+        )
 
     for row in rows:
         text = _clean(" ".join(row))
@@ -430,9 +2192,19 @@ def _apply_account_facts(account: dict[str, Any], rows: list[list[str]]) -> None
         if inactive:
             account.update(_status_fields(inactive.group(1)))
 
+    _apply_collapsed_account_clusters(
+        parse_result,
+        account,
+        rows,
+        page=page,
+        table=table,
+        physical_row_indices=physical_row_indices,
+    )
+
     if account.get("due_date"):
         account["contract_maturity_date"] = account["due_date"]
-    account.setdefault("reporting_amount_currency", "CNY")
+    if account.get("currency"):
+        account["reporting_amount_currency"] = account["currency"]
     account.setdefault("amount_unit", "yuan")
     account.setdefault("reporting_amount_unit", "yuan")
     account.setdefault("reporting_amount_precision", 0)
@@ -577,7 +2349,7 @@ def _repayment_records(
 
 def _account_base(rows: list[list[str]]) -> bool:
     compact = _compact(" ".join(cell for row in rows[:4] for cell in row))
-    return "账户标识" in compact and ("管理机构" in compact or "发卡机构" in compact)
+    return "账户标识" in compact and ("管理机构" in compact or "发卡机构" in compact) and not _other_entity_table(rows)
 
 
 def _other_entity_table(rows: list[list[str]]) -> bool:
@@ -595,6 +2367,18 @@ def _other_entity_table(rows: list[list[str]]) -> bool:
             "查询日期查询机构查询原因",
         )
     )
+
+
+def _account_heading_fields(value: Any) -> dict[str, str]:
+    """Decode business identifiers printed in one canonical account anchor."""
+
+    text = _compact(value)
+    tail = re.search(r"卡片尾号[：:]?([0-9]{4})", text)
+    agreement = re.search(r"授信协议标识[：:]?([A-Z0-9]{8,80})", text, re.IGNORECASE)
+    return {
+        **({"card_tail": tail.group(1)} if tail else {}),
+        **({"credit_agreement_identifier": agreement.group(1).upper()} if agreement else {}),
+    }
 
 
 def _account_heading_for_table(page: Any, table: Any) -> dict[str, str]:
@@ -617,110 +2401,646 @@ def _account_heading_for_table(page: Any, table: Any) -> dict[str, str]:
     maximum_gap = max(72.0, page_height * 0.10) if page_height else 72.0
     if table_top != float("inf") and table_top - bottom > maximum_gap:
         return {}
-    text = _compact(raw_text)
-    tail = re.search(r"卡片尾号[：:]?([0-9]{4})", text)
-    agreement = re.search(r"授信协议标识[：:]?([A-Z0-9]+)", text, re.IGNORECASE)
-    return {
-        **({"card_tail": tail.group(1)} if tail else {}),
-        **({"credit_agreement_identifier": agreement.group(1)} if agreement else {}),
+    return _account_heading_fields(raw_text)
+
+
+_ACCOUNT_CONTINUATION_LABELS = frozenset(
+    {
+        "账户状态",
+        "状态",
+        "五级分类",
+        "余额",
+        "透支余额",
+        "剩余还款期数",
+        "剩余分期期数",
+        "本月应还款",
+        "本月实还款",
+        "应还款日",
+        "账单日",
+        "最近一次还款日期",
+        "当前逾期期数",
+        "当前逾期总额",
+        "逾期31—60天未还本金",
+        "逾期31－60天未还本金",
+        "逾期61—90天未还本金",
+        "逾期61－90天未还本金",
+        "逾期91—180天未还本金",
+        "逾期91－180天未还本金",
+        "逾期180天以上未还本金",
+        "透支180天以上未付余额",
+        "已用额度",
+        "最近6个月平均使用额度",
+        "最大使用额度",
+        "未出单的大额专项分期余额",
+        "大额专项分期额度",
+        "分期额度生效日期",
+        "分期额度到期日期",
+        "已用分期金额",
+        "还款日期",
+        "还款金额",
+        "当前还款状态",
+        "特殊交易类型",
+        "特殊事件说明",
     }
+)
+
+
+def _account_continuation_fragment(rows: list[list[str]], pending_labels: list[str] | None = None) -> bool:
+    """Recognize a canonical account-detail fragment, not another account body."""
+
+    compact = _compact(" ".join(cell for row in rows for cell in row))
+    if not compact:
+        return False
+    if any(_compact(label) in compact for label in _ACCOUNT_CONTINUATION_LABELS):
+        return True
+    if "还款记录" in compact or "逾期金额" in compact:
+        return True
+    # A value-only table is eligible only when the immediately preceding
+    # account fragment ended with an exact canonical label row.
+    return bool(pending_labels and _label_row(pending_labels))
+
+
+def _table_top_value(table: Any) -> float | None:
+    bbox = getattr(table, "bbox", None)
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        return float(bbox[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _geometric_prior_account_continuation(
+    *,
+    page: Any,
+    table: Any,
+    page_tables: list[Any],
+    current_logical_page: int,
+    current_table_top: float | None,
+    rows: list[list[str]],
+    pending_labels: list[str] | None,
+) -> bool:
+    """Authorize the unique prior-account interval around a split table.
+
+    On the same logical page, a secondary account table below the current body
+    remains inside that body's interval.  At a logical-page boundary, a
+    secondary table can belong to the prior account only when it is
+    geometrically above the next canonical account body.  Page adjacency or a
+    footer alone is never sufficient.
+    """
+
+    if not _account_continuation_fragment(rows, pending_labels):
+        return False
+    top = _table_top_value(table)
+    logical_page = int(getattr(page, "page_number", 0) or 0)
+    if top is None or not logical_page or not current_logical_page:
+        return False
+    if logical_page == current_logical_page:
+        return current_table_top is not None and top + 1.0 >= current_table_top
+    if logical_page < current_logical_page:
+        return False
+    next_body_tops = [
+        candidate_top
+        for candidate in page_tables
+        if candidate is not table
+        and _account_base(_table_rows(candidate))
+        and (candidate_top := _table_top_value(candidate)) is not None
+        and candidate_top > top
+    ]
+    return bool(next_body_tops and top < min(next_body_tops))
+
+
+_ACCOUNT_EVENT_DATASETS = {
+    "special_transaction": "credit_account_special_transactions",
+    "large_installment": "credit_card_large_installments",
+    "latest_repayment": "credit_account_latest_repayments",
+    "special_event_note": "credit_account_special_events",
+}
+
+
+def _account_event_type(row: list[str]) -> str | None:
+    compact = _compact("".join(row))
+    if "特殊交易类型" in compact:
+        return "special_transaction"
+    if "大额专项分期额度" in compact:
+        return "large_installment"
+    if "还款日期" in compact and "还款金额" in compact and "当前还款状态" in compact:
+        return "latest_repayment"
+    if "特殊事件说明" in compact:
+        return "special_event_note"
+    return None
+
+
+def _large_installment_tail_header(row: list[str]) -> bool:
+    compact = _compact("".join(row))
+    return all(label in compact for label in ("分期额度到期日期", "已用分期金额"))
+
+
+def _account_event_continuation_value_index(rows: list[list[str]]) -> int | None:
+    """Return the first value row that can consume a pending typed event header."""
+
+    for row_index, row in enumerate(rows):
+        if not _nonempty(row):
+            continue
+        if _account_event_type(row) is not None or _label_row(row):
+            return None
+        return row_index
+    return None
+
+
+def _report_pending_account_event_unresolved(
+    issue_owner: Any,
+    pending: Mapping[str, Any],
+    *,
+    boundary: str,
+    candidate_table: Any | None = None,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    event_type = str(pending.get("event_type") or "")
+    account_id = str(pending.get("account_id") or "")
+    page = pending.get("page")
+    table = pending.get("table")
+    row_index = int(pending.get("row_index") or 0)
+    record_issue(
+        issue_owner,
+        make_issue(
+            category="page_continuation",
+            issue_code="candidate_b_account_event_continuation_unresolved",
+            message=(
+                "A canonical account-event header ended an account fragment, but no affirmatively owned "
+                "continuation supplied its value row; the event was withheld."
+            ),
+            parser_stage="candidate_b_account_event_continuation",
+            target_dataset=_ACCOUNT_EVENT_DATASETS.get(
+                event_type, "personal_detail_account_events"
+            ),
+            target_record_id=str(
+                (pending.get("target_event") or {}).get("account_event_id")
+                or stable_record_id(
+                    "personal_detail_account_event",
+                    account_id,
+                    event_type,
+                    int(getattr(page, "page_number", 0) or 0),
+                    row_index,
+                )
+            ),
+            observed_value={
+                "event_type": event_type,
+                "header": list(pending.get("row") or ()),
+                "boundary": boundary,
+                **(
+                    {"candidate_table_id": str(getattr(candidate_table, "table_id", "") or "")}
+                    if candidate_table is not None
+                    else {}
+                ),
+            },
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=(
+                "canonical_event_header_at_fragment_end",
+                "continuation_value_not_affirmatively_owned",
+                "event_record_withheld",
+                "dataset_incomplete",
+            ),
+        ),
+    )
 
 
 def _account_events(
+    issue_owner: Any,
     account: dict[str, Any],
     page: Any,
     table: Any,
     rows: list[list[str]],
+    *,
+    leading_header: Mapping[str, Any] | None = None,
+    leading_value_row_index: int = 0,
+    defer_trailing_large_installment_tail: bool = False,
 ) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    scoped_rows: list[tuple[list[str], Any, Any, int]] = []
+    if leading_header is not None:
+        scoped_rows.append(
+            (
+                list(leading_header.get("row") or ()),
+                leading_header.get("page"),
+                leading_header.get("table"),
+                int(leading_header.get("row_index") or 0),
+            )
+        )
+    scoped_rows.extend(
+        (row, page, table, row_index)
+        for row_index, row in enumerate(rows)
+        if leading_header is None or row_index >= leading_value_row_index
+    )
+
+    def scoped_ref(index: int, column: int | None = None) -> dict[str, Any]:
+        _row, source_page, source_table, source_row = scoped_rows[index]
+        return _source_ref(source_page, source_table, row=source_row, column=column)
+
     events: list[dict[str, Any]] = []
-    page_number = int(getattr(page, "page_number", 0) or 0)
-    for row_index, row in enumerate(rows):
-        compact = _compact("".join(row))
-        event_type: str | None = None
-        if "特殊交易类型" in compact:
-            event_type = "special_transaction"
-        elif "大额专项分期额度" in compact:
-            event_type = "large_installment"
-        elif "还款日期" in compact and "还款金额" in compact and "当前还款状态" in compact:
-            event_type = "latest_repayment"
-        elif "特殊事件说明" in compact:
-            event_type = "special_event_note"
-        if event_type is None or row_index + 1 >= len(rows):
+    for row_index, (row, header_page, header_table, header_row_index) in enumerate(scoped_rows):
+        event_type = _account_event_type(row)
+        if event_type is None or row_index + 1 >= len(scoped_rows):
             continue
-        value_row = rows[row_index + 1]
-        values = _nonempty(value_row)
-        if not values:
-            continue
-        facts = _pairs([row, value_row])
-        if event_type == "special_transaction":
-            payload = {
-                "transaction_type": _field(facts, "特殊交易类型") or values[0],
-                "event_date": _date(_field(facts, "发生日期")),
-                "changed_months": _number(_field(facts, "变更月数")),
-                "amount": _number(_field(facts, "发生金额")),
-                "details": None if _compact(_field(facts, "明细记录")) == "--" else _clean(_field(facts, "明细记录")),
-            }
-        elif event_type == "large_installment":
-            payload = {
-                "installment_limit": _number(_field(facts, "大额专项分期额度")),
-                "effective_date": _date(_field(facts, "分期额度生效日期")),
-                "expiry_date": _date(_field(facts, "分期额度到期日期")),
-                "used_installment_amount": _number(_field(facts, "已用分期金额")),
-            }
-        elif event_type == "latest_repayment":
-            payload = {
-                "five_tier_class": _clean(_field(facts, "五级分类")),
-                "balance": _number(_field(facts, "余额")),
-                "repayment_date": _date(_field(facts, "还款日期")),
-                "repayment_amount": _number(_field(facts, "还款金额")),
-                "repayment_status": _clean(_field(facts, "当前还款状态")),
-            }
-        else:
-            payload = {"details": values[0]}
-        payload = {key: value for key, value in payload.items() if value not in (None, "")}
+        target_dataset = _ACCOUNT_EVENT_DATASETS[event_type]
+        value_row = scoped_rows[row_index + 1][0]
+        page_number = int(getattr(header_page, "page_number", 0) or 0)
         event_id = stable_record_id(
             "personal_detail_account_event",
             account.get("account_id"),
             event_type,
             page_number,
-            row_index,
+            header_row_index,
         )
-        events.append(
-            {
-                "record_id": event_id,
-                "account_event_id": event_id,
-                "account_id": account.get("account_id"),
-                "event_type": event_type,
-                **payload,
-                "source": "native_personal_detail_account_event",
-                "source_refs": [_source_ref(page, table, row=row_index)],
-                "confidence": 1.0,
-            }
-        )
+        record: dict[str, Any] = {
+            "record_id": event_id,
+            "account_event_id": event_id,
+            "account_id": account.get("account_id"),
+            "event_type": event_type,
+            "source": "native_personal_detail_account_event",
+            "source_refs": [scoped_ref(row_index)],
+            "source_refs_by_field": {},
+            "canonical_raw": {},
+            "confidence": min(
+                float(getattr(header_table, "confidence", None) or 0.9),
+                float(getattr(scoped_rows[row_index + 1][2], "confidence", None) or 0.9),
+            ),
+        }
+        observations, unresolved_slots = _exact_label_observations([row, value_row])
+        cluster_decoded = None
+        cluster_raw = ""
+        cluster_value_rows: dict[str, tuple[int, int | None]] = {}
+        if event_type in {"special_transaction", "large_installment"}:
+            kind = event_type
+            fragments = [f"{_clean(' '.join(row))} {_clean(' '.join(value_row))}"]
+            first_value_cell = _single_business_cell(value_row)
+            for field_name in (
+                ("transaction_type", "event_date", "changed_months", "amount", "details")
+                if event_type == "special_transaction"
+                else ("installment_limit", "effective_date")
+            ):
+                cluster_value_rows[field_name] = (
+                    row_index + 1,
+                    first_value_cell[0] if first_value_cell is not None else None,
+                )
+            if event_type == "large_installment" and row_index + 3 < len(scoped_rows):
+                second_header = _compact("".join(scoped_rows[row_index + 2][0]))
+                if all(label in second_header for label in ("分期额度到期日期", "已用分期金额")):
+                    second_value = scoped_rows[row_index + 3][0]
+                    fragments.append(
+                        f"{_clean(' '.join(scoped_rows[row_index + 2][0]))} {_clean(' '.join(second_value))}"
+                    )
+                    second_value_cell = _single_business_cell(second_value)
+                    for field_name in ("expiry_date", "used_installment_amount"):
+                        cluster_value_rows[field_name] = (
+                            row_index + 3,
+                            second_value_cell[0] if second_value_cell is not None else None,
+                        )
+            cluster_decoded = decode_labeled_cluster(
+                tuple(fragments),
+                kind=kind,
+            )
+            cluster_raw = " | ".join(fragments)
+
+        def bind_cluster(field_name: str) -> bool:
+            if cluster_decoded is None or field_name not in cluster_decoded.fields:
+                return False
+            value = cluster_decoded.fields[field_name]
+            source_row, source_column = cluster_value_rows.get(field_name, (row_index + 1, None))
+            source_ref = scoped_ref(source_row, source_column)
+            source_ref["binding"] = "closed_canonical_account_event_cluster"
+            source_ref["binding_quality"] = "closed_canonical_account_event_cluster"
+            record[field_name] = value
+            record["canonical_raw"][field_name] = cluster_raw
+            record["source_refs_by_field"].setdefault(field_name, []).append(
+                {**source_ref, "field_name": field_name}
+            )
+            return True
+
+        def bind_exact(field_name: str, label: str, converter: Any) -> None:
+            candidates = observations.get(label) or []
+            distinct = {_compact(raw) for raw, _physical_row, _column in candidates if _compact(raw)}
+            if len(distinct) != 1:
+                if bind_cluster(field_name):
+                    return
+                record_issue(
+                    issue_owner,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code="candidate_b_account_event_slot_unresolved",
+                        message=(
+                            "A canonical account-event field was missing or ambiguous; no adjacent value "
+                            "was shifted into the slot."
+                        ),
+                        parser_stage="candidate_b_account_event_canonical_slots",
+                        target_dataset=target_dataset,
+                        target_record_id=event_id,
+                        field_name=field_name,
+                        observed_value={
+                            "label": label,
+                            "candidate_values": [raw for raw, _physical_row, _column in candidates],
+                        },
+                        source_refs=(scoped_ref(row_index),),
+                        reason_codes=(
+                            "canonical_event_label_observed",
+                            "exact_value_slot_unresolved",
+                            "positional_fallback_forbidden",
+                            "normalized_value_withheld",
+                        ),
+                    ),
+                )
+                _append_internal_field(record, "_unresolved_fields", field_name)
+                return
+            raw, physical_row, column = candidates[0]
+            source_ref = scoped_ref(row_index + physical_row, column)
+            if _compact(raw) in {"-", "--"}:
+                _mark_source_absent(record, field_name, raw)
+                record["source_refs_by_field"].setdefault(field_name, []).append(
+                    {**source_ref, "field_name": field_name}
+                )
+                return
+            value = converter(raw)
+            if value in (None, ""):
+                if bind_cluster(field_name):
+                    return
+                _reject_exact_observation(
+                    issue_owner,
+                    record,
+                    dataset=target_dataset,
+                    target_record_id=event_id,
+                    field_name=field_name,
+                    raw=raw,
+                    source_ref=source_ref,
+                    parser_stage="candidate_b_account_event_canonical_slots",
+                )
+                return
+            record[field_name] = value
+            record["canonical_raw"][field_name] = raw
+            record["source_refs_by_field"].setdefault(field_name, []).append(
+                {**source_ref, "field_name": field_name}
+            )
+
+        field_contracts: dict[str, tuple[tuple[str, str, Any], ...]] = {
+            "special_transaction": (
+                ("transaction_type", "特殊交易类型", _clean),
+                ("event_date", "发生日期", _date),
+                ("changed_months", "变更月数", _number),
+                ("amount", "发生金额", _number),
+                ("details", "明细记录", _clean),
+            ),
+            "large_installment": (
+                ("installment_limit", "大额专项分期额度", _number),
+                ("effective_date", "分期额度生效日期", _date),
+                ("expiry_date", "分期额度到期日期", _date),
+                ("used_installment_amount", "已用分期金额", _number),
+            ),
+            "latest_repayment": (
+                ("five_tier_class", "五级分类", _clean),
+                ("balance", "余额", _number),
+                ("repayment_date", "还款日期", _date),
+                ("repayment_amount", "还款金额", _number),
+                ("repayment_status", "当前还款状态", _clean),
+            ),
+            "special_event_note": (("details", "特殊事件说明", _clean),),
+        }
+        for field_name, label, converter in field_contracts[event_type]:
+            if (
+                defer_trailing_large_installment_tail
+                and event_type == "large_installment"
+                and field_name in {"expiry_date", "used_installment_amount"}
+                and _large_installment_tail_header(scoped_rows[-1][0])
+            ):
+                continue
+            bind_exact(field_name, label, converter)
+        # Keep the observed row even when one slot failed: the normalized
+        # omissions are linked to explicit issues and the source record count
+        # remains conserved.
+        if unresolved_slots:
+            record.setdefault("_unresolved_source_slots", []).extend(
+                sorted({label for label, _row, _column in unresolved_slots})
+            )
+        events.append(record)
     return events
 
 
-def _extract_accounts(
+def _consume_pending_large_installment_tail(
+    issue_owner: Any,
+    pending: Mapping[str, Any],
+    *,
+    page: Any,
+    table: Any,
+    rows: list[list[str]],
+    value_row_index: int,
+) -> None:
+    """Bind the second large-installment pair to its already materialized event."""
+
+    event = pending.get("target_event")
+    if not isinstance(event, dict):
+        _report_pending_account_event_unresolved(
+            issue_owner,
+            pending,
+            boundary="large_installment_tail_without_primary_event",
+            candidate_table=table,
+        )
+        return
+    header = list(pending.get("row") or ())
+    value_row = rows[value_row_index]
+    observations, _unresolved = _exact_label_observations([header, value_row])
+    event_id = str(event.get("account_event_id") or event.get("record_id") or "")
+    target_dataset = _ACCOUNT_EVENT_DATASETS["large_installment"]
+    for field_name, label, converter in (
+        ("expiry_date", "分期额度到期日期", _date),
+        ("used_installment_amount", "已用分期金额", _number),
+    ):
+        candidates = observations.get(label) or []
+        distinct = {_compact(raw) for raw, _row, _column in candidates if _compact(raw)}
+        if len(distinct) != 1:
+            _reject_exact_observation(
+                issue_owner,
+                event,
+                dataset=target_dataset,
+                target_record_id=event_id,
+                field_name=field_name,
+                raw="",
+                source_ref=_source_ref(
+                    pending.get("page"),
+                    pending.get("table"),
+                    row=int(pending.get("row_index") or 0),
+                ),
+                parser_stage="candidate_b_account_event_continuation",
+            )
+            continue
+        raw, _physical_row, column = candidates[0]
+        value = converter(raw)
+        valid = value not in (None, "")
+        if converter is _number:
+            valid = isinstance(value, int) and not isinstance(value, bool)
+        if not valid:
+            _reject_exact_observation(
+                issue_owner,
+                event,
+                dataset=target_dataset,
+                target_record_id=event_id,
+                field_name=field_name,
+                raw=raw,
+                source_ref=_source_ref(page, table, row=value_row_index, column=column),
+                parser_stage="candidate_b_account_event_continuation",
+            )
+            continue
+        event[field_name] = value
+        event.setdefault("canonical_raw", {})[field_name] = raw
+        value_ref = _source_ref(page, table, row=value_row_index, column=column)
+        event.setdefault("source_refs_by_field", {}).setdefault(field_name, []).append(
+            {**value_ref, "field_name": field_name}
+        )
+    for ref in (
+        _source_ref(
+            pending.get("page"),
+            pending.get("table"),
+            row=int(pending.get("row_index") or 0),
+        ),
+        _source_ref(page, table, row=value_row_index),
+    ):
+        if ref not in event.setdefault("source_refs", []):
+            event["source_refs"].append(ref)
+
+
+def _extract_table_accounts(
     parse_result: Any,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     accounts: list[dict[str, Any]] = []
     repayments: list[dict[str, Any]] = []
     account_events: list[dict[str, Any]] = []
-    category_counts: defaultdict[str, int] = defaultdict(int)
     phase = "non_revolving_loan"
     current: dict[str, Any] | None = None
     pending_labels: list[str] | None = None
+    pending_label_source: tuple[Any, Any, int] | None = None
+    pending_event: dict[str, Any] | None = None
     current_table_id = ""
     current_logical_page = 0
+    current_table_top: float | None = None
     continuation_check = getattr(parse_result, "tables_continue", None)
 
+    def flush_pending_fact_labels(boundary: str) -> None:
+        nonlocal pending_labels, pending_label_source
+        if current is None or pending_labels is None or pending_label_source is None:
+            pending_labels = None
+            pending_label_source = None
+            return
+        source_page, source_table, source_row_index = pending_label_source
+        _apply_account_facts(
+            parse_result,
+            current,
+            [pending_labels, []],
+            page=source_page,
+            table=source_table,
+            physical_row_indices=[source_row_index, None],
+            defer_trailing_labels=False,
+        )
+        current.setdefault("_terminal_unresolved_fact_boundaries", []).append(boundary)
+        pending_labels = None
+        pending_label_source = None
+
+    def flush_pending_event(
+        boundary: str,
+        *,
+        candidate_table: Any | None = None,
+    ) -> None:
+        nonlocal pending_event
+        if pending_event is None:
+            return
+        _report_pending_account_event_unresolved(
+            parse_result,
+            pending_event,
+            boundary=boundary,
+            candidate_table=candidate_table,
+        )
+        pending_event = None
+
+    def flush_pending_institution(boundary: str) -> None:
+        if current is not None:
+            _flush_pending_account_institution_observations(
+                parse_result,
+                current,
+                boundary=boundary,
+            )
+
+    def set_trailing_pending_state(page: Any, table: Any, rows: list[list[str]]) -> None:
+        nonlocal pending_labels, pending_label_source, pending_event
+        trailing_event_type = _account_event_type(rows[-1]) if rows else None
+        if trailing_event_type is not None:
+            pending_event = {
+                "event_type": trailing_event_type,
+                "account_id": str(current.get("account_id") or "") if current is not None else "",
+                "page": page,
+                "table": table,
+                "row_index": len(rows) - 1,
+                "row": list(rows[-1]),
+            }
+            # Event headers are typed structures.  They must never also act as
+            # generic account-fact headers (latest-repayment includes 余额).
+            pending_labels = None
+            pending_label_source = None
+            return
+        if rows and _large_installment_tail_header(rows[-1]):
+            target_event = next(
+                (
+                    event
+                    for event in reversed(account_events)
+                    if event.get("account_id") == (current or {}).get("account_id")
+                    and event.get("event_type") == "large_installment"
+                    and not {
+                        "expiry_date",
+                        "used_installment_amount",
+                    }.issubset(event)
+                ),
+                None,
+            )
+            pending_event = {
+                "event_type": "large_installment",
+                "event_part": "tail",
+                "target_event": target_event,
+                "account_id": str(current.get("account_id") or "") if current is not None else "",
+                "page": page,
+                "table": table,
+                "row_index": len(rows) - 1,
+                "row": list(rows[-1]),
+            }
+            pending_labels = None
+            pending_label_source = None
+            return
+        pending_event = None
+        pending_labels = rows[-1] if rows and _label_row(rows[-1]) else None
+        pending_label_source = (
+            (page, table, len(rows) - 1) if pending_labels is not None else None
+        )
+
     for page in getattr(parse_result, "pages", None) or []:
-        for table in getattr(page, "tables", None) or []:
+        page_tables = list(getattr(page, "tables", None) or [])
+        page_tables.sort(
+            key=lambda candidate: (
+                _table_top_value(candidate) is None,
+                _table_top_value(candidate) or 0.0,
+            )
+        )
+        for source_table_index, table in enumerate(page_tables):
             rows = _table_rows(table)
             if not rows:
                 continue
             compact = _compact(" ".join(cell for row in rows[:6] for cell in row))
             if _account_base(rows):
+                if current is not None:
+                    flush_pending_event("next_account", candidate_table=table)
+                    flush_pending_fact_labels("next_account")
+                    flush_pending_institution("next_account")
                 if "发卡机构" in compact:
                     account_type = "credit_card" if "业务种类" in compact else "quasi_credit_card"
                     phase = account_type
@@ -733,46 +3053,83 @@ def _extract_accounts(
                 else:
                     account_type = "non_revolving_loan"
 
-                category_counts[account_type] += 1
+                table_ref = _source_ref(page, table)
+                table_observation_id = stable_record_id(
+                    "credit_account_table_observation",
+                    account_type,
+                    table_ref.get("logical_page"),
+                    table_ref.get("source_page"),
+                    table_ref.get("table_id"),
+                    table_ref.get("bbox"),
+                    source_table_index,
+                )
                 current = {
-                    "account_id": f"credit_account:{account_type}:{category_counts[account_type]}",
+                    # A table is an observation, not an account identity.  Only
+                    # a printed anchor can contribute the family ordinal.  The
+                    # source-position digest stays stable when the ordinal is
+                    # unreadable and cannot silently masquerade as one.
+                    "account_id": table_observation_id,
+                    "_table_observation_id": table_observation_id,
                     "sequence": len(accounts) + 1,
-                    "category_sequence": category_counts[account_type],
                     "account_type": account_type,
                     "source": "native_detail_account_table",
-                    "source_refs": [_source_ref(page, table)],
+                    "source_refs": [table_ref],
                     "confidence": 1.0,
                     "canonical_raw": {},
                 }
-                current.update(_account_heading_for_table(page, table))
                 if account_type in {"credit_card", "quasi_credit_card"}:
                     current["credit_card_type"] = account_type
-                _apply_account_facts(current, rows)
+                _apply_account_facts(
+                    parse_result,
+                    current,
+                    rows,
+                    page=page,
+                    table=table,
+                    physical_row_indices=list(range(len(rows))),
+                )
                 accounts.append(current)
                 repayment_rows, _context = _repayment_records(page, table, rows, current)
                 repayments.extend(repayment_rows)
-                account_events.extend(_account_events(current, page, table, rows))
-                pending_labels = rows[-1] if rows and _label_row(rows[-1]) else None
+                account_events.extend(
+                    _account_events(
+                        parse_result,
+                        current,
+                        page,
+                        table,
+                        rows,
+                        defer_trailing_large_installment_tail=True,
+                    )
+                )
+                set_trailing_pending_state(page, table, rows)
                 current_table_id = str(getattr(table, "table_id", "") or "")
                 current_logical_page = int(getattr(page, "page_number", 0) or 0)
+                current_table_top = _table_top_value(table)
                 continue
 
             logical_page = int(getattr(page, "page_number", 0) or 0)
-            crosses_page = bool(current_logical_page and logical_page != current_logical_page)
-            if current is not None and crosses_page:
-                candidate_table_id = str(getattr(table, "table_id", "") or "")
-                continuation = (
-                    continuation_check(current_table_id, candidate_table_id)
-                    if callable(continuation_check)
-                    else None
-                )
-                if continuation is not True:
-                    current = None
-                    pending_labels = None
-                    current_table_id = ""
-                    current_logical_page = 0
+            candidate_table_id = str(getattr(table, "table_id", "") or "")
+            continuation = None
+            if current is not None and callable(continuation_check) and current_table_id and candidate_table_id:
+                continuation = continuation_check(current_table_id, candidate_table_id)
 
-            if current is not None and not _other_entity_table(rows):
+            geometric_prior_owner = bool(
+                current is not None
+                and not _other_entity_table(rows)
+                and _geometric_prior_account_continuation(
+                    page=page,
+                    table=table,
+                    page_tables=page_tables,
+                    current_logical_page=current_logical_page,
+                    current_table_top=current_table_top,
+                    rows=rows,
+                    pending_labels=pending_labels,
+                )
+            )
+
+            # Ownership comes either from the entity graph or from the unique
+            # static interval around a canonical secondary account table.  The
+            # geometric path never relies on a footer or page adjacency alone.
+            if current is not None and (continuation is True or geometric_prior_owner) and not _other_entity_table(rows):
                 continuation_values = [value for row in rows for value in _nonempty(row)]
                 if (
                     len(continuation_values) == 1
@@ -785,13 +3142,146 @@ def _extract_accounts(
                         str(account_events[-1]["transaction_type"]) + continuation_values[0]
                     )
                 fact_rows = ([pending_labels] if pending_labels else []) + rows
-                _apply_account_facts(current, fact_rows)
+                _apply_account_facts(
+                    parse_result,
+                    current,
+                    fact_rows,
+                    page=page,
+                    table=table,
+                    physical_row_indices=([None] if pending_labels else []) + list(range(len(rows))),
+                )
                 repayment_rows, _context = _repayment_records(page, table, rows, current)
                 repayments.extend(repayment_rows)
-                account_events.extend(_account_events(current, page, table, rows))
-                pending_labels = rows[-1] if rows and _label_row(rows[-1]) else None
+                if pending_event is not None:
+                    value_row_index = _account_event_continuation_value_index(rows)
+                    if value_row_index is None:
+                        flush_pending_event(
+                            "affirmed_continuation_without_value_row",
+                            candidate_table=table,
+                        )
+                        account_events.extend(
+                            _account_events(
+                                parse_result,
+                                current,
+                                page,
+                                table,
+                                rows,
+                                defer_trailing_large_installment_tail=True,
+                            )
+                        )
+                    else:
+                        if pending_event.get("event_part") == "tail":
+                            _consume_pending_large_installment_tail(
+                                parse_result,
+                                pending_event,
+                                page=page,
+                                table=table,
+                                rows=rows,
+                                value_row_index=value_row_index,
+                            )
+                            account_events.extend(
+                                _account_events(
+                                    parse_result,
+                                    current,
+                                    page,
+                                    table,
+                                    rows,
+                                    defer_trailing_large_installment_tail=True,
+                                )
+                            )
+                        else:
+                            account_events.extend(
+                                _account_events(
+                                    parse_result,
+                                    current,
+                                    page,
+                                    table,
+                                    rows,
+                                    leading_header=pending_event,
+                                    leading_value_row_index=value_row_index,
+                                    defer_trailing_large_installment_tail=True,
+                                )
+                            )
+                        pending_event = None
+                else:
+                    account_events.extend(
+                        _account_events(
+                            parse_result,
+                            current,
+                            page,
+                            table,
+                            rows,
+                            defer_trailing_large_installment_tail=True,
+                        )
+                    )
+                continuation_ref = _source_ref(page, table)
+                if continuation_ref not in current.setdefault("source_refs", []):
+                    current["source_refs"].append(continuation_ref)
+                set_trailing_pending_state(page, table, rows)
                 current_table_id = str(getattr(table, "table_id", "") or current_table_id)
                 current_logical_page = logical_page or current_logical_page
+                current_table_top = _table_top_value(table) or current_table_top
+                continue
+
+            if current is not None:
+                compact_values = _compact(" ".join(cell for row in rows for cell in row))
+                looks_like_account_fragment = (
+                    any(label in compact_values for label in _ACCOUNT_LABELS)
+                    or "还款记录" in compact_values
+                    or "逾期金额" in compact_values
+                )
+                if looks_like_account_fragment and not _other_entity_table(rows):
+                    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                        make_issue,
+                        record_issue,
+                    )
+
+                    record_issue(
+                        parse_result,
+                        make_issue(
+                            category="ocr_structure_correction",
+                            issue_code="candidate_b_account_table_fragment_owner_unresolved",
+                            message=(
+                                "An account-like table fragment was not joined because canonical continuation "
+                                "ownership was not affirmatively established."
+                            ),
+                            parser_stage="candidate_b_account_table_ownership",
+                            target_dataset="credit_accounts",
+                            target_record_id=str(current.get("account_id") or "") or None,
+                            source_refs=(_source_ref(page, table),),
+                            observed_value={
+                                "left_table_id": current_table_id,
+                                "candidate_table_id": candidate_table_id,
+                                "left_logical_page": current_logical_page,
+                                "candidate_logical_page": logical_page,
+                                "continuation_decision": continuation,
+                            },
+                            reason_codes=(
+                                "canonical_continuation_not_verified",
+                                "table_fragment_withheld",
+                                "neighbour_order_not_used",
+                            ),
+                        ),
+                    )
+                    flush_pending_event("unowned_account_fragment", candidate_table=table)
+                    flush_pending_fact_labels("unowned_account_fragment")
+                    flush_pending_institution("unowned_account_fragment")
+                    current = None
+                    current_table_id = ""
+                    current_logical_page = 0
+                    current_table_top = None
+                elif _other_entity_table(rows):
+                    flush_pending_event("next_section", candidate_table=table)
+                    flush_pending_fact_labels("next_section")
+                    flush_pending_institution("next_section")
+                    current = None
+                    current_table_id = ""
+                    current_logical_page = 0
+                    current_table_top = None
+
+    flush_pending_event("end_of_document")
+    flush_pending_fact_labels("end_of_document")
+    flush_pending_institution("end_of_document")
 
     account_identifiers = {str(account["account_id"]): account.get("account_identifier") for account in accounts}
     deduped: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -805,123 +3295,3624 @@ def _extract_accounts(
     return accounts, list(deduped.values()), account_events
 
 
+_ACCOUNT_SECTION_END = (
+    "授信协议信息",
+    "相关还款责任信息",
+    "非信贷交易信息明细",
+    "公共信息明细",
+    "查询记录",
+    "报告说明",
+)
+
+
+def _account_family_from_heading(value: Any) -> tuple[str, str] | None:
+    """Resolve the printed PBOC family without collapsing R1 and R2."""
+    compact = re.sub(r"[\s（）()：:、，,。._-]+", "", str(value or ""))
+    if "非循环贷账户" in compact:
+        return "non_revolving_loan", "exact"
+    if "循环贷账户一" in compact:
+        return "revolving_loan_subaccount", "exact"
+    if "循环贷账户二" in compact:
+        return "revolving_loan_account", "exact"
+    if "准贷记卡账户" in compact:
+        return "quasi_credit_card", "exact"
+    if "贷记卡账户" in compact:
+        return "credit_card", "exact"
+    if "循环贷账户" in compact:
+        return "revolving_loan_subaccount", "ambiguous_missing_variant"
+    return None
+_ACCOUNT_ANCHOR_RE = re.compile(
+    r"^[^\u3400-\u9fff0-9]*账户\s*(\d{1,3})?\s*(?:[：:(（]|$|\s)"
+)
+_ACCOUNT_IDENTIFIER_PREFIX_RE = re.compile(
+    r"(?<![A-Z0-9])([A-Z][0-9]{8}[A-Z][A-Z0-9]{0,20})(?![A-Z0-9])",
+    re.I,
+)
+_ACCOUNT_IDENTIFIER_SUFFIX_RE = re.compile(
+    r"(?<![A-Z0-9])(?=[A-Z0-9]{4,})(?=[A-Z0-9]*\d)[A-Z0-9]{4,}(?![A-Z0-9])",
+    re.I,
+)
+
+
+def _account_identifier_from_detail(detail: list[dict[str, Any]]) -> str | None:
+    """Recover one identifier from the canonical account table row text.
+
+    Whole-page OCR commonly emits the ten-character identifier prefix as its
+    own line and the numeric suffix inside the following multi-cell row.  The
+    printed open date is the canonical boundary that prevents credit limits or
+    other numeric fields from being absorbed into the identifier.
+    """
+    header = next(
+        (
+            index
+            for index, line in enumerate(detail)
+            if "账户标识" in _compact(str(line.get("text") or ""))
+        ),
+        None,
+    )
+    if header is None:
+        return None
+
+    prefix = ""
+    suffix_parts: list[str] = []
+    saw_date_boundary = False
+    for line in detail[header + 1 : header + 9]:
+        text = str(line.get("text") or "").upper()
+        if "授信协议标识" in _compact(text):
+            continue
+        date_match = re.search(r"(?:19|20)\d{2}\s*(?:[./,，-]|年)\s*\d{1,2}", text)
+        before_date = text[: date_match.start()] if date_match else text
+        matches = list(_ACCOUNT_IDENTIFIER_PREFIX_RE.finditer(before_date))
+        if matches:
+            if prefix or len(matches) != 1:
+                return None
+            prefix = matches[0].group(1).upper()
+            before_date = before_date[matches[0].end() :]
+        if prefix:
+            suffix_parts.extend(match.group(0) for match in _ACCOUNT_IDENTIFIER_SUFFIX_RE.finditer(before_date))
+        if date_match and prefix:
+            saw_date_boundary = True
+            break
+
+    candidate = prefix + "".join(suffix_parts)
+    if saw_date_boundary and 24 <= len(candidate) <= 80 and re.fullmatch(r"[A-Z0-9]+", candidate):
+        return candidate
+    return None
+
+
+def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
+    """Build the canonical account row skeleton from printed account anchors."""
+    evidence_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if not callable(evidence_loader):
+        return []
+    flattened: list[dict[str, Any]] = []
+    active_type = ""
+    active_family_quality = ""
+    for page in evidence_loader():
+        lines = [line for line in page.get("lines") or () if isinstance(line, dict)]
+        for index, line in enumerate(lines):
+            text = str(line.get("text") or line.get("content") or "")
+            compact = _compact(text)
+            if active_type and any(marker in compact for marker in _ACCOUNT_SECTION_END):
+                active_type = ""
+                active_family_quality = ""
+            family = _account_family_from_heading(compact)
+            marker = family[0] if family else None
+            if marker is not None:
+                active_type = marker
+                active_family_quality = family[1]
+            flattened.append(
+                {
+                    **line,
+                    "text": text,
+                    "page": int(page.get("page") or 0),
+                    "source_page": int(page.get("source_page") or 0),
+                    "account_type": active_type,
+                    "account_family_quality": active_family_quality,
+                    "line_index": index,
+                }
+            )
+
+    starts = [
+        index
+        for index, line in enumerate(flattened)
+        if line.get("account_type") and _ACCOUNT_ANCHOR_RE.search(str(line.get("text") or ""))
+    ]
+    printed_ordinals: list[int | None] = []
+    ordinal_counts: Counter[tuple[str, int]] = Counter()
+    for start in starts:
+        anchor = flattened[start]
+        match = _ACCOUNT_ANCHOR_RE.search(str(anchor.get("text") or ""))
+        detected = int(match.group(1)) if match and match.group(1) else None
+        printed_ordinals.append(detected)
+        if detected is not None and detected > 0:
+            ordinal_counts[(str(anchor.get("account_type") or ""), detected)] += 1
+
+    transition_check = getattr(parse_result, "allows_scanned_line_transition", None)
+    skeletons: list[dict[str, Any]] = []
+    for position, start in enumerate(starts):
+        anchor = flattened[start]
+        account_type = str(anchor["account_type"])
+        next_start = starts[position + 1] if position + 1 < len(starts) else len(flattened)
+        end = next_start
+        for index in range(start + 1, next_start):
+            if flattened[index].get("account_type") != account_type:
+                end = index
+                break
+        # A physical/logical page boundary belongs to the account segment only
+        # when the canonical entity context affirms the evidence transition.
+        # Adjacency by itself is deliberately insufficient.
+        verified_end = end
+        for index in range(start + 1, end):
+            left = flattened[index - 1]
+            right = flattened[index]
+            left_page = int(left.get("page") or 0)
+            right_page = int(right.get("page") or 0)
+            if left_page == right_page:
+                continue
+            decision = None
+            if callable(transition_check):
+                decision = transition_check(
+                    left_page,
+                    left,
+                    int(left.get("line_index") or 0),
+                    right_page,
+                    right,
+                    int(right.get("line_index") or 0),
+                )
+            if decision is not True:
+                verified_end = index
+                break
+        detail = flattened[start:verified_end]
+        boundary = flattened[verified_end] if verified_end < len(flattened) else None
+
+        page_segments: list[dict[str, Any]] = []
+        segment_pages: list[int] = []
+        for line in detail:
+            page_number = int(line.get("page") or 0)
+            if page_number and page_number not in segment_pages:
+                segment_pages.append(page_number)
+        anchor_bbox = anchor.get("bbox")
+        anchor_top = (
+            float(anchor_bbox[1])
+            if isinstance(anchor_bbox, (list, tuple)) and len(anchor_bbox) == 4
+            else None
+        )
+        for page_index, page_number in enumerate(segment_pages):
+            upper: float | None = None
+            if boundary is not None and int(boundary.get("page") or 0) == page_number:
+                boundary_bbox = boundary.get("bbox")
+                if isinstance(boundary_bbox, (list, tuple)) and len(boundary_bbox) == 4:
+                    upper = float(boundary_bbox[1])
+            page_segments.append(
+                {
+                    "logical_page": page_number,
+                    "min_y": anchor_top if page_index == 0 else 0.0,
+                    "max_y": upper,
+                    "continuation_verified": page_index > 0,
+                }
+            )
+
+        detected = printed_ordinals[position]
+        ordinal_is_unique = bool(
+            detected is not None
+            and detected > 0
+            and ordinal_counts[(account_type, detected)] == 1
+        )
+        if ordinal_is_unique:
+            account_id = f"credit_account:{account_type}:{detected}"
+            ordinal_status = "printed_unique"
+        else:
+            ordinal_status = "printed_duplicate" if detected else "printed_unreadable"
+            account_id = stable_record_id(
+                "credit_account_provisional",
+                account_type,
+                anchor.get("source_page"),
+                anchor.get("page"),
+                anchor.get("bbox"),
+                anchor.get("evidence_ids"),
+                anchor.get("line_index"),
+                anchor.get("text"),
+            )
+        skeleton = {
+                "account_id": account_id,
+                "sequence": len(skeletons) + 1,
+                **({"category_sequence": detected} if ordinal_is_unique else {}),
+                **_account_heading_fields(anchor.get("text")),
+                "account_type": account_type,
+                "account_family_quality": str(anchor.get("account_family_quality") or ""),
+                "_printed_ordinal_status": ordinal_status,
+                "_canonical_segment": {
+                    "ownership_basis": "printed_anchor_to_next_anchor",
+                    "anchor_logical_page": int(anchor.get("page") or 0),
+                    "anchor_bbox": list(anchor.get("bbox") or ()),
+                    "pages": page_segments,
+                    "cross_page_continuation_verified": len(page_segments) > 1,
+                },
+                "account_state": "unknown",
+                "source": "candidate_b_account_anchor",
+                "page": int(anchor.get("page") or 0),
+                "source_page": int(anchor.get("source_page") or 0),
+                "bbox": list(anchor.get("bbox") or ()),
+                "source_refs": [
+                    {
+                        "source": "candidate_b_account_anchor",
+                        "logical_page": int(anchor.get("page") or 0),
+                        "source_page": int(anchor.get("source_page") or 0),
+                        "bbox": list(anchor.get("bbox") or ()),
+                        "evidence_ids": list(anchor.get("evidence_ids") or ()),
+                    }
+                ],
+                "raw_detail_lines": [
+                    {
+                        "logical_page": int(line.get("page") or 0),
+                        "source_page": int(line.get("source_page") or 0),
+                        "text": str(line.get("text") or ""),
+                        "bbox": list(line.get("bbox") or ()),
+                        "evidence_ids": list(line.get("evidence_ids") or ()),
+                    }
+                    for line in detail
+                ],
+                "confidence": float(anchor.get("confidence") or 0.0),
+            }
+        reconstructed_identifier = _account_identifier_from_detail(detail)
+        if reconstructed_identifier:
+            skeleton["account_identifier"] = reconstructed_identifier
+            skeleton["account_identifier_source"] = "canonical_anchor_table_row"
+        skeletons.append(skeleton)
+        if not ordinal_is_unique:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_account_printed_ordinal_unresolved",
+                    message=(
+                        "A printed account ordinal was missing or duplicated; encounter order was not emitted "
+                        "as the account family sequence and a source-stable provisional identity was used."
+                    ),
+                    parser_stage="candidate_b_account_anchor_ownership",
+                    target_dataset="credit_accounts",
+                    target_record_id=account_id,
+                    field_name="category_sequence",
+                    observed_value={
+                        "account_type": account_type,
+                        "printed_ordinal": detected,
+                        "ordinal_status": ordinal_status,
+                    },
+                    source_refs=skeleton.get("source_refs") or (),
+                    reason_codes=(
+                        "printed_ordinal_duplicate" if detected else "printed_ordinal_unreadable",
+                        "encounter_order_not_used",
+                        "stable_provisional_identity",
+                        "normalized_ordinal_withheld",
+                    ),
+                ),
+            )
+    return skeletons
+
+
+def _account_stream_position(record: dict[str, Any]) -> tuple[int, float] | None:
+    """Return the canonical logical-page position of an account observation."""
+    page = int(record.get("page") or 0)
+    bbox = record.get("bbox")
+    if not page:
+        for ref in record.get("source_refs") or ():
+            if not isinstance(ref, dict):
+                continue
+            page = int(ref.get("logical_page") or 0)
+            if not bbox:
+                bbox = ref.get("bbox")
+            if page:
+                break
+    if not page or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        top = float(bbox[1])
+    except (TypeError, ValueError):
+        return None
+    return page, top
+
+
+def _match_account_table_observations(
+    skeletons: list[dict[str, Any]],
+    table_accounts: list[dict[str, Any]],
+) -> dict[int, int]:
+    """Match tables only inside an anchor-owned canonical stream segment.
+
+    The exact ownership interval begins at the printed anchor and ends at the
+    next printed anchor (or the registered section boundary).  Later logical
+    pages are eligible only when ``_account_anchor_skeletons`` recorded an
+    affirmative continuation transition.  Family labels, encounter order and
+    a globally nearest predecessor are deliberately not identity keys.
+    """
+    matches: dict[int, int] = {}
+    consumed_tables: set[int] = set()
+    fallback_segments: dict[int, tuple[int, float, float | None]] = {}
+    positioned_skeletons = [
+        (index, position)
+        for index, skeleton in enumerate(skeletons)
+        if (position := _account_stream_position(skeleton)) is not None
+    ]
+    for offset, (skeleton_index, (page, top)) in enumerate(positioned_skeletons):
+        upper: float | None = None
+        for _next_index, (next_page, next_top) in positioned_skeletons[offset + 1 :]:
+            if next_page == page:
+                upper = next_top
+                break
+            if next_page > page:
+                break
+        fallback_segments[skeleton_index] = (page, top, upper)
+
+    def owns(skeleton_index: int, page: int, top: float) -> bool:
+        skeleton = skeletons[skeleton_index]
+        segment = skeleton.get("_canonical_segment")
+        pages = segment.get("pages") if isinstance(segment, Mapping) else None
+        if isinstance(pages, list):
+            for page_segment in pages:
+                if not isinstance(page_segment, Mapping):
+                    continue
+                if int(page_segment.get("logical_page") or 0) != page:
+                    continue
+                minimum = page_segment.get("min_y")
+                maximum = page_segment.get("max_y")
+                if minimum is None:
+                    return False
+                try:
+                    lower = float(minimum)
+                    upper = float(maximum) if maximum is not None else None
+                except (TypeError, ValueError):
+                    return False
+                return top + 8.0 >= lower and (upper is None or top < upper)
+            return False
+        fallback = fallback_segments.get(skeleton_index)
+        if fallback is None:
+            return False
+        segment_page, lower, upper = fallback
+        return page == segment_page and top + 8.0 >= lower and (upper is None or top < upper)
+
+    positioned_tables = sorted(
+        (
+            (position, table_index)
+            for table_index, table in enumerate(table_accounts)
+            if (position := _account_stream_position(table)) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    for (page, top), table_index in positioned_tables:
+        candidates = [
+            skeleton_index
+            for skeleton_index in range(len(skeletons))
+            if owns(skeleton_index, page, top)
+        ]
+        if len(candidates) != 1:
+            continue
+        skeleton_index = candidates[0]
+        if skeleton_index in matches or table_index in consumed_tables:
+            continue
+        matches[skeleton_index] = table_index
+        consumed_tables.add(table_index)
+    return matches
+
+
+def _account_card_identifier(record: Mapping[str, Any]) -> str:
+    """Return one strong account-card identity, never an observation ID."""
+
+    marker = re.sub(
+        r"[^0-9A-Z]",
+        "",
+        str(record.get("account_identifier") or "").upper(),
+    )
+    return marker if len(marker) >= 12 else ""
+
+
+def _account_card_source_boxes(
+    record: Mapping[str, Any],
+) -> list[tuple[int, tuple[float, float, float, float], str]]:
+    """Collect table-scoped source boxes suitable for replay comparison."""
+
+    boxes: list[tuple[int, tuple[float, float, float, float], str]] = []
+    refs = list(record.get("source_refs") or ())
+    if record.get("bbox"):
+        refs.append(
+            {
+                "logical_page": record.get("page"),
+                "source_page": record.get("source_page"),
+                "bbox": record.get("bbox"),
+            }
+        )
+    for ref in refs:
+        if not isinstance(ref, Mapping):
+            continue
+        bbox = ref.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            coordinates = tuple(float(value) for value in bbox)
+        except (TypeError, ValueError):
+            continue
+        page = int(ref.get("source_page") or ref.get("logical_page") or 0)
+        if not page:
+            continue
+        boxes.append((page, coordinates, str(ref.get("table_id") or "")))
+    return boxes
+
+
+def _account_card_boxes_are_replays(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> bool:
+    """Require near-total physical overlap for identifier-free replay proof."""
+
+    left_x1, left_y1, left_x2, left_y2 = left
+    right_x1, right_y1, right_x2, right_y2 = right
+    intersection_width = max(0.0, min(left_x2, right_x2) - max(left_x1, right_x1))
+    intersection_height = max(0.0, min(left_y2, right_y2) - max(left_y1, right_y1))
+    intersection = intersection_width * intersection_height
+    left_area = max(0.0, left_x2 - left_x1) * max(0.0, left_y2 - left_y1)
+    right_area = max(0.0, right_x2 - right_x1) * max(0.0, right_y2 - right_y1)
+    smaller_area = min(left_area, right_area)
+    return bool(smaller_area and intersection / smaller_area >= 0.9)
+
+
+def _same_native_account_card_replay(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    """Prove that two native table observations replay one source card."""
+
+    if (
+        left.get("source") != "native_detail_account_table"
+        or right.get("source") != "native_detail_account_table"
+        or not left.get("_table_observation_id")
+        or not right.get("_table_observation_id")
+        or str(left.get("account_type") or "")
+        != str(right.get("account_type") or "")
+    ):
+        return False
+    left_identifier = _account_card_identifier(left)
+    right_identifier = _account_card_identifier(right)
+    if left_identifier and right_identifier:
+        return left_identifier == right_identifier
+
+    for left_page, left_bbox, left_table_id in _account_card_source_boxes(left):
+        for right_page, right_bbox, right_table_id in _account_card_source_boxes(right):
+            if left_page != right_page:
+                continue
+            if left_table_id and left_table_id == right_table_id:
+                return True
+            if _account_card_boxes_are_replays(left_bbox, right_bbox):
+                return True
+    return False
+
+
+def _native_account_card_groups(
+    table_accounts: list[dict[str, Any]], table_indices: Iterable[int]
+) -> list[tuple[int, ...]]:
+    """Collapse only transitively proven replays of one native account card."""
+
+    indices = sorted(set(int(index) for index in table_indices))
+    remaining = set(indices)
+    groups: list[tuple[int, ...]] = []
+    while remaining:
+        seed = min(remaining)
+        component = {seed}
+        frontier = [seed]
+        remaining.remove(seed)
+        while frontier:
+            current = frontier.pop()
+            connected = {
+                candidate
+                for candidate in remaining
+                if _same_native_account_card_replay(
+                    table_accounts[current], table_accounts[candidate]
+                )
+            }
+            remaining.difference_update(connected)
+            component.update(connected)
+            frontier.extend(connected)
+        groups.append(tuple(sorted(component)))
+    return groups
+
+
+def _canonical_singleton_account_matches(
+    skeletons: list[dict[str, Any]],
+    table_accounts: list[dict[str, Any]],
+    table_matches: Mapping[int, int],
+) -> dict[int, int]:
+    """Prove the one safe exception to a missing printed family ordinal.
+
+    A canonical PBOC family may omit ``1`` when it contains one account.  The
+    ordinal is completed only when the independently decoded table population
+    corroborates that exact singleton: one exact-family unnumbered anchor, one
+    native same-family table observation, and the existing stream-ownership
+    matcher binds those two observations one-to-one.  Encounter order and a
+    family label alone are deliberately insufficient.
+    """
+
+    skeletons_by_family: defaultdict[str, list[int]] = defaultdict(list)
+    tables_by_family: defaultdict[str, list[int]] = defaultdict(list)
+    for index, skeleton in enumerate(skeletons):
+        account_type = str(skeleton.get("account_type") or "")
+        if account_type:
+            skeletons_by_family[account_type].append(index)
+    for index, table in enumerate(table_accounts):
+        account_type = str(table.get("account_type") or "")
+        if account_type:
+            tables_by_family[account_type].append(index)
+
+    completed: dict[int, int] = {}
+    for account_type, skeleton_indices in skeletons_by_family.items():
+        table_indices = tables_by_family.get(account_type, [])
+        card_groups = _native_account_card_groups(table_accounts, table_indices)
+        if len(skeleton_indices) != 1 or len(card_groups) != 1:
+            continue
+        skeleton_index = skeleton_indices[0]
+        card_group = card_groups[0]
+        table_index = table_matches.get(skeleton_index)
+        if table_index not in card_group:
+            continue
+        skeleton = skeletons[skeleton_index]
+        table = table_accounts[table_index]
+        if skeleton.get("account_family_quality") != "exact":
+            continue
+        if skeleton.get("_printed_ordinal_status") != "printed_unreadable":
+            continue
+        if skeleton.get("category_sequence") not in (None, ""):
+            continue
+        if table.get("source") != "native_detail_account_table":
+            continue
+        if not table.get("_table_observation_id"):
+            continue
+        completed[skeleton_index] = table_index
+    return completed
+
+
+def _suppress_completed_singleton_ordinal_issue(
+    parse_result: Any,
+    *,
+    account_type: str,
+    provisional_account_id: str,
+) -> None:
+    """Remove only the diagnostic superseded by exact singleton proof."""
+
+    issues = getattr(parse_result, "_personal_detail_extraction_issues", None)
+    if not isinstance(issues, list):
+        return
+    issues[:] = [
+        issue
+        for issue in issues
+        if not (
+            isinstance(issue, Mapping)
+            and issue.get("issue_code") == "candidate_b_account_printed_ordinal_unresolved"
+            and issue.get("field_name") == "category_sequence"
+            and str(issue.get("target_record_id") or "") == provisional_account_id
+            and str((issue.get("observed_value") or {}).get("account_type") or "")
+            == account_type
+            and str((issue.get("observed_value") or {}).get("ordinal_status") or "")
+            == "printed_unreadable"
+        )
+    ]
+
+
+def _extract_accounts(
+    parse_result: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Materialize one account population from anchors enriched by tables."""
+    table_accounts, repayments, events = _extract_table_accounts(parse_result)
+    skeletons = _account_anchor_skeletons(parse_result)
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    if not skeletons:
+        # Preserve otherwise useful canonical cells as explicitly partial
+        # observations, but never promote table encounter order to an account
+        # family identity when the printed anchors were not recovered.
+        for table in table_accounts:
+            table.pop("category_sequence", None)
+            table["extraction_status"] = "review"
+            table["_ownership_status"] = "printed_anchor_missing"
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_account_anchor_population_missing",
+                    message=(
+                        "Canonical account-table cells were retained as a partial observation, but no printed "
+                        "account anchor was available to establish family identity or ordinal."
+                    ),
+                    parser_stage="candidate_b_account_anchor_ownership",
+                    target_dataset="credit_accounts",
+                    target_record_id=str(table.get("account_id") or "") or None,
+                    field_name="category_sequence",
+                    source_refs=table.get("source_refs") or (),
+                    reason_codes=(
+                        "printed_anchor_missing",
+                        "stable_table_observation_identity",
+                        "encounter_order_not_used",
+                        "record_partial",
+                    ),
+                ),
+            )
+        return table_accounts, repayments, events
+
+    table_matches = _match_account_table_observations(skeletons, table_accounts)
+    singleton_matches = _canonical_singleton_account_matches(
+        skeletons,
+        table_accounts,
+        table_matches,
+    )
+    singleton_replays_by_skeleton: dict[int, tuple[int, ...]] = {}
+    for skeleton_index, table_index in singleton_matches.items():
+        account_type = str(skeletons[skeleton_index].get("account_type") or "")
+        family_indices = [
+            index
+            for index, table in enumerate(table_accounts)
+            if str(table.get("account_type") or "") == account_type
+        ]
+        replay_group = next(
+            (
+                group
+                for group in _native_account_card_groups(table_accounts, family_indices)
+                if table_index in group
+            ),
+            (table_index,),
+        )
+        singleton_replays_by_skeleton[skeleton_index] = tuple(
+            index for index in replay_group if index != table_index
+        )
+    singleton_replay_indices = {
+        index
+        for replay_indices in singleton_replays_by_skeleton.values()
+        for index in replay_indices
+    }
+    emitted: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+    account_id_remap: dict[str, str] = {}
+    for skeleton_index in singleton_matches:
+        skeleton = skeletons[skeleton_index]
+        account_type = str(skeleton.get("account_type") or "")
+        provisional_account_id = str(skeleton.get("account_id") or "")
+        canonical_account_id = f"credit_account:{account_type}:1"
+        skeleton["account_id"] = canonical_account_id
+        skeleton["category_sequence"] = 1
+        skeleton["_printed_ordinal_status"] = "canonical_singleton_inferred"
+        _suppress_completed_singleton_ordinal_issue(
+            parse_result,
+            account_type=account_type,
+            provisional_account_id=provisional_account_id,
+        )
+        if provisional_account_id and provisional_account_id != canonical_account_id:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                register_issue_target_remap,
+            )
+
+            register_issue_target_remap(
+                parse_result,
+                provisional_account_id,
+                canonical_account_id,
+            )
+    for skeleton_index, skeleton in enumerate(skeletons):
+        table_index = table_matches.get(skeleton_index)
+        table = table_accounts[table_index] if table_index is not None else None
+        if table is not None:
+            record = dict(table)
+            # Printed anchors own population identity and canonical ordering;
+            # the table contributes only decoded business cells.
+            for field_name in (
+                "account_id",
+                "sequence",
+                "category_sequence",
+                "account_type",
+                "account_family_quality",
+                "_printed_ordinal_status",
+                "_canonical_segment",
+                "page",
+                "source_page",
+                "bbox",
+                "credit_agreement_identifier",
+                "card_tail",
+            ):
+                if field_name in skeleton:
+                    record[field_name] = deepcopy(skeleton[field_name])
+                else:
+                    record.pop(field_name, None)
+            if skeleton.get("account_identifier"):
+                anchor_refs = [
+                    ref for ref in skeleton.get("source_refs") or () if isinstance(ref, Mapping)
+                ]
+                if anchor_refs:
+                    _merge_exact_observation(
+                        parse_result,
+                        record,
+                        dataset="credit_accounts",
+                        target_record_id=str(skeleton.get("account_id") or ""),
+                        field_name="account_identifier",
+                        value=str(skeleton["account_identifier"]),
+                        raw=str(skeleton["account_identifier"]),
+                        source_ref={
+                            **dict(anchor_refs[0]),
+                            "binding": "canonical_account_anchor",
+                            "binding_quality": "canonical_account_anchor",
+                        },
+                        parser_stage="candidate_b_account_canonical_slots",
+                    )
+                elif not record.get("account_identifier") and "account_identifier" not in record.get(
+                    "_unresolved_fields", []
+                ):
+                    record["account_identifier"] = skeleton["account_identifier"]
+                if record.get("account_identifier"):
+                    record["account_identifier_source"] = skeleton.get("account_identifier_source")
+            anchor_refs = [ref for ref in skeleton.get("source_refs") or () if isinstance(ref, Mapping)]
+            for field_name in ("credit_agreement_identifier", "card_tail"):
+                if not skeleton.get(field_name):
+                    continue
+                record[field_name] = skeleton[field_name]
+                record.setdefault("canonical_raw", {})[field_name] = skeleton[field_name]
+                if anchor_refs:
+                    record.setdefault("source_refs_by_field", {})[field_name] = [
+                        {
+                            **dict(anchor_refs[0]),
+                            "field_name": field_name,
+                            "binding": "canonical_account_anchor",
+                            "binding_quality": "canonical_account_anchor",
+                        }
+                    ]
+            record_refs = [
+                *(table.get("source_refs") or ()),
+                *(
+                    ref
+                    for replay_index in singleton_replays_by_skeleton.get(
+                        skeleton_index, ()
+                    )
+                    for ref in table_accounts[replay_index].get("source_refs") or ()
+                ),
+                *(skeleton.get("source_refs") or ()),
+            ]
+            record["source_refs"] = []
+            seen_record_refs: set[str] = set()
+            for ref in record_refs:
+                if not isinstance(ref, Mapping):
+                    continue
+                marker = json.dumps(
+                    dict(ref), ensure_ascii=False, sort_keys=True, default=str
+                )
+                if marker in seen_record_refs:
+                    continue
+                seen_record_refs.add(marker)
+                record["source_refs"].append(dict(ref))
+            record["raw_detail_lines"] = list(skeleton.get("raw_detail_lines") or ())
+            emitted.append(record)
+            consumed.add(table_index)
+            prior_account_id = str(table.get("account_id") or "")
+            canonical_account_id = str(skeleton.get("account_id") or "")
+            if prior_account_id and canonical_account_id:
+                account_id_remap[prior_account_id] = canonical_account_id
+                from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                    register_issue_target_remap,
+                )
+
+                register_issue_target_remap(parse_result, prior_account_id, canonical_account_id)
+                for replay_index in singleton_replays_by_skeleton.get(
+                    skeleton_index, ()
+                ):
+                    replay_account_id = str(
+                        table_accounts[replay_index].get("account_id") or ""
+                    )
+                    if not replay_account_id:
+                        continue
+                    account_id_remap[replay_account_id] = canonical_account_id
+                    register_issue_target_remap(
+                        parse_result, replay_account_id, canonical_account_id
+                    )
+            continue
+
+        emitted.append(skeleton)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_table_missing",
+                message="A printed account anchor was present but its canonical account table was not recoverable.",
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=str(skeleton.get("account_id") or ""),
+                observed_value={
+                    "account_type": skeleton.get("account_type"),
+                    "category_sequence": skeleton.get("category_sequence"),
+                },
+                source_refs=skeleton.get("source_refs") or (),
+                reason_codes=("printed_account_anchor", "canonical_table_missing", "record_partial"),
+            ),
+        )
+
+    anchored_types = {
+        str(skeleton.get("account_type") or "")
+        for skeleton in skeletons
+        if skeleton.get("account_type")
+    }
+    for table_index, table in enumerate(table_accounts):
+        if table_index in consumed or table_index in singleton_replay_indices:
+            continue
+        account_type = str(table.get("account_type") or "")
+        structurally_missing_category = bool(account_type) and account_type not in anchored_types
+        account_observation_id = str(
+            table.get("_table_observation_id") or table.get("account_id") or ""
+        )
+        suppressed_children: list[dict[str, Any]] = []
+        if not structurally_missing_category:
+            for child in repayments:
+                if str(child.get("account_id") or "") != str(table.get("account_id") or ""):
+                    continue
+                suppressed_children.append(
+                    {
+                        "dataset": "credit_account_monthly_performance",
+                        "child_observation_id": str(
+                            child.get("repayment_id") or child.get("record_id") or ""
+                        ),
+                        "account_observation_id": account_observation_id,
+                        "source_refs": [
+                            dict(ref)
+                            for ref in child.get("source_refs") or ()
+                            if isinstance(ref, Mapping)
+                        ],
+                    }
+                )
+            for child in events:
+                if str(child.get("account_id") or "") != str(table.get("account_id") or ""):
+                    continue
+                event_type = str(child.get("event_type") or "")
+                suppressed_children.append(
+                    {
+                        "dataset": _ACCOUNT_EVENT_DATASETS.get(
+                            event_type, "credit_account_special_events"
+                        ),
+                        "child_observation_id": str(
+                            child.get("account_event_id") or child.get("record_id") or ""
+                        ),
+                        "account_observation_id": account_observation_id,
+                        "event_type": event_type or None,
+                        "source_refs": [
+                            dict(ref)
+                            for ref in child.get("source_refs") or ()
+                            if isinstance(ref, Mapping)
+                        ],
+                    }
+                )
+        suppressed_child_counts = Counter(
+            str(child["dataset"]) for child in suppressed_children
+        )
+        issue_refs: list[dict[str, Any]] = []
+        seen_issue_refs: set[str] = set()
+        for ref in (
+            *(table.get("source_refs") or ()),
+            *(
+                child_ref
+                for child in suppressed_children
+                for child_ref in child.get("source_refs") or ()
+            ),
+        ):
+            if not isinstance(ref, Mapping):
+                continue
+            normalized_ref = dict(ref)
+            marker = json.dumps(normalized_ref, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in seen_issue_refs:
+                continue
+            seen_issue_refs.add(marker)
+            issue_refs.append(normalized_ref)
+        if structurally_missing_category:
+            record = dict(table)
+            record["sequence"] = len(emitted) + 1
+            record.pop("category_sequence", None)
+            record["extraction_status"] = "review"
+            record["_ownership_status"] = "printed_category_anchor_missing"
+            emitted.append(record)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code=(
+                    "candidate_b_account_category_anchor_missing"
+                    if structurally_missing_category
+                    else "candidate_b_unmatched_account_table_suppressed"
+                ),
+                message=(
+                    "A canonical account category had table evidence but no recoverable printed anchor; "
+                    "the table row was retained with uncertainty."
+                    if structurally_missing_category
+                    else (
+                        "An account-table observation in an already anchored category could not be assigned to "
+                        "one printed account and was suppressed together with its exact related child observations."
+                    )
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=account_observation_id or None,
+                observed_value={
+                    "table_observation_id": account_observation_id or None,
+                    "account_observation_id": account_observation_id or None,
+                    "account_type_candidate": account_type or None,
+                    **(
+                        {
+                            "suppressed_child_count": len(suppressed_children),
+                            "suppressed_child_counts_by_dataset": dict(
+                                sorted(suppressed_child_counts.items())
+                            ),
+                            "affected_child_datasets": sorted(suppressed_child_counts),
+                            "suppressed_child_observations": suppressed_children,
+                        }
+                        if not structurally_missing_category
+                        else {}
+                    ),
+                },
+                candidate_value=(
+                    {
+                        "same_category_emitted_account_ids": sorted(
+                            {
+                                str(account.get("account_id") or "")
+                                for account in emitted
+                                if str(account.get("account_type") or "") == account_type
+                                and account.get("account_id")
+                            }
+                        )
+                    }
+                    if not structurally_missing_category
+                    else None
+                ),
+                source_refs=issue_refs,
+                reason_codes=(
+                    "canonical_account_table",
+                    (
+                        "printed_anchor_missing"
+                        if structurally_missing_category
+                        else "printed_anchor_ownership_unresolved"
+                    ),
+                    "record_requires_review" if structurally_missing_category else "account_ownership_unresolved",
+                    *(
+                        ("related_child_observations_suppressed",)
+                        if suppressed_children
+                        else ()
+                    ),
+                ),
+            ),
+        )
+
+    for account in emitted:
+        if account.get("account_family_quality") != "ambiguous_missing_variant":
+            continue
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_account_family_variant_unresolved",
+                message=(
+                    "The printed revolving-loan family heading did not preserve its one/two variant; "
+                    "the conservative R1 family was retained and explicitly marked uncertain."
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                target_record_id=str(account.get("account_id") or ""),
+                field_name="account_type",
+                observed_value="循环贷账户",
+                candidate_value=account.get("account_type"),
+                source_refs=account.get("source_refs") or (),
+                reason_codes=("account_family_variant_missing", "normalized_value_requires_review"),
+            ),
+        )
+
+    emitted_by_family: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for account in emitted:
+        account_type = str(account.get("account_type") or "")
+        if account_type:
+            emitted_by_family[account_type].append(account)
+    for account_type, family_accounts in emitted_by_family.items():
+        observed: list[int] = []
+        unresolved_accounts: list[dict[str, Any]] = []
+        for account in family_accounts:
+            try:
+                ordinal = int(account.get("category_sequence") or 0)
+            except (TypeError, ValueError):
+                ordinal = 0
+            if ordinal > 0:
+                observed.append(ordinal)
+            else:
+                unresolved_accounts.append(account)
+        observed = sorted(set(observed))
+        # PBOC category ordinals start at one and are dense. Bound the gap
+        # expansion so a single OCR-joined outlier cannot manufacture hundreds
+        # of supposed missing records; the outlier is still reported below.
+        credible_ceiling = max(12, len(observed) * 3)
+        bounded_endpoint = min(max(observed), credible_ceiling) if observed else 0
+        missing = sorted(set(range(1, bounded_endpoint + 1)) - set(observed))
+        outliers = [ordinal for ordinal in observed if ordinal > credible_ceiling]
+        if not missing and not outliers and not unresolved_accounts:
+            continue
+        refs = [
+            dict(ref)
+            for account in family_accounts
+            for ref in account.get("source_refs") or ()
+            if isinstance(ref, dict)
+        ]
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="candidate_b_account_sequence_gap",
+                message=(
+                    "Printed account ordinals in one PBOC account family were not uniquely recoverable or "
+                    "not dense; no ordinal or missing record was invented."
+                ),
+                parser_stage="candidate_b_account_schema",
+                target_dataset="credit_accounts",
+                observed_value={
+                    "account_type": account_type,
+                    "observed_category_sequences": observed,
+                },
+                candidate_value={
+                    "missing_category_sequences": missing,
+                    "outlier_category_sequences": outliers,
+                    "unresolved_printed_ordinal_count": len(unresolved_accounts),
+                    "provisional_account_ids": [
+                        str(account.get("account_id") or "")
+                        for account in unresolved_accounts
+                        if account.get("account_id")
+                    ],
+                },
+                source_refs=refs,
+                reason_codes=(
+                    (
+                        "printed_category_ordinals_not_dense"
+                        if missing or outliers
+                        else "printed_category_ordinal_unresolved"
+                    ),
+                    *(
+                        ("printed_category_ordinal_unresolved",)
+                        if unresolved_accounts and (missing or outliers)
+                        else ()
+                    ),
+                    "missing_records_not_invented",
+                    "business_population_uncertain",
+                ),
+            ),
+        )
+
+    for account in emitted:
+        if account.get("source") != "native_detail_account_table":
+            continue
+        source_absent = set(account.get("_source_absent_fields") or ())
+        for field_name in ("management_institution", "account_identifier", "open_date", "currency"):
+            if account.get(field_name) not in (None, "") or field_name in source_absent:
+                continue
+            _append_internal_field(account, "_unresolved_fields", field_name)
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_account_required_field_unresolved",
+                    message="A required canonical account field was not safely decoded; the field remains withheld.",
+                    parser_stage="candidate_b_account_canonical_slots",
+                    target_dataset="credit_accounts",
+                    target_record_id=str(account.get("account_id") or ""),
+                    field_name=field_name,
+                    source_refs=(
+                        account.get("source_refs_by_field", {}).get(field_name)
+                        or account.get("source_refs")
+                        or ()
+                    ),
+                    reason_codes=(
+                        "canonical_account_template",
+                        "required_field_missing",
+                        "normalized_value_withheld",
+                    ),
+                ),
+            )
+
+    account_identifiers = {
+        str(account.get("account_id") or ""): account.get("account_identifier")
+        for account in emitted
+        if account.get("account_id")
+    }
+    accepted_table_account_ids = {
+        str(table_accounts[index].get("account_id") or "")
+        for index in consumed
+        if 0 <= index < len(table_accounts)
+    }
+    accepted_table_account_ids.update(
+        str(account.get("account_id") or "")
+        for account in emitted
+        if account.get("_ownership_status") == "printed_category_anchor_missing"
+    )
+    filtered_repayments: list[dict[str, Any]] = []
+    filtered_events: list[dict[str, Any]] = []
+    for related_record, target in [
+        *((record, filtered_repayments) for record in repayments),
+        *((record, filtered_events) for record in events),
+    ]:
+        prior_account_id = str(related_record.get("account_id") or "")
+        if prior_account_id not in accepted_table_account_ids:
+            continue
+        canonical_account_id = account_id_remap.get(prior_account_id)
+        if canonical_account_id:
+            related_record["account_id"] = canonical_account_id
+            if not related_record.get("account_identifier"):
+                related_record["account_identifier"] = account_identifiers.get(canonical_account_id)
+        target.append(related_record)
+    return emitted, filtered_repayments, filtered_events
+
+
 def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+        PBOCPersonalDetailNativeParser,
+    )
+
+    field_names = {
+        "授信协议标识": "account_identifier",
+        "管理机构": "institution",
+        "授信额度用途": "facility_type",
+        "生效日期": "effective_date",
+        "到期日期": "due_date",
+        "授信额度": "total_limit",
+        "授信限额": "credit_limit",
+        "已用额度": "used_limit",
+        "授信限额编号": "limit_identifier",
+        "币种": "currency",
+    }
     records: list[dict[str, Any]] = []
-    for page in getattr(parse_result, "pages", None) or []:
-        for table in getattr(page, "tables", None) or []:
-            rows = _table_rows(table)
-            compact = _compact(" ".join(cell for row in rows[:4] for cell in row))
-            if "授信协议标识" not in compact or "授信额度用途" not in compact:
+    for candidate in PBOCPersonalDetailNativeParser(parse_result).records("credit_lines"):
+        facts = candidate.fields
+        identifier = _typed_identifier(_field(facts, "授信协议标识"))
+        if not identifier:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_credit_agreement_identifier_unresolved",
+                    message="A canonical credit-agreement card was observed but its agreement identifier was not safely extractable.",
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    field_name="account_identifier",
+                    observed_value=_field(facts, "授信协议标识") or None,
+                    source_refs=candidate.source_refs,
+                    reason_codes=("canonical_credit_agreement_card", "typed_identifier_failed", "record_withheld"),
+                ),
+            )
+            continue
+        due_raw = _field(facts, "到期日期")
+        raw_currency = _field(facts, "币种")
+        if _agreement_source_absent(raw_currency):
+            currency, currency_residue, currency_resolution = None, "", "source_absent"
+        else:
+            currency, currency_residue, currency_resolution = _currency_token(raw_currency)
+        printed_sequence_raw = _field(facts, "__printed_sequence")
+        printed_sequence = int(printed_sequence_raw) if str(printed_sequence_raw).isdigit() else None
+        candidate_refs_by_field = getattr(candidate, "source_refs_by_field", {})
+        candidate_bindings_by_field = getattr(candidate, "binding_quality_by_field", {})
+        anchor_refs = [
+            dict(ref)
+            for ref in candidate_refs_by_field.get("__printed_sequence", ())
+            if isinstance(ref, Mapping)
+            and ref.get("binding") == "canonical_card_anchor"
+        ] if isinstance(candidate_refs_by_field, Mapping) else []
+        anchor_binding = (
+            str(candidate_bindings_by_field.get("__printed_sequence") or "")
+            if isinstance(candidate_bindings_by_field, Mapping)
+            else ""
+        )
+        canonical_card_key = (
+            f"credit_agreement:{printed_sequence}"
+            if printed_sequence is not None
+            and anchor_refs
+            and anchor_binding == "canonical_card_anchor"
+            else None
+        )
+        raw_limit_identifier = _field(facts, "授信限额编号")
+        limit_identifier = _typed_identifier(raw_limit_identifier)
+        if (
+            raw_limit_identifier
+            and not _agreement_source_absent(raw_limit_identifier)
+            and not limit_identifier
+        ):
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_credit_limit_identifier_unresolved",
+                    message="The credit-limit identifier cell contained multiple or invalid identifier tokens and was withheld.",
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=stable_record_id("credit_line", identifier),
+                    field_name="limit_identifier",
+                    observed_value=raw_limit_identifier,
+                    source_refs=candidate.source_refs,
+                    reason_codes=(
+                        "canonical_credit_agreement_card",
+                        "typed_identifier_failed",
+                        "normalized_value_withheld",
+                    ),
+                ),
+            )
+        raw_due_compact = _compact(due_raw)
+        source_refs_by_field: dict[str, list[dict[str, Any]]] = {}
+        for label, refs in candidate_refs_by_field.items():
+            field_name = field_names.get(str(label))
+            if not field_name:
                 continue
-            facts = _pairs(rows)
-            identifier = _identifier(_field(facts, "授信协议标识"))
-            if not identifier:
-                continue
-            due_raw = _field(facts, "到期日期")
-            currency = _currency(_field(facts, "币种")) or "CNY"
-            record = {
-                "credit_line_id": stable_record_id("credit_line", identifier),
+            source_refs_by_field[field_name] = [
+                {**dict(ref), "field_name": field_name}
+                for ref in refs
+                if isinstance(ref, Mapping)
+            ]
+        binding_quality_by_field = {
+            field_names[label]: quality
+            for label, quality in candidate_bindings_by_field.items()
+            if label in field_names
+        }
+        source_absent_fields = {
+            field_names[label]
+            for label in field_names
+            if _agreement_source_absent(_field(facts, label))
+        }
+        unresolved_fields = {
+            field_names[label]
+            for label in getattr(candidate, "unresolved_labels", frozenset())
+            if label in field_names
+        }
+        credit_line_id = stable_record_id("credit_line", identifier)
+        currency_refs = tuple(
+            dict(ref)
+            for ref in candidate_refs_by_field.get("币种", ())
+            if isinstance(ref, Mapping)
+        ) if isinstance(candidate_refs_by_field, Mapping) else tuple(candidate.source_refs)
+        if currency_resolution == "residue" and currency is not None:
+            _report_currency_residue(
+                parse_result,
+                dataset="credit_lines",
+                target_record_id=credit_line_id,
+                raw=raw_currency,
+                currency=currency,
+                residue=currency_residue,
+                source_refs=currency_refs or tuple(candidate.source_refs),
+                parser_stage="candidate_b_credit_agreement_schema",
+            )
+        elif currency_resolution in {"unknown", "multiple"}:
+            unresolved_fields.add("currency")
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_credit_agreement_currency_unresolved",
+                    message="The credit-agreement currency cell did not contain exactly one finite supported currency token and was withheld.",
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=credit_line_id,
+                    field_name="currency",
+                    observed_value=raw_currency,
+                    source_refs=currency_refs or tuple(candidate.source_refs),
+                    reason_codes=(
+                        "finite_currency_vocabulary",
+                        f"currency_token_{currency_resolution}",
+                        "normalized_value_withheld",
+                    ),
+                ),
+            )
+        observed_fields = {
+            field_names[label]
+            for label in getattr(candidate, "observed_labels", frozenset())
+            if label in field_names
+        }
+        raw_institution = _field(facts, "管理机构")
+        raw_facility_type = _field(facts, "授信额度用途")
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            institution_name_has_separated_leading_han,
+        )
+
+        pending_institution = None
+        if raw_institution and institution_name_has_separated_leading_han(raw_institution):
+            pending_value = _account_institution(
+                raw_institution,
+                independently_corroborated=True,
+            )
+            if pending_value:
+                pending_institution = {
+                    "raw": raw_institution,
+                    "value": pending_value,
+                    "source_refs": list(source_refs_by_field.get("institution") or ()),
+                }
+        institution = _account_institution(raw_institution)
+        raw_effective_date = _field(facts, "生效日期")
+        effective_date = _date(raw_effective_date)
+        due_date = _date(due_raw)
+        record = {
+                "credit_line_id": credit_line_id,
+                "_printed_sequence": printed_sequence,
+                "_canonical_card_key": canonical_card_key,
+                "_canonical_card_anchor_refs": anchor_refs,
                 "account_identifier": identifier,
-                "institution": _clean(_field(facts, "管理机构")),
-                "facility_type": _clean(_field(facts, "授信额度用途")),
-                "effective_date": _date(_field(facts, "生效日期")),
-                "due_date": _date(due_raw),
-                "validity_type": "perpetual" if _compact(due_raw) == "长期" else "fixed_term",
-                "total_limit": _number(_field(facts, "授信额度")),
-                "used_limit": _number(_field(facts, "已用额度")),
-                "limit_identifier": _identifier(_field(facts, "授信限额编号")),
+                "institution": institution,
+                "facility_type": (
+                    None
+                    if _agreement_source_absent(raw_facility_type)
+                    else _clean(raw_facility_type)
+                ),
+                "effective_date": effective_date,
+                "due_date": due_date,
+                "validity_type": (
+                    "perpetual"
+                    if raw_due_compact == "长期"
+                    else "fixed_term"
+                    if due_date
+                    else "unknown"
+                ),
+                "total_limit": (
+                    None
+                    if _agreement_source_absent(_field(facts, "授信额度"))
+                    else _number(_field(facts, "授信额度"))
+                ),
+                "credit_limit": (
+                    None
+                    if _agreement_source_absent(_field(facts, "授信限额"))
+                    else _number(_field(facts, "授信限额"))
+                ),
+                "used_limit": (
+                    None
+                    if _agreement_source_absent(_field(facts, "已用额度"))
+                    else _number(_field(facts, "已用额度"))
+                ),
+                "limit_identifier": limit_identifier,
                 "currency": currency,
                 "account_currency": currency,
-                "reporting_amount_currency": "CNY",
+                "reporting_amount_currency": currency,
                 "amount_unit": "yuan",
                 "reporting_amount_unit": "yuan",
-                "status": "active",
-                "source": "native_detail_credit_agreement_table",
-                "source_refs": [_source_ref(page, table)],
-                "confidence": 1.0,
+                "source": "candidate_b_credit_agreement_schema",
+                "source_refs": list(candidate.source_refs),
+                "confidence": candidate.confidence,
+                "source_refs_by_field": source_refs_by_field,
+                "_field_binding_quality": binding_quality_by_field,
+                "_source_absent_fields": sorted(source_absent_fields),
+                "_unresolved_fields": sorted(unresolved_fields),
+                "_observed_fields": sorted(observed_fields),
+                **(
+                    {"_pending_institution_observation": pending_institution}
+                    if pending_institution is not None
+                    else {}
+                ),
             }
-            records.append(record)
+        for field_name, raw_value, converted in (
+            ("institution", raw_institution, institution),
+            ("effective_date", raw_effective_date, effective_date),
+            ("due_date", due_raw, due_date),
+        ):
+            raw_compact = _compact(raw_value)
+            if (
+                converted not in (None, "")
+                or not raw_compact
+                or _agreement_source_absent(raw_value)
+                or (field_name == "due_date" and raw_compact == "长期")
+            ):
+                continue
+            if field_name == "institution" and pending_institution is not None:
+                continue
+            field_refs = source_refs_by_field.get(field_name) or []
+            source_ref = (
+                dict(field_refs[0])
+                if field_refs
+                else next(
+                    (dict(ref) for ref in candidate.source_refs if isinstance(ref, Mapping)),
+                    {},
+                )
+            )
+            _reject_exact_observation(
+                parse_result,
+                record,
+                dataset="credit_lines",
+                target_record_id=credit_line_id,
+                field_name=field_name,
+                raw=raw_value,
+                source_ref=source_ref,
+                parser_stage="candidate_b_credit_agreement_schema",
+            )
+        records.append(record)
     return records
 
 
-def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for page in getattr(parse_result, "pages", None) or []:
-        for table in getattr(page, "tables", None) or []:
-            rows = _table_rows(table)
-            compact = _compact(" ".join(cell for row in rows[:5] for cell in row))
-            if "责任人类型" not in compact or "保证合同编号" not in compact:
+def _agreement_source_absent(value: Any) -> bool:
+    """Return whether an agreement cell explicitly prints only dash glyphs."""
+
+    return is_explicit_source_absence(value)
+
+
+def _agreement_identifier_text(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _agreement_strong_field_matches(left: Mapping[str, Any], right: Mapping[str, Any]) -> int:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import normalize_institution_name
+
+    matches = 0
+    for field_name in (
+        "institution",
+        "facility_type",
+        "effective_date",
+        "due_date",
+        "total_limit",
+        "credit_limit",
+        "used_limit",
+        "currency",
+    ):
+        left_value = left.get(field_name)
+        right_value = right.get(field_name)
+        if left_value in (None, "") or right_value in (None, ""):
+            continue
+        if field_name == "institution":
+            equal = normalize_institution_name(str(left_value)) == normalize_institution_name(str(right_value))
+        elif field_name in {"total_limit", "credit_limit", "used_limit"}:
+            equal = str(left_value).replace(",", "") == str(right_value).replace(",", "")
+        else:
+            equal = _compact(left_value) == _compact(right_value)
+        matches += int(equal)
+    return matches
+
+
+def _agreement_field_value_key(field_name: str, value: Any) -> str:
+    if field_name == "institution":
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            normalize_institution_name,
+        )
+        return normalize_institution_name(str(value or ""))
+    if field_name in {"total_limit", "credit_limit", "used_limit"}:
+        parsed = _number(value)
+        return str(parsed) if parsed is not None else ""
+    return _compact(value)
+
+
+def _agreement_printed_sequences_match(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_sequence = left.get("_printed_sequence")
+    right_sequence = right.get("_printed_sequence")
+    return bool(
+        left_sequence not in (None, "")
+        and right_sequence not in (None, "")
+        and int(left_sequence) == int(right_sequence)
+    )
+
+
+def _agreement_single_leading_ocr_insertion(
+    left_identifier: str,
+    right_identifier: str,
+) -> str | None:
+    """Return the shorter exact identifier after one leading OCR insertion.
+
+    This is deliberately not edit-distance matching: every character of the
+    canonical candidate must be an exact suffix of the other observation.
+    """
+
+    longer, shorter = sorted(
+        (left_identifier, right_identifier),
+        key=lambda value: (len(value), value),
+        reverse=True,
+    )
+    if (
+        len(shorter) >= 20
+        and len(longer) == len(shorter) + 1
+        and longer[0].isalpha()
+        and longer[1:] == shorter
+    ):
+        return shorter
+    return None
+
+
+def _agreement_same_source_page(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    def pages(record: Mapping[str, Any]) -> set[int]:
+        return {
+            int(ref.get("source_page") or ref.get("logical_page") or 0)
+            for ref in _agreement_observation_refs(record)
+            if int(ref.get("source_page") or ref.get("logical_page") or 0) > 0
+        }
+
+    return bool(pages(left) & pages(right))
+
+
+def _agreement_observation_refs(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    refs = [ref for ref in record.get("source_refs") or () if isinstance(ref, Mapping)]
+    for field_refs in (record.get("source_refs_by_field") or {}).values():
+        refs.extend(ref for ref in field_refs or () if isinstance(ref, Mapping))
+    return refs
+
+
+def _agreement_canonical_card_key(record: Mapping[str, Any]) -> str:
+    key = str(record.get("_canonical_card_key") or "")
+    sequence = record.get("_printed_sequence")
+    if sequence in (None, "") or not str(sequence).isdigit():
+        return ""
+    expected = f"credit_agreement:{int(sequence)}"
+    return key if key == expected else ""
+
+
+def _agreement_anchor_planes(record: Mapping[str, Any]) -> set[str]:
+    planes: set[str] = set()
+    for ref in record.get("_canonical_card_anchor_refs") or ():
+        if not isinstance(ref, Mapping) or ref.get("binding") != "canonical_card_anchor":
+            continue
+        source = str(ref.get("source") or "")
+        if source.startswith("personal_detail_corrected_page"):
+            planes.add("corrected_page")
+        elif source.startswith("native_detail"):
+            planes.add("native_table")
+    return planes
+
+
+def _agreement_anchor_geometry_overlaps(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    left_refs = [
+        ref
+        for ref in left.get("_canonical_card_anchor_refs") or ()
+        if isinstance(ref, Mapping) and ref.get("binding") == "canonical_card_anchor"
+    ]
+    right_refs = [
+        ref
+        for ref in right.get("_canonical_card_anchor_refs") or ()
+        if isinstance(ref, Mapping) and ref.get("binding") == "canonical_card_anchor"
+    ]
+    left_evidence = {
+        str(evidence_id)
+        for ref in left_refs
+        for evidence_id in ref.get("evidence_ids") or ()
+        if evidence_id
+    }
+    right_evidence = {
+        str(evidence_id)
+        for ref in right_refs
+        for evidence_id in ref.get("evidence_ids") or ()
+        if evidence_id
+    }
+    if left_evidence & right_evidence:
+        return True
+    for left_ref in left_refs:
+        left_box = left_ref.get("bbox")
+        left_page = int(left_ref.get("source_page") or left_ref.get("logical_page") or 0)
+        if left_page <= 0 or not isinstance(left_box, (list, tuple)) or len(left_box) != 4:
+            continue
+        for right_ref in right_refs:
+            right_box = right_ref.get("bbox")
+            right_page = int(right_ref.get("source_page") or right_ref.get("logical_page") or 0)
+            if right_page != left_page or not isinstance(right_box, (list, tuple)) or len(right_box) != 4:
                 continue
-            facts = _pairs(rows)
-            contract_number = _identifier(_field(facts, "保证合同编号"))
-            related_id = _identifier(_field(facts, "主业务借款人证件号码"))
-            identifier = contract_number or stable_record_id("liability_source", len(records) + 1)
-            currency = _currency(_field(facts, "币种")) or "CNY"
-            records.append(
-                {
-                    "liability_id": stable_record_id("repayment_liability", identifier),
-                    "sequence": len(records) + 1,
-                    "open_date": _date(_field(facts, "开立日期")),
-                    "due_date": _date(_field(facts, "到期日期")),
-                    "related_party_name": _clean(_field(facts, "主业务借款人")),
-                    "related_party_id_type": _clean(_field(facts, "主业务借款人证件类型")),
-                    "related_party_id_number": related_id,
-                    "institution": _clean(_field(facts, "管理机构")),
-                    "business_type": _clean(_field(facts, "业务种类")),
-                    "responsibility_type": _clean(_field(facts, "责任人类型")),
-                    "responsibility_amount": _number(_field(facts, "还款责任金额")),
-                    "responsibility_amount_reported": True,
-                    "contract_number": contract_number,
-                    "snapshot_date": next(
+            intersection = max(
+                0.0,
+                min(float(left_box[2]), float(right_box[2]))
+                - max(float(left_box[0]), float(right_box[0])),
+            ) * max(
+                0.0,
+                min(float(left_box[3]), float(right_box[3]))
+                - max(float(left_box[1]), float(right_box[1])),
+            )
+            left_area = max(
+                1.0,
+                (float(left_box[2]) - float(left_box[0]))
+                * (float(left_box[3]) - float(left_box[1])),
+            )
+            right_area = max(
+                1.0,
+                (float(right_box[2]) - float(right_box[0]))
+                * (float(right_box[3]) - float(right_box[1])),
+            )
+            if intersection / min(left_area, right_area) >= 0.60:
+                return True
+    return False
+
+
+def _agreement_authorized_cross_plane_anchors(
+    records: list[dict[str, Any]],
+) -> set[str]:
+    """Return exact card anchors that are unique inside every evidence plane."""
+
+    identifiers_by_key_and_plane: dict[str, dict[str, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    for record in records:
+        key = _agreement_canonical_card_key(record)
+        identifier = _agreement_identifier_text(record.get("account_identifier"))
+        if not key or not identifier:
+            continue
+        for plane in _agreement_anchor_planes(record):
+            identifiers_by_key_and_plane[key][plane].add(identifier)
+    return {
+        key
+        for key, identifiers_by_plane in identifiers_by_key_and_plane.items()
+        if len(identifiers_by_plane) >= 2
+        and all(len(identifiers) == 1 for identifiers in identifiers_by_plane.values())
+    }
+
+
+def _agreement_overlapping_business_conflicts(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> set[str]:
+    conflicts: set[str] = set()
+    for field_name in (
+        "institution",
+        "facility_type",
+        "effective_date",
+        "due_date",
+        "total_limit",
+        "credit_limit",
+        "used_limit",
+        "currency",
+    ):
+        left_value = left.get(field_name)
+        right_value = right.get(field_name)
+        if left_value in (None, "") or right_value in (None, ""):
+            continue
+        if _agreement_field_value_key(field_name, left_value) != _agreement_field_value_key(
+            field_name,
+            right_value,
+        ):
+            conflicts.add(field_name)
+    return conflicts
+
+
+def _agreement_has_strict_business_field_superset(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    field_names = {
+        "institution",
+        "facility_type",
+        "effective_date",
+        "due_date",
+        "total_limit",
+        "credit_limit",
+        "used_limit",
+        "currency",
+    }
+    left_fields = {field_name for field_name in field_names if left.get(field_name) not in (None, "")}
+    right_fields = {field_name for field_name in field_names if right.get(field_name) not in (None, "")}
+    return left_fields < right_fields or right_fields < left_fields
+
+
+def _agreement_exact_anchor_authorizes_merge(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    authorized_anchors: set[str],
+) -> bool:
+    left_key = _agreement_canonical_card_key(left)
+    right_key = _agreement_canonical_card_key(right)
+    left_planes = _agreement_anchor_planes(left)
+    right_planes = _agreement_anchor_planes(right)
+    return bool(
+        left_key
+        and left_key == right_key
+        and left_key in authorized_anchors
+        and left_planes
+        and right_planes
+        and left_planes.isdisjoint(right_planes)
+        and _agreement_strong_field_matches(left, right) >= 3
+        and not _agreement_overlapping_business_conflicts(left, right)
+        and _agreement_has_strict_business_field_superset(left, right)
+    )
+
+
+def _agreement_verified_observation_relation(
+    issue_owner: Any,
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Require shared canonical geometry or an explicit continuation edge.
+
+    Page proximity and identifier resemblance are intentionally insufficient:
+    several distinct agreements can share a page, institution, dates, and
+    amount fields.  This relation only establishes that two observations came
+    from the same canonical card region (or two tables explicitly joined by
+    the plugin's continuation graph).
+    """
+
+    left_refs = _agreement_observation_refs(left)
+    right_refs = _agreement_observation_refs(right)
+    left_tables = {str(ref.get("table_id") or "") for ref in left_refs if ref.get("table_id")}
+    right_tables = {str(ref.get("table_id") or "") for ref in right_refs if ref.get("table_id")}
+    if left_tables & right_tables:
+        return True
+
+    continuation_check = getattr(issue_owner, "tables_continue", None)
+    if callable(continuation_check) and any(
+        continuation_check(left_table, right_table) is True
+        for left_table in left_tables
+        for right_table in right_tables
+    ):
+        return True
+
+    for left_ref in left_refs:
+        left_box = left_ref.get("bbox")
+        if not isinstance(left_box, (list, tuple)) or len(left_box) != 4:
+            continue
+        left_page = int(left_ref.get("source_page") or left_ref.get("logical_page") or 0)
+        for right_ref in right_refs:
+            right_page = int(right_ref.get("source_page") or right_ref.get("logical_page") or 0)
+            right_box = right_ref.get("bbox")
+            if left_page <= 0 or left_page != right_page:
+                continue
+            if not isinstance(right_box, (list, tuple)) or len(right_box) != 4:
+                continue
+            intersection = max(0.0, min(float(left_box[2]), float(right_box[2])) - max(float(left_box[0]), float(right_box[0]))) * max(
+                0.0, min(float(left_box[3]), float(right_box[3])) - max(float(left_box[1]), float(right_box[1]))
+            )
+            left_area = max(1.0, (float(left_box[2]) - float(left_box[0])) * (float(left_box[3]) - float(left_box[1])))
+            right_area = max(1.0, (float(right_box[2]) - float(right_box[0])) * (float(right_box[3]) - float(right_box[1])))
+            if intersection / min(left_area, right_area) >= 0.60:
+                return True
+    return False
+
+
+def _agreement_field_provenance_quality(record: Mapping[str, Any], field_name: str) -> int:
+    bindings = record.get("_field_binding_quality")
+    binding = str(bindings.get(field_name) or "") if isinstance(bindings, Mapping) else ""
+    refs_by_field = record.get("source_refs_by_field")
+    refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+    cell_scoped = any(
+        isinstance(ref, Mapping)
+        and ref.get("geometry_scope") == "cell"
+        and ref.get("binding") in {"canonical_label_slot", "label_column"}
+        for ref in refs or ()
+    )
+    if binding == "canonical_cell_slot" and cell_scoped:
+        return 4
+    if binding == "native_label_column" and cell_scoped:
+        return 3
+    if binding == "native_label_column":
+        return 2
+    # Backward-compatible synthetic observations remain comparable in unit
+    # tests, but can never outrank a label-bound production observation.
+    return 1 if record.get(field_name) not in (None, "") else 0
+
+
+def _agreement_observation_quality(record: Mapping[str, Any]) -> tuple[int, int, int]:
+    """Rank one agreement observation by schema validity before OCR confidence.
+
+    Repeated observations of a card can contain a fully populated canonical row
+    and a damaged continuation fragment.  Counting non-empty cells alone lets
+    the fragment win when an OCR artifact happens to look numeric.  Candidate B
+    therefore ranks observations by field contracts first and uses confidence
+    only as a later tie-breaker.
+    """
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        _is_valid_for_role,
+    )
+
+    role_fields = (
+        ("account_identifier", "account_identifier"),
+        ("institution", "institution_name"),
+        ("facility_type", "facility_type"),
+        ("effective_date", "date"),
+        ("due_date", "date"),
+        ("total_limit", "amount"),
+        ("credit_limit", "amount"),
+        ("used_limit", "amount"),
+        ("currency", "currency"),
+    )
+    valid_fields = 0
+    valid_identity_fields = 0
+    provenance = 0
+    for field_name, role in role_fields:
+        value = record.get(field_name)
+        if value in (None, ""):
+            continue
+        if _is_valid_for_role(str(value), role):
+            valid_fields += 1
+            provenance += _agreement_field_provenance_quality(record, field_name)
+            if field_name in {"institution", "facility_type"}:
+                valid_identity_fields += 1
+    return provenance, valid_identity_fields, valid_fields
+
+
+def reconcile_candidate_b_credit_lines(
+    parse_result: Any,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the one-row-per-agreement schema constraint after correction."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+        register_issue_target_remap,
+    )
+
+    authorized_cross_plane_anchors = _agreement_authorized_cross_plane_anchors(records)
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    prototypes: dict[str, dict[str, Any]] = {}
+    for index, source in enumerate(records):
+        record = dict(source)
+        if record.get("_printed_sequence") in (None, "") and record.get("sequence") not in (None, ""):
+            record["_printed_sequence"] = record.get("sequence")
+        issue_target_ids = {
+            str(value)
+            for value in (source.get("credit_line_id"), source.get("record_id"))
+            if value
+        }
+        raw_identifier = _agreement_identifier_text(record.get("account_identifier"))
+        identifier = _typed_identifier(record.get("account_identifier"))
+        if identifier:
+            record["account_identifier"] = identifier
+            record["credit_line_id"] = stable_record_id("credit_line", identifier)
+            issue_target_ids.add(str(record["credit_line_id"]))
+        if issue_target_ids:
+            record["_issue_target_ids"] = sorted(issue_target_ids)
+        identity = str(record.get("credit_line_id") or f"candidate_b_credit_line_row:{index + 1}")
+        if identity not in groups and raw_identifier:
+            compatible: list[str] = []
+            for candidate_identity, prototype in prototypes.items():
+                prototype_identifier = _agreement_identifier_text(prototype.get("account_identifier"))
+                strong_match_count = _agreement_strong_field_matches(record, prototype)
+                sequence_match = _agreement_printed_sequences_match(record, prototype)
+                verified_relation = _agreement_verified_observation_relation(
+                    parse_result, prototype, record
+                )
+                leading_insertion_identifier = _agreement_single_leading_ocr_insertion(
+                    raw_identifier,
+                    prototype_identifier,
+                )
+                exact_leading_insertion_relation = bool(
+                    leading_insertion_identifier
+                    and sequence_match
+                    and _agreement_same_source_page(prototype, record)
+                    and strong_match_count >= 2
+                )
+                exact_anchor_relation = _agreement_exact_anchor_authorizes_merge(
+                    prototype,
+                    record,
+                    authorized_cross_plane_anchors,
+                )
+                if (
+                    raw_identifier != prototype_identifier
+                    and (
                         (
-                            _date("-".join(match.groups()))
-                            for row in rows
-                            if (match := _AS_OF_RE.search(_clean(" ".join(row))))
+                            sequence_match
+                            and verified_relation
+                            and strong_match_count >= 3
+                        )
+                        or exact_leading_insertion_relation
+                        or exact_anchor_relation
+                    )
+                ):
+                    if exact_leading_insertion_relation:
+                        prototype["_identifier_leading_insertion_canonical"] = leading_insertion_identifier
+                        record["_identifier_leading_insertion_canonical"] = leading_insertion_identifier
+                    if exact_anchor_relation:
+                        prototype["_canonical_card_anchor_verified"] = True
+                        record["_canonical_card_anchor_verified"] = True
+                    compatible.append(candidate_identity)
+                    continue
+                same_authorized_card_key = bool(
+                    _agreement_canonical_card_key(record)
+                    and _agreement_canonical_card_key(record)
+                    == _agreement_canonical_card_key(prototype)
+                )
+                if raw_identifier != prototype_identifier and (
+                    sequence_match
+                    or same_authorized_card_key
+                    or leading_insertion_identifier
+                    or _agreement_anchor_geometry_overlaps(prototype, record)
+                ):
+                    record_issue(
+                        parse_result,
+                        make_issue(
+                            category="schema_incompleteness",
+                            issue_code="candidate_b_credit_agreement_identity_ambiguous",
+                            message=(
+                                "Two credit-agreement observations had different identifiers without the exact "
+                                "ordinal-and-source relation required to prove one canonical card; both were retained."
+                            ),
+                            parser_stage="candidate_b_credit_agreement_schema",
+                            target_dataset="credit_lines",
+                            observed_value={
+                                "left_identifier": prototype.get("account_identifier"),
+                                "right_identifier": record.get("account_identifier"),
+                                "left_sequence": prototype.get("_printed_sequence"),
+                                "right_sequence": record.get("_printed_sequence"),
+                            },
+                            source_refs=[
+                                *(prototype.get("source_refs") or ()),
+                                *(record.get("source_refs") or ()),
+                            ],
+                            reason_codes=(
+                                "different_identifiers",
+                                "exact_card_identity_not_proven",
+                                (
+                                    "canonical_card_anchor_business_conflict"
+                                    if same_authorized_card_key
+                                    and _agreement_canonical_card_key(record)
+                                    in authorized_cross_plane_anchors
+                                    else "canonical_card_anchor_not_cross_plane_unique"
+                                    if same_authorized_card_key
+                                    else "canonical_card_anchor_unavailable"
+                                ),
+                                "fuzzy_identifier_merge_forbidden",
+                                "records_conservatively_retained",
+                            ),
                         ),
-                        None,
-                    ),
-                    "balance": _number(_field(facts, "余额")),
-                    "five_tier_class": _clean(_field(facts, "五级分类")),
-                    "overdue_months_or_repayment_status": _clean(_field(facts, "逾期月数", "还款状态")),
-                    "currency": currency,
-                    "reporting_amount_currency": currency,
-                    "amount_unit": "yuan",
-                    "reporting_amount_unit": "yuan",
-                    "source": "native_detail_liability_table",
-                    "source_refs": [_source_ref(page, table)],
-                    "confidence": 1.0,
+                    )
+            if len(compatible) == 1:
+                identity = compatible[0]
+        if identity not in groups:
+            groups[identity] = []
+            order.append(identity)
+            prototypes[identity] = record
+        groups[identity].append(record)
+
+    reconciled: list[dict[str, Any]] = []
+    ignored_fields = {
+        "source",
+        "source_refs",
+        "source_refs_by_field",
+        "confidence",
+        "credit_line_id",
+        "sequence",
+        "_printed_sequence",
+        "_issue_target_ids",
+        "_field_binding_quality",
+        "_source_absent_fields",
+        "_unresolved_fields",
+        "_observed_fields",
+        "_identifier_leading_insertion_canonical",
+        "_canonical_card_key",
+        "_canonical_card_anchor_refs",
+        "_canonical_card_anchor_verified",
+        "_pending_institution_observation",
+    }
+    provenance_fields = (
+        "account_identifier",
+        "institution",
+        "facility_type",
+        "effective_date",
+        "due_date",
+        "total_limit",
+        "credit_limit",
+        "used_limit",
+        "limit_identifier",
+        "currency",
+    )
+    for identity in order:
+        observations = groups[identity]
+        ranked = sorted(
+            observations,
+            key=lambda row: (
+                _agreement_observation_quality(row),
+                sum(value not in (None, "", [], {}) for key, value in row.items() if key not in ignored_fields),
+                float(row.get("confidence") or 0.0),
+                len(str(row.get("account_identifier") or "")),
+            ),
+            reverse=True,
+        )
+        selected = dict(ranked[0])
+        printed_sequences = {
+            int(observation["_printed_sequence"])
+            for observation in observations
+            if observation.get("_printed_sequence") not in (None, "")
+        }
+        if len(printed_sequences) == 1:
+            selected["sequence"] = next(iter(printed_sequences))
+        selected.pop("_printed_sequence", None)
+        selected.pop("_issue_target_ids", None)
+        selected.pop("_pending_institution_observation", None)
+        conflicts: set[str] = set()
+        conflict_values: dict[str, list[Any]] = {}
+        merged_refs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for observation in ranked:
+            for ref in observation.get("source_refs") or ():
+                if not isinstance(ref, dict):
+                    continue
+                marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen_refs:
+                    seen_refs.add(marker)
+                    merged_refs.append(dict(ref))
+            for key, value in observation.items():
+                if key in ignored_fields or value in (None, "", [], {}):
+                    continue
+                if key in provenance_fields:
+                    continue
+                retained = selected.get(key)
+                if retained in (None, "", [], {}):
+                    selected[key] = deepcopy(value)
+                elif retained != value:
+                    conflicts.add(key)
+
+        selected_field_refs: dict[str, list[dict[str, Any]]] = {}
+        selected_binding_quality: dict[str, str] = {}
+        source_absent_fields = {
+            str(field_name)
+            for observation in observations
+            for field_name in observation.get("_source_absent_fields") or ()
+        }
+        unresolved_fields = {
+            str(field_name)
+            for observation in observations
+            for field_name in observation.get("_unresolved_fields") or ()
+        }
+        observed_fields = {
+            str(field_name)
+            for observation in observations
+            for field_name in observation.get("_observed_fields") or ()
+        }
+        unresolved_institution_boundaries: list[Mapping[str, Any]] = []
+        for field_name in provenance_fields:
+            if field_name == "account_identifier":
+                insertion_candidates = {
+                    str(observation.get("_identifier_leading_insertion_canonical") or "")
+                    for observation in observations
+                    if observation.get("_identifier_leading_insertion_canonical")
                 }
+                if len(insertion_candidates) == 1:
+                    canonical_identifier = next(iter(insertion_candidates))
+                    selected[field_name] = canonical_identifier
+                    chosen_observations = [
+                        observation
+                        for observation in observations
+                        if _agreement_identifier_text(observation.get(field_name)) == canonical_identifier
+                    ]
+                    selected_field_refs[field_name] = [
+                        dict(ref)
+                        for observation in chosen_observations
+                        for ref in (
+                            (observation.get("source_refs_by_field") or {}).get(field_name)
+                            if isinstance(observation.get("source_refs_by_field"), Mapping)
+                            else ()
+                        )
+                        if isinstance(ref, Mapping)
+                    ]
+                    continue
+            candidates = [
+                (
+                    _agreement_field_provenance_quality(observation, field_name),
+                    float(observation.get("confidence") or 0.0),
+                    observation.get(field_name),
+                    observation,
+                )
+                for observation in observations
+                if observation.get(field_name) not in (None, "")
+            ]
+            if field_name == "institution":
+                pending_boundaries = [
+                    pending
+                    for observation in observations
+                    for pending in (observation.get("_pending_institution_observation"),)
+                    if isinstance(pending, Mapping) and pending.get("value")
+                ]
+                corroborated_pending: list[Mapping[str, Any]] = []
+                for pending in pending_boundaries:
+                    pending_refs = [
+                        ref for ref in pending.get("source_refs") or () if isinstance(ref, Mapping)
+                    ]
+                    same_pending_refs = [
+                        ref
+                        for other in pending_boundaries
+                        if other is not pending and other.get("value") == pending.get("value")
+                        for ref in other.get("source_refs") or ()
+                        if isinstance(ref, Mapping)
+                    ]
+                    clean_refs = [
+                        ref
+                        for _quality, _confidence, value, observation in candidates
+                        if _agreement_field_value_key("institution", value)
+                        == _agreement_field_value_key("institution", pending.get("value"))
+                        for ref in (
+                            (observation.get("source_refs_by_field") or {}).get("institution")
+                            if isinstance(observation.get("source_refs_by_field"), Mapping)
+                            else ()
+                        )
+                        if isinstance(ref, Mapping)
+                    ]
+                    if any(
+                        _institution_refs_are_independent(left, right)
+                        for left in pending_refs
+                        for right in [*same_pending_refs, *clean_refs]
+                    ):
+                        corroborated_pending.append(pending)
+                corroborated_values = {
+                    _agreement_field_value_key("institution", pending.get("value"))
+                    for pending in corroborated_pending
+                }
+                clean_values = {
+                    _agreement_field_value_key("institution", candidate[2])
+                    for candidate in candidates
+                }
+                if corroborated_values and clean_values and len(corroborated_values | clean_values) > 1:
+                    selected[field_name] = None
+                    unresolved_fields.add(field_name)
+                    conflicts.add(field_name)
+                    conflict_values[field_name] = [
+                        *[candidate[2] for candidate in candidates],
+                        *[pending.get("value") for pending in corroborated_pending],
+                    ]
+                    unresolved_institution_boundaries.extend(pending_boundaries)
+                    continue
+                if len(corroborated_values) == 1 and not candidates:
+                    selected[field_name] = next(
+                        pending.get("value")
+                        for pending in corroborated_pending
+                        if _agreement_field_value_key("institution", pending.get("value"))
+                        in corroborated_values
+                    )
+                    selected_field_refs[field_name] = [
+                        dict(ref)
+                        for pending in corroborated_pending
+                        for ref in pending.get("source_refs") or ()
+                        if isinstance(ref, Mapping)
+                    ]
+                    unresolved_fields.discard(field_name)
+                    continue
+                if len(corroborated_values) != 1:
+                    corroborated_pending = []
+                unresolved_institution_boundaries.extend(
+                    pending
+                    for pending in pending_boundaries
+                    if pending not in corroborated_pending
+                )
+            if not candidates:
+                selected[field_name] = None
+                continue
+            if field_name == "institution":
+                source_bound = [candidate for candidate in candidates if candidate[0] >= 2]
+                independent_values = {
+                    _agreement_field_value_key(field_name, candidate[2])
+                    for candidate in source_bound
+                }
+                if len(independent_values) > 1:
+                    selected[field_name] = None
+                    unresolved_fields.add(field_name)
+                    conflicts.add(field_name)
+                    conflict_values[field_name] = [
+                        candidate[2]
+                        for candidate in sorted(
+                            source_bound,
+                            key=lambda item: (item[0], item[1], str(item[2])),
+                            reverse=True,
+                        )
+                    ]
+                    continue
+            best_quality = max(candidate[0] for candidate in candidates)
+            best = [candidate for candidate in candidates if candidate[0] == best_quality]
+            by_value: dict[str, list[tuple[int, float, Any, Mapping[str, Any]]]] = defaultdict(list)
+            for candidate in best:
+                by_value[_agreement_field_value_key(field_name, candidate[2])].append(candidate)
+            if len(by_value) != 1:
+                selected[field_name] = None
+                unresolved_fields.add(field_name)
+                conflicts.add(field_name)
+                conflict_values[field_name] = [
+                    candidate[2]
+                    for candidate in sorted(best, key=lambda item: (item[1], str(item[2])), reverse=True)
+                ]
+                continue
+            chosen = max(best, key=lambda item: (item[1], len(str(item[2]))))
+            selected[field_name] = deepcopy(chosen[2])
+            chosen_observations = by_value[next(iter(by_value))]
+            field_refs: list[dict[str, Any]] = []
+            field_ref_markers: set[str] = set()
+            for _quality, _confidence, _value, observation in chosen_observations:
+                refs_by_field = observation.get("source_refs_by_field")
+                refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+                for ref in refs or ():
+                    if not isinstance(ref, Mapping):
+                        continue
+                    marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                    if marker in field_ref_markers:
+                        continue
+                    field_ref_markers.add(marker)
+                    field_refs.append(dict(ref))
+            if field_refs:
+                selected_field_refs[field_name] = field_refs
+            binding_map = chosen[3].get("_field_binding_quality")
+            if isinstance(binding_map, Mapping) and binding_map.get(field_name):
+                selected_binding_quality[field_name] = str(binding_map[field_name])
+
+        selected_identifier = _typed_identifier(selected.get("account_identifier"))
+        if selected_identifier:
+            selected["account_identifier"] = selected_identifier
+            selected["credit_line_id"] = stable_record_id("credit_line", selected_identifier)
+        else:
+            selected["account_identifier"] = None
+            selected["credit_line_id"] = stable_record_id(
+                "credit_line_unresolved",
+                next(iter(printed_sequences)) if len(printed_sequences) == 1 else identity,
+                sorted(
+                    {
+                        _agreement_identifier_text(observation.get("account_identifier"))
+                        for observation in observations
+                        if _agreement_identifier_text(observation.get("account_identifier"))
+                    }
+                ),
+            )
+            unresolved_fields.add("account_identifier")
+        final_target_id = str(selected["credit_line_id"])
+        if unresolved_institution_boundaries:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_institution_leading_boundary_ambiguous",
+                    message=(
+                        "A separated leading Han glyph could be either intra-name OCR whitespace or cross-cell "
+                        "debris; the joined institution was not silently selected without independent source evidence."
+                    ),
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=final_target_id,
+                    field_name="institution",
+                    observed_value=[
+                        str(pending.get("raw") or "")
+                        for pending in unresolved_institution_boundaries
+                    ],
+                    candidate_value={
+                        "joined_values": sorted(
+                            {
+                                str(pending.get("value") or "")
+                                for pending in unresolved_institution_boundaries
+                            }
+                        )
+                    },
+                    source_refs=[
+                        ref
+                        for pending in unresolved_institution_boundaries
+                        for ref in pending.get("source_refs") or ()
+                        if isinstance(ref, Mapping)
+                    ],
+                    reason_codes=(
+                        "separated_leading_han_boundary",
+                        "independent_source_corroboration_missing",
+                        "normalized_value_withheld",
+                    ),
+                ),
+            )
+        for observation in observations:
+            for prior_target_id in observation.get("_issue_target_ids") or ():
+                register_issue_target_remap(parse_result, prior_target_id, final_target_id)
+
+        selected["source_refs_by_field"] = selected_field_refs
+        selected["_field_binding_quality"] = selected_binding_quality
+        selected["_source_absent_fields"] = sorted(source_absent_fields)
+        selected["_unresolved_fields"] = sorted(unresolved_fields)
+        selected["_observed_fields"] = sorted(observed_fields)
+        currency = selected.get("currency")
+        selected["account_currency"] = currency
+        selected["reporting_amount_currency"] = currency
+        due_date = selected.get("due_date")
+        if due_date not in (None, ""):
+            selected["validity_type"] = "fixed_term"
+        elif any(
+            _compact(observation.get("canonical_raw", {}).get("due_date") if isinstance(observation.get("canonical_raw"), Mapping) else "") == "长期"
+            for observation in observations
+        ):
+            selected["validity_type"] = "perpetual"
+        elif selected.get("validity_type") != "perpetual":
+            selected["validity_type"] = "unknown"
+        if merged_refs:
+            selected["source_refs"] = merged_refs
+        anchor_verified = bool(selected.pop("_canonical_card_anchor_verified", False))
+        selected.pop("_canonical_card_key", None)
+        selected.pop("_canonical_card_anchor_refs", None)
+        reconciled.append(selected)
+        identifier_variants = {
+            _agreement_identifier_text(observation.get("account_identifier"))
+            for observation in observations
+            if _agreement_identifier_text(observation.get("account_identifier"))
+        }
+        if len(identifier_variants) > 1:
+            leading_insertion_canonical = selected.get("_identifier_leading_insertion_canonical")
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_credit_agreement_identifier_variant",
+                    message=(
+                        "Source-verified observations of one agreement contained different identifiers; "
+                        "only a uniquely stronger canonical field observation may be retained."
+                    ),
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=str(selected.get("credit_line_id") or identity),
+                    field_name="account_identifier",
+                    observed_value=sorted(identifier_variants),
+                    candidate_value=selected.get("account_identifier"),
+                    source_refs=merged_refs,
+                    reason_codes=(
+                        (
+                            "exact_canonical_card_anchor_cross_plane"
+                            if anchor_verified
+                            else "same_printed_sequence"
+                            if len(printed_sequences) == 1
+                            else "verified_source_relation"
+                        ),
+                        "different_identifier_observations",
+                        (
+                            "exact_leading_ocr_insertion_corrected"
+                            if leading_insertion_canonical
+                            else "canonical_anchor_provenance_selection"
+                            if anchor_verified
+                            else "fuzzy_identifier_selection_forbidden"
+                        ),
+                        (
+                            "normalized_value_withheld"
+                            if selected.get("account_identifier") in (None, "")
+                            else "higher_provenance_value_retained_for_review"
+                        ),
+                    ),
+                ),
+            )
+        if len(observations) > 1 and conflicts:
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_credit_agreement_observation_conflict",
+                    message=(
+                        "Multiple corrected observations resolved to one canonical credit-agreement identity; "
+                        "equally source-bound values disagreed; the conflicting fields were withheld for review."
+                    ),
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=str(selected.get("credit_line_id") or identity),
+                    observed_value={
+                        "candidate_count": len(observations),
+                        "conflicting_fields": sorted(conflicts),
+                        "field_candidates": conflict_values,
+                    },
+                    source_refs=merged_refs,
+                    reason_codes=(
+                        "canonical_identity_collision",
+                        "field_provenance_tie",
+                        "conflicting_values_withheld",
+                    ),
+                ),
+            )
+    sequence_counts = Counter(
+        int(record["sequence"])
+        for record in reconciled
+        if record.get("sequence") not in (None, "")
+    )
+    for record in reconciled:
+        sequence = record.get("sequence")
+        reason_codes: tuple[str, ...]
+        if sequence not in (None, "") and sequence_counts[int(sequence)] == 1:
+            continue
+        if sequence not in (None, ""):
+            record.pop("sequence", None)
+            reason_codes = (
+                "printed_sequence_collision",
+                "row_order_not_used",
+                "normalized_value_withheld",
+            )
+        else:
+            reason_codes = (
+                "printed_sequence_unreadable",
+                "row_order_not_used",
+                "normalized_value_withheld",
+            )
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="candidate_b_credit_agreement_sequence_unresolved",
+                message="The printed credit-agreement ordinal was missing or non-unique; encounter order was not emitted as business data.",
+                parser_stage="candidate_b_credit_agreement_schema",
+                target_dataset="credit_lines",
+                target_record_id=str(record.get("credit_line_id") or "") or None,
+                field_name="sequence",
+                observed_value=sequence,
+                source_refs=record.get("source_refs") or (),
+                reason_codes=reason_codes,
+            ),
+        )
+    for record in reconciled:
+        source_absent_fields = set(record.get("_source_absent_fields") or ())
+        expected_fields = (
+            "account_identifier",
+            "institution",
+            "facility_type",
+            "effective_date",
+            "due_date",
+            "total_limit",
+            "credit_limit",
+            "used_limit",
+            "limit_identifier",
+            "currency",
+        )
+        for field_name in expected_fields:
+            if record.get(field_name) not in (None, ""):
+                continue
+            if field_name in source_absent_fields:
+                continue
+            if field_name == "due_date" and record.get("validity_type") == "perpetual":
+                continue
+            refs_by_field = record.get("source_refs_by_field")
+            field_refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_credit_agreement_required_field_unresolved",
+                    message=(
+                        "A required credit-agreement field remained unavailable after all canonical "
+                        "observations were reconciled; no business value was invented."
+                    ),
+                    parser_stage="candidate_b_credit_agreement_schema",
+                    target_dataset="credit_lines",
+                    target_record_id=str(record.get("credit_line_id") or "") or None,
+                    field_name=field_name,
+                    source_refs=field_refs or record.get("source_refs") or (),
+                    reason_codes=(
+                        "required_field_missing",
+                        "canonical_credit_agreement_field_unresolved",
+                        "field_slot_not_safely_bound",
+                        "preserved_unknown_value",
+                    ),
+                ),
+            )
+    return reconciled
+
+
+_LIABILITY_LABEL_TO_FIELD = {
+    "管理机构": "institution",
+    "业务种类": "business_type",
+    "开立日期": "open_date",
+    "到期日期": "due_date",
+    "责任人类型": "responsibility_type",
+    "还款责任金额": "responsibility_amount",
+    "币种": "currency",
+    "保证合同编号": "contract_number",
+    "主业务借款人": "related_party_name",
+    "主业务借款人证件类型": "related_party_id_type",
+    "主业务借款人证件号码": "related_party_id_number",
+    "__snapshot_date": "snapshot_date",
+    "余额": "balance",
+    "五级分类": "five_tier_class",
+    "逾期月数": "overdue_months",
+    "还款状态": "repayment_status_code",
+}
+
+_LIABILITY_PLACEHOLDERS = frozenset({"", "-", "--", "---", "未报告", "不详"})
+_LIABILITY_RESPONSIBILITY_TYPES = frozenset(
+    {
+        "本人",
+        "保证",
+        "保证人",
+        "担保",
+        "担保人",
+        "共同借款人",
+        "共同还款人",
+        "抵押",
+        "抵押人",
+        "质押",
+        "质押人",
+        "其他",
+        "未知",
+    }
+)
+_LIABILITY_ID_TYPES = frozenset(
+    {
+        "身份证",
+        "居民身份证",
+        "统一社会信用代码",
+        "中征码",
+        "组织机构代码",
+        "护照",
+        "军官证",
+        "士兵证",
+        "其他证件",
+        "未知",
+    }
+)
+_LIABILITY_FIVE_TIER_CLASSES = frozenset({"正常", "关注", "次级", "可疑", "损失", "未分类", "未知"})
+
+
+def _liability_source_absent(value: Any) -> bool:
+    return _compact(value) in _LIABILITY_PLACEHOLDERS
+
+
+def _liability_currency(value: Any) -> str | None:
+    compact = _compact(value).upper()
+    return _CURRENCY_TOKEN_ALIASES.get(compact)
+
+
+def _liability_date(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    snapshot = re.fullmatch(
+        r"截至\s*((?:19|20)\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        raw,
+    )
+    if snapshot is not None:
+        return _date("-".join(snapshot.groups()))
+    return _date(raw)
+
+
+def _liability_identifier(value: Any, *, contract: bool = False) -> str | None:
+    compact = re.sub(r"\s+", "", str(value or "")).upper()
+    minimum = 8 if contract else 6
+    if not (minimum <= len(compact) <= 100):
+        return None
+    if not re.fullmatch(r"[A-Z0-9*\-]+", compact):
+        return None
+    if contract and not re.search(r"[A-Z0-9]", compact):
+        return None
+    return compact
+
+
+def _liability_text(value: Any, *, minimum: int = 1, maximum: int = 120) -> str | None:
+    text = _business_text(value)
+    if not (minimum <= len(text) <= maximum):
+        return None
+    if not re.search(r"[\u3400-\u9fffA-Za-z]", text):
+        return None
+    if re.search(r"[\"'?？]{2,}", text):
+        return None
+    return text
+
+
+def _liability_convert(
+    field_name: str,
+    raw_value: Any,
+    *,
+    related_party_id_type: Any = None,
+) -> Any | None:
+    compact = _compact(raw_value)
+    if _liability_source_absent(raw_value):
+        return None
+    if field_name in {"responsibility_amount", "balance"}:
+        parsed = _number(raw_value)
+        return parsed if isinstance(parsed, int) and parsed >= 0 else None
+    if field_name in {"open_date", "due_date", "snapshot_date"}:
+        return _liability_date(raw_value)
+    if field_name == "currency":
+        return _liability_currency(raw_value)
+    if field_name == "contract_number":
+        return _liability_identifier(raw_value, contract=True)
+    if field_name == "related_party_id_number":
+        id_type = _compact(related_party_id_type)
+        source = re.sub(r"\s+", "", str(raw_value or ""))
+        if id_type == "统一社会信用代码":
+            return source if re.fullmatch(r"[0-9A-Z]{18}", source) else None
+        if id_type == "中征码":
+            return source if re.fullmatch(r"[0-9A-Za-z]{16}", source) else None
+        return _liability_identifier(raw_value)
+    if field_name == "responsibility_type":
+        return compact if compact in _LIABILITY_RESPONSIBILITY_TYPES else None
+    if field_name == "related_party_id_type":
+        return compact if compact in _LIABILITY_ID_TYPES else None
+    if field_name == "five_tier_class":
+        return compact if compact in _LIABILITY_FIVE_TIER_CLASSES else None
+    if field_name == "overdue_months":
+        return int(compact) if re.fullmatch(r"\d{1,2}", compact) else None
+    if field_name == "repayment_status_code":
+        upper = compact.upper()
+        if upper in _STATUS_CODES:
+            return upper
+        return compact if compact in {"正常", "逾期", "结清", "未知"} else None
+    if field_name == "related_party_name":
+        return _liability_text(raw_value, minimum=2)
+    if field_name == "institution":
+        return _liability_text(raw_value, minimum=2)
+    if field_name == "business_type":
+        return _liability_text(raw_value, minimum=2, maximum=60)
+    return None
+
+
+def _liability_party_category(record: Mapping[str, Any]) -> str:
+    explicit = str(record.get("_party_category") or "")
+    if explicit in {"person", "organization"}:
+        return explicit
+    id_type = _compact(record.get("related_party_id_type"))
+    identifier = _compact(record.get("related_party_id_number")).upper()
+    if "身份" in id_type or re.fullmatch(r"\d{17}[0-9X]", identifier):
+        return "person"
+    if any(marker in id_type for marker in ("统一社会信用", "中征码", "组织机构")):
+        return "organization"
+    return "unknown"
+
+
+def _liability_field_provenance_quality(record: Mapping[str, Any], field_name: str) -> int:
+    bindings = record.get("_field_binding_quality")
+    binding = str(bindings.get(field_name) or "") if isinstance(bindings, Mapping) else ""
+    refs_by_field = record.get("source_refs_by_field")
+    refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+    cell_scoped = any(
+        isinstance(ref, Mapping) and ref.get("geometry_scope") == "cell" for ref in refs or ()
+    )
+    if binding in {"canonical_cell_slot", "canonical_snapshot_date_cell"} and cell_scoped:
+        return 4
+    if binding == "native_label_column" and cell_scoped:
+        return 3
+    if binding in {"native_label_column", "canonical_snapshot_date_cell"}:
+        return 2
+    return 1 if record.get(field_name) not in (None, "") else 0
+
+
+def _liability_value_key(field_name: str, value: Any) -> str:
+    if field_name in {"responsibility_amount", "balance", "overdue_months"}:
+        return str(_number(value))
+    return _compact(value).upper()
+
+
+def _liability_records_compatible(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_category = _liability_party_category(left)
+    right_category = _liability_party_category(right)
+    if left_category != "unknown" and right_category != "unknown" and left_category != right_category:
+        return False
+    left_contract = _compact(left.get("contract_number")).upper()
+    right_contract = _compact(right.get("contract_number")).upper()
+    if left_contract and right_contract and left_contract == right_contract:
+        return True
+    left_sequence = left.get("_printed_sequence")
+    right_sequence = right.get("_printed_sequence")
+    same_canonical_ordinal = bool(
+        str(left_sequence or "").isdigit()
+        and str(right_sequence or "").isdigit()
+        and int(left_sequence) == int(right_sequence)
+        and left_category != "unknown"
+        and left_category == right_category
+    )
+    if same_canonical_ordinal:
+        return True
+    if left_contract and right_contract:
+        return False
+    if (
+        str(left_sequence or "").isdigit()
+        and str(right_sequence or "").isdigit()
+        and int(left_sequence) != int(right_sequence)
+    ):
+        return False
+
+    def composite_base(record: Mapping[str, Any]) -> tuple[str, ...] | None:
+        balance = record.get("balance")
+        values = (
+            _compact(record.get("institution")).upper(),
+            _compact(record.get("open_date")),
+            _compact(record.get("due_date")),
+            str(_number(balance)) if balance not in (None, "") else "",
+        )
+        return values if all(values) else None
+
+    left_composite = composite_base(left)
+    right_composite = composite_base(right)
+    if left_composite is None or left_composite != right_composite:
+        return False
+    left_party_id = _compact(left.get("related_party_id_number")).upper()
+    right_party_id = _compact(right.get("related_party_id_number")).upper()
+    if left_party_id and right_party_id:
+        return left_party_id == right_party_id
+    left_party_name = _compact(left.get("related_party_name")).upper()
+    right_party_name = _compact(right.get("related_party_name")).upper()
+    return bool(left_party_name and left_party_name == right_party_name)
+
+
+def _liability_field_refs(record: Mapping[str, Any], field_name: str) -> list[dict[str, Any]]:
+    refs_by_field = record.get("source_refs_by_field")
+    refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+    return [dict(ref) for ref in refs or () if isinstance(ref, Mapping)]
+
+
+def reconcile_candidate_b_liabilities(
+    parse_result: Any,
+    observations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reconcile fixed-layout liability cards without fuzzy business matching."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    groups: list[list[dict[str, Any]]] = []
+    for observation in observations:
+        compatible = [
+            group for group in groups if any(_liability_records_compatible(observation, prior) for prior in group)
+        ]
+        if len(compatible) == 1:
+            compatible[0].append(observation)
+        else:
+            # Ambiguous bridges are never used to collapse business records.
+            groups.append([observation])
+
+    reconciled: list[dict[str, Any]] = []
+    for output_sequence, group in enumerate(groups, start=1):
+        merged_refs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for observation in group:
+            for ref in observation.get("source_refs") or ():
+                if not isinstance(ref, Mapping):
+                    continue
+                marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen_refs:
+                    seen_refs.add(marker)
+                    merged_refs.append(dict(ref))
+
+        printed_sequences = {
+            int(observation["_printed_sequence"])
+            for observation in group
+            if str(observation.get("_printed_sequence") or "").isdigit()
+        }
+        group_contracts = {
+            str(observation.get("contract_number") or "")
+            for observation in group
+            if observation.get("contract_number") not in (None, "")
+        }
+        group_categories = {
+            _liability_party_category(observation)
+            for observation in group
+            if _liability_party_category(observation) != "unknown"
+        }
+        identity_seed: Any = next(iter(group_contracts)) if len(group_contracts) == 1 else None
+        if identity_seed is None and len(printed_sequences) == 1 and len(group_categories) == 1:
+            identity_seed = f"{next(iter(group_categories))}:{next(iter(printed_sequences))}"
+        if identity_seed is None:
+            identity_seed = json.dumps(merged_refs, ensure_ascii=False, sort_keys=True, default=str)
+        liability_id = stable_record_id("repayment_liability", identity_seed or output_sequence)
+        selected: dict[str, Any] = {
+            "liability_id": liability_id,
+            "sequence": output_sequence,
+            "source": "candidate_b_repayment_responsibility_schema",
+            "source_refs": merged_refs,
+            "confidence": max(float(observation.get("confidence") or 0.0) for observation in group),
+            "amount_unit": "yuan",
+            "reporting_amount_unit": "yuan",
+        }
+        if len(printed_sequences) == 1:
+            selected["_printed_sequence"] = next(iter(printed_sequences))
+        if len(group_categories) == 1:
+            selected["related_party_category"] = next(iter(group_categories))
+        selected_field_refs: dict[str, list[dict[str, Any]]] = {}
+        selected_bindings: dict[str, str] = {}
+        selected_raw: dict[str, Any] = {}
+        source_absent_fields = {
+            str(field_name)
+            for observation in group
+            for field_name in observation.get("_source_absent_fields") or ()
+        }
+        unresolved_fields = {
+            str(field_name)
+            for observation in group
+            for field_name in observation.get("_unresolved_fields") or ()
+        }
+        observed_fields = {
+            str(field_name)
+            for observation in group
+            for field_name in observation.get("_observed_fields") or ()
+        }
+        source_absent_quality = {
+            field_name: max(
+                (
+                    _liability_field_provenance_quality(observation, field_name)
+                    for observation in group
+                    if field_name in set(observation.get("_source_absent_fields") or ())
+                ),
+                default=0,
+            )
+            for field_name in source_absent_fields
+        }
+        unresolved_quality = {
+            field_name: max(
+                (
+                    _liability_field_provenance_quality(observation, field_name)
+                    for observation in group
+                    if field_name in set(observation.get("_unresolved_fields") or ())
+                ),
+                default=0,
+            )
+            for field_name in unresolved_fields
+        }
+        invalid_raw: dict[str, list[Any]] = defaultdict(list)
+        for observation in group:
+            raw_map = observation.get("_invalid_raw_by_field")
+            if not isinstance(raw_map, Mapping):
+                continue
+            for field_name, values in raw_map.items():
+                invalid_raw[str(field_name)].extend(values if isinstance(values, list) else [values])
+        for field_name, values in invalid_raw.items():
+            if values and field_name not in selected_raw:
+                selected_raw[field_name] = deepcopy(values[0])
+
+        for field_name in source_absent_fields:
+            raw_absences = [
+                observation.get("canonical_raw", {}).get(field_name)
+                for observation in group
+                if field_name in set(observation.get("_source_absent_fields") or ())
+                and isinstance(observation.get("canonical_raw"), Mapping)
+            ]
+            raw_absences = [raw for raw in raw_absences if raw not in (None, "")]
+            if raw_absences:
+                selected_raw[field_name] = deepcopy(raw_absences[0])
+
+        conflict_fields: set[str] = set()
+        for field_name in _LIABILITY_CANONICAL_FIELDS:
+            candidates = [
+                (
+                    _liability_field_provenance_quality(observation, field_name),
+                    float(observation.get("confidence") or 0.0),
+                    observation.get(field_name),
+                    observation,
+                )
+                for observation in group
+                if observation.get(field_name) not in (None, "")
+            ]
+            if not candidates:
+                selected[field_name] = None
+                continue
+            best_quality = max(candidate[0] for candidate in candidates)
+            best = [candidate for candidate in candidates if candidate[0] == best_quality]
+            by_value: dict[str, list[tuple[int, float, Any, Mapping[str, Any]]]] = defaultdict(list)
+            for candidate in best:
+                by_value[_liability_value_key(field_name, candidate[2])].append(candidate)
+            if len(by_value) != 1:
+                selected[field_name] = None
+                unresolved_fields.add(field_name)
+                conflict_fields.add(field_name)
+                conflict_refs = [
+                    ref
+                    for _quality, _confidence, _value, observation in best
+                    for ref in _liability_field_refs(observation, field_name)
+                ]
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_repayment_responsibility_field_conflict",
+                        message=(
+                            "Equally source-bound observations disagreed for one canonical repayment-"
+                            "responsibility field; the value was withheld instead of guessed."
+                        ),
+                        parser_stage="candidate_b_repayment_responsibility_schema",
+                        target_dataset="repayment_liability_records",
+                        target_record_id=liability_id,
+                        field_name=field_name,
+                        observed_value=[candidate[2] for candidate in best],
+                        source_refs=conflict_refs or merged_refs,
+                        reason_codes=(
+                            "closed_canonical_liability_slot",
+                            "equal_provenance_conflict",
+                            "conflicting_value_withheld",
+                        ),
+                    ),
+                )
+                continue
+            chosen = max(best, key=lambda candidate: candidate[1])
+            selected[field_name] = deepcopy(chosen[2])
+            chosen_group = by_value[next(iter(by_value))]
+            field_refs: list[dict[str, Any]] = []
+            field_ref_markers: set[str] = set()
+            for _quality, _confidence, _value, observation in chosen_group:
+                for ref in _liability_field_refs(observation, field_name):
+                    marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                    if marker not in field_ref_markers:
+                        field_ref_markers.add(marker)
+                        field_refs.append(ref)
+            if field_refs:
+                selected_field_refs[field_name] = field_refs
+            bindings = chosen[3].get("_field_binding_quality")
+            if isinstance(bindings, Mapping) and bindings.get(field_name):
+                selected_bindings[field_name] = str(bindings[field_name])
+            raw_values = chosen[3].get("canonical_raw")
+            if isinstance(raw_values, Mapping) and field_name in raw_values:
+                selected_raw[field_name] = deepcopy(raw_values[field_name])
+
+        selected["responsibility_amount_reported"] = isinstance(selected.get("responsibility_amount"), int)
+        selected["reporting_amount_currency"] = selected.get("currency")
+        selected["source_refs_by_field"] = selected_field_refs
+        selected["_field_binding_quality"] = selected_bindings
+        selected["_source_absent_fields"] = sorted(source_absent_fields)
+        selected["_unresolved_fields"] = sorted(unresolved_fields)
+        if invalid_raw:
+            selected["_invalid_raw_by_field"] = {
+                field_name: list(dict.fromkeys(values))
+                for field_name, values in invalid_raw.items()
+            }
+        if selected_raw:
+            selected["canonical_raw"] = selected_raw
+
+        for field_name in _LIABILITY_CANONICAL_FIELDS:
+            if selected.get(field_name) not in (None, ""):
+                continue
+            if field_name in {"overdue_months", "repayment_status_code"} and field_name not in observed_fields:
+                # Canonical liability cards print one of these mutually
+                # exclusive labels.  The absent alternative is not a missing
+                # business value and must not generate a false report.
+                continue
+            explicit_absence_is_best_evidence = bool(
+                field_name in source_absent_fields
+                and source_absent_quality.get(field_name, 0) >= unresolved_quality.get(field_name, 0)
+            )
+            if explicit_absence_is_best_evidence or field_name in conflict_fields:
+                continue
+            field_invalid_raw = list(dict.fromkeys(invalid_raw.get(field_name) or ()))
+            if field_name == "related_party_id_number" and field_invalid_raw:
+                # Exact related-party identity can only be repaired after every
+                # distinct liability row is available for source-bound
+                # corroboration.  The post-pass below reports success or
+                # failure without publishing the contaminated observation.
+                continue
+            field_refs = selected_field_refs.get(field_name) or [
+                ref
+                for observation in group
+                for ref in _liability_field_refs(observation, field_name)
+            ]
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_cell_level_error" if field_invalid_raw else "schema_incompleteness",
+                    issue_code=(
+                        "candidate_b_repayment_responsibility_field_invalid"
+                        if field_invalid_raw
+                        else "candidate_b_repayment_responsibility_required_field_unresolved"
+                    ),
+                    message=(
+                        "A canonical repayment-responsibility field failed its field contract and was withheld."
+                        if field_invalid_raw
+                        else "A fixed-layout repayment-responsibility field remained unresolved after correction."
+                    ),
+                    parser_stage="candidate_b_repayment_responsibility_schema",
+                    target_dataset="repayment_liability_records",
+                    target_record_id=liability_id,
+                    field_name=field_name,
+                    observed_value=field_invalid_raw or None,
+                    source_refs=field_refs or merged_refs,
+                    reason_codes=(
+                        "closed_canonical_liability_slot",
+                        "field_contract_failed" if field_invalid_raw else "required_field_missing",
+                        "value_withheld_not_invented",
+                    ),
+                ),
+            )
+        reconciled.append(selected)
+    return _corroborate_liability_party_identifiers(parse_result, reconciled)
+
+
+def _corroborate_liability_party_identifiers(
+    parse_result: Any,
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Repair a rejected party ID only from one other exact-party liability row."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        key = (
+            _compact(record.get("related_party_name")).upper(),
+            str(record.get("related_party_category") or ""),
+            _compact(record.get("related_party_id_type")),
+        )
+        if all(key):
+            grouped[key].append(record)
+
+    for group in grouped.values():
+        for target in group:
+            invalid_map = target.get("_invalid_raw_by_field")
+            invalid_values = (
+                invalid_map.get("related_party_id_number")
+                if isinstance(invalid_map, Mapping)
+                else None
+            )
+            invalid_values = list(dict.fromkeys(invalid_values or ()))
+            if target.get("related_party_id_number") not in (None, "") or not invalid_values:
+                continue
+
+            id_type = target.get("related_party_id_type")
+            corroborators: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            for other in group:
+                if other is target:
+                    continue
+                candidate = _liability_convert(
+                    "related_party_id_number",
+                    other.get("related_party_id_number"),
+                    related_party_id_type=id_type,
+                )
+                if candidate is not None:
+                    corroborators[str(candidate)].append(other)
+
+            target_id = str(target.get("liability_id") or "")
+            invalid_refs = _liability_field_refs(target, "related_party_id_number")
+            if len(corroborators) == 1:
+                value, supporting_records = next(iter(corroborators.items()))
+                target["related_party_id_number"] = value
+                unresolved = set(target.get("_unresolved_fields") or ())
+                unresolved.discard("related_party_id_number")
+                target["_unresolved_fields"] = sorted(unresolved)
+                refs_by_field = target.setdefault("source_refs_by_field", {})
+                supporting_refs = [
+                    {**ref, "binding": "corroborated_exact_party_identity"}
+                    for record in supporting_records
+                    for ref in _liability_field_refs(record, "related_party_id_number")
+                ]
+                refs_by_field["related_party_id_number"] = [
+                    *invalid_refs,
+                    *supporting_refs,
+                ]
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_liability_party_id_corroborated",
+                        message=(
+                            "A contaminated related-party identifier was replaced only after one "
+                            "unique valid identifier was independently printed for the exact same "
+                            "party, category, and identifier type."
+                        ),
+                        severity="info",
+                        status="resolved",
+                        parser_stage="candidate_b_repayment_responsibility_schema",
+                        target_dataset="repayment_liability_records",
+                        target_record_id=target_id,
+                        field_name="related_party_id_number",
+                        observed_value=invalid_values,
+                        candidate_value=value,
+                        source_refs=[*invalid_refs, *supporting_refs],
+                        reason_codes=(
+                            "identifier_field_contract_failed",
+                            "independent_exact_party_identity_corroboration",
+                            "unique_valid_identifier_published",
+                        ),
+                    ),
+                )
+                continue
+
+            candidate_values = sorted(corroborators)
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_liability_party_id_corroboration_unresolved",
+                    message=(
+                        "A related-party identifier failed its exact type-specific contract and no "
+                        "unique independently printed identifier could repair it; the value remains "
+                        "withheld."
+                    ),
+                    parser_stage="candidate_b_repayment_responsibility_schema",
+                    target_dataset="repayment_liability_records",
+                    target_record_id=target_id,
+                    field_name="related_party_id_number",
+                    observed_value=invalid_values,
+                    candidate_value=candidate_values or None,
+                    source_refs=invalid_refs or target.get("source_refs") or (),
+                    reason_codes=(
+                        "identifier_field_contract_failed",
+                        (
+                            "ambiguous_independent_party_identifiers"
+                            if candidate_values
+                            else "independent_party_identifier_missing"
+                        ),
+                        "value_withheld_not_invented",
+                    ),
+                ),
             )
     return records
 
 
+def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+        PBOCPersonalDetailNativeParser,
+    )
+
+    observations: list[dict[str, Any]] = []
+    for candidate_index, candidate in enumerate(
+        PBOCPersonalDetailNativeParser(parse_result).records("repayment_liability_records"), start=1
+    ):
+        facts = candidate.fields
+        observation: dict[str, Any] = {
+            "_printed_sequence": facts.get("__printed_sequence"),
+            "_party_category": facts.get("__party_category"),
+            "source": "candidate_b_repayment_responsibility_observation",
+            "source_refs": list(candidate.source_refs),
+            "confidence": candidate.confidence,
+            "source_refs_by_field": {},
+            "_field_binding_quality": {},
+            "_source_absent_fields": [],
+            "_unresolved_fields": [],
+            "_invalid_raw_by_field": {},
+            "_observed_fields": [
+                _LIABILITY_LABEL_TO_FIELD[label]
+                for label in _LIABILITY_LABEL_TO_FIELD
+                if label in candidate.observed_labels or facts.get(label) not in (None, "")
+            ],
+            "canonical_raw": {},
+        }
+        source_absent_fields: set[str] = set()
+        unresolved_fields = {
+            _LIABILITY_LABEL_TO_FIELD[label]
+            for label in candidate.unresolved_labels
+            if label in _LIABILITY_LABEL_TO_FIELD
+        }
+        for label, field_name in _LIABILITY_LABEL_TO_FIELD.items():
+            raw_value = facts.get(label)
+            if raw_value in (None, ""):
+                continue
+            observation["canonical_raw"][field_name] = raw_value
+            if _liability_source_absent(raw_value):
+                source_absent_fields.add(field_name)
+                observation[field_name] = None
+            else:
+                converted = _liability_convert(
+                    field_name,
+                    raw_value,
+                    related_party_id_type=observation.get("related_party_id_type"),
+                )
+                observation[field_name] = converted
+                if converted is None:
+                    unresolved_fields.add(field_name)
+                    observation["_invalid_raw_by_field"].setdefault(field_name, []).append(raw_value)
+
+            raw_refs = candidate.source_refs_by_field.get(label) or ()
+            if raw_refs:
+                observation["source_refs_by_field"].setdefault(field_name, []).extend(
+                    dict(ref) for ref in raw_refs if isinstance(ref, Mapping)
+                )
+            binding = candidate.binding_quality_by_field.get(label)
+            if binding:
+                observation["_field_binding_quality"][field_name] = binding
+
+        observation["_source_absent_fields"] = sorted(source_absent_fields)
+        observation["_unresolved_fields"] = sorted(unresolved_fields)
+        has_identity = observation.get("contract_number") not in (None, "")
+        has_amount = isinstance(observation.get("responsibility_amount"), int)
+        has_sequence = str(observation.get("_printed_sequence") or "").isdigit()
+        if not (has_identity or has_amount or has_sequence):
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_repayment_responsibility_identity_unresolved",
+                    message=(
+                        "A canonical repayment-responsibility card was observed but no contract, printed "
+                        "ordinal, or valid responsibility amount could identify it."
+                    ),
+                    parser_stage="candidate_b_repayment_responsibility_schema",
+                    target_dataset="repayment_liability_records",
+                    observed_value=observation.get("_invalid_raw_by_field") or None,
+                    source_refs=candidate.source_refs,
+                    reason_codes=(
+                        "canonical_responsibility_card",
+                        "record_identity_unresolved",
+                        "record_withheld",
+                    ),
+                ),
+            )
+            continue
+        # Keep observations separate until exact contract/ordinal reconciliation.
+        observation["_observation_index"] = candidate_index
+        observations.append(observation)
+    return reconcile_candidate_b_liabilities(parse_result, observations)
+
+
+def _normalize_inquiry_reason(value: str) -> str:
+    text = str(value or "")
+    for observed, canonical in _INQUIRY_REASON_REPAIRS.items():
+        text = text.replace(observed, canonical)
+    return text
+
+
+def _longest_inquiry_reason_suffix(value: str) -> str:
+    """Return the longest closed-vocabulary inquiry reason printed as a suffix."""
+
+    text = _normalize_inquiry_reason(value).strip()
+    matches = [reason for reason in _INQUIRY_REASONS if text.endswith(reason)]
+    return max(matches, key=len, default="")
+
+
+def _repair_inquiry_reason_boundary(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Move a finite long-reason prefix out of a contaminated institution cell."""
+
+    repaired = dict(record)
+    institution = _compact(record.get("institution"))
+    reason = _compact(_normalize_inquiry_reason(str(record.get("reason") or "")))
+    if not institution or not reason:
+        return repaired
+    candidates = [
+        canonical
+        for canonical in _INQUIRY_REASONS
+        if len(canonical) > len(reason)
+        and canonical.endswith(reason)
+        and institution.endswith(canonical[: -len(reason)])
+    ]
+    if not candidates:
+        return repaired
+    canonical = max(candidates, key=len)
+    prefix = canonical[: -len(reason)]
+    repaired_institution = institution[: -len(prefix)]
+    if repaired_institution:
+        repaired["institution"] = repaired_institution
+        repaired["reason"] = canonical
+    return repaired
+
+
+def _inquiry_geometry_groups(lines: Any) -> list[list[dict[str, Any]]]:
+    """Join OCR tokens that occupy one canonical inquiry-table row."""
+    positioned: list[tuple[float, float, dict[str, Any]]] = []
+    for index, line in enumerate(lines or ()):
+        if not isinstance(line, dict):
+            continue
+        bbox = line.get("bbox")
+        if isinstance(bbox, list) and len(bbox) == 4:
+            try:
+                top, left = float(bbox[1]), float(bbox[0])
+            except (TypeError, ValueError):
+                top, left = float(index * 20), 0.0
+        else:
+            top, left = float(index * 20), 0.0
+        positioned.append((top, left, line))
+    positioned.sort(key=lambda item: (item[0], item[1]))
+
+    groups: list[list[tuple[float, float, dict[str, Any]]]] = []
+    for top, left, line in positioned:
+        if groups and abs(top - sum(item[0] for item in groups[-1]) / len(groups[-1])) <= 3.5:
+            groups[-1].append((top, left, line))
+        else:
+            groups.append([(top, left, line)])
+    return [
+        [line for _top, _left, line in sorted(group, key=lambda item: item[1])]
+        for group in groups
+    ]
+
+
+def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
+    """Reconstruct known inquiry-template rows from canonical line geometry."""
+    evidence_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if not callable(evidence_loader):
+        return []
+    rows: list[dict[str, Any]] = []
+    last_sequence = {"institution": 0, "personal": 0}
+    repaired_sequences: defaultdict[
+        str,
+        list[tuple[int, int | None, str, dict[str, Any], str]],
+    ] = defaultdict(list)
+    for page in evidence_loader():
+        if str(page.get("canonical_template_id") or "") != "annotations_and_inquiries":
+            continue
+        for group in _inquiry_geometry_groups(page.get("lines") or ()):
+            text = _normalize_inquiry_reason(
+                " ".join(str(line.get("text") or line.get("content") or "").strip() for line in group)
+            )
+            date_match = re.search(r"(?:19|20)\d{2}[.,/-]\d{1,2}[.,/-]\d{1,2}", text)
+            if date_match is None:
+                continue
+            reason = _longest_inquiry_reason_suffix(text[date_match.end() :])
+            if not reason:
+                continue
+            reason_index = text.find(reason, date_match.end())
+            institution = re.sub(
+                r"^[^\u3400-\u9fffA-Za-z]+",
+                "",
+                text[date_match.end() : reason_index],
+            ).strip()
+            inquiry_type = "personal" if reason.startswith("本人查询") or institution == "本人" else "institution"
+            if inquiry_type == "personal" and not institution:
+                institution = "本人"
+            if not institution:
+                continue
+            expected = last_sequence[inquiry_type] + 1
+            sequence_tokens = re.findall(r"\d{1,4}", text[: date_match.start()])
+            detected = int(sequence_tokens[-1]) if sequence_tokens else 0
+            inferred_sequence = detected == 0
+            corrected_sequence = detected > expected and str(detected).endswith(str(expected))
+            sequence = expected if inferred_sequence or corrected_sequence else detected
+            if sequence <= last_sequence[inquiry_type]:
+                continue
+            last_sequence[inquiry_type] = sequence
+            inquiry_date = _date(date_match.group(0).replace(",", "."))
+            if inquiry_date is None:
+                continue
+            boxes = [line.get("bbox") for line in group if isinstance(line.get("bbox"), list) and len(line["bbox"]) == 4]
+            bbox = (
+                [
+                    min(float(box[0]) for box in boxes),
+                    min(float(box[1]) for box in boxes),
+                    max(float(box[2]) for box in boxes),
+                    max(float(box[3]) for box in boxes),
+                ]
+                if boxes
+                else []
+            )
+            source_ref = {
+                "source": "candidate_b_canonical_inquiry_line",
+                "logical_page": int(page.get("page") or 0),
+                "source_page": int(page.get("source_page") or 0),
+                "bbox": bbox,
+                "geometry_scope": "row",
+                "evidence_ids": list(
+                    dict.fromkeys(
+                        str(evidence_id)
+                        for line in group
+                        for evidence_id in (line.get("evidence_ids") or ())
+                        if evidence_id
+                    )
+                ),
+            }
+            row = {
+                "inquiry_id": stable_record_id(
+                    "credit_inquiry", inquiry_type, sequence
+                ),
+                "sequence": sequence,
+                "inquiry_date": inquiry_date,
+                "institution": institution,
+                "reason": reason,
+                "source_reason": text[reason_index:].strip(),
+                "query_channel": inquiry_type,
+                "inquiry_type": inquiry_type,
+                "source": "candidate_b_canonical_inquiry_line",
+                "source_refs": [source_ref],
+                "confidence": min(
+                    min((float(line.get("confidence") or 0.0) for line in group), default=0.0),
+                    0.8,
+                ),
+            }
+            if corrected_sequence or inferred_sequence:
+                repair_kind = "missing" if inferred_sequence else "prefixed_noise"
+                repaired_sequences[inquiry_type].append(
+                    (sequence, detected or None, row["inquiry_id"], source_ref, repair_kind)
+                )
+            rows.append(row)
+    if repaired_sequences:
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+        for inquiry_type, observations in repaired_sequences.items():
+            for sequence, raw_sequence, inquiry_id, source_ref, repair_kind in observations:
+                inferred = repair_kind == "missing"
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code=(
+                            "candidate_b_inquiry_sequence_inferred_from_row_order"
+                            if inferred
+                            else "candidate_b_inquiry_sequence_prefix_noise_corrected"
+                        ),
+                        message=(
+                            "An inquiry row number was unreadable and was inferred from canonical table order."
+                            if inferred
+                            else "A prefixed OCR glyph in an inquiry sequence was removed by the contiguous-row contract."
+                        ),
+                        severity="warning" if inferred else "info",
+                        status="requires_review" if inferred else "resolved",
+                        parser_stage="candidate_b_inquiry_schema",
+                        target_dataset="inquiry_records",
+                        target_record_id=inquiry_id,
+                        field_name="sequence",
+                        observed_value={
+                            "inquiry_type": inquiry_type,
+                            "missing_ocr_sequence": inferred,
+                            "raw_sequence": raw_sequence,
+                        },
+                        candidate_value={"normalized_sequence": sequence},
+                        source_refs=(source_ref,),
+                        reason_codes=(
+                            "canonical_four_column_table",
+                            "contiguous_row_order",
+                            (
+                                "sequence_missing_in_source_ocr"
+                                if inferred
+                                else "sequence_prefixed_ocr_noise"
+                            ),
+                            (
+                                "sequence_requires_review"
+                                if inferred
+                                else "deterministic_sequence_prefix_removed"
+                            ),
+                            "other_row_fields_verified_independently",
+                        ),
+                    ),
+                )
+    return rows
+
+
+def _normalized_inquiry_field(field_name: str, value: Any) -> str:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        normalize_institution_name,
+        normalize_role_candidate,
+    )
+
+    if field_name == "institution":
+        normalized = normalize_institution_name(str(value or ""))
+        compact = re.sub(r"\s+", "", normalized)
+        # PBOC personal-query rows use 本人 as the institution.  Permit only a
+        # tiny amount of surrounding OCR debris so bank names cannot collapse
+        # into this special value.
+        if "本人" in compact and len(compact.replace("本人", "")) <= 2:
+            return "本人"
+        return normalized
+
+    if field_name == "reason":
+        normalized = normalize_role_candidate(value, "inquiry_reason")
+        compact = re.sub(r"\s+", "", normalized)
+        for canonical in sorted(_INQUIRY_REASONS, key=len, reverse=True):
+            if canonical in compact:
+                return canonical
+        return normalized
+
+    role = {
+        "inquiry_date": "date",
+    }[field_name]
+    return normalize_role_candidate(value, role)
+
+
+def _inquiry_business_equivalent(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left = _repair_inquiry_reason_boundary(left)
+    right = _repair_inquiry_reason_boundary(right)
+    if any(
+        _normalized_inquiry_field(field, left.get(field))
+        != _normalized_inquiry_field(field, right.get(field))
+        for field in ("inquiry_date", "reason")
+    ):
+        return False
+    left_institution = re.sub(r"\s+", "", _normalized_inquiry_field("institution", left.get("institution")))
+    right_institution = re.sub(r"\s+", "", _normalized_inquiry_field("institution", right.get("institution")))
+    return bool(left_institution) and left_institution == right_institution
+
+
+def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, float]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import role_candidate_is_valid
+
+    valid = sum(
+        role_candidate_is_valid(record.get(field), role)
+        for field, role in (
+            ("inquiry_date", "date"),
+            ("institution", "institution_name"),
+            ("reason", "inquiry_reason"),
+        )
+    )
+    populated = sum(record.get(field) not in (None, "") for field in ("inquiry_date", "institution", "reason"))
+    refs_by_field = record.get("source_refs_by_field")
+    exact_fields = sum(
+        any(
+            isinstance(ref, Mapping)
+            and ref.get("geometry_scope") == "cell"
+            and ref.get("binding") == "canonical_header_column"
+            for ref in refs_by_field.get(field_name) or ()
+        )
+        for field_name in ("inquiry_date", "institution", "reason")
+    ) if isinstance(refs_by_field, Mapping) else 0
+    return exact_fields * 10 + valid, populated, float(record.get("confidence") or 0.0)
+
+
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    active_canonical_table = False
+    active_slots: dict[str, int] = {}
+    inquiry_aliases = {
+        "sequence": ("编号", "序号"),
+        "inquiry_date": ("查询日期",),
+        "institution": ("查询机构",),
+        "reason": ("查询原因",),
+    }
     for page in getattr(parse_result, "pages", None) or []:
+        page_is_canonical_inquiry = (
+            str(getattr(page, "canonical_template_id", "") or "") == "annotations_and_inquiries"
+        )
+        page_had_inquiry_table = False
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
             if not rows:
                 continue
             header = _nonempty(rows[0])
             compact_header = _compact("".join(header))
-            if not all(marker in compact_header for marker in ("查询日期", "查询机构", "查询原因")):
+            has_header = all(marker in compact_header for marker in ("查询日期", "查询机构", "查询原因"))
+            header_slots = _canonical_header_slots(tuple(str(value or "") for value in rows[0]), inquiry_aliases)
+            has_exact_header = has_header and set(header_slots) == set(inquiry_aliases)
+            is_continuation = (
+                not has_header
+                and page_is_canonical_inquiry
+                and active_canonical_table
+                and set(active_slots) == set(inquiry_aliases)
+                and bool(_nonempty(rows[0]))
+                and re.fullmatch(r"\d{1,4}", _nonempty(rows[0])[0]) is not None
+            )
+            if has_header and not has_exact_header:
+                from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                    make_issue,
+                    record_issue,
+                )
+
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code="candidate_b_inquiry_header_columns_unresolved",
+                        message="The canonical inquiry header was visible but its four fields did not resolve to distinct columns.",
+                        parser_stage="candidate_b_inquiry_schema",
+                        target_dataset="inquiry_records",
+                        observed_value={"header": rows[0], "resolved_roles": sorted(header_slots)},
+                        source_refs=(_source_ref(page, table, row=0),),
+                        reason_codes=(
+                            "closed_canonical_inquiry_template",
+                            "distinct_header_columns_required",
+                            "rows_withheld_until_page_repair",
+                        ),
+                    ),
+                )
+                active_canonical_table = False
+                active_slots = {}
                 continue
-            for row_index, row in enumerate(rows[1:], start=1):
-                values = _nonempty(row)
-                if len(values) < 4 or not re.fullmatch(r"\d+", values[0]):
+            if not has_exact_header and not is_continuation:
+                continue
+            page_had_inquiry_table = True
+            active_canonical_table = True
+            if has_exact_header:
+                active_slots = header_slots
+            slots = dict(active_slots)
+            start = 1 if has_exact_header else 0
+            for row_index, row in enumerate(rows[start:], start=start):
+                cells = tuple(str(value or "").strip() for value in row)
+                raw_sequence = _slot_value(cells, slots, "sequence")
+                sequence_match = re.fullmatch(r"\D*(\d{1,4})\D*", raw_sequence)
+                if sequence_match is None:
                     continue
-                inquiry_date = _date(values[1])
-                institution = values[2]
-                source_reason = values[3]
+                sequence = int(sequence_match.group(1))
+                date_cell = _slot_value(cells, slots, "inquiry_date")
+                inquiry_date = _date(date_cell)
+                institution = _slot_value(cells, slots, "institution")
+                source_reason = _slot_value(cells, slots, "reason")
+                if not institution or not source_reason or inquiry_date is None:
+                    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                        make_issue,
+                        record_issue,
+                    )
+
+                    missing_fields = [
+                        field_name
+                        for field_name, value in (
+                            ("inquiry_date", inquiry_date),
+                            ("institution", institution),
+                            ("reason", source_reason),
+                        )
+                        if value in (None, "")
+                    ]
+                    record_issue(
+                        parse_result,
+                        make_issue(
+                            category="ocr_structure_correction",
+                            issue_code="candidate_b_inquiry_row_cells_unresolved",
+                            message="A printed inquiry row could not be assigned completely to the canonical four-column schema.",
+                            parser_stage="candidate_b_inquiry_schema",
+                            target_dataset="inquiry_records",
+                            field_name=missing_fields[0] if len(missing_fields) == 1 else None,
+                            observed_value={"sequence": sequence, "row": list(cells)},
+                            candidate_value={"missing_fields": missing_fields},
+                            source_refs=(_source_ref(page, table, row=row_index),),
+                            reason_codes=(
+                                "printed_inquiry_sequence_observed",
+                                "exact_header_column_binding_failed",
+                                "record_not_invented",
+                            ),
+                        ),
+                    )
+                    continue
                 inquiry_type = (
                     "personal" if institution == "本人" or source_reason.startswith("本人查询") else "institution"
                 )
+                inquiry_id = stable_record_id("credit_inquiry", inquiry_type, sequence)
+                refs_by_field = {
+                    field_name: [
+                        {
+                            **_source_ref(page, table, row=row_index, column=slots[field_name]),
+                            "field_name": field_name,
+                            "binding": "canonical_header_column",
+                        }
+                    ]
+                    for field_name in ("inquiry_date", "institution", "reason")
+                }
                 records.append(
                     {
-                        "inquiry_id": stable_record_id(
-                            "credit_inquiry", inquiry_type, values[0], inquiry_date, institution, source_reason
-                        ),
-                        "sequence": int(values[0]),
+                        "inquiry_id": inquiry_id,
+                        "sequence": sequence,
                         "inquiry_date": inquiry_date,
                         "institution": institution,
                         "reason": source_reason,
@@ -930,568 +6921,4439 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                         "inquiry_type": inquiry_type,
                         "source": "native_detail_inquiry_table",
                         "source_refs": [_source_ref(page, table, row=row_index)],
-                        "confidence": 1.0,
+                        "source_refs_by_field": refs_by_field,
+                        "confidence": float(getattr(table, "confidence", None) or 0.9),
                     }
                 )
-    return records
+        if not page_is_canonical_inquiry and not page_had_inquiry_table:
+            active_canonical_table = False
+            active_slots = {}
+    records.extend(_canonical_inquiry_line_rows(parse_result))
+    grouped: defaultdict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    for raw_record in records:
+        record = _repair_inquiry_reason_boundary(raw_record)
+        key = (str(record.get("inquiry_type") or ""), int(record.get("sequence") or 0))
+        if key[0] and key[1] > 0:
+            grouped[key].append(record)
+
+    best: dict[tuple[str, int], dict[str, Any]] = {}
+    for key, observations in grouped.items():
+        selected = deepcopy(max(observations, key=_inquiry_observation_score))
+        selected["inquiry_id"] = stable_record_id("credit_inquiry", key[0], key[1])
+        merged_refs: list[dict[str, Any]] = []
+        seen_refs: set[str] = set()
+        for observation in observations:
+            for ref in observation.get("source_refs") or ():
+                if not isinstance(ref, Mapping):
+                    continue
+                marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+                if marker not in seen_refs:
+                    seen_refs.add(marker)
+                    merged_refs.append(dict(ref))
+        selected["source_refs"] = merged_refs
+        selected_refs_by_field: dict[str, list[dict[str, Any]]] = {}
+        for field_name in ("inquiry_date", "institution", "reason"):
+            candidates: list[tuple[int, float, Any, Mapping[str, Any]]] = []
+            for observation in observations:
+                value = observation.get(field_name)
+                if value in (None, ""):
+                    continue
+                refs_by_field = observation.get("source_refs_by_field")
+                refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+                exact = any(
+                    isinstance(ref, Mapping)
+                    and ref.get("geometry_scope") == "cell"
+                    and ref.get("binding") == "canonical_header_column"
+                    for ref in refs or ()
+                )
+                candidates.append((2 if exact else 1, float(observation.get("confidence") or 0.0), value, observation))
+            if not candidates:
+                selected[field_name] = None
+                continue
+            top_quality = max(candidate[0] for candidate in candidates)
+            top = [candidate for candidate in candidates if candidate[0] == top_quality]
+            normalized: defaultdict[str, list[tuple[int, float, Any, Mapping[str, Any]]]] = defaultdict(list)
+            for candidate in top:
+                normalized[_normalized_inquiry_field(field_name, candidate[2])].append(candidate)
+            if len(normalized) > 1:
+                selected[field_name] = None
+                selected["extraction_status"] = "review"
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code="candidate_b_inquiry_field_conflict",
+                        message="Equally source-bound observations disagree for one canonical inquiry field; the value was withheld.",
+                        parser_stage="candidate_b_inquiry_schema",
+                        target_dataset="inquiry_records",
+                        target_record_id=selected["inquiry_id"],
+                        field_name=field_name,
+                        observed_value=[candidate[2] for candidate in top],
+                        source_refs=merged_refs,
+                        reason_codes=(
+                            "same_printed_inquiry_row",
+                            "equal_field_provenance",
+                            "conflicting_values_withheld",
+                        ),
+                    ),
+                )
+                continue
+            chosen = max(top, key=lambda candidate: (candidate[1], len(str(candidate[2]))))
+            selected[field_name] = chosen[2]
+            for _quality, _confidence, _value, observation in normalized[next(iter(normalized))]:
+                refs_by_field = observation.get("source_refs_by_field")
+                for ref in refs_by_field.get(field_name) or () if isinstance(refs_by_field, Mapping) else ():
+                    if isinstance(ref, Mapping):
+                        selected_refs_by_field.setdefault(field_name, []).append(dict(ref))
+        if selected_refs_by_field:
+            selected["source_refs_by_field"] = selected_refs_by_field
+        best[key] = selected
+    # Full-page OCR occasionally prefixes a row number with a neighbouring
+    # watermark digit (89 -> 789).  If the suffix row already exists in the
+    # same canonical population, the prefixed observation is redundant rather
+    # than a new sequence endpoint.
+    for key, record in list(best.items()):
+        inquiry_type, sequence = key
+        if sequence < 100:
+            continue
+        suffix = sequence % 100
+        suffix_key = (inquiry_type, suffix)
+        if suffix <= 0 or suffix_key not in best:
+            continue
+        suffix_record = best[suffix_key]
+        if record.get("inquiry_date") != suffix_record.get("inquiry_date"):
+            continue
+        best.pop(key, None)
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_inquiry_sequence_prefix_suppressed",
+                message="A prefixed OCR row number duplicated an existing canonical inquiry row.",
+                severity="info",
+                status="resolved",
+                parser_stage="candidate_b_inquiry_schema",
+                target_dataset="inquiry_records",
+                target_record_id=str(suffix_record.get("inquiry_id") or ""),
+                observed_value={"raw_sequence": sequence},
+                candidate_value={"canonical_sequence": suffix},
+                source_refs=record.get("source_refs") or (),
+                reason_codes=("sequence_prefix_noise", "canonical_duplicate_suppressed"),
+            ),
+        )
+
+    ordered = sorted(best.values(), key=lambda row: (str(row.get("inquiry_type") or ""), int(row.get("sequence") or 0)))
+    for inquiry_type in sorted({str(row.get("inquiry_type") or "unknown") for row in ordered}):
+        sequences = {
+            int(row.get("sequence") or 0)
+            for row in ordered
+            if str(row.get("inquiry_type") or "unknown") == inquiry_type and int(row.get("sequence") or 0) > 0
+        }
+        missing = sorted(set(range(1, max(sequences) + 1)) - sequences) if sequences else []
+        if not missing:
+            continue
+        record_issue(
+            parse_result,
+            make_issue(
+                category="page_continuation",
+                issue_code="canonical_inquiry_sequence_gap",
+                message="Canonical inquiry rows contain a printed sequence gap; no missing row was invented.",
+                parser_stage="candidate_b_inquiry_schema",
+                target_dataset="inquiry_records",
+                observed_value={
+                    "inquiry_type": inquiry_type,
+                    "observed_row_count": len(sequences),
+                    "observed_sequences": sorted(sequences),
+                },
+                candidate_value={"source_sequence_endpoint": max(sequences), "missing_sequences": missing},
+                reason_codes=("canonical_sequence_not_contiguous", "missing_row_not_invented", "dataset_incomplete"),
+            ),
+        )
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="inquiry_records",
+        aliases=inquiry_aliases,
+        records=ordered,
+    )
+    return ordered
+
+
+_PUBLIC_CANONICAL_LAYOUTS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "tax_arrears",
+        "record_type": "tax_arrears",
+        "signature": ("tax_authority", "arrears_amount"),
+        "aliases": {
+            "sequence": ("编号",),
+            "tax_authority": ("主管税务机关",),
+            "arrears_amount": ("欠税总额",),
+            "statistics_date": ("欠税统计日期",),
+        },
+        "fields": {
+            "tax_authority": ("tax_authority", "text"),
+            "arrears_amount": ("arrears_amount", "number"),
+            "statistics_date": ("statistics_date", "date"),
+        },
+    },
+    {
+        "name": "civil_judgment_base",
+        "record_type": "civil_judgment",
+        "signature": ("filing_court", "closure_method"),
+        "aliases": {
+            "sequence": ("编号",),
+            "filing_court": ("立案法院",),
+            "cause": ("案由",),
+            "filing_date": ("立案日期",),
+            "closure_method": ("结案方式",),
+        },
+        "fields": {
+            "filing_court": ("filing_court", "text"),
+            "cause": ("cause", "text"),
+            "filing_date": ("filing_date", "date"),
+            "closure_method": ("closure_method", "text"),
+        },
+    },
+    {
+        "name": "civil_judgment_detail",
+        "record_type": "civil_judgment",
+        "signature": ("judgment_result", "claim_amount"),
+        "aliases": {
+            "sequence": ("编号",),
+            "judgment_result": ("判决/调解结果", "判决／调解结果"),
+            "judgment_effective_date": ("判决/调解生效日期", "判决／调解生效日期"),
+            "claim_subject": ("诉讼标的",),
+            "claim_amount": ("诉讼标的金额",),
+        },
+        "fields": {
+            "judgment_result": ("judgment_result", "text"),
+            "judgment_effective_date": ("judgment_effective_date", "date"),
+            "claim_subject": ("claim_subject", "text"),
+            "claim_amount": ("claim_amount", "number"),
+        },
+    },
+    {
+        "name": "enforcement_base",
+        "record_type": "enforcement",
+        "signature": ("court", "closure_method"),
+        "aliases": {
+            "sequence": ("编号",),
+            "court": ("执行法院",),
+            "cause": ("执行案由", "案由"),
+            "filing_date": ("立案日期",),
+            "closure_method": ("结案方式",),
+        },
+        "fields": {
+            "court": ("court", "text"),
+            "cause": ("cause", "text"),
+            "filing_date": ("filing_date", "date"),
+            "closure_method": ("closure_method", "text"),
+        },
+    },
+    {
+        "name": "enforcement_detail",
+        "record_type": "enforcement",
+        "signature": ("case_status", "requested_subject", "executed_subject"),
+        "aliases": {
+            "sequence": ("编号",),
+            "case_status": ("案件状态",),
+            "closure_date": ("结案日期",),
+            "requested_subject": ("申请执行标的",),
+            "requested_amount": ("申请执行标的金额", "申请执行标的的价值"),
+            "executed_subject": ("已执行标的",),
+            "executed_amount": ("已执行标的金额",),
+        },
+        "fields": {
+            "case_status": ("case_status", "text"),
+            "closure_date": ("closure_date", "date"),
+            "requested_subject": ("requested_subject", "text"),
+            "requested_amount": ("requested_amount", "number"),
+            "executed_subject": ("executed_subject", "text"),
+            "executed_amount": ("executed_amount", "number"),
+        },
+    },
+    {
+        "name": "administrative_penalty",
+        "record_type": "administrative_penalty",
+        "signature": ("authority", "penalty_content", "penalty_amount"),
+        "aliases": {
+            "sequence": ("编号",),
+            "authority": ("处罚机构",),
+            "penalty_content": ("处罚内容",),
+            "penalty_amount": ("处罚金额",),
+            "effective_date": ("生效日期",),
+            "end_date": ("截止日期",),
+            "administrative_review_result": ("行政复议结果",),
+        },
+        "fields": {
+            "authority": ("authority", "text"),
+            "penalty_content": ("penalty_content", "text"),
+            "penalty_amount": ("penalty_amount", "number"),
+            "effective_date": ("effective_date", "date"),
+            "end_date": ("end_date", "date"),
+            "administrative_review_result": ("administrative_review_result", "text"),
+        },
+    },
+    {
+        "name": "housing_fund_base",
+        "record_type": "housing_fund",
+        "signature": ("contribution_location", "monthly_contribution"),
+        "sequence_optional": True,
+        "record_boundary": "start",
+        "aliases": {
+            "contribution_location": ("参缴地",),
+            "participation_date": ("参缴日期",),
+            "first_contribution_month": ("初缴月份", "初缴日期"),
+            "paid_through_month": ("缴至月份",),
+            "payment_status": ("缴费状态",),
+            "monthly_contribution": ("月缴存额",),
+            "personal_contribution_ratio": ("个人缴存比例",),
+            "employer_contribution_ratio": ("单位缴存比例",),
+        },
+        "fields": {
+            "contribution_location": ("contribution_location", "text"),
+            "participation_date": ("participation_date", "date"),
+            "first_contribution_month": ("first_contribution_month", "date"),
+            "paid_through_month": ("paid_through_month", "date"),
+            "payment_status": ("payment_status", "text"),
+            "monthly_contribution": ("monthly_contribution", "number"),
+            "personal_contribution_ratio": ("personal_contribution_ratio", "text"),
+            "employer_contribution_ratio": ("employer_contribution_ratio", "text"),
+        },
+    },
+    {
+        "name": "housing_fund_provider",
+        "record_type": "housing_fund",
+        "signature": ("employer", "information_updated_month"),
+        "sequence_optional": True,
+        "record_boundary": "continuation",
+        "aliases": {
+            "employer": ("缴费单位",),
+            "information_updated_month": ("信息更新日期", "信息更新月份"),
+        },
+        "fields": {
+            "employer": ("employer", "employer_name"),
+            "information_updated_month": ("information_updated_month", "date"),
+        },
+    },
+    {
+        "name": "professional_qualification",
+        "record_type": "professional_qualification",
+        "signature": ("qualification_name", "issuing_authority"),
+        "aliases": {
+            "sequence": ("编号",),
+            "qualification_name": ("执业资格名称",),
+            "level": ("等级",),
+            "obtained_date": ("获得日期",),
+            "expiry_date": ("到期日期",),
+            "revocation_date": ("吊销日期",),
+            "issuing_authority": ("颁发机构",),
+            "authority_location": ("机构所在地",),
+        },
+        "fields": {
+            "qualification_name": ("qualification_name", "text"),
+            "level": ("level", "text"),
+            "obtained_date": ("obtained_date", "date"),
+            "expiry_date": ("expiry_date", "date"),
+            "revocation_date": ("revocation_date", "date"),
+            "issuing_authority": ("issuing_authority", "text"),
+            "authority_location": ("authority_location", "text"),
+        },
+    },
+    {
+        "name": "award",
+        "record_type": "award",
+        "signature": ("authority", "award_content"),
+        "aliases": {
+            "sequence": ("编号",),
+            "authority": ("奖励机构",),
+            "award_content": ("奖励内容",),
+            "effective_date": ("生效日期",),
+            "end_date": ("截止日期",),
+        },
+        "fields": {
+            "authority": ("authority", "text"),
+            "award_content": ("award_content", "text"),
+            "effective_date": ("effective_date", "date"),
+            "end_date": ("end_date", "date"),
+        },
+    },
+)
+
+
+_PUBLIC_LAYOUT_LABELS = frozenset(
+    str(alias)
+    for layout in _PUBLIC_CANONICAL_LAYOUTS
+    for aliases in layout["aliases"].values()
+    for alias in aliases
+    if alias
+)
+_PUBLIC_TYPED_INSTITUTION_RE = re.compile(
+    r"(?:人民法院|法院|税务局|管理局|监管局|管理中心|"
+    r"住房公积金管理中心|银行(?:股份)?有限公司|有限公司)"
+)
+_PUBLIC_TYPED_AMOUNT_RE = re.compile(
+    r"(?:[\uffe5¥] *-?\d[\d,]*(?:\.\d{1,2})?|"
+    r"-?\d[\d,]*(?:\.\d{1,2})? *(?:元|%))"
+)
+
+
+def _public_text_slot_is_unambiguous(raw: str) -> bool:
+    """Reject text cells that visibly contain another canonical slot."""
+
+    compact = _compact(raw)
+    if not compact:
+        return False
+    if any(label in compact for label in _PUBLIC_LAYOUT_LABELS):
+        return False
+    typed_markers = len(_valid_date_spans(compact))
+    typed_markers += len(_PUBLIC_TYPED_INSTITUTION_RE.findall(compact))
+    typed_markers += len(_PUBLIC_TYPED_AMOUNT_RE.findall(compact))
+    return typed_markers < 2
+
+
+def _public_value(raw: str, kind: str) -> Any:
+    if kind == "number":
+        value = _number(raw)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if kind == "date":
+        return _date(raw)
+    if kind == "employer_name":
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            normalize_role_candidate,
+            role_candidate_is_valid,
+        )
+
+        value = normalize_role_candidate(raw, "employer_name")
+        return value if role_candidate_is_valid(value, "employer_name") else None
+    return _clean(raw) if _public_text_slot_is_unambiguous(raw) else None
+
+
+_PUBLIC_FINAL_DATASETS = {
+    "tax_arrears": "tax_arrears_records",
+    "civil_judgment": "civil_judgment_records",
+    "enforcement": "enforcement_records",
+    "administrative_penalty": "administrative_penalty_records",
+    "housing_fund": "housing_fund_records",
+    "professional_qualification": "professional_qualification_records",
+    "award": "administrative_award_records",
+}
+
+
+def _consume_public_canonical_row(
+    parse_result: Any,
+    working: dict[tuple[str, int], dict[str, Any]],
+    *,
+    page: Any,
+    table: Any,
+    layout: Mapping[str, Any],
+    slots: Mapping[str, int],
+    data_row: tuple[str, ...],
+    row_index: int,
+    sequence: int,
+) -> None:
+    record_type = str(layout["record_type"])
+    target_dataset = _PUBLIC_FINAL_DATASETS[record_type]
+    target_id = stable_record_id("public_record", record_type, sequence)
+    item = working.setdefault(
+        (record_type, sequence),
+        {
+            "public_record_id": target_id,
+            "sequence": sequence,
+            "record_type": record_type,
+            "source": "native_detail_public_table",
+            "source_refs": [],
+            "confidence": 1.0,
+        },
+    )
+    row_ref = _source_ref(page, table, row=row_index)
+    if row_ref not in item["source_refs"]:
+        item["source_refs"].append(row_ref)
+    for role, (field_name, kind) in layout["fields"].items():
+        raw = _slot_value(data_row, slots, role)
+        ref = _source_ref(page, table, row=row_index, column=slots[role])
+        if not raw:
+            _report_required_row_failure(
+                parse_result,
+                issue_code="candidate_b_public_record_cell_unresolved",
+                dataset=target_dataset,
+                sequence=sequence,
+                field_name=field_name,
+                row=data_row,
+                page=page,
+                table=table,
+                row_index=row_index,
+                target_record_id=target_id,
+            )
+            _append_internal_field(item, "_unresolved_fields", field_name)
+            continue
+        if _compact(raw) in {"-", "--", "---"}:
+            _mark_source_absent(item, field_name, raw)
+            continue
+        value = _public_value(raw, kind)
+        if value in (None, ""):
+            _reject_exact_observation(
+                parse_result,
+                item,
+                dataset=target_dataset,
+                target_record_id=target_id,
+                field_name=field_name,
+                raw=raw,
+                source_ref=ref,
+                parser_stage="candidate_b_public_canonical_slots",
+            )
+            continue
+        _merge_exact_observation(
+            parse_result,
+            item,
+            dataset=target_dataset,
+            target_record_id=target_id,
+            field_name=field_name,
+            value=value,
+            raw=raw,
+            source_ref=ref,
+            parser_stage="candidate_b_public_canonical_slots",
+        )
 
 
 def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
+    # All accepted layouts are enumerated from the canonical PBOC report.  A
+    # missed physical cell therefore becomes uncertainty, never a left-shifted
+    # value guessed from the remaining non-empty cells.
+    working: dict[tuple[str, int], dict[str, Any]] = {}
+    optional_sequence_counters: defaultdict[str, int] = defaultdict(int)
+    pending_optional_sequences: dict[str, dict[str, int]] = {}
+    reading_order = dict(getattr(parse_result, "reading_order_by_logical", {}) or {})
+
+    def report_pending(record_type: str) -> None:
+        pending = pending_optional_sequences.pop(record_type, None)
+        if pending is None:
+            return
+        sequence = int(pending["sequence"])
+        _report_optional_public_continuation_missing(
+            parse_result,
+            dataset=_PUBLIC_FINAL_DATASETS[record_type],
+            target_record_id=stable_record_id("public_record", record_type, sequence),
+            sequence=sequence,
+            source_refs=working.get((record_type, sequence), {}).get("source_refs", []),
+        )
+
     for page in getattr(parse_result, "pages", None) or []:
         for table in getattr(page, "tables", None) or []:
-            rows = _table_rows(table)
-            if not rows:
-                continue
-            compact = _compact(" ".join(cell for row in rows for cell in row))
-            page_number = int(getattr(page, "page_number", 0) or 0)
-            typed_rows: list[tuple[str, str, dict[str, Any]]] = []
-            if "主管税务机关" in compact and "欠税总额" in compact:
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if len(values) >= 4 and values[0].isdigit():
-                        typed_rows.append(
-                            (
-                                "tax_arrears",
-                                values[1],
-                                {"arrears_amount": _number(values[2]), "statistics_date": _date(values[3])},
-                            )
-                        )
-            elif "立案法院" in compact and "判决/调解结果" in compact:
-                base: dict[str, dict[str, Any]] = {}
-                detail_mode = False
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if values and values[0] == "编号":
-                        detail_mode = True
-                        continue
-                    if len(values) < 2 or not values[0].isdigit():
-                        continue
-                    if not detail_mode and len(values) >= 5:
-                        base[values[0]] = {
-                            "authority": values[1],
-                            "cause": None if values[2] == "--" else values[2],
-                            "filing_date": _date(values[3]),
-                            "closure_method": values[4],
-                        }
-                    elif detail_mode and len(values) >= 5:
-                        item = base.setdefault(values[0], {})
-                        item.update(
-                            {
-                                "judgment_result": values[1],
-                                "effective_date": _date(values[2]),
-                                "claim_subject": values[3],
-                                "claim_amount": _number(values[4]),
-                            }
-                        )
-                typed_rows.extend(("civil_judgment", item.get("authority", ""), item) for item in base.values())
-            elif "执行法院" in compact and "申请执行标的" in compact:
-                base = {}
-                detail_mode = False
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if values and values[0] == "编号":
-                        detail_mode = True
-                        continue
-                    if len(values) < 2 or not values[0].isdigit():
-                        continue
-                    if not detail_mode and len(values) >= 5:
-                        base[values[0]] = {
-                            "authority": values[1],
-                            "cause": None if values[2] == "--" else values[2],
-                            "filing_date": _date(values[3]),
-                            "closure_method": values[4],
-                        }
-                    elif detail_mode and len(values) >= 7:
-                        item = base.setdefault(values[0], {})
-                        item.update(
-                            {
-                                "case_status": values[1],
-                                "closure_date": _date(values[2]),
-                                "requested_subject": values[3],
-                                "requested_amount": _number(values[4]),
-                                "executed_subject": values[5],
-                                "executed_amount": _number(values[6]),
-                            }
-                        )
-                typed_rows.extend(("enforcement", item.get("authority", ""), item) for item in base.values())
-            elif "处罚机构" in compact and "处罚内容" in compact:
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if len(values) >= 7 and values[0].isdigit():
-                        typed_rows.append(
-                            (
-                                "administrative_penalty",
-                                values[1],
-                                {
-                                    "penalty_content": values[2],
-                                    "penalty_amount": _number(values[3]),
-                                    "effective_date": _date(values[4]),
-                                    "end_date": _date(values[5]),
-                                    "administrative_review_result": None if values[6] == "--" else values[6],
-                                },
-                            )
-                        )
-            elif "参缴地" in compact and "月缴存额" in compact:
-                values = _nonempty(rows[1]) if len(rows) > 1 else []
-                unit_values = _nonempty(rows[3]) if len(rows) > 3 else []
-                if len(values) >= 8:
-                    typed_rows.append(
-                        (
-                            "housing_fund",
-                            unit_values[0] if unit_values else "",
-                            {
-                                "contribution_location": values[0],
-                                "participation_date": _date(values[1]),
-                                "first_contribution_month": _date(values[2]),
-                                "paid_through_month": _date(values[3]),
-                                "payment_status": values[4],
-                                "monthly_contribution": _number(values[5]),
-                                "personal_contribution_ratio": values[6],
-                                "employer_contribution_ratio": values[7],
-                                "employer": unit_values[0] if unit_values else None,
-                                "information_updated_month": _date(unit_values[1]) if len(unit_values) > 1 else None,
-                            },
-                        )
+            rows = [tuple(row) for row in _table_rows(table)]
+            for header_index, header in enumerate(rows):
+                matched: dict[str, Any] | None = None
+                slots: dict[str, int] = {}
+                for layout in _PUBLIC_CANONICAL_LAYOUTS:
+                    candidate = _canonical_header_slots(header, layout["aliases"])
+                    if all(role in candidate for role in layout["signature"]):
+                        matched = layout
+                        slots = candidate
+                        break
+                if matched is None:
+                    continue
+                matched_record_type = str(matched["record_type"])
+                matched_boundary = str(matched.get("record_boundary") or "standalone")
+                for pending_record_type in tuple(pending_optional_sequences):
+                    if not (
+                        matched_record_type == pending_record_type
+                        and matched_boundary == "continuation"
+                    ):
+                        report_pending(pending_record_type)
+                expected = set(matched["aliases"])
+                if matched.get("sequence_optional"):
+                    expected.discard("sequence")
+                if not expected.issubset(slots):
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset=_PUBLIC_FINAL_DATASETS[str(matched["record_type"])],
+                        page=page,
+                        table=table,
+                        row_index=header_index,
+                        row=header,
                     )
-            elif "执业资格名称" in compact and "颁发机构" in compact:
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if len(values) >= 8 and values[0].isdigit():
-                        typed_rows.append(
-                            (
-                                "professional_qualification",
-                                values[6],
-                                {
-                                    "qualification_name": values[1],
-                                    "level": values[2],
-                                    "obtained_date": _date(values[3]),
-                                    "expiry_date": _date(values[4]),
-                                    "revocation_date": _date(values[5]),
-                                    "issuing_authority": values[6],
-                                    "authority_location": values[7],
-                                },
-                            )
+                    continue
+                if header_index + 1 >= len(rows):
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset=_PUBLIC_FINAL_DATASETS[str(matched["record_type"])],
+                        page=page,
+                        table=table,
+                        row_index=header_index,
+                        row=header,
+                    )
+                    continue
+                for data_index in range(header_index + 1, len(rows)):
+                    data_row = rows[data_index]
+                    if any(
+                        all(
+                            role in _canonical_header_slots(data_row, candidate_layout["aliases"])
+                            for role in candidate_layout["signature"]
                         )
-            elif "奖励机构" in compact and "奖励内容" in compact:
-                for row in rows[1:]:
-                    values = _nonempty(row)
-                    if len(values) >= 5 and values[0].isdigit():
-                        typed_rows.append(
-                            (
-                                "award",
-                                values[1],
-                                {
-                                    "award_content": values[2],
-                                    "effective_date": _date(values[3]),
-                                    "end_date": _date(values[4]),
-                                },
+                        for candidate_layout in _PUBLIC_CANONICAL_LAYOUTS
+                    ):
+                        break
+                    if matched.get("sequence_optional") and not any(_clean(cell) for cell in data_row):
+                        continue
+                    if matched.get("sequence_optional"):
+                        record_type = matched_record_type
+                        boundary = matched_boundary
+                        if boundary == "start":
+                            optional_sequence_counters[record_type] += 1
+                            sequence = optional_sequence_counters[record_type]
+                            logical_page = int(getattr(page, "page_number", 0) or 0)
+                            pending_optional_sequences[record_type] = {
+                                "sequence": sequence,
+                                "logical_page": logical_page,
+                                "reading_order": int(
+                                    reading_order.get(logical_page, logical_page) or logical_page
+                                ),
+                            }
+                        elif boundary == "continuation":
+                            pending = pending_optional_sequences.get(record_type)
+                            if pending is None:
+                                _report_unowned_optional_public_fragment(
+                                    parse_result,
+                                    dataset=_PUBLIC_FINAL_DATASETS[record_type],
+                                    row=data_row,
+                                    page=page,
+                                    table=table,
+                                    row_index=data_index,
+                                )
+                                break
+                            logical_page = int(getattr(page, "page_number", 0) or 0)
+                            current_order = int(
+                                reading_order.get(logical_page, logical_page) or logical_page
                             )
-                        )
-            for record_type, authority, content in typed_rows:
-                sequence = 1 + sum(record.get("record_type") == record_type for record in records)
-                records.append(
-                    {
-                        "public_record_id": stable_record_id(
-                            "public_record", record_type, sequence, authority, page_number
-                        ),
-                        "sequence": sequence,
-                        "record_type": record_type,
-                        "authority": authority,
-                        "start_date": content.get("filing_date") or content.get("effective_date"),
-                        "end_date": content.get("closure_date") or content.get("end_date"),
-                        # The shared canonical assembler treats dictionaries as
-                        # value wrappers. Keep the personal-detail payload as a
-                        # deterministic JSON value so no type-specific fields
-                        # are discarded before community serialization.
-                        "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
-                        "source": "native_detail_public_table",
-                        "source_refs": [_source_ref(page, table)],
-                        "confidence": 1.0,
-                    }
-                )
+                            start_page = int(pending["logical_page"])
+                            adjacent = logical_page == start_page or (
+                                current_order == int(pending["reading_order"]) + 1
+                            )
+                            if not adjacent:
+                                report_pending(record_type)
+                                _report_unowned_optional_public_fragment(
+                                    parse_result,
+                                    dataset=_PUBLIC_FINAL_DATASETS[record_type],
+                                    row=data_row,
+                                    page=page,
+                                    table=table,
+                                    row_index=data_index,
+                                )
+                                break
+                            sequence = int(pending["sequence"])
+                        else:
+                            optional_sequence_counters[record_type] += 1
+                            sequence = optional_sequence_counters[record_type]
+                    else:
+                        sequence = _sequence_value(data_row, slots)
+                    if sequence is None:
+                        raw_sequence = _slot_value(data_row, slots, "sequence")
+                        if raw_sequence or (
+                            data_index == header_index + 1
+                            and sum(bool(_clean(cell)) for cell in data_row) >= 2
+                        ):
+                            _report_unkeyed_business_row(
+                                parse_result,
+                                dataset=_PUBLIC_FINAL_DATASETS[str(matched["record_type"])],
+                                row=data_row,
+                                page=page,
+                                table=table,
+                                row_index=data_index,
+                            )
+                        continue
+                    _consume_public_canonical_row(
+                        parse_result,
+                        working,
+                        page=page,
+                        table=table,
+                        layout=matched,
+                        slots=slots,
+                        data_row=data_row,
+                        row_index=data_index,
+                        sequence=sequence,
+                    )
+                    if (
+                        matched.get("sequence_optional")
+                        and matched.get("record_boundary") == "continuation"
+                    ):
+                        pending_optional_sequences.pop(str(matched["record_type"]), None)
+                    if matched.get("sequence_optional"):
+                        break
+
+    for record_type in tuple(pending_optional_sequences):
+        report_pending(record_type)
+
+    records: list[dict[str, Any]] = []
+    authority_fields = {
+        "tax_arrears": "tax_authority",
+        "civil_judgment": "filing_court",
+        "enforcement": "court",
+        "administrative_penalty": "authority",
+        "housing_fund": "employer",
+        "professional_qualification": "issuing_authority",
+        "award": "authority",
+    }
+    internal = {
+        "public_record_id",
+        "sequence",
+        "record_type",
+        "source",
+        "source_refs",
+        "source_refs_by_field",
+        "confidence",
+    }
+    for (record_type, _sequence), item in sorted(working.items(), key=lambda pair: pair[0]):
+        content = {
+            key: value
+            for key, value in item.items()
+            if key not in internal and not key.startswith("_") and key != "canonical_raw"
+        }
+        for field_name in item.get("_source_absent_fields", []):
+            content.setdefault(field_name, None)
+        if record_type in {"tax_arrears", "civil_judgment", "enforcement", "administrative_penalty", "housing_fund"}:
+            content["reporting_amount_currency"] = "CNY"
+            content["reporting_amount_unit"] = "yuan"
+        if "cause" in item:
+            content["cause_status"] = "reported"
+        elif "cause" in item.get("_source_absent_fields", []):
+            content["cause_status"] = "not_reported"
+        if "administrative_review_result" in item:
+            content["administrative_review_result_status"] = "reported"
+        elif "administrative_review_result" in item.get("_source_absent_fields", []):
+            content["administrative_review_result_status"] = "not_reported"
+        record = {
+            **item,
+            "authority": item.get(authority_fields[record_type]),
+            "start_date": item.get("filing_date") or item.get("effective_date"),
+            "end_date": item.get("closure_date") or item.get("end_date"),
+            "content": json.dumps(content, ensure_ascii=False, sort_keys=True),
+        }
+        records.append(record)
     return records
 
 
+# Employment cells use finite PBOC code-list descriptions.  These are used
+# only to disambiguate OCR cells whose printed column boundaries collapsed;
+# arbitrary text is never coerced into one of these values.
+_EMPLOYER_TYPES = (
+    "机关事业单位",
+    "国有企业",
+    "集体企业",
+    "外资企业",
+    "私营企业",
+    "民营企业",
+    "个体工商户",
+    "个体、私营企业",
+    "其他（包括三资企业、民营企业、民间团体等）",
+    "未知",
+)
+_EMPLOYMENT_INDUSTRIES = (
+    "农、林、牧、渔业",
+    "采矿业",
+    "制造业",
+    "电力、燃气及水的生产和供应业",
+    "建筑业",
+    "交通运输、仓储和邮政业",
+    "信息传输、计算机服务和软件业",
+    "批发和零售业",
+    "住宿和餐饮业",
+    "金融业",
+    "房地产业",
+    "租赁和商务服务业",
+    "科学研究、技术服务和地质勘查业",
+    "水利、环境和公共设施管理业",
+    "居民服务和其他服务业",
+    "教育",
+    "卫生、社会保障和社会福利业",
+    "文化、体育和娱乐业",
+    "公共管理和社会组织",
+    "国际组织",
+    "未知",
+)
+_EMPLOYMENT_OCCUPATIONS = (
+    "国家机关、党群组织、企业、事业单位负责人",
+    "专业技术人员",
+    "办事人员和有关人员",
+    "商业、服务业人员",
+    "农、林、牧、渔、水利业生产人员",
+    "生产、运输设备操作人员及有关人员",
+    "军人",
+    "不便分类的其他从业人员",
+    "未知",
+)
+_EMPLOYMENT_POSITIONS = ("高级领导", "中级领导", "一般员工", "其他", "未知")
+_EMPLOYMENT_TITLES = ("高级", "中级", "初级", "无", "未知")
+_EMPLOYMENT_DETAIL_VOCABULARIES = {
+    "industry": _EMPLOYMENT_INDUSTRIES,
+    "occupation": _EMPLOYMENT_OCCUPATIONS,
+    "position": _EMPLOYMENT_POSITIONS,
+    "professional_title": _EMPLOYMENT_TITLES,
+}
+
+
+def _canonical_header_slots(
+    row: tuple[str, ...], aliases: Mapping[str, tuple[str, ...]]
+) -> dict[str, int]:
+    """Map semantic roles to distinct physical columns in a printed header."""
+    candidates: dict[str, int] = {}
+    by_column: defaultdict[int, list[str]] = defaultdict(list)
+    for role, labels in aliases.items():
+        for column, cell in enumerate(row):
+            text = _compact(cell)
+            if text and any(_compact(label) in text for label in labels):
+                candidates[role] = column
+                by_column[column].append(role)
+                break
+    # A single OCR blob containing several labels is not a column graph.
+    duplicate_columns = {column for column, roles in by_column.items() if len(roles) > 1}
+    return {role: column for role, column in candidates.items() if column not in duplicate_columns}
+
+
+def _header_role_columns(
+    row: tuple[str, ...], aliases: Mapping[str, tuple[str, ...]]
+) -> dict[str, int]:
+    """Return observed role columns without pretending merged columns are distinct."""
+
+    columns: dict[str, int] = {}
+    for role, labels in aliases.items():
+        for column, cell in enumerate(row):
+            text = _compact(cell)
+            if text and any(_compact(label) in text for label in labels):
+                columns[role] = column
+                break
+    return columns
+
+
+def _employment_signature(value: Any) -> str:
+    """Ignore layout punctuation when matching one finite employment value."""
+
+    return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", str(value or ""))
+
+
+def _finite_employment_value(value: Any, vocabulary: Iterable[str]) -> str | None:
+    """Return a canonical finite value only for a unique exact glyph signature."""
+
+    marker = _employment_signature(value)
+    if not marker:
+        return None
+    matches = [candidate for candidate in vocabulary if _employment_signature(candidate) == marker]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _employment_address_has_cross_field_contamination(record: Mapping[str, Any]) -> bool:
+    """Detect exact business-field spans copied into an employer address.
+
+    The address is withheld as a whole.  Removing the matching span would
+    invent a cell boundary which the OCR evidence did not preserve.
+    """
+
+    address = str(record.get("employer_address") or "")
+    address_marker = _employment_signature(address)
+    if not address_marker:
+        return False
+    employer_marker = _employment_signature(record.get("employer"))
+    department_suffixes = (
+        "销售部",
+        "营业部",
+        "门市部",
+        "办公室",
+        "办事处",
+        "项目部",
+    )
+    # A printed workplace address may legitimately end with the full employer
+    # name and one exact department suffix.  Keep that source value only when
+    # an address-shaped prefix precedes the employer; a bare organization name
+    # is not promoted into an address by this exception.
+    employer_is_address_suffix = bool(
+        employer_marker
+        and any(
+            address_marker.endswith(employer_marker + suffix)
+            and len(address_marker[: -len(employer_marker + suffix)]) >= 3
+            and re.search(
+                r"(?:省|市|区|县|镇|乡|街|路|道|巷|弄|号|楼|村|社区)",
+                address_marker[: -len(employer_marker + suffix)],
+            )
+            for suffix in department_suffixes
+        )
+    )
+    if (
+        len(employer_marker) >= 3
+        and employer_marker in address_marker
+        and not employer_is_address_suffix
+    ):
+        return True
+
+    # A merged/truncated cell can end part-way through the same record's legal
+    # employer name.  Require a long prefix owned by this exact record; short
+    # generic fragments such as a district or ``公司`` are never sufficient.
+    minimum_prefix = max(6, (len(employer_marker) + 1) // 2)
+    if len(employer_marker) >= 8 and len(address_marker) > minimum_prefix:
+        if any(
+            address_marker.endswith(employer_marker[:prefix_length])
+            for prefix_length in range(len(employer_marker) - 1, minimum_prefix - 1, -1)
+        ):
+            return True
+
+    # Position and title values are short, so require an exact suffix token;
+    # an interior occurrence such as ``中级人民法院`` may be legitimate address
+    # text.  Include both extracted values and the finite printed vocabulary
+    # so contamination is still recognized when the corresponding detail cell
+    # was itself unreadable.
+    role_tokens = {
+        str(record.get("position") or ""),
+        str(record.get("professional_title") or ""),
+        *_EMPLOYMENT_POSITIONS,
+        *_EMPLOYMENT_TITLES,
+    }
+    return any(
+        token_marker
+        and address_marker != token_marker
+        and address_marker.endswith(token_marker)
+        for token in role_tokens
+        if (token_marker := _employment_signature(token))
+    )
+
+
+def _enforce_employment_record_contracts(
+    parse_result: Any,
+    records: Iterable[dict[str, Any]],
+) -> None:
+    """Apply cross-field contracts after any employment record merge plane."""
+
+    for record in records:
+        if not _employment_address_has_cross_field_contamination(record):
+            continue
+        address = str(record.get("employer_address") or "")
+        refs = record.get("source_refs_by_field", {}).get("employer_address") or ()
+        source_ref = next(
+            (dict(ref) for ref in refs if isinstance(ref, Mapping)),
+            dict((record.get("source_refs") or [{}])[0]),
+        )
+        target_record_id = str(
+            record.get("employment_record_id")
+            or record.get("record_id")
+            or "employment_record:unresolved"
+        )
+        _reject_exact_observation(
+            parse_result,
+            record,
+            dataset="employment_records",
+            target_record_id=target_record_id,
+            field_name="employer_address",
+            raw=address,
+            source_ref=source_ref,
+            parser_stage="candidate_b_employment_record_contract",
+        )
+
+
+def _finite_values_in_cluster(
+    value: Any,
+    vocabularies: Mapping[str, Iterable[str]],
+) -> dict[str, str]:
+    """Find uniquely owned finite values inside one OCR-merged business cell.
+
+    A glyph sequence shared by multiple logical roles (for example ``未知``)
+    is intentionally left unresolved.  For a role with nested candidates, the
+    longest observed candidate wins only when it is unique.
+    """
+
+    marker = _employment_signature(value)
+    if not marker:
+        return {}
+    candidates: dict[str, list[tuple[str, str]]] = {}
+    for role, vocabulary in vocabularies.items():
+        observed = [
+            (candidate, _employment_signature(candidate))
+            for candidate in vocabulary
+            if _employment_signature(candidate) in marker
+        ]
+        if not observed:
+            continue
+        longest = max(len(signature) for _candidate, signature in observed)
+        maximal = [item for item in observed if len(item[1]) == longest]
+        if len(maximal) == 1:
+            candidates[role] = maximal
+    signatures_to_roles: defaultdict[str, list[str]] = defaultdict(list)
+    for role, ((_, signature),) in candidates.items():
+        signatures_to_roles[signature].append(role)
+    return {
+        role: candidate
+        for role, ((candidate, signature),) in candidates.items()
+        if len(signatures_to_roles[signature]) == 1
+        and not any(
+            signature != other_signature
+            and signature in other_signature
+            and marker.count(signature) <= marker.count(other_signature)
+            for other_role, ((_, other_signature),) in candidates.items()
+            if other_role != role
+        )
+    }
+
+
+def _employment_cluster_residue(value: Any, owned_values: Iterable[Any]) -> str:
+    """Return glyphs in one cluster not owned by selected exact values."""
+
+    residue = _employment_signature(value)
+    for owned_value in owned_values:
+        signature = _employment_signature(owned_value)
+        if signature and signature in residue:
+            residue = residue.replace(signature, "", 1)
+    return residue
+
+
+def _recovered_employment_basic_header(
+    row: tuple[str, ...], aliases: Mapping[str, tuple[str, ...]]
+) -> tuple[dict[str, int], dict[str, str]] | None:
+    """Recover only the canonical five-column header with a damaged ordinal label."""
+
+    columns = _header_role_columns(row, aliases)
+    business_roles = ("employer", "employer_type", "employer_address", "employer_phone")
+    if not all(role in columns for role in business_roles):
+        return None
+    if [columns[role] for role in business_roles] != [1, 2, 3, 4]:
+        return None
+    sequence_header = _compact(row[0] if row else "")
+    if sequence_header and "编" not in sequence_header and "号" not in sequence_header:
+        return None
+    columns["sequence"] = 0
+    overflow: dict[str, str] = {}
+    for role in business_roles:
+        cell = _clean(row[columns[role]])
+        residue = cell
+        for label in aliases[role]:
+            residue = residue.replace(label, " ")
+        residue = _clean(residue)
+        if residue:
+            overflow[role] = residue
+    return columns, overflow
+
+
+def _collapsed_employment_basic_header(row: tuple[str, ...]) -> tuple[int, int] | None:
+    """Recognize the closed five-role header after OCR collapsed its columns.
+
+    The four business labels may appear in the OCR traversal order rather than
+    their visual left-to-right order.  Recognition therefore depends on the
+    exact finite label set and rejects every extra glyph; values are assigned
+    later by their field contracts, never by this traversal order.
+    """
+
+    labels = ("工作单位", "单位性质", "单位地址", "单位电话")
+    populated = [(index, _compact(value)) for index, value in enumerate(row) if _compact(value)]
+    if not populated:
+        return None
+    sequence_columns = [index for index, value in populated if value == "编号"]
+    cluster_candidates: list[tuple[int, str]] = []
+    for index, value in populated:
+        residue = value
+        if residue.startswith("编号"):
+            residue = residue.removeprefix("编号")
+        if all(residue.count(label) == 1 for label in labels):
+            for label in labels:
+                residue = residue.replace(label, "", 1)
+            if not residue:
+                cluster_candidates.append((index, value))
+    if len(cluster_candidates) != 1:
+        return None
+    cluster_column, cluster_value = cluster_candidates[0]
+    if cluster_value.startswith("编号"):
+        if len(populated) != 1:
+            return None
+        return cluster_column, cluster_column
+    if len(sequence_columns) != 1 or len(populated) != 2:
+        return None
+    return sequence_columns[0], cluster_column
+
+
+def _clustered_employment_detail_header(
+    row: tuple[str, ...], aliases: Mapping[str, tuple[str, ...]]
+) -> dict[str, int] | None:
+    """Recognize the canonical detail layout after OCR merged its role columns."""
+
+    columns = _header_role_columns(row, aliases)
+    if not {"sequence", "industry", "occupation", "entry_year", "professional_title", "information_updated_date"} <= set(columns):
+        return None
+    if columns["sequence"] != 0:
+        return None
+    main_column = columns["industry"]
+    secondary_column = columns["entry_year"]
+    updated_column = columns["information_updated_date"]
+    if columns["occupation"] != main_column or columns["professional_title"] != secondary_column:
+        return None
+    if not (0 < main_column < secondary_column < updated_column):
+        return None
+    # The position label is frequently the only damaged label in this exact
+    # three-role cluster.  Infer its slot, never its value.
+    position_column = columns.get("position")
+    if position_column not in (None, secondary_column):
+        return None
+    return {
+        "sequence": 0,
+        "industry": main_column,
+        "occupation": main_column,
+        "entry_year": secondary_column,
+        "professional_title": secondary_column,
+        "position": secondary_column,
+        "information_updated_date": updated_column,
+    }
+
+
+def _slot_value(row: tuple[str, ...], slots: Mapping[str, int], role: str) -> str:
+    column = slots.get(role)
+    return _clean(row[column]) if column is not None and column < len(row) else ""
+
+
+def _sequence_value(row: tuple[str, ...], slots: Mapping[str, int]) -> int | None:
+    value = _slot_value(row, slots, "sequence")
+    match = re.fullmatch(r"\D*(\d{1,3})\D*", value)
+    return int(match.group(1)) if match else None
+
+
+def _employment_sequence_value(
+    row: tuple[str, ...], slots: Mapping[str, int]
+) -> int | None:
+    """Accept an exact ordinal or a watermark-duplicated identical ordinal."""
+
+    sequence = _sequence_value(row, slots)
+    if sequence is not None:
+        return sequence
+    value = _slot_value(row, slots, "sequence")
+    tokens = re.findall(r"\d{1,3}", value)
+    if len(tokens) >= 2 and len(set(tokens)) == 1:
+        return int(tokens[0])
+    return None
+
+
+def _canonical_employer_phone(value: Any) -> str | None:
+    """Return digits from one exact phone slot with a bounded layout shape.
+
+    The source may insert whitespace, a hyphen, or paired parentheses around
+    an area code.  Letters, Han text, arbitrary punctuation, and layouts that
+    look like multiple adjacent business values are rejected rather than
+    concatenated.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or re.search(r"[A-Za-z\u3400-\u9fff]", raw):
+        return None
+    if not re.fullmatch(r"[0-9\s()（）\-－]+", raw):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if not 5 <= len(digits) <= 16:
+        return None
+    runs = re.findall(r"\d+", raw)
+    lengths = tuple(len(run) for run in runs)
+    if len(runs) == 1 or all(length == 1 for length in lengths):
+        return digits
+    canonical_layouts = {
+        (3, 7),
+        (3, 8),
+        (4, 7),
+        (4, 8),
+        (3, 4, 4),
+        (4, 4, 4),
+    }
+    return digits if lengths in canonical_layouts or all(length <= 4 for length in lengths) else None
+
+
+def _employment_run_end(rows: list[list[str]], start: int) -> int:
+    """Return the exclusive end of one canonical employment data run."""
+
+    header_labels = (
+        "编号",
+        "工作单位",
+        "单位性质",
+        "单位地址",
+        "单位电话",
+        "职业",
+        "行业",
+        "职务",
+        "职称",
+        "进入本单位年份",
+        "信息更新日期",
+        "数据发生机构名称",
+    )
+    for row_index in range(start, len(rows)):
+        compact = _compact("".join(rows[row_index]))
+        if sum(label in compact for label in header_labels) >= 2:
+            return row_index
+    return len(rows)
+
+
+def _employment_row_sequence(
+    row: tuple[str, ...],
+    *,
+    sequence_column: int,
+    cluster_column: int | None = None,
+) -> int | None:
+    """Read a sequence from one row without using any business value."""
+
+    sequence = _employment_sequence_value(row, {"sequence": sequence_column})
+    if sequence is not None or cluster_column != sequence_column:
+        return sequence
+    cluster_raw = _clean(row[cluster_column] if cluster_column < len(row) else "")
+    match = re.fullmatch(r"\s*(\d{1,3})\s+.+", cluster_raw)
+    return int(match.group(1)) if match is not None else None
+
+
+def _employment_sequence_repairs(
+    rows: list[list[str]],
+    *,
+    start: int,
+    sequence_column: int,
+    mode: str,
+    known_basic_population: Iterable[int] = (),
+    cluster_column: int | None = None,
+) -> dict[int, int]:
+    """Recover unreadable ordinals only from a closed canonical row run.
+
+    Basic-table repairs must sit between globally consistent printed anchors.
+    Detail-table repairs additionally require a unique alignment to the dense
+    basic-table population.  Printed dash sentinels are never replaced.
+    """
+
+    end = _employment_run_end(rows, start)
+    run_indices = [index for index in range(start, end) if _nonempty(rows[index])]
+    if not run_indices or mode not in {"basic", "detail"}:
+        return {}
+    observed = [
+        _employment_row_sequence(
+            tuple(rows[index]),
+            sequence_column=sequence_column,
+            cluster_column=cluster_column,
+        )
+        for index in run_indices
+    ]
+    inferred: dict[int, int] = {}
+    if mode == "basic":
+        anchors = [
+            (position, sequence)
+            for position, sequence in enumerate(observed)
+            if sequence is not None
+        ]
+        if len(anchors) < 2:
+            return {}
+        offsets = {sequence - position for position, sequence in anchors}
+        if len(offsets) != 1:
+            return {}
+        offset = offsets.pop()
+        first_anchor = anchors[0][0]
+        last_anchor = anchors[-1][0]
+        for position in range(first_anchor + 1, last_anchor):
+            if observed[position] is not None:
+                continue
+            row_index = run_indices[position]
+            raw_sequence = (
+                rows[row_index][sequence_column]
+                if sequence_column < len(rows[row_index])
+                else ""
+            )
+            if is_explicit_source_absence(raw_sequence):
+                continue
+            expected = position + offset
+            if expected > 0:
+                inferred[row_index] = expected
+        return inferred
+
+    population = sorted(set(int(value) for value in known_basic_population))
+    if not population or population != list(range(1, population[-1] + 1)):
+        return {}
+    if len(run_indices) > len(population):
+        return {}
+    alignments: list[list[int]] = []
+    for population_start in range(len(population) - len(run_indices) + 1):
+        candidate = population[population_start : population_start + len(run_indices)]
+        if all(
+            sequence is None or sequence == candidate[position]
+            for position, sequence in enumerate(observed)
+        ):
+            alignments.append(candidate)
+    if len(alignments) != 1:
+        return {}
+    for position, expected in enumerate(alignments[0]):
+        if observed[position] is not None:
+            continue
+        row_index = run_indices[position]
+        raw_sequence = (
+            rows[row_index][sequence_column]
+            if sequence_column < len(rows[row_index])
+            else ""
+        )
+        if not is_explicit_source_absence(raw_sequence):
+            inferred[row_index] = expected
+    return inferred
+
+
+_EMPLOYMENT_PROVIDER_ANCHOR_RE = re.compile(
+    r"(?:银行|信用社|信用合作联社|消费金融|汽车金融|财务|"
+    r"信托|小额贷款|融资担保|征信|公积金管理)"
+)
+_EMPLOYMENT_PROVIDER_END_RE = re.compile(
+    r"(?:有限公司|中心|分行|支行|营业部|银行|信托|信用社|联社)$"
+)
+
+
+def _strict_employment_provider_span(value: Any) -> str | None:
+    """Return one complete institution span, excluding bounded OCR debris.
+
+    Employment-provider rows are ordinal-keyed, but the provider may land in
+    any physical column.  Isolated watermark glyphs are separated by OCR
+    whitespace in this layout, so enumerate token spans and retain a unique
+    institution-shaped span.  A one-glyph edge token is excluded only when the
+    remaining span is independently complete; this preserves names split as
+    ``有限公 司`` while dropping debris such as ``福 <name> 水``.
+    """
+
+    tokens = [token for token in re.split(r"\s+", _clean(value)) if token]
+    if not tokens:
+        return None
+
+    def valid(candidate_tokens: list[str]) -> str | None:
+        candidate = _compact(" ".join(candidate_tokens))
+        if not 5 <= len(candidate) <= 96:
+            return None
+        if any(
+            label in candidate
+            for label in ("数据发生机构名称", "编号", "信息更新日期")
+        ):
+            return None
+        if re.search(r"(?:19|20)\d{2}", candidate):
+            return None
+        if _EMPLOYMENT_PROVIDER_ANCHOR_RE.search(candidate) is None:
+            return None
+        if _EMPLOYMENT_PROVIDER_END_RE.search(candidate) is None:
+            return None
+        if len(re.findall(r"[\u3400-\u9fff]", candidate)) < 4:
+            return None
+        return candidate
+
+    candidates: list[str] = []
+    for start in range(len(tokens)):
+        for end in range(start + 1, len(tokens) + 1):
+            candidate_tokens = tokens[start:end]
+            candidate = valid(candidate_tokens)
+            if candidate is None:
+                continue
+            if (
+                len(_employment_signature(candidate_tokens[0])) == 1
+                and len(candidate_tokens) > 1
+                and valid(candidate_tokens[1:]) is not None
+            ):
+                continue
+            if (
+                len(_employment_signature(candidate_tokens[-1])) == 1
+                and len(candidate_tokens) > 1
+                and valid(candidate_tokens[:-1]) is not None
+            ):
+                continue
+            candidates.append(candidate)
+    unique = list(dict.fromkeys(candidates))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _bounded_provider_header_cell(value: Any) -> bool:
+    """Accept the canonical provider label with at most two stray glyphs."""
+
+    signature = _employment_signature(value)
+    label = "数据发生机构名称"
+    if signature.count(label) != 1:
+        return False
+    residue = signature.replace(label, "", 1)
+    return len(residue) <= 2 and not any(character.isdigit() for character in residue)
+
+
+def _employment_provider_header(row: tuple[str, ...]) -> dict[str, int] | None:
+    """Recognize the two-label provider header with bounded label debris."""
+
+    populated = [
+        (column, value)
+        for column, value in enumerate(row)
+        if _employment_signature(value)
+    ]
+    if len(populated) != 2:
+        return None
+    sequence_columns = [
+        column
+        for column, value in populated
+        if _employment_signature(value) == "编号"
+    ]
+    provider_columns = [
+        column for column, value in populated if _bounded_provider_header_cell(value)
+    ]
+    if len(sequence_columns) != 1 or len(provider_columns) != 1:
+        return None
+    sequence_column = sequence_columns[0]
+    provider_column = provider_columns[0]
+    if sequence_column == provider_column:
+        return None
+    return {"sequence": sequence_column, "data_provider": provider_column}
+
+
+def _employment_provider_observation(
+    row: tuple[str, ...], *, sequence_column: int
+) -> tuple[str | None, int | None, str]:
+    """Select the one institution-shaped non-sequence cell in a provider row."""
+
+    candidates: list[tuple[str, int]] = []
+    explicit_absence: list[tuple[str, int]] = []
+    for column, raw in enumerate(row):
+        if column == sequence_column:
+            continue
+        value = _clean(raw)
+        if not value:
+            continue
+        if is_explicit_source_absence(value):
+            explicit_absence.append((value, column))
+            continue
+        provider = _strict_employment_provider_span(value)
+        if provider is not None:
+            candidates.append((provider, column))
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique[0][0], unique[0][1], "exact"
+    if not unique and len(explicit_absence) == 1:
+        return explicit_absence[0][0], explicit_absence[0][1], "source_absent"
+    return None, None, "ambiguous" if unique else "missing"
+
+
+def _continuation_rows_are_provider_shaped(
+    rows: list[list[str]],
+    *,
+    known_sequences: set[int],
+) -> tuple[bool, int | None]:
+    """Recognize a headerless provider tail without consuming business rows.
+
+    A provider tail has exactly two populated columns, institution-shaped
+    values, and either repeats already observed sequence numbers or contains
+    at least two consistently unreadable sequence glyphs.  A new numbered
+    residence/employment row therefore stays in its current canonical mode.
+    """
+
+    if not rows or not known_sequences:
+        return False, None
+    nonempty_columns = [
+        [index for index, value in enumerate(row) if _clean(value)] for row in rows
+    ]
+    if not all(len(columns) == 2 and columns[0] == 0 for columns in nonempty_columns):
+        return False, None
+    provider_column = nonempty_columns[0][1]
+    if any(columns[1] != provider_column for columns in nonempty_columns):
+        return False, None
+    provider_pattern = re.compile(
+        r"(?:银行(?:股份)?有限公司|银行|信用社|消费金融(?:股份)?有限公司|财务有限公司|管理中心|征信中心)$"
+    )
+    if not all(provider_pattern.search(_clean(row[provider_column])) for row in rows):
+        return False, None
+    parsed_sequences: list[int] = []
+    unreadable_sequences = 0
+    for row in rows:
+        first = _clean(row[0] if row else "")
+        if first.isdigit():
+            parsed_sequences.append(int(first))
+        else:
+            unreadable_sequences += 1
+    if parsed_sequences:
+        return (
+            unreadable_sequences == 0 and set(parsed_sequences) <= known_sequences,
+            provider_column,
+        )
+    return len(rows) >= 2 and unreadable_sequences == len(rows), provider_column
+
+
+def _report_required_row_failure(
+    parse_result: Any,
+    *,
+    issue_code: str,
+    dataset: str,
+    sequence: int,
+    field_name: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+    target_record_id: str | None = None,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code=issue_code,
+            message="A canonical table row was observed but a required business cell could not be assigned to its printed column.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            target_record_id=target_record_id or f"{dataset}:{sequence}",
+            field_name=field_name,
+            observed_value={"sequence": sequence, "physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("canonical_column_graph", "required_cell_unresolved", "normalized_value_withheld"),
+        ),
+    )
+
+
+def _report_header_graph_failure(
+    parse_result: Any,
+    *,
+    dataset: str,
+    page: Any,
+    table: Any,
+    row_index: int,
+    row: tuple[str, ...],
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_canonical_header_graph_unresolved",
+            message="Canonical header labels were observed, but OCR did not preserve distinct physical columns.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            observed_value={"physical_header_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("merged_header_cells", "column_roles_unresolved", "page_ocr_eligible"),
+        ),
+    )
+
+
+def _report_unkeyed_fragment(
+    parse_result: Any,
+    *,
+    dataset: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="page_continuation",
+            issue_code="candidate_b_continuation_sequence_unresolved",
+            message="A continued provider fragment lacked a trustworthy printed sequence and was not attached by row order.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            field_name="sequence",
+            observed_value={"physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("continuation_fragment", "printed_sequence_unreadable", "row_order_not_used"),
+        ),
+    )
+
+
+_TERMINAL_HEADER_LABEL_GROUPS = (
+    ("编号", "手机号码", "信息更新日期", "数据发生机构名称"),
+    ("姓名", "证件类型", "证件号码", "工作单位", "联系电话"),
+    ("编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"),
+    ("编号", "工作单位", "单位地址", "职业", "信息更新日期"),
+    ("编号", "查询日期", "查询机构", "查询原因"),
+)
+
+
+def _enforce_observed_header_terminal_invariant(
+    parse_result: Any,
+    *,
+    dataset: str,
+    aliases: Mapping[str, tuple[str, ...]],
+    records: Iterable[Mapping[str, Any]],
+) -> None:
+    """Ensure every exact canonical header terminates in data, absence, or an issue."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    consumed_positions = {
+        (int(ref.get("logical_page") or 0), str(ref.get("table_id") or ""), int(ref.get("row")))
+        for record in records
+        if isinstance(record, Mapping)
+        for ref in record.get("source_refs") or ()
+        if isinstance(ref, Mapping) and ref.get("row") is not None
+    }
+    issue_positions = {
+        (int(ref.get("logical_page") or 0), str(ref.get("table_id") or ""), int(ref.get("row")))
+        for issue in getattr(parse_result, "_personal_detail_extraction_issues", ())
+        if isinstance(issue, Mapping) and issue.get("target_dataset") == dataset
+        for ref in issue.get("source_refs") or ()
+        if isinstance(ref, Mapping) and ref.get("row") is not None
+    }
+    active: dict[str, Any] | None = None
+    previous_table_id = ""
+    continuation_check = getattr(parse_result, "tables_continue", None)
+
+    def finish() -> None:
+        nonlocal active
+        if active is None or active.get("terminal"):
+            active = None
+            return
+        record_issue(
+            parse_result,
+            make_issue(
+                category="schema_incompleteness",
+                issue_code="candidate_b_observed_header_without_terminal_row",
+                message=(
+                    "A canonical section header was observed, but it produced neither a consumed business row, "
+                    "an explicit source-absence row, nor a localized extraction issue."
+                ),
+                parser_stage="candidate_b_terminal_header_invariant",
+                target_dataset=dataset,
+                observed_value={"physical_header_cells": active["row"]},
+                source_refs=(active["source_ref"],),
+                reason_codes=(
+                    "canonical_header_observed",
+                    "no_consumed_business_row",
+                    "no_explicit_source_absence",
+                    "silent_drop_prevented",
+                ),
+            ),
+        )
+        active = None
+
+    for page in getattr(parse_result, "pages", None) or ():
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        for table in getattr(page, "tables", None) or ():
+            table_id = str(getattr(table, "table_id", "") or "")
+            continues = bool(
+                active is not None
+                and previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
+            )
+            if active is not None and not continues:
+                finish()
+            for row_index, row in enumerate(_table_rows(table)):
+                slots = _canonical_header_slots(row, aliases)
+                if set(aliases) <= set(slots):
+                    finish()
+                    active = {
+                        "row": list(row),
+                        "slots": slots,
+                        "source_ref": _source_ref(page, table, row=row_index),
+                        "terminal": False,
+                    }
+                    continue
+                if active is None:
+                    continue
+                compact = _compact("".join(row))
+                if any(sum(label in compact for label in labels) >= 2 for labels in _TERMINAL_HEADER_LABEL_GROUPS):
+                    finish()
+                    continue
+                position = (page_number, table_id, row_index)
+                if position in consumed_positions or position in issue_positions:
+                    active["terminal"] = True
+                    continue
+                data_values = [
+                    _slot_value(row, active["slots"], role)
+                    for role in aliases
+                    if role != "sequence"
+                ]
+                nonempty = [_compact(value) for value in data_values if _compact(value)]
+                if nonempty and all(re.fullmatch(r"[-－‐‑‒–—―]+", value) for value in nonempty):
+                    active["terminal"] = True
+            previous_table_id = table_id or previous_table_id
+    finish()
+
+
+def _report_employment_cluster_field_unresolved(
+    parse_result: Any,
+    *,
+    record: dict[str, Any],
+    field_name: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    """Expose a logical employment field lost inside a merged OCR cell."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    _append_internal_field(record, "_unresolved_fields", field_name)
+    record["extraction_status"] = "review"
+    reported = record.setdefault("_reported_cluster_fields", [])
+    if field_name in reported:
+        return
+    reported.append(field_name)
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_employment_cluster_field_unresolved",
+            message="A canonical employment field remained unassignable after finite-value decoding of an OCR-merged cell.",
+            parser_stage="candidate_b_employment_cluster_decoder",
+            target_dataset="employment_records",
+            target_record_id=str(record["employment_record_id"]),
+            field_name=field_name,
+            observed_value={"physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=(
+                "canonical_cluster_topology",
+                "logical_field_not_uniquely_owned",
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+
+
+def _report_employment_provider_unresolved(
+    parse_result: Any,
+    *,
+    record: dict[str, Any],
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+    resolution: str,
+) -> None:
+    """Expose a missing or ambiguous provider cell in an exact provider row."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    _append_internal_field(record, "_unresolved_fields", "data_provider")
+    record["extraction_status"] = "review"
+    if "data_provider" in record.setdefault("_reported_provider_fields", []):
+        return
+    record["_reported_provider_fields"].append("data_provider")
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_employment_provider_cell_unresolved",
+            message=(
+                "An exact employment-provider row did not contain one uniquely "
+                "institution-shaped non-sequence cell."
+            ),
+            parser_stage="candidate_b_employment_provider_row",
+            target_dataset="employment_records",
+            target_record_id=str(record["employment_record_id"]),
+            field_name="data_provider",
+            observed_value={
+                "sequence": record.get("sequence"),
+                "physical_cells": list(row),
+                "resolution": resolution,
+            },
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=(
+                "exact_provider_header",
+                f"provider_cell_{resolution}",
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+
+
+def _report_employment_cluster_residue(
+    parse_result: Any,
+    *,
+    record: dict[str, Any],
+    field_names: Iterable[str],
+    raw: str,
+    residue: str,
+    page: Any,
+    table: Any,
+    row_index: int,
+    column: int,
+) -> None:
+    """Report residue while retaining uniquely owned values and full raw evidence."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    record["extraction_status"] = "review"
+    source_ref = _source_ref(page, table, row=row_index, column=column)
+    for field_name in dict.fromkeys(field_names):
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_employment_cluster_residue_unresolved",
+                message=(
+                    "An OCR-merged employment cell contained residue beyond its uniquely "
+                    "owned canonical values; the values were retained with scoped uncertainty."
+                ),
+                parser_stage="candidate_b_employment_cluster_decoder",
+                target_dataset="employment_records",
+                target_record_id=str(record["employment_record_id"]),
+                field_name=field_name,
+                observed_value={"raw_cluster": raw, "unconsumed_residue": residue},
+                source_refs=(source_ref,),
+                reason_codes=(
+                    "canonical_cluster_topology",
+                    "unconsumed_cluster_residue",
+                    "candidate_value_retained_with_uncertainty",
+                ),
+            ),
+        )
+
+
+_STALE_EMPLOYMENT_FIELD_ISSUE_CODES = frozenset(
+    {
+        "candidate_b_employment_cluster_field_unresolved",
+        "candidate_b_employment_canonical_cell_unresolved",
+        "candidate_b_employment_recovered_header_cell_unresolved",
+        "candidate_b_employment_required_cell_unresolved",
+        "candidate_b_employment_provider_cell_unresolved",
+    }
+)
+
+
+def _employment_field_is_independently_bound(
+    record: Mapping[str, Any], field_name: str
+) -> bool:
+    """Require a final value and a row/cell-bound source observation."""
+
+    if record.get(field_name) in (None, ""):
+        return False
+    refs = record.get("source_refs_by_field", {}).get(field_name) or ()
+    for ref in refs:
+        if not isinstance(ref, Mapping) or not isinstance(ref.get("row"), int):
+            continue
+        if isinstance(ref.get("column"), int):
+            return True
+        binding = str(ref.get("binding_quality") or ref.get("binding") or "")
+        if binding.startswith("closed_canonical_employment_"):
+            return True
+    return False
+
+
+def _prune_resolved_employment_field_issues(
+    parse_result: Any, records: Iterable[dict[str, Any]]
+) -> None:
+    """Remove only stale missing-field diagnostics after exact reconciliation.
+
+    Residue, invalid-value, and conflict issues describe real source evidence
+    and deliberately survive.  Only a missing-field diagnostic is stale when
+    that same final record/field now owns an independent canonical source
+    binding.
+    """
+
+    records_by_id = {
+        str(record.get("employment_record_id") or record.get("record_id") or ""): record
+        for record in records
+    }
+    resolved_pairs = {
+        (record_id, field_name)
+        for record_id, record in records_by_id.items()
+        if record_id
+        for field_name in record
+        if _employment_field_is_independently_bound(record, field_name)
+    }
+    if not resolved_pairs:
+        return
+
+    issues = getattr(parse_result, "_personal_detail_extraction_issues", None)
+    if not isinstance(issues, list):
+        return
+    retained_issues = [
+        issue
+        for issue in issues
+        if not (
+            isinstance(issue, Mapping)
+            and issue.get("issue_code") in _STALE_EMPLOYMENT_FIELD_ISSUE_CODES
+            and (
+                str(issue.get("target_record_id") or ""),
+                str(issue.get("field_name") or ""),
+            )
+            in resolved_pairs
+        )
+    ]
+    setattr(parse_result, "_personal_detail_extraction_issues", retained_issues)
+
+    remaining_issue_targets = {
+        str(issue.get("target_record_id") or "")
+        for issue in retained_issues
+        if isinstance(issue, Mapping)
+        and issue.get("status") not in {
+            "resolved",
+            "suppressed_redundant",
+            "informational",
+        }
+    }
+    for record_id, record in records_by_id.items():
+        unresolved = [
+            field_name
+            for field_name in record.get("_unresolved_fields", [])
+            if (record_id, str(field_name)) not in resolved_pairs
+        ]
+        if unresolved:
+            record["_unresolved_fields"] = unresolved
+        else:
+            record.pop("_unresolved_fields", None)
+        if (
+            record_id not in remaining_issue_targets
+            and not unresolved
+            and not record.get("_invalid_observation_fields")
+            and not record.get("_reported_field_conflicts")
+        ):
+            record.pop("extraction_status", None)
+
+
+def _report_employment_slot_unresolved(
+    parse_result: Any,
+    *,
+    record: dict[str, Any],
+    field_name: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+    column: int,
+) -> None:
+    """Report one blank value cell whose canonical header/row binding is exact."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    if field_name in set(record.get("_source_absent_fields") or ()):
+        return
+    _append_internal_field(record, "_unresolved_fields", field_name)
+    record["extraction_status"] = "review"
+    reported = record.setdefault("_reported_employment_slot_fields", [])
+    if field_name in reported:
+        return
+    reported.append(field_name)
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_employment_canonical_cell_unresolved",
+            message=(
+                "A canonical employment value cell was blank or unreadable even though "
+                "its header column and keyed business row were established."
+            ),
+            parser_stage="candidate_b_employment_canonical_slots",
+            target_dataset="employment_records",
+            target_record_id=str(record["employment_record_id"]),
+            field_name=field_name,
+            observed_value={"sequence": record.get("sequence"), "physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index, column=column),),
+            reason_codes=(
+                "canonical_header_column",
+                "keyed_employment_row",
+                "value_cell_unreadable",
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+
+
+def _ordered_employment_detail_values(
+    value: Any,
+) -> tuple[dict[str, str], set[str]]:
+    """Decode unique finite detail tokens in their canonical role order."""
+
+    marker = _employment_signature(value)
+    role_order = ("occupation", "industry", "position", "professional_title")
+    role_candidates: dict[str, list[tuple[str, str, int, int]]] = {}
+    for role in role_order:
+        observed: list[tuple[str, str, int, int]] = []
+        for candidate in _EMPLOYMENT_DETAIL_VOCABULARIES[role]:
+            signature = _employment_signature(candidate)
+            start = 0
+            while signature and (index := marker.find(signature, start)) >= 0:
+                observed.append((candidate, signature, index, index + len(signature)))
+                start = index + 1
+        maximal = [
+            item
+            for item in observed
+            if not any(
+                item[2] >= other[2]
+                and item[3] <= other[3]
+                and len(item[1]) < len(other[1])
+                for other in observed
+            )
+        ]
+        if len(maximal) == 1:
+            role_candidates[role] = maximal
+
+    unique_candidates = {
+        role: candidates[0]
+        for role, candidates in role_candidates.items()
+        if not any(
+            candidates[0][2] >= other_candidates[0][2]
+            and candidates[0][3] <= other_candidates[0][3]
+            and len(candidates[0][1]) < len(other_candidates[0][1])
+            for other_role, other_candidates in role_candidates.items()
+            if other_role != role
+        )
+        and not any(
+            candidates[0][1] == other_candidates[0][1]
+            and candidates[0][2:] == other_candidates[0][2:]
+            for other_role, other_candidates in role_candidates.items()
+            if other_role != role
+        )
+    }
+    selected: dict[str, str] = {
+        role: unique_candidates[role][0]
+        for role in ("occupation", "industry")
+        if role in unique_candidates
+    }
+    rejected_roles: set[str] = set(role_candidates) - set(unique_candidates)
+    last_end = -1
+    # OCR traversal can reverse the two wide description columns even when
+    # their finite vocabularies own each token uniquely.  Position and title,
+    # however, are adjacent short scalars: enforce their canonical order so a
+    # pre-position ``无`` is not silently promoted to professional_title.
+    for role in ("position", "professional_title"):
+        candidate = unique_candidates.get(role)
+        if candidate is None:
+            continue
+        canonical, _signature, start, end = candidate
+        if start < last_end:
+            rejected_roles.add(role)
+            continue
+        selected[role] = canonical
+        last_end = end
+    return selected, rejected_roles
+
+
+def _bounded_glyph_edit_distance(left: str, right: str, *, limit: int = 1) -> int:
+    """Return a small edit distance, stopping once ``limit`` is exceeded."""
+
+    if abs(len(left) - len(right)) > limit:
+        return limit + 1
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, start=1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[right_index] + 1,
+                    previous[right_index - 1]
+                    + (left_character != right_character),
+                )
+            )
+        if min(current) > limit:
+            return limit + 1
+        previous = current
+    return previous[-1]
+
+
+def _recover_unique_cluster_occupation(
+    value: Any,
+    *,
+    owned_values: Iterable[Any],
+) -> str | None:
+    """Recover one long finite occupation after bounded OCR interleaving.
+
+    The closed report schema supplies a finite occupation vocabulary.  This
+    correction is deliberately unavailable to short or open-text fields: after
+    removing independently decoded detail values and one isolated layout digit,
+    a long occupation must be the unique candidate within one glyph edit and
+    leave at most three unowned glyphs in the row cluster.
+    """
+
+    source_marker = _employment_signature(value)
+    if not source_marker:
+        return None
+    matches: list[tuple[int, int, str]] = []
+    for candidate in _EMPLOYMENT_OCCUPATIONS:
+        candidate_marker = _employment_signature(candidate)
+        if len(candidate_marker) < 8:
+            continue
+        marker = source_marker
+        for owned_value in owned_values:
+            owned_marker = _employment_signature(owned_value)
+            if (
+                owned_marker
+                and owned_marker not in candidate_marker
+                and owned_marker in marker
+            ):
+                marker = marker.replace(owned_marker, "", 1)
+        marker = re.sub(r"(?<!\d)\d(?!\d)", "", marker)
+        for window_length in range(
+            max(1, len(candidate_marker) - 1), len(candidate_marker) + 2
+        ):
+            outside = len(marker) - window_length
+            if outside < 0 or outside > 3:
+                continue
+            for start in range(0, len(marker) - window_length + 1):
+                window = marker[start : start + window_length]
+                distance = _bounded_glyph_edit_distance(
+                    window, candidate_marker, limit=1
+                )
+                if distance <= 1:
+                    matches.append((distance, outside, candidate))
+    if not matches:
+        return None
+    best_score = min((distance, outside) for distance, outside, _candidate in matches)
+    candidates = {
+        candidate
+        for distance, outside, candidate in matches
+        if (distance, outside) == best_score
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _drop_detail_values_owned_by_longer_roles(
+    values: dict[str, str], *, source_value: Any
+) -> None:
+    """Do not reuse glyphs inside occupation/industry as a short role."""
+
+    source_marker = _employment_signature(source_value)
+    for role in ("position", "professional_title"):
+        value = values.get(role)
+        value_marker = _employment_signature(value)
+        if not value_marker:
+            continue
+        explained_occurrences = sum(
+            _employment_signature(values.get(owner)).count(value_marker)
+            for owner in ("occupation", "industry")
+        )
+        if (
+            explained_occurrences
+            and source_marker.count(value_marker) <= explained_occurrences
+        ):
+            values.pop(role, None)
+
+
+def _employment_value_source(
+    row: tuple[str, ...],
+    *,
+    sequence_column: int,
+    value: Any,
+) -> tuple[str, int | None]:
+    """Locate one decoded token in a unique source cell when possible."""
+
+    signature = _employment_signature(value)
+    hits = [
+        (raw, column)
+        for column, raw in enumerate(row)
+        if column != sequence_column and signature and signature in _employment_signature(raw)
+    ]
+    if len(hits) == 1:
+        return _clean(hits[0][0]), hits[0][1]
+    union_raw = " ".join(
+        _clean(raw)
+        for column, raw in enumerate(row)
+        if column != sequence_column and _clean(raw)
+    )
+    return union_raw, None
+
+
+def _decode_clustered_employment_detail(
+    parse_result: Any,
+    *,
+    record: dict[str, Any],
+    row: tuple[str, ...],
+    slots: Mapping[str, int],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    """Decode one collapsed detail row from the union of its physical cells."""
+
+    target_record_id = str(record["employment_record_id"])
+    parser_stage = "candidate_b_employment_cluster_decoder"
+    sequence_column = int(slots["sequence"])
+    union_raw = " ".join(
+        _clean(raw)
+        for column, raw in enumerate(row)
+        if column != sequence_column and _clean(raw)
+    )
+
+    full_dates = [
+        (span, normalized)
+        for span, normalized in _valid_date_spans(union_raw)
+        if len(normalized) == 10
+    ]
+    working = union_raw
+    updated_date: str | None = None
+    updated_raw = ""
+    if len(full_dates) == 1:
+        (start, end), updated_date = full_dates[0]
+        updated_raw = union_raw[start:end]
+        working = union_raw[:start] + " " * (end - start) + union_raw[end:]
+
+    year_matches = list(
+        re.finditer(
+            r"(?<!\d)((?:19|20)\d{2})(?!\s*[.,年/月\-]\s*\d)(?!\d)",
+            working,
+        )
+    )
+    entry_year: int | None = None
+    entry_year_raw = ""
+    if len(year_matches) == 1:
+        match = year_matches[0]
+        entry_year_raw = match.group(1)
+        entry_year = int(entry_year_raw)
+        working = working[: match.start()] + " " * len(match.group(0)) + working[match.end() :]
+
+    cluster_values, _rejected_roles = _ordered_employment_detail_values(working)
+    corrected_occupation = False
+    if "occupation" not in cluster_values:
+        occupation = _recover_unique_cluster_occupation(
+            working,
+            owned_values=cluster_values.values(),
+        )
+        if occupation is not None:
+            cluster_values["occupation"] = occupation
+            corrected_occupation = True
+    _drop_detail_values_owned_by_longer_roles(cluster_values, source_value=working)
+    for role in ("occupation", "industry", "position", "professional_title"):
+        value = cluster_values.get(role)
+        if value is None:
+            _report_employment_cluster_field_unresolved(
+                parse_result,
+                record=record,
+                field_name=role,
+                row=row,
+                page=page,
+                table=table,
+                row_index=row_index,
+            )
+            continue
+        cluster_raw, column = _employment_value_source(
+            row,
+            sequence_column=sequence_column,
+            value=value,
+        )
+        source_ref = _source_ref(page, table, row=row_index, column=column)
+        binding = (
+            "closed_canonical_employment_finite_occupation_correction"
+            if role == "occupation" and corrected_occupation
+            else "closed_canonical_employment_row_union"
+        )
+        source_ref["binding"] = binding
+        source_ref["binding_quality"] = binding
+        _merge_exact_observation(
+            parse_result,
+            record,
+            dataset="employment_records",
+            target_record_id=target_record_id,
+            field_name=role,
+            value=value,
+            raw=cluster_raw,
+            source_ref=source_ref,
+            parser_stage=parser_stage,
+        )
+
+    if entry_year is None:
+        _report_employment_cluster_field_unresolved(
+            parse_result,
+            record=record,
+            field_name="entry_year",
+            row=row,
+            page=page,
+            table=table,
+            row_index=row_index,
+        )
+    else:
+        year_raw, year_column = _employment_value_source(
+            row,
+            sequence_column=sequence_column,
+            value=entry_year_raw,
+        )
+        _merge_exact_observation(
+            parse_result,
+            record,
+            dataset="employment_records",
+            target_record_id=target_record_id,
+            field_name="entry_year",
+            value=entry_year,
+            raw=year_raw,
+            source_ref=_source_ref(page, table, row=row_index, column=year_column),
+            parser_stage=parser_stage,
+        )
+
+    if updated_date is None:
+        date_slot_raw = _slot_value(row, slots, "information_updated_date")
+        if is_explicit_source_absence(date_slot_raw):
+            _mark_source_absent(record, "information_updated_date", date_slot_raw)
+        else:
+            _report_employment_cluster_field_unresolved(
+                parse_result,
+                record=record,
+                field_name="information_updated_date",
+                row=row,
+                page=page,
+                table=table,
+                row_index=row_index,
+            )
+    else:
+        _date_raw, date_column = _employment_value_source(
+            row,
+            sequence_column=sequence_column,
+            value=updated_raw,
+        )
+        _merge_exact_observation(
+            parse_result,
+            record,
+            dataset="employment_records",
+            target_record_id=target_record_id,
+            field_name="information_updated_date",
+            value=updated_date,
+            raw=updated_raw,
+            source_ref=_source_ref(page, table, row=row_index, column=date_column),
+            parser_stage=parser_stage,
+        )
+
+    # Residue is assessed per physical cell even though decoding used the row
+    # union.  This keeps uncertainty attached only to values sharing the same
+    # OCR cell rather than contaminating every recovered field in the row.
+    for column, raw in enumerate(row):
+        if column == sequence_column or not _clean(raw):
+            continue
+        scoped_fields = [
+            role
+            for role, value in cluster_values.items()
+            if _employment_signature(value) in _employment_signature(raw)
+        ]
+        owned_values: list[Any] = [cluster_values[role] for role in scoped_fields]
+        if updated_raw and _employment_signature(updated_raw) in _employment_signature(raw):
+            owned_values.append(updated_raw)
+            scoped_fields.append("information_updated_date")
+        if entry_year_raw and entry_year_raw in _employment_signature(raw):
+            owned_values.append(entry_year_raw)
+            scoped_fields.append("entry_year")
+        residue = _employment_cluster_residue(raw, owned_values)
+        if residue and scoped_fields:
+            _report_employment_cluster_residue(
+                parse_result,
+                record=record,
+                field_names=scoped_fields,
+                raw=_clean(raw),
+                residue=residue,
+                page=page,
+                table=table,
+                row_index=row_index,
+                column=column,
+            )
+
+
+def _report_optional_public_continuation_missing(
+    parse_result: Any,
+    *,
+    dataset: str,
+    target_record_id: str,
+    sequence: int,
+    source_refs: Iterable[Mapping[str, Any]],
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="page_continuation",
+            issue_code="candidate_b_public_record_continuation_missing",
+            message="A canonical public-record start block was preserved, but its required continuation block was not observed.",
+            parser_stage="candidate_b_public_record_boundaries",
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            observed_value={"sequence": sequence, "start_block_observed": True},
+            candidate_value={
+                "missing_fields": ["employer", "information_updated_month"]
+            },
+            source_refs=tuple(source_refs),
+            reason_codes=(
+                "canonical_start_block_observed",
+                "required_continuation_not_observed",
+                "partial_record_preserved",
+            ),
+        ),
+    )
+
+
+def _report_unowned_optional_public_fragment(
+    parse_result: Any,
+    *,
+    dataset: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="page_continuation",
+            issue_code="candidate_b_public_record_continuation_unowned",
+            message="A canonical public-record continuation block had no preceding start block and was not attached by proximity.",
+            parser_stage="candidate_b_public_record_boundaries",
+            target_dataset=dataset,
+            observed_value={"physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=(
+                "canonical_continuation_block_observed",
+                "preceding_start_block_not_observed",
+                "proximity_attachment_forbidden",
+                "record_not_invented",
+            ),
+        ),
+    )
+
+
+def _report_unkeyed_business_row(
+    parse_result: Any,
+    *,
+    dataset: str,
+    row: tuple[str, ...],
+    page: Any,
+    table: Any,
+    row_index: int,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
+
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_sequence_cell_unresolved",
+            message="A canonical business row was present but its printed sequence cell was unreadable; no row identity was invented.",
+            parser_stage="candidate_b_canonical_cell_graph",
+            target_dataset=dataset,
+            field_name="sequence",
+            observed_value={"physical_cells": list(row)},
+            source_refs=(_source_ref(page, table, row=row_index),),
+            reason_codes=("canonical_business_row", "printed_sequence_unreadable", "record_not_silently_dropped"),
+        ),
+    )
+
+
 def _extract_residence_records(parse_result: Any) -> list[dict[str, Any]]:
+    aliases = {
+        "sequence": ("编号",),
+        "address": ("居住地址",),
+        "residential_phone": ("住宅电话",),
+        "residence_status": ("居住状况",),
+        "information_updated_date": ("信息更新日期",),
+    }
     records: dict[int, dict[str, Any]] = {}
-    provider_rows: dict[int, tuple[str, dict[str, Any]]] = {}
-    residence_table_id = ""
+    providers: defaultdict[int, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    provider_source_absent: set[int] = set()
+    unkeyed_providers: list[
+        tuple[str, dict[str, Any], tuple[str, ...], Any, Any, int]
+    ] = []
+    active_slots: dict[str, int] = {}
+    mode = ""
+    previous_table_id = ""
     continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "page_number", 0) or 0)
         source_page = int(getattr(page, "source_page_number", 0) or page_number)
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            if not rows:
-                continue
-            header_index = next(
-                (
-                    index
-                    for index, row in enumerate(rows)
-                    if all(
-                        marker in _compact("".join(row))
-                        for marker in ("编号", "居住地址", "住宅电话", "居住状况", "信息更新日期")
-                    )
-                ),
-                None,
+            table_id = str(getattr(table, "table_id", "") or "")
+            table_text = _compact(" ".join(cell for row in rows for cell in row))
+            continues = bool(
+                previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
             )
-            if header_index is not None:
-                residence_table_id = str(getattr(table, "table_id", "") or residence_table_id)
-                provider_header = next(
-                    (
-                        index
-                        for index, row in enumerate(rows[header_index + 1 :], start=header_index + 1)
-                        if "数据发生机构名称" in _compact("".join(row))
-                    ),
-                    len(rows),
+            residence_schema_markers = ("居住地址", "住宅电话", "居住状况")
+            other_section_markers = ("学历", "学位", "电子邮箱", "通讯地址", "户籍地址", "工作单位", "职业")
+            if (
+                mode in {"residence", "provider"}
+                and not any(marker in table_text for marker in residence_schema_markers)
+                and any(marker in table_text for marker in other_section_markers)
+            ):
+                continues = False
+            if not continues:
+                active_slots = {}
+                mode = ""
+            if not continues and not any(marker in table_text for marker in residence_schema_markers):
+                previous_table_id = table_id or previous_table_id
+                continue
+            if continues and mode == "residence" and rows:
+                provider_shaped, provider_column = _continuation_rows_are_provider_shaped(
+                    rows,
+                    known_sequences=set(records),
                 )
-                for row_index, row in enumerate(rows[header_index + 1 : provider_header], start=header_index + 1):
-                    sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                    if sequence_match is None:
-                        break
-                    sequence = int(sequence_match.group(0))
-                    address = _clean(row[1] if len(row) > 1 else "")
-                    phone = _clean(row[2] if len(row) > 2 else "")
-                    status = _clean(row[3] if len(row) > 3 else "")
-                    updated = _date(row[4] if len(row) > 4 else "")
-                    if not address:
-                        continue
-                    residence_id = stable_record_id("credit_residence", sequence, address, updated)
-                    records[sequence] = {
-                        "record_id": residence_id,
-                        "residence_record_id": residence_id,
+                if provider_shaped and provider_column is not None:
+                    active_slots = {"sequence": 0, "data_provider": provider_column}
+                    mode = "provider"
+            for row_index, row in enumerate(rows):
+                residence_slots = _canonical_header_slots(row, aliases)
+                compact_header = _compact("".join(row))
+                header_anchor = len(residence_slots) >= 2
+                if (
+                    all(marker in compact_header for marker in ("编号", "居住地址", "信息更新日期"))
+                    and not set(aliases) <= set(residence_slots)
+                ) or (header_anchor and not set(aliases) <= set(residence_slots)):
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="residence_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
+                    )
+                    active_slots = {}
+                    mode = ""
+                    continue
+                if set(aliases) <= set(residence_slots):
+                    active_slots = residence_slots
+                    mode = "residence"
+                    continue
+                if "数据发生机构名称" in _compact("".join(row)) and mode in {"residence", "provider"}:
+                    provider_slots = _canonical_header_slots(
+                        row, {"sequence": ("编号",), "data_provider": ("数据发生机构名称",)}
+                    )
+                    active_slots = provider_slots
+                    mode = "provider"
+                    continue
+                if not active_slots or mode not in {"residence", "provider"}:
+                    continue
+                sequence = _sequence_value(row, active_slots)
+                if sequence is None and mode == "provider":
+                    first = _clean(row[0] if row else "")
+                    sequence = int(first) if first.isdigit() else None
+                if sequence is None:
+                    nonempty = _nonempty(row)
+                    if (
+                        mode == "provider"
+                        and continues
+                        and 0 < len(nonempty) <= 2
+                        and any(
+                            re.search(r"(?:银行|信用社|有限公司|管理中心|征信中心)", value)
+                            for value in nonempty
+                        )
+                    ):
+                        institution = next(
+                            (
+                                value
+                                for value in reversed(nonempty)
+                                if re.search(
+                                    r"(?:银行|信用社|有限公司|管理中心|征信中心)",
+                                    value,
+                                )
+                            ),
+                            "",
+                        )
+                        if institution:
+                            unkeyed_providers.append(
+                                (
+                                    institution,
+                                    _source_ref(page, table, row=row_index),
+                                    tuple(row),
+                                    page,
+                                    table,
+                                    row_index,
+                                )
+                            )
+                        else:
+                            _report_unkeyed_fragment(
+                                parse_result,
+                                dataset="residence_records",
+                                row=row,
+                                page=page,
+                                table=table,
+                                row_index=row_index,
+                            )
+                    elif mode == "provider" and nonempty:
+                        _report_unkeyed_fragment(
+                            parse_result,
+                            dataset="residence_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    elif mode == "residence" and nonempty:
+                        _report_unkeyed_business_row(
+                            parse_result,
+                            dataset="residence_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    continue
+                ref = _source_ref(page, table, row=row_index)
+                if mode == "provider":
+                    provider = _slot_value(row, active_slots, "data_provider")
+                    provider_column = active_slots.get("data_provider")
+                    if is_explicit_source_absence(provider):
+                        provider_source_absent.add(sequence)
+                    elif provider and provider_column is not None:
+                        providers[sequence].append(
+                            (provider, _source_ref(page, table, row=row_index, column=provider_column))
+                        )
+                    continue
+                residence_id = stable_record_id("credit_residence", sequence)
+                address = _slot_value(row, active_slots, "address")
+                updated_raw = _slot_value(row, active_slots, "information_updated_date")
+                updated = _date(updated_raw)
+                collapsed_updated: str | None = None
+                if address and not updated and not updated_raw:
+                    date_matches = list(_DATE_RE.finditer(address))
+                    if len(date_matches) == 1:
+                        candidate_date = _date(date_matches[0].group(0))
+                        residual = (
+                            address[: date_matches[0].start()]
+                            + " "
+                            + address[date_matches[0].end() :]
+                        )
+                        residual = re.sub(
+                            r"^[\s\"“”'*#=—–-]+|[\s\"“”'*#=—–-]+$",
+                            "",
+                            residual,
+                        )
+                        if candidate_date and len(_compact(residual)) >= 4:
+                            address = residual
+                            collapsed_updated = candidate_date
+                            updated = candidate_date
+                record = records.setdefault(
+                    sequence,
+                    {
                         "sequence": sequence,
-                        "address": address,
-                        **({"residential_phone": phone} if phone and phone != "--" else {}),
-                        **({"residence_status": status} if status and status != "--" else {}),
-                        **({"information_updated_date": updated} if updated and updated != "--" else {}),
                         "page": page_number,
                         "source_page": source_page,
                         "source": "native_personal_detail_residence_table",
-                        "source_refs": [_source_ref(page, table, row=row_index)],
+                        "source_refs": [],
+                        "record_id": residence_id,
+                        "residence_record_id": residence_id,
                         "confidence": 1.0,
-                    }
-                available_sequences = iter(sorted(records))
-                used_provider_sequences: set[int] = set()
-                for row_index, row in enumerate(rows[provider_header + 1 :], start=provider_header + 1):
-                    nonempty = [(index, _clean(value)) for index, value in enumerate(row) if _clean(value)]
-                    if not nonempty:
-                        continue
-                    sequence_match = re.search(r"\d+", nonempty[0][1]) if nonempty[0][0] == 0 else None
-                    sequence = int(sequence_match.group(0)) if sequence_match else None
-                    institution_parts = [
-                        value
-                        for index, value in nonempty
-                        if not (
-                            index == 0
-                            and (
-                                sequence_match is not None
-                                or (len(value) <= 2 and len(nonempty) > 1)
-                            )
+                    },
+                )
+                record["source_refs"].append(ref)
+                if address == "--":
+                    _mark_source_absent(record, "address", address)
+                elif address:
+                    address_ref = _source_ref(
+                        page, table, row=row_index, column=active_slots["address"]
+                    )
+                    suspicious_address = bool(
+                        _DATE_RE.search(address)
+                        or re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", address)
+                        or any(
+                            label in _compact(address)
+                            for label_names in aliases.values()
+                            for label in label_names
                         )
-                    ]
-                    institution = " ".join(institution_parts).strip()
-                    if sequence not in records:
-                        sequence = next(
-                            (candidate for candidate in available_sequences if candidate not in used_provider_sequences),
-                            None,
+                    )
+                    if suspicious_address:
+                        _reject_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="residence_records",
+                            target_record_id=residence_id,
+                            field_name="address",
+                            raw=address,
+                            source_ref=address_ref,
+                            parser_stage="candidate_b_residence_canonical_slots",
                         )
-                    if sequence is None or sequence not in records or not institution:
-                        continue
-                    institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
-                    provider_rows[sequence] = (institution, _source_ref(page, table, row=row_index))
-                    used_provider_sequences.add(sequence)
-            table_id = str(getattr(table, "table_id", "") or "")
-            if (
-                records
-                and residence_table_id
-                and table_id
-                and callable(continuation_check)
-                and continuation_check(residence_table_id, table_id) is True
-            ):
-                candidates: dict[int, tuple[str, dict[str, Any]]] = {}
-                for row_index, row in enumerate(rows):
-                    values = _nonempty(row)
-                    if len(values) != 2 or not values[0].isdigit():
-                        candidates = {}
-                        break
-                    candidates[int(values[0])] = (values[1], _source_ref(page, table, row=row_index))
-                if candidates and set(candidates) <= set(records):
-                    provider_rows.update(candidates)
+                    else:
+                        _merge_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="residence_records",
+                            target_record_id=residence_id,
+                            field_name="address",
+                            value=address,
+                            raw=address,
+                            source_ref=address_ref,
+                            parser_stage="candidate_b_residence_canonical_slots",
+                        )
+                else:
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_residence_required_cell_unresolved",
+                        dataset="residence_records",
+                        sequence=sequence,
+                        field_name="address",
+                        row=row,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        target_record_id=residence_id,
+                    )
+                phone = _slot_value(row, active_slots, "residential_phone")
+                status = _slot_value(row, active_slots, "residence_status")
+                if is_explicit_source_absence(phone):
+                    _mark_source_absent(record, "residential_phone", phone)
+                elif phone:
+                    phone_digits = re.sub(r"\D", "", phone)
+                    phone_ref = _source_ref(
+                        page, table, row=row_index, column=active_slots["residential_phone"]
+                    )
+                    if any(character.isalpha() for character in phone) or not 5 <= len(phone_digits) <= 16:
+                        _reject_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="residence_records",
+                            target_record_id=residence_id,
+                            field_name="residential_phone",
+                            raw=phone,
+                            source_ref=phone_ref,
+                            parser_stage="candidate_b_residence_canonical_slots",
+                        )
+                    else:
+                        _merge_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="residence_records",
+                            target_record_id=residence_id,
+                            field_name="residential_phone",
+                            value=phone,
+                            raw=phone,
+                            source_ref=phone_ref,
+                            parser_stage="candidate_b_residence_canonical_slots",
+                        )
+                if status == "--":
+                    _mark_source_absent(record, "residence_status", status)
+                elif status:
+                    _merge_exact_observation(
+                        parse_result,
+                        record,
+                        dataset="residence_records",
+                        target_record_id=residence_id,
+                        field_name="residence_status",
+                        value=status,
+                        raw=status,
+                        source_ref=_source_ref(
+                            page, table, row=row_index, column=active_slots["residence_status"]
+                        ),
+                        parser_stage="candidate_b_residence_canonical_slots",
+                    )
+                if updated_raw and not is_explicit_source_absence(updated_raw):
+                    _merge_canonical_date_observation(
+                        parse_result,
+                        record,
+                        dataset="residence_records",
+                        target_record_id=residence_id,
+                        field_name="information_updated_date",
+                        raw=updated_raw,
+                        source_ref=_source_ref(
+                            page,
+                            table,
+                            row=row_index,
+                            column=active_slots["information_updated_date"],
+                        ),
+                        parser_stage="candidate_b_residence_canonical_slots",
+                    )
+                elif collapsed_updated:
+                    _merge_exact_observation(
+                        parse_result,
+                        record,
+                        dataset="residence_records",
+                        target_record_id=residence_id,
+                        field_name="information_updated_date",
+                        value=collapsed_updated,
+                        raw=collapsed_updated,
+                        source_ref=_source_ref(
+                            page,
+                            table,
+                            row=row_index,
+                            column=active_slots["address"],
+                        ),
+                        parser_stage="candidate_b_residence_canonical_slots",
+                    )
+                elif is_explicit_source_absence(updated_raw):
+                    _mark_source_absent(record, "information_updated_date", updated_raw)
+                elif not updated_raw:
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_residence_required_cell_unresolved",
+                        dataset="residence_records",
+                        sequence=sequence,
+                        field_name="information_updated_date",
+                        row=row,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        target_record_id=residence_id,
+                    )
+            previous_table_id = table_id or previous_table_id
+
+    keyed_sequences = {sequence for sequence, values in providers.items() if values}
+    missing_provider_sequences = [
+        sequence for sequence in sorted(records) if sequence not in keyed_sequences
+    ]
+    if (
+        unkeyed_providers
+        and len(unkeyed_providers) == len(missing_provider_sequences)
+        and sorted(records) == list(range(1, max(records, default=0) + 1))
+        and missing_provider_sequences
+        == list(range(min(missing_provider_sequences), max(records) + 1))
+    ):
+        for sequence, (provider, provider_ref, _row, _page, _table, _row_index) in zip(
+            missing_provider_sequences,
+            unkeyed_providers,
+            strict=True,
+        ):
+            providers[sequence].append((provider, provider_ref))
+        unkeyed_providers = []
+    for _provider, _ref, row, page, table, row_index in unkeyed_providers:
+        _report_unkeyed_fragment(
+            parse_result,
+            dataset="residence_records",
+            row=row,
+            page=page,
+            table=table,
+            row_index=row_index,
+        )
     for sequence, record in records.items():
-        provider = provider_rows.get(sequence)
-        if provider:
-            record["data_provider"] = provider[0]
-            record["source_refs"].append(provider[1])
-    return [records[key] for key in sorted(records)]
+        residence_id = str(record["residence_record_id"])
+        if sequence in provider_source_absent:
+            _mark_source_absent(record, "data_provider", "--")
+        for provider, provider_ref in providers.get(sequence, ()):
+            record["source_refs"].append(provider_ref)
+            _merge_exact_observation(
+                parse_result,
+                record,
+                dataset="residence_records",
+                target_record_id=residence_id,
+                field_name="data_provider",
+                value=provider,
+                raw=provider,
+                source_ref=provider_ref,
+                parser_stage="candidate_b_residence_canonical_slots",
+            )
+        if (
+            not record.get("data_provider")
+            and "data_provider" not in set(record.get("_source_absent_fields") or ())
+        ):
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
 
-
-_EMPLOYER_TYPES = (
-    "国有企业",
-    "集体企业",
-    "私营企业",
-    "外资企业",
-    "事业单位",
-    "国家机关",
-    "个体经营",
-    "其他",
-)
-
-
-def _split_employment_basic_row(row: tuple[str, ...]) -> dict[str, Any]:
-    """Recover a basic employment row even when OCR merged its columns."""
-    cells = [_clean(value) for value in row]
-    positional_phone = next(
-        (
-            value
-            for value in reversed(cells[4:])
-            if len(re.sub(r"\D", "", value)) >= 7
-        ),
-        "",
+            record["extraction_status"] = "review"
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="page_continuation",
+                    issue_code="candidate_b_residence_provider_missing",
+                    message="A canonical residence row has no safely bound provider row.",
+                    parser_stage="candidate_b_residence_canonical_slots",
+                    target_dataset="residence_records",
+                    target_record_id=residence_id,
+                    field_name="data_provider",
+                    observed_value={"sequence": sequence},
+                    source_refs=tuple(record.get("source_refs") or ()),
+                    reason_codes=(
+                        "canonical_residence_row_observed",
+                        "provider_component_not_bound",
+                        "row_marked_for_review",
+                    ),
+                ),
+            )
+    output = [records[key] for key in sorted(records)]
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="residence_records",
+        aliases=aliases,
+        records=output,
     )
-    if len(cells) >= 5 and cells[1] and (cells[2] or positional_phone):
-        # Preserve a table that already has positional columns. Applying the
-        # collapsed-row heuristic here can detach an area-code prefix from the
-        # phone and shift every employment-detail field that follows it.
-        return {
-            "employer": cells[1],
-            **({"employer_type": cells[2]} if cells[2] and cells[2] != "--" else {}),
-            **({"employer_address": cells[3]} if cells[3] and cells[3] != "--" else {}),
-            **({"employer_phone": positional_phone} if positional_phone else {}),
-        }
-
-    text = re.sub(r"\s+", " ", " ".join(_clean(value) for value in row[1:] if _clean(value))).strip()
-    parsed: dict[str, Any] = {}
-    phone_match = re.search(r"(?<!\d)(\d{7,16})(?!\d)\s*$", text)
-    if phone_match:
-        parsed["employer_phone"] = phone_match.group(1)
-        text = text[: phone_match.start()].strip()
-
-    employer_type = next((value for value in _EMPLOYER_TYPES if value in text), "")
-    if employer_type:
-        employer, address = text.split(employer_type, 1)
-        parsed["employer"] = employer.strip()
-        parsed["employer_type"] = employer_type
-        if address.strip() and address.strip() != "--":
-            parsed["employer_address"] = address.strip()
-        return parsed
-
-    # Most legal names have a reliable suffix even when every table column was
-    # collapsed into one OCR cell. Keep uncertain trailing text as the address
-    # instead of silently appending it to the employer name.
-    legal = re.match(r"(.{2,60}?(?:有限责任公司|股份有限公司|有限公司|工业公司|学校|公司))(?:\s+|(?=[省市县区镇路街]))?(.*)$", text)
-    if legal:
-        parsed["employer"] = legal.group(1).strip()
-        trailing = legal.group(2).strip()
-        if trailing and trailing != "--":
-            parsed["employer_address"] = trailing
-    elif text and text != "--":
-        parsed["employer"] = text
-    return parsed
+    return output
 
 
 def _extract_employment_records(parse_result: Any) -> list[dict[str, Any]]:
+    basic_aliases = {
+        "sequence": ("编号",),
+        "employer": ("工作单位",),
+        "employer_type": ("单位性质",),
+        "employer_address": ("单位地址",),
+        "employer_phone": ("单位电话",),
+    }
+    detail_aliases = {
+        "sequence": ("编号",),
+        "occupation": ("职业",),
+        "industry": ("行业",),
+        "position": ("职务",),
+        "professional_title": ("职称",),
+        "entry_year": ("进入本单位年份",),
+        "information_updated_date": ("信息更新日期",),
+    }
     records: dict[int, dict[str, Any]] = {}
+    active_slots: dict[str, int] = {}
+    mode = ""
+    basic_header_recovered = False
+    basic_cluster_column: int | None = None
+    detail_header_clustered = False
+    sequence_repairs: dict[int, int] = {}
+    pending_basic_overflow: dict[str, str] = {}
+    basic_header_row_index: int | None = None
+    employment_section_active = False
+    previous_table_id = ""
+    continuation_check = getattr(parse_result, "tables_continue", None)
     for page in getattr(parse_result, "pages", None) or []:
         page_number = int(getattr(page, "page_number", 0) or 0)
         source_page = int(getattr(page, "source_page_number", 0) or page_number)
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            basic_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows)
-                    if all(marker in _compact("".join(row)) for marker in ("编号", "工作单位", "单位性质", "单位电话"))
-                ),
-                None,
+            table_id = str(getattr(table, "table_id", "") or "")
+            table_text = _compact(" ".join(cell for row in rows for cell in row))
+            table_has_employment_schema = any(
+                marker in table_text
+                for marker in ("工作单位", "单位性质", "单位电话", "职业", "职务", "职称")
             )
-            if basic_header is None:
+            continues = bool(
+                previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
+            )
+            other_section_markers = (
+                "居住地址",
+                "住宅电话",
+                "居住状况",
+                "手机号码",
+                "配偶",
+                "学历",
+                "学位",
+                "电子邮箱",
+                "通讯地址",
+                "户籍地址",
+            )
+            if (
+                employment_section_active
+                and not table_has_employment_schema
+                and any(marker in table_text for marker in other_section_markers)
+            ):
+                continues = False
+                employment_section_active = False
+            if not continues:
+                active_slots = {}
+                mode = ""
+                basic_header_recovered = False
+                basic_cluster_column = None
+                detail_header_clustered = False
+                sequence_repairs = {}
+                pending_basic_overflow = {}
+                basic_header_row_index = None
+                employment_section_active = table_has_employment_schema
+            elif table_has_employment_schema:
+                employment_section_active = True
+            if not employment_section_active and not table_has_employment_schema:
+                previous_table_id = table_id or previous_table_id
                 continue
-            detail_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows[basic_header + 1 :], start=basic_header + 1)
-                    if all(marker in _compact("".join(row)) for marker in ("编号", "职业", "行业", "职务", "职称"))
-                ),
-                None,
-            )
-            if detail_header is None:
-                continue
-            institution_header = next(
-                (
-                    index
-                    for index, row in enumerate(rows[detail_header + 1 :], start=detail_header + 1)
-                    if "数据发生机构名称" in _compact("".join(row))
-                ),
-                len(rows),
-            )
-            for row_index, row in enumerate(rows[basic_header + 1 : detail_header], start=basic_header + 1):
-                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                if sequence_match is None:
-                    continue
-                sequence = int(sequence_match.group(0))
-                parsed = _split_employment_basic_row(row)
-                records[sequence] = {
-                    "employment_record_id": stable_record_id("credit_employment", sequence, parsed),
-                    "sequence": sequence,
-                    **{key: value for key, value in parsed.items() if value and value != "--"},
-                    "page": page_number,
-                    "source_page": source_page,
-                    "source": "native_personal_detail_employment_table",
-                    "source_refs": [_source_ref(page, table, row=row_index)],
-                    "confidence": 1.0,
-                }
-            for row_index, row in enumerate(rows[detail_header + 1 : institution_header], start=detail_header + 1):
-                sequence_match = re.search(r"\d+", str(row[0] if row else ""))
-                if sequence_match is None:
-                    continue
-                sequence = int(sequence_match.group(0))
-                if sequence not in records:
-                    continue
-                cells = [_clean(value) for value in row]
-                if len(cells) >= 7 and _date(cells[6]):
-                    entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", cells[5])
-                    detail = {
-                        "occupation": cells[1],
-                        "industry": cells[2],
-                        "position": cells[3],
-                        "professional_title": cells[4],
-                        "entry_year": int(entry_match.group(0)) if entry_match else None,
-                        "information_updated_date": _date(cells[6]),
-                    }
-                    records[sequence].update(
-                        {key: value for key, value in detail.items() if value and value != "--"}
+            if continues and mode in {"basic", "detail"} and rows:
+                provider_shaped, provider_column = _continuation_rows_are_provider_shaped(
+                    rows,
+                    known_sequences=set(records),
+                )
+                if provider_shaped and provider_column is not None:
+                    active_slots = {"sequence": 0, "data_provider": provider_column}
+                    mode = "provider"
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = {}
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+            for row_index, row in enumerate(rows):
+                basic_slots = _canonical_header_slots(row, basic_aliases)
+                detail_slots = _canonical_header_slots(row, detail_aliases)
+                recovered_basic = _recovered_employment_basic_header(row, basic_aliases)
+                collapsed_basic = _collapsed_employment_basic_header(row)
+                clustered_detail = _clustered_employment_detail_header(row, detail_aliases)
+                provider_header = _employment_provider_header(row)
+                compact_header = _compact("".join(row))
+                basic_anchor = len(basic_slots) >= 2
+                detail_anchor = len(detail_slots) >= 2
+                broken_basic = (
+                    all(marker in compact_header for marker in ("编号", "工作单位", "单位性质", "单位电话"))
+                    or basic_anchor
+                ) and not set(basic_aliases) <= set(basic_slots) and recovered_basic is None and collapsed_basic is None
+                broken_detail = (
+                    all(marker in compact_header for marker in ("编号", "职业", "行业", "职务", "职称"))
+                    or detail_anchor
+                ) and not set(detail_aliases) <= set(detail_slots) and clustered_detail is None
+                if broken_basic or broken_detail:
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="employment_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
                     )
-                    records[sequence]["source_refs"].append(
-                        _source_ref(page, table, row=row_index)
+                    active_slots = {}
+                    mode = ""
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = {}
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+                    employment_section_active = True
+                    continue
+                if set(basic_aliases) <= set(basic_slots):
+                    active_slots = basic_slots
+                    mode = "basic"
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = _employment_sequence_repairs(
+                        rows,
+                        start=row_index + 1,
+                        sequence_column=active_slots["sequence"],
+                        mode="basic",
+                    )
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+                    continue
+                if recovered_basic is not None:
+                    active_slots, pending_basic_overflow = recovered_basic
+                    mode = "basic"
+                    basic_header_recovered = True
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = _employment_sequence_repairs(
+                        rows,
+                        start=row_index + 1,
+                        sequence_column=active_slots["sequence"],
+                        mode="basic",
+                    )
+                    basic_header_row_index = row_index
+                    continue
+                if collapsed_basic is not None:
+                    sequence_column, basic_cluster_column = collapsed_basic
+                    active_slots = {"sequence": sequence_column}
+                    mode = "basic"
+                    basic_header_recovered = False
+                    detail_header_clustered = False
+                    sequence_repairs = _employment_sequence_repairs(
+                        rows,
+                        start=row_index + 1,
+                        sequence_column=active_slots["sequence"],
+                        mode="basic",
+                        cluster_column=basic_cluster_column,
+                    )
+                    pending_basic_overflow = {}
+                    basic_header_row_index = row_index
+                    continue
+                if set(detail_aliases) <= set(detail_slots):
+                    active_slots = detail_slots
+                    mode = "detail"
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = _employment_sequence_repairs(
+                        rows,
+                        start=row_index + 1,
+                        sequence_column=active_slots["sequence"],
+                        mode="detail",
+                        known_basic_population=(
+                            sequence
+                            for sequence, record in records.items()
+                            if "basic" in set(record.get("_observed_components") or ())
+                        ),
+                    )
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+                    continue
+                if clustered_detail is not None:
+                    active_slots = clustered_detail
+                    mode = "detail"
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = True
+                    sequence_repairs = _employment_sequence_repairs(
+                        rows,
+                        start=row_index + 1,
+                        sequence_column=active_slots["sequence"],
+                        mode="detail",
+                        known_basic_population=(
+                            sequence
+                            for sequence, record in records.items()
+                            if "basic" in set(record.get("_observed_components") or ())
+                        ),
+                    )
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+                    continue
+                if employment_section_active and provider_header is not None:
+                    active_slots = provider_header
+                    mode = "provider"
+                    basic_header_recovered = False
+                    basic_cluster_column = None
+                    detail_header_clustered = False
+                    sequence_repairs = {}
+                    pending_basic_overflow = {}
+                    basic_header_row_index = None
+                    continue
+                if not active_slots:
+                    continue
+                sequence = _employment_sequence_value(row, active_slots)
+                sequence_recovered = False
+                cluster_raw = ""
+                if mode == "basic" and basic_cluster_column is not None:
+                    cluster_raw = _slot_value(row, {"cluster": basic_cluster_column}, "cluster")
+                    if active_slots.get("sequence") == basic_cluster_column:
+                        match = re.fullmatch(r"\s*(\d{1,3})\s+(.+)", cluster_raw)
+                        if match is not None:
+                            sequence = int(match.group(1))
+                            cluster_raw = match.group(2).strip()
+                if sequence is None and mode == "provider":
+                    first = _clean(row[0] if row else "")
+                    sequence = int(first) if first.isdigit() else None
+                if sequence is None and row_index in sequence_repairs:
+                    sequence = sequence_repairs[row_index]
+                    sequence_recovered = True
+                if sequence is None:
+                    if mode == "provider" and _nonempty(row):
+                        _report_unkeyed_fragment(
+                            parse_result,
+                            dataset="employment_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    elif mode in {"basic", "detail"} and _nonempty(row):
+                        _report_unkeyed_business_row(
+                            parse_result,
+                            dataset="employment_records",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                        )
+                    continue
+                record = records.setdefault(
+                    sequence,
+                    {
+                        "record_id": stable_record_id("credit_employment", sequence),
+                        "employment_record_id": stable_record_id("credit_employment", sequence),
+                        "sequence": sequence,
+                        "page": page_number,
+                        "source_page": source_page,
+                        "source": "native_personal_detail_employment_table",
+                        "source_refs": [],
+                        "confidence": 1.0,
+                    },
+                )
+                row_ref = _source_ref(page, table, row=row_index)
+                if sequence_recovered:
+                    row_ref["binding"] = "closed_canonical_employment_sequence_run"
+                    row_ref["binding_quality"] = "closed_canonical_employment_sequence_run"
+                record["source_refs"].append(row_ref)
+                observed_components = record.setdefault("_observed_components", [])
+                if mode not in observed_components:
+                    observed_components.append(mode)
+                if mode == "provider":
+                    provider, provider_column, provider_resolution = (
+                        _employment_provider_observation(
+                            row,
+                            sequence_column=active_slots["sequence"],
+                        )
+                    )
+                    if provider_resolution == "source_absent" and provider:
+                        _mark_source_absent(record, "data_provider", provider)
+                    elif provider_resolution == "exact" and provider and provider_column is not None:
+                        provider_raw = _clean(
+                            row[provider_column]
+                            if provider_column < len(row)
+                            else provider
+                        )
+                        _merge_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=str(record["employment_record_id"]),
+                            field_name="data_provider",
+                            value=provider,
+                            raw=provider_raw,
+                            source_ref=_source_ref(
+                                page, table, row=row_index, column=provider_column
+                            ),
+                            parser_stage="candidate_b_employment_canonical_slots",
+                        )
+                    else:
+                        _report_employment_provider_unresolved(
+                            parse_result,
+                            record=record,
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                            resolution=provider_resolution,
+                        )
+                    continue
+                if mode == "basic" and basic_cluster_column is not None:
+                    target_record_id = str(record["employment_record_id"])
+                    source_ref = _source_ref(
+                        page,
+                        table,
+                        row=row_index,
+                        column=basic_cluster_column,
+                    )
+                    source_ref["binding"] = "closed_canonical_employment_cluster"
+                    source_ref["binding_quality"] = "closed_canonical_employment_cluster"
+                    decoded = decode_employment_basic_cluster(cluster_raw)
+                    for field_name, value in decoded.fields.items():
+                        _merge_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=target_record_id,
+                            field_name=field_name,
+                            value=value,
+                            raw=cluster_raw,
+                            source_ref=source_ref,
+                            parser_stage="candidate_b_employment_closed_cluster",
+                        )
+                    _report_collapsed_cluster_fields(
+                        parse_result,
+                        record,
+                        dataset="employment_records",
+                        target_record_id=target_record_id,
+                        raw=decoded.unresolved_residue or cluster_raw,
+                        source_ref=source_ref,
+                        unresolved_fields=decoded.unresolved_fields,
+                        parser_stage="candidate_b_employment_closed_cluster",
                     )
                     continue
-                role_text = _clean(row[1] if len(row) > 1 else "")
-                industry = "批发和零售业" if "批发和零售业" in role_text else ""
-                occupation = role_text.replace(industry, "").strip(" #*-.")
-                trailing = re.sub(
-                    r"\s+",
-                    " ",
-                    " ".join(_clean(value) for value in row[3:] if _clean(value)),
-                ).strip()
-                date_match = re.search(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", trailing)
-                updated = _date(date_match.group(0)) if date_match else None
-                before_date = trailing[: date_match.start()].strip() if date_match else trailing
-                entry_match = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", before_date)
-                detail = {
-                    "occupation": occupation,
-                    "industry": industry,
-                    "position": _clean(row[2] if len(row) > 2 else ""),
-                    "professional_title": re.sub(r"[\s#*\-.]+", "", before_date),
-                    "entry_year": int(entry_match.group(0)) if entry_match else None,
-                    "information_updated_date": updated,
-                }
-                records[sequence].update({key: value for key, value in detail.items() if value and value != "--"})
-                records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
-            used_provider_sequences: set[int] = set()
-            for row_index, row in enumerate(rows[institution_header + 1 :], start=institution_header + 1):
-                cells = [_clean(value) for value in row]
-                first = cells[0] if cells else ""
-                sequence_match = re.search(r"\d+", first)
-                sequence = int(sequence_match.group(0)) if sequence_match else None
-                institution = " ".join(
-                    value
-                    for index, value in enumerate(cells)
-                    if value and not (index == 0 and sequence_match is not None)
-                ).strip()
-                if sequence not in records:
-                    sequence = next(
-                        (candidate for candidate in sorted(records) if candidate not in used_provider_sequences),
-                        None,
+                if mode == "detail" and detail_header_clustered:
+                    _decode_clustered_employment_detail(
+                        parse_result,
+                        record=record,
+                        row=row,
+                        slots=active_slots,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
                     )
-                if sequence is None or sequence not in records or not institution:
                     continue
-                institution = re.sub(r"^[A-Za-z0-9#*.,'\"\s]+(?=[\u3400-\u9fff])", "", institution)
-                records[sequence]["data_provider"] = institution
-                records[sequence]["source_refs"].append(_source_ref(page, table, row=row_index))
-                used_provider_sequences.add(sequence)
+                row_basic_overflow: dict[str, str] = {}
+                if mode == "basic" and basic_header_recovered and pending_basic_overflow:
+                    # Header-cell overflow can only belong to the immediately
+                    # following keyed row.  Never carry it to a later record.
+                    row_basic_overflow = pending_basic_overflow
+                    pending_basic_overflow = {}
+                roles = basic_aliases if mode == "basic" else detail_aliases
+                for role in roles:
+                    if role == "sequence":
+                        continue
+                    raw = _slot_value(row, active_slots, role)
+                    ref = _source_ref(page, table, row=row_index, column=active_slots[role])
+                    if (
+                        mode == "basic"
+                        and basic_header_recovered
+                        and not raw
+                        and role in row_basic_overflow
+                    ):
+                        raw = row_basic_overflow[role]
+                        ref = _source_ref(
+                            page,
+                            table,
+                            row=basic_header_row_index,
+                            column=active_slots[role],
+                        )
+                    if is_explicit_source_absence(raw):
+                        _mark_source_absent(record, role, raw)
+                        continue
+                    if not raw:
+                        if not (mode == "basic" and basic_header_recovered):
+                            _report_employment_slot_unresolved(
+                                parse_result,
+                                record=record,
+                                field_name=role,
+                                row=row,
+                                page=page,
+                                table=table,
+                                row_index=row_index,
+                                column=active_slots[role],
+                            )
+                        continue
+                    target_record_id = str(record["employment_record_id"])
+                    if role == "entry_year":
+                        match = re.fullmatch(r"\D*((?:19|20)\d{2})\D*", raw)
+                        if match:
+                            _merge_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                value=int(match.group(1)),
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                        else:
+                            _reject_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                    elif role == "information_updated_date":
+                        _merge_canonical_date_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=target_record_id,
+                            field_name=role,
+                            raw=raw,
+                            source_ref=ref,
+                            parser_stage="candidate_b_employment_canonical_slots",
+                        )
+                    elif role == "employer_phone":
+                        phone = _canonical_employer_phone(raw)
+                        if phone is None:
+                            _reject_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                        else:
+                            _merge_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                value=phone,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                    elif role == "employer_type":
+                        employer_type = _finite_employment_value(raw, _EMPLOYER_TYPES)
+                        if employer_type:
+                            _merge_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                value=employer_type,
+                                raw=employer_type,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                        else:
+                            _reject_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                    elif role in _EMPLOYMENT_DETAIL_VOCABULARIES:
+                        canonical = _finite_employment_value(
+                            raw, _EMPLOYMENT_DETAIL_VOCABULARIES[role]
+                        )
+                        if canonical:
+                            _merge_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                value=canonical,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                        else:
+                            _reject_exact_observation(
+                                parse_result,
+                                record,
+                                dataset="employment_records",
+                                target_record_id=target_record_id,
+                                field_name=role,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_employment_canonical_slots",
+                            )
+                    elif role == "employer" and not validate_pboc_field(
+                        raw, "employer_name"
+                    ).valid:
+                        _reject_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=target_record_id,
+                            field_name=role,
+                            raw=raw,
+                            source_ref=ref,
+                            parser_stage="candidate_b_employment_canonical_slots",
+                        )
+                    elif role == "employer_address" and not validate_pboc_field(
+                        raw, "address"
+                    ).valid:
+                        _reject_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=target_record_id,
+                            field_name=role,
+                            raw=raw,
+                            source_ref=ref,
+                            parser_stage="candidate_b_employment_canonical_slots",
+                        )
+                    else:
+                        _merge_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="employment_records",
+                            target_record_id=target_record_id,
+                            field_name=role,
+                            value=raw,
+                            raw=raw,
+                            source_ref=ref,
+                            parser_stage="candidate_b_employment_canonical_slots",
+                        )
+                if mode == "basic" and basic_header_recovered:
+                    for unresolved_role in basic_aliases:
+                        if unresolved_role == "sequence":
+                            continue
+                        if (
+                            record.get(unresolved_role)
+                            or unresolved_role in record.get("_unresolved_fields", [])
+                            or unresolved_role in record.get("_source_absent_fields", [])
+                        ):
+                            continue
+                        _append_internal_field(record, "_unresolved_fields", unresolved_role)
+                        record["extraction_status"] = "review"
+                        _report_required_row_failure(
+                            parse_result,
+                            issue_code="candidate_b_employment_recovered_header_cell_unresolved",
+                            dataset="employment_records",
+                            sequence=sequence,
+                            field_name=unresolved_role,
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                            target_record_id=str(record["employment_record_id"]),
+                        )
+                required_roles = ("employer",) if mode == "basic" else (
+                    "occupation",
+                    "information_updated_date",
+                )
+                for required_role in required_roles:
+                    if (
+                        record.get(required_role)
+                        or required_role in record.get("_unresolved_fields", [])
+                        or required_role in record.get("_source_absent_fields", [])
+                    ):
+                        continue
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_employment_required_cell_unresolved",
+                        dataset="employment_records",
+                        sequence=sequence,
+                        field_name=required_role,
+                        row=row,
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        target_record_id=str(record["employment_record_id"]),
+                    )
+            previous_table_id = table_id or previous_table_id
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    _enforce_employment_record_contracts(parse_result, records.values())
+    _prune_resolved_employment_field_issues(parse_result, records.values())
     for sequence, record in records.items():
-        record["employment_record_id"] = stable_record_id(
-            "credit_employment",
-            sequence,
-            {key: value for key, value in record.items() if key not in {"source_refs", "confidence"}},
+        observed_components = set(record.get("_observed_components") or ())
+        missing_components = [
+            component
+            for component in ("basic", "detail", "provider")
+            if component not in observed_components
+        ]
+        if not missing_components:
+            continue
+        record["extraction_status"] = "review"
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_employment_component_missing",
+                message="A canonical employment row is missing one or more schema components.",
+                parser_stage="candidate_b_employment_canonical_slots",
+                target_dataset="employment_records",
+                target_record_id=str(record["employment_record_id"]),
+                field_name="employment_components",
+                observed_value={
+                    "sequence": sequence,
+                    "observed_components": sorted(observed_components),
+                },
+                candidate_value={"missing_components": missing_components},
+                source_refs=tuple(record.get("source_refs") or ()),
+                reason_codes=(
+                    "canonical_employment_row_observed",
+                    "component_population_incomplete",
+                    "row_marked_for_review",
+                ),
+            ),
         )
-    return [records[key] for key in sorted(records)]
+    output = [records[key] for key in sorted(records)]
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="employment_records",
+        aliases=basic_aliases,
+        records=output,
+    )
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="employment_records",
+        aliases=detail_aliases,
+        records=output,
+    )
+    return output
 
 
-def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
-    mobile_records: list[dict[str, Any]] = []
-    spouse_records: list[dict[str, Any]] = []
+def _credible_sequence_endpoint(values: set[int]) -> tuple[int | None, list[int]]:
+    """Return a dense sequence endpoint and isolate implausible OCR outliers."""
+    if not values:
+        return None, []
+    # Printed ordinals are dense within a PBOC account family. Permit a small
+    # number of missing observations, but never let one account identifier or
+    # OCR-joined number inflate the expected row count by dozens of records.
+    ceiling = max(3, len(values) + max(2, len(values) // 4))
+    credible = {value for value in values if 1 <= value <= ceiling}
+    outliers = sorted(values - credible)
+    return (max(credible) if credible else None), outliers
+
+
+def _inquiry_sequence_endpoint(
+    values: set[int],
+    dates_by_sequence: Mapping[int, set[str]] | None = None,
+) -> tuple[int | None, list[int]]:
+    """Trust exact inquiry ordinal cells while suppressing prefix bleed.
+
+    Unlike account-family discovery, a canonical inquiry sequence is already
+    bound to the exact leftmost header column, so a sparse high ordinal is
+    valid evidence of preceding rows.  The only bounded correction here is the
+    known watermark/neighbour prefix form (for example 89 read as 789).
+    """
+
+    retained = {value for value in values if 1 <= value <= 9999}
+    rejected: list[int] = []
+    dates = dates_by_sequence or {}
+    for value in sorted(retained):
+        if value < 100:
+            continue
+        suffix = value % 100
+        if suffix <= 0 or suffix >= value:
+            continue
+        actual_neighbours = value - 1 in retained or value + 1 in retained
+        same_date_duplicate = bool(
+            value >= 300
+            and suffix in retained
+            and dates.get(value)
+            and dates.get(suffix)
+            and dates[value] & dates[suffix]
+            and not actual_neighbours
+        )
+        bounded_prefix_between_neighbours = bool(
+            value >= 300
+            and suffix - 1 in retained
+            and suffix + 1 in retained
+            and not actual_neighbours
+        )
+        if same_date_duplicate or bounded_prefix_between_neighbours:
+            retained.discard(value)
+            rejected.append(value)
+    return (max(retained) if retained else None), rejected
+
+
+def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
+    """Inventory printed inquiry ordinals before any business row is emitted.
+
+    Inquiry rows are closed-world canonical records: institutional and personal
+    inquiry ordinals each restart at one.  Completeness therefore comes from
+    the printed ordinal populations, not from the subset of rows whose date,
+    institution, and reason all happened to decode.  Headerless physical-page
+    continuations remain attached to the last canonical four-column table.
+    """
+
+    aliases = {
+        "sequence": ("编号", "序号"),
+        "inquiry_date": ("查询日期",),
+        "institution": ("查询机构",),
+        "reason": ("查询原因",),
+    }
+    groups: list[dict[str, Any]] = []
+    active_group: dict[str, Any] | None = None
+    active_slots: dict[str, int] = {}
+
+    for page in getattr(parse_result, "pages", None) or []:
+        canonical_page = (
+            str(getattr(page, "canonical_template_id", "") or "")
+            == "annotations_and_inquiries"
+        )
+        page_had_inquiry_table = False
+        for table in getattr(page, "tables", None) or []:
+            rows = _table_rows(table)
+            if not rows:
+                continue
+            header_text = _compact("".join(_nonempty(rows[0])))
+            has_header = all(
+                marker in header_text
+                for marker in ("查询日期", "查询机构", "查询原因")
+            )
+            header_slots = _canonical_header_slots(
+                tuple(str(value or "") for value in rows[0]), aliases
+            )
+            first_value = _clean(rows[0][0] if rows[0] else "")
+            is_continuation = bool(
+                not has_header
+                and canonical_page
+                and active_group is not None
+                and "sequence" in active_slots
+                and re.fullmatch(r"\D*\d{1,4}\D*", first_value)
+            )
+            if has_header:
+                # Even a damaged/merged header is useful as a section boundary.
+                # The canonical printed sequence is the leftmost column, but no
+                # other field is guessed when its header binding is unresolved.
+                active_slots = dict(header_slots)
+                active_slots.setdefault("sequence", 0)
+                active_group = {"observations": [], "source_refs": []}
+                groups.append(active_group)
+                start = 1
+            elif is_continuation:
+                start = 0
+            else:
+                continue
+
+            page_had_inquiry_table = True
+            table_ref = _source_ref(page, table)
+            active_group["source_refs"].append(table_ref)
+            for row_index, row in enumerate(rows[start:], start=start):
+                cells = tuple(str(value or "").strip() for value in row)
+                raw_sequence = _slot_value(cells, active_slots, "sequence")
+                match = re.fullmatch(r"\D*(\d{1,4})\D*", raw_sequence)
+                if match is None:
+                    continue
+                sequence = int(match.group(1))
+                if sequence <= 0:
+                    continue
+                institution = _slot_value(cells, active_slots, "institution")
+                reason = _slot_value(cells, active_slots, "reason")
+                compact_institution = _compact(
+                    _normalized_inquiry_field("institution", institution)
+                )
+                compact_reason = _compact(_normalized_inquiry_field("reason", reason))
+                inquiry_type: str | None
+                if compact_institution == "本人" or compact_reason.startswith("本人查询"):
+                    inquiry_type = "personal"
+                elif compact_institution or compact_reason:
+                    inquiry_type = "institution"
+                else:
+                    inquiry_type = None
+                active_group["observations"].append(
+                    {
+                        "sequence": sequence,
+                        "inquiry_type": inquiry_type,
+                        "inquiry_date": _slot_value(cells, active_slots, "inquiry_date"),
+                        "source_ref": _source_ref(page, table, row=row_index),
+                    }
+                )
+
+        if not canonical_page and not page_had_inquiry_table:
+            active_group = None
+            active_slots = {}
+
+    # A header can repeat at a physical-page boundary.  If all readable rows in
+    # that group have one type, their unreadable neighbours share that canonical
+    # population.  A headerless group beginning above one likewise continues
+    # the nearest preceding typed population.  Mixed groups stay unclassified.
+    group_types: list[str | None] = []
+    for group in groups:
+        types = {
+            str(observation.get("inquiry_type"))
+            for observation in group["observations"]
+            if observation.get("inquiry_type")
+        }
+        group_types.append(next(iter(types)) if len(types) == 1 else None)
+    for index, group in enumerate(groups):
+        if group_types[index] is not None:
+            continue
+        sequences = {
+            int(observation["sequence"])
+            for observation in group["observations"]
+            if int(observation.get("sequence") or 0) > 0
+        }
+        if sequences and min(sequences) > 1:
+            preceding = next(
+                (group_types[cursor] for cursor in range(index - 1, -1, -1) if group_types[cursor]),
+                None,
+            )
+            if preceding:
+                group_types[index] = preceding
+
+    sequences_by_type: defaultdict[str, set[int]] = defaultdict(set)
+    dates_by_type: defaultdict[str, defaultdict[int, set[str]]] = defaultdict(
+        lambda: defaultdict(set)
+    )
+    unclassified_endpoints: list[int] = []
+    all_refs: list[dict[str, Any]] = []
+    for index, group in enumerate(groups):
+        group_type = group_types[index]
+        known_types = {
+            str(observation.get("inquiry_type"))
+            for observation in group["observations"]
+            if observation.get("inquiry_type")
+        }
+        group_sequences: set[int] = set()
+        for observation in group["observations"]:
+            explicit_type = observation.get("inquiry_type")
+            inquiry_type = group_type if len(known_types) <= 1 else explicit_type
+            sequence = int(observation.get("sequence") or 0)
+            if inquiry_type and sequence > 0:
+                sequences_by_type[str(inquiry_type)].add(sequence)
+                raw_date = _compact(observation.get("inquiry_date"))
+                if raw_date:
+                    dates_by_type[str(inquiry_type)][sequence].add(raw_date)
+            elif sequence > 0:
+                group_sequences.add(sequence)
+        if group_sequences:
+            endpoint, _outliers = _inquiry_sequence_endpoint(group_sequences)
+            if endpoint:
+                unclassified_endpoints.append(endpoint)
+        all_refs.extend(
+            dict(ref) for ref in group.get("source_refs") or () if isinstance(ref, Mapping)
+        )
+
+    endpoints: dict[str, int] = {}
+    outliers: dict[str, list[int]] = {}
+    observed: dict[str, list[int]] = {}
+    for inquiry_type, values in sequences_by_type.items():
+        endpoint, rejected = _inquiry_sequence_endpoint(
+            values, dates_by_type.get(inquiry_type)
+        )
+        if endpoint:
+            endpoints[inquiry_type] = endpoint
+        observed[inquiry_type] = sorted(values)
+        if rejected:
+            outliers[inquiry_type] = rejected
+
+    # Keep issue evidence compact and deterministic: one source table reference
+    # is sufficient to select each affected page for the one-shot repair pass.
+    unique_refs: list[dict[str, Any]] = []
+    seen_refs: set[str] = set()
+    for ref in all_refs:
+        marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+        if marker not in seen_refs:
+            seen_refs.add(marker)
+            unique_refs.append(ref)
+    expected = sum(endpoints.values()) + sum(unclassified_endpoints)
+    return {
+        **({"sequence_endpoints": endpoints} if endpoints else {}),
+        **({"observed_sequences": observed} if observed else {}),
+        **({"sequence_outliers": outliers} if outliers else {}),
+        **({"unclassified_sequence_endpoints": unclassified_endpoints} if unclassified_endpoints else {}),
+        **({"expected_row_count": expected} if expected else {}),
+        **({"source_refs": unique_refs} if unique_refs else {}),
+    }
+
+
+def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
+    """Count printed sequence evidence independently of emitted records."""
+    sequences: dict[str, set[int]] = {
+        "residence_records": set(),
+        "employment_records": set(),
+    }
     for page in getattr(parse_result, "pages", None) or []:
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
-            for row_index, row in enumerate(rows):
-                compact = _compact("".join(row))
-                if all(marker in compact for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")):
-                    for ordinal, (data_index, data_row) in enumerate(
-                        enumerate(rows[row_index + 1 :], start=row_index + 1),
-                        start=1,
-                    ):
-                        cells = [_clean(value) for value in data_row]
-                        phone = next((re.sub(r"\D", "", value) for value in cells if len(re.sub(r"\D", "", value)) == 11), "")
-                        updated = next((value for value in cells if re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", value)), "")
-                        if not phone or not updated:
-                            break
-                        sequence_match = re.fullmatch(r"\d{1,3}", cells[0] if cells else "")
-                        sequence = int(sequence_match.group(0)) if sequence_match else ordinal
-                        provider = next(
-                            (
-                                value
-                                for value in reversed(cells)
-                                if value and value not in {phone, updated} and re.search(r"[\u3400-\u9fff]", value)
-                            ),
-                            None,
-                        )
-                        mobile_id = stable_record_id("personal_mobile_phone", sequence, phone, updated)
-                        mobile_records.append(
-                            {
-                                "record_id": mobile_id,
-                                "mobile_phone_record_id": mobile_id,
-                                "sequence": sequence,
-                                "mobile_phone": phone,
-                                "information_updated_date": _date(updated),
-                                "data_provider": provider,
-                                "source": "native_personal_detail_profile_table",
-                                "source_refs": [_source_ref(page, table, row=data_index)],
-                                "confidence": 1.0,
-                            }
-                        )
-                if all(marker in compact for marker in ("姓名", "证件类型", "证件号码", "工作单位", "联系电话")):
-                    if row_index + 1 >= len(rows):
-                        continue
-                    values = [_clean(value) for value in rows[row_index + 1]]
-                    if not values or not values[0]:
-                        continue
-                    provider = None
-                    if row_index + 3 < len(rows) and "数据发生机构名称" in _compact("".join(rows[row_index + 2])):
-                        provider_values = _nonempty(rows[row_index + 3])
-                        provider = provider_values[0] if provider_values else None
-                    values.extend([""] * (5 - len(values)))
-                    spouse_id = stable_record_id("personal_spouse", values[0], values[2])
-                    spouse_records.append(
+            compact = _compact(" ".join(cell for row in rows for cell in row))
+            targets: list[str] = []
+            if any(marker in compact for marker in ("居住地址", "住宅电话", "居住状况")):
+                targets.append("residence_records")
+            if any(marker in compact for marker in ("工作单位", "单位性质", "进入本单位年份")) or all(
+                marker in compact for marker in ("职业", "行业", "职务", "职称")
+            ):
+                targets.append("employment_records")
+            for row in rows:
+                first = _clean(row[0] if row else "")
+                numbers = [int(value) for value in re.findall(r"\d{1,3}", first)]
+                sequence = numbers[0] if numbers and len(set(numbers)) == 1 else None
+                if sequence is not None and 1 <= sequence <= 20:
+                    for target in targets:
+                        sequences[target].add(sequence)
+
+    # Account numbers restart for each PBOC account family, so count the
+    # maximum printed endpoint within each observed family instead of taking
+    # one document-wide maximum.
+    family = ""
+    family_sequences: defaultdict[str, set[int]] = defaultdict(set)
+    loader = getattr(parse_result, "corrected_evidence_pages", None)
+    pages = loader() if callable(loader) else []
+    for page in pages or []:
+        for line in page.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            text = _compact(line.get("text") or line.get("content") or "")
+            heading = _account_family_from_heading(text)
+            if heading is not None:
+                family = heading[0]
+            match = re.match(r"^(?:账户|业务)[（(]?(\d{1,3})(?:[）)]|\D|$)", text)
+            if match and family:
+                family_sequences[family].add(int(match.group(1)))
+
+    # Agreement cards are repeated labelled records, and a parser that emits
+    # one valid card cannot use that partial success as evidence that the
+    # section is complete.  Count both printed ordinals and repeated primary
+    # labels directly from canonical page evidence before business repair.
+    agreement_sequences: set[int] = set()
+    agreement_label_count = 0
+    agreement_refs: list[dict[str, Any]] = []
+    active_agreements = False
+    agreement_heading = "授信协议信息"
+    agreement_label = "授信协议标识"
+    agreement_anchor = re.compile(r"授信协议\s*(\d{1,3})")
+    agreement_end_markers = (
+        "非信贷交易信息明细",
+        "公共信息明细",
+        "异议标注",
+        "查询记录",
+        "报告说明",
+    )
+    for page in pages or []:
+        logical_page = int(page.get("page") or 0)
+        source_page = int(page.get("source_page") or logical_page)
+        page_observed = False
+        for line in page.get("lines") or []:
+            if not isinstance(line, Mapping):
+                continue
+            text = _compact(line.get("text") or line.get("content") or "")
+            if agreement_heading in text:
+                active_agreements = True
+                page_observed = True
+            if not active_agreements and agreement_anchor.search(text):
+                # A damaged/missing section heading must not hide an explicit
+                # agreement ordinal.  The primary label alone is insufficient:
+                # it also appears in ordinary account-detail headings.
+                active_agreements = True
+            if not active_agreements:
+                continue
+            matches = [int(match.group(1)) for match in agreement_anchor.finditer(text)]
+            if matches:
+                agreement_sequences.update(value for value in matches if 1 <= value <= 100)
+                page_observed = True
+            label_occurrences = text.count(agreement_label)
+            if label_occurrences:
+                agreement_label_count += label_occurrences
+                page_observed = True
+            if any(marker in text for marker in agreement_end_markers):
+                active_agreements = False
+        if page_observed and logical_page > 0:
+            agreement_refs.append(
+                {
+                    "source": "candidate_b_source_coverage_ledger",
+                    "logical_page": logical_page,
+                    "source_page": source_page,
+                    "geometry_scope": "logical_page",
+                }
+            )
+
+    endpoints: dict[str, int] = {}
+    sequence_outliers: dict[str, list[int]] = {}
+    for account_family, values in family_sequences.items():
+        endpoint, outliers = _credible_sequence_endpoint(values)
+        if endpoint is not None:
+            endpoints[account_family] = endpoint
+        if outliers:
+            sequence_outliers[account_family] = outliers
+
+    agreement_endpoint, agreement_outliers = _credible_sequence_endpoint(agreement_sequences)
+    inquiry_coverage = _inquiry_source_coverage(parse_result)
+    # Every canonical agreement card has a printed ordinal.  Once at least one
+    # credible ordinal is available, its dense endpoint is a stronger
+    # population witness than raw primary-label occurrences: corrected logical
+    # pages can contain overlapping evidence fragments and therefore repeat the
+    # same ``授信协议标识`` label.  Treating those duplicate labels as extra cards
+    # creates a false partial-dataset report even when all printed ordinals were
+    # recovered.  Label counting remains the fallback for a section whose
+    # ordinal headings are completely unreadable.
+    agreement_expected = agreement_endpoint or agreement_label_count
+    source_refs: dict[str, list[dict[str, Any]]] = {}
+    if agreement_refs:
+        source_refs["credit_lines"] = agreement_refs
+    if inquiry_coverage.get("source_refs"):
+        source_refs["inquiry_records"] = list(inquiry_coverage["source_refs"])
+    return {
+        "sequence_endpoints": {
+            name: max(values)
+            for name, values in sequences.items()
+            if values
+        },
+        **({"credit_accounts": sum(endpoints.values())} if endpoints else {}),
+        **({"credit_agreements": agreement_expected} if agreement_expected else {}),
+        **({"credit_agreement_sequence_endpoint": agreement_endpoint} if agreement_endpoint else {}),
+        **({"credit_agreement_sequence_outliers": agreement_outliers} if agreement_outliers else {}),
+        **(
+            {"inquiry_records": int(inquiry_coverage["expected_row_count"])}
+            if inquiry_coverage.get("expected_row_count")
+            else {}
+        ),
+        **(
+            {"inquiry_sequence_endpoints": dict(inquiry_coverage["sequence_endpoints"])}
+            if inquiry_coverage.get("sequence_endpoints")
+            else {}
+        ),
+        **(
+            {"inquiry_observed_sequences": dict(inquiry_coverage["observed_sequences"])}
+            if inquiry_coverage.get("observed_sequences")
+            else {}
+        ),
+        **(
+            {"inquiry_sequence_outliers": dict(inquiry_coverage["sequence_outliers"])}
+            if inquiry_coverage.get("sequence_outliers")
+            else {}
+        ),
+        **(
+            {
+                "inquiry_unclassified_sequence_endpoints": list(
+                    inquiry_coverage["unclassified_sequence_endpoints"]
+                )
+            }
+            if inquiry_coverage.get("unclassified_sequence_endpoints")
+            else {}
+        ),
+        **({"account_family_endpoints": dict(endpoints)} if endpoints else {}),
+        **({"account_family_sequence_outliers": sequence_outliers} if sequence_outliers else {}),
+        **({"source_refs": source_refs} if source_refs else {}),
+    }
+
+
+def _record_pre_repair_source_gaps(
+    parse_result: Any,
+    datasets: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish source-population gaps early enough to select repair pages.
+
+    The final completeness pass remains authoritative.  This early pass exists
+    solely so a record that was never instantiated can still trigger the one
+    allowed page repair instead of disappearing silently.
+    """
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    ledger = _source_completeness_ledger(parse_result)
+    source_refs = ledger.get("source_refs") if isinstance(ledger.get("source_refs"), Mapping) else {}
+    checks = (
+        ("credit_lines", "credit_agreements"),
+        ("inquiry_records", "inquiry_records"),
+    )
+    for dataset_name, ledger_name in checks:
+        expected = ledger.get(ledger_name)
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+            continue
+        observed = sum(isinstance(row, Mapping) for row in datasets.get(dataset_name) or ())
+        if observed >= expected:
+            continue
+        record_issue(
+            parse_result,
+            make_issue(
+                category="page_continuation",
+                issue_code="source_sequence_or_count_gap",
+                message=(
+                    "Independent canonical section evidence contains more records than the first schema pass; "
+                    "the affected pages must be repaired before completeness is decided."
+                ),
+                parser_stage="candidate_b_pre_repair_source_coverage",
+                target_dataset=dataset_name,
+                observed_value={"observed_row_count": observed},
+                candidate_value={
+                    "source_expected_row_count": expected,
+                    **(
                         {
+                            "source_sequence_endpoints": ledger.get(
+                                "inquiry_sequence_endpoints", {}
+                            ),
+                            "unclassified_sequence_endpoints": ledger.get(
+                                "inquiry_unclassified_sequence_endpoints", []
+                            ),
+                        }
+                        if dataset_name == "inquiry_records"
+                        else {}
+                    ),
+                },
+                source_refs=(source_refs.get(dataset_name) or ()),
+                reason_codes=(
+                    "independent_source_ledger",
+                    "missing_business_records",
+                    "schema_triggered_page_repair_eligible",
+                    "no_missing_row_invented",
+                ),
+            ),
+        )
+    return ledger
+
+
+def _collapsed_mobile_observation(row: tuple[str, ...]) -> dict[str, Any] | None:
+    """Decode a canonical mobile row whose labels and values share cells.
+
+    Some OCR table reconstructions preserve the three printed physical cells
+    but flatten the header and first (or only) data row into those cells.  This
+    path is intentionally narrow: both the phone and its printed ordinal must
+    be unique before a business row can be keyed.
+    """
+
+    compact_row = _compact("".join(row))
+    if not all(
+        marker in compact_row
+        for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")
+    ):
+        return None
+    sequence_columns = [index for index, cell in enumerate(row) if "编号" in _compact(cell)]
+    phone_columns = [index for index, cell in enumerate(row) if "手机号码" in _compact(cell)]
+    if (
+        len(sequence_columns) != 1
+        or len(phone_columns) != 1
+        or sequence_columns[0] != phone_columns[0]
+    ):
+        return None
+    shared_column = sequence_columns[0]
+    shared_text = _clean(row[shared_column])
+    phone_matches = re.findall(r"(?<!\d)1[3-9]\d{9}(?!\d)", shared_text)
+    if len(set(phone_matches)) != 1:
+        return None
+    phone = phone_matches[0]
+    sequence_residue = shared_text.replace(phone, " ")
+    sequence_residue = re.sub(r"手机号码|编号", " ", sequence_residue)
+    sequences = {
+        int(match)
+        for match in re.findall(r"(?<!\d)\d{1,3}(?!\d)", sequence_residue)
+        if 1 <= int(match) <= 999
+    }
+    if len(sequences) != 1:
+        return None
+
+    updated_columns = [
+        index for index, cell in enumerate(row) if "信息更新日期" in _compact(cell)
+    ]
+    provider_columns = [
+        index for index, cell in enumerate(row) if "数据发生机构名称" in _compact(cell)
+    ]
+    updated_raw = ""
+    updated_column = updated_columns[0] if len(updated_columns) == 1 else shared_column
+    if len(updated_columns) == 1:
+        matches = list(_DATE_RE.finditer(str(row[updated_column] or "")))
+        if len(matches) == 1:
+            updated_raw = matches[0].group(0)
+    provider = ""
+    provider_column = provider_columns[-1] if provider_columns else shared_column
+    if provider_columns:
+        provider_text = str(row[provider_column] or "")
+        provider = _clean(provider_text.rsplit("数据发生机构名称", 1)[-1])
+    return {
+        "sequence": next(iter(sequences)),
+        "mobile_phone": phone,
+        "information_updated_date": updated_raw,
+        "data_provider": provider,
+        "columns": {
+            "sequence": shared_column,
+            "mobile_phone": shared_column,
+            "information_updated_date": updated_column,
+            "data_provider": provider_column,
+        },
+    }
+
+
+def _materialize_mobile_record(
+    parse_result: Any,
+    records: dict[int, dict[str, Any]],
+    *,
+    page: Any,
+    table: Any,
+    row: tuple[str, ...],
+    row_index: int,
+    sequence: int,
+    values: Mapping[str, str],
+    columns: Mapping[str, int],
+) -> None:
+    mobile_id = stable_record_id("personal_mobile_phone", sequence)
+    record = records.setdefault(
+        sequence,
+        {
+            "record_id": mobile_id,
+            "mobile_phone_record_id": mobile_id,
+            "sequence": sequence,
+            "source": "native_personal_detail_profile_table",
+            "source_refs": [],
+            "confidence": 1.0,
+        },
+    )
+    record["source_refs"].append(_source_ref(page, table, row=row_index))
+    raw_phone = _clean(values.get("mobile_phone"))
+    phone = re.sub(r"\D", "", raw_phone)
+    phone_column = int(columns.get("mobile_phone", 0) or 0)
+    phone_ref = _source_ref(page, table, row=row_index, column=phone_column)
+    if not raw_phone:
+        _report_required_row_failure(
+            parse_result,
+            issue_code="candidate_b_mobile_row_unresolved",
+            dataset="mobile_phone_records",
+            sequence=sequence,
+            field_name="mobile_phone",
+            row=row,
+            page=page,
+            table=table,
+            row_index=row_index,
+            target_record_id=mobile_id,
+        )
+    elif raw_phone == "--":
+        _mark_source_absent(record, "mobile_phone", raw_phone)
+    elif any(character.isalpha() for character in raw_phone) or not re.fullmatch(
+        r"1[3-9]\d{9}", phone
+    ):
+        _reject_exact_observation(
+            parse_result,
+            record,
+            dataset="mobile_phone_records",
+            target_record_id=mobile_id,
+            field_name="mobile_phone",
+            raw=raw_phone,
+            source_ref=phone_ref,
+            parser_stage="candidate_b_mobile_canonical_slots",
+        )
+    else:
+        _merge_exact_observation(
+            parse_result,
+            record,
+            dataset="mobile_phone_records",
+            target_record_id=mobile_id,
+            field_name="mobile_phone",
+            value=phone,
+            raw=raw_phone,
+            source_ref=phone_ref,
+            parser_stage="candidate_b_mobile_canonical_slots",
+        )
+
+    raw_updated = _clean(values.get("information_updated_date"))
+    updated_column = int(columns.get("information_updated_date", 0) or 0)
+    updated_ref = _source_ref(page, table, row=row_index, column=updated_column)
+    if raw_updated and not is_explicit_source_absence(raw_updated):
+        _merge_canonical_date_observation(
+            parse_result,
+            record,
+            dataset="mobile_phone_records",
+            target_record_id=mobile_id,
+            field_name="information_updated_date",
+            raw=raw_updated,
+            source_ref=updated_ref,
+            parser_stage="candidate_b_mobile_canonical_slots",
+        )
+    elif is_explicit_source_absence(raw_updated):
+        _mark_source_absent(record, "information_updated_date", raw_updated)
+    else:
+        _report_required_row_failure(
+            parse_result,
+            issue_code="candidate_b_mobile_row_unresolved",
+            dataset="mobile_phone_records",
+            sequence=sequence,
+            field_name="information_updated_date",
+            row=row,
+            page=page,
+            table=table,
+            row_index=row_index,
+            target_record_id=mobile_id,
+        )
+
+    provider = _clean(values.get("data_provider"))
+    provider_column = int(columns.get("data_provider", 0) or 0)
+    if provider == "--":
+        _mark_source_absent(record, "data_provider", provider)
+    elif provider:
+        _merge_exact_observation(
+            parse_result,
+            record,
+            dataset="mobile_phone_records",
+            target_record_id=mobile_id,
+            field_name="data_provider",
+            value=provider,
+            raw=provider,
+            source_ref=_source_ref(page, table, row=row_index, column=provider_column),
+            parser_stage="candidate_b_mobile_canonical_slots",
+        )
+    else:
+        _report_required_row_failure(
+            parse_result,
+            issue_code="candidate_b_mobile_row_unresolved",
+            dataset="mobile_phone_records",
+            sequence=sequence,
+            field_name="data_provider",
+            row=row,
+            page=page,
+            table=table,
+            row_index=row_index,
+            target_record_id=mobile_id,
+        )
+
+
+def _extract_profile_detail_records(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
+    mobile_aliases = {
+        "sequence": ("编号",),
+        "mobile_phone": ("手机号码",),
+        "information_updated_date": ("信息更新日期",),
+        "data_provider": ("数据发生机构名称",),
+    }
+    spouse_aliases = {
+        "name": ("姓名",),
+        "document_type": ("证件类型",),
+        "document_number": ("证件号码",),
+        "employer": ("工作单位",),
+        "phone": ("联系电话",),
+    }
+    mobile_records: dict[int, dict[str, Any]] = {}
+    spouse_record: dict[str, Any] | None = None
+    active_slots: dict[str, int] = {}
+    mode = ""
+    spouse_observed = False
+    previous_table_id = ""
+    continuation_check = getattr(parse_result, "tables_continue", None)
+    for page in getattr(parse_result, "pages", None) or []:
+        for table in getattr(page, "tables", None) or []:
+            rows = _table_rows(table)
+            table_id = str(getattr(table, "table_id", "") or "")
+            continues = bool(
+                previous_table_id
+                and table_id
+                and callable(continuation_check)
+                and continuation_check(previous_table_id, table_id) is True
+            )
+            if not continues:
+                active_slots = {}
+                mode = ""
+                spouse_observed = False
+            for row_index, row in enumerate(rows):
+                mobile_slots = _canonical_header_slots(row, mobile_aliases)
+                spouse_slots = _canonical_header_slots(row, spouse_aliases)
+                compact_header = _compact("".join(row))
+                collapsed_mobile = (
+                    _collapsed_mobile_observation(row)
+                    if not set(mobile_aliases) <= set(mobile_slots)
+                    else None
+                )
+                if collapsed_mobile is not None:
+                    _materialize_mobile_record(
+                        parse_result,
+                        mobile_records,
+                        page=page,
+                        table=table,
+                        row=row,
+                        row_index=row_index,
+                        sequence=int(collapsed_mobile["sequence"]),
+                        values={
+                            role: str(collapsed_mobile.get(role) or "")
+                            for role in ("mobile_phone", "information_updated_date", "data_provider")
+                        },
+                        columns=collapsed_mobile["columns"],
+                    )
+                    active_slots = {}
+                    mode = ""
+                    continue
+                broken_mobile = all(
+                    marker in compact_header
+                    for marker in ("编号", "手机号码", "信息更新日期", "数据发生机构名称")
+                ) and not set(mobile_aliases) <= set(mobile_slots)
+                broken_mobile = broken_mobile or (
+                    len(mobile_slots) >= 2
+                    and not set(mobile_aliases) <= set(mobile_slots)
+                )
+                broken_spouse = all(
+                    marker in compact_header for marker in ("姓名", "证件类型", "证件号码", "工作单位", "联系电话")
+                ) and not set(spouse_aliases) <= set(spouse_slots)
+                broken_spouse = broken_spouse or (
+                    len(spouse_slots) >= 2
+                    and not set(spouse_aliases) <= set(spouse_slots)
+                )
+                if broken_mobile or broken_spouse:
+                    _report_header_graph_failure(
+                        parse_result,
+                        dataset="mobile_phone_records" if broken_mobile else "spouse_records",
+                        page=page,
+                        table=table,
+                        row_index=row_index,
+                        row=row,
+                    )
+                    active_slots = {}
+                    mode = ""
+                    continue
+                if set(mobile_aliases) <= set(mobile_slots):
+                    active_slots = mobile_slots
+                    mode = "mobile"
+                    continue
+                if set(spouse_aliases) <= set(spouse_slots):
+                    active_slots = spouse_slots
+                    mode = "spouse"
+                    continue
+                if "数据发生机构名称" in _compact("".join(row)) and spouse_observed:
+                    active_slots = _canonical_header_slots(
+                        row, {"sequence": ("编号",), "data_provider": ("数据发生机构名称",)}
+                    )
+                    mode = "spouse_provider"
+                    continue
+                if not active_slots:
+                    continue
+                if mode == "mobile":
+                    sequence = _sequence_value(row, active_slots)
+                    if sequence is None:
+                        if _nonempty(row):
+                            _report_unkeyed_business_row(
+                                parse_result,
+                                dataset="mobile_phone_records",
+                                row=row,
+                                page=page,
+                                table=table,
+                                row_index=row_index,
+                            )
+                        continue
+                    _materialize_mobile_record(
+                        parse_result,
+                        mobile_records,
+                        page=page,
+                        table=table,
+                        row=row,
+                        row_index=row_index,
+                        sequence=sequence,
+                        values={
+                            role: _slot_value(row, active_slots, role)
+                            for role in ("mobile_phone", "information_updated_date", "data_provider")
+                        },
+                        columns=active_slots,
+                    )
+                elif mode == "spouse":
+                    values = {
+                        role: _slot_value(row, active_slots, role)
+                        for role in spouse_aliases
+                    }
+                    row_is_source_absent = bool(values) and all(
+                        not value or is_explicit_source_absence(value)
+                        for value in values.values()
+                    )
+                    if not any(value for value in values.values()) or row_is_source_absent:
+                        spouse_observed = row_is_source_absent
+                        continue
+                    spouse_id = stable_record_id("personal_spouse", 1)
+                    if spouse_record is None:
+                        spouse_record = {
                             "record_id": spouse_id,
                             "spouse_record_id": spouse_id,
-                            "name": values[0],
-                            **({"document_type": values[1]} if values[1] and values[1] != "--" else {}),
-                            **({"document_number": values[2]} if values[2] and values[2] != "--" else {}),
-                            **({"employer": values[3]} if values[3] and values[3] != "--" else {}),
-                            **({"phone": values[4]} if values[4] and values[4] != "--" else {}),
-                            "data_provider": provider,
                             "source": "native_personal_detail_profile_table",
-                            "source_refs": [_source_ref(page, table, row=row_index + 1)],
+                            "source_refs": [],
                             "confidence": 1.0,
                         }
-                    )
+                    spouse_record["source_refs"].append(_source_ref(page, table, row=row_index))
+                    spouse_observed = True
+                    for role, raw in values.items():
+                        if is_explicit_source_absence(raw):
+                            _mark_source_absent(spouse_record, role, raw)
+                            continue
+                        if not raw:
+                            continue
+                        ref = _source_ref(page, table, row=row_index, column=active_slots[role])
+                        valid = True
+                        normalized = raw
+                        if role == "phone":
+                            digits = re.sub(r"\D", "", raw)
+                            valid = not any(character.isalpha() for character in raw) and 5 <= len(digits) <= 16
+                        elif role == "name":
+                            valid = bool(re.search(r"[\u3400-\u9fffA-Za-z]", raw)) and _compact(raw) not in _ACCOUNT_LABELS
+                        elif role == "document_number":
+                            compact_number = re.sub(r"\s+", "", raw)
+                            valid = bool(re.fullmatch(r"[A-Za-z0-9()（）-]{4,40}", compact_number))
+                            normalized = compact_number
+                        if valid:
+                            _merge_exact_observation(
+                                parse_result,
+                                spouse_record,
+                                dataset="spouse_records",
+                                target_record_id=spouse_id,
+                                field_name=role,
+                                value=normalized,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_spouse_canonical_slots",
+                            )
+                        else:
+                            _reject_exact_observation(
+                                parse_result,
+                                spouse_record,
+                                dataset="spouse_records",
+                                target_record_id=spouse_id,
+                                field_name=role,
+                                raw=raw,
+                                source_ref=ref,
+                                parser_stage="candidate_b_spouse_canonical_slots",
+                            )
+                    if (
+                        not spouse_record.get("name")
+                        and "name" not in set(spouse_record.get("_source_absent_fields") or ())
+                    ):
+                        _report_required_row_failure(
+                            parse_result,
+                            issue_code="candidate_b_spouse_row_unresolved",
+                            dataset="spouse_records",
+                            sequence=1,
+                            field_name="name",
+                            row=row,
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                            target_record_id=spouse_id,
+                        )
+                elif mode == "spouse_provider" and spouse_record is not None:
+                    provider = _slot_value(row, active_slots, "data_provider")
+                    if is_explicit_source_absence(provider):
+                        _mark_source_absent(spouse_record, "data_provider", provider)
+                    elif provider:
+                        ref = _source_ref(
+                            page, table, row=row_index, column=active_slots["data_provider"]
+                        )
+                        spouse_record["source_refs"].append(ref)
+                        _merge_exact_observation(
+                            parse_result,
+                            spouse_record,
+                            dataset="spouse_records",
+                            target_record_id=str(spouse_record["spouse_record_id"]),
+                            field_name="data_provider",
+                            value=provider,
+                            raw=provider,
+                            source_ref=ref,
+                            parser_stage="candidate_b_spouse_canonical_slots",
+                        )
+            previous_table_id = table_id or previous_table_id
+    mobile_output = [mobile_records[key] for key in sorted(mobile_records)]
+    spouse_output = [spouse_record] if spouse_record is not None else []
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="mobile_phone_records",
+        aliases=mobile_aliases,
+        records=mobile_output,
+    )
+    _enforce_observed_header_terminal_invariant(
+        parse_result,
+        dataset="spouse_records",
+        aliases=spouse_aliases,
+        records=spouse_output,
+    )
     return {
-        "mobile_phone_records": mobile_records,
-        "spouse_records": spouse_records,
+        "mobile_phone_records": mobile_output,
+        "spouse_records": spouse_output,
     }
 
 
@@ -1506,53 +11368,153 @@ def _extract_personal_notes(parse_result: Any) -> tuple[list[dict[str, Any]], li
             for row_index, row in enumerate(rows):
                 compact = _compact("".join(row))
                 if all(marker in compact for marker in ("编号", "标注内容", "添加日期")):
-                    for data_index, data_row in enumerate(rows[row_index + 1 :], start=row_index + 1):
-                        values = _nonempty(data_row)
-                        if len(values) < 3 or not values[0].isdigit():
-                            break
-                        text = values[1]
-                        annotations.append(
-                            {
-                                "id": stable_record_id("personal_detail_annotation", page_number, text, values[2]),
-                                "note_type": "report_annotation",
-                                "text": text,
-                                "added_date": _date(values[2]),
-                                "logical_page": page_number,
-                                "source_page": source_page,
-                                "source": "native_personal_detail_note_table",
-                                "source_refs": [_source_ref(page, table, row=data_index)],
-                                "confidence": 1.0,
-                            }
+                    slots = _canonical_header_slots(
+                        tuple(row),
+                        {"sequence": ("编号",), "text": ("标注内容",), "added_date": ("添加日期",)},
+                    )
+                    if set(slots) != {"sequence", "text", "added_date"}:
+                        _report_header_graph_failure(
+                            parse_result,
+                            dataset="annotation_statements",
+                            page=page,
+                            table=table,
+                            row_index=row_index,
+                            row=tuple(row),
                         )
+                        continue
+                    for data_index, data_row in enumerate(rows[row_index + 1 :], start=row_index + 1):
+                        physical = tuple(data_row)
+                        sequence = _sequence_value(physical, slots)
+                        if sequence is None:
+                            if _slot_value(physical, slots, "sequence"):
+                                _report_unkeyed_business_row(
+                                    parse_result,
+                                    dataset="annotation_statements",
+                                    row=physical,
+                                    page=page,
+                                    table=table,
+                                    row_index=data_index,
+                                )
+                            break
+                        target_id = stable_record_id("personal_detail_annotation", sequence)
+                        record: dict[str, Any] = {
+                            "id": target_id,
+                            "annotation_id": target_id,
+                            "sequence": sequence,
+                            "note_type": "report_annotation",
+                            "logical_page": page_number,
+                            "source_page": source_page,
+                            "source": "native_personal_detail_note_table",
+                            "source_refs": [_source_ref(page, table, row=data_index)],
+                            "confidence": float(getattr(table, "confidence", None) or 0.9),
+                        }
+                        for role, field_name, kind in (
+                            ("text", "text", "text"),
+                            ("added_date", "added_date", "date"),
+                        ):
+                            raw = _slot_value(physical, slots, role)
+                            ref = _source_ref(page, table, row=data_index, column=slots[role])
+                            value = _date(raw) if kind == "date" else _clean(raw)
+                            if value in (None, ""):
+                                _reject_exact_observation(
+                                    parse_result,
+                                    record,
+                                    dataset="annotation_statements",
+                                    target_record_id=f"annotation_statement:{target_id}",
+                                    field_name=field_name,
+                                    raw=raw,
+                                    source_ref=ref,
+                                    parser_stage="candidate_b_note_canonical_slots",
+                                )
+                            else:
+                                _merge_exact_observation(
+                                    parse_result,
+                                    record,
+                                    dataset="annotation_statements",
+                                    target_record_id=f"annotation_statement:{target_id}",
+                                    field_name=field_name,
+                                    value=value,
+                                    raw=raw,
+                                    source_ref=ref,
+                                    parser_stage="candidate_b_note_canonical_slots",
+                                )
+                        annotations.append(record)
                 marker = next(
                     (candidate for candidate in ("异议标注", "本人声明", "机构说明") if candidate in compact),
                     None,
                 )
                 if marker is None or row_index + 1 >= len(rows):
                     continue
-                values = _nonempty(rows[row_index + 1])
+                # A standalone canonical heading is followed by one narrative
+                # cell (and, for annotation forms, optionally one date cell).
+                # Multiple free-floating cells are not concatenated into an
+                # unstructured text blob.
+                if any(label in compact for label in ("编号", "标注内容", "添加日期")):
+                    continue
+                next_compact = _compact("".join(rows[row_index + 1]))
+                if all(label in next_compact for label in ("编号", "标注内容", "添加日期")):
+                    continue
+                values = [
+                    (column, _clean(value))
+                    for column, value in enumerate(rows[row_index + 1])
+                    if _clean(value)
+                ]
                 if not values:
                     continue
-                text = values[0]
-                added_date = _date(values[-1]) if len(values) > 1 else None
                 target = annotations if marker == "异议标注" else statements
-                target.append(
-                    {
-                        "id": stable_record_id("personal_detail_note", marker, page_number, text, added_date),
-                        "note_type": {
-                            "异议标注": "dispute_annotation",
-                            "本人声明": "subject_statement",
-                            "机构说明": "institution_statement",
-                        }[marker],
-                        "text": text,
-                        "added_date": added_date,
-                        "logical_page": page_number,
-                        "source_page": source_page,
-                        "source": "native_personal_detail_note_table",
-                        "source_refs": [_source_ref(page, table, row=row_index + 1)],
-                        "confidence": 1.0,
-                    }
-                )
+                target_id = stable_record_id("personal_detail_note", marker, page_number, row_index)
+                record = {
+                    "id": target_id,
+                    (
+                        "annotation_id"
+                        if marker == "异议标注"
+                        else "statement_id"
+                    ): target_id,
+                    "note_type": {
+                        "异议标注": "dispute_annotation",
+                        "本人声明": "subject_statement",
+                        "机构说明": "institution_statement",
+                    }[marker],
+                    "logical_page": page_number,
+                    "source_page": source_page,
+                    "source": "native_personal_detail_note_table",
+                    "source_refs": [_source_ref(page, table, row=row_index + 1)],
+                    "confidence": float(getattr(table, "confidence", None) or 0.9),
+                }
+                text_column, text = values[0]
+                if len(values) > 2 or (len(values) == 2 and _date(values[1][1]) is None):
+                    _report_required_row_failure(
+                        parse_result,
+                        issue_code="candidate_b_note_narrative_cells_unresolved",
+                        dataset="annotation_statements",
+                        sequence=len(target) + 1,
+                        field_name="text",
+                        row=tuple(rows[row_index + 1]),
+                        page=page,
+                        table=table,
+                        row_index=row_index + 1,
+                        target_record_id=f"annotation_statement:{target_id}",
+                    )
+                    _append_internal_field(record, "_unresolved_fields", "text")
+                else:
+                    _merge_exact_observation(
+                        parse_result,
+                        record,
+                        dataset="annotation_statements",
+                        target_record_id=f"annotation_statement:{target_id}",
+                        field_name="text",
+                        value=text,
+                        raw=text,
+                        source_ref=_source_ref(page, table, row=row_index + 1, column=text_column),
+                        parser_stage="candidate_b_note_narrative_slot",
+                    )
+                    if len(values) == 2:
+                        date_column, date_raw = values[1]
+                        record["added_date"] = _date(date_raw)
+                        record.setdefault("source_refs_by_field", {})["added_date"] = [
+                            _source_ref(page, table, row=row_index + 1, column=date_column)
+                        ]
+                target.append(record)
     return annotations, statements
 
 
@@ -1582,6 +11544,101 @@ def _extract_source_rows(parse_result: Any) -> list[dict[str, Any]]:
     return records
 
 
+def _decode_exact_label_card(
+    parse_result: Any,
+    *,
+    page: Any,
+    table: Any,
+    dataset: str,
+    target_record_id: str,
+    fields: Mapping[str, tuple[tuple[str, ...], str]],
+) -> dict[str, Any]:
+    """Decode a canonical label/value card without compacting physical cells."""
+
+    rows = _table_rows(table)
+    observations, unresolved = _exact_label_observations(rows)
+    record: dict[str, Any] = {"source_refs": [_source_ref(page, table)]}
+    for field_name, (labels, kind) in fields.items():
+        candidates = [item for label in labels for item in observations.get(_compact(label), ())]
+        if not candidates:
+            label_location = next(
+                ((row, column) for label, row, column in unresolved if label in {_compact(item) for item in labels}),
+                None,
+            )
+            row_index = label_location[0] if label_location is not None else 0
+            _report_required_row_failure(
+                parse_result,
+                issue_code="candidate_b_canonical_card_field_unresolved",
+                dataset=dataset,
+                sequence=1,
+                field_name=field_name,
+                row=tuple(rows[row_index]) if row_index < len(rows) else (),
+                page=page,
+                table=table,
+                row_index=row_index,
+                target_record_id=target_record_id,
+            )
+            _append_internal_field(record, "_unresolved_fields", field_name)
+            continue
+        for raw, row_index, column in candidates:
+            ref = _source_ref(page, table, row=row_index, column=column)
+            if _compact(raw) in {"-", "--", "---"}:
+                _mark_source_absent(record, field_name, raw)
+                continue
+            if kind == "date":
+                value = _date(raw)
+            elif kind == "number":
+                candidate = _number(raw)
+                value = candidate if isinstance(candidate, int) and not isinstance(candidate, bool) else None
+            else:
+                value = _clean(raw)
+            if value in (None, ""):
+                _reject_exact_observation(
+                    parse_result,
+                    record,
+                    dataset=dataset,
+                    target_record_id=target_record_id,
+                    field_name=field_name,
+                    raw=raw,
+                    source_ref=ref,
+                    parser_stage="candidate_b_canonical_label_card",
+                )
+                continue
+            _merge_exact_observation(
+                parse_result,
+                record,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name=field_name,
+                value=value,
+                raw=raw,
+                source_ref=ref,
+                parser_stage="candidate_b_canonical_label_card",
+            )
+    return record
+
+
+_POSTPAID_CARD_FIELDS: dict[str, tuple[tuple[str, ...], str]] = {
+    "institution": (("机构名称",), "text"),
+    "business_type": (("业务类型",), "text"),
+    "service_start_date": (("业务开通日期",), "date"),
+    "payment_status": (("当前缴费状态",), "text"),
+    "current_arrears_amount": (("当前欠费金额", "当前欠款金额"), "number"),
+    "billing_month": (("记账年月",), "date"),
+}
+
+
+def _postpaid_id(page: Any, table: Any, record: Mapping[str, Any]) -> str:
+    identity = (record.get("institution"), record.get("business_type"), record.get("billing_month"))
+    if all(value not in (None, "") for value in identity):
+        return stable_record_id("postpaid", *identity)
+    return stable_record_id(
+        "postpaid_unresolved",
+        int(getattr(page, "page_number", 0) or 0),
+        str(getattr(table, "table_id", "") or ""),
+    )
+
+
 def _extract_postpaid_records(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for page in getattr(parse_result, "pages", None) or []:
@@ -1595,30 +11652,36 @@ def _extract_postpaid_records(parse_result: Any) -> list[dict[str, Any]]:
                 for marker in ("机构名称", "业务类型", "业务开通日期", "当前缴费状态", "当前欠费金额", "记账年月")
             ):
                 continue
-            facts = _pairs(rows)
-            institution = _clean(_field(facts, "机构名称"))
-            business_type = _clean(_field(facts, "业务类型"))
-            if not institution or not business_type:
-                continue
-            records.append(
+            provisional_id = stable_record_id(
+                "postpaid_unresolved",
+                int(getattr(page, "page_number", 0) or 0),
+                str(getattr(table, "table_id", "") or ""),
+            )
+            record = _decode_exact_label_card(
+                parse_result,
+                page=page,
+                table=table,
+                dataset="postpaid_records",
+                target_record_id=provisional_id,
+                fields=_POSTPAID_CARD_FIELDS,
+            )
+            postpaid_id = _postpaid_id(page, table, record)
+            record.update(
                 {
-                    "postpaid_record_id": stable_record_id(
-                        "postpaid", institution, business_type, _field(facts, "记账年月")
-                    ),
+                    "postpaid_record_id": postpaid_id,
                     "sequence": len(records) + 1,
-                    "institution": institution,
-                    "business_type": business_type,
-                    "service_start_date": _date(_field(facts, "业务开通日期")),
-                    "payment_status": _clean(_field(facts, "当前缴费状态")),
-                    "current_arrears_amount": _number(_field(facts, "当前欠费金额")),
-                    "billing_month": _date(_field(facts, "记账年月")),
                     "reporting_amount_currency": "CNY",
                     "reporting_amount_unit": "yuan",
                     "source": "native_detail_postpaid_table",
-                    "source_refs": [_source_ref(page, table)],
-                    "confidence": 1.0,
+                    "confidence": float(getattr(table, "confidence", None) or 0.9),
                 }
             )
+            # Keep issue links valid if the canonical identity became readable.
+            if postpaid_id != provisional_id:
+                for issue in getattr(parse_result, "_personal_detail_extraction_issues", []) or []:
+                    if isinstance(issue, dict) and issue.get("target_record_id") == provisional_id:
+                        issue["target_record_id"] = postpaid_id
+            records.append(record)
     return records
 
 
@@ -1630,15 +11693,37 @@ def _extract_postpaid_payment_history(parse_result: Any) -> list[dict[str, Any]]
             compact = _compact(" ".join(cell for row in rows[:3] for cell in row))
             if not all(marker in compact for marker in ("机构名称", "业务类型", "缴费记录")):
                 continue
-            facts = _pairs(rows[:3])
-            institution = _clean(_field(facts, "机构名称"))
-            business_type = _clean(_field(facts, "业务类型"))
-            if not institution or not business_type:
+            observations, _unresolved = _exact_label_observations(rows)
+            identity: dict[str, Any] = {}
+            for field_name, label in (("institution", "机构名称"), ("business_type", "业务类型"), ("billing_month", "记账年月")):
+                candidates = observations.get(label) or []
+                distinct = {_compact(value) for value, _row, _column in candidates}
+                if len(distinct) == 1:
+                    raw = candidates[0][0]
+                    identity[field_name] = _date(raw) if field_name == "billing_month" else _clean(raw)
+            postpaid_id = _postpaid_id(page, table, identity)
+            month_header = next(
+                (
+                    (row_index, {column: int(_compact(cell)) for column, cell in enumerate(row) if re.fullmatch(r"(?:[1-9]|1[0-2])", _compact(cell))})
+                    for row_index, row in enumerate(rows)
+                    if sum(bool(re.fullmatch(r"(?:[1-9]|1[0-2])", _compact(cell))) for cell in row) >= 5
+                ),
+                None,
+            )
+            if month_header is None:
+                _report_header_graph_failure(
+                    parse_result,
+                    dataset="postpaid_payment_history",
+                    page=page,
+                    table=table,
+                    row_index=0,
+                    row=tuple(rows[0]) if rows else (),
+                )
                 continue
-            months = _month_centers(table, rows)
-            centers = _column_centers(table, max((len(row) for row in rows), default=0))
-            postpaid_id = stable_record_id("postpaid", institution, business_type, _field(facts, "记账年月"))
+            month_header_index, months_by_column = month_header
             for row_index, row in enumerate(rows):
+                if row_index <= month_header_index:
+                    continue
                 year_cell = next(
                     (
                         (column, _compact(cell))
@@ -1650,39 +11735,253 @@ def _extract_postpaid_payment_history(parse_result: Any) -> list[dict[str, Any]]
                 if year_cell is None:
                     continue
                 year_column, year_raw = year_cell
-                for column, cell in enumerate(row):
-                    status = _compact(cell)
-                    if column == year_column or status not in _STATUS_CODES:
-                        continue
-                    month = _nearest_month(column, centers, months)
-                    if month is None:
-                        continue
+                for column, month in months_by_column.items():
+                    status = _compact(row[column]) if column < len(row) else ""
                     history_id = stable_record_id("postpaid_payment_history", postpaid_id, year_raw, month)
-                    records.append(
-                        {
-                            "record_id": history_id,
-                            "postpaid_payment_history_id": history_id,
-                            "postpaid_record_id": postpaid_id,
-                            "institution": institution,
-                            "business_type": business_type,
-                            "year": int(year_raw),
-                            "month": month,
-                            "status": status,
-                            "source": "native_personal_detail_postpaid_history",
-                            "source_refs": [_source_ref(page, table, row=row_index)],
-                            "confidence": 1.0,
-                        }
-                    )
+                    record = {
+                        "record_id": history_id,
+                        "postpaid_payment_history_id": history_id,
+                        "postpaid_record_id": postpaid_id,
+                        "institution": identity.get("institution"),
+                        "business_type": identity.get("business_type"),
+                        "year": int(year_raw),
+                        "month": month,
+                        "source": "native_personal_detail_postpaid_history",
+                        "source_refs": [_source_ref(page, table, row=row_index, column=column)],
+                        "confidence": float(getattr(table, "confidence", None) or 0.9),
+                    }
+                    if status in _STATUS_CODES:
+                        record["status"] = status
+                    else:
+                        _reject_exact_observation(
+                            parse_result,
+                            record,
+                            dataset="postpaid_payment_history",
+                            target_record_id=history_id,
+                            field_name="status",
+                            raw=status,
+                            source_ref=_source_ref(page, table, row=row_index, column=column),
+                            parser_stage="candidate_b_postpaid_month_slots",
+                        )
+                    records.append(record)
     return records
 
 
 def _is_summary_anchor(rows: list[list[str]]) -> bool:
     compact = _compact(" ".join(cell for row in rows for cell in row))
     return bool(
-        "汇总" in compact
-        or ("账户数" in compact and "首笔业务发放月份" in compact)
-        or "最近1个月内的查询" in compact
+        "汇总" in compact or ("账户数" in compact and "首笔业务发放月份" in compact) or "最近1个月内的查询" in compact
     )
+
+
+_CREDIT_OVERVIEW_BUSINESS_TYPES = (
+    "个人商用房贷款（包括商住两用房）",
+    "个人商用房贷款(包括商住两用房)",
+    "个人住房贷款",
+    "其他类贷款",
+    "准贷记卡",
+    "贷记卡",
+)
+
+
+def _is_headerless_credit_overview_fragment(rows: list[list[str]]) -> bool:
+    """Recognize only the four-column tail of the canonical credit overview."""
+
+    if not rows or max((len(row) for row in rows), default=0) != 4:
+        return False
+    witnessed = 0
+    for row in rows:
+        category_cell = _compact(row[1] if len(row) > 1 else "")
+        matches = [value for value in _CREDIT_OVERVIEW_BUSINESS_TYPES if value in category_cell]
+        if "准贷记卡" in matches and "贷记卡" in matches:
+            matches.remove("贷记卡")
+        if len(matches) != 1:
+            continue
+        count_cell = _compact(row[2] if len(row) > 2 else "")
+        month_cell = _compact(row[3] if len(row) > 3 else "")
+        if re.search(r"\d", count_cell) or re.search(r"(?:19|20)\d{2}[.:/-]\d{1,2}", month_cell):
+            witnessed += 1
+    return witnessed >= 2
+
+
+def _corrected_text_source_ref(
+    page: Mapping[str, Any],
+    line: Mapping[str, Any],
+    line_index: int,
+) -> dict[str, Any]:
+    logical_page = int(page.get("page") or 0)
+    source_page = int(page.get("source_page") or logical_page)
+    ref: dict[str, Any] = {
+        "source": "candidate_b_corrected_page_line",
+        "logical_page": logical_page,
+        "source_page": source_page,
+        "line": line_index,
+        "geometry_scope": "line",
+        "binding": "closed_canonical_summary_text_row",
+        "binding_quality": "closed_canonical_summary_text_row",
+    }
+    bbox = line.get("bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        ref["bbox"] = list(bbox)
+    evidence_ids = line.get("evidence_ids")
+    if isinstance(evidence_ids, list) and evidence_ids:
+        ref["evidence_ids"] = [str(value) for value in evidence_ids if value]
+    elif line.get("evidence_id"):
+        ref["evidence_ids"] = [str(line["evidence_id"])]
+    return ref
+
+
+def _credit_overview_text_evidence(parse_result: Any) -> dict[int, dict[str, Any]]:
+    """Collect exact header-anchored overview rows from corrected page evidence."""
+
+    loader = getattr(parse_result, "corrected_evidence_pages", None)
+    pages = loader() if callable(loader) else []
+    output: dict[int, dict[str, Any]] = {}
+    for page in pages or ():
+        if not isinstance(page, Mapping):
+            continue
+        lines = [line for line in page.get("lines") or () if isinstance(line, Mapping)]
+        texts = [_clean(line.get("text") or line.get("content") or "") for line in lines]
+        decoded_rows, unresolved_rows = decode_credit_business_overview_text_lines(texts)
+        active = False
+        header_refs: list[dict[str, Any]] = []
+        decoded: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        unresolved_counts = Counter(unresolved_rows)
+        unresolved: list[tuple[str, dict[str, Any]]] = []
+        for line_index, (line, text) in enumerate(zip(lines, texts, strict=True)):
+            if is_credit_business_overview_text_header(text):
+                active = True
+                header_refs.append(_corrected_text_source_ref(page, line, line_index))
+                continue
+            if not active:
+                continue
+            if "汇总" in _compact(text):
+                break
+            ref = _corrected_text_source_ref(page, line, line_index)
+            row = decode_credit_business_overview_text_line(text)
+            if row is not None:
+                decoded.append((row, ref, text))
+            elif unresolved_counts[text] > 0:
+                unresolved.append((text, ref))
+                unresolved_counts[text] -= 1
+        if not header_refs:
+            continue
+        logical_page = int(page.get("page") or 0)
+        if logical_page:
+            output[logical_page] = {
+                "decoded": decoded,
+                "unresolved": unresolved,
+                "header_refs": header_refs,
+                "source_page": int(page.get("source_page") or logical_page),
+            }
+    return output
+
+
+_CANONICAL_SUMMARY_LEAF_LABELS = frozenset(
+    {
+        "业务类型",
+        "账户类型",
+        "信息类型",
+        "账户数",
+        "记录数",
+        "月份数",
+        "首笔业务发放月份",
+        "余额",
+        "欠费金额",
+        "涉及金额",
+        "单月最高逾期/透支总额",
+        "最长逾期/透支月数",
+        "管理机构数",
+        "发卡机构数",
+        "授信总额",
+        "单家机构最高授信额",
+        "单家机构最低授信额",
+        "已用额度",
+        "透支余额",
+        "最近6个月平均应还款",
+        "最近6个月平均使用额度",
+        "最近6个月平均透支余额",
+        "担保金额",
+        "还款责任金额",
+        "贷款审批",
+        "信用卡审批",
+        "本人查询",
+        "贷后管理",
+        "担保资格审查",
+        "特约商户实名审查",
+    }
+)
+_CANONICAL_SUMMARY_GROUP_LABELS = frozenset(
+    {
+        "为个人",
+        "为企业",
+        "担保责任",
+        "其他相关还款责任",
+        "最近1个月内的查询机构数",
+        "最近1个月内的查询次数",
+        "最近2年内的查询次数",
+    }
+)
+_CANONICAL_SUMMARY_HEADER_LABELS = frozenset(
+    _compact(value)
+    for value in (*_CANONICAL_SUMMARY_LEAF_LABELS, *_CANONICAL_SUMMARY_GROUP_LABELS)
+)
+
+_CANONICAL_SUMMARY_COLUMN_TEMPLATES: dict[str, tuple[str, ...]] = {
+    "信用业务概要": ("业务分组", "业务类型", "账户数", "首笔业务发放月份"),
+    "逾期(透支)信息汇总": (
+        "账户类型",
+        "账户数",
+        "月份数",
+        "单月最高逾期/透支总额",
+        "最长逾期/透支月数",
+    ),
+    "非循环贷账户信息汇总": (
+        "管理机构数",
+        "账户数",
+        "授信总额",
+        "余额",
+        "最近6个月平均应还款",
+    ),
+    "循环贷账户一信息汇总": (
+        "管理机构数",
+        "账户数",
+        "授信总额",
+        "余额",
+        "最近6个月平均应还款",
+    ),
+    "循环贷账户二信息汇总": (
+        "管理机构数",
+        "账户数",
+        "授信总额",
+        "余额",
+        "最近6个月平均应还款",
+    ),
+    "贷记卡账户信息汇总": (
+        "发卡机构数",
+        "账户数",
+        "授信总额",
+        "单家机构最高授信额",
+        "单家机构最低授信额",
+        "已用额度",
+        "最近6个月平均使用额度",
+    ),
+    "准贷记卡账户信息汇总": (
+        "发卡机构数",
+        "账户数",
+        "授信总额",
+        "单家机构最高授信额",
+        "单家机构最低授信额",
+        "透支余额",
+        "最近6个月平均透支余额",
+    ),
+}
+
+
+def _canonical_summary_columns(title: str, width: int) -> tuple[str, ...] | None:
+    key = _compact(title).translate(str.maketrans({"（": "(", "）": ")"}))
+    columns = _CANONICAL_SUMMARY_COLUMN_TEMPLATES.get(key)
+    return columns if columns is not None and len(columns) == width else None
 
 
 def _summary_title(rows: list[list[str]]) -> str:
@@ -1707,23 +12006,55 @@ def _expanded_summary_headers(row: list[str], width: int) -> list[str]:
     populated = [index for index, value in enumerate(values) if value]
     if not populated:
         return [""] * width
+    if any(_compact(values[index]) not in _CANONICAL_SUMMARY_HEADER_LABELS for index in populated):
+        return [""] * width
     expanded = [""] * width
     for position, start in enumerate(populated):
         end = populated[position + 1] if position + 1 < len(populated) else width
         for column in range(start, end):
             expanded[column] = values[start]
-    if populated[0] > 0:
-        for column in range(populated[0]):
-            expanded[column] = values[populated[0]]
     return expanded
 
 
 def _summary_business_rows(
     fragments: list[tuple[Any, Any, list[list[str]]]],
-) -> list[tuple[Any, Any, int, list[str], list[str]]]:
+    *,
+    title: str,
+) -> tuple[
+    list[tuple[Any, Any, int, list[str], list[str]]],
+    list[tuple[Any, Any, int, list[str], str]],
+]:
     width = max((len(row) for _page, _table, rows in fragments for row in rows), default=0)
+    canonical_columns = _canonical_summary_columns(title, width)
+    if canonical_columns is not None:
+        output: list[tuple[Any, Any, int, list[str], list[str]]] = []
+        rejected: list[tuple[Any, Any, int, list[str], str]] = []
+        header_conflict = False
+        for page, table, rows in fragments:
+            for source_row_index, row in enumerate(rows):
+                if _summary_row_has_values(row):
+                    output.append(
+                        (page, table, source_row_index, row, list(canonical_columns))
+                    )
+                    continue
+                for column, value in enumerate(row[:width]):
+                    compact = _compact(value)
+                    if not compact or compact in _CANONICAL_SUMMARY_GROUP_LABELS or "汇总" in compact:
+                        continue
+                    if compact not in _CANONICAL_SUMMARY_HEADER_LABELS:
+                        continue
+                    if compact != _compact(canonical_columns[column]):
+                        header_conflict = True
+                        rejected.append(
+                            (page, table, source_row_index, row, "canonical_template_header_conflict")
+                        )
+        if header_conflict:
+            return [], rejected
+        return output, rejected
+
     header_paths: list[list[str]] = [[] for _column in range(width)]
     output: list[tuple[Any, Any, int, list[str], list[str]]] = []
+    rejected: list[tuple[Any, Any, int, list[str], str]] = []
     for page, table, rows in fragments:
         for source_row_index, row in enumerate(rows):
             nonempty = _nonempty(row)
@@ -1731,9 +12062,22 @@ def _summary_business_rows(
                 continue
             if _summary_row_has_values(row):
                 labels = ["/".join(path) for path in header_paths]
+                missing_label_columns = [
+                    column
+                    for column, value in enumerate(row)
+                    if _clean(value) and (column >= len(labels) or not labels[column])
+                ]
+                if missing_label_columns:
+                    rejected.append(
+                        (page, table, source_row_index, row, "value_without_exact_canonical_header")
+                    )
+                    continue
                 output.append((page, table, source_row_index, row, labels))
                 continue
             expanded = _expanded_summary_headers(row, width)
+            if nonempty and not any(expanded):
+                rejected.append((page, table, source_row_index, row, "unknown_summary_header"))
+                continue
             distinct = {value for value in expanded if value}
             if len(distinct) == 1:
                 label = next(iter(distinct))
@@ -1742,7 +12086,7 @@ def _summary_business_rows(
             for column, label in enumerate(expanded):
                 if label and (not header_paths[column] or header_paths[column][-1] != label):
                     header_paths[column].append(label)
-    return output
+    return output, rejected
 
 
 def _extract_summary_datasets(
@@ -1759,9 +12103,14 @@ def _extract_summary_datasets(
                 physical.append((page, table, rows))
 
     continuation_check = getattr(parse_result, "tables_continue", None)
+    reading_order = dict(getattr(parse_result, "reading_order_by_logical", {}) or {})
+    text_evidence = _credit_overview_text_evidence(parse_result)
+    consumed_text_pages: set[int] = set()
     consumed: set[int] = set()
     for index, (page, table, rows) in enumerate(physical):
-        if index in consumed or not _is_summary_anchor(rows):
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        text_anchor = page_number in text_evidence and _is_headerless_credit_overview_fragment(rows)
+        if index in consumed or (not _is_summary_anchor(rows) and not text_anchor):
             continue
         fragments = [(page, table, rows)]
         anchor_width = max((len(row) for row in rows), default=0)
@@ -1776,8 +12125,10 @@ def _extract_summary_datasets(
             next_width = max((len(row) for row in next_rows), default=0)
             previous_table_id = str(getattr(previous_table, "table_id", "") or "")
             next_table_id = str(getattr(next_table, "table_id", "") or "")
+            previous_order = reading_order.get(previous_page_number, previous_page_number)
+            next_order = reading_order.get(next_page_number, next_page_number)
             if (
-                next_page_number != previous_page_number + 1
+                next_order != previous_order + 1
                 or not callable(continuation_check)
                 or continuation_check(previous_table_id, next_table_id) is not True
                 or (anchor_width and next_width != anchor_width)
@@ -1787,11 +12138,199 @@ def _extract_summary_datasets(
             consumed.add(cursor)
             cursor += 1
 
-        title = _summary_title(rows)
+        title = "信用业务概要" if text_anchor else _summary_title(rows)
         table_id = str(getattr(table, "table_id", "") or "")
-        page_number = int(getattr(page, "page_number", 0) or 0)
         summary_id = stable_record_id("personal_detail_summary", page_number, table_id, title)
-        business_rows = _summary_business_rows(fragments)
+        business_rows, rejected_rows = _summary_business_rows(fragments, title=title)
+        text_rows: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        overview_evidence = text_evidence.get(page_number) if _compact(title) == "信用业务概要" else None
+        if isinstance(overview_evidence, Mapping):
+            remove_business_rows: set[int] = set()
+            for decoded, ref, raw_text in overview_evidence.get("decoded") or ():
+                if not isinstance(decoded, Mapping) or not isinstance(ref, Mapping):
+                    continue
+                count = decoded.get("account_count")
+                month = str(decoded.get("first_business_issue_month") or "")
+                business_type = str(decoded.get("business_type") or "")
+                exact_matches: list[int] = []
+                identity_matches: list[int] = []
+                for row_index, (_row_page, _row_table, _source_index, source_row, _labels) in enumerate(
+                    business_rows
+                ):
+                    if len(source_row) < 4:
+                        continue
+                    raw_count = _compact(source_row[2]).replace(",", "")
+                    raw_month = _compact(source_row[3])
+                    month_match = re.fullmatch(r"((?:19|20)\d{2})[.:/-](\d{1,2})", raw_month)
+                    normalized_month = (
+                        f"{int(month_match.group(1)):04d}-{int(month_match.group(2)):02d}"
+                        if month_match and 1 <= int(month_match.group(2)) <= 12
+                        else ""
+                    )
+                    if raw_count == str(count) and normalized_month == month:
+                        identity_matches.append(row_index)
+                        normalized_row = decode_credit_business_overview_text_line(
+                            f"{source_row[1]} {source_row[2]} {source_row[3]}"
+                        )
+                        if normalized_row and str(normalized_row.get("business_type") or "") == business_type:
+                            exact_matches.append(row_index)
+                if exact_matches:
+                    remove_business_rows.update(exact_matches[1:])
+                    continue
+                if len(identity_matches) == 1:
+                    table_index = identity_matches[0]
+                    source_row = business_rows[table_index][3]
+                    normalized_table = decode_credit_business_overview_text_line(
+                        f"{source_row[1]} {source_row[2]} {source_row[3]}"
+                    )
+                    table_category = (
+                        str(normalized_table.get("business_type") or "")
+                        if normalized_table
+                        else ""
+                    )
+                    remove_business_rows.add(table_index)
+                    if table_category and table_category != business_type:
+                        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                            make_issue,
+                            record_issue,
+                        )
+
+                        ambiguous = dict(decoded)
+                        ambiguous["business_type"] = None
+                        text_rows.append((ambiguous, dict(ref), str(raw_text)))
+                        record_issue(
+                            parse_result,
+                            make_issue(
+                                category="ocr_structure_correction",
+                                issue_code="candidate_b_summary_category_collision_unresolved",
+                                message=(
+                                    "Text and table observations shared one count/month identity but disagreed "
+                                    "on the business category; the category was withheld."
+                                ),
+                                parser_stage="candidate_b_summary_text_table_reconciliation",
+                                target_dataset="personal_detail_summary_cells",
+                                target_record_id=summary_id,
+                                field_name="business_type",
+                                observed_value={
+                                    "table_category": table_category,
+                                    "text_category": business_type,
+                                    "account_count": count,
+                                    "first_business_issue_month": month,
+                                },
+                                source_refs=(ref,),
+                                reason_codes=(
+                                    "one_to_one_count_month_collision",
+                                    "conflicting_finite_categories",
+                                    "category_withheld",
+                                    "duplicate_row_suppressed",
+                                ),
+                            ),
+                        )
+                    else:
+                        text_rows.append((dict(decoded), dict(ref), str(raw_text)))
+                    continue
+                if len(identity_matches) > 1:
+                    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                        make_issue,
+                        record_issue,
+                    )
+
+                    record_issue(
+                        parse_result,
+                        make_issue(
+                            category="ocr_structure_correction",
+                            issue_code="candidate_b_summary_category_collision_unresolved",
+                            message=(
+                                "A corrected text row matched multiple table rows by count and month but no "
+                                "category matched exactly; the ambiguous text category was withheld."
+                            ),
+                            parser_stage="candidate_b_summary_text_table_reconciliation",
+                            target_dataset="personal_detail_summary_cells",
+                            target_record_id=summary_id,
+                            field_name="business_type",
+                            observed_value={
+                                "text_category": business_type,
+                                "account_count": count,
+                                "first_business_issue_month": month,
+                                "table_match_count": len(identity_matches),
+                            },
+                            source_refs=(ref,),
+                            reason_codes=(
+                                "one_to_many_count_month_collision",
+                                "category_owner_ambiguous",
+                                "text_row_withheld",
+                                "duplicate_row_suppressed",
+                            ),
+                        ),
+                    )
+                    continue
+                text_rows.append((dict(decoded), dict(ref), str(raw_text)))
+            if remove_business_rows:
+                business_rows = [
+                    row for row_index, row in enumerate(business_rows) if row_index not in remove_business_rows
+                ]
+            consumed_text_pages.add(page_number)
+        if rejected_rows:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            for rejected_page, rejected_table, rejected_row_index, rejected_row, reason in rejected_rows:
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_structure_correction",
+                        issue_code="candidate_b_summary_layout_unresolved",
+                        message=(
+                            "A canonical summary row could not be bound to the finite summary template; "
+                            "its cells were withheld instead of inheriting positional labels."
+                        ),
+                        parser_stage="candidate_b_summary_canonical_slots",
+                        target_dataset="personal_detail_summary_cells",
+                        observed_value={"row": rejected_row, "reason": reason},
+                        source_refs=(
+                            _source_ref(
+                                rejected_page,
+                                rejected_table,
+                                row=rejected_row_index,
+                            ),
+                        ),
+                        reason_codes=(
+                            "canonical_summary_table_observed",
+                            reason,
+                            "header_fill_inference_forbidden",
+                            "normalized_cells_withheld",
+                        ),
+                    ),
+                )
+        if not business_rows and not text_rows:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_summary_anchor_without_usable_rows",
+                    message="A canonical summary anchor was observed but yielded zero usable business rows.",
+                    parser_stage="candidate_b_summary_canonical_slots",
+                    target_dataset="personal_detail_summary_cells",
+                    target_record_id=summary_id,
+                    observed_value={"title": title, "usable_row_count": 0},
+                    source_refs=(
+                        _source_ref(fragment_page, fragment_table)
+                        for fragment_page, fragment_table, _fragment_rows in fragments
+                    ),
+                    reason_codes=(
+                        "canonical_summary_anchor_observed",
+                        "zero_usable_rows",
+                        "silent_drop_prevented",
+                    ),
+                ),
+            )
         records.append(
             {
                 "record_id": summary_id,
@@ -1803,20 +12342,65 @@ def _extract_summary_datasets(
                     (len(row) for _fragment_page, _fragment_table, fragment_rows in fragments for row in fragment_rows),
                     default=0,
                 ),
-                "source_row_count": len(business_rows),
+                "source_row_count": len(text_rows) + len(business_rows),
                 "source": "native_personal_detail_summary_table",
-                "source_refs": [_source_ref(fragment_page, fragment_table) for fragment_page, fragment_table, _ in fragments],
+                "source_refs": [
+                    *[
+                        _source_ref(fragment_page, fragment_table)
+                        for fragment_page, fragment_table, _ in fragments
+                    ],
+                    *[ref for _decoded, ref, _raw_text in text_rows],
+                ],
                 "confidence": 1.0,
             }
         )
+        for logical_row_index, (decoded, ref, raw_text) in enumerate(text_rows, start=1):
+            for column_index, (header, value) in enumerate(
+                (
+                    ("业务类型", decoded.get("business_type")),
+                    ("账户数", decoded.get("account_count")),
+                    ("首笔业务发放月份", decoded.get("first_business_issue_month")),
+                ),
+                start=2,
+            ):
+                if value in (None, ""):
+                    continue
+                cell_id = stable_record_id(
+                    "personal_detail_summary_cell",
+                    summary_id,
+                    logical_row_index,
+                    column_index,
+                    value,
+                )
+                cells.append(
+                    {
+                        "record_id": cell_id,
+                        "summary_cell_id": cell_id,
+                        "summary_record_id": summary_id,
+                        "summary_type": "信用业务概要",
+                        "title": "信用业务概要",
+                        "row_index": logical_row_index,
+                        "column_index": column_index,
+                        "column_label": header,
+                        "value": str(value),
+                        "canonical_raw": {"value": raw_text},
+                        "source": "candidate_b_corrected_summary_text_row",
+                        "source_refs": [ref],
+                        "confidence": 1.0,
+                    }
+                )
         for logical_row_index, (source_page, source_table, source_row_index, row, labels) in enumerate(
-            business_rows, start=1
+            business_rows, start=len(text_rows) + 1
         ):
             for column_index, value in enumerate(row, start=1):
                 value = _clean(value)
                 if not value:
                     continue
                 header = labels[column_index - 1] if column_index <= len(labels) else ""
+                if _compact(title) == "信用业务概要" and header == "业务分组":
+                    # 贷款/信用卡/其他 is a merged visual group label, not the
+                    # row's individualized business category.
+                    continue
                 cell_id = stable_record_id(
                     "personal_detail_summary_cell",
                     summary_id,
@@ -1847,6 +12431,156 @@ def _extract_summary_datasets(
                         "confidence": 1.0,
                     }
                 )
+        if isinstance(overview_evidence, Mapping):
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            for raw_text, ref in overview_evidence.get("unresolved") or ():
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_summary_text_row_unresolved",
+                        message=(
+                            "A canonical credit-overview text row failed its finite category/count/month "
+                            "contract and was withheld rather than guessed."
+                        ),
+                        parser_stage="candidate_b_summary_text_fallback",
+                        target_dataset="personal_detail_summary_cells",
+                        target_record_id=summary_id,
+                        observed_value=raw_text,
+                        source_refs=(ref,),
+                        reason_codes=(
+                            "canonical_credit_overview_text_header",
+                            "typed_summary_row_contract_failed",
+                            "normalized_cells_withheld",
+                        ),
+                    ),
+                )
+    for page_number, overview_evidence in text_evidence.items():
+        if page_number in consumed_text_pages:
+            continue
+        decoded_rows = list(overview_evidence.get("decoded") or ())
+        unresolved_rows = list(overview_evidence.get("unresolved") or ())
+        summary_id = stable_record_id(
+            "personal_detail_summary",
+            page_number,
+            "corrected_text",
+            "信用业务概要",
+        )
+        source_refs = [
+            dict(ref)
+            for _decoded, ref, _raw_text in decoded_rows
+            if isinstance(ref, Mapping)
+        ]
+        source_refs.extend(
+            dict(ref)
+            for ref in overview_evidence.get("header_refs") or ()
+            if isinstance(ref, Mapping) and dict(ref) not in source_refs
+        )
+        if not decoded_rows:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            record_issue(
+                parse_result,
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_summary_anchor_without_usable_rows",
+                    message="A canonical summary text anchor was observed but yielded zero usable business rows.",
+                    parser_stage="candidate_b_summary_text_fallback",
+                    target_dataset="personal_detail_summary_cells",
+                    target_record_id=summary_id,
+                    observed_value={"title": "信用业务概要", "usable_row_count": 0},
+                    source_refs=source_refs,
+                    reason_codes=(
+                        "canonical_summary_anchor_observed",
+                        "zero_usable_rows",
+                        "silent_drop_prevented",
+                    ),
+                ),
+            )
+        records.append(
+            {
+                "record_id": summary_id,
+                "summary_record_id": summary_id,
+                "summary_type": "信用业务概要",
+                "title": "信用业务概要",
+                "source_table_id": None,
+                "source_column_count": 4,
+                "source_row_count": len(decoded_rows),
+                "source": "candidate_b_corrected_summary_text",
+                "source_refs": source_refs,
+                "confidence": 1.0,
+            }
+        )
+        for logical_row_index, (decoded, ref, raw_text) in enumerate(decoded_rows, start=1):
+            for column_index, (header, value) in enumerate(
+                (
+                    ("业务类型", decoded.get("business_type")),
+                    ("账户数", decoded.get("account_count")),
+                    ("首笔业务发放月份", decoded.get("first_business_issue_month")),
+                ),
+                start=2,
+            ):
+                if value in (None, ""):
+                    continue
+                cell_id = stable_record_id(
+                    "personal_detail_summary_cell",
+                    summary_id,
+                    logical_row_index,
+                    column_index,
+                    value,
+                )
+                cells.append(
+                    {
+                        "record_id": cell_id,
+                        "summary_cell_id": cell_id,
+                        "summary_record_id": summary_id,
+                        "summary_type": "信用业务概要",
+                        "title": "信用业务概要",
+                        "row_index": logical_row_index,
+                        "column_index": column_index,
+                        "column_label": header,
+                        "value": str(value),
+                        "canonical_raw": {"value": raw_text},
+                        "source": "candidate_b_corrected_summary_text_row",
+                        "source_refs": [dict(ref)],
+                        "confidence": 1.0,
+                    }
+                )
+        if unresolved_rows:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+                make_issue,
+                record_issue,
+            )
+
+            for raw_text, ref in unresolved_rows:
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_summary_text_row_unresolved",
+                        message=(
+                            "A canonical credit-overview text row failed its finite category/count/month "
+                            "contract and was withheld rather than guessed."
+                        ),
+                        parser_stage="candidate_b_summary_text_fallback",
+                        target_dataset="personal_detail_summary_cells",
+                        target_record_id=summary_id,
+                        observed_value=raw_text,
+                        source_refs=(ref,),
+                        reason_codes=(
+                            "canonical_credit_overview_text_header",
+                            "typed_summary_row_contract_failed",
+                            "normalized_cells_withheld",
+                        ),
+                    ),
+                )
     return records, cells
 
 
@@ -1858,20 +12592,43 @@ def _extract_recovery_records(parse_result: Any) -> list[dict[str, Any]]:
             compact = _compact(" ".join(cell for row in rows[:3] for cell in row))
             if "债权接收日期" not in compact or "原债权人" not in compact:
                 continue
-            facts = _pairs(rows)
-            institution = _clean(_field(facts, "管理机构"))
-            received_date = _date(_field(facts, "债权接收日期"))
-            records.append(
+            sequence = len(records) + 1
+            provisional_id = stable_record_id(
+                "recovery_unresolved",
+                int(getattr(page, "page_number", 0) or 0),
+                str(getattr(table, "table_id", "") or ""),
+            )
+            record = _decode_exact_label_card(
+                parse_result,
+                page=page,
+                table=table,
+                dataset="recovery_records",
+                target_record_id=provisional_id,
+                fields={
+                    "institution": (("管理机构",), "text"),
+                    "business_type": (("业务种类",), "text"),
+                    "debt_received_date": (("债权接收日期",), "date"),
+                    "original_creditor": (("原债权人",), "text"),
+                    "original_business_type": (("原债务业务种类",), "text"),
+                    "debt_amount": (("债权金额",), "number"),
+                    "transfer_repayment_status": (("债权转移时的还款状态",), "text"),
+                    "account_status": (("账户状态",), "text"),
+                    "balance": (("余额",), "number"),
+                    "last_repayment_date": (("最近一次还款日期",), "date"),
+                    "close_date": (("账户关闭日期",), "date"),
+                },
+            )
+            received_date = record.get("debt_received_date")
+            institution = record.get("institution")
+            recovery_id = (
+                stable_record_id("recovery", institution, received_date, sequence)
+                if institution and received_date
+                else provisional_id
+            )
+            record.update(
                 {
-                    "recovery_record_id": stable_record_id("recovery", institution, received_date, len(records) + 1),
-                    "sequence": len(records) + 1,
-                    "institution": institution,
-                    "business_type": _clean(_field(facts, "业务种类")),
-                    "debt_received_date": received_date,
-                    "original_creditor": _clean(_field(facts, "原债权人")),
-                    "original_business_type": _clean(_field(facts, "原债务业务种类")),
-                    "debt_amount": _number(_field(facts, "债权金额")),
-                    "transfer_repayment_status": _clean(_field(facts, "债权转移时的还款状态")),
+                    "recovery_record_id": recovery_id,
+                    "sequence": sequence,
                     "snapshot_date": next(
                         (
                             _date("-".join(match.groups()))
@@ -1880,57 +12637,216 @@ def _extract_recovery_records(parse_result: Any) -> list[dict[str, Any]]:
                         ),
                         None,
                     ),
-                    "account_status": _clean(_field(facts, "账户状态")),
-                    "balance": _number(_field(facts, "余额")),
-                    "last_repayment_date": _date(_field(facts, "最近一次还款日期")),
-                    "close_date": _date(_field(facts, "账户关闭日期")),
                     "reporting_amount_currency": "CNY",
                     "reporting_amount_unit": "yuan",
                     "source": "native_detail_recovery_table",
-                    "source_refs": [_source_ref(page, table)],
-                    "confidence": 1.0,
+                    "confidence": float(getattr(table, "confidence", None) or 0.9),
                 }
             )
+            if recovery_id != provisional_id:
+                for issue in getattr(parse_result, "_personal_detail_extraction_issues", []) or []:
+                    if isinstance(issue, dict) and issue.get("target_record_id") == provisional_id:
+                        issue["target_record_id"] = recovery_id
+            records.append(record)
     return records
+
+
+def _iso_report_time(parts: tuple[str, str, str, str, str, str]) -> str | None:
+    try:
+        value = datetime(*(int(part) for part in parts))
+    except ValueError:
+        return None
+    return value.isoformat(timespec="seconds") + "+08:00"
+
+
+def _strict_report_time(compact: str, report_number: str | None) -> str | None:
+    standard = re.search(
+        r"报告时间[:：]?(20\d{2})[.年/-](\d{1,2})[.月/-](\d{1,2})日?(\d{1,2}):(\d{2}):(\d{2})",
+        compact,
+    )
+    if standard:
+        return _iso_report_time(tuple(standard.groups()))
+
+    # One recurring scan form deletes a single date digit, e.g.
+    # ``2023.01314:45:37``.  Recover it only when the report-number timestamp
+    # is valid and deleting exactly one of its digits reproduces the complete
+    # malformed timestamp evidence.  This is cross-field source agreement,
+    # not a date guess.
+    damaged = re.search(r"报告时间[:：]?((?:19|20)\d{2}[.年/-]\d{3,6}:\d{2}:\d{2})", compact)
+    prefix = str(report_number or "")[:14]
+    if damaged is None or not re.fullmatch(r"\d{14}", prefix):
+        return None
+    source_digits = re.sub(r"\D", "", damaged.group(1))
+    if len(source_digits) != 13 or not any(
+        prefix[:index] + prefix[index + 1 :] == source_digits for index in range(len(prefix))
+    ):
+        return None
+    return _iso_report_time(
+        (prefix[0:4], prefix[4:6], prefix[6:8], prefix[8:10], prefix[10:12], prefix[12:14])
+    )
 
 
 def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, list[dict[str, Any]]]:
     compact = _compact(full_text)
     report_number = next(iter(re.findall(r"报告编号[:：]?(\d{18,30})", compact)), None)
-    time_match = re.search(
-        r"报告时间[:：]?(20\d{2})[.年/-](\d{1,2})[.月/-](\d{1,2})日?(\d{1,2}):(\d{2}):(\d{2})",
-        compact,
-    )
-    report_time = (
-        f"{int(time_match.group(1)):04d}-{int(time_match.group(2)):02d}-{int(time_match.group(3)):02d}"
-        f"T{int(time_match.group(4)):02d}:{time_match.group(5)}:{time_match.group(6)}+08:00"
-        if time_match
-        else None
-    )
-    subject_name = id_type = id_number = query_institution = query_reason = None
-    other_documents: list[tuple[str, str]] = []
+    report_time = _strict_report_time(compact, report_number)
+    field_candidates: dict[str, list[str]] = defaultdict(list)
     for page in list(getattr(parse_result, "pages", None) or [])[:1]:
         for table in getattr(page, "tables", None) or []:
             rows = _table_rows(table)
             for row_index, row in enumerate(rows[:-1]):
-                labels = _nonempty(row)
-                values = _nonempty(rows[row_index + 1])
-                label_text = _compact("".join(labels))
-                if (
-                    all(
-                        marker in label_text
-                        for marker in ("被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因")
-                    )
-                    and len(values) >= 5
-                ):
-                    subject_name, id_type, id_number, query_institution, query_reason = values[:5]
-                elif labels == ["证件类型", "证件号码"] and len(values) >= 2:
-                    other_documents.append((values[0], values[1]))
+                header_slots = _canonical_header_slots(
+                    tuple(row),
+                    {
+                        "subject_name": ("被查询者姓名",),
+                        "primary_id_type": ("被查询者证件类型",),
+                        "primary_id_number": ("被查询者证件号码",),
+                        "query_institution": ("查询机构",),
+                        "query_reason": ("查询原因",),
+                    },
+                )
+                if set(header_slots) != {
+                    "subject_name",
+                    "primary_id_type",
+                    "primary_id_number",
+                    "query_institution",
+                    "query_reason",
+                }:
+                    continue
+                value_row = tuple(rows[row_index + 1])
+                for key, column in header_slots.items():
+                    value = _clean(value_row[column] if column < len(value_row) else "")
+                    if value:
+                        field_candidates[key].append(value)
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+        retarget_issue_record,
+    )
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import PBOCPersonalDetailNativeParser
+
+    parser = PBOCPersonalDetailNativeParser(parse_result)
+    label_to_key = {
+        "被查询者姓名": "subject_name",
+        "被查询者证件类型": "primary_id_type",
+        "被查询者证件号码": "primary_id_number",
+        "查询机构": "query_institution",
+        "查询原因": "query_reason",
+        "报告编号": "report_number",
+        "报告时间": "report_time",
+    }
+    for candidate in parser.records("report_header"):
+        for label, key in label_to_key.items():
+            value = candidate.fields.get(label)
+            if value not in (None, ""):
+                field_candidates[key].append(str(value))
+    if report_number:
+        field_candidates["report_number"].append(report_number)
+    if report_time:
+        field_candidates["report_time"].append(report_time)
+
+    def candidate_valid(key: str, value: str, selected_id_type: str | None = None) -> bool:
+        if key == "query_reason":
+            return validate_pboc_field(value, "inquiry_reason").valid
+        return header_field_valid(key, value, id_type=selected_id_type)
+
+    def select(key: str, selected_type: str | None = None) -> str | None:
+        observed = tuple(dict.fromkeys(value.strip() for value in field_candidates.get(key, []) if value.strip()))
+        valid = tuple(
+            dict.fromkeys(
+                normalize_pboc_field(value, "inquiry_reason") if key == "query_reason" else value
+                for value in observed
+                if candidate_valid(key, value, selected_type)
+            )
+        )
+        if len(valid) == 1:
+            return valid[0]
+        target_dataset = (
+            "report_query"
+            if key in {"query_institution", "query_reason"}
+            else "report_metadata"
+        )
+        record_issue(
+            parse_result,
+            make_issue(
+                category="ocr_cell_level_error",
+                issue_code="page_one_consensus_unresolved",
+                message="Page-one header evidence was missing, invalid, or conflicting; the normalized value was withheld.",
+                parser_stage="page_one_consensus",
+                target_dataset=target_dataset,
+                target_record_id="personal_report_metadata:primary",
+                field_name=key,
+                observed_value=list(observed),
+                source_refs=(
+                    {
+                        "source": "candidate_b_page_one_business_fields",
+                        "logical_page": 1,
+                        "source_page": 1,
+                        "geometry_scope": "logical_page",
+                    },
+                ),
+                reason_codes=("page_one_consensus", "schema_field_validation", "normalized_value_withheld"),
+            ),
+        )
+        return None
+
+    subject_name = select("subject_name")
+    id_type = select("primary_id_type")
+    id_number = select("primary_id_number", id_type or "身份证")
+    observed_primary_numbers = tuple(
+        dict.fromkeys(
+            value.strip()
+            for value in field_candidates.get("primary_id_number", [])
+            if value.strip()
+        )
+    )
+    source_primary_id_number = (
+        id_number
+        or (observed_primary_numbers[0] if len(observed_primary_numbers) == 1 else None)
+    )
+    if id_type is None and cn_identity_number_valid(id_number):
+        id_type = "身份证"
+        for issue in getattr(parse_result, "_personal_detail_extraction_issues", []) or []:
+            if (
+                isinstance(issue, dict)
+                and issue.get("issue_code") == "page_one_consensus_unresolved"
+                and issue.get("field_name") == "primary_id_type"
+            ):
+                issue["status"] = "resolved"
+                issue["severity"] = "info"
+                issue["reason_codes"] = [
+                    *issue.get("reason_codes", []),
+                    "checksum_valid_resident_identity_implies_document_type",
+                ]
+    query_institution = select("query_institution")
+    query_reason = select("query_reason")
+    report_number = select("report_number")
+    report_time = select("report_time")
+    metadata_id = stable_record_id(
+        "personal_report_metadata", report_number, report_time, subject_name
+    )
+    page_one_targets = {
+        "report_metadata": metadata_id,
+        "report_query": f"report_query:{metadata_id}",
+    }
+    issues = getattr(parse_result, "_personal_detail_extraction_issues", None)
+    if isinstance(issues, list):
+        for index, issue in enumerate(issues):
+            if not isinstance(issue, Mapping):
+                continue
+            target_dataset = str(issue.get("target_dataset") or "")
+            if (
+                issue.get("issue_code") == "page_one_consensus_unresolved"
+                and issue.get("target_record_id") == "personal_report_metadata:primary"
+                and target_dataset in page_one_targets
+            ):
+                issues[index] = retarget_issue_record(
+                    issue,
+                    page_one_targets[target_dataset],
+                )
     metadata = [
         {
-            "personal_report_metadata_id": stable_record_id(
-                "personal_report_metadata", report_number, report_time, subject_name
-            ),
+            "personal_report_metadata_id": metadata_id,
             "report_number": report_number,
             "report_time": report_time,
             "subject_name": subject_name,
@@ -1948,29 +12864,21 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
         }
     ]
     identities: list[dict[str, Any]] = []
-    if id_type and id_number:
+    if id_type and source_primary_id_number:
         identities.append(
             {
-                "identity_document_id": stable_record_id("identity_document", "primary", id_type, id_number),
+                "identity_document_id": stable_record_id(
+                    "identity_document", "primary", id_type, source_primary_id_number
+                ),
                 "sequence": 1,
                 "holder_name": subject_name,
                 "document_type": id_type,
-                "document_number": id_number,
+                # Preserve the source-visible row even when its displayed
+                # number fails a checksum/type contract.  The v2 quality gate
+                # withholds the normalized field and publishes the linked
+                # uncertainty instead of silently deleting the identity row.
+                "document_number": source_primary_id_number,
                 "is_primary": True,
-                "source": "native_detail_header",
-                "source_refs": [{"source": "native_detail_header", "logical_page": 1, "source_page": 1}],
-                "confidence": 1.0,
-            }
-        )
-    for other_type, other_number in other_documents:
-        identities.append(
-            {
-                "identity_document_id": stable_record_id("identity_document", "other", other_type, other_number),
-                "sequence": len(identities) + 1,
-                "holder_name": subject_name,
-                "document_type": other_type,
-                "document_number": other_number,
-                "is_primary": False,
                 "source": "native_detail_header",
                 "source_refs": [{"source": "native_detail_header", "logical_page": 1, "source_page": 1}],
                 "confidence": 1.0,
@@ -1980,105 +12888,27 @@ def _extract_header_datasets(parse_result: Any, full_text: str) -> dict[str, lis
 
 
 def extract_personal_detail_native_business(parse_result: Any, full_text: str) -> dict[str, Any]:
-    """Return canonical base collections for a native detailed report."""
-    account_loader = getattr(parse_result, "account_collections", None)
-    accounts, repayments, _account_event_rows = (
-        account_loader() if callable(account_loader) else _extract_accounts(parse_result)
+    """Return the business slice of the authoritative Candidate B result."""
+    from copy import deepcopy
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+        build_personal_detail_extraction_context,
     )
-    credit_lines = _extract_credit_lines(parse_result)
-    liabilities = _extract_liabilities(parse_result)
-    inquiries = _extract_inquiries(parse_result)
-    public_records = _extract_public_records(parse_result)
-    return {
-        "credit_accounts": accounts,
-        "credit_lines": credit_lines,
-        "repayment_liability_records": liabilities,
-        "repayment_records": repayments,
-        "inquiry_records": inquiries,
-        "public_records": public_records,
-        "credit_summary": {
-            "source": "personal_detail_native_tables",
-            "reported_account_count": len(accounts),
-            "projected_account_count": len(accounts),
-            "repayment_liability_count": len(liabilities),
-            "inquiry_count": len(inquiries),
-        },
-    }
+
+    context = build_personal_detail_extraction_context(parse_result)
+    return deepcopy(context.candidate_b_extraction(full_text).business)
 
 
 def extract_personal_detail_section_content(parse_result: Any, full_text: str) -> dict[str, Any]:
-    """Return supplemental canonical datasets and lossless source rows."""
-    from docmirror.plugins.credit_report.business_records import derive_overdue_records
-    from docmirror.plugins.credit_report.scanned_business import extract_scanned_credit_business
+    """Return the supplemental slice of the authoritative Candidate B result."""
+    from copy import deepcopy
 
-    scanned_loader = getattr(parse_result, "scanned_business", None)
-    scanned_compatible = (
-        scanned_loader(full_text)
-        if callable(scanned_loader)
-        else extract_scanned_credit_business(parse_result, full_text)
+    from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+        build_personal_detail_extraction_context,
     )
-    account_loader = getattr(parse_result, "account_collections", None)
-    accounts, repayments, account_events = (
-        account_loader() if callable(account_loader) else _extract_accounts(parse_result)
-    )
-    native_loader = getattr(parse_result, "native_business", None)
-    native_compatible = (
-        native_loader(full_text)
-        if callable(native_loader)
-        else extract_personal_detail_native_business(parse_result, full_text)
-    )
-    annotations, statements = _extract_personal_notes(parse_result)
-    employment_records = _extract_employment_records(parse_result)
-    residence_records = _extract_residence_records(parse_result)
-    summary_records, summary_cells = _extract_summary_datasets(parse_result)
-    subject_profile = dict(scanned_compatible.get("subject_profile") or {})
-    profile_facts = {
-        key: value.get("normalized_value", value.get("value"))
-        for key, value in subject_profile.items()
-        if isinstance(value, dict) and value.get("normalized_value", value.get("value")) not in (None, "")
-    }
-    if profile_facts.get("birth_date"):
-        birth_match = re.fullmatch(
-            r"(\d{4})[./-](\d{1,2})[./-](\d{1,2})",
-            _compact(profile_facts["birth_date"]),
-        )
-        if birth_match:
-            profile_facts["birth_date"] = (
-                f"{int(birth_match.group(1)):04d}-{int(birth_match.group(2)):02d}-{int(birth_match.group(3)):02d}"
-            )
-    profile_detail_records = _extract_profile_detail_records(parse_result)
-    header = extract_personal_detail_common_datasets(parse_result, full_text)
-    datasets: dict[str, list[dict[str, Any]]] = {
-        **header,
-        "recovery_records": _extract_recovery_records(parse_result),
-        "postpaid_records": _extract_postpaid_records(parse_result),
-        "postpaid_payment_history": _extract_postpaid_payment_history(parse_result),
-        "personal_detail_account_events": account_events,
-        "personal_detail_summary_records": summary_records,
-        "personal_detail_summary_cells": summary_cells,
-        **profile_detail_records,
-        "residence_records": residence_records or list(scanned_compatible.get("residence_records") or []),
-        "employment_records": employment_records or list(scanned_compatible.get("employment_records") or []),
-        "annotations": annotations or list(scanned_compatible.get("annotations") or []),
-        "statements": statements or list(scanned_compatible.get("statements") or []),
-    }
-    expected_counts = {
-        **{name: len(rows) for name, rows in datasets.items()},
-        "credit_lines": len(native_compatible.get("credit_lines") or []),
-        "repayment_liability_records": len(native_compatible.get("repayment_liability_records") or []),
-        "repayment_records": len(repayments),
-        "overdue_records": len(derive_overdue_records(accounts, repayments)),
-        "public_records": len(native_compatible.get("public_records") or []),
-    }
-    return {
-        "facts": {
-            "subject_profile": subject_profile,
-            **profile_facts,
-            "canonical_dataset_schema": "personal_credit_report_detailed.v1",
-            **{f"personal_detail_expected_{name}_count": count for name, count in expected_counts.items()},
-        },
-        "datasets": {name: rows for name, rows in datasets.items() if rows},
-    }
+
+    context = build_personal_detail_extraction_context(parse_result)
+    return deepcopy(context.candidate_b_extraction(full_text).section_content)
 
 
 def extract_personal_detail_common_datasets(

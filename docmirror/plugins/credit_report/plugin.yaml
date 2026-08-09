@@ -36,8 +36,9 @@ projection:
     enforcement_records: 强制执行记录
     administrative_penalty_records: 行政处罚记录
     enterprise_report_metadata: 报告信息
+    enterprise_section_presence: 企业报告章节存在性
     enterprise_exchange_rates: 汇率信息
-    enterprise_report_identity: 企业报告身份与查询信息
+    enterprise_report_identity: 企业报告身份标识
     enterprise_dispute_overview: 异议处理概要
     enterprise_credit_overview: 企业信用概要
     enterprise_public_record_counts: 公共及非信贷记录条数
@@ -46,10 +47,13 @@ projection:
     enterprise_profile: 企业基本信息规范记录
     enterprise_contributors: 主要出资人
     enterprise_key_personnel: 主要人员
+    enterprise_credit_detail_groups: 信贷记录明细业务分组
     enterprise_credit_accounts: 企业信贷账户
+    enterprise_account_annotations: 账户说明及标注
     enterprise_interest_arrears: 欠息记录
     enterprise_credit_facilities: 企业授信额度
     enterprise_repayment_responsibility_accounts: 企业相关还款责任账户
+    enterprise_repayment_responsibility_group_details: 相关还款责任分组明细
     enterprise_utility_payment_history: 公用事业历史缴费明细
     enterprise_housing_fund_history: 住房公积金历史缴费明细
     residence_records: 居住信息
@@ -64,16 +68,13 @@ projection:
     statements: 信息主体声明
     annotations: 异议标注
     repayment_liability_records: 相关还款责任信息
-    enterprise_profile_fields: 企业基本信息
     enterprise_capital_summary: 注册资本及主要出资人信息
-    enterprise_stakeholders: 出资人及主要人员
     enterprise_relationships: 关联关系
     enterprise_facility_summary: 授信额度汇总
     enterprise_current_credit_summary: 当前信贷信息概要
     enterprise_closed_credit_summary: 已结清信贷信息概要
     enterprise_displayed_credit_summary: 信贷记录明细分组汇总
     enterprise_repayment_responsibility_summary: 相关还款责任信息概要
-    enterprise_extraction_audit: 企业提取完整性审计
     enterprise_attachment_accounts: 附件账户及业务清单
     enterprise_credit_supplement: 信用记录补充信息
     enterprise_attachment_credit_details: 附件信贷明细
@@ -83,7 +84,8 @@ projection:
     enterprise_public_civil_judgment_records: 民事判决记录
     enterprise_public_enforcement_records: 强制执行记录
     enterprise_public_administrative_penalty_records: 行政处罚记录
-    enterprise_public_social_security_payment_records: 社会保障及住房公积金缴费记录
+    enterprise_public_housing_fund_payment_records: 住房公积金缴费记录
+    enterprise_public_social_security_payment_records: 社会保险缴费记录
     enterprise_public_license_records: 行政许可记录
     enterprise_public_certification_records: 认证记录
     enterprise_public_qualification_records: 资质认定记录
@@ -244,6 +246,7 @@ projection:
     statements: [notes]
     annotations: [notes]
     enterprise_report_metadata: [report_metadata]
+    enterprise_section_presence: [report_metadata]
     enterprise_exchange_rates: [notes]
     enterprise_report_identity: [identity]
     enterprise_dispute_overview: [credit_summary]
@@ -254,15 +257,16 @@ projection:
     enterprise_profile: [basic_information]
     enterprise_contributors: [basic_information]
     enterprise_key_personnel: [basic_information]
+    enterprise_credit_detail_groups: [credit_details]
     enterprise_credit_accounts: [credit_details]
     enterprise_interest_arrears: [credit_details]
     enterprise_credit_facilities: [credit_details]
     enterprise_repayment_responsibility_accounts: [credit_details]
+    enterprise_repayment_responsibility_group_details: [credit_details]
+    enterprise_account_annotations: [credit_details]
     enterprise_utility_payment_history: [credit_supplement]
     enterprise_housing_fund_history: [credit_supplement]
-    enterprise_profile_fields: [basic_information]
     enterprise_capital_summary: [basic_information]
-    enterprise_stakeholders: [basic_information]
     enterprise_relationships: [basic_information]
     enterprise_facility_summary: [credit_summary]
     enterprise_current_credit_summary: [credit_summary]
@@ -278,6 +282,7 @@ projection:
     enterprise_public_civil_judgment_records: [public_records]
     enterprise_public_enforcement_records: [public_records]
     enterprise_public_administrative_penalty_records: [public_records]
+    enterprise_public_housing_fund_payment_records: [public_records]
     enterprise_public_social_security_payment_records: [public_records]
     enterprise_public_license_records: [public_records]
     enterprise_public_certification_records: [public_records]
@@ -497,14 +502,32 @@ projection:
       - administrative_review_result
     enterprise_report_metadata:
       - report_edition
+      - report_number
+      - query_institution
+      - report_time
     enterprise_exchange_rates:
       - exchange_rate_usd_cny
       - exchange_rate_effective_period
-    enterprise_profile_fields:
+    enterprise_profile:
       - sequence
-      - field
-      - value
-      - source_institution
+      - economic_type
+      - organization_type
+      - enterprise_scale
+      - industry
+      - establishment_year
+      - registration_certificate_valid_through
+      - registered_address
+      - operating_address
+      - operating_status
+      - economic_type_source_institution
+      - organization_type_source_institution
+      - enterprise_scale_source_institution
+      - industry_source_institution
+      - establishment_year_source_institution
+      - registration_certificate_valid_through_source_institution
+      - registered_address_source_institution
+      - operating_address_source_institution
+      - operating_status_source_institution
     enterprise_capital_summary:
       - registered_capital_amount
       - currency
@@ -513,7 +536,7 @@ projection:
       - contributor_status
       - source_institution
       - update_date
-    enterprise_stakeholders:
+    enterprise_contributors:
       - sequence
       - role
       - name
@@ -522,6 +545,74 @@ projection:
       - ownership_percentage
       - source_institution
       - update_date
+    enterprise_key_personnel:
+      - sequence
+      - role
+      - name
+      - identity_type
+      - identity_number
+      - ownership_percentage
+      - source_institution
+      - update_date
+    enterprise_credit_accounts:
+      - sequence
+      - account_identifier
+      - institution
+      - business_type
+      - status
+      - open_date
+      - maturity_date
+      - close_date
+      - snapshot_date
+      - currency
+      - amount_unit
+      - loan_amount
+      - credit_limit
+      - balance
+      - five_tier_class
+      - overdue_total
+      - overdue_principal
+      - overdue_months
+      - current_overdue_status
+    enterprise_interest_arrears:
+      - sequence
+      - institution
+      - arrears_type
+      - arrears_balance
+      - balance_change_date
+      - snapshot_date
+      - currency
+      - amount_unit
+    enterprise_credit_facilities:
+      - institution
+      - facility_type
+      - facility_product
+      - revolving_flag
+      - effective_date
+      - maturity_date
+      - snapshot_date
+      - total_limit
+      - used_limit
+      - available_limit
+      - facility_limit
+      - currency
+      - amount_unit
+    enterprise_repayment_responsibility_accounts:
+      - sequence
+      - account_identifier
+      - responsibility_type
+      - contract_number
+      - institution
+      - business_type
+      - open_date
+      - maturity_date
+      - responsibility_amount
+      - loan_or_credit_amount
+      - balance
+      - five_tier_class
+      - overdue_total
+      - overdue_principal
+      - snapshot_date
     enterprise_relationships:
       - sequence
       - relationship_type
@@ -626,9 +717,14 @@ projection:
       - business_type
       - account_status
       - open_date
-      - due_date
+      - maturity_date
       - currency
-      - amount
+      - amount_kind
+      - credit_limit
+      - loan_amount
+      - discount_amount
+      - instrument_amount
+      - guarantee_amount
       - amount_unit
       - close_date
       - guarantee_type

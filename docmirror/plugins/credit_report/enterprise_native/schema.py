@@ -12,7 +12,7 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
     """Return an enterprise-owned dictionary with no personal-report fields."""
     return {
         "schema_id": "enterprise_credit_report",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "definitions": {
             "authoritative_business_records": "datasets",
             "amount_storage": (
@@ -21,11 +21,26 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
             ),
             "missing_values": (
                 "JSON null means no normalized value. Reporting-status fields distinguish "
-                "not_reported, not_applicable, derived, and unresolved source values."
+                "reported, not_reported, not_applicable, section_absent, derived, and "
+                "unresolved source values."
+            ),
+            "field_provenance": (
+                "Profile business fields use explicit *_source_institution and "
+                "*_source_institution_status columns. Private semantic debug data also "
+                "retains field_info source coordinates. This is report business data, "
+                "separate from DocMirror capture provenance."
+            ),
+            "section_presence": (
+                "enterprise_section_presence emits every canonical PBOC enterprise section "
+                "as present_with_records, present_no_records, or absent_from_report."
             ),
             "date_semantics": (
                 "maturity_date is contractual 到期日; expiry_date is a validity/许可截止日期; "
                 "close_date is settlement or account closure; snapshot_date is 信息报告日期."
+            ),
+            "extraction_failure_protocol": (
+                "The semantic JSON extraction object reports schema, field, and record "
+                "failures. A zero-record source section is complete, not failed."
             ),
         },
         "fields": {
@@ -45,30 +60,16 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
                     "source_page": {"label": "源页码", "type": "integer"},
                 },
             },
-            "credit_accounts": {
+            "enterprise_credit_accounts": {
                 "definition": "企业报告正文中的一个可识别信贷账户卡片一行。",
                 "columns": {},
             },
-            "credit_lines": {
+            "enterprise_credit_facilities": {
                 "definition": "企业报告中的一份授信协议明细一行。",
                 "columns": {},
             },
-            "repayment_liability_records": {
+            "enterprise_repayment_responsibility_accounts": {
                 "definition": "相关还款责任明细中的一个可识别账户一行。",
-                "columns": {},
-            },
-            "repayment_records": {
-                "definition": "企业账户历史中的一个还款月份一行。",
-                "columns": {},
-            },
-            "overdue_records": {
-                "definition": (
-                    "仅存放源报告明确报告的逾期事实；不得由五级分类关注、次级、可疑或损失推断。"
-                ),
-                "columns": {},
-            },
-            "inquiry_records": {
-                "definition": "企业报告明确列示的一次查询记录一行。",
                 "columns": {},
             },
         },
@@ -77,8 +78,22 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
                 "reported": "已报告",
                 "not_reported": "未报告",
                 "not_applicable": "不适用",
+                "section_absent": "源报告不含该章节",
                 "derived": "派生值",
                 "unresolved": "未解析",
+            },
+            "source_state": {
+                "reported": "源报告已报告",
+                "not_reported": "字段存在但源报告未提供值",
+                "not_applicable": "字段不适用于该业务记录",
+                "section_absent": "源报告不含字段所属章节",
+                "derived": "由源报告字段确定性派生",
+                "unresolved": "源内容存在但尚未可靠解析",
+            },
+            "section_presence_status": {
+                "present_with_records": "章节存在且包含业务记录",
+                "present_no_records": "章节存在并明确无业务记录",
+                "absent_from_report": "源报告不含该章节",
             },
             "document_type": {
                 "enterprise_credit_report": "企业信用报告",
@@ -90,6 +105,19 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
                 "native_text": "原生文本",
                 "mixed": "混合文本与图像",
                 "scanned_ocr": "扫描图像",
+            },
+            "extraction_status": {
+                "complete": "All checked extraction contracts passed.",
+                "partial": "Business data was emitted with reported extraction failures.",
+                "failed": "Input integrity prevented reliable canonical extraction.",
+            },
+            "extraction_failure_code": {
+                "INPUT_INTEGRITY_VIOLATION": "The ParseResult failed an input-integrity contract.",
+                "EXPECTED_FIELD_NOT_EXTRACTED": "A populated source field is absent from canonical data.",
+                "EXTRACTED_FIELD_VALUE_MISMATCH": "A canonical value conflicts with its source value.",
+                "RECORD_RECONSTRUCTION_MISMATCH": "Expected and extracted record populations disagree.",
+                "UNCONSUMED_BUSINESS_TEXT": "A source unit was not assigned to the component graph.",
+                "UNSTRUCTURED_BUSINESS_CONTENT": "Multiple fields remain packed into one content value.",
             },
         },
     }

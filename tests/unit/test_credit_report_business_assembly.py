@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from docmirror.models.entities.parse_result import PageContent, ParserInfo, TableBlock
+from docmirror.models.entities.parse_result import PageContent, ParserInfo, TableBlock, TextBlock
 from docmirror.plugins.credit_report.business_assembly import assemble_credit_report_business
+from docmirror.plugins.credit_report.enterprise_native.pipeline import run_enterprise_pipeline
 from docmirror.plugins.credit_report.projection import _records
 
 
@@ -300,8 +301,9 @@ def test_assembly_quarantines_unresolved_repayment_status_from_ready_contract() 
     assert audit["status"] == "review"
 
 
-def test_enterprise_accounts_prefer_canonical_physical_table_fields() -> None:
+def test_enterprise_canonical_pipeline_preserves_physical_table_fields() -> None:
     result = _result()
+    result.pages[0].texts = [TextBlock(content="信贷记录明细")]
     result.pages[0].tables = [
         TableBlock(
             table_id="pt_1_0",
@@ -323,17 +325,12 @@ def test_enterprise_accounts_prefer_canonical_physical_table_fields() -> None:
         )
     ]
 
-    assembled = assemble_credit_report_business(
-        result,
-        "企业信用报告 信贷交易信息明细",
-        report_subtype="enterprise",
-        content_mode="native_text",
-    )
+    semantic = run_enterprise_pipeline(result).semantic_document
 
-    account = assembled["credit_accounts"][0]
+    account = semantic.datasets["enterprise_credit_accounts"][0]
     assert account["open_date"] == "2024-12-24"
     assert account["due_date"] == "2025-12-23"
     assert account["currency"] == "CNY"
     assert account["loan_amount"] == 10000
     assert account["source_refs"][0]["source"] == "canonical_physical_table"
-    assert assembled["credit_summary"]["canonical_table_account_count"] == 1
+    assert semantic.credit_summary["displayed_credit_account_card_count"] == 1

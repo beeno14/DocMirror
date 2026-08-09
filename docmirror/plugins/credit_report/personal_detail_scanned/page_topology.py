@@ -1,14 +1,13 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validated logical-page geometry for scanned personal detailed reports.
+"""Validated source-fragment geometry for scanned personal detailed reports.
 
-The core extraction pipeline remains the authority for page splitting.  This
-module verifies that the resulting one-page or two-page topology is safe to
-reuse for plugin-owned OCR.  A bounded recovery reruns the core splitter only
-when a logical page's stored transform cannot be rendered, and only when the
-recovered slice can be matched to the existing logical page without changing
-its coordinate system.
+Core logical pages are immutable evidence fragments, not canonical PBOC page
+identities.  The plugin validates their transforms and may register any number
+of non-overlapping fragments onto one canonical page. Missing spread halves
+are recovered with static image geometry only; topology construction never
+runs OCR and never mutates the sealed ParseResult.
 """
 
 from __future__ import annotations
@@ -30,13 +29,14 @@ class LogicalPageGeometry:
     split_kind: str
     segment_index: int | None
     selected_rotation: int
+    split_confidence: float
     source_crop_bbox: tuple[float, float, float, float] | None
     transform_usable: bool
     issues: tuple[str, ...] = ()
 
 
 class PersonalDetailPageTopology:
-    """Validate the canonical single-page/two-page layouts owned by core."""
+    """Validate arbitrary core-produced source fragments without re-splitting them."""
 
     def __init__(self, parse_result: Any) -> None:
         self._pages: dict[int, Any] = {}
@@ -65,7 +65,7 @@ class PersonalDetailPageTopology:
 
     def _validate_source_group(self, source: int, logicals: list[int]) -> tuple[int, ...]:
         geometries = [self._geometry[logical] for logical in logicals]
-        if source <= 0 or not (1 <= len(geometries) <= 2):
+        if source <= 0 or not geometries:
             self._invalidate(source, f"unsupported_logical_page_count:{len(geometries)}")
             return tuple(sorted(logicals))
         if any(not geometry.transform_usable for geometry in geometries):
@@ -78,6 +78,28 @@ class PersonalDetailPageTopology:
             if geometry.split_kind == "two_page_spread" and geometry.segment_index not in {0, 1}:
                 self._invalidate(source, "spread_segment_missing")
             return (geometry.logical_page,)
+
+        if len(geometries) > 2:
+            crops = [geometry.source_crop_bbox for geometry in geometries]
+            if any(crop is None for crop in crops):
+                self._invalidate(source, "multi_fragment_source_crop_missing")
+            else:
+                for index, left in enumerate(crops):
+                    for right in crops[index + 1 :]:
+                        if left is not None and right is not None and _overlap_ratio(left, right) > 0.08:
+                            self._invalidate(source, "multi_fragment_crops_overlap")
+                            break
+            return tuple(
+                geometry.logical_page
+                for geometry in sorted(
+                    geometries,
+                    key=lambda item: (
+                        (item.source_crop_bbox or (0, 0, 0, 0))[1],
+                        (item.source_crop_bbox or (0, 0, 0, 0))[0],
+                        item.logical_page,
+                    ),
+                )
+            )
 
         if any(geometry.split_kind != "two_page_spread" for geometry in geometries):
             self._invalidate(source, "two_logical_pages_without_spread_metadata")
@@ -115,14 +137,19 @@ class PersonalDetailPageTopology:
     def logicals_for_source(self, source_page: int) -> tuple[int, ...]:
         return self._logicals_by_source.get(int(source_page or 0), ())
 
+    def ordered_fragments(self, source_page: int) -> tuple[int, ...]:
+        """Return every validated fragment for a physical source surface."""
+        source = int(source_page or 0)
+        if source in self._invalid_sources:
+            return ()
+        return self._logicals_by_source.get(source, ())
+
     def ordered_pair(self, logical_pages: Iterable[int]) -> tuple[int, int] | None:
         requested = {int(page) for page in logical_pages if int(page) > 0}
         if len(requested) != 2:
             return None
         sources = {
-            geometry.source_page
-            for logical in requested
-            if (geometry := self._geometry.get(logical)) is not None
+            geometry.source_page for logical in requested if (geometry := self._geometry.get(logical)) is not None
         }
         if len(sources) != 1:
             return None
@@ -135,17 +162,19 @@ class PersonalDetailPageTopology:
     def transform_usable(self, logical_page: int) -> bool:
         geometry = self.geometry(logical_page)
         return bool(
-            geometry is not None
-            and geometry.transform_usable
-            and geometry.source_page not in self._invalid_sources
+            geometry is not None and geometry.transform_usable and geometry.source_page not in self._invalid_sources
         )
 
     def audit(self) -> dict[str, Any]:
         single_sources = 0
         double_sources = 0
         partial_spread_sources = 0
-        for logicals in self._logicals_by_source.values():
-            if len(logicals) == 2:
+        fragmented_sources = 0
+        potential_split_sources: list[int] = []
+        for source, logicals in self._logicals_by_source.items():
+            if len(logicals) > 2:
+                fragmented_sources += 1
+            elif len(logicals) == 2:
                 double_sources += 1
             elif logicals:
                 geometry = self._geometry[logicals[0]]
@@ -153,15 +182,18 @@ class PersonalDetailPageTopology:
                     partial_spread_sources += 1
                 else:
                     single_sources += 1
+                if geometry.split_kind == "two_page_spread" or geometry.split_confidence >= 0.55:
+                    potential_split_sources.append(source)
         return {
-            "valid": not self._invalid_sources and not any(
-                issue.startswith("invalid_or_duplicate_logical_page:") for issue in self._issues
-            ),
+            "valid": not self._invalid_sources
+            and not any(issue.startswith("invalid_or_duplicate_logical_page:") for issue in self._issues),
             "logical_page_count": len(self._geometry),
             "source_page_count": len(self._logicals_by_source),
             "single_page_sources": single_sources,
             "double_page_sources": double_sources,
             "partial_spread_sources": partial_spread_sources,
+            "fragmented_sources": fragmented_sources,
+            "potential_split_sources": sorted(potential_split_sources),
             "invalid_source_pages": sorted(self._invalid_sources),
             "issues": list(self._issues),
             "logical_pages_by_source": {
@@ -171,7 +203,7 @@ class PersonalDetailPageTopology:
 
 
 class PersonalDetailLogicalPageImageResolver:
-    """Render only topology-validated logical pages for plugin OCR repair."""
+    """Render frozen logical pages and statically recover missing spread slices."""
 
     def __init__(
         self,
@@ -186,39 +218,113 @@ class PersonalDetailLogicalPageImageResolver:
         self.topology = topology or PersonalDetailPageTopology(parse_result)
         self._base = LogicalPageImageResolver(parse_result, zoom=self._zoom)
         self._cache: dict[int, dict[str, Any] | None] = {}
-        self._recoveries: set[int] = set()
+        self._registered_static_splits: dict[int, dict[str, Any]] = {}
+        self._static_split_cache: dict[int, tuple[dict[str, Any], ...]] = {}
+        self._static_split_recoveries: list[dict[str, Any]] = []
+        self._static_split_decisions: list[dict[str, Any]] = []
 
     def __call__(self, logical_page: int) -> dict[str, Any] | None:
         logical = int(logical_page or 0)
+        if logical in self._registered_static_splits:
+            return self._registered_static_splits[logical]
         if logical in self._cache:
             return self._cache[logical]
         rendered = self._base(logical) if self.topology.transform_usable(logical) else None
-        if rendered is None:
-            rendered = self._recover_with_core_splitter(logical)
-            if rendered is not None:
-                self._recoveries.add(logical)
         self._cache[logical] = rendered
         return rendered
 
     def clear(self) -> None:
         self._base.clear()
         self._cache.clear()
+        self._registered_static_splits.clear()
+        self._static_split_cache.clear()
+
+    def register_static_logical_page(self, logical_page: int, recovered: dict[str, Any]) -> None:
+        """Freeze one statically split image under its final logical-page id."""
+
+        logical = int(logical_page or 0)
+        if logical <= 0:
+            raise ValueError("static logical page must be positive")
+        page = dict(recovered)
+        page["logical_page"] = logical
+        page["page"] = logical
+        self._registered_static_splits[logical] = page
+        self._cache.pop(logical, None)
+
+    def page_key(self, logical_page: int) -> str:
+        """Return the immutable image identity for one-shot page re-OCR."""
+
+        logical = int(logical_page or 0)
+        registered = self._registered_static_splits.get(logical)
+        if registered is not None:
+            return str(registered.get("page_key") or registered.get("static_page_id") or "")
+        rendered = self._cache.get(logical)
+        if isinstance(rendered, dict):
+            transform = dict(rendered.get("coordinate_transform") or {})
+            decomposition = dict(transform.get("decomposition") or {})
+            source = int(transform.get("source_page_number") or rendered.get("source_page") or 0)
+            crop = transform.get("source_crop_bbox")
+            if source > 0 and isinstance(crop, (list, tuple)) and len(crop) == 4:
+                crop_key = ":".join(f"{float(value):.4f}" for value in crop)
+                return (
+                    f"source:{source}:crop:{crop_key}:"
+                    f"rotation:{int(decomposition.get('selected_rotation') or 0) % 360}"
+                )
+        geometry = self.topology.geometry(logical)
+        if geometry is None:
+            return ""
+        crop = geometry.source_crop_bbox or (0.0, 0.0, geometry.width, geometry.height)
+        crop_key = ":".join(f"{float(value):.4f}" for value in crop)
+        return (
+            f"source:{geometry.source_page}:crop:{crop_key}:"
+            f"rotation:{int(geometry.selected_rotation) % 360}"
+        )
 
     def audit(self) -> dict[str, Any]:
         return {
             **self.topology.audit(),
-            "recovered_logical_pages": sorted(self._recoveries),
+            "static_split_recoveries": list(self._static_split_recoveries),
+            "static_split_decisions": list(self._static_split_decisions),
         }
 
-    def _recover_with_core_splitter(self, logical_page: int) -> dict[str, Any] | None:
-        """Recover an existing logical slice; never invent a new logical page."""
-        page = self.topology.page(logical_page)
-        geometry = self.topology.geometry(logical_page)
-        if page is None or geometry is None or not self._file_path.is_file() or self._file_path.suffix.lower() != ".pdf":
-            return None
-        if geometry.source_page <= 0:
-            return None
+    def static_split_slices(self, source_pages: Iterable[int]) -> list[dict[str, Any]]:
+        """Construct statically confirmed subpages for potential-split sources."""
+        result: list[dict[str, Any]] = []
+        for source_page in sorted({int(page) for page in source_pages if int(page) > 0}):
+            if source_page not in self._static_split_cache:
+                self._static_split_cache[source_page] = tuple(self._construct_split_slices(source_page))
+            result.extend(dict(item) for item in self._static_split_cache[source_page])
+        return result
 
+    def _construct_split_slices(self, source_page: int) -> list[dict[str, Any]]:
+        siblings = self.topology.logicals_for_source(source_page)
+        if not siblings or len(siblings) > 2:
+            self._static_split_decisions.append(
+                {
+                    "source_page": source_page,
+                    "status": "failed",
+                    "reason": "invalid_source_fragment_count",
+                    "observed_fragment_count": len(siblings),
+                }
+            )
+            return []
+        geometries = [geometry for logical in siblings if (geometry := self.topology.geometry(logical)) is not None]
+        if not geometries or not self._file_path.is_file() or self._file_path.suffix.lower() != ".pdf":
+            self._static_split_decisions.append(
+                {
+                    "source_page": source_page,
+                    "status": "failed",
+                    "reason": "source_page_not_renderable",
+                }
+            )
+            return []
+        existing_segments = {
+            int(geometry.segment_index)
+            for geometry in geometries
+            if geometry.split_kind == "two_page_spread" and geometry.segment_index in {0, 1}
+        }
+        if existing_segments == {0, 1}:
+            return []
         try:
             import cv2
             import fitz
@@ -230,91 +336,170 @@ class PersonalDetailLogicalPageImageResolver:
                 split_or_passthrough,
             )
 
+            analysis_zoom = min(1.25, self._zoom)
             with fitz.open(self._file_path) as document:
-                if geometry.source_page > len(document):
-                    return None
-                source = document[geometry.source_page - 1]
+                if source_page > len(document):
+                    self._static_split_decisions.append(
+                        {
+                            "source_page": source_page,
+                            "status": "failed",
+                            "reason": "source_page_out_of_range",
+                        }
+                    )
+                    return []
+                source = document[source_page - 1]
                 source_width = float(source.rect.width)
                 source_height = float(source.rect.height)
-                pix = source.get_pixmap(matrix=fitz.Matrix(self._zoom, self._zoom), alpha=False)
-            image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                pix = source.get_pixmap(matrix=fitz.Matrix(analysis_zoom, analysis_zoom), alpha=False)
+            image: Any = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height, pix.width, pix.n
+            )
             image = image[:, :, :3] if pix.n >= 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
+            consensus_boost = self._split_consensus_boost()
+            geometry_rotation = int(geometries[0].selected_rotation) % 360
             analyses = analyze_spread_candidates(image)
-            decision = decision_from_analyses(analyses, mode="auto")
-            if not decision.analyses:
-                return None
-            selected_rotation = int(decision.analyses[0].rotation) % 360
-            if not decision.should_split and selected_rotation != 0:
-                return None
-            oriented = _rotate_image(image, selected_rotation)
+            selected_analyses = tuple(
+                item for item in analyses if int(item.rotation) % 360 == geometry_rotation
+            )
+            decision = decision_from_analyses(
+                selected_analyses,
+                mode="auto",
+                consensus_boost=consensus_boost,
+            )
+            if not decision.should_split or not decision.analyses:
+                self._static_split_decisions.append(
+                    {
+                        "source_page": source_page,
+                        "status": "uncertain" if decision.confidence >= 0.65 else "no_split",
+                        "confidence": float(decision.confidence),
+                        "core_confidence": float(geometries[0].split_confidence),
+                        "selected_rotation": geometry_rotation,
+                    }
+                )
+                return []
+            # The core transform has already selected page orientation. Static
+            # topology validation must not invoke OCR to second-guess it.
+            rotation = geometry_rotation
+            if self._zoom > analysis_zoom:
+                with fitz.open(self._file_path) as document:
+                    source = document[source_page - 1]
+                    pix = source.get_pixmap(matrix=fitz.Matrix(self._zoom, self._zoom), alpha=False)
+                image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+                image = image[:, :, :3] if pix.n >= 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
             slices = split_or_passthrough(
-                oriented,
+                _rotate_image(image, rotation),
                 source_width=source_width,
                 source_height=source_height,
-                selected_rotation=selected_rotation,
+                selected_rotation=rotation,
                 zoom=self._zoom,
                 decision=decision,
                 mode="auto",
             )
-            siblings = self.topology.logicals_for_source(geometry.source_page)
-            if len(siblings) == 2:
-                sibling_segments = {
-                    sibling_geometry.segment_index
-                    for sibling in siblings
-                    if (sibling_geometry := self.topology.geometry(sibling)) is not None
+            slices_by_segment = {int(item.segment_index): item for item in slices}
+            if set(slices_by_segment) != {0, 1}:
+                self._static_split_decisions.append(
+                    {
+                        "source_page": source_page,
+                        "status": "uncertain",
+                        "confidence": float(decision.confidence),
+                        "core_confidence": float(geometries[0].split_confidence),
+                        "selected_rotation": rotation,
+                        "observed_segments": sorted(slices_by_segment),
+                    }
+                )
+                return []
+            final_width = float(slices_by_segment[0].width) + float(slices_by_segment[1].width)
+            final_split_ratio = float(slices_by_segment[0].width) / final_width if final_width > 0 else 0.5
+            self._static_split_decisions.append(
+                {
+                    "source_page": source_page,
+                    "status": "split",
+                    "confidence": float(decision.confidence),
+                    "core_confidence": float(geometries[0].split_confidence),
+                    "selected_rotation": rotation,
+                    "split_ratio": final_split_ratio,
                 }
-                if sibling_segments != {0, 1} or len(slices) != 2:
-                    return None
-            page_slice = _select_recovered_slice(geometry, slices)
-            if page_slice is None or not _dimensions_match(
-                geometry.width,
-                geometry.height,
-                float(page_slice.width),
-                float(page_slice.height),
-            ):
-                return None
-            return {
-                "image": page_slice.image,
-                "page_width": float(page_slice.width),
-                "page_height": float(page_slice.height),
-                "logical_page": logical_page,
-                "source_page": geometry.source_page,
-                "zoom": self._zoom,
-                "coordinate_transform": {
-                    "source_page_number": geometry.source_page,
-                    "source_crop_bbox": list(page_slice.source_crop_bbox),
-                    "matrix": page_slice.source_to_logical,
-                    "inverse_matrix": page_slice.logical_to_source,
-                    "display_width": float(page_slice.width),
-                    "display_height": float(page_slice.height),
-                    "decomposition": {
-                        "kind": "two_page_spread" if decision.should_split else "none",
-                        "segment_index": int(page_slice.segment_index),
-                        "selected_rotation": selected_rotation,
-                        "confidence": float(page_slice.split_confidence),
+            )
+            # A single unsplit core page represents neither half reliably, so
+            # both split slices become static topology candidates. For a partial
+            # core spread, only the segment absent from the sealed topology is
+            # constructed.
+            missing_segments = ({0, 1} - existing_segments) if existing_segments else {0, 1}
+            recoveries: list[dict[str, Any]] = []
+            for missing_segment in sorted(missing_segments):
+                candidate = slices_by_segment[missing_segment]
+                candidate_image = candidate.image
+                crop_key = ":".join(f"{float(value):.4f}" for value in candidate.source_crop_bbox)
+                page_key = (
+                    f"source:{source_page}:crop:{crop_key}:"
+                    f"rotation:{int(candidate.selected_rotation) % 360}"
+                )
+                recovery = {
+                    "image": candidate_image,
+                    "page_width": float(candidate.width),
+                    "page_height": float(candidate.height),
+                    "source_page": source_page,
+                    "segment_index": missing_segment,
+                    "zoom": self._zoom,
+                    "source_crop_bbox": list(candidate.source_crop_bbox),
+                    "crop_bbox_oriented": list(candidate.crop_bbox_oriented),
+                    "source_to_logical": candidate.source_to_logical,
+                    "logical_to_source": candidate.logical_to_source,
+                    "selected_rotation": rotation,
+                    "split_confidence": float(candidate.split_confidence),
+                    "split_position": float(candidate.crop_bbox_oriented[2])
+                    if missing_segment == 0
+                    else float(candidate.crop_bbox_oriented[0]),
+                    "split_ratio": final_split_ratio,
+                    "split_consensus_boost": consensus_boost,
+                    "subpage_basis": "static_split_validator",
+                    "static_page_id": f"source:{source_page}:segment:{missing_segment}:static-split",
+                    "page_key": page_key,
+                    "coordinate_transform": {
+                        "source_page_number": source_page,
+                        "source_crop_bbox": list(candidate.source_crop_bbox),
+                        "display_width": float(candidate.width),
+                        "display_height": float(candidate.height),
+                        "matrix": candidate.source_to_logical,
+                        "inverse_matrix": candidate.logical_to_source,
+                        "decomposition": {
+                            "kind": "two_page_spread",
+                            "segment_index": missing_segment,
+                            "selected_rotation": rotation,
+                            "confidence": float(candidate.split_confidence),
+                        },
                     },
-                },
-                "recovered_with_core_splitter": True,
-            }
-        except Exception:
-            return None
+                }
+                self._static_split_recoveries.append({key: value for key, value in recovery.items() if key != "image"})
+                recoveries.append(recovery)
+            return recoveries
+        except Exception as exc:
+            self._static_split_decisions.append(
+                {
+                    "source_page": source_page,
+                    "status": "failed",
+                    "reason": "static_validator_exception",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            return []
 
+    def _split_consensus_boost(self) -> float:
+        """Reuse strong document topology evidence without consulting footers."""
+        audit = self.topology.audit()
+        return 0.05 if int(audit.get("double_page_sources") or 0) >= 2 else 0.0
 
 def _page_geometry(page: Any, logical_page: int) -> LogicalPageGeometry:
     transform = dict(getattr(page, "coordinate_transform", None) or {})
     decomposition = dict(transform.get("decomposition") or {})
-    source_page = int(
-        transform.get("source_page_number")
-        or getattr(page, "source_page_number", 0)
-        or logical_page
-    )
+    source_page = int(transform.get("source_page_number") or getattr(page, "source_page_number", 0) or logical_page)
     width = _finite(getattr(page, "width", 0) or transform.get("display_width"))
     height = _finite(getattr(page, "height", 0) or transform.get("display_height"))
     split_kind = str(decomposition.get("kind") or "")
     segment_raw = decomposition.get("segment_index")
     segment_index = int(segment_raw) if isinstance(segment_raw, int) and not isinstance(segment_raw, bool) else None
     rotation = int(decomposition.get("selected_rotation") or transform.get("content_rotation_applied") or 0) % 360
+    split_confidence = max(0.0, min(1.0, _finite(decomposition.get("confidence"))))
     crop = _bbox4(transform.get("source_crop_bbox"))
     issues: list[str] = []
     if source_page <= 0:
@@ -335,31 +520,11 @@ def _page_geometry(page: Any, logical_page: int) -> LogicalPageGeometry:
         split_kind=split_kind,
         segment_index=segment_index,
         selected_rotation=rotation,
+        split_confidence=split_confidence,
         source_crop_bbox=crop,
         transform_usable=not issues,
         issues=tuple(issues),
     )
-
-
-def _select_recovered_slice(geometry: LogicalPageGeometry, slices: list[Any]) -> Any | None:
-    if not slices:
-        return None
-    if len(slices) == 1:
-        only = slices[0]
-        if geometry.split_kind == "two_page_spread" and geometry.segment_index not in {None, int(only.segment_index)}:
-            return None
-        return only
-    if len(slices) != 2 or geometry.segment_index not in {0, 1}:
-        return None
-    return next((item for item in slices if int(item.segment_index) == geometry.segment_index), None)
-
-
-def _dimensions_match(expected_width: float, expected_height: float, width: float, height: float) -> bool:
-    if expected_width <= 0 or expected_height <= 0:
-        return False
-    width_tolerance = max(5.0, expected_width * 0.03)
-    height_tolerance = max(5.0, expected_height * 0.03)
-    return abs(expected_width - width) <= width_tolerance and abs(expected_height - height) <= height_tolerance
 
 
 def _rotate_image(image: Any, rotation: int) -> Any:
@@ -394,9 +559,7 @@ def _is_matrix3(value: Any) -> bool:
         return False
     try:
         return all(
-            isinstance(row, (list, tuple))
-            and len(row) == 3
-            and all(math.isfinite(float(item)) for item in row)
+            isinstance(row, (list, tuple)) and len(row) == 3 and all(math.isfinite(float(item)) for item in row)
             for row in value
         )
     except (TypeError, ValueError):

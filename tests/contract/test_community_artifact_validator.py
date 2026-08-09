@@ -180,17 +180,13 @@ def test_validator_rejects_misrouted_english_enterprise_public_dataset(
     assert any("community: top-level blocks=" in issue for issue in issues)
 
 
-def test_validator_detects_semantic_dataset_divergence(tmp_path: Path) -> None:
-    community_path = _write_bundle(tmp_path, "semantic_dataset_divergence")
+def test_bundle_does_not_publish_semantic_intermediate(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "no_semantic_intermediate")
     payload = json.loads(community_path.read_text(encoding="utf-8"))
-    semantic_path = community_path.parent / payload["files"]["semantic_json"]
-    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
-    semantic["datasets"][0]["rows"].pop()
-    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
 
-    issues = validate_community_artifacts(community_path)
-
-    assert "semantic: datasets diverge from Community JSON" in issues
+    assert "semantic_json" not in payload["files"]
+    assert not list(community_path.parent.glob("*_community_semantic.json"))
+    assert validate_community_artifacts(community_path) == []
 
 
 def test_validator_detects_completeness_contradiction(tmp_path: Path) -> None:
@@ -225,10 +221,8 @@ def test_validator_detects_audit_record_loss(tmp_path: Path) -> None:
 def test_validator_requires_evidence_for_enterprise_audit_fields(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "enterprise_evidence_loss")
     payload = json.loads(community_path.read_text(encoding="utf-8"))
-    semantic_path = community_path.parent / payload["files"]["semantic_json"]
-    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
-    semantic["classification"]["document_type"] = "enterprise_credit_report"
-    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
+    payload["document"]["type"] = "enterprise_credit_report"
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     audit_path = community_path.parent / payload["files"]["dataset_audit_csv"]
     with audit_path.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -246,10 +240,8 @@ def test_validator_requires_evidence_for_enterprise_audit_fields(tmp_path: Path)
 def test_validator_requires_every_enterprise_field_in_audit_csv(tmp_path: Path) -> None:
     community_path = _write_bundle(tmp_path, "enterprise_field_loss")
     payload = json.loads(community_path.read_text(encoding="utf-8"))
-    semantic_path = community_path.parent / payload["files"]["semantic_json"]
-    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
-    semantic["classification"]["document_type"] = "enterprise_credit_report"
-    semantic_path.write_text(json.dumps(semantic, ensure_ascii=False), encoding="utf-8")
+    payload["document"]["type"] = "enterprise_credit_report"
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     audit_path = community_path.parent / payload["files"]["dataset_audit_csv"]
     with audit_path.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.DictReader(stream))

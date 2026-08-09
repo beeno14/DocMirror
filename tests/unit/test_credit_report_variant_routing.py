@@ -5,7 +5,6 @@
 
 from types import SimpleNamespace
 
-from docmirror.plugins.credit_report.enterprise_native import extraction as enterprise_extraction
 from docmirror.plugins.credit_report.personal_brief_native import extraction as personal_brief_extraction
 from docmirror.plugins.credit_report.variant_router import (
     registered_credit_report_variants,
@@ -46,8 +45,10 @@ def test_credit_report_variant_dataset_contracts_preserve_existing_outputs() -> 
     personal_detail = resolve_credit_report_variant("personal_detail", "scanned_ocr")
 
     assert "credit_lines" not in personal_brief.dataset_names()
-    assert enterprise.dataset_names()[1] == "credit_lines"
-    assert personal_detail.dataset_names()[1] == "credit_lines"
+    assert "enterprise_credit_facilities" in enterprise.dataset_names()
+    assert "credit_lines" not in enterprise.dataset_names()
+    assert "credit_agreements" in personal_detail.dataset_names()
+    assert "credit_lines" not in personal_detail.dataset_names()
     assert personal_brief.keep_query_institution is False
     assert enterprise.keep_query_institution is True
     assert personal_detail.keep_query_institution is True
@@ -59,10 +60,46 @@ def test_personal_detail_presentation_overrides_are_variant_local() -> None:
     personal_detail = resolve_credit_report_variant("personal_detail", "native_text")
 
     overrides = personal_detail.semantic_extensions()["community_projection_overrides"]
-    assert overrides["dataset_labels"]["personal_report_metadata"] == "个人信用报告信息"
-    assert overrides["dataset_labels"]["credit_accounts"] == "信贷交易账户明细"
-    assert overrides["section_markers"]["statements"] == ["statements", "notes"]
-    assert "community_projection_overrides" not in personal_brief.semantic_extensions()
+    assert overrides["dataset_labels"]["report_metadata"] == "报告元数据"
+    assert overrides["dataset_labels"]["credit_accounts"] == "信贷交易账户"
+    assert overrides["section_markers"]["annotation_statements"] == ["statements", "annotations"]
+    personal_semantic = personal_brief.semantic_extensions()
+    personal_overrides = personal_semantic["community_projection_overrides"]
+    assert personal_overrides["section_markers"]["personal_report_metadata"] == [
+        "report_header"
+    ]
+    assert personal_overrides["section_markers"]["report_notes"] == ["notes"]
+    assert "appendix" not in personal_semantic["enhanced_markdown"]
+    assert personal_semantic["enhanced_markdown"]["dataset_layouts"]["public_records"] == {
+        "hidden": True
+    }
+    personal_layouts = personal_semantic["enhanced_markdown"]["dataset_layouts"]
+    assert personal_layouts["overdue_records"] == {"hidden": True}
+    account_partitions = personal_layouts["credit_accounts"]["partitions"]
+    assert [partition["prepend_partition"]["title"] for partition in account_partitions] == [
+        "信用卡逾期记录",
+        "贷款逾期记录",
+        "其他业务逾期记录",
+    ]
+    assert all(
+        partition["prepend_partition"]["dataset"] == "overdue_records"
+        and partition["prepend_partition"]["join_on"] == "account_id"
+        for partition in account_partitions
+    )
+    for other_semantic in (
+        enterprise.semantic_extensions(),
+        personal_detail.semantic_extensions(),
+    ):
+        other_layouts = other_semantic.get("enhanced_markdown", {}).get(
+            "dataset_layouts", {}
+        )
+        assert not any(
+            "prepend_partition" in partition
+            for layout in other_layouts.values()
+            if isinstance(layout, dict)
+            for partition in layout.get("partitions", [])
+            if isinstance(partition, dict)
+        )
     assert "community_projection_overrides" not in enterprise.semantic_extensions()
 
 
@@ -74,7 +111,7 @@ def test_unknown_credit_report_variant_preserves_legacy_fallback_shape() -> None
     assert "credit_lines" in unknown.dataset_names()
 
 
-def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatch) -> None:
+def test_native_business_extraction_is_owned_by_non_enterprise_variants(monkeypatch) -> None:
     parse_result = SimpleNamespace()
     personal_brief = resolve_credit_report_variant("personal_brief", "native_text")
     enterprise = resolve_credit_report_variant("enterprise", "native_text")
@@ -84,22 +121,12 @@ def test_native_business_extraction_is_owned_by_each_document_variant(monkeypatc
         "extract_personal_brief_native_business",
         lambda _result, _text: {"owner": "personal_brief_native"},
     )
-    monkeypatch.setattr(
-        enterprise_extraction,
-        "extract_enterprise_native_business",
-        lambda _result, _text: {"owner": "enterprise_native"},
-    )
-
     assert personal_brief.extract_native_business(
         parse_result,
         "",
         content_mode="native_text",
     ) == {"owner": "personal_brief_native"}
-    assert enterprise.extract_native_business(
-        parse_result,
-        "",
-        content_mode="native_text",
-    ) == {"owner": "enterprise_native"}
+    assert "extract_native_business" not in type(enterprise).__dict__
     assert (
         personal_detail.extract_native_business(
             parse_result,
@@ -131,20 +158,23 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "sensitive": True,
     }
     assert "个人简版" in personal_dictionary["datasets"]["credit_accounts"]["definition"]
-    assert "个人简版" not in enterprise_dictionary["datasets"]["credit_accounts"]["definition"]
+    assert "个人简版" not in enterprise_dictionary["datasets"]["enterprise_credit_accounts"]["definition"]
     assert personal_semantic["presentation_policy"]["classification"] == ("highly_sensitive_personal_financial_data")
     assert enterprise_semantic["presentation_policy"]["classification"] == ("sensitive_enterprise_credit_data")
-    assert enterprise_semantic["dataset_relationships"]["credit_lines"]["relationship"] == (
+    assert enterprise_semantic["dataset_relationships"]["enterprise_credit_facilities"]["relationship"] == (
         "independent_enterprise_facility_records"
     )
     assert personal_semantic["dataset_document_order"][:5] == [
         "personal_report_metadata",
-        "report_notes",
         "identity_documents",
         "personal_credit_summary_records",
         "asset_disposition_records",
+        "guarantor_compensation_records",
     ]
-    assert personal_semantic["dataset_document_order"][-1] == "inquiry_records"
+    assert personal_semantic["dataset_document_order"][-2:] == [
+        "inquiry_records",
+        "report_notes",
+    ]
     enterprise_order = enterprise_semantic["dataset_document_order"]
     assert enterprise_order[:4] == [
         "enterprise_report_metadata",
@@ -152,26 +182,69 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
         "enterprise_exchange_rates",
         "enterprise_report_identity",
     ]
+    assert enterprise_order[4] == "enterprise_section_presence"
     assert (
         enterprise_order.index("enterprise_current_credit_summary")
         < enterprise_order.index("enterprise_facility_summary")
         < enterprise_order.index("enterprise_closed_credit_summary")
     )
     assert (
-        enterprise_order.index("enterprise_profile_fields")
+        enterprise_order.index("enterprise_profile")
         < enterprise_order.index("enterprise_capital_summary")
-        < enterprise_order.index("enterprise_stakeholders")
+        < enterprise_order.index("enterprise_contributors")
     )
     assert (
-        enterprise_order.index("credit_accounts")
-        < enterprise_order.index("enterprise_displayed_credit_summary")
-        < enterprise_order.index("credit_lines")
+        enterprise_order.index("enterprise_displayed_credit_summary")
+        < enterprise_order.index("enterprise_credit_accounts")
+        < enterprise_order.index("enterprise_credit_facilities")
     )
-    assert enterprise_order[-1] == "enterprise_extraction_audit"
+    assert "enterprise_extraction_audit" not in enterprise_order
     assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
-    assert enterprise_dictionary["version"] == "2.0.0"
+    assert enterprise_dictionary["version"] == "3.0.0"
     assert "identity_documents" not in enterprise_dictionary["datasets"]
     assert "enterprise_credit_accounts" in enterprise_dictionary["datasets"]
+
+
+def test_enterprise_enhanced_markdown_uses_business_only_allowlists() -> None:
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    semantic = enterprise.semantic_extensions()
+    enhanced = semantic["enhanced_markdown"]
+    layouts = enhanced["dataset_layouts"]
+
+    assert enhanced["suppress_empty_columns"] is True
+    assert layouts["report_notes"] == {"hidden": True}
+    assert layouts["enterprise_section_presence"] == {"hidden": True}
+    assert layouts["enterprise_report_identity"] == {"hidden": True}
+    assert layouts["enterprise_credit_overview"] == {"hidden": True}
+    assert set(enterprise.dataset_names()) == set(layouts)
+    assert all(layout.get("hidden") or layout.get("columns") for layout in layouts.values())
+    assert enhanced["section_layouts"]["identity"]["omit_unlisted"] is True
+    assert enhanced["section_layouts"]["credit_summary"]["omit_unlisted"] is True
+
+    technical_columns = {
+        "sequence",
+        "source_page",
+        "source_page_end",
+        "source_table_id",
+        "source_table_id_end",
+        "presence_status",
+        "heading_detected",
+        "count_scope",
+        "represented_dataset",
+        "reported_record_count_status",
+        "continuation_complete",
+    }
+    for layout in layouts.values():
+        assert not (technical_columns & set(layout.get("columns") or ()))
+
+    detail_groups = layouts["enterprise_credit_detail_groups"]
+    assert detail_groups["title_fields"] == ["group_phase", "business_category"]
+    assert enterprise.data_dictionary()["enums"]["group_phase"] == {
+        "active": "未结清信贷",
+        "recovered": "被追偿",
+        "settled": "已结清信贷",
+        "repayment_responsibility": "相关还款责任",
+    }
 
 
 def test_enterprise_official_public_record_lexicon_is_complete() -> None:
@@ -179,7 +252,7 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
     dictionary = enterprise.data_dictionary()
     dataset_layouts = enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"]
 
-    assert dictionary["fields"]["public_record_type_counts"]["map_key_enum"] == "record_type"
+    assert dictionary["fields"]["extracted_public_record_type_counts"]["map_key_enum"] == "record_type"
     assert "public_records" not in dictionary["datasets"]
     assert "public_records" not in dataset_layouts
     assert list(dictionary["datasets"]["enterprise_public_license_records"]["columns"]) == [
@@ -196,7 +269,6 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
     assert enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"][
         "enterprise_public_certification_records"
     ]["columns"] == [
-        "sequence",
         "certification_authority",
         "certification_type",
         "certification_date",
@@ -210,6 +282,7 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
         "civil_judgment",
         "enforcement",
         "administrative_penalty",
+        "housing_fund_payment",
         "social_security_payment",
         "license",
         "certification",
@@ -226,3 +299,30 @@ def test_enterprise_official_public_record_lexicon_is_complete() -> None:
         "dispute_annotation",
     }
     assert all(dictionary["enums"]["record_type"].values())
+
+
+def test_enterprise_attachment_amount_schema_prefers_typed_business_fields() -> None:
+    enterprise = resolve_credit_report_variant("enterprise", "native_text")
+    dictionary = enterprise.data_dictionary()
+    columns = dictionary["datasets"]["enterprise_attachment_credit_details"]["columns"]
+    layout = enterprise.semantic_extensions()["enhanced_markdown"]["dataset_layouts"][
+        "enterprise_attachment_credit_details"
+    ]["columns"]
+
+    assert {
+        "amount",
+        "amount_kind",
+        "credit_limit",
+        "loan_amount",
+        "discount_amount",
+        "instrument_amount",
+        "guarantee_amount",
+        "balance",
+        "risk_exposure_amount",
+    } <= set(columns)
+    assert columns["amount"]["label"] == "金额"
+    assert "amount_kind" in columns["amount"]["definition"]
+    assert "amount" not in layout
+    assert "amount_kind" in layout
+    assert "instrument_amount" in layout
+    assert "guarantee_amount" in layout

@@ -179,9 +179,7 @@ def test_unresolved_first_grid_links_to_first_account_on_same_page() -> None:
             "year": 2025,
             "month": 1,
             "status": "unknown",
-            "source_cell_refs": [
-                {"grid_id": "unresolved-grid", "page": 4, "geometry_status": "unresolved"}
-            ],
+            "source_cell_refs": [{"grid_id": "unresolved-grid", "page": 4, "geometry_status": "unresolved"}],
         }
     ]
     accounts = [
@@ -332,3 +330,73 @@ def test_scanned_account_cards_are_segmented_across_pages_without_false_summary_
     assert accounts[1]["credit_limit"] == 12000
     assert accounts[1]["management_institution"] == "示例银行股份有限公司厦门市分行"
     assert accounts[1]["audit"]["projection_completeness"] == "raw_and_semantic_core_complete"
+
+
+def test_scanned_account_scope_closes_before_repayment_liabilities() -> None:
+    def line(text: str, y: float) -> dict:
+        return {"text": text, "bbox": [20, y, 500, y + 12], "confidence": 0.98, "evidence_ids": [text]}
+
+    bundles = [
+        {
+            "page": 1,
+            "source_page_number": 1,
+            "local_structure_evidence": {
+                "lines": [
+                    line("(三)贷记卡账户", 20),
+                    line("账户1(授信协议标识:CARD0001)", 40),
+                    line("发卡机构 账户标识 开立日期 账户授信额度 币种 业务种类", 60),
+                    line("示例银行股份有限公司 CARD0001 2024.01.01 12,000 人民币元 贷记卡", 80),
+                    line("(五)相关还款责任信息", 100),
+                    line("账户1", 120),
+                    line("管理机构 账户标识 责任人类型 还款责任金额 保证合同编号", 140),
+                    line("另一银行股份有限公司 A1 保证人 4,000,000 G-001", 160),
+                ]
+            },
+        }
+    ]
+    result = ParseResult(
+        entities=DocumentEntities(
+            document_type="credit_report",
+            domain_specific={"_page_evidence_bundles": bundles},
+        )
+    )
+
+    business = extract_scanned_credit_business(result, "合计 1")
+    accounts = business["credit_accounts"]
+
+    assert [account["account_id"] for account in accounts] == ["credit_account:credit_card:1"]
+    assert "还款责任金额" not in accounts[0]["raw_detail_text"]
+    assert business["credit_summary"]["suppressed_liability_anchor_count"] == 1
+
+
+def test_scanned_account_keeps_valid_prefix_before_liability_table() -> None:
+    def line(text: str, y: float) -> dict:
+        return {"text": text, "bbox": [20, y, 500, y + 12], "confidence": 0.98, "evidence_ids": [text]}
+
+    bundles = [
+        {
+            "page": 1,
+            "source_page_number": 1,
+            "local_structure_evidence": {
+                "lines": [
+                    line("(三)贷记卡账户", 20),
+                    line("账户1(授信协议标识:CARD0001)", 40),
+                    line("(五)相关还款责任信息", 60),
+                    line("管理机构 账户标识 责任人类型 还款责任金额 保证合同编号", 80),
+                    line("另一银行股份有限公司 A1 保证人 4,000,000 G-001", 100),
+                ]
+            },
+        }
+    ]
+    result = ParseResult(
+        entities=DocumentEntities(
+            document_type="credit_report",
+            domain_specific={"_page_evidence_bundles": bundles},
+        )
+    )
+
+    accounts = extract_scanned_credit_accounts(result)
+
+    assert [account["account_id"] for account in accounts] == ["credit_account:credit_card:1"]
+    assert accounts[0]["credit_agreement_identifier"] == "CARD0001"
+    assert "还款责任金额" not in accounts[0]["raw_detail_text"]

@@ -8,7 +8,6 @@ import pytest
 from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow, TextBlock
 from docmirror.plugins.credit_report.business_assembly import _build_audit
 from docmirror.plugins.credit_report.business_records import (
-    _merge_enterprise_accounts,
     derive_overdue_records,
     extract_native_credit_business,
 )
@@ -17,7 +16,6 @@ from docmirror.plugins.credit_report.currency_codes import (
     normalize_currency_code,
 )
 from docmirror.plugins.credit_report.enterprise_native.extraction import (
-    _merge_accounts,
     extract_enterprise_attachment_datasets,
     extract_enterprise_capital_summary,
     extract_enterprise_credit_lines_from_tables,
@@ -28,8 +26,9 @@ from docmirror.plugins.credit_report.enterprise_native.extraction import (
     extract_enterprise_report_metadata_records,
     extract_enterprise_report_notes,
     extract_enterprise_summary_datasets,
-    refine_enterprise_business,
 )
+from docmirror.plugins.credit_report.enterprise_native.ir import build_canonical_enterprise_document
+from docmirror.plugins.credit_report.enterprise_native.pipeline import extract_enterprise_semantic_document
 from docmirror.plugins.credit_report.personal_brief_native.extraction import (
     extract_personal_brief_section_content,
 )
@@ -39,6 +38,11 @@ def _result(text: str) -> SimpleNamespace:
     return SimpleNamespace(
         pages=[PageContent(page_number=1, texts=[TextBlock(content=text)])],
     )
+
+
+def _enterprise_semantic(result: SimpleNamespace):
+    document = build_canonical_enterprise_document(result)
+    return extract_enterprise_semantic_document(document)
 
 
 def _native_table(
@@ -79,7 +83,7 @@ def test_enterprise_facility_detail_emits_every_declared_row_pair() -> None:
 
     rows = extract_enterprise_credit_lines_from_tables(result, [])
 
-    assert [row["account_identifier"] for row in rows] == [
+    assert [row["credit_agreement_identifier"] for row in rows] == [
         "B11215800H0001N24044608",
         "B11215800H0001N25027358",
     ]
@@ -367,35 +371,29 @@ def test_enterprise_public_overview_and_detail_type_counts_are_both_preserved() 
                 page_number=3,
                 source_page_number=3,
                 tables=[overview],
-                texts=[],
+                texts=[_native_text("信息概要", top=0)],
             ),
             SimpleNamespace(
                 page_number=10,
                 source_page_number=10,
                 tables=[license_record],
-                texts=[],
+                texts=[_native_text("公共记录明细", top=0)],
             ),
         ]
     )
 
-    refined = refine_enterprise_business(
-        result,
-        {
-            "credit_summary": {},
-            "credit_accounts": [],
-            "credit_lines": [],
-            "public_records": [],
-        },
-    )
+    document = build_canonical_enterprise_document(result)
+    refined = extract_enterprise_semantic_document(document).credit_summary
 
-    assert refined["credit_summary"]["public_record_counts"] == {
+    assert refined["public_record_overview_counts"] == {
         "non_credit_accounts": 0,
         "tax_arrears": 0,
         "civil_judgments": 0,
         "enforcements": 0,
         "administrative_penalties": 0,
     }
-    assert refined["credit_summary"]["public_record_type_counts"] == {"license": 1}
+    assert refined["extracted_public_record_type_counts"] == {"license": 1}
+    assert refined["extracted_public_record_count"] == 1
 
 
 def test_enterprise_attachment_history_binds_to_visual_account_context() -> None:
@@ -950,58 +948,6 @@ def test_personal_brief_handles_wrapped_fields_liabilities_and_online_queries() 
     assert business["credit_summary"]["inactive_credit_card_account_count"] == 1
 
 
-def test_enterprise_merge_fills_only_reconciled_main_account_gap() -> None:
-    canonical = [
-        {
-            "account_identifier": "ACCOUNT000001",
-            "management_institution": "示例银行一",
-            "business_type": "流动资金贷款",
-            "open_date": "2025-01-01",
-            "due_date": "2026-01-01",
-            "balance": 10,
-        }
-    ]
-    fallback = [
-        dict(canonical[0]),
-        {
-            "account_identifier": "ACCOUNT000002",
-            "management_institution": "示例银行二",
-            "business_type": "订单融资",
-            "open_date": "2025-02-01",
-            "due_date": "2026-02-01",
-        },
-    ]
-
-    merged = _merge_accounts(fallback, canonical, expected=2)
-
-    assert [row["account_identifier"] for row in merged] == ["ACCOUNT000001", "ACCOUNT000002"]
-
-
-def test_enterprise_merge_does_not_guess_when_population_is_ambiguous() -> None:
-    canonical = [
-        {
-            "account_identifier": "ACCOUNT000001",
-            "management_institution": "示例银行一",
-            "business_type": "流动资金贷款",
-            "open_date": "2025-01-01",
-        }
-    ]
-    fallback = [
-        *canonical,
-        *[
-            {
-                "account_identifier": f"ACCOUNT00000{index}",
-                "management_institution": f"示例银行{index}",
-                "business_type": "附件历史",
-                "open_date": f"2025-0{index}-01",
-            }
-            for index in (2, 3)
-        ],
-    ]
-
-    assert _merge_accounts(fallback, canonical, expected=2) == canonical
-
-
 def test_enterprise_identity_can_continue_in_an_adjacent_table_and_page() -> None:
     result = SimpleNamespace(
         pages=[
@@ -1120,56 +1066,6 @@ def test_personal_brief_accepts_new_structured_inquiry_reason_suffix() -> None:
     assert business["inquiry_records"][0]["reason"] == "客户准入审查"
 
 
-def test_enterprise_extracts_summary_facilities_accounts_and_public_records() -> None:
-    text = """
-    企业信用报告 信息概要
-    首次有信贷交易的年份 发生信贷交易的机构数 当前有未结清信贷交易的机构数
-    首次有相关还款责任的年份
-    2019 3 2 2024
-    借贷交易 担保交易 余额 37311.68 余额 6000 其中：被追偿余额 0
-    非信贷交易账户数 欠税记录条数 民事判决记录条数 强制执行记录条数 行政处罚记录条数
-    0 0 0 0 0
-    非循环信用额度 循环信用额度
-    总额 已用额度 剩余可用额度 总额 已用额度 剩余可用额度
-    3000 2500 500 4900 4000 900
-    责任类型
-    公共记录明细 获得许可记录
-    许可部门 许可类型 许可日期 截止日期 许可内容
-    示例市生态环境
-    局 普通 2023-05-25 2028-07-21 排污
-    许可
-    认证部门 认证类型 认证日期 截止日期 认证内容
-    国家税务总局 纳税信用A级纳税人 -- 2028-12-31 2022年度纳税信用A级纳税人
-    附件1：信用记录补充信息
-    1.未结清账户编号：G10323310H000123456789
-    授信机构：示例商业银行股份有限公司
-    业务种类：流动资金贷款
-    信息报告日期 余额 五级分类
-    """
-
-    business = extract_native_credit_business(
-        _result(text),
-        text,
-        report_subtype="enterprise",
-        content_mode="native_text",
-    )
-
-    assert business["credit_summary"]["first_credit_year"] == 2019
-    assert business["credit_summary"]["active_credit_institution_count"] == 2
-    assert business["credit_summary"]["credit_balance"] == 37311.68
-    # Aggregate facility totals are summary facts, not source-grained records.
-    assert business["credit_lines"] == []
-    assert len(business["credit_accounts"]) == 1
-    assert business["credit_accounts"][0]["account_status"] == "active"
-    assert {item["record_type"] for item in business["public_records"]} == {
-        "license",
-        "certification",
-    }
-    license_record = next(item for item in business["public_records"] if item["record_type"] == "license")
-    assert license_record["authority"] == "示例市生态环境局"
-    assert license_record["content"] == "排污许可"
-
-
 def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers() -> None:
     table = TableBlock(
         table_id="summary",
@@ -1200,24 +1096,27 @@ def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=1, tables=[table, balances])])
-
-    business = extract_native_credit_business(
-        result,
-        "| headers |\n| --- |\n| 2019 | 3 | 2 | 2024 |",
-        report_subtype="enterprise",
-        content_mode="native_text",
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="信息概要")],
+                tables=[table, balances],
+            )
+        ]
     )
+
+    semantic = _enterprise_semantic(result)
 
     assert {
         "first_credit_year": 2019,
         "credit_institution_count": 3,
         "active_credit_institution_count": 2,
         "first_repayment_responsibility_year": 2024,
-    }.items() <= business["credit_summary"].items()
-    assert business["credit_summary"]["credit_balance"] == 37311.68
-    assert business["credit_summary"]["guarantee_balance"] == 6000
-    assert business["credit_summary"]["recovered_debt_balance"] == 0
+    }.items() <= semantic.credit_summary.items()
+    assert semantic.credit_summary["credit_balance"] == "37311.68"
+    assert semantic.credit_summary["guarantee_balance"] == "6000"
+    assert semantic.credit_summary["recovered_debt_balance"] == "0"
 
 
 def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility_values() -> None:
@@ -1323,83 +1222,50 @@ def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility
     )
     result = SimpleNamespace(
         pages=[
-            PageContent(page_number=3, tables=[summary, facilities]),
-            PageContent(page_number=4, tables=[first_page]),
+            PageContent(
+                page_number=3,
+                texts=[TextBlock(content="信息概要")],
+                tables=[summary, facilities],
+            ),
+            PageContent(
+                page_number=4,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[first_page],
+            ),
             PageContent(page_number=5, tables=[continuation, revolving, facility_detail]),
         ]
     )
 
-    business = extract_native_credit_business(
-        result,
-        "企业信用报告",
-        report_subtype="enterprise",
-        content_mode="native_text",
-    )
+    semantic = _enterprise_semantic(result)
+    accounts = semantic.datasets["enterprise_credit_accounts"]
+    credit_lines = semantic.datasets["enterprise_credit_facilities"]
 
-    assert [account["account_identifier"] for account in business["credit_accounts"]] == [
+    assert [account["account_identifier"] for account in accounts] == [
         "Y10061000H0001EIP1967714",
         "D10055840H0001LE20220228XS000007641",
     ]
-    first, second = business["credit_accounts"]
+    first, second = accounts
     assert first["balance"] == 34.88
     assert first["loan_amount"] == 62.99
     assert first["snapshot_date"] == "2023-01-03"
     assert second["balance"] == 25.87
     assert second["credit_limit"] == 34.1
     assert "loan_amount" not in second
-    assert business["credit_summary"]["reported_account_count"] == 2
-    assert "detail_account_balance" not in business["credit_summary"]
-    assert "account_balance_reconciliation_tolerance" not in business["credit_summary"]
-    assert len(business["credit_lines"]) == 1
-    facility = business["credit_lines"][0]
+    assert semantic.credit_summary["reported_account_count"] == 2
+    assert "detail_account_balance" not in semantic.credit_summary
+    assert "account_balance_reconciliation_tolerance" not in semantic.credit_summary
+    assert len(credit_lines) == 1
+    facility = credit_lines[0]
     assert (facility["total_limit"], facility["used_limit"]) == (34.33, 25.87)
     assert "available_limit" not in facility
     assert facility["account_id"] == second["account_id"]
-    assert business["credit_summary"]["facility_summary"] == {
-        "non_revolving": {
-            "total_limit": 0,
-            "used_limit": 0,
-            "available_limit": 0,
-            "currency": "CNY",
-            "amount_unit": "CNY_10K",
-        },
-        "revolving": {
-            "total_limit": 34.33,
-            "used_limit": 25.87,
-            "available_limit": 8.47,
-            "currency": "CNY",
-            "amount_unit": "CNY_10K",
-        },
-    }
-
-
-def test_enterprise_merge_rejects_truncated_canonical_account_prefix() -> None:
-    canonical = [
-        {
-            "account_identifier": "D10123320H000170060110009",
-            "account_id": "credit_account:D10123320H000170060110009",
-            "source": "canonical_physical_table",
-        }
+    assert [
+        (row["facility_type"], row["total_limit"], row["used_limit"], row["available_limit"])
+        for row in semantic.datasets["enterprise_facility_summary"]
+    ] == [
+        ("non_revolving", 0, 0, 0),
+        ("revolving", 34.33, 25.87, 8.47),
     ]
-    narrative = [
-        {
-            "account_identifier": "D10123320H000170060110009026522",
-            "account_id": "credit_account:D10123320H000170060110009026522",
-            "source": "enterprise_account_history",
-        },
-        {
-            "account_identifier": "D10123320H000170060110009027778",
-            "account_id": "credit_account:D10123320H000170060110009027778",
-            "source": "enterprise_account_history",
-        },
-    ]
-
-    merged = _merge_enterprise_accounts(canonical, narrative)
-
-    assert {item["account_identifier"] for item in merged} == {
-        "D10123320H000170060110009026522",
-        "D10123320H000170060110009027778",
-    }
 
 
 def test_enterprise_settled_cards_keep_closed_status_and_do_not_absorb_later_tables() -> None:
@@ -1443,69 +1309,26 @@ def test_enterprise_settled_cards_keep_closed_status_and_do_not_absorb_later_tab
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=8, tables=[settled, unrelated])])
-
-    business = extract_native_credit_business(
-        result,
-        "企业信用报告",
-        report_subtype="enterprise",
-        content_mode="native_text",
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=8,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[settled, unrelated],
+            )
+        ]
     )
 
-    assert len(business["credit_accounts"]) == 2
-    assert [record["account_status"] for record in business["credit_accounts"]] == ["settled", "settled"]
-    assert [record["close_date"] for record in business["credit_accounts"]] == [
+    semantic = _enterprise_semantic(result)
+    accounts = semantic.datasets["enterprise_credit_accounts"]
+
+    assert len(accounts) == 2
+    assert [record["account_status"] for record in accounts] == ["settled", "settled"]
+    assert [record["close_date"] for record in accounts] == [
         "2015-06-30",
         "2015-07-31",
     ]
-    assert all("balance" not in record for record in business["credit_accounts"])
-
-
-def test_enterprise_public_records_support_one_cell_per_text_line() -> None:
-    text = """
-    企业信用报告（自主查询版）
-    公共记录明细
-    许可部门
-    许可类型
-    许可日期
-    截止日期
-    许可内容
-    示例市生态环境局
-    普通
-    2024-01-02
-    2025-01-02
-    排污许可
-    示例省示例市市场
-    监督管理局
-    普通
-    2024-03-04
-    2026-03-04
-    热食类食品制售
-    认证部门
-    认证类型
-    认证日期
-    截止日期
-    认证内容
-    国家税务总局
-    纳税信用A级纳税人
-    --
-    2025-12-31
-    2024年度纳税信
-    用A级纳税人
-    附件1：信用记录补充信息
-    """
-
-    business = extract_native_credit_business(
-        _result(text),
-        text,
-        report_subtype="enterprise",
-        content_mode="native_text",
-    )
-
-    records = business["public_records"]
-    assert len(records) == 3
-    assert records[1]["authority"] == "示例省示例市市场监督管理局"
-    assert records[2]["content"] == "2024年度纳税信用A级纳税人"
+    assert all("balance" not in record for record in accounts)
 
 
 def test_derive_overdue_records_from_scanned_account_and_repayment_month() -> None:

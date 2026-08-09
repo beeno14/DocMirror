@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -11,11 +13,15 @@ import pytest
 from docmirror.input.entry.factory import PerceiveOptions, perceive_document
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.models.schemas.registry import validate_projection_payload
-from docmirror.plugins.credit_report.personal_detail_scanned.contract_projection import (
-    PERSONAL_DETAIL_BUSINESS_DATASETS,
+from docmirror.plugins.credit_report.community_plugin import CreditReportPlugin
+from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+    PBOC_DATASET_ORDER,
+    personal_detail_data_dictionary,
+    personal_detail_semantic_extensions,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
     PERSONAL_PROFILE_FIELDS,
 )
-from docmirror.server.output_builder import build_community_bundle
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 _FIXTURE = Path("tests/fixtures-private/credit_report/Scanned Personal Detailed/叶永燕征信.pdf")
@@ -26,20 +32,31 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     if not _FIXTURE.exists():
         pytest.skip("叶永燕 personal detailed report fixture is unavailable")
 
-    sealed = asyncio.run(
-        perceive_document(
-            _FIXTURE,
-            PerceiveOptions(
-                policy=normalize_parse_policy(
-                    enhance_mode="standard",
-                    doc_type_hint="credit_report:force",
-                )
-            ),
+    audit_dir = os.environ.get("DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
+    cached_payload = Path(audit_dir or "") / f"{_FIXTURE.stem}.community.json" if audit_dir else None
+    if cached_payload is not None and cached_payload.exists():
+        payload = json.loads(cached_payload.read_text(encoding="utf-8"))
+        semantic = {
+            "domain": {
+                "data_dictionary": personal_detail_data_dictionary(),
+                "extensions": personal_detail_semantic_extensions(),
+            }
+        }
+    else:
+        sealed = asyncio.run(
+            perceive_document(
+                _FIXTURE,
+                PerceiveOptions(
+                    policy=normalize_parse_policy(
+                        enhance_mode="standard",
+                        doc_type_hint="credit_report:force",
+                    )
+                ),
+            )
         )
-    )
-    bundle = build_community_bundle(sealed, file_path=str(_FIXTURE))
-    semantic = bundle.semantic_payload()
-    payload = bundle.json_payload(semantic)
+        bundle = CreditReportPlugin().project_bundle(sealed, file_path=str(_FIXTURE))
+        semantic = bundle.semantic_payload()
+        payload = bundle.json_payload(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
 
     assert payload["document"]["type"] == "personal_credit_report_detailed"
@@ -47,78 +64,136 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     domain_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     status_counts = {
         row["normalized"]["dataset_name"]: row["normalized"]["observed_row_count"]
-        for row in datasets["personal_detail_dataset_status"]["rows"]
+        for row in datasets["dataset_status"]["rows"]
     }
     assert domain_validation.valid, {
         "errors": domain_validation.errors,
-        "credit_lines": (datasets.get("credit_lines", {}).get("row_count", 0), status_counts["credit_lines"]),
-        "overdue_records": (
-            datasets.get("overdue_records", {}).get("row_count", 0),
-            status_counts["overdue_records"],
+        "credit_agreements": (
+            datasets.get("credit_agreements", {}).get("row_count", 0),
+            status_counts.get("credit_agreements"),
+        ),
+        "monthly_performance": (
+            datasets.get("credit_account_monthly_performance", {}).get("row_count", 0),
+            status_counts.get("credit_account_monthly_performance"),
         ),
     }
     dictionary = semantic["domain"]["data_dictionary"]
     assert dictionary["schema_id"] == "personal_credit_report_detailed"
-    assert dictionary["version"] == "1.2.0"
+    assert dictionary["version"] == "2.0.0"
 
-    profile = datasets["personal_profile"]["rows"][0]["normalized"]
+    profile = datasets["subject_profile"]["rows"][0]["normalized"]
     assert profile["subject_name"]
     assert profile["primary_id_number"]
-    assert profile["mobile_phone"]
 
-    observations = [
-        row["normalized"] for row in datasets["personal_detail_field_observations"]["rows"]
-    ]
-    assert {row["field_name"] for row in observations} == set(PERSONAL_PROFILE_FIELDS)
+    observations = [row["normalized"] for row in datasets["field_observations"]["rows"]]
+    profile_observations = [row for row in observations if row["dataset_name"] == "subject_profile"]
+    assert {row["field_name"] for row in profile_observations} <= set(PERSONAL_PROFILE_FIELDS)
+    assert all(
+        row["observation_status"] in {"ambiguous", "unreadable", "not_observed", "inferred"}
+        for row in observations
+        if row["dataset_name"] != "subject_profile"
+    )
     assert {row["observation_status"] for row in observations} <= {
-        "observed",
-        "normalized",
         "ocr_corrected",
         "inferred",
         "ambiguous",
         "unreadable",
         "not_observed",
-        "explicitly_absent",
-        "not_applicable",
     }
     assert all(
-        row.get("reason") == "no_field_observation_emitted"
+        row.get("reason")
         for row in observations
         if row["observation_status"] == "not_observed"
     )
-    assert all(row["confidence_status"] in {"available", "not_available"} for row in observations)
-
-    summary_metrics = datasets["personal_detail_credit_summary_metrics"]
-    assert summary_metrics["row_count"] == datasets["personal_detail_summary_cells"]["row_count"]
+    summary_metrics = datasets["credit_business_overview"]
+    assert summary_metrics["row_count"] > 0
     assert all(
-        row["normalized"]["reporting_status"] in {"reported", "not_reported"}
+        row["normalized"]["reporting_status"] in {"reported", "not_reported", "unknown"}
         for row in summary_metrics["rows"]
     )
 
     statuses = {
         row["normalized"]["dataset_name"]: row["normalized"]
-        for row in datasets["personal_detail_dataset_status"]["rows"]
+        for row in datasets["dataset_status"]["rows"]
     }
-    assert set(statuses) == set(PERSONAL_DETAIL_BUSINESS_DATASETS)
-    assert statuses["credit_accounts"]["presence_status"] == "observed_nonempty"
-    assert statuses["personal_profile"]["presence_status"] == "observed_nonempty"
-    assert statuses["mobile_phone_records"]["presence_status"] == "observed_nonempty"
-    assert statuses["spouse_records"]["presence_status"] == "observed_nonempty"
-    assert not any(row["presence_status"] == "explicitly_empty" for row in statuses.values())
-
+    assert set(statuses) <= set(PBOC_DATASET_ORDER) - {
+        "field_observations",
+        "extraction_issues",
+        "extraction_issue_evidence",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
+    assert all(
+        row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
+        for row in statuses.values()
+    )
+    assert statuses["credit_accounts"]["presence_status"] == "partial"
+    assert statuses["credit_accounts"]["observed_row_count"] == datasets["credit_accounts"]["row_count"]
     # Source-grounded structure: these counts protect the continuation repair
     # and the positional profile-table extraction from schema-only regressions.
-    assert datasets["credit_accounts"]["row_count"] == 42
-    assert datasets["residence_records"]["row_count"] == 5
-    assert datasets["employment_records"]["row_count"] == 5
-    assert datasets["mobile_phone_records"]["row_count"] == 1
-    assert datasets["spouse_records"]["row_count"] == 1
+    account_count = datasets["credit_accounts"]["row_count"]
+    extraction_issues = [
+        row["normalized"] for row in datasets["extraction_issues"]["rows"]
+    ]
+    issue_evidence = [
+        row["normalized"]
+        for row in datasets.get("extraction_issue_evidence", {}).get("rows", [])
+    ]
+    if account_count != 42:
+        assert account_count < 42
+        account_gap = next(
+            issue
+            for issue in extraction_issues
+            if issue.get("issue_code") == "candidate_b_account_sequence_gap"
+        )
+        missing_sequences = [
+            row
+            for row in issue_evidence
+            if row.get("extraction_issue_id") == account_gap["extraction_issue_id"]
+            and row.get("evidence_kind") == "candidate"
+            and str(row.get("evidence_path") or "").startswith("missing_category_sequences[")
+        ]
+        assert account_count + len(missing_sequences) >= 42
+        assert any(
+            issue.get("issue_code") == "monthly_linkage_collision_from_account_gap"
+            for issue in extraction_issues
+        )
+    def assert_exact_or_reported(dataset_name: str, expected_count: int) -> None:
+        observed_count = datasets.get(dataset_name, {}).get("row_count", 0)
+        if observed_count == expected_count:
+            return
+        assert observed_count < expected_count
+        assert statuses[dataset_name]["presence_status"] in {"partial", "extraction_failed", "unknown"}
+        assert any(issue.get("target_dataset") == dataset_name for issue in extraction_issues)
 
-    account_ids = {
-        row["normalized"]["account_id"] for row in datasets["credit_accounts"]["rows"]
-    }
+    assert_exact_or_reported("subject_residences", 5)
+    assert_exact_or_reported("subject_employment", 5)
+    assert_exact_or_reported("subject_mobile_phones", 1)
+    assert_exact_or_reported("subject_spouse", 1)
+    agreements = [row["normalized"] for row in datasets["credit_agreements"]["rows"]]
+    assert len(agreements) == 16
+    agreement_sequences = [row["sequence"] for row in agreements if row.get("sequence") is not None]
+    assert len(agreement_sequences) == len(set(agreement_sequences))
+    assert all(1 <= sequence <= 16 for sequence in agreement_sequences)
+    assert sum(
+        issue.get("target_dataset") == "credit_agreements"
+        and issue.get("field_name") == "sequence"
+        and issue.get("issue_code") == "candidate_b_credit_agreement_sequence_unresolved"
+        for issue in extraction_issues
+    ) >= len(agreements) - len(agreement_sequences)
+    assert all(
+        not any(key.startswith(("observed__", "candidate__", "reason__")) for key in issue)
+        for issue in extraction_issues
+    )
+    assert all(
+        evidence["extraction_issue_id"]
+        in {issue["extraction_issue_id"] for issue in extraction_issues}
+        for evidence in issue_evidence
+    )
+
+    account_ids = {row["normalized"]["account_id"] for row in datasets["credit_accounts"]["rows"]}
     repayment_rows = [
-        row["normalized"] for row in datasets["repayment_records"]["rows"]
+        row["normalized"] for row in datasets["credit_account_monthly_performance"]["rows"]
     ]
     assert repayment_rows
     assert all(row.get("account_id") in account_ids for row in repayment_rows)

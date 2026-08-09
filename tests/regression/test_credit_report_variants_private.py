@@ -27,6 +27,39 @@ _DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
 _KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
 _PERSONAL_BRIEF_DISPLAY_SAMPLE = _FIXTURE_DIR / "个人信用报告（本人简版）展示样本.pdf"
 
+_DIGITAL_ENTERPRISE_ACCURACY_EXPECTED = {
+    "征信报告_本报告由中国人民银行_20250311.pdf": {
+        "first_credit_year_status": "not_reported",
+        "extracted_public_record_count": 3,
+        "extracted_public_record_type_counts": {"license": 3},
+        "attachment_history_row_count": 0,
+        "profile_source_field": "industry_source_institution",
+        "profile_source_value": "中国建设银行股份有限公司广东省分行",
+        "profile_missing_field": "operating_status",
+        "public_section_status": "present_with_records",
+    },
+    "身份标识类型身份标识_征信报告_本报告由中国人民银行_20250224.PDF": {
+        "first_credit_year_status": "not_reported",
+        "extracted_public_record_count": 0,
+        "extracted_public_record_type_counts": {},
+        "attachment_history_row_count": 0,
+        "profile_source_field": "industry_source_institution",
+        "profile_source_value": "中国民生银行股份有限公司上海杨浦支行",
+        "profile_missing_field": "establishment_year",
+        "public_section_status": "absent_from_report",
+    },
+    "雯玥轩企业征信(1).pdf": {
+        "first_credit_year_status": "reported",
+        "extracted_public_record_count": 0,
+        "extracted_public_record_type_counts": {},
+        "attachment_history_row_count": 34,
+        "profile_source_field": "establishment_year_source_institution",
+        "profile_source_value": "中国工商银行股份有限公司厦门市分行",
+        "profile_missing_field": None,
+        "public_section_status": "absent_from_report",
+    },
+}
+
 _DIGITAL_PERSONAL_BRIEF_EXPECTED = {
     "人行征信报告-2025-04-14.pdf": (18, 0, 82, 10, 1),
     "人行征信报告-2026-06-24 08-52-53(1).pdf": (39, 0, 100, 13, 0),
@@ -109,6 +142,107 @@ def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    "fixture_name,expected",
+    list(_DIGITAL_ENTERPRISE_ACCURACY_EXPECTED.items()),
+)
+def test_digital_enterprise_accuracy_schema_contract(
+    fixture_name: str,
+    expected: dict[str, object],
+) -> None:
+    fixture = _DIGITAL_ENTERPRISE_DIR / fixture_name
+    if not fixture.exists():
+        pytest.skip(f"digital-enterprise accuracy fixture is unavailable: {fixture_name}")
+
+    sealed = asyncio.run(
+        perceive_document(
+            fixture,
+            PerceiveOptions(
+                policy=normalize_parse_policy(
+                    enhance_mode="standard",
+                    doc_type_hint="credit_report:force",
+                )
+            ),
+        )
+    )
+    bundle = build_community_bundle(sealed, file_path=str(fixture))
+    semantic = bundle.semantic_payload()
+    payload = bundle.json_payload(semantic)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    dictionary = semantic["domain"]["data_dictionary"]
+    summary = semantic["domain"]["facts"]["credit_summary"]
+    profile = datasets["enterprise_profile"]["rows"][0]["normalized"]
+    rich_profile = semantic_datasets["enterprise_profile"]["rows"][0]["normalized"]
+    section_rows = semantic_datasets["enterprise_section_presence"]["rows"]
+    section_by_key = {
+        row["normalized"]["section_key"]: row["normalized"] for row in section_rows
+    }
+
+    assert dictionary["version"] == "3.0.0"
+    assert semantic["extraction"]["status"] == "complete"
+    assert semantic["extraction"]["failures"] == []
+    assert len(section_rows) == 10
+    assert semantic_datasets["enterprise_section_presence"]["completeness"]["verified"] is True
+    assert section_by_key["public_records"]["presence_status"] == expected[
+        "public_section_status"
+    ]
+    assert summary["first_credit_year_status"] == expected["first_credit_year_status"]
+    assert summary["extracted_public_record_count"] == expected[
+        "extracted_public_record_count"
+    ]
+    assert summary["extracted_public_record_type_counts"] == expected[
+        "extracted_public_record_type_counts"
+    ]
+    assert summary["extracted_public_record_count_scope"] == "public_record_detail_rows"
+    assert summary["public_record_overview_count_scope"] == (
+        "information_overview_fixed_categories"
+    )
+    assert summary["attachment_history_row_count"] == expected[
+        "attachment_history_row_count"
+    ]
+    assert profile[str(expected["profile_source_field"])] == expected[
+        "profile_source_value"
+    ]
+    missing_field = expected["profile_missing_field"]
+    if isinstance(missing_field, str):
+        assert missing_field not in profile
+        assert f"{missing_field}_status" not in profile
+        assert f"{missing_field}_source_institution" not in profile
+        assert f"{missing_field}_source_institution_status" not in profile
+        assert rich_profile[missing_field] is None
+        assert rich_profile[f"{missing_field}_status"] == "not_reported"
+        assert rich_profile[f"{missing_field}_source_institution"] is None
+        assert rich_profile[f"{missing_field}_source_institution_status"] == "not_reported"
+    assert "field_info" not in profile
+    assert "public_record_count" not in summary
+    assert "public_record_counts" not in summary
+    assert "public_record_type_counts" not in summary
+    assert "attachment_credit_detail_count" not in summary
+
+    for dataset in payload["datasets"]:
+        columns = dictionary["datasets"].get(dataset["name"], {}).get("columns", {})
+        for row in dataset["rows"]:
+            assert {"normalized", "raw", "canonical_raw"} <= set(row)
+            assert not any(
+                isinstance(value, (dict, list))
+                for value in row["normalized"].values()
+            ), (dataset["name"], row["record_id"])
+            for field, metadata in columns.items():
+                value = row["normalized"].get(field)
+                if value is None:
+                    continue
+                field_type = metadata.get("type")
+                if field_type in {"money", "number", "percentage", "decimal"}:
+                    assert isinstance(value, str), (dataset["name"], field, value)
+                elif field_type == "integer":
+                    assert isinstance(value, int) and not isinstance(value, bool)
+                elif field_type == "boolean":
+                    assert isinstance(value, bool)
+                elif field_type in {"string", "text", "date", "datetime", "long_id"}:
+                    assert isinstance(value, str)
+
+
 def test_personal_brief_display_sample_projects_complete_business_schema() -> None:
     if not _PERSONAL_BRIEF_DISPLAY_SAMPLE.exists():
         pytest.skip("personal-brief display sample is unavailable")
@@ -142,10 +276,12 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
         "civil_judgment_records": 2,
         "enforcement_records": 2,
         "administrative_penalty_records": 1,
-        "public_records": 6,
-        "report_notes": 5,
     }
     assert {name: datasets[name]["row_count"] for name in expected_counts} == expected_counts
+    semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    assert semantic_datasets["public_records"]["row_count"] == 6
+    assert semantic_datasets["report_notes"]["row_count"] == 5
+    assert not {"public_records", "report_notes", "repayment_records"} & set(datasets)
     assert validate_projection_payload("community_semantic", semantic).valid
     assert validate_projection_payload("community", payload).valid
 
@@ -159,7 +295,13 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert credit_line.get("credit_line_expiry_date") is None
     assert credit_line.get("due_date") is None
     assert transferred["termination_event_type"] == "transferred_out"
-    assert transferred["transfer_out_date"] == "2023-11"
+    assert transferred["termination_event_date"] == "2023-11"
+    rich_transferred = next(
+        row["normalized"]
+        for row in semantic_datasets["credit_accounts"]["rows"]
+        if row["normalized"]["account_lifecycle_state"] == "transferred_out"
+    )
+    assert rich_transferred["transfer_out_date"] == "2023-11"
     assert bad_debt["business_type"] == "贷记卡"
     assert unactivated["account_currency"] == "USD"
     assert unactivated["reporting_amount_currency"] == "CNY"
@@ -191,6 +333,62 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert penalties[0]["effective_date"] == "2021-08"
     assert penalties[0]["end_date"] == "2024-07"
 
+    enhanced = bundle.render_enhanced_markdown(semantic)
+    visible = "\n".join(
+        line for line in enhanced.splitlines() if not line.startswith("<!--")
+    )
+    assert visible.index("## 报告信息") < visible.index("## 信贷记录") < visible.index(
+        "## 非信贷交易记录"
+    ) < visible.index("## 公共记录") < visible.index("## 查询记录")
+    assert visible.index("## 信贷记录") < visible.index("### 信息概要") < visible.index(
+        "\n#### 信用卡逾期记录\n"
+    )
+    assert visible.index("\n#### 信用卡逾期记录\n") < visible.index(
+        "\n#### 信用卡\n"
+    ) < visible.index("\n#### 贷款逾期记录\n") < visible.index("\n#### 贷款\n")
+    for hidden in (
+        "## 附录：文档来源与提取信息",
+        "## 说明",
+        "canonical_personal_brief_document_ir",
+        "personal_brief:component:",
+        "institution_statement:",
+        "sha256:",
+        "source_reported",
+        "not_reported",
+        "settled",
+        "账户标识",
+        "兼容结清/销户日期",
+    ):
+        assert hidden not in visible
+    assert "结清/销户日期" in visible
+    assert "| 序号 | 持有人姓名 | 证件类型 | 证件号码 | 是否主证件 |" in visible
+    assert identities[1]["document_number"] in visible
+    assert "| 概要指标 | 业务类别 | 指标值 | 报告状态 |" in visible
+    assert "### 逾期记录" not in visible
+    card_overdue_table = visible.split("\n#### 信用卡逾期记录\n", maxsplit=1)[1].split(
+        "\n#### 信用卡\n", maxsplit=1
+    )[0]
+    loan_overdue_table = visible.split("\n#### 贷款逾期记录\n", maxsplit=1)[1].split(
+        "\n#### 贷款\n", maxsplit=1
+    )[0]
+    assert sum(
+        bool(re.match(r"^\|\s*\d+\s*\|", line))
+        for line in card_overdue_table.splitlines()
+    ) == 3
+    assert sum(
+        bool(re.match(r"^\|\s*\d+\s*\|", line))
+        for line in loan_overdue_table.splitlines()
+    ) == 5
+    loan_table = visible.split("\n#### 贷款\n", maxsplit=1)[1].split(
+        "\n### ", maxsplit=1
+    )[0]
+    loan_sequences = [
+        int(line.split("|", maxsplit=2)[1].strip())
+        for line in loan_table.splitlines()
+        if re.match(r"^\|\s*\d+\s*\|", line)
+    ]
+    assert loan_sequences == list(range(1, 11))
+
 
 def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: Path) -> None:
     fixtures = sorted(_DIGITAL_ENTERPRISE_DIR.glob("*(1).pdf"))
@@ -212,30 +410,60 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     semantic = bundle.semantic_payload()
     payload = bundle.json_payload(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
-    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
-    credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
+    semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    accounts = [row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]]
+    rich_accounts = [
+        row["normalized"]
+        for row in semantic_datasets["enterprise_credit_accounts"]["rows"]
+    ]
+    credit_lines = [row["normalized"] for row in datasets["enterprise_credit_facilities"]["rows"]]
+    rich_credit_lines = [
+        row["normalized"]
+        for row in semantic_datasets["enterprise_credit_facilities"]["rows"]
+    ]
     facts = semantic["domain"]["facts"]
-    audit = facts["credit_extraction_audit"]
     facilities = [row["normalized"] for row in datasets["enterprise_facility_summary"]["rows"]]
     capital = [row["normalized"] for row in datasets["enterprise_capital_summary"]["rows"]]
-    stakeholders = [row["normalized"] for row in datasets["enterprise_stakeholders"]["rows"]]
+    stakeholders = [row["normalized"] for row in datasets["enterprise_key_personnel"]["rows"]]
     relationships = [row["normalized"] for row in datasets["enterprise_relationships"]["rows"]]
     supplement = [row["normalized"] for row in datasets["enterprise_credit_supplement"]["rows"]]
     report_metadata = [row["normalized"] for row in datasets["enterprise_report_metadata"]["rows"]]
+    report_identity = datasets["enterprise_report_identity"]["rows"][0]["normalized"]
     exchange_rates = [row["normalized"] for row in datasets["enterprise_exchange_rates"]["rows"]]
-    report_notes = [row["normalized"] for row in datasets["report_notes"]["rows"]]
+    report_notes = [
+        row["normalized"] for row in semantic_datasets["report_notes"]["rows"]
+    ]
+    profile = datasets["enterprise_profile"]["rows"][0]["normalized"]
+    rich_profile = semantic_datasets["enterprise_profile"]["rows"][0]["normalized"]
+    section_presence = [
+        row["normalized"]
+        for row in semantic_datasets["enterprise_section_presence"]["rows"]
+    ]
+    credit_section = next(section for section in payload["sections"] if section["type"] == "credit_details")
+    detail_groups = datasets["enterprise_credit_detail_groups"]
 
     assert len(accounts) == 3
     assert len({account["account_identifier"] for account in accounts}) == 3
     assert [account["balance"] for account in accounts] == ["34.88", "4.67", "25.87"]
-    assert [account["loan_amount"] for account in accounts] == ["62.99", "5.6", None]
-    assert [account["credit_limit"] for account in accounts] == [None, None, "34.1"]
+    assert [account.get("loan_amount") for account in accounts] == ["62.99", "5.6", None]
+    assert [account.get("credit_limit") for account in accounts] == [None, None, "34.1"]
+    assert all(not any(key.endswith("_status") for key in account) for account in accounts)
+    assert rich_accounts[0]["loan_amount_status"] == "reported"
+    assert rich_accounts[0]["credit_limit_status"] == "not_applicable"
+    assert rich_accounts[0]["discount_amount_status"] == "not_applicable"
+    assert rich_accounts[2]["credit_limit_status"] == "reported"
+    assert rich_accounts[2]["loan_amount_status"] == "not_applicable"
     assert len(credit_lines) == 1
     assert (credit_lines[0]["total_limit"], credit_lines[0]["used_limit"]) == ("34.33", "25.87")
-    assert credit_lines[0]["available_limit"] is None
+    assert "available_limit" not in credit_lines[0]
     assert credit_lines[0]["facility_product"] == "贷款"
+    assert credit_lines[0]["credit_agreement_identifier"] == "D10055840H0001CE20220228XS000007641"
+    assert "account_identifier" not in credit_lines[0]
     assert credit_lines[0]["revolving_flag"] is True
-    assert datasets["credit_lines"]["rows"][0]["record_id"] == credit_lines[0]["credit_line_id"]
+    assert datasets["enterprise_credit_facilities"]["rows"][0]["record_id"] == rich_credit_lines[0][
+        "credit_line_id"
+    ]
+    assert "credit_line_id" not in credit_lines[0]
     assert [(row["facility_type"], row["total_limit"], row["used_limit"]) for row in facilities] == [
         ("non_revolving", "0", "0"),
         ("revolving", "34.33", "25.87"),
@@ -249,13 +477,9 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         {
             "amount_unit": "CNY_10K",
             "contributor_count": 0,
-            "contributor_source_page": None,
-            "contributor_status": "no_records",
             "currency": "CNY",
             "registered_capital_amount": "100",
-            "sequence": 1,
             "source_institution": "深圳前海微众银行股份有限公司",
-            "source_page": 4,
             "update_date": "2022-10-08",
         }
     ]
@@ -264,21 +488,55 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert relationships[0]["source_institution"] == "中国工商银行股份有限公司"
     assert relationships[0]["update_date"] == "2021-01-18"
     assert report_metadata[0]["report_edition"] == "independent_query"
-    assert report_metadata[0]["source_page"] == 1
+    assert report_metadata[0]["report_number"] == "2023011215134243183575"
+    assert report_metadata[0]["query_institution"] == "中国工商银行股份有限公司厦门市分行"
+    assert report_metadata[0]["report_time"] == "2023-01-12T15:13:42"
+    assert "source_page" not in report_metadata[0]
+    assert not (
+        {"report_edition", "report_number", "query_institution", "report_time"}
+        & set(report_identity)
+    )
     assert exchange_rates[0]["exchange_rate_usd_cny"] == "6.96"
     assert exchange_rates[0]["exchange_rate_effective_period"] == "2023-01"
-    assert exchange_rates[0]["source_page"] == 2
+    assert "source_page" not in exchange_rates[0]
     assert [note["sequence"] for note in report_notes] == list(range(1, 21))
     assert all(note["source_page"] == 2 for note in report_notes)
-    assert [account["current_overdue_status"] for account in accounts] == [
+    assert profile["industry_source_institution"] == "深圳前海微众银行股份有限公司"
+    assert profile["establishment_year_source_institution"] == "中国工商银行股份有限公司厦门市分行"
+    assert "industry_source_institution_status" not in profile
+    assert rich_profile["industry_source_institution_status"] == "reported"
+    assert all(
+        rich_profile[f"{field}_status"] in {"reported", "not_reported"}
+        for field in (
+            "economic_type",
+            "organization_type",
+            "enterprise_scale",
+            "industry",
+            "establishment_year",
+            "registration_certificate_valid_through",
+            "registered_address",
+            "operating_address",
+            "operating_status",
+        )
+    )
+    assert "field_info" not in profile
+    assert len(section_presence) == 10
+    assert detail_groups["section_id"] == credit_section["id"]
+    assert detail_groups["id"] in credit_section["dataset_refs"]
+    assert {row["presence_status"] for row in section_presence} <= {
+        "present_with_records",
+        "present_no_records",
+        "absent_from_report",
+    }
+    assert [account["current_overdue_status"] for account in rich_accounts] == [
         "not_overdue",
         "not_reported",
         "not_overdue",
     ]
-    assert datasets["credit_accounts"]["status"] == "complete"
-    assert datasets["credit_accounts"]["completeness"]["verified"] is True
-    assert datasets["credit_lines"]["status"] == "complete"
-    assert datasets["credit_lines"]["completeness"]["verified"] is True
+    assert datasets["enterprise_credit_accounts"]["status"] == "complete"
+    assert datasets["enterprise_credit_accounts"]["completeness"]["verified"] is True
+    assert datasets["enterprise_credit_facilities"]["status"] == "complete"
+    assert datasets["enterprise_credit_facilities"]["completeness"]["verified"] is True
     assert "id_type" not in facts
     assert "id_number" not in facts
     assert "subject_id" not in facts
@@ -289,11 +547,15 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "sensitive_enterprise_credit_data"
     )
 
+    semantic_before = json.dumps(semantic, ensure_ascii=False, sort_keys=True)
+    raw_before = bundle.render_markdown()
     enhanced = bundle.render_enhanced_markdown(semantic)
+    assert json.dumps(semantic, ensure_ascii=False, sort_keys=True) == semantic_before
+    assert bundle.render_markdown() == raw_before
     assert "**企业名称:**" in enhanced
     assert "**证件类型:**" not in enhanced
     assert "## 基本信息" in enhanced
-    assert "### 企业基本信息" in enhanced
+    assert "### 企业基本信息规范记录" not in enhanced
     assert "**Document type:**" not in enhanced
     assert facts["unified_social_credit_code"] in enhanced
     assert facts["organization_code"] in enhanced
@@ -302,36 +564,31 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     assert "amount unit" not in enhanced
     assert '{"amount_unit"' not in enhanced
     assert "### 授信额度汇总" in enhanced
-    assert "**额度使用率:** 75.36%" in enhanced
+    assert "**额度使用率:**" not in enhanced
     assert "#### 账户 Y10061000H0001EIP1967714" in enhanced
     assert "### 信用记录补充信息" not in enhanced
     assert "##### 余额与风险" in enhanced
     assert "##### 还款表现" in enhanced
-    assert (
-        "| 注册资本 | 币种 | 金额单位 | 主要出资人记录数 | 主要出资人信息状态 | 信息来源机构 | 更新日期 |" in enhanced
-    )
-    assert "| 100 | 人民币 | 万元（人民币） | 0 | 无记录 | 深圳前海微众银行股份有限公司 | 2022-10-08 |" in enhanced
+    assert "**注册资本:** 100" in enhanced
+    assert "**主要出资人记录数:** 0" in enhanced
+    assert "**主要出资人信息状态:**" not in enhanced
     assert "#### 100 · 万元（人民币）" not in enhanced
     assert "**信息来源机构:** 深圳前海微众银行股份有限公司" in enhanced
     assert "**更新日期:** 2022-10-08" in enhanced
     assert "**授信机构:** 梅赛德斯-奔驰汽车金融有限公司" in enhanced
     assert "**管理机构:**" not in enhanced
     assert "**兼容状态（已弃用）:**" not in enhanced
-    account_table = enhanced.split("### 信贷账户", maxsplit=1)[1].split(
+    account_preview = enhanced.split("### 企业信贷账户", maxsplit=1)[1].split(
         "\n### ",
         maxsplit=1,
     )[0]
-    assert (
-        "| 序号 | 业务类别 | 账户标识 | 授信机构 | 业务类型 | 账户状态 | 开立日期 | 到期日期 | 信息截至日期 |"
-    ) in account_table
-    assert (
-        "| 1 | 中长期借款 | Y10061000H0001EIP1967714 | 梅赛德斯-奔驰汽车金融有限公司 | 固定资产贷款 | 未结清 |"
-    ) in account_table
-    assert "| 2 | 短期借款 | JQ20220902XS0M00000460UN |" in account_table
-    assert "| 3 | 循环透支 | D10055840H0001LE20220228XS000007641 |" in account_table
-    assert "当前逾期报告状态" in account_table
-    assert "剩余还款月数" in account_table
-    assert "#### 1. 中长期借款" not in account_table
+    assert "#### 中长期借款 · Y10061000H0001EIP1967714" in account_preview
+    assert "**授信机构:** 梅赛德斯-奔驰汽车金融有限公司" in account_preview
+    assert "#### 短期借款 · JQ20220902XS0M00000460UN" in account_preview
+    assert "#### 循环透支 · D10055840H0001LE20220228XS000007641" in account_preview
+    assert "当前逾期报告状态" not in account_preview
+    assert "**剩余还款月数:** 21" in account_preview
+    assert "| 序号 |" not in account_preview
     assert "| 1 | -- | -- |" not in enhanced
     assert "#### 法定代表人/非法人组织负责人" in enhanced
     assert "法定代表人/非法人组织负责人 · 林岚挺" not in enhanced
@@ -343,43 +600,42 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     identity_position = enhanced.index("## 身份标识")
     assert report_position < notes_position < identity_position
     assert "| 自主查询版 |" in enhanced[report_position:notes_position]
-    assert "| 20 | 更多咨询，请致电全国客户服务热线400-810-8866。 |" in enhanced[notes_position:identity_position]
+    assert "更多咨询，请致电全国客户服务热线" not in enhanced
     assert "| 6.96 | 2023-01 |" in enhanced[notes_position:identity_position]
+    assert "### 企业报告章节存在性" not in enhanced
+    assert "数据范围说明" not in enhanced
+    assert not re.search(
+        r"\b(?:present_with_records|present_no_records|absent_from_report|consistent|limited|"
+        r"reported|not_reported|account_card|facility|active|settled)\b|"
+        r"\binformation_summary_current_account_population\b|"
+        r"\binformation_overview_fixed_categories\b|\bpublic_record_detail_rows\b|"
+        r"\benterprise_[a-z_]+:[0-9a-f]+\b|\bpt_\d+_\d+\b",
+        enhanced,
+    )
+    section_markers = [
+        "## 报告信息",
+        "## 说明",
+        "## 身份标识",
+        "## 信息概要",
+        "## 基本信息",
+        "## 信贷记录明细",
+        "## 附件",
+    ]
+    section_positions = [enhanced.index(marker) for marker in section_markers]
+    assert section_positions == sorted(section_positions)
     assert "detail_account_balance" not in facts["credit_summary"]
     assert "account_balance_difference" not in facts["credit_summary"]
     assert "account_balance_reconciliation_tolerance" not in facts["credit_summary"]
     assert "account_balance_reconciliation_status" not in facts["credit_summary"]
-    balance_reconciliation = next(item for item in audit["reconciliations"] if item["name"] == "credit_account_balance")
-    assert balance_reconciliation == {
-        "name": "credit_account_balance",
-        "expected": 65.41,
-        "actual": 65.42,
-        "difference": 0.01,
-        "tolerance": 0.02,
-        "currency": "CNY",
-        "amount_unit": "CNY_10K",
-        "matched": True,
-        "status": "within_rounding_tolerance",
-    }
+    assert "credit_extraction_audit" not in facts
     assert "account_balance_reconciliation_tolerance" not in semantic["domain"]["data_dictionary"]["fields"]
-    appendix_position = enhanced.index("## 附录：文档来源与审计信息")
-    assert appendix_position > enhanced.index("## 信用记录补充信息")
-    assert "企业提取完整性审计" not in enhanced[:appendix_position]
-    assert "审计舍入容差" not in enhanced[:appendix_position]
-    audit_appendix = enhanced[appendix_position:]
-    assert "### 企业提取完整性审计" in audit_appendix
-    assert "enterprise extraction audit" not in enhanced.lower()
-    assert [line for line in enhanced.splitlines() if line.startswith("## ")][-1] == ("## 附录：文档来源与审计信息")
-    assert "### 账户余额可比性检查（审计信息）" in audit_appendix
-    assert "**源报告账户余额合计:** 65.41" in audit_appendix
-    assert "**账户明细余额计算合计:** 65.42" in audit_appendix
-    assert "**两者差额:** 0.01" in audit_appendix
-    assert "**审计舍入容差:** 0.02" in audit_appendix
-    assert "**审计结论:** 存在差异，但在舍入容差内" in audit_appendix
-    assert "审计计算不改写任何业务数据" in audit_appendix
     assert facts["credit_summary"]["first_credit_year"] == 2021
+    assert facts["credit_summary"]["first_credit_year_status"] == "reported"
     assert facts["credit_summary"]["first_repayment_responsibility_year_status"] == "not_reported"
-    assert facts["credit_summary"]["public_record_counts"]["administrative_penalties"] == 0
+    assert facts["credit_summary"]["public_record_overview_counts"]["administrative_penalties"] == 0
+    assert facts["credit_summary"]["attachment_history_row_count"] == 34
+    assert facts["credit_summary"]["attachment_detail_card_count"] == 0
+    assert "attachment_credit_detail_count" not in facts["credit_summary"]
 
     _task_id, written = write_outputs(
         sealed,
@@ -392,52 +648,25 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
     )
     assert validate_community_artifacts(written["community"]) == []
     persisted = json.loads(written["community"].read_text(encoding="utf-8"))
-    persisted_semantic = json.loads(written["community_semantic"].read_text(encoding="utf-8"))
-    persisted_reconciliation = next(
-        item
-        for item in persisted_semantic["domain"]["facts"]["credit_extraction_audit"]["reconciliations"]
-        if item["name"] == "credit_account_balance"
-    )
-    assert persisted_reconciliation == balance_reconciliation
+    assert "community_semantic" not in written
+    assert "semantic_json" not in persisted["files"]
+    assert not (written["community"].parent / "001_community_semantic.json").exists()
     assert "_audit_reconciliations" not in {dataset["name"] for dataset in persisted["datasets"]}
-    audit_rows = list(
-        csv.DictReader((written["datasets"] / "_audit_cells.csv").read_text(encoding="utf-8-sig").splitlines())
-    )
-    reconciliation_rows = [
-        row
-        for row in audit_rows
-        if row["dataset_id"] == "_audit_reconciliations" and row["record_id"] == "audit:credit_account_balance"
-    ]
-    assert {row["field_key"]: row["value"] for row in reconciliation_rows} == {
-        "expected": "65.41",
-        "actual": "65.42",
-        "difference": "0.01",
-        "tolerance": "0.02",
-        "currency": "CNY",
-        "amount_unit": "CNY_10K",
-        "matched": "True",
-        "status": "within_rounding_tolerance",
-    }
     assert {dataset["name"]: dataset["row_count"] for dataset in persisted["datasets"]} == {
-        "credit_accounts": 3,
-        "credit_lines": 1,
-        "report_notes": 20,
-            "enterprise_profile_fields": 9,
-            "enterprise_report_metadata": 1,
-            "enterprise_exchange_rates": 1,
-            "enterprise_report_identity": 1,
-            "enterprise_credit_overview": 1,
-            "enterprise_public_record_counts": 5,
-            "enterprise_profile": 1,
-            "enterprise_capital_summary": 1,
+        "enterprise_credit_accounts": 3,
+        "enterprise_credit_facilities": 1,
+        "enterprise_report_metadata": 1,
+        "enterprise_exchange_rates": 1,
+        "enterprise_report_identity": 1,
+        "enterprise_credit_overview": 1,
+        "enterprise_public_record_counts": 5,
+        "enterprise_profile": 1,
+        "enterprise_capital_summary": 1,
             "enterprise_key_personnel": 1,
-            "enterprise_stakeholders": 1,
             "enterprise_relationships": 1,
-            "enterprise_credit_accounts": 3,
-            "enterprise_credit_facilities": 1,
+            "enterprise_credit_detail_groups": 4,
             "enterprise_facility_summary": 2,
         "enterprise_current_credit_summary": 4,
-        "enterprise_extraction_audit": 5,
         "enterprise_attachment_accounts": 3,
         "enterprise_credit_supplement": 34,
     }
@@ -465,8 +694,8 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     facts = semantic["domain"]["facts"]
 
-    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
-    credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
+    accounts = [row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]]
+    credit_lines = [row["normalized"] for row in datasets["enterprise_credit_facilities"]["rows"]]
     account_identifiers = {row["account_identifier"] for row in accounts}
     assert len(accounts) == 97
     assert {
@@ -475,7 +704,7 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         "D10123320H000170060110009028463",
     }.issubset(account_identifiers)
     assert "D10123320H000170060110009" not in account_identifiers
-    assert [row["account_identifier"] for row in credit_lines] == [
+    assert [row["credit_agreement_identifier"] for row in credit_lines] == [
         "B11215800H0001N24044608",
         "B11215800H0001N25027358",
     ]
@@ -483,8 +712,8 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         ("500", "300"),
         ("400", "300"),
     ]
-    assert datasets["credit_lines"]["completeness"]["verified"] is True
-    assert datasets["credit_lines"]["completeness"]["expected_row_count"] == 2
+    assert datasets["enterprise_credit_facilities"]["completeness"]["verified"] is True
+    assert datasets["enterprise_credit_facilities"]["completeness"]["expected_row_count"] == 2
 
     assert facts["business_registration_number"] == "913100005515731558"
     capital = datasets["enterprise_capital_summary"]["rows"][0]["normalized"]
@@ -571,7 +800,9 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     assert all(row["attachment_account_id"] in attachment_ids for row in transactions)
 
     rendered_csvs = bundle.render_dataset_csvs(semantic)
-    account_csv = next(content for path, content in rendered_csvs.items() if path.endswith("/credit_accounts.csv"))
+    account_csv = next(
+        content for path, content in rendered_csvs.items() if path.endswith("/enterprise_credit_accounts.csv")
+    )
     history_csv = next(
         content for path, content in rendered_csvs.items() if path.endswith("/enterprise_credit_supplement.csv")
     )
@@ -599,9 +830,10 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     summary = facts["credit_summary"]
     assert summary["source_display_limited"] is True
     assert summary["attachment_account_count"] == 201
-    assert summary["attachment_credit_detail_count"] == 109
+    assert summary["attachment_history_row_count"] == 477
+    assert summary["attachment_detail_card_count"] == 109
     assert summary["attachment_special_transaction_count"] == 23
-    assert datasets["credit_accounts"]["status"] == "partial"
+    assert datasets["enterprise_credit_accounts"]["status"] == "complete"
 
     enhanced = bundle.render_enhanced_markdown(semantic)
     for expected in (
@@ -609,13 +841,18 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         "6000",
         "已结清信贷信息概要",
         "相关还款责任信息概要",
-        "附件账户及业务清单",
         "附件信贷明细",
         "特定交易提示",
-        "信贷账户及附件说明",
-        "账户余额可比性检查（审计信息）",
     ):
         assert expected in enhanced
+    for hidden in (
+        "附件账户及业务清单",
+        "信贷账户及附件说明",
+        "账户余额可比性检查（审计信息）",
+        "企业报告章节存在性",
+        "数据范围说明",
+    ):
+        assert hidden not in enhanced
 
 
 def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
@@ -639,7 +876,7 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     enhanced = bundle.render_enhanced_markdown(semantic)
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     facts = semantic["domain"]["facts"]
-    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
+    accounts = [row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]]
     details = [row["normalized"] for row in datasets["enterprise_attachment_credit_details"]["rows"]]
 
     assert sum(row["issuance_form"] == "新增" for row in accounts) == 5
@@ -769,7 +1006,10 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert responsibility[0]["other_credit_account_count"] == 1
     assert responsibility[0]["other_credit_balance"] == "1100"
 
-    liabilities = [row["normalized"] for row in datasets["repayment_liability_records"]["rows"]]
+    liabilities = [
+        row["normalized"]
+        for row in datasets["enterprise_repayment_responsibility_accounts"]["rows"]
+    ]
     assert len(liabilities) == 1
     assert liabilities[0]["account_identifier"] == "D10023330H00029030001124000265200"
     assert liabilities[0]["contract_number"] == "D10023330H0002DB2024111100000171"
@@ -789,14 +1029,14 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert "**信息截至日期:** 2025-07-20" in liability_preview
 
     summary = facts["credit_summary"]
-    assert summary["public_record_counts"] == {
+    assert summary["public_record_overview_counts"] == {
         "non_credit_accounts": 0,
         "tax_arrears": 0,
         "civil_judgments": 0,
         "enforcements": 0,
         "administrative_penalties": 0,
     }
-    assert summary["public_record_type_counts"] == {
+    assert summary["extracted_public_record_type_counts"] == {
         "license": 2,
         "certification": 1,
     }
@@ -830,8 +1070,8 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
     semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
     data_dictionary = semantic["domain"]["data_dictionary"]
-    accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
-    credit_lines = [row["normalized"] for row in datasets["credit_lines"]["rows"]]
+    accounts = [row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]]
+    credit_lines = [row["normalized"] for row in datasets["enterprise_credit_facilities"]["rows"]]
     typed_public_datasets = {
         name: dataset
         for name, dataset in semantic_datasets.items()
@@ -844,13 +1084,19 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     facts = semantic["domain"]["facts"]
 
     assert data_dictionary["schema_id"] == "enterprise_credit_report"
-    assert data_dictionary["version"] == "2.0.0"
+    assert data_dictionary["version"] == "3.0.0"
     assert "identity_documents" not in data_dictionary["datasets"]
     assert "enterprise_credit_accounts" in data_dictionary["datasets"]
-    assert len(accounts) == 9
+    assert len(accounts) == 10
     assert sum(account["status"] == "settled" for account in accounts) == 6
-    assert accounts[0]["balance"] == "50"
-    assert all(account["balance"] != "37.5" for account in accounts)
+    revolving_account = next(
+        account for account in accounts if account["account_identifier"] == "N101W5810H0008321"
+    )
+    assert revolving_account["balance"] == "50"
+    assert revolving_account["credit_limit"] == "100"
+    assert revolving_account["guarantee_type"] == "抵押"
+    assert revolving_account["last_repayment_amount"] == "3"
+    assert all(account.get("balance") != "37.5" for account in accounts)
     assert all(account["business_type"] not in {"2015-08-01", "2015-09-01"} for account in accounts)
     assert len(credit_lines) == 1
     assert (
@@ -878,22 +1124,22 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert dataset_names.index("enterprise_current_credit_summary") < dataset_names.index(
         "enterprise_facility_summary"
     ) < dataset_names.index("enterprise_closed_credit_summary")
-    assert dataset_names.index("enterprise_profile_fields") < dataset_names.index(
+    assert dataset_names.index("enterprise_profile") < dataset_names.index(
         "enterprise_capital_summary"
-    ) < dataset_names.index("enterprise_stakeholders") < dataset_names.index(
+    ) < dataset_names.index("enterprise_contributors") < dataset_names.index(
         "enterprise_relationships"
     )
     credit_detail_order = [
         name
         for name in (
-            "credit_accounts",
             "enterprise_displayed_credit_summary",
-            "credit_lines",
+            "enterprise_credit_accounts",
+            "enterprise_credit_facilities",
         )
         if name in datasets
     ]
     assert [name for name in dataset_names if name in credit_detail_order] == credit_detail_order
-    assert dataset_names[-1] == "enterprise_extraction_audit"
+    assert "enterprise_extraction_audit" not in dataset_names
     assert {
         f"enterprise_public_{record_type}_records"
         for record_type in (
@@ -936,22 +1182,37 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         for row in dataset["rows"]
     )
     assert facts["credit_summary"]["reported_account_count"] == 28
-    assert facts["credit_summary"]["account_population_comparable"] is False
-    assert datasets["credit_accounts"]["completeness"]["basis"] == "emitted_records_only"
-    assert datasets["credit_accounts"]["completeness"]["expected_row_count"] == 9
+    assert datasets["enterprise_credit_accounts"]["completeness"]["basis"] == (
+        "canonical_source_component_count"
+    )
+    assert datasets["enterprise_credit_accounts"]["completeness"]["expected_row_count"] == 10
     assert "id_number" not in facts
     assert "subject_id" not in facts
-    assert datasets["enterprise_profile_fields"]["row_count"] == 9
-    assert datasets["enterprise_stakeholders"]["row_count"] == 8
+    assert datasets["enterprise_profile"]["row_count"] == 1
+    assert datasets["enterprise_contributors"]["row_count"] == 2
+    assert datasets["enterprise_key_personnel"]["row_count"] == 6
     assert datasets["enterprise_report_identity"]["row_count"] == 1
     report_identity = datasets["enterprise_report_identity"]["rows"][0]["normalized"]
-    assert report_identity["enterprise_name"] == "北京报告样本有限责任公司"
-    assert report_identity["report_edition"] == "independent_query"
-    assert report_identity["report_time"] == "2015-11-01T10:05:15"
+    rich_report_identity = semantic_datasets["enterprise_report_identity"]["rows"][0][
+        "normalized"
+    ]
+    report_metadata = datasets["enterprise_report_metadata"]["rows"][0]["normalized"]
+    assert report_identity["subject_name"] == "北京报告样本有限责任公司"
+    assert report_identity["cover_subject_name"] == "北京报告样本公司"
+    assert not {"identity_subject_name", "subject_name_assertion_status"} & set(
+        report_identity
+    )
+    assert rich_report_identity["cover_subject_name"] == "北京报告样本公司"
+    assert rich_report_identity["identity_subject_name"] == "北京报告样本有限责任公司"
+    assert rich_report_identity["subject_name_assertion_status"] == "conflict"
+    assert report_metadata["report_edition"] == "independent_query"
+    assert report_metadata["report_time"] == "2015-11-01T10:05:15"
     assert report_identity["unified_social_credit_code"] == "91110102183797313J"
     assert report_identity["organization_code"] == "18379731-3"
     assert report_identity["zhongzheng_code"] == "4103090000069511"
-    assert report_identity["query_institution"] == "中国某某银行北京分行"
+    assert report_metadata["query_institution"] == "中国某某银行北京分行"
+    assert "report_number" not in report_metadata
+    assert "report_number" not in facts
     assert datasets["enterprise_dispute_overview"]["rows"][0]["normalized"][
         "in_progress_dispute_count"
     ] == 3
@@ -959,12 +1220,18 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     recovery_rows = [
         row["normalized"] for row in datasets["enterprise_recovery_summary"]["rows"]
     ]
-    assert [
-        (row["recovery_type"], row["account_count"], row["balance"])
-        for row in recovery_rows
-    ] == [
-        ("asset_management_disposed_debt", 5, "63"),
-        ("advance", 4, "67.6"),
+    assert len(recovery_rows) == 4
+    assert [row["settlement_status"] for row in recovery_rows] == [
+        "active",
+        "active",
+        "settled",
+        "settled",
+    ]
+    assert [row["recovery_type"] for row in recovery_rows] == [
+        "asset_management_disposed_debt",
+        "advance",
+        "asset_management_disposed_debt",
+        "advance",
     ]
     overdue_summary = datasets["enterprise_overdue_summary"]["rows"][0]["normalized"]
     assert (
@@ -972,24 +1239,23 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         overdue_summary["overdue_interest_and_other"],
         overdue_summary["overdue_total"],
     ) == ("155", "14.86", "169.86")
-    assert datasets["enterprise_profile"]["row_count"] == 1
-    assert datasets["enterprise_contributors"]["row_count"] == 2
-    assert datasets["enterprise_key_personnel"]["row_count"] == 6
-    assert datasets["enterprise_credit_accounts"]["row_count"] == 9
+    assert datasets["enterprise_credit_detail_groups"]["row_count"] == 18
+    assert datasets["enterprise_credit_accounts"]["row_count"] == 10
+    recovered_account = datasets["enterprise_credit_accounts"]["rows"][0]["normalized"]
+    assert recovered_account["creditor_institution"] == "华融资产管理有限公司"
+    assert recovered_account["last_repayment_amount"] == "2"
+    assert recovered_account["original_debt_type"] == "贸易融资"
+    assert datasets["enterprise_account_annotations"]["row_count"] == 4
     assert datasets["enterprise_credit_facilities"]["row_count"] == 1
     assert datasets["enterprise_repayment_responsibility_accounts"]["row_count"] == 3
+    assert datasets["enterprise_repayment_responsibility_group_details"]["row_count"] == 6
+    assert datasets["enterprise_displayed_credit_summary"]["row_count"] == 12
     assert [
         row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]
     ] == accounts
     assert [
         row["normalized"] for row in datasets["enterprise_credit_facilities"]["rows"]
     ] == credit_lines
-    assert [
-        row["normalized"]
-        for row in datasets["enterprise_repayment_responsibility_accounts"]["rows"]
-    ] == [
-        row["normalized"] for row in datasets["repayment_liability_records"]["rows"]
-    ]
     assert datasets["enterprise_interest_arrears"]["row_count"] == 2
     assert datasets["enterprise_public_utility_payment_records"]["rows"][0]["normalized"][
         "cumulative_arrears"
@@ -1006,11 +1272,11 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         for row in datasets["enterprise_public_financing_restriction_records"]["rows"]
     ]
     assert [
-        (row["catalog"], row["control_type"], row["year"], row["scale"])
+            (row["catalog"], row.get("control_type"), row["year"], row["scale"])
         for row in financing_rows
     ] == [
         ("土地储备机构名录", "年度可融资规模", 2016, "待定"),
-        ("土地储备机构名录", "--", 2015, "1500"),
+        ("土地储备机构名录", None, 2015, "1500"),
     ]
     assert datasets["enterprise_public_data_provider_statement_records"]["rows"][0][
         "normalized"
@@ -1020,9 +1286,8 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert datasets["enterprise_current_credit_summary"]["row_count"] == 11
     assert datasets["enterprise_closed_credit_summary"]["row_count"] == 11
     assert datasets["enterprise_repayment_responsibility_summary"]["row_count"] == 8
-    assert datasets["repayment_liability_records"]["row_count"] == 3
     assert datasets["enterprise_attachment_accounts"]["row_count"] == 12
-    assert datasets["enterprise_credit_supplement"]["row_count"] == 3
+    assert datasets["enterprise_credit_supplement"]["row_count"] == 9
     assert datasets["enterprise_attachment_credit_details"]["row_count"] == 10
     assert datasets["enterprise_special_transactions"]["row_count"] == 2
     assert {
@@ -1043,9 +1308,9 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         column["key"].startswith("license_")
         for column in semantic_datasets["enterprise_public_certification_records"]["columns"]
     )
-    audit_rows = [row["normalized"] for row in datasets["enterprise_extraction_audit"]["rows"]]
-    assert all(row["reconciliation_status"] == "complete" for row in audit_rows)
-    assert all(row["unresolved_record_count"] == 0 for row in audit_rows)
+    assert semantic["extraction"]["protocol"] == "pboc-enterprise-extraction-failure"
+    assert semantic["extraction"]["status"] == "complete"
+    assert semantic["extraction"]["failures"] == []
     public_record_tokens = {
         "utility_payment",
         "tax_arrears",
@@ -1077,8 +1342,10 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert "### 行政许可记录" in public_preview
     assert "### 认证记录" in public_preview
     assert "| 序号 | 记录类型 | 记录内容 |" not in enhanced
-    assert "| 序号 | 许可部门 | 许可类型 | 许可日期 | 截止日期 | 许可内容 |" in enhanced
-    assert "| 序号 | 认证部门 | 认证类型 | 认证日期 | 截止日期 | 认证内容 |" in enhanced
+    assert "| 许可部门 | 许可类型 | 许可日期 | 截止日期 | 许可内容 |" in enhanced
+    assert "| 认证部门 | 认证类型 | 认证日期 |" in enhanced
+    assert "| 序号 | 许可部门 |" not in enhanced
+    assert "| 序号 | 认证部门 |" not in enhanced
     assert "#### 账户 借贷交易" not in enhanced
     assert "#### 账户 担保交易" not in enhanced
 
@@ -1124,17 +1391,22 @@ def test_credit_report_subtype_projects_complete_v3(
         assert dataset_names == [name for name in document_order if name in dataset_names]
     if subtype == "enterprise":
         enterprise_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
-        audit_dataset = enterprise_datasets["enterprise_extraction_audit"]
-        audit_rows = [row["normalized"] for row in audit_dataset["rows"]]
+        extraction = semantic["extraction"]
+        assert extraction["protocol"] == "pboc-enterprise-extraction-failure"
+        assert extraction["status"] == "complete"
+        assert extraction["failures"] == []
+        assert "enterprise_extraction_audit" not in enterprise_datasets
+        assert "credit_accounts" not in enterprise_datasets
+        assert "credit_lines" not in enterprise_datasets
+        assert "enterprise_profile_fields" not in enterprise_datasets
+        assert "enterprise_stakeholders" not in enterprise_datasets
+        assert "enterprise_dataset_completeness" not in semantic["domain"]["extensions"]
         audit_cells = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
         enterprise_audit_cells = [row for row in audit_cells if not row["dataset_id"].startswith("_audit")]
         assert enterprise_audit_cells
         assert all(row["evidence_ref"] for row in enterprise_audit_cells)
         assert all(json.loads(row["evidence_ref"]) for row in enterprise_audit_cells)
-        assert all(row["expected_record_count"] == row["extracted_record_count"] for row in audit_rows)
-        assert all(
-            row["reconciliation_status"] == "complete" and row["unresolved_record_count"] == 0 for row in audit_rows
-        )
+        assert all(dataset["completeness"]["verified"] for dataset in enterprise_datasets.values())
         displayed_dataset = enterprise_datasets.get("enterprise_displayed_credit_summary")
         if displayed_dataset is not None:
             displayed_rows = [row["normalized"] for row in displayed_dataset["rows"]]
@@ -1155,6 +1427,11 @@ def test_credit_report_subtype_projects_complete_v3(
         accounts = datasets["credit_accounts"]
         inquiries = datasets["inquiry_records"]
         liabilities = datasets.get("repayment_liability_records", [])
+        semantic_datasets = {
+            dataset["name"]: dataset for dataset in semantic["datasets"]
+        }
+        rich_accounts = semantic_datasets["credit_accounts"]["rows"]
+        rich_inquiries = semantic_datasets["inquiry_records"]["rows"]
         assert len(accounts) == expected_accounts
         assert len(liabilities) == expected_liabilities
         assert len(inquiries) == expected_inquiries
@@ -1163,28 +1440,38 @@ def test_credit_report_subtype_projects_complete_v3(
         assert sum(row["normalized"]["inquiry_type"] == "personal" for row in inquiries) == expected_personal
         personal_inquiries = [row["normalized"] for row in inquiries if row["normalized"]["inquiry_type"] == "personal"]
         assert all(row["reason"] == "本人查询" for row in personal_inquiries)
-        assert all(row["source_reason"].startswith("本人查询") for row in personal_inquiries)
-        assert sum(row["normalized"]["status"] == "inactive" for row in accounts) == expected_inactive
+        rich_personal_inquiries = [
+            row["normalized"]
+            for row in rich_inquiries
+            if row["normalized"]["inquiry_type"] == "personal"
+        ]
+        assert all(
+            row["source_reason"].startswith("本人查询")
+            for row in rich_personal_inquiries
+        )
+        assert sum(
+            row["normalized"]["status"] == "inactive" for row in rich_accounts
+        ) == expected_inactive
         enhanced_preview = bundle.render_enhanced_markdown(semantic)
         account_types = {row["normalized"]["account_type"] for row in accounts}
         if "credit_card" in account_types:
-            assert "#### 信用卡账户" in enhanced_preview
-            credit_card_preview = enhanced_preview.split("#### 信用卡账户", maxsplit=1)[1].split(
+            assert "\n#### 信用卡\n" in enhanced_preview
+            credit_card_preview = enhanced_preview.split("\n#### 信用卡\n", maxsplit=1)[1].split(
                 "\n#### ",
                 maxsplit=1,
             )[0]
             assert "信用额度" in credit_card_preview
             assert "贷款发放金额" not in credit_card_preview
-        if "loan" in account_types:
-            assert "#### 贷款账户" in enhanced_preview
-            loan_preview = enhanced_preview.split("#### 贷款账户", maxsplit=1)[1].split(
+        if {"loan", "credit_line"}.intersection(account_types):
+            assert "\n#### 贷款\n" in enhanced_preview
+            loan_preview = enhanced_preview.split("\n#### 贷款\n", maxsplit=1)[1].split(
                 "\n#### ",
                 maxsplit=1,
             )[0]
             assert "贷款发放金额" in loan_preview
-            assert "信用额度" not in loan_preview
+            assert "信用额度" in loan_preview
         if "credit_line" in account_types:
-            assert "#### 贷款授信" in enhanced_preview
+            assert "#### 贷款授信" not in enhanced_preview
         if liabilities:
             liability_preview = enhanced_preview.split("### 相关还款责任信息", maxsplit=1)[1].split(
                 "\n### ",
@@ -1197,21 +1484,78 @@ def test_credit_report_subtype_projects_complete_v3(
             assert "liability date" not in liability_preview
             assert "related party name" not in liability_preview
             assert "responsibility amount" not in liability_preview
-        information_summary_preview = enhanced_preview.split("## 信息概要", maxsplit=1)[1].split(
-            "\n## 信贷记录",
-            maxsplit=1,
+        report_header_preview = enhanced_preview.split("## 报告信息", maxsplit=1)[1].split(
+            "\n## 信贷记录", maxsplit=1
         )[0]
-        assert "### 个人信息" in information_summary_preview
-        assert "### 信用概览" in information_summary_preview
-        assert "### 报告信息" in information_summary_preview
-        assert "## 附录：文档来源与提取信息" in enhanced_preview
-        assert semantic["domain"]["facts"]["id_number"] in information_summary_preview
-        assert semantic["domain"]["facts"]["report_number"] in information_summary_preview
+        credit_preview = enhanced_preview.split("## 信贷记录", maxsplit=1)[1].split(
+            "\n## ", maxsplit=1
+        )[0]
+        normalized_overdue = [
+            row["normalized"] for row in datasets.get("overdue_records", [])
+        ]
+        card_overdue = [
+            row
+            for row in normalized_overdue
+            if row["account_type"] in {"credit_card", "quasi_credit_card"}
+        ]
+        loan_overdue = [
+            row
+            for row in normalized_overdue
+            if row["account_type"] in {"loan", "credit_line"}
+        ]
+        assert "### 逾期记录" not in credit_preview
+        assert ("#### 信用卡逾期记录" in credit_preview) is bool(card_overdue)
+        assert ("#### 贷款逾期记录" in credit_preview) is bool(loan_overdue)
+        if card_overdue:
+            assert credit_preview.index("#### 信用卡逾期记录") < credit_preview.index(
+                "#### 信用卡\n"
+            )
+            card_overdue_preview = credit_preview.split(
+                "#### 信用卡逾期记录", maxsplit=1
+            )[1].split("\n#### 信用卡\n", maxsplit=1)[0]
+            assert sum(
+                bool(re.match(r"^\|\s*\d+\s*\|", line))
+                for line in card_overdue_preview.splitlines()
+            ) == len(card_overdue)
+        if loan_overdue:
+            assert credit_preview.index("#### 贷款逾期记录") < credit_preview.index(
+                "#### 贷款\n"
+            )
+            loan_overdue_preview = credit_preview.split(
+                "#### 贷款逾期记录", maxsplit=1
+            )[1].split("\n#### 贷款\n", maxsplit=1)[0]
+            assert sum(
+                bool(re.match(r"^\|\s*\d+\s*\|", line))
+                for line in loan_overdue_preview.splitlines()
+            ) == len(loan_overdue)
+        assert report_header_preview.index("### 报告信息") < report_header_preview.index("### 个人信息")
+        assert "### 信息概要" in credit_preview
+        assert "## 附录：文档来源与提取信息" not in enhanced_preview
+        assert "canonical_personal_brief_document_ir" not in enhanced_preview
+        assert "personal_brief:component:" not in enhanced_preview
+        assert "sha256:" not in enhanced_preview
+        assert semantic["domain"]["facts"]["id_number"] in report_header_preview
+        assert semantic["domain"]["facts"]["report_number"] in report_header_preview
         expected_marital_status, expected_marital_label = _DIGITAL_PERSONAL_BRIEF_MARITAL_STATUS[fixture.name]
         assert semantic["domain"]["facts"]["marital_status"] == expected_marital_status
         assert semantic["domain"]["entity_fields"]["marital_status"] == expected_marital_status
-        assert f"**婚姻状况:** {expected_marital_label}" in information_summary_preview
+        assert f"**婚姻状况:** {expected_marital_label}" in report_header_preview
         assert not any(re.search(r"[A-Za-z_]", label) for label in re.findall(r"\*\*([^*]+):\*\*", enhanced_preview))
+        ordered_headings = [
+            heading
+            for heading in (
+                "## 报告信息",
+                "## 信贷记录",
+                "## 非信贷交易记录",
+                "## 公共记录",
+                "## 机构说明",
+                "## 查询记录",
+            )
+            if heading in enhanced_preview
+        ]
+        assert [enhanced_preview.index(heading) for heading in ordered_headings] == sorted(
+            enhanced_preview.index(heading) for heading in ordered_headings
+        )
         if personal_inquiries:
             assert "#### 个人查询" in enhanced_preview
             assert "#### 本人查询" not in enhanced_preview
@@ -1235,16 +1579,42 @@ def test_credit_report_subtype_projects_complete_v3(
             assert len(normalized_overdue) == 9
             assert [row["over_90_days_months"] for row in normalized_overdue] == [1, 3, 2, 2, 2, 1, 2, 1, 0]
             assert all(row["current_overdue_status"] == "overdue" for row in normalized_overdue)
-            assert sum(row["over_90_days"] is True for row in normalized_overdue) == 8
-            overdue_markdown = enhanced_preview.split("### 逾期记录", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+            assert all(
+                row["over_90_days"] is (row["over_90_days_months"] > 0)
+                for row in normalized_overdue
+            )
+            rich_overdue = [
+                row["normalized"]
+                for row in semantic_datasets["overdue_records"]["rows"]
+            ]
+            assert sum(row["over_90_days"] is True for row in rich_overdue) == 8
+            card_overdue_markdown = credit_preview.split(
+                "#### 信用卡逾期记录", maxsplit=1
+            )[1].split("\n#### 信用卡\n", maxsplit=1)[0]
+            loan_overdue_markdown = credit_preview.split(
+                "#### 贷款逾期记录", maxsplit=1
+            )[1].split("\n#### 贷款\n", maxsplit=1)[0]
             assert (
-                "| 组内序号 | 账户类型 | 管理机构 | 业务类型 | 卡片尾号 | 开立日期 | "
+                "| 组内序号 | 管理机构 | 业务类型 | 卡片尾号 | 开立日期 | "
                 "最近5年逾期月数 | 其中超过90天月数 | 当前逾期状态 |"
-            ) in overdue_markdown
-            assert "account id" not in overdue_markdown
-            assert "overdue id" not in overdue_markdown
-            assert "last_5_years" not in overdue_markdown
-            assert "当前有逾期" in overdue_markdown
+            ) in card_overdue_markdown
+            assert (
+                "| 组内序号 | 管理机构 | 业务类型 | 开立日期 | 最近5年逾期月数 | "
+                "其中超过90天月数 | 当前逾期状态 |"
+            ) in loan_overdue_markdown
+            assert sum(
+                bool(re.match(r"^\|\s*\d+\s*\|", line))
+                for line in card_overdue_markdown.splitlines()
+            ) == 4
+            assert sum(
+                bool(re.match(r"^\|\s*\d+\s*\|", line))
+                for line in loan_overdue_markdown.splitlines()
+            ) == 5
+            for overdue_markdown in (card_overdue_markdown, loan_overdue_markdown):
+                assert "account id" not in overdue_markdown
+                assert "overdue id" not in overdue_markdown
+                assert "last_5_years" not in overdue_markdown
+                assert "当前有逾期" in overdue_markdown
         if (expected_accounts, expected_liabilities, expected_inquiries) == (45, 4, 124):
             semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
             summary = semantic["domain"]["facts"]["credit_summary"]
@@ -1282,7 +1652,7 @@ def test_credit_report_subtype_projects_complete_v3(
             assert all(binding["evidence_refs"] for binding in inquiry_bindings)
             assert semantic["diagnostics"]["evidence_ids"]
         if fixture.name == "赵思雯个人征信.pdf":
-            normalized_accounts = [row["normalized"] for row in accounts]
+            normalized_accounts = [row["normalized"] for row in rich_accounts]
             credit_cards = [row for row in normalized_accounts if row["account_type"] == "credit_card"]
             loans = [row for row in normalized_accounts if row["account_type"] != "credit_card"]
             assert [row["sequence"] for row in credit_cards] == list(range(1, 22))
@@ -1295,7 +1665,7 @@ def test_credit_report_subtype_projects_complete_v3(
             )
             institution_sequences = {
                 int(row["normalized"]["sequence"])
-                for row in inquiries
+                for row in rich_inquiries
                 if row["normalized"]["inquiry_type"] == "institution"
             }
             assert institution_sequences == set(range(1, 116))
@@ -1336,18 +1706,12 @@ def test_credit_report_subtype_projects_complete_v3(
             )
             enhanced = written["enhanced_reading"].read_text(encoding="utf-8")
             assert next(line for line in enhanced.splitlines() if line.startswith("# ")) == "# 个人信用报告"
-            assert (
-                next(
-                    row for row in account_csv_rows if row["account_type"] == "credit_card" and row["sequence"] == "13"
-                )["currency"]
-                == "HKD"
-            )
-            assert (
-                next(
-                    row for row in account_csv_rows if row["account_type"] == "credit_card" and row["sequence"] == "14"
-                )["currency"]
-                == "CHF"
-            )
+            account_currencies = {
+                row["account_currency"]
+                for row in account_csv_rows
+                if row["account_type"] == "credit_card"
+            }
+            assert {"HKD", "CHF"} <= account_currencies
             table_lines = enhanced.split(f"### {reading_table['title']}", maxsplit=1)[1].split(
                 "\n## ",
                 maxsplit=1,
@@ -1366,18 +1730,19 @@ def test_credit_report_subtype_projects_complete_v3(
             assert all(row["evidence_ref"] for row in audit_rows)
             assert semantic["domain"]["facts"]["id_number"] in enhanced
             assert semantic["domain"]["facts"]["report_number"] in enhanced
-            information_summary = enhanced.split("## 信息概要", maxsplit=1)[1].split("\n## 信贷记录", maxsplit=1)[0]
-            appendix = enhanced.split("## 附录：文档来源与提取信息", maxsplit=1)[1]
-            assert information_summary.index("### 个人信息") < information_summary.index("### 信用概览")
-            assert information_summary.index("### 信用概览") < information_summary.index("### 报告信息")
-            assert "**内容模式:**" not in information_summary
-            assert "**数据来源:**" not in information_summary
-            assert "**旧版派生有效状态口径:**" not in information_summary
-            assert "**源概要表标识:**" not in information_summary
-            assert "**内容模式:**" in appendix
-            assert "**数据来源:**" in appendix
-            assert "**源概要表标识:**" in appendix
-            assert "**源概要表页码:**" in appendix
+            report_header = enhanced.split("## 报告信息", maxsplit=1)[1].split("\n## 信贷记录", maxsplit=1)[0]
+            credit_section = enhanced.split("## 信贷记录", maxsplit=1)[1].split("\n## ", maxsplit=1)[0]
+            assert report_header.index("### 报告信息") < report_header.index("### 个人信息")
+            assert "### 信息概要" in credit_section
+            assert "## 附录：文档来源与提取信息" not in enhanced
+            assert "**内容模式:**" not in enhanced
+            assert "**数据来源:**" not in enhanced
+            assert "**旧版派生有效状态口径:**" not in enhanced
+            assert "**源概要表标识:**" not in enhanced
+            assert "**源概要表页码:**" not in enhanced
+            assert "canonical_personal_brief_document_ir" not in enhanced
+            assert "personal_brief:component:" not in enhanced
+            assert "sha256:" not in enhanced
             bold_labels = re.findall(r"\*\*([^*]+):\*\*", enhanced)
             assert bold_labels
             assert not any(re.search(r"[A-Za-z_]", label) for label in bold_labels)
