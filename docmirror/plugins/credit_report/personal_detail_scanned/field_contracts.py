@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from difflib import SequenceMatcher
+
+from docmirror.plugins.credit_report.currency_codes import (
+    CURRENCY_CODE_BY_ALIAS,
+    ISO_4217_CURRENT_CODES,
+)
 
 CONTRACT_ID = "pboc.personal_credit_report.instructed_cells"
-CONTRACT_VERSION = "2026-08-07"
+CONTRACT_VERSION = "2026-08-08"
 
 _PLACEHOLDERS = frozenset({"-", "--", "---", "未报告", "不详", "未知"})
+_SOURCE_ABSENCE_DASH_RE = re.compile(r"[-－‐‑‒–—―]+")
 
 _VOCABULARIES: dict[str, frozenset[str]] = {
     "gender": frozenset({"男", "女", "未说明的性别", "未知"}),
@@ -38,10 +43,24 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
     ),
     "degree": frozenset({"名誉博士", "博士", "硕士", "学士", "其他", "无", "未知", "未说明"}),
     "currency": frozenset(
-        {"人民币", "人民币元", "美元", "欧元", "日元", "港元", "英镑", "CNY", "RMB", "USD", "EUR", "JPY", "HKD", "GBP"}
+        {*CURRENCY_CODE_BY_ALIAS, *ISO_4217_CURRENT_CODES, "RMB"}
     ),
     "responsibility_type": frozenset(
-        {"本人", "保证人", "担保人", "共同借款人", "共同还款人", "抵押人", "质押人", "其他", "未知"}
+        {
+            "本人",
+            "保证",
+            "保证人",
+            "担保",
+            "担保人",
+            "共同借款人",
+            "共同还款人",
+            "抵押",
+            "抵押人",
+            "质押",
+            "质押人",
+            "其他",
+            "未知",
+        }
     ),
     "inquiry_reason": frozenset(
         {
@@ -60,6 +79,7 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
         {
             "非循环贷款额度",
             "循环贷款额度",
+            "循环额度",
             "信用卡共享额度",
             "信用卡独立额度",
             "其他额度",
@@ -68,14 +88,65 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
     "account_business_type": frozenset(
         {
             "个人住房贷款",
+            "个人住房商业贷款",
+            "个人住房公积金贷款",
             "个人商用房贷款",
             "个人经营性贷款",
             "个人消费贷款",
+            "个人汽车消费贷款",
             "其他个人消费贷款",
+            "国家助学贷款",
+            "农户贷款",
             "其他贷款",
+            "其他类贷款",
             "循环贷款",
+            "融资租赁业务",
             "贷记卡",
             "准贷记卡",
+        }
+    ),
+    "guarantee_type": frozenset(
+        {
+            "信用/无担保",
+            "信用/免担保",
+            "抵押",
+            "质押",
+            "保证",
+            "组合（含保证）",
+            "组合（不含保证）",
+            "农户联保",
+            "其他",
+        }
+    ),
+    "repayment_frequency": frozenset(
+        {
+            "日",
+            "周",
+            "月",
+            "季",
+            "半年",
+            "年",
+            "一次性",
+            "不定期",
+            "其他",
+        }
+    ),
+    "repayment_method": frozenset(
+        {
+            "按期结息，到期还本",
+            "按期结息，自由还本",
+            "到期还本分期结息",
+            "分期等额本息",
+            "分期等额本金",
+            "等额本息",
+            "等额本金",
+            "先息后本",
+            "一次性还本付息",
+            "按期计算还本付息",
+            "随借随还",
+            "不区分还款方式",
+            "无",
+            "其他",
         }
     ),
     "identity_document_type": frozenset(
@@ -85,6 +156,7 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
             "军官证",
             "士兵证",
             "护照",
+            "统一社会信用代码",
             "中征码",
             "组织机构代码",
             "港澳居民来往内地通行证",
@@ -95,6 +167,17 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
         }
     ),
     "boolean_flag": frozenset({"有", "无", "是", "否", "未知"}),
+}
+
+_TYPOGRAPHIC_ALIASES: dict[str, dict[str, str]] = {
+    "guarantee_type": {
+        "组合(含保证)": "组合（含保证）",
+        "组合(不含保证)": "组合（不含保证）",
+    },
+    "repayment_method": {
+        "按期结息,到期还本": "按期结息，到期还本",
+        "按期结息,自由还本": "按期结息，自由还本",
+    },
 }
 
 _PATTERNS: dict[str, re.Pattern[str]] = {
@@ -117,32 +200,48 @@ def _controlled_marker(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "")).translate(str.maketrans({"（": "(", "）": ")"}))
 
 
+def is_explicit_source_absence(value: object) -> bool:
+    """Return whether a nonblank cell contains only a printed dash sentinel.
+
+    Blank OCR is deliberately not source absence: an empty canonical slot is
+    unreadable evidence and must remain reviewable.  The accepted glyphs are
+    the finite dash variants used by PBOC renderers, without treating prose
+    such as ``未知`` as a statement that the source omitted the field.
+    """
+
+    marker = re.sub(r"\s+", "", str(value or ""))
+    return bool(marker and _SOURCE_ABSENCE_DASH_RE.fullmatch(marker))
+
+
 def normalize_pboc_field(value: str, role: str) -> str:
-    """Return a canonical vocabulary spelling when only layout whitespace differs."""
+    """Return a canonical spelling for exact or sanctioned typographic aliases.
+
+    Business enums are deliberately not spell-corrected or fuzzy matched.  An
+    OCR-near value may be a different printed category or may include residue
+    from a neighbouring cell; that evidence must be reported, not silently
+    replaced by the nearest vocabulary member.
+    """
     text = str(value or "").strip()
     candidates = _VOCABULARIES.get(role)
     if candidates is None:
         return text
-    if role == "facility_type":
-        # Short sequence/watermark fragments frequently trail the intended
-        # value after a damaged table boundary.  Strip only a separated,
-        # non-lexical suffix; never delete characters inside the value.
-        text = re.sub(r"\s+[%*?#]?\d{1,2}\s*$", "", text).strip()
     marker = _controlled_marker(text)
     matches = sorted(candidate for candidate in candidates if _controlled_marker(candidate) == marker)
     if matches:
         return matches[0]
-    if role in {"facility_type", "account_business_type"}:
-        scored = sorted(
-            ((SequenceMatcher(None, marker, _controlled_marker(candidate)).ratio(), candidate) for candidate in candidates),
-            reverse=True,
-        )
-        if scored:
-            best_score, best = scored[0]
-            runner = scored[1][0] if len(scored) > 1 else 0.0
-            if best_score >= 0.84 and best_score - runner >= 0.08 and abs(len(marker) - len(_controlled_marker(best))) <= 2:
-                return best
+    aliases = _TYPOGRAPHIC_ALIASES.get(role, {})
+    alias_matches = sorted(
+        canonical for alias, canonical in aliases.items() if _controlled_marker(alias) == marker
+    )
+    if alias_matches:
+        return alias_matches[0]
     return text
+
+
+def pboc_controlled_vocabulary(role: str) -> frozenset[str]:
+    """Return the finite printed vocabulary for one canonical field role."""
+
+    return _VOCABULARIES.get(str(role), frozenset())
 
 
 def _custom_contract(text: str, role: str) -> FieldContractResult | None:
@@ -170,10 +269,6 @@ def _custom_contract(text: str, role: str) -> FieldContractResult | None:
             and 2 <= len(compact) <= 120
             and not (leading_ordinal or date_or_phone or appended_position or trailing_token)
         )
-    elif role == "repayment_method":
-        date_text = bool(re.search(r"截至\s*(?:19|20)\d{2}|(?:19|20)\d{2}[./年-]\d{1,2}", compact))
-        duration_only = bool(re.fullmatch(r"\d{1,4}(?:月|期|次|年)", compact))
-        valid = bool(re.search(r"[\u3400-\u9fff]", compact)) and not date_text and not duration_only
     elif role == "employment_descriptor":
         valid = bool(re.fullmatch(r"[\u3400-\u9fffA-Za-z0-9·（）()\-]{1,40}", compact)) and bool(
             re.search(r"[\u3400-\u9fffA-Za-z]", compact)
@@ -190,7 +285,7 @@ def _custom_contract(text: str, role: str) -> FieldContractResult | None:
 def validate_pboc_field(value: str, role: str) -> FieldContractResult:
     """Validate one instructed cell without correcting or discarding it."""
     text = normalize_pboc_field(value, role)
-    if text in _PLACEHOLDERS:
+    if text in _PLACEHOLDERS or is_explicit_source_absence(text):
         return FieldContractResult(assessed=True, valid=True, reason_code="explicit_placeholder")
     custom = _custom_contract(text, role)
     if custom is not None:
@@ -216,6 +311,8 @@ __all__ = [
     "CONTRACT_ID",
     "CONTRACT_VERSION",
     "FieldContractResult",
+    "is_explicit_source_absence",
     "normalize_pboc_field",
+    "pboc_controlled_vocabulary",
     "validate_pboc_field",
 ]

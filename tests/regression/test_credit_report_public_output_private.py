@@ -162,3 +162,49 @@ def test_credit_report_public_json_compacts_private_source_provenance(
                 if not row["dataset_id"].startswith("_audit_")
             }
         assert audit_dataset_ids <= {dataset["id"] for dataset in persisted["datasets"]}
+    elif subtype == "personal_brief":
+        semantic_names = {dataset["name"] for dataset in semantic["datasets"]}
+        public_names = {dataset["name"] for dataset in persisted["datasets"]}
+        assert "report_notes" in semantic_names
+        assert not {"repayment_records", "public_records", "report_notes"} & public_names
+        assert all(
+            set(row) == {"record_id", "normalized", "canonical_raw", "raw", "source"}
+            and row["canonical_raw"] == row["raw"] == row["source"] == {}
+            for dataset in persisted["datasets"]
+            for row in dataset["rows"]
+        )
+        account_rows = next(
+            dataset["rows"]
+            for dataset in persisted["datasets"]
+            if dataset["name"] == "credit_accounts"
+        )
+        assert all(
+            not {
+                "sequence",
+                "status",
+                "account_state",
+                "activation_state",
+                "source_section",
+                "source_sequence",
+                "currency",
+                "amount_unit",
+            }
+            & set(row["normalized"])
+            for row in account_rows
+        )
+        csv_names = {
+            path.stem
+            for path in written["datasets"].glob("*.csv")
+            if path.name != "_audit_cells.csv"
+        }
+        assert csv_names == public_names
+        with (written["datasets"] / "_audit_cells.csv").open(
+            encoding="utf-8-sig",
+            newline="",
+        ) as stream:
+            audit_dataset_ids = {
+                row["dataset_id"]
+                for row in csv.DictReader(stream)
+                if not row["dataset_id"].startswith("_audit_")
+            }
+        assert audit_dataset_ids <= {dataset["id"] for dataset in persisted["datasets"]}

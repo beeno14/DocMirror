@@ -8,6 +8,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from docmirror.plugins.credit_report.currency_codes import ISO_4217_CURRENT_CODES
+
 
 def personal_detail_source_dictionary_components() -> dict[str, Any]:
     """Return descriptors for the extractor's private source collections."""
@@ -289,7 +291,8 @@ def personal_detail_source_dictionary_components() -> dict[str, Any]:
             "due_date": {"label": "到期日期", "type": "date"},
             "five_tier_class": {"label": "五级分类", "type": "enum"},
             "open_date": {"label": "开立日期", "type": "date"},
-            "overdue_months_or_repayment_status": {"label": "逾期月数或还款状态", "type": "string"},
+        "overdue_months": {"label": "逾期月数", "type": "integer"},
+        "repayment_status_code": {"label": "还款状态代码", "type": "string"},
         }
     )
     datasets["postpaid_payment_history"] = {
@@ -553,7 +556,10 @@ def personal_detail_source_dictionary_components() -> dict[str, Any]:
                 "not_available": "源未提供字段置信度",
             },
             "mapping_status": {"mapped": "已映射", "unmapped": "未映射"},
-            "currency_code": {"CNY": "人民币"},
+            "currency_code": {
+                **{code: code for code in sorted(ISO_4217_CURRENT_CODES)},
+                "CNY": "人民币",
+            },
             "amount_unit": {"yuan": "元"},
             "repayment_status_code": {
                 "*": "本月没有还款历史",

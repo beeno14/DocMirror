@@ -16,6 +16,11 @@ from typing import Any
 
 from docmirror.plugins.credit_report.value_utils import stable_record_id
 
+_REPAYMENT_RANGE_RE = re.compile(
+    r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?\s*[-—–－至到]\s*"
+    r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?"
+)
+
 
 def _geometry_box(value: Any) -> list[float] | None:
     """Recover a usable grid box from its own box or constituent cells."""
@@ -112,6 +117,157 @@ def _merged_source_refs(*records: dict[str, Any]) -> list[dict[str, Any]]:
     return refs
 
 
+def _account_segments(accounts: list[dict[str, Any]]) -> dict[str, list[tuple[int, float, float | None]]]:
+    segments: dict[str, list[tuple[int, float, float | None]]] = {}
+    fallback: dict[int, list[tuple[float, str]]] = {}
+    for account in accounts:
+        if not isinstance(account, dict):
+            continue
+        account_id = str(account.get("account_id") or "")
+        if not account_id:
+            continue
+        canonical = account.get("_canonical_segment")
+        pages = canonical.get("pages") if isinstance(canonical, dict) else None
+        exact: list[tuple[int, float, float | None]] = []
+        if isinstance(pages, list):
+            for item in pages:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    page = int(item.get("logical_page") or 0)
+                    minimum = float(item["min_y"])
+                    maximum = float(item["max_y"]) if item.get("max_y") is not None else None
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if page > 0:
+                    exact.append((page, minimum, maximum))
+        if exact:
+            segments[account_id] = exact
+            continue
+        refs = [ref for ref in account.get("source_refs") or () if isinstance(ref, dict)]
+        first = refs[0] if refs else {}
+        bbox = account.get("bbox") or first.get("bbox")
+        try:
+            page = int(account.get("page") or first.get("logical_page") or first.get("page") or 0)
+            minimum = float(bbox[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if page > 0:
+            fallback.setdefault(page, []).append((minimum, account_id))
+    for page, values in fallback.items():
+        ordered = sorted(values)
+        for index, (minimum, account_id) in enumerate(ordered):
+            maximum = ordered[index + 1][0] if index + 1 < len(ordered) else None
+            segments[account_id] = [(page, minimum, maximum)]
+    return segments
+
+
+def candidate_b_repayment_anchor_ledger(
+    evidence_pages: list[dict[str, Any]],
+    accounts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ledger visible monthly anchors without relying on grid materialization."""
+
+    account_segments = _account_segments(accounts)
+    anchors: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int, str]] = set()
+    for page_data in evidence_pages:
+        if not isinstance(page_data, dict):
+            continue
+        page = int(page_data.get("page") or 0)
+        source_page = int(page_data.get("source_page") or page)
+        lines = [line for line in page_data.get("lines") or () if isinstance(line, dict)]
+        for index, line in enumerate(lines):
+            text = str(line.get("text") or line.get("content") or "").strip()
+            if "还款记录" not in re.sub(r"\s+", "", text):
+                continue
+            bbox = line.get("bbox")
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                box = [float(value) for value in bbox]
+                top = box[1]
+            except (TypeError, ValueError):
+                continue
+            range_match = _REPAYMENT_RANGE_RE.search(text)
+            if range_match is None:
+                for neighbor_index in (index - 1, index + 1):
+                    if not 0 <= neighbor_index < len(lines):
+                        continue
+                    neighbor = lines[neighbor_index]
+                    neighbor_text = str(neighbor.get("text") or neighbor.get("content") or "").strip()
+                    neighbor_box = neighbor.get("bbox")
+                    if not isinstance(neighbor_box, list) or len(neighbor_box) != 4:
+                        continue
+                    try:
+                        nearby = abs(float(neighbor_box[1]) - top) <= 32.0
+                    except (TypeError, ValueError):
+                        nearby = False
+                    if nearby and _REPAYMENT_RANGE_RE.search(neighbor_text):
+                        text = f"{neighbor_text} {text}" if neighbor_index < index else f"{text} {neighbor_text}"
+                        range_match = _REPAYMENT_RANGE_RE.search(text)
+                        box = [
+                            min(box[0], float(neighbor_box[0])),
+                            min(box[1], float(neighbor_box[1])),
+                            max(box[2], float(neighbor_box[2])),
+                            max(box[3], float(neighbor_box[3])),
+                        ]
+                        top = box[1]
+                        break
+            owner_segments = [
+                (account_id, minimum, maximum)
+                for account_id, segments in account_segments.items()
+                for segment_page, minimum, maximum in segments
+                if segment_page == page
+                    and top + 8.0 >= minimum
+                    and (maximum is None or top < maximum)
+            ]
+            if len(owner_segments) != 1:
+                continue
+            account_id, segment_minimum, segment_maximum = owner_segments[0]
+            marker = (account_id, page, round(top), re.sub(r"\s+", "", text))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            date_range = None
+            if range_match is not None:
+                start_year, start_month, end_year, end_month = map(int, range_match.groups())
+                if (
+                    1 <= start_month <= 12
+                    and 1 <= end_month <= 12
+                    and end_year * 12 + end_month >= start_year * 12 + start_month
+                ):
+                    date_range = {
+                        "start_year": start_year,
+                        "start_month": start_month,
+                        "end_year": end_year,
+                        "end_month": end_month,
+                    }
+            anchors.append(
+                {
+                    "anchor_id": stable_record_id("monthly_repayment_anchor", account_id, page, round(top), text),
+                    "account_id": account_id,
+                    "page": page,
+                    "source_page": source_page,
+                    "bbox": box,
+                    "anchor_text": text,
+                    "date_range": date_range,
+                    "segment_min_y": segment_minimum,
+                    "segment_max_y": segment_maximum,
+                    "source_refs": [
+                        {
+                            "source": "candidate_b_monthly_anchor_ledger",
+                            "logical_page": page,
+                            "source_page": source_page,
+                            "bbox": box,
+                            "geometry_scope": "line",
+                        }
+                    ],
+                }
+            )
+    return anchors
+
+
 def link_candidate_b_repayments(
     repayments: list[dict[str, Any]],
     accounts: list[dict[str, Any]],
@@ -119,6 +275,7 @@ def link_candidate_b_repayments(
     *,
     reading_order_by_logical: dict[int, int] | None = None,
     issue_context: Any | None = None,
+    repayment_anchors: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Attach monthly grids only to their exact canonical account segment."""
     del reading_order_by_logical
@@ -359,8 +516,25 @@ def link_candidate_b_repayments(
     # detectors are collapsed only after a valid account relation exists.
     output: list[dict[str, Any]] = []
     positions: dict[tuple[str, int, int], int] = {}
-    conflicting_duplicate_count = 0
     reported_duplicate_conflicts: set[tuple[str, int, int]] = set()
+    account_gaps = [
+        issue
+        for issue in getattr(issue_context, "_personal_detail_extraction_issues", ())
+        if isinstance(issue, dict)
+        and issue.get("issue_code") == "candidate_b_account_sequence_gap"
+        and str(issue.get("status") or "open") != "resolved"
+    ]
+    cross_grid_collisions: dict[tuple[str, int, int], dict[str, Any]] = {}
+
+    def record_grid_id(record: dict[str, Any]) -> str:
+        refs = (
+            record.get("source_cell_refs")
+            if isinstance(record.get("source_cell_refs"), list)
+            else []
+        )
+        first_ref = refs[0] if refs and isinstance(refs[0], dict) else {}
+        return str(record.get("grid_id") or first_ref.get("grid_id") or "")
+
     for item in linked:
         account_id = str(item.get("account_id") or "")
         try:
@@ -391,11 +565,26 @@ def link_candidate_b_repayments(
         refs = _merged_source_refs(selected, other)
         if refs:
             selected["source_cell_refs"] = refs
+        current_grid_id = record_grid_id(current)
+        item_grid_id = record_grid_id(item)
+        if account_gaps and current_grid_id and item_grid_id and current_grid_id != item_grid_id:
+            collision = cross_grid_collisions.setdefault(
+                key,
+                {
+                    "grid_ids": set(),
+                    "records": [],
+                    "suppressed_candidate_count": 0,
+                },
+            )
+            collision["grid_ids"].update((current_grid_id, item_grid_id))
+            collision["records"].extend((current, item))
+            collision["suppressed_candidate_count"] += 1
         selected_signature = _monthly_business_signature(selected)
         other_signature = _monthly_business_signature(other)
         if selected_signature == other_signature:
-            # Detector replays with the same normalized status and amount are
-            # evidence aggregation, not business uncertainty.
+            # Equal business values retain one canonical row. Same-grid
+            # detector replays are evidence aggregation; a distinct-grid
+            # collapse under an account gap is reported below.
             output[existing] = selected
             continue
 
@@ -413,7 +602,6 @@ def link_candidate_b_repayments(
             output[existing] = usable
             continue
 
-        conflicting_duplicate_count += 1
         audit = dict(selected.get("audit") or {})
         prior_count = audit.get("duplicate_month_candidates")
         audit["duplicate_month_candidates"] = (
@@ -463,51 +651,58 @@ def link_candidate_b_repayments(
                     ),
                 ),
             )
-    if issue_context is not None and conflicting_duplicate_count:
-        account_gaps = [
-            issue
-            for issue in getattr(issue_context, "_personal_detail_extraction_issues", ())
-            if isinstance(issue, dict)
-            and issue.get("issue_code") == "candidate_b_account_sequence_gap"
-            and str(issue.get("status") or "open") != "resolved"
-        ]
-        if account_gaps:
-            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
-                make_issue,
-                record_issue,
-            )
+    if issue_context is not None and cross_grid_collisions:
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            make_issue,
+            record_issue,
+        )
 
+        missing_sequences = {
+            str((issue.get("observed_value") or {}).get("account_type") or "unknown"): list(
+                (issue.get("candidate_value") or {}).get("missing_category_sequences") or ()
+            )
+            for issue in account_gaps
+        }
+        for key, collision in cross_grid_collisions.items():
+            retained = output[positions[key]]
+            grid_ids = sorted(collision["grid_ids"])
+            collision_refs = _merged_source_refs(*collision["records"])
             record_issue(
                 issue_context,
                 make_issue(
                     category="schema_incompleteness",
                     issue_code="monthly_linkage_collision_from_account_gap",
                     message=(
-                        "Monthly grid candidates collapsed onto duplicate account-month keys while account-family "
-                        "ordinals were unresolved; the final rows were deduplicated and the population loss was reported."
+                        "Distinct monthly grids collapsed onto one account-month while account-family ordinals "
+                        "were unresolved; one canonical row was retained and the possible population loss was reported."
                     ),
                     parser_stage="candidate_b_relationship_schema",
                     target_dataset="repayment_records",
+                    target_record_id=_monthly_record_id(
+                        retained, str(retained.get("grid_id") or "")
+                    ),
                     field_name="account_id",
-                    observed_value={"final_linked_row_count": len(output)},
+                    observed_value={
+                        "account_id": key[0],
+                        "performance_month": f"{key[1]:04d}-{key[2]:02d}",
+                        "colliding_grid_ids": grid_ids,
+                        "distinct_grid_count": len(grid_ids),
+                        "suppressed_candidate_count": collision[
+                            "suppressed_candidate_count"
+                        ],
+                        "final_linked_row_count": len(output),
+                    },
                     candidate_value={
                         "pre_deduplication_row_count": len(linked),
-                        "collapsed_candidate_count": conflicting_duplicate_count,
-                        "missing_account_category_sequences": {
-                            str((issue.get("observed_value") or {}).get("account_type") or "unknown"): list(
-                                (issue.get("candidate_value") or {}).get("missing_category_sequences") or ()
-                            )
-                            for issue in account_gaps
-                        },
+                        "collapsed_candidate_count": collision[
+                            "suppressed_candidate_count"
+                        ],
+                        "missing_account_category_sequences": missing_sequences,
                     },
-                    source_refs=(
-                        dict(ref)
-                        for issue in account_gaps
-                        for ref in issue.get("source_refs") or ()
-                        if isinstance(ref, dict)
-                    ),
+                    source_refs=collision_refs,
                     reason_codes=(
                         "credit_account_population_incomplete",
+                        "distinct_monthly_grids_share_account_month",
                         "duplicate_account_month_linkage",
                         "final_population_loss_reported",
                     ),
@@ -619,6 +814,83 @@ def link_candidate_b_repayments(
                         "printed_date_range_contract",
                         "single_account_grid_contract",
                         "dataset_incomplete",
+                    ),
+                ),
+            )
+        for anchor in repayment_anchors or ():
+            if not isinstance(anchor, dict):
+                continue
+            account_id = str(anchor.get("account_id") or "")
+            page = int(anchor.get("page") or 0)
+            anchor_box = _geometry_box(anchor)
+            anchor_top = float(anchor_box[1]) if anchor_box else None
+            try:
+                segment_minimum = float(anchor.get("segment_min_y"))
+            except (TypeError, ValueError):
+                segment_minimum = anchor_top
+            try:
+                segment_maximum = float(anchor.get("segment_max_y"))
+            except (TypeError, ValueError):
+                segment_maximum = None
+            anchor_range = anchor.get("date_range")
+            anchor_months = _grid_months({"audit": {"date_range": anchor_range}})
+            candidates: list[str] = []
+            for grid_id, grid in grids.items():
+                if int(grid.get("page") or 0) != page:
+                    continue
+                explicit_account_id = str(grid.get("account_id") or "")
+                if explicit_account_id and explicit_account_id != account_id:
+                    continue
+                grid_box = _geometry_box(grid)
+                geometry_match = False
+                if grid_box is not None:
+                    grid_top = float(grid_box[1])
+                    geometry_match = (
+                        (anchor_top is None or grid_top + 12.0 >= anchor_top)
+                        and (segment_minimum is None or grid_top + 8.0 >= segment_minimum)
+                        and (segment_maximum is None or grid_top < segment_maximum)
+                    )
+                text_match = bool(
+                    re.sub(r"\s+", "", str(anchor.get("anchor_text") or ""))
+                    and re.sub(r"\s+", "", str(anchor.get("anchor_text") or ""))
+                    == re.sub(r"\s+", "", str(grid.get("anchor_text") or ""))
+                )
+                range_match = bool(anchor_months and anchor_months == _grid_months(grid))
+                if geometry_match or (
+                    explicit_account_id == account_id and (text_match or range_match)
+                ):
+                    candidates.append(grid_id)
+            if candidates:
+                continue
+            record_issue(
+                issue_context,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_anchor_grid_missing",
+                    message=(
+                        "An account-bound printed repayment-record anchor produced no canonical monthly grid; "
+                        "no monthly business rows were invented."
+                    ),
+                    parser_stage="candidate_b_relationship_schema",
+                    target_dataset="repayment_records",
+                    target_record_id=account_id,
+                    field_name="account_id",
+                    observed_value={
+                        "anchor_id": anchor.get("anchor_id"),
+                        "account_id": account_id or None,
+                        "anchor_text": anchor.get("anchor_text"),
+                        "date_range": anchor_range,
+                        "materialized_grid_count": 0,
+                    },
+                    candidate_value={"resolution": "missing_grid_reported_for_account"},
+                    source_refs=tuple(
+                        ref for ref in anchor.get("source_refs") or () if isinstance(ref, dict)
+                    ),
+                    reason_codes=(
+                        "independent_visible_repayment_anchor",
+                        "exact_account_segment_owner",
+                        "zero_materialized_grids",
+                        "monthly_rows_not_invented",
                     ),
                 ),
             )

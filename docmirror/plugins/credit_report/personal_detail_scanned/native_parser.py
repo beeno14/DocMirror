@@ -20,6 +20,10 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
     make_issue,
     record_issue,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.liability_clusters import (
+    decode_packed_liability_row,
+    normalize_packed_liability_header,
+)
 
 _LABELS = frozenset(
     {
@@ -82,6 +86,27 @@ _PRIMARY_RECORD_LABELS = {
     "credit_lines": "授信协议标识",
     "repayment_liability_records": "保证合同编号",
 }
+_CREDIT_AGREEMENT_INLINE_LABELS = tuple(
+    sorted(
+        (
+            "授信协议标识",
+            "管理机构",
+            "授信额度用途",
+            "生效日期",
+            "到期日期",
+            "授信额度",
+            "授信限额",
+            "已用额度",
+            "授信限额编号",
+            "币种",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+_CREDIT_AGREEMENT_INLINE_LABEL_RE = re.compile(
+    "|".join(re.escape(label) for label in _CREDIT_AGREEMENT_INLINE_LABELS)
+)
 _EVIDENCE_SECTION_END_MARKERS = (
     "非信贷交易信息",
     "公共信息",
@@ -90,6 +115,22 @@ _EVIDENCE_SECTION_END_MARKERS = (
     "异议标注",
     "报告说明",
 )
+
+_PACKED_LIABILITY_FIELD_LABELS = {
+    "institution": "管理机构",
+    "business_type": "业务种类",
+    "open_date": "开立日期",
+    "due_date": "到期日期",
+    "responsibility_type": "责任人类型",
+    "responsibility_amount": "还款责任金额",
+    "currency": "币种",
+    "contract_number": "保证合同编号",
+}
+_PACKED_LIABILITY_LABEL_FIELDS = {
+    label: field_name for field_name, label in _PACKED_LIABILITY_FIELD_LABELS.items()
+}
+
+
 def _compact(value: Any) -> str:
     return re.sub(r"[\s:：,，。；;()（）\[\]【】]", "", str(value or "")).strip()
 
@@ -117,6 +158,29 @@ def _canonical_label(value: Any) -> tuple[str | None, float]:
     if alias in _LABELS:
         return alias, 0.96
     return None, 0.0
+
+
+def _collapsed_credit_agreement_pairs(value: Any) -> list[tuple[str, str]]:
+    """Decode exact labels and their suffixes from one collapsed card cell.
+
+    Some OCR table graphs preserve a complete PBOC agreement row as one text
+    cell.  This remains schema-bound evidence because every value is delimited
+    by an exact printed label; unknown/fuzzy labels are never authorized.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return []
+    matches = list(_CREDIT_AGREEMENT_INLINE_LABEL_RE.finditer(text))
+    if not matches or text[: matches[0].start()].strip(" \t:：,，;；|/"):
+        return []
+    pairs: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        candidate = text[match.end() : end].strip(" \t:：,，;；|/")
+        if candidate:
+            pairs.append((match.group(0), candidate))
+    return pairs
 
 
 def _source_ref(page: Any, table: Any) -> dict[str, Any]:
@@ -232,11 +296,275 @@ def _cell_text(value: Any) -> str:
     return value.text if isinstance(value, _PositionedEvidenceCell) else str(value or "")
 
 
+@dataclass(frozen=True, slots=True)
+class _PackedLiabilityRowObservation:
+    """One adjacent canonical packed header/value witness."""
+
+    header_row_index: int
+    value_row_index: int | None
+    normalized_labels: tuple[str, ...]
+    header_values: tuple[str, ...]
+    fields: dict[str, str]
+    unresolved_reason: str | None
+
+    @property
+    def resolved(self) -> bool:
+        return self.unresolved_reason is None
+
+
+def _packed_liability_row_observations(
+    rows: list[list[Any]],
+) -> list[_PackedLiabilityRowObservation]:
+    """Decode every adjacent complete liability header without fuzzy repair."""
+
+    observations: list[_PackedLiabilityRowObservation] = []
+    for header_row_index, header_row in enumerate(rows):
+        header_values = [_cell_text(cell) for cell in header_row]
+        normalized_labels = normalize_packed_liability_header(header_values)
+        if normalized_labels is None:
+            continue
+        value_row_index = header_row_index + 1 if header_row_index + 1 < len(rows) else None
+        value_values = (
+            [_cell_text(cell) for cell in rows[value_row_index]]
+            if value_row_index is not None
+            else []
+        )
+        source_header_tokens = tuple(_compact(value) for value in header_values if _compact(value))
+        source_value_tokens = tuple(_compact(value) for value in value_values if _compact(value))
+        if (
+            source_header_tokens == tuple(_compact(value) for value in normalized_labels)
+            and len(source_value_tokens) == len(normalized_labels)
+        ):
+            # A clean one-cell-per-slot table already has a narrower exact
+            # binding in the ordinary label-column decoder. The packed-row
+            # decoder is reserved for packed rows and the helper's exact OCR
+            # label aliases, avoiding broader provenance on clean tables.
+            continue
+        decoded = decode_packed_liability_row(header_values, value_values)
+        fields = {
+            _PACKED_LIABILITY_FIELD_LABELS[field_name]: str(value)
+            for field_name, value in decoded.fields.items()
+            if field_name in _PACKED_LIABILITY_FIELD_LABELS
+        }
+        observations.append(
+            _PackedLiabilityRowObservation(
+                header_row_index=header_row_index,
+                value_row_index=value_row_index,
+                normalized_labels=normalized_labels,
+                header_values=tuple(header_values),
+                fields=fields,
+                unresolved_reason=decoded.unresolved_reason,
+            )
+        )
+    return observations
+
+
+def _packed_value_equivalent(label: str, left: Any, right: Any) -> bool:
+    """Compare raw direct-cell and normalized packed-row representations."""
+
+    if label in {"开立日期", "到期日期"}:
+        return re.sub(r"\D", "", str(left or "")) == re.sub(r"\D", "", str(right or ""))
+    if label == "还款责任金额":
+        return re.sub(r"\D", "", str(left or "")) == re.sub(r"\D", "", str(right or ""))
+    if label == "币种":
+        currencies = {
+            "人民币": "CNY",
+            "人民币元": "CNY",
+            "RMB": "CNY",
+            "CNY": "CNY",
+            "美元": "USD",
+            "USD": "USD",
+            "欧元": "EUR",
+            "EUR": "EUR",
+            "港元": "HKD",
+            "HKD": "HKD",
+            "日元": "JPY",
+            "JPY": "JPY",
+            "英镑": "GBP",
+            "GBP": "GBP",
+        }
+        return currencies.get(_compact(left).upper()) == currencies.get(_compact(right).upper())
+    return _compact(left).upper() == _compact(right).upper()
+
+
+def _merge_packed_liability_fields(
+    fields: dict[str, str],
+    refs_by_field: dict[str, tuple[dict[str, Any], ...]],
+    bindings_by_field: dict[str, str],
+    observed_labels: frozenset[str],
+    unresolved_labels: frozenset[str],
+    observations: list[_PackedLiabilityRowObservation],
+    packed_refs: dict[int, tuple[dict[str, Any], ...]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Merge helper-authorized fields and retain exact independent bindings.
+
+    An unresolved packed row may still expose uniquely typed fields. The merge
+    retains those exact spans and keeps every unsupported slot unresolved.
+    """
+
+    observed = set(observed_labels)
+    unresolved = set(unresolved_labels)
+    for observation_index, observation in enumerate(observations):
+        observed.update(observation.normalized_labels)
+        row_refs = packed_refs.get(observation_index, ())
+        header_compact = _compact("".join(observation.header_values))
+        for label in observation.normalized_labels:
+            existing = fields.get(label)
+            if (
+                existing not in (None, "")
+                and _compact(existing)
+                and _compact(existing) in header_compact
+            ):
+                # The generic collapsed-agreement reader can see agreement
+                # labels inside a packed liability header.  Such header text
+                # is not a business value and must not survive either a
+                # resolved or unresolved liability-row interpretation.
+                fields.pop(label, None)
+                refs_by_field.pop(label, None)
+                bindings_by_field.pop(label, None)
+        for label, candidate in observation.fields.items():
+            existing = fields.get(label)
+            if existing not in (None, "") and not _packed_value_equivalent(label, existing, candidate):
+                fields.pop(label, None)
+                refs_by_field.pop(label, None)
+                bindings_by_field.pop(label, None)
+                unresolved.add(label)
+                continue
+            if existing in (None, ""):
+                fields[label] = candidate
+                if row_refs:
+                    refs_by_field[label] = tuple({**ref, "field_name": label} for ref in row_refs)
+                bindings_by_field[label] = "canonical_packed_liability_row"
+            unresolved.discard(label)
+        if not observation.resolved:
+            # Direct same-column evidence remains valid even when residue in a
+            # different slot prevents a complete packed-row interpretation.
+            # Exact partial packed-row fields likewise survive, while every
+            # absent slot remains explicitly unresolved.
+            unresolved.update(label for label in observation.normalized_labels if label not in fields)
+    unresolved.difference_update(fields)
+    return frozenset(observed), frozenset(unresolved)
+
+
 class PBOCPersonalDetailNativeParser:
     """Resolve labelled card observations into one canonical record stream."""
 
     def __init__(self, context: Any) -> None:
         self.context = context
+
+    @staticmethod
+    def _native_packed_row_refs(
+        page: Any,
+        table: Any,
+        rows: list[list[Any]],
+        *,
+        row_offset: int,
+        row_indices: tuple[int, ...],
+        field_name: str,
+        binding: str,
+    ) -> tuple[dict[str, Any], ...]:
+        refs: list[dict[str, Any]] = []
+        for row_index in row_indices:
+            if not 0 <= row_index < len(rows):
+                continue
+            for column_index, cell in enumerate(rows[row_index]):
+                if not _cell_text(cell).strip():
+                    continue
+                refs.append(
+                    {
+                        **_field_source_ref(
+                            page,
+                            table,
+                            row=row_offset + row_index,
+                            column=column_index,
+                            field_name=field_name,
+                        ),
+                        "binding": binding,
+                    }
+                )
+        return tuple(refs)
+
+    @staticmethod
+    def _evidence_packed_row_refs(
+        rows: list[list[_PositionedEvidenceCell]],
+        *,
+        row_indices: tuple[int, ...],
+        field_name: str,
+        binding: str,
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            {
+                **cell.source_ref(field_name=field_name),
+                "binding": binding,
+            }
+            for row_index in row_indices
+            if 0 <= row_index < len(rows)
+            for cell in rows[row_index]
+            if cell.text.strip()
+        )
+
+    def _record_unresolved_packed_liability_rows(
+        self,
+        rows: list[list[Any]],
+        observations: list[_PackedLiabilityRowObservation],
+        witness_refs: dict[int, tuple[dict[str, Any], ...]],
+        *,
+        parser_stage: str,
+    ) -> None:
+        for observation_index, observation in enumerate(observations):
+            if observation.resolved:
+                continue
+            header = [_cell_text(cell) for cell in rows[observation.header_row_index]]
+            value = (
+                [_cell_text(cell) for cell in rows[observation.value_row_index]]
+                if observation.value_row_index is not None
+                else []
+            )
+            affected_fields = [
+                _PACKED_LIABILITY_LABEL_FIELDS[label]
+                for label in observation.normalized_labels
+                if label not in observation.fields
+                and label in _PACKED_LIABILITY_LABEL_FIELDS
+            ]
+            printed_sequences = {
+                match.group(1)
+                for row in rows
+                for cell in row
+                if (match := re.search(r"账户\s*(\d{1,3})", _cell_text(cell)))
+            }
+            observed_value: dict[str, Any] = {
+                "header": header,
+                "value": value,
+                "unresolved_reason": observation.unresolved_reason,
+                "retained_typed_fields": dict(observation.fields),
+                "affected_fields": affected_fields,
+            }
+            if len(printed_sequences) == 1:
+                observed_value["printed_sequence"] = next(iter(printed_sequences))
+            record_issue(
+                self.context,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_packed_liability_row_unresolved",
+                    message=(
+                        "A complete canonical repayment-responsibility header was observed, but its "
+                        "adjacent packed value row did not have one complete typed interpretation. "
+                        "Fields without unique typed support were withheld and the source witness was preserved."
+                    ),
+                    parser_stage=parser_stage,
+                    target_dataset="repayment_liability_records",
+                    observed_value=observed_value,
+                    source_refs=witness_refs.get(observation_index, ()),
+                    reason_codes=(
+                        "canonical_packed_liability_header",
+                        str(observation.unresolved_reason or "packed_row_unresolved"),
+                        "unique_typed_fields_retained",
+                        "residual_or_ambiguous_fields_reported",
+                        "raw_witness_preserved",
+                        "unsupported_fields_withheld",
+                    ),
+                ),
+            )
 
     @staticmethod
     def _canonical_template_id(page: Any, table: Any) -> str:
@@ -292,6 +620,104 @@ class PBOCPersonalDetailNativeParser:
             return "", None
         _bottom, sequence, ref = max(candidates, key=lambda item: item[0])
         return sequence, ref
+
+    @staticmethod
+    def _record_group_top(table: Any, row_offset: int, row_count: int) -> float | None:
+        metadata = getattr(table, "metadata", None) or {}
+        cell_boxes = (
+            metadata.get("source_cell_bboxes") or metadata.get("cell_bboxes")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(cell_boxes, list):
+            return None
+        tops: list[float] = []
+        for row in cell_boxes[row_offset : row_offset + row_count]:
+            if not isinstance(row, list):
+                continue
+            for box in row:
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    tops.append(float(box[1]))
+        return min(tops) if tops else None
+
+    @classmethod
+    def _printed_sequence_anchors_for_groups(
+        cls,
+        page: Any,
+        table: Any,
+        dataset_name: str,
+        groups: list[tuple[int, list[list[str]]]],
+    ) -> dict[int, tuple[str, dict[str, Any]]]:
+        """Bind each printed card heading to at most one repeated table card."""
+
+        if dataset_name != "credit_lines" or not groups:
+            return {}
+        pattern = re.compile(r"授信协议\s*(\d{1,3})")
+        anchors: list[tuple[float, str, dict[str, Any]]] = []
+        for text_item in getattr(page, "texts", None) or ():
+            match = pattern.search(str(getattr(text_item, "content", "") or ""))
+            box = getattr(text_item, "bbox", None)
+            if match is None or not isinstance(box, (list, tuple)) or len(box) != 4:
+                continue
+            anchors.append(
+                (
+                    float(box[3]),
+                    match.group(1),
+                    {
+                        "source": "native_detail_canonical_anchor_text",
+                        "logical_page": int(getattr(page, "page_number", 0) or 0),
+                        "source_page": int(
+                            getattr(page, "source_page_number", 0)
+                            or getattr(page, "page_number", 0)
+                            or 0
+                        ),
+                        "bbox": list(box),
+                        "geometry_scope": "text",
+                        "field_name": "sequence",
+                        "binding": "canonical_card_anchor",
+                    },
+                )
+            )
+        if not anchors:
+            return {}
+        anchors.sort(key=lambda item: item[0])
+        group_tops = [
+            cls._record_group_top(table, row_offset, len(record_rows))
+            for row_offset, record_rows in groups
+        ]
+        assigned: dict[int, tuple[str, dict[str, Any]]] = {}
+        used: set[int] = set()
+        if all(top is not None for top in group_tops):
+            for (row_offset, _record_rows), group_top in zip(groups, group_tops, strict=True):
+                eligible = [
+                    (index, anchor)
+                    for index, anchor in enumerate(anchors)
+                    if index not in used and anchor[0] <= float(group_top) + 8.0
+                ]
+                if not eligible:
+                    continue
+                index, (_bottom, sequence, ref) = max(eligible, key=lambda item: item[1][0])
+                used.add(index)
+                assigned[row_offset] = (sequence, ref)
+            return assigned
+
+        # Geometry-free fallback is authorized only by a complete one-to-one
+        # set of explicit headings.  Never reuse one heading for several cards.
+        table_box = getattr(table, "bbox", None)
+        if isinstance(table_box, (list, tuple)) and len(table_box) == 4:
+            nearby = [
+                anchor
+                for anchor in anchors
+                if float(table_box[1]) - 120.0 <= anchor[0] <= float(table_box[3]) + 8.0
+            ]
+        else:
+            nearby = anchors
+        if len(nearby) == len(groups) and len({sequence for _bottom, sequence, _ref in nearby}) == len(groups):
+            for (row_offset, _record_rows), (_bottom, sequence, ref) in zip(
+                groups, nearby, strict=True
+            ):
+                assigned[row_offset] = (sequence, ref)
+        return assigned
 
     def _table_groups(self) -> list[tuple[Any, Any, list[list[str]], tuple[dict[str, Any], ...]]]:
         entries: list[tuple[Any, Any, list[list[str]], dict[str, Any]]] = []
@@ -393,6 +819,19 @@ class PBOCPersonalDetailNativeParser:
         for row_index, row in enumerate(rows):
             for column, cell in enumerate(row):
                 cell_text = _cell_text(cell)
+                collapsed_pairs = _collapsed_credit_agreement_pairs(cell_text)
+                if collapsed_pairs:
+                    for label, candidate in collapsed_pairs:
+                        observed.add(label)
+                        if label in fields and _compact(fields[label]) != _compact(candidate):
+                            fields.pop(label, None)
+                            positions.pop(label, None)
+                            unresolved.add(label)
+                            continue
+                        fields.setdefault(label, candidate)
+                        positions.setdefault(label, (row_index, column))
+                        scores.append(1.0)
+                    continue
                 label, score = _canonical_label(cell_text)
                 if label is None:
                     inline = re.match(r"^\s*([^:：]{2,30})[:：]\s*(.+?)\s*$", cell_text)
@@ -594,7 +1033,15 @@ class PBOCPersonalDetailNativeParser:
                         liability_party_category = "organization"
                         continue
                 has_primary = bool(primary_label and primary_label in compact)
-                if anchor.search(compact) or (has_primary and current_has_primary):
+                complete_liability_header = bool(
+                    dataset_name == "repayment_liability_records"
+                    and normalize_packed_liability_header([cell.text for cell in row]) is not None
+                )
+                if (
+                    anchor.search(compact)
+                    or (has_primary and current_has_primary)
+                    or (complete_liability_header and not current_rows)
+                ):
                     flush()
                     current_rows = [row]
                 elif current_rows:
@@ -669,6 +1116,14 @@ class PBOCPersonalDetailNativeParser:
         for row_index, row in enumerate(rows):
             labels: list[tuple[str, float, _PositionedEvidenceCell]] = []
             for cell in row:
+                collapsed_pairs = _collapsed_credit_agreement_pairs(cell.text)
+                if collapsed_pairs:
+                    for label, candidate in collapsed_pairs:
+                        observed.add(label)
+                        values_by_label.setdefault(label, []).append(
+                            (candidate, (cell,), 1.0)
+                        )
+                    continue
                 inline = re.match(r"^\s*([^:：]{2,30})[:：]\s*(.+?)\s*$", cell.text)
                 if inline:
                     label, score = _canonical_label(inline.group(1))
@@ -840,7 +1295,14 @@ class PBOCPersonalDetailNativeParser:
                 # Account-detail cards also print ``授信协议标识`` in their
                 # heading.  They are account evidence, not agreement rows.
                 continue
-            for row_offset, record_rows in self._split_repeated_cards_with_offsets(dataset_name, rows):
+            record_groups = self._split_repeated_cards_with_offsets(dataset_name, rows)
+            assigned_sequence_anchors = self._printed_sequence_anchors_for_groups(
+                _page,
+                _table,
+                dataset_name,
+                record_groups,
+            )
+            for row_offset, record_rows in record_groups:
                 fields, confidence, positions, observed_labels, unresolved = self._pairs_with_bindings(record_rows)
                 refs_by_field = {
                     label: (
@@ -855,6 +1317,58 @@ class PBOCPersonalDetailNativeParser:
                     for label, position in positions.items()
                 }
                 bindings_by_field = {label: "native_label_column" for label in positions}
+                if dataset_name == "repayment_liability_records":
+                    packed_observations = _packed_liability_row_observations(record_rows)
+                    packed_refs: dict[int, tuple[dict[str, Any], ...]] = {}
+                    witness_refs: dict[int, tuple[dict[str, Any], ...]] = {}
+                    for observation_index, observation in enumerate(packed_observations):
+                        value_indices = (
+                            (observation.value_row_index,)
+                            if observation.value_row_index is not None
+                            else ()
+                        )
+                        packed_refs[observation_index] = self._native_packed_row_refs(
+                            _page,
+                            _table,
+                            record_rows,
+                            row_offset=row_offset,
+                            row_indices=value_indices,
+                            field_name="packed_liability_value_row",
+                            binding="canonical_packed_liability_row",
+                        )
+                        witness_refs[observation_index] = self._native_packed_row_refs(
+                            _page,
+                            _table,
+                            record_rows,
+                            row_offset=row_offset,
+                            row_indices=tuple(
+                                value
+                                for value in (
+                                    observation.header_row_index,
+                                    observation.value_row_index,
+                                )
+                                if value is not None
+                            ),
+                            field_name="packed_liability_witness",
+                            binding="canonical_packed_liability_witness",
+                        )
+                    self._record_unresolved_packed_liability_rows(
+                        record_rows,
+                        packed_observations,
+                        witness_refs,
+                        parser_stage="candidate_b_native_packed_liability_decoder",
+                    )
+                    observed_labels, unresolved = _merge_packed_liability_fields(
+                        fields,
+                        refs_by_field,
+                        bindings_by_field,
+                        observed_labels,
+                        unresolved,
+                        packed_observations,
+                        packed_refs,
+                    )
+                    if any(observation.resolved for observation in packed_observations):
+                        confidence = confidence or 1.0
                 if dataset_name in {"credit_lines", "repayment_liability_records"}:
                     sequence_pattern = (
                         re.compile(r"授信协议\s*(\d{1,3})")
@@ -889,11 +1403,17 @@ class PBOCPersonalDetailNativeParser:
                     elif len(printed_sequences) > 1:
                         unresolved = frozenset({*unresolved, "__printed_sequence"})
                     else:
-                        printed_sequence, anchor_ref = self._printed_sequence_anchor_above_table(
-                            _page,
-                            _table,
-                            dataset_name,
-                        )
+                        assigned_anchor = assigned_sequence_anchors.get(row_offset)
+                        if assigned_anchor is not None:
+                            printed_sequence, anchor_ref = assigned_anchor
+                        elif len(record_groups) == 1:
+                            printed_sequence, anchor_ref = self._printed_sequence_anchor_above_table(
+                                _page,
+                                _table,
+                                dataset_name,
+                            )
+                        else:
+                            printed_sequence, anchor_ref = "", None
                         if printed_sequence and anchor_ref:
                             fields["__printed_sequence"] = printed_sequence
                             refs_by_field["__printed_sequence"] = (anchor_ref,)
@@ -926,7 +1446,11 @@ class PBOCPersonalDetailNativeParser:
                         unresolved = frozenset({*unresolved, "__snapshot_date"})
                 observed_fields = set(fields)
                 label_text = _compact("".join(cell for row in record_rows for cell in row))
-                marker_hits = {marker for marker in required if marker in observed_fields or marker in label_text}
+                marker_hits = {
+                    marker
+                    for marker in required
+                    if marker in observed_fields or marker in observed_labels or marker in label_text
+                }
                 identified_credit_agreement = bool(
                     dataset_name == "credit_lines"
                     and (fields.get("授信协议标识") or "授信协议标识" in label_text)
@@ -1019,6 +1543,59 @@ class PBOCPersonalDetailNativeParser:
                 unresolved,
             ) = self._evidence_fields(dataset_name, rows)
             if dataset_name == "repayment_liability_records":
+                packed_observations = _packed_liability_row_observations(rows)
+                packed_refs: dict[int, tuple[dict[str, Any], ...]] = {}
+                witness_refs: dict[int, tuple[dict[str, Any], ...]] = {}
+                packed_confidences: list[float] = []
+                for observation_index, observation in enumerate(packed_observations):
+                    value_indices = (
+                        (observation.value_row_index,)
+                        if observation.value_row_index is not None
+                        else ()
+                    )
+                    packed_refs[observation_index] = self._evidence_packed_row_refs(
+                        rows,
+                        row_indices=value_indices,
+                        field_name="packed_liability_value_row",
+                        binding="canonical_packed_liability_row",
+                    )
+                    witness_refs[observation_index] = self._evidence_packed_row_refs(
+                        rows,
+                        row_indices=tuple(
+                            value
+                            for value in (
+                                observation.header_row_index,
+                                observation.value_row_index,
+                            )
+                            if value is not None
+                        ),
+                        field_name="packed_liability_witness",
+                        binding="canonical_packed_liability_witness",
+                    )
+                    if observation.resolved and observation.value_row_index is not None:
+                        packed_confidences.extend(
+                            cell.confidence
+                            for cell in rows[observation.value_row_index]
+                            if cell.text.strip() and cell.confidence > 0.0
+                        )
+                self._record_unresolved_packed_liability_rows(
+                    rows,
+                    packed_observations,
+                    witness_refs,
+                    parser_stage="candidate_b_corrected_page_packed_liability_decoder",
+                )
+                observed, unresolved = _merge_packed_liability_fields(
+                    fields,
+                    refs_by_field,
+                    bindings_by_field,
+                    observed,
+                    unresolved,
+                    packed_observations,
+                    packed_refs,
+                )
+                if packed_confidences:
+                    packed_confidence = min(packed_confidences)
+                    confidence = min(confidence, packed_confidence) if confidence > 0.0 else packed_confidence
                 party_categories = {
                     str(ref.get("canonical_party_category") or "")
                     for ref in refs

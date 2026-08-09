@@ -190,8 +190,8 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
                     "title": "信贷交易信息提示",
                     "row_index": 1,
                     "column_index": 1,
-                    "column_label": "账户类型",
-                    "value": "贷款",
+                    "column_label": "业务类型",
+                    "value": "其他类贷款",
                 },
                 {
                     "summary_cell_id": "cell:2",
@@ -239,9 +239,9 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
 
     metrics = datasets["personal_detail_credit_summary_metrics"]
     account_count = next(row for row in metrics if row["metric_name"] == "账户数")
-    assert account_count["row_dimension_name"] == "账户类型"
-    assert account_count["row_dimension_value"] == "贷款"
-    assert account_count["business_category"] == "贷款"
+    assert account_count["row_dimension_name"] == "业务类型"
+    assert account_count["row_dimension_value"] == "其他类贷款"
+    assert account_count["business_category"] == "其他类贷款"
     assert account_count["numeric_value"] == "23505"
     assert account_count["reporting_status"] == "reported"
     assert account_count["metric_code"] == "account_count"

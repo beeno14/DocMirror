@@ -6,10 +6,25 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from docmirror.evidence.repair import RepairCandidate
-from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import _source_ref
+from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+    collect_extraction_issues,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _account_institution,
+    _apply_account_facts,
+    _date,
+    _flush_pending_account_institution_observations,
+    _liability_date,
+    _source_ref,
+    reconcile_candidate_b_credit_lines,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
     PersonalDetailOCRCorrectionOverlay,
+    institution_slot_is_unambiguous,
     normalize_institution_name,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    prepare_personal_detail_source_collections,
 )
 from docmirror.plugins.credit_report.scanned_business import (
     _extract_inquiries,
@@ -58,16 +73,271 @@ def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
 
 
 def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -> None:
-    assert normalize_institution_name("重庆蚂蚊消费金融有限公司 Ss") == "重庆蚂蚁消费金融有限公司"
-    assert normalize_institution_name("福 中信银行股份有限公司个人信贷部") == ("中信银行股份有限公司个人信贷部")
+    assert normalize_institution_name("重庆蚂蚊消费金融有限公司 Ss") == "重庆蚂蚊消费金融有限公司"
+    assert normalize_institution_name("福 中信银行股份有限公司个人信贷部") == (
+        "福中信银行股份有限公司个人信贷部"
+    )
+    assert _account_institution("福 中信银行股份有限公司个人信贷部") is None
     assert normalize_institution_name("未知机构名称") == "未知机构名称"
     assert normalize_institution_name("新疆样例银行股份有限公司乌鲁木齐分行") == (
         "新疆样例银行股份有限公司乌鲁木齐分行"
     )
     assert normalize_institution_name("云南省农村信用社联合社") == "云南省农村信用社联合社"
-    assert normalize_institution_name(
-        "开立日期账户授信额度共享授信额度币种业务种类担保方式中国建设银行股份有限公司"
-    ) == "中国建设银行股份有限公司"
+    contaminated = "开立日期账户授信额度共享授信额度币种业务种类担保方式中国建设银行股份有限公司"
+    assert normalize_institution_name(contaminated) == contaminated
+    assert not institution_slot_is_unambiguous(contaminated)
+
+
+def test_institution_normalization_has_no_unconditional_business_name_aliases() -> None:
+    assert normalize_institution_name("重庆蚂蚊消费金融有限公司") == "重庆蚂蚊消费金融有限公司"
+    assert normalize_institution_name("某银行偏用卡中心") == "某银行偏用卡中心"
+    assert normalize_institution_name("某银行个大信贷部") == "某银行个大信贷部"
+
+
+def test_institution_leading_han_is_never_deleted_by_scalar_normalization() -> None:
+    assert normalize_institution_name("中 国银行股份有限公司") == "中国银行股份有限公司"
+    assert normalize_institution_name("中 信银行股份有限公司") == "中信银行股份有限公司"
+    assert _account_institution("中 国银行股份有限公司") is None
+    assert _account_institution("中 信银行股份有限公司") is None
+    assert _account_institution("中国银行股份有限公司") == "中国银行股份有限公司"
+
+
+def test_final_overlay_withholds_uncorroborated_leading_han_business_names() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "inquiry_records": [
+            {
+                "inquiry_id": "inquiry:1",
+                "institution": "福 中国银行股份有限公司",
+            }
+        ],
+        "employment_records": [
+            {
+                "employment_record_id": "employment:1",
+                "employer": "中 信银行股份有限公司",
+                "data_provider": "福 中国银行股份有限公司",
+            }
+        ],
+        "residence_records": [
+            {
+                "residence_record_id": "residence:1",
+                "data_provider": "福 中国银行股份有限公司",
+            }
+        ],
+        "personal_profile": [
+            {
+                "personal_profile_id": "profile:1",
+                "query_institution": "福 中国银行股份有限公司",
+            }
+        ],
+        "credit_lines": [
+            {
+                "credit_line_id": "line:clean",
+                "institution": "中国银行股份有限公司",
+            }
+        ],
+    }
+
+    corrected = overlay.correct_business_candidates(
+        payload,
+        stage="candidate_b_final_validation",
+    )
+
+    assert corrected["inquiry_records"][0]["institution"] is None
+    assert corrected["employment_records"][0]["employer"] is None
+    assert corrected["employment_records"][0]["data_provider"] is None
+    assert corrected["residence_records"][0]["data_provider"] is None
+    assert corrected["personal_profile"][0]["query_institution"] is None
+    assert corrected["credit_lines"][0]["institution"] == "中国银行股份有限公司"
+    assert corrected["inquiry_records"][0]["canonical_raw"]["institution"] == (
+        "福 中国银行股份有限公司"
+    )
+    anomalies = overlay.audit()["cell_anomalies"]
+    assert len(anomalies) == 5
+    assert all(
+        anomaly["reason_codes"]
+        == (
+            "separated_leading_han_boundary",
+            "independent_source_corroboration_missing",
+            "normalized_value_withheld",
+        )
+        for anomaly in anomalies
+    )
+
+
+def test_institution_legal_name_preserves_sanctioned_internal_dashes() -> None:
+    clean = "梅赛德斯-奔驰汽车金融有限公司"
+    split = "梅赛德斯 - 奔驰汽车金融 有限公司"
+
+    assert normalize_institution_name(clean) == clean
+    assert normalize_institution_name(split) == clean
+    assert _account_institution(clean) == clean
+    assert _account_institution(split) == clean
+    assert _account_institution("中国银行股份有限公司") == "中国银行股份有限公司"
+
+    multiple = f"{clean} 乙银行股份有限公司"
+    assert not institution_slot_is_unambiguous(multiple)
+    assert normalize_institution_name(multiple) == multiple
+    assert _account_institution(multiple) is None
+
+    debris = "账户标识 梅赛德斯-奔驰汽车金融有限公司"
+    assert not institution_slot_is_unambiguous(debris)
+    assert normalize_institution_name(debris) == debris
+    assert _account_institution(debris) is None
+
+
+def test_account_institution_requires_independent_source_bound_corroboration() -> None:
+    context = SimpleNamespace()
+    page = SimpleNamespace(page_number=1, source_page_number=1)
+    account = {"account_id": "account:1", "canonical_raw": {}}
+    rows = [["管理机构", "账户标识"], ["中 国银行股份有限公司", "ABC12345678"]]
+    for table_id in ("native:institution", "corrected:institution"):
+        table = SimpleNamespace(table_id=table_id, metadata={})
+        _apply_account_facts(context, account, rows, page=page, table=table)
+
+    assert account["management_institution"] == "中国银行股份有限公司"
+    assert "_pending_institution_observations" not in account or not account[
+        "_pending_institution_observations"
+    ]
+    assert not any(
+        issue["issue_code"] == "candidate_b_institution_leading_boundary_ambiguous"
+        for issue in collect_extraction_issues(context)
+    )
+
+
+def test_account_institution_reports_uncorroborated_cross_cell_debris() -> None:
+    context = SimpleNamespace()
+    page = SimpleNamespace(page_number=1, source_page_number=1)
+    table = SimpleNamespace(table_id="native:institution", metadata={})
+    account = {"account_id": "account:1", "canonical_raw": {}}
+    rows = [["管理机构", "账户标识"], ["福 中信银行股份有限公司个人信贷部", "ABC12345678"]]
+
+    _apply_account_facts(context, account, rows, page=page, table=table)
+    _flush_pending_account_institution_observations(context, account, boundary="unit_test")
+
+    assert "management_institution" not in account
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_institution_leading_boundary_ambiguous"
+    assert issues[0]["field_name"] == "management_institution"
+
+
+def test_credit_agreement_reconciler_accepts_only_corroborated_leading_boundary() -> None:
+    context = SimpleNamespace()
+    identifier = "ABC123456789"
+    records = []
+    for table_id in ("native:agreement", "corrected:agreement"):
+        ref = {"table_id": table_id, "source_page": 1, "field_name": "institution"}
+        records.append(
+            {
+                "credit_line_id": "credit-line:1",
+                "account_identifier": identifier,
+                "institution": None,
+                "source_refs": [ref],
+                "source_refs_by_field": {"institution": [ref]},
+                "_pending_institution_observation": {
+                    "raw": "中 信银行股份有限公司",
+                    "value": "中信银行股份有限公司",
+                    "source_refs": [ref],
+                },
+            }
+        )
+
+    reconciled = reconcile_candidate_b_credit_lines(context, records)
+
+    assert len(reconciled) == 1
+    assert reconciled[0]["institution"] == "中信银行股份有限公司"
+    assert "_pending_institution_observation" not in reconciled[0]
+    assert not any(
+        issue["issue_code"] == "candidate_b_institution_leading_boundary_ambiguous"
+        for issue in collect_extraction_issues(context)
+    )
+
+
+def test_institution_slot_rejects_multiple_legal_names_and_preserves_one_branch() -> None:
+    multiple = "甲银行股份有限公司 乙银行股份有限公司"
+    clean = "中国银行股份有限公司厦门分行"
+
+    assert not institution_slot_is_unambiguous(multiple)
+    assert normalize_institution_name(multiple) == multiple
+    assert _account_institution(multiple) is None
+    assert institution_slot_is_unambiguous(clean)
+    assert normalize_institution_name(clean) == clean
+    assert _account_institution(clean) == clean
+
+
+def test_typed_date_correction_rejects_multiple_valid_spans() -> None:
+    overlay = _overlay()
+
+    clean, clean_decision = overlay.correct_text("2024.02.29", role="date")
+    ambiguous, ambiguous_decision = overlay.correct_text(
+        "2024.02.29 2025.03.01",
+        role="date",
+    )
+
+    assert clean == "2024-02-29"
+    assert clean_decision is not None
+    assert ambiguous == "2024.02.29 2025.03.01"
+    assert ambiguous_decision is None
+
+
+def test_native_scalar_dates_accept_exact_19xx_and_reject_ambiguity_or_invalid_days() -> None:
+    assert _date("1999.01.02") == "1999-01-02"
+    assert _liability_date("1999年1月2日") == "1999-01-02"
+    assert _date("1999.01.02 2000.03.04") is None
+    assert _liability_date("1999.02.29") is None
+    assert _date("1999.01.02 信息更新日期") is None
+    assert _date("1999.01.02 A") is None
+
+    context = SimpleNamespace()
+    page = SimpleNamespace(page_number=1, source_page_number=1)
+    table = SimpleNamespace(table_id="account-date", metadata={})
+    account = {"account_id": "account:1999", "canonical_raw": {}}
+    _apply_account_facts(
+        context,
+        account,
+        [["开立日期"], ["1999.01.02"]],
+        page=page,
+        table=table,
+    )
+    assert account["open_date"] == "1999-01-02"
+    assert collect_extraction_issues(context) == []
+
+    ambiguous_context = SimpleNamespace()
+    ambiguous_account = {"account_id": "account:ambiguous", "canonical_raw": {}}
+    raw = "1999.01.02 2000.03.04"
+    _apply_account_facts(
+        ambiguous_context,
+        ambiguous_account,
+        [["开立日期"], [raw]],
+        page=page,
+        table=table,
+    )
+    assert "open_date" not in ambiguous_account
+    issue = collect_extraction_issues(ambiguous_context)[0]
+    assert issue["field_name"] == "open_date"
+    assert issue["observed_value"] == [raw]
+
+
+def test_typed_date_correction_accepts_only_bounded_ascii_residue() -> None:
+    overlay = _overlay()
+
+    corrected, decision = overlay.correct_text("2022,09.15 A", role="date")
+    labeled, labeled_decision = overlay.correct_text(
+        "2022.09.15 信息更新日期",
+        role="date",
+    )
+    ambiguous, ambiguous_decision = overlay.correct_text(
+        "2022.09.15 2023.01.02",
+        role="date",
+    )
+
+    assert corrected == "2022-09-15"
+    assert decision is not None
+    assert labeled == "2022.09.15 信息更新日期"
+    assert labeled_decision is None
+    assert ambiguous == "2022.09.15 2023.01.02"
+    assert ambiguous_decision is None
 
 
 def test_institution_correction_removes_isolated_legal_suffix_debris() -> None:
@@ -154,17 +424,20 @@ def test_summary_cells_use_role_scoped_correction_and_audit_unresolved_values() 
     audit = overlay.audit()
 
     cells = corrected["personal_detail_summary_cells"]
-    assert cells[0]["value"] == "循环贷账户一"
+    assert cells[0]["value"] is None
+    assert cells[0]["canonical_raw"]["value"] == "教 循环贷账户一"
     assert cells[1]["value"] == "2"
     assert cells[2]["value"] is None
     assert audit["audited_cell_count"] >= 3
-    assert audit["abnormal_cell_count"] == 1
-    assert audit["cell_anomalies"][0]["role"] == "amount_or_placeholder"
-    assert audit["cell_anomalies"][0]["value"] == "*-"
-    assert audit["cell_anomalies"][0]["normalized_value_withheld"] is True
+    assert audit["abnormal_cell_count"] == 2
+    assert {item["role"] for item in audit["cell_anomalies"]} == {
+        "account_type_label",
+        "amount_or_placeholder",
+    }
+    assert all(item["normalized_value_withheld"] is True for item in audit["cell_anomalies"])
 
 
-def test_summary_business_category_correction_is_field_scoped() -> None:
+def test_summary_business_category_pollution_is_withheld_and_reported() -> None:
     overlay = _overlay()
     corrected = overlay.correct_business_candidates(
         {
@@ -178,12 +451,158 @@ def test_summary_business_category_correction_is_field_scoped() -> None:
         stage="candidate_b_final_validation",
     )
 
+    cells = corrected["personal_detail_summary_cells"]
+    assert [row["value"] for row in cells] == [None, None, None]
+    assert [row["canonical_raw"]["value"] for row in cells] == [
+        "其馆类贷款",
+        "贯记卡",
+        "2 贷记卡 n",
+    ]
+    assert corrected["other_rows"][0]["value"] == "贯记卡"
+    anomalies = overlay.audit()["cell_anomalies"]
+    assert len(anomalies) == 3
+    assert all(item["field_name"] == "value" for item in anomalies)
+    assert all(item["normalized_value_withheld"] is True for item in anomalies)
+
+
+def test_exact_summary_business_category_and_account_type_stay_silent() -> None:
+    overlay = _overlay()
+    corrected = overlay.correct_business_candidates(
+        {
+            "personal_detail_summary_cells": [
+                {"record_id": "summary:1", "column_label": "业务类型", "value": "其他类贷款"},
+                {"record_id": "summary:2", "column_label": "业务类型", "value": "贷记卡"},
+                {"record_id": "summary:3", "column_label": "账户类型", "value": "非循环贷账户"},
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
     assert [row["value"] for row in corrected["personal_detail_summary_cells"]] == [
         "其他类贷款",
         "贷记卡",
-        "贷记卡",
+        "非循环贷账户",
     ]
-    assert corrected["other_rows"][0]["value"] == "贯记卡"
+    assert overlay.audit()["abnormal_cell_count"] == 0
+    assert overlay.audit()["decision_count"] == 0
+
+
+def test_generic_enum_near_match_is_not_silently_coerced() -> None:
+    overlay = _overlay()
+    corrected = overlay.correct_business_candidates(
+        {
+            "personal_detail_summary_cells": [
+                {
+                    "record_id": "summary:account-type",
+                    "column_label": "账户类型",
+                    "value": "非循环贷账",
+                    "source_refs": [
+                        {
+                            "logical_page": 2,
+                            "geometry_scope": "cell",
+                            "field_name": "value",
+                        }
+                    ],
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    cell = corrected["personal_detail_summary_cells"][0]
+    assert cell["value"] is None
+    assert cell["canonical_raw"]["value"] == "非循环贷账"
+    anomaly = overlay.audit()["cell_anomalies"][0]
+    assert anomaly["role"] == "account_type_label"
+    assert anomaly["value"] == "非循环贷账"
+    assert anomaly["normalized_value_withheld"] is True
+
+
+def test_polluted_summary_value_reaches_public_issue_observation() -> None:
+    payload = {
+        "personal_detail_summary_records": [
+            {
+                "summary_record_id": "summary:1",
+                "summary_type": "信用业务概要",
+                "title": "信贷交易信息提示",
+            }
+        ],
+        "personal_detail_summary_cells": [
+            {
+                "record_id": "summary:polluted",
+                "summary_cell_id": "summary:polluted",
+                "summary_record_id": "summary:1",
+                "summary_type": "信用业务概要",
+                "title": "信贷交易信息提示",
+                "row_index": 1,
+                "column_index": 1,
+                "column_label": "业务类型",
+                "value": "2 贷记卡 n",
+                "source_refs": [
+                    {
+                        "logical_page": 1,
+                        "geometry_scope": "cell",
+                        "field_name": "value",
+                    }
+                ],
+            }
+        ],
+    }
+    overlay = _overlay()
+    corrected = overlay.correct_business_candidates(
+        payload,
+        stage="candidate_b_final_validation",
+    )
+    issues = collect_extraction_issues(SimpleNamespace(ocr_correction_audit=overlay.audit))
+    corrected["personal_detail_extraction_issues"] = issues
+    prepared = prepare_personal_detail_source_collections({"facts": {}, "datasets": corrected})
+
+    assert corrected["personal_detail_summary_cells"][0]["value"] is None
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "pboc_cell_contract_unresolved"
+    assert issues[0]["target_dataset"] == "personal_detail_summary_cells"
+    assert issues[0]["field_name"] == "value"
+    assert issues[0]["observed_value"] == "2 贷记卡 n"
+    observations = prepared["datasets"]["personal_detail_field_observations"]
+    assert any(
+        row["dataset_name"] == "personal_detail_summary_cells"
+        and row["field_name"] == "value"
+        and row["raw_value"] == "2 贷记卡 n"
+        for row in observations
+    )
+
+
+def test_exact_liability_identity_and_responsibility_types_stay_silent() -> None:
+    identity_types = ("统一社会信用代码", "中征码")
+    responsibility_types = ("保证", "担保", "抵押", "质押", "保证人", "担保人", "抵押人", "质押人")
+
+    for value in identity_types:
+        overlay = _overlay()
+        corrected = overlay.correct_business_candidates(
+            {
+                "repayment_liability_records": [
+                    {"liability_id": f"liability:id:{value}", "related_party_id_type": value}
+                ]
+            },
+            stage="candidate_b_final_validation",
+        )
+        assert corrected["repayment_liability_records"][0]["related_party_id_type"] == value
+        assert overlay.audit()["abnormal_cell_count"] == 0
+        assert overlay.audit()["decision_count"] == 0
+
+    for value in responsibility_types:
+        overlay = _overlay()
+        corrected = overlay.correct_business_candidates(
+            {
+                "repayment_liability_records": [
+                    {"liability_id": f"liability:responsibility:{value}", "responsibility_type": value}
+                ]
+            },
+            stage="candidate_b_final_validation",
+        )
+        assert corrected["repayment_liability_records"][0]["responsibility_type"] == value
+        assert overlay.audit()["abnormal_cell_count"] == 0
+        assert overlay.audit()["decision_count"] == 0
 
 
 def test_credit_line_contract_does_not_invent_used_not_above_agreement_limit_rule() -> None:
@@ -338,6 +757,15 @@ def test_r2_billing_adjustment_is_a_valid_personal_detail_repayment_status() -> 
     assert decision is not None
 
 
+def test_printed_hash_is_a_valid_personal_detail_repayment_status() -> None:
+    overlay = _overlay()
+
+    value, decision = overlay.correct_text("#", role="repayment_status")
+
+    assert value == "#"
+    assert decision is None
+
+
 def test_summary_source_ref_prefers_exact_cell_geometry() -> None:
     page = SimpleNamespace(page_number=3, source_page_number=2)
     table = SimpleNamespace(
@@ -439,7 +867,7 @@ def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences(
     assert [record["sequence"] for record in records if record["inquiry_type"] == "institution"] == [1, 2, 3, 4]
     assert [record["sequence"] for record in records if record["inquiry_type"] == "personal"] == [1]
     corrected = overlay.correct_business_candidates({"inquiry_records": records}, stage="test")
-    assert corrected["inquiry_records"][2]["institution"] == "重庆蚂蚁消费金融有限公司"
+    assert corrected["inquiry_records"][2]["institution"] == "重庆蚂蚊消费金融有限公司"
 
 
 def test_inquiry_extraction_reconstructs_full_page_ocr_cells_by_date_row() -> None:
@@ -547,7 +975,7 @@ def test_business_overlay_promotes_one_valid_account_identifier_and_preserves_ra
 
     assert "account_identifier" not in payload["credit_accounts"][0]
     account = corrected["credit_accounts"][0]
-    assert account["management_institution"] == "重庆蚂蚁消费金融有限公司"
+    assert account["management_institution"] == "重庆蚂蚊消费金融有限公司"
     assert account["account_identifier"] == "ABCD12345678"
     assert account["raw_detail_text"] == payload["credit_accounts"][0]["raw_detail_text"]
     assert overlay.audit()["applied_count"] >= 2

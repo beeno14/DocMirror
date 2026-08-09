@@ -430,7 +430,7 @@ def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None
         "projector_id": "bank_statement",
         "document_type": "bank_statement",
         "domain_facts": {
-            "source_reported_transaction_count": 2,
+            "expected_primary_rows": 2,
         },
         "datasets": {
             "records": [
@@ -449,7 +449,7 @@ def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None
         "emitted_row_count": 2,
         "omitted_row_count": 0,
         "verified": True,
-        "basis": "source_footer_transaction_count",
+        "basis": "bank_expected_primary_rows",
     }
     assert payload["warnings"] == []
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
+from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import CandidateBPipeline
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailExtractionContext,
 )
@@ -11,6 +12,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.profile_extraction 
     extract_candidate_b_profile,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+    candidate_b_repayment_anchor_ledger,
     link_candidate_b_repayments,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -97,6 +99,83 @@ def test_context_builds_candidate_b_once(monkeypatch) -> None:
     assert calls == ["source"]
 
 
+def test_profile_uncertainty_reaches_the_single_repair_planner(monkeypatch) -> None:
+    profile_table = SimpleNamespace(
+        table_id="profile-unreadable",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [["性别"], ["无法辨认"]],
+        },
+        rows=[],
+    )
+    profile_page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[profile_table],
+    )
+    planned_issues: list[dict[str, object]] = []
+
+    context = SimpleNamespace(
+        pages=[profile_page],
+        reading_order_by_logical={},
+        account_collections=lambda: ([], [], []),
+        corrected_repayment_records=lambda: [],
+        corrected_repayment_micro_grids=lambda: [],
+        prepare_candidate_b_business_repair=lambda _payload: planned_issues.extend(
+            list(getattr(context, "_personal_detail_extraction_issues", ()))
+        )
+        or False,
+        correct_candidate_b_datasets=lambda payload: payload,
+        ocr_correction_audit=lambda: {"business_repair": {}},
+        canonical_layout_audit=lambda: {},
+        page_topology_audit=lambda: {},
+    )
+    def empty(_context):
+        return []
+
+    for name in (
+        "_extract_credit_lines",
+        "_extract_employment_records",
+        "_extract_inquiries",
+        "_extract_liabilities",
+        "_extract_postpaid_payment_history",
+        "_extract_postpaid_records",
+        "_extract_public_records",
+        "_extract_recovery_records",
+        "_extract_residence_records",
+        "_extract_source_rows",
+    ):
+        monkeypatch.setattr(native_extraction, name, empty)
+    monkeypatch.setattr(native_extraction, "_extract_header_datasets", lambda _context, _text: {})
+    monkeypatch.setattr(native_extraction, "_extract_personal_notes", lambda _context: ([], []))
+    monkeypatch.setattr(native_extraction, "_extract_profile_detail_records", lambda _context: {})
+    monkeypatch.setattr(native_extraction, "_extract_summary_datasets", lambda _context: ([], []))
+    monkeypatch.setattr(native_extraction, "_record_pre_repair_source_gaps", lambda *_args: None)
+    monkeypatch.setattr(native_extraction, "_source_completeness_ledger", lambda _context: {})
+    monkeypatch.setattr(native_extraction, "reconcile_candidate_b_credit_lines", lambda _context, rows: rows)
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.relations.link_candidate_b_repayments",
+        lambda rows, *_args, **_kwargs: rows,
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.relations.derive_candidate_b_overdue_records",
+        lambda *_args: [],
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.source_projection.prepare_personal_detail_source_collections",
+        lambda payload, _business, **_kwargs: payload,
+    )
+
+    CandidateBPipeline(context, "").run()
+
+    assert any(
+        issue.get("field_name") == "gender"
+        and issue.get("issue_code") == "candidate_b_profile_contract_unresolved"
+        for issue in planned_issues
+    )
+
+
 def test_profile_schema_withholds_concatenated_multi_region_address() -> None:
     table = SimpleNamespace(
         table_id="profile",
@@ -124,6 +203,240 @@ def test_profile_schema_withholds_concatenated_multi_region_address() -> None:
     assert profile["mailing_address"]["normalized_value"] is None
     assert profile["mailing_address"]["observation_status"] == "unreadable"
     assert context._personal_detail_extraction_issues[0]["issue_code"] == "candidate_b_profile_contract_unresolved"
+
+
+def _profile_with_mailing_address(address: str) -> tuple[dict, SimpleNamespace]:
+    table = SimpleNamespace(
+        table_id="profile-address-contract",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [["性别", "通讯地址"], ["男", address]],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    context = SimpleNamespace(pages=[page])
+    return extract_candidate_b_profile(context), context
+
+
+def test_profile_address_preserves_province_name_inside_community_proper_name() -> None:
+    address = "福建省福州市鼓楼区华林路福建省政府宿舍12号"
+
+    profile, context = _profile_with_mailing_address(address)
+
+    assert profile["mailing_address"]["normalized_value"] == address
+    assert profile["mailing_address"]["observation_status"] == "observed"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+def test_profile_address_rejects_structural_region_and_provider_concatenation() -> None:
+    contaminated = (
+        "福建省福州市鼓楼区华林路1号 福建省厦门市思明区湖滨路2号",
+        "福建省福州市鼓楼区华林路1号 江西省上饶市信州区广信路2号",
+    )
+
+    for address in contaminated:
+        profile, context = _profile_with_mailing_address(address)
+
+        assert profile["mailing_address"]["normalized_value"] is None
+        assert profile["mailing_address"]["observation_status"] == "unreadable"
+        assert profile["mailing_address"]["raw"] == [address]
+        assert any(
+            issue.get("field_name") == "mailing_address"
+            and issue.get("observed_value") == [address]
+            for issue in context._personal_detail_extraction_issues
+        )
+
+
+def test_profile_address_decodes_exact_provider_boundary_and_preserves_full_raw() -> None:
+    address = "福建省福州市鼓楼区华林路1号"
+    provider = "某银行股份有限公司"
+    raw = f"{address} 数据发生机构名称 {provider}"
+
+    profile, context = _profile_with_mailing_address(raw)
+    entry = profile["mailing_address"]
+
+    assert entry["normalized_value"] == address
+    assert entry["raw"] == raw
+    assert entry["provider_evidence"]["normalized_value"] == provider
+    assert entry["provider_evidence"]["observation_status"] == "observed"
+    assert entry["provider_evidence"]["source_refs"] == entry["source_refs"]
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+def test_profile_address_keeps_safe_prefix_but_reports_invalid_provider() -> None:
+    address = "福建省福州市鼓楼区华林路1号"
+    raw = f"{address} 数据发生机构名称 月38"
+
+    profile, context = _profile_with_mailing_address(raw)
+    entry = profile["mailing_address"]
+
+    assert entry["normalized_value"] == address
+    assert entry["raw"] == raw
+    assert entry["provider_evidence"]["normalized_value"] is None
+    assert entry["provider_evidence"]["observation_status"] == "unreadable"
+    assert any(
+        issue.get("issue_code") == "candidate_b_profile_provider_contract_unresolved"
+        and issue.get("field_name") == "mailing_address.data_provider"
+        and issue.get("observed_value") == "月38"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_profile_address_with_multiple_provider_markers_is_withheld_and_reported() -> None:
+    address = "福建省福州市鼓楼区华林路1号"
+    raw = (
+        f"{address} 数据发生机构名称 某银行股份有限公司 "
+        "数据发生机构名称 某征信中心"
+    )
+
+    profile, context = _profile_with_mailing_address(raw)
+    entry = profile["mailing_address"]
+
+    assert entry["normalized_value"] is None
+    assert entry["raw"] == [raw]
+    assert entry["provider_evidence"][0]["observation_status"] == "ambiguous"
+    assert {issue.get("field_name") for issue in context._personal_detail_extraction_issues} >= {
+        "mailing_address",
+        "mailing_address.data_provider",
+    }
+
+
+def test_profile_schema_decodes_collapsed_canonical_identity_cells() -> None:
+    table = SimpleNamespace(
+        table_id="identity-profile-collapsed",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [
+                ["出生日期 性别", "d 婚姻状况", "就业状况"],
+                [
+                    "2002.08.03 男 数据发生机构名称 示例银行",
+                    "未婚 数据发生机构名称 示例银行",
+                    "职员 数据发生机构名称 示例银行",
+                ],
+                ["学位 学历", "国赣", "电子邮箱"],
+                ["光 大专", "中国（含港澳台）", "1838961623@qq.com"],
+            ],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    context = SimpleNamespace(pages=[page])
+
+    profile = extract_candidate_b_profile(context)
+
+    assert {
+        field: entry["normalized_value"]
+        for field, entry in profile.items()
+        if entry["normalized_value"] is not None
+    } == {
+        "gender": "男",
+        "birth_date": "2002-08-03",
+        "marital_status": "未婚",
+        "employment_status": "职员",
+        "education_level": "大专",
+        "nationality": "中国（含港澳台）",
+        "email": "1838961623@qq.com",
+    }
+    assert profile["degree"]["normalized_value"] is None
+    assert profile["degree"]["raw"] == ["光 大专"]
+    assert any(
+        issue.get("issue_code") == "candidate_b_profile_contract_unresolved"
+        and issue.get("field_name") == "degree"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_profile_schema_does_not_mine_provider_suffix_for_identity_value() -> None:
+    table = SimpleNamespace(
+        table_id="identity-profile-provider-suffix",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [["性别"], ["数据发生机构名称 女士银行"]],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    context = SimpleNamespace(pages=[page])
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["gender"]["normalized_value"] is None
+    assert profile["gender"]["observation_status"] == "unreadable"
+    assert context._personal_detail_extraction_issues[0]["field_name"] == "gender"
+
+
+def test_profile_schema_keeps_printed_placeholder_as_source_absent() -> None:
+    table = SimpleNamespace(
+        table_id="identity-profile-placeholder",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [["性别", "婚姻状况"], ["--", "--"]],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    context = SimpleNamespace(pages=[page])
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["gender"]["normalized_value"] is None
+    assert profile["gender"]["observation_status"] == "source_absent"
+    assert profile["marital_status"]["normalized_value"] is None
+    assert profile["marital_status"]["observation_status"] == "source_absent"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+def test_profile_schema_exposes_damaged_household_address_slot_for_review() -> None:
+    table = SimpleNamespace(
+        table_id="identity-profile-address-slots",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [
+                ["性别", "", ""],
+                ["男", "", ""],
+                ["通讯地址", "", "户瓣地址"],
+                ["福建省泉州市示例路1号", "", ""],
+            ],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    context = SimpleNamespace(pages=[page])
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["mailing_address"]["normalized_value"] == "福建省泉州市示例路1号"
+    assert profile["household_address"]["normalized_value"] is None
+    assert profile["household_address"]["observation_status"] == "unreadable"
+    issue = context._personal_detail_extraction_issues[0]
+    assert issue["field_name"] == "household_address"
+    assert issue["source_refs"][0]["logical_page"] == 1
 
 
 def test_profile_schema_ignores_residence_and_employment_contact_tables() -> None:
@@ -345,6 +658,263 @@ def test_account_schema_withholds_every_duplicate_printed_ordinal() -> None:
     assert all(issue["observed_value"]["ordinal_status"] == "printed_duplicate" for issue in issues)
 
 
+def test_account_schema_completes_exact_canonical_singleton_ordinal(monkeypatch) -> None:
+    context = SimpleNamespace(
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 4,
+                "source_page": 2,
+                "lines": [
+                    {"text": "\u5faa\u73af\u8d37\u8d26\u6237\uff08\u4e8c\uff09", "bbox": [10, 10, 200, 30]},
+                    {"text": "\u8d26\u6237", "bbox": [10, 40, 100, 60]},
+                ],
+            }
+        ]
+    )
+    table_id = "credit_account_table_observation:singleton"
+    table = {
+        "account_id": table_id,
+        "_table_observation_id": table_id,
+        "account_type": "revolving_loan_account",
+        "source": "native_detail_account_table",
+        "management_institution": "\u793a\u4f8b\u94f6\u884c",
+        "account_identifier": "D10053310H00012022052901021012089466554314",
+        "open_date": "2022-05-29",
+        "currency": "CNY",
+        "source_refs": [{"logical_page": 4, "bbox": [10, 100, 500, 180]}],
+    }
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([table], [], []),
+    )
+
+    accounts, repayments, events = native_extraction._extract_accounts(context)
+
+    assert repayments == []
+    assert events == []
+    assert len(accounts) == 1
+    assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:1"
+    assert accounts[0]["category_sequence"] == 1
+    assert accounts[0]["_printed_ordinal_status"] == "canonical_singleton_inferred"
+    issue_codes = {
+        issue.get("issue_code")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    }
+    assert "candidate_b_account_printed_ordinal_unresolved" not in issue_codes
+    assert "candidate_b_account_sequence_gap" not in issue_codes
+    assert "monthly_population_incomplete_from_account_gap" not in issue_codes
+
+
+def test_account_schema_completes_singleton_after_same_card_native_replay(
+    monkeypatch,
+) -> None:
+    context = SimpleNamespace(
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 4,
+                "source_page": 2,
+                "lines": [
+                    {"text": "循环贷账户（二）", "bbox": [10, 10, 200, 30]},
+                    {"text": "账户", "bbox": [10, 40, 100, 60]},
+                ],
+            }
+        ]
+    )
+    account_identifier = "D10000000H00012022052901021012000000000001"
+    primary = {
+        "account_id": "credit_account_table_observation:primary",
+        "_table_observation_id": "credit_account_table_observation:primary",
+        "account_type": "revolving_loan_account",
+        "source": "native_detail_account_table",
+        "account_identifier": account_identifier,
+        "management_institution": "示例银行",
+        "source_refs": [
+            {
+                "logical_page": 4,
+                "source_page": 2,
+                "table_id": "account-card-primary",
+                "bbox": [10, 100, 500, 280],
+            }
+        ],
+    }
+    replay = {
+        **primary,
+        "account_id": "credit_account_table_observation:replay",
+        "_table_observation_id": "credit_account_table_observation:replay",
+        "source_refs": [
+            {
+                "logical_page": 4,
+                "source_page": 2,
+                "table_id": "account-card-replay",
+                "bbox": [11, 101, 499, 279],
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([primary, replay], [], []),
+    )
+
+    accounts, repayments, events = native_extraction._extract_accounts(context)
+
+    assert repayments == []
+    assert events == []
+    assert len(accounts) == 1
+    assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:1"
+    assert accounts[0]["category_sequence"] == 1
+    assert accounts[0]["_printed_ordinal_status"] == "canonical_singleton_inferred"
+    assert {
+        ref.get("table_id") for ref in accounts[0]["source_refs"] if ref.get("table_id")
+    } >= {"account-card-primary", "account-card-replay"}
+    issue_codes = {
+        issue.get("issue_code")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    }
+    assert not issue_codes.intersection(
+        {
+            "candidate_b_account_printed_ordinal_unresolved",
+            "candidate_b_account_sequence_gap",
+            "candidate_b_unmatched_account_table_suppressed",
+            "monthly_population_incomplete_from_account_gap",
+        }
+    )
+
+
+def test_account_schema_does_not_promote_two_distinct_unnumbered_cards(
+    monkeypatch,
+) -> None:
+    context = SimpleNamespace(
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 4,
+                "source_page": 2,
+                "lines": [
+                    {"text": "循环贷账户（二）", "bbox": [10, 10, 200, 30]},
+                    {"text": "账户", "bbox": [10, 40, 100, 60]},
+                ],
+            }
+        ]
+    )
+    tables = [
+        {
+            "account_id": f"credit_account_table_observation:{index}",
+            "_table_observation_id": f"credit_account_table_observation:{index}",
+            "account_type": "revolving_loan_account",
+            "source": "native_detail_account_table",
+            "account_identifier": account_identifier,
+            "source_refs": [
+                {
+                    "logical_page": 4,
+                    "source_page": 2,
+                    "table_id": f"account-card-{index}",
+                    "bbox": bbox,
+                }
+            ],
+        }
+        for index, account_identifier, bbox in (
+            ("one", "D10000000000000000000000000000000000000001", [10, 100, 500, 220]),
+            ("two", "D10000000000000000000000000000000000000002", [10, 240, 500, 360]),
+        )
+    ]
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: (tables, [], []),
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    assert accounts[0]["account_id"].startswith("credit_account_provisional:")
+    assert "category_sequence" not in accounts[0]
+    issue_codes = {
+        issue.get("issue_code")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    }
+    assert {
+        "candidate_b_account_printed_ordinal_unresolved",
+        "candidate_b_account_sequence_gap",
+        "candidate_b_unmatched_account_table_suppressed",
+    } <= issue_codes
+
+
+def test_singleton_completion_rejects_multi_account_or_ambiguous_families() -> None:
+    unnumbered = {
+        "account_id": "credit_account_provisional:one",
+        "account_type": "revolving_loan_account",
+        "account_family_quality": "exact",
+        "_printed_ordinal_status": "printed_unreadable",
+    }
+    numbered = {
+        "account_id": "credit_account:revolving_loan_account:2",
+        "account_type": "revolving_loan_account",
+        "account_family_quality": "exact",
+        "_printed_ordinal_status": "printed_unique",
+        "category_sequence": 2,
+    }
+    tables = [
+        {
+            "_table_observation_id": f"table:{index}",
+            "account_type": "revolving_loan_account",
+            "source": "native_detail_account_table",
+        }
+        for index in (1, 2)
+    ]
+
+    assert native_extraction._canonical_singleton_account_matches(
+        [unnumbered, numbered],
+        tables,
+        {0: 0, 1: 1},
+    ) == {}
+
+    ambiguous = {
+        **unnumbered,
+        "account_family_quality": "ambiguous_missing_variant",
+    }
+    assert native_extraction._canonical_singleton_account_matches(
+        [ambiguous],
+        [tables[0]],
+        {0: 0},
+    ) == {}
+
+
+def test_singleton_completion_requires_one_native_same_family_owned_table() -> None:
+    skeleton = {
+        "account_id": "credit_account_provisional:one",
+        "account_type": "revolving_loan_account",
+        "account_family_quality": "exact",
+        "_printed_ordinal_status": "printed_unreadable",
+    }
+    table = {
+        "_table_observation_id": "table:1",
+        "account_type": "revolving_loan_account",
+        "source": "native_detail_account_table",
+    }
+
+    assert native_extraction._canonical_singleton_account_matches(
+        [skeleton],
+        [table],
+        {0: 0},
+    ) == {0: 0}
+    assert native_extraction._canonical_singleton_account_matches(
+        [skeleton],
+        [{**table, "source": "candidate_b_account_anchor"}],
+        {0: 0},
+    ) == {}
+    assert native_extraction._canonical_singleton_account_matches(
+        [skeleton],
+        [{**table, "account_type": "revolving_loan_subaccount"}],
+        {0: 0},
+    ) == {}
+    assert native_extraction._canonical_singleton_account_matches(
+        [skeleton],
+        [table],
+        {},
+    ) == {}
+
+
 def test_account_schema_reconstructs_split_identifier_at_date_boundary() -> None:
     context = SimpleNamespace(
         corrected_evidence_pages=lambda: [
@@ -391,6 +961,106 @@ def test_account_schema_suppresses_unmatched_table_in_anchored_category(monkeypa
     assert context._personal_detail_extraction_issues[1]["issue_code"] == (
         "candidate_b_unmatched_account_table_suppressed"
     )
+
+
+def test_unmatched_account_report_identifies_exact_suppressed_child_population(monkeypatch) -> None:
+    table_id = "credit_account_table_observation:unmatched"
+    table_ref = {"logical_page": 4, "table_id": "table:unmatched", "bbox": [10, 200, 500, 300]}
+    table = {
+        "account_id": table_id,
+        "_table_observation_id": table_id,
+        "account_type": "credit_card",
+        "category_sequence": 2,
+        "source_refs": [table_ref],
+    }
+    anchor = {
+        "account_id": "credit_account:credit_card:1",
+        "account_type": "credit_card",
+        "category_sequence": 1,
+        "_canonical_segment": {
+            "pages": [{"logical_page": 4, "min_y": 20, "max_y": 100}]
+        },
+        "source_refs": [{"logical_page": 4, "bbox": [10, 20, 100, 40]}],
+    }
+    repayments = [
+        {
+            "repayment_id": "repayment:2024-01",
+            "account_id": table_id,
+            "year": 2024,
+            "month": 1,
+            "source_refs": [{"logical_page": 4, "table_id": "monthly:1", "row": 2}],
+        },
+        {
+            "repayment_id": "repayment:2024-02",
+            "account_id": table_id,
+            "year": 2024,
+            "month": 2,
+            "source_refs": [{"logical_page": 4, "table_id": "monthly:1", "row": 3}],
+        },
+    ]
+    events = [
+        {
+            "account_event_id": "event:special",
+            "account_id": table_id,
+            "event_type": "special_transaction",
+            "source_refs": [{"logical_page": 4, "table_id": "event:1", "row": 5}],
+        },
+        {
+            "account_event_id": "event:latest",
+            "account_id": table_id,
+            "event_type": "latest_repayment",
+            "source_refs": [{"logical_page": 4, "table_id": "event:2", "row": 7}],
+        },
+    ]
+    context = SimpleNamespace()
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([table], repayments, events),
+    )
+    monkeypatch.setattr(native_extraction, "_account_anchor_skeletons", lambda _context: [anchor])
+
+    accounts, filtered_repayments, filtered_events = native_extraction._extract_accounts(context)
+
+    assert accounts == [anchor]
+    assert filtered_repayments == []
+    assert filtered_events == []
+    issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_unmatched_account_table_suppressed"
+    )
+    assert issue["target_record_id"] == table_id
+    assert issue["observed_value"]["suppressed_child_count"] == 4
+    assert issue["observed_value"]["suppressed_child_counts_by_dataset"] == {
+        "credit_account_latest_repayments": 1,
+        "credit_account_monthly_performance": 2,
+        "credit_account_special_transactions": 1,
+    }
+    assert issue["observed_value"]["affected_child_datasets"] == [
+        "credit_account_latest_repayments",
+        "credit_account_monthly_performance",
+        "credit_account_special_transactions",
+    ]
+    child_rows = issue["observed_value"]["suppressed_child_observations"]
+    assert {row["child_observation_id"] for row in child_rows} == {
+        "repayment:2024-01",
+        "repayment:2024-02",
+        "event:special",
+        "event:latest",
+    }
+    assert all(row["account_observation_id"] == table_id for row in child_rows)
+    assert all(row["source_refs"] for row in child_rows)
+    assert issue["candidate_value"]["same_category_emitted_account_ids"] == [
+        "credit_account:credit_card:1"
+    ]
+    assert {ref.get("table_id") for ref in issue["source_refs"]} == {
+        "table:unmatched",
+        "monthly:1",
+        "event:1",
+        "event:2",
+    }
+    assert "related_child_observations_suppressed" in issue["reason_codes"]
 
 
 def test_account_schema_keeps_unanchored_table_only_as_reported_partial(monkeypatch) -> None:
@@ -1624,6 +2294,46 @@ def test_monthly_equivalent_duplicate_replays_merge_without_false_review() -> No
     )
 
 
+def test_monthly_same_grid_replay_stays_clean_with_open_account_gap() -> None:
+    gap = {
+        "issue_code": "candidate_b_account_sequence_gap",
+        "status": "requires_review",
+        "observed_value": {"account_type": "credit_card"},
+        "candidate_value": {"missing_category_sequences": [2]},
+    }
+    context = SimpleNamespace(_personal_detail_extraction_issues=[gap])
+    accounts = [
+        {
+            "account_id": "account:1",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 20.0, "max_y": 300.0}]
+            },
+        }
+    ]
+    grid = {"grid_id": "grid:1", "page": 4, "bbox": [10, 120, 100, 220]}
+    rows = [
+        {
+            "repayment_id": "grid:1:2024-01",
+            "grid_id": "grid:1",
+            "year": 2024,
+            "month": 1,
+            "status": "N",
+            "overdue_amount": "0",
+            "source_cell_refs": [{"grid_id": "grid:1", "cell": cell}],
+        }
+        for cell in ("a", "b")
+    ]
+
+    linked = link_candidate_b_repayments(rows, accounts, [grid], issue_context=context)
+
+    assert len(linked) == 1
+    assert {ref["cell"] for ref in linked[0]["source_cell_refs"]} == {"a", "b"}
+    assert not any(
+        issue.get("issue_code") == "monthly_linkage_collision_from_account_gap"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
 def test_monthly_conflicting_duplicate_is_selected_and_reported() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     accounts = [{"account_id": "account:1", "page": 4, "bbox": [10, 20, 100, 100], "sequence": 1}]
@@ -1711,10 +2421,12 @@ def test_inquiry_schema_joins_geometry_tokens_and_reports_inferred_sequence() ->
     assert [row["sequence"] for row in rows] == [1, 2]
     assert rows[1]["inquiry_date"] == "2024-01-01"
     assert rows[1]["institution"] == "银行乙"
-    assert rows[1]["extraction_status"] == "review"
+    assert "extraction_status" not in rows[1]
     assert context._personal_detail_extraction_issues[0]["issue_code"] == (
         "candidate_b_inquiry_sequence_inferred_from_row_order"
     )
+    assert context._personal_detail_extraction_issues[0]["target_record_id"] == rows[1]["inquiry_id"]
+    assert context._personal_detail_extraction_issues[0]["field_name"] == "sequence"
 
 
 def test_account_schema_reports_non_dense_family_ordinals_without_inventing_rows(monkeypatch) -> None:
@@ -1887,6 +2599,72 @@ def test_monthly_link_reports_population_loss_when_account_ordinals_are_missing(
     assert linkage_gap["candidate_value"]["pre_deduplication_row_count"] == 2
 
 
+def test_monthly_equal_values_from_distinct_grids_report_account_gap_collision() -> None:
+    gap = {
+        "issue_code": "candidate_b_account_sequence_gap",
+        "status": "requires_review",
+        "observed_value": {"account_type": "credit_card"},
+        "candidate_value": {"missing_category_sequences": [2]},
+        "source_refs": [{"logical_page": 4, "bbox": [10, 10, 50, 20]}],
+    }
+    context = SimpleNamespace(_personal_detail_extraction_issues=[gap])
+    accounts = [
+        {
+            "account_id": "account:1",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 20.0, "max_y": 300.0}]
+            },
+        }
+    ]
+    grids = [
+        {"grid_id": grid_id, "page": 4, "bbox": [10, top, 100, top + 30]}
+        for grid_id, top in (("grid:1", 100), ("grid:2", 180))
+    ]
+    rows = [
+        {
+            "repayment_id": f"{grid_id}:2024-01",
+            "grid_id": grid_id,
+            "year": 2024,
+            "month": 1,
+            "status": "N",
+            "overdue_amount": "0",
+            "source_cell_refs": [
+                {"grid_id": grid_id, "logical_page": 4, "bbox": [10, top, 20, top + 10]}
+            ],
+        }
+        for grid_id, top in (("grid:1", 100), ("grid:2", 180))
+    ]
+
+    linked = link_candidate_b_repayments(rows, accounts, grids, issue_context=context)
+
+    assert len(linked) == 1
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_duplicate_conflict"
+        for issue in context._personal_detail_extraction_issues
+    )
+    collision = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code") == "monthly_linkage_collision_from_account_gap"
+    )
+    assert collision["target_record_id"] == "grid:1:2024-01"
+    expected_observed = {
+        "account_id": "account:1",
+        "performance_month": "2024-01",
+        "colliding_grid_ids": ["grid:1", "grid:2"],
+        "distinct_grid_count": 2,
+        "suppressed_candidate_count": 1,
+    }
+    assert {
+        key: collision["observed_value"][key] for key in expected_observed
+    } == expected_observed
+    assert collision["candidate_value"]["collapsed_candidate_count"] == 1
+    assert collision["candidate_value"]["missing_account_category_sequences"] == {
+        "credit_card": [2]
+    }
+    assert {ref["grid_id"] for ref in collision["source_refs"]} == {"grid:1", "grid:2"}
+
+
 def test_monthly_grid_uses_one_owner_and_matches_printed_date_range() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     accounts = [
@@ -1952,3 +2730,145 @@ def test_monthly_grid_reports_missing_printed_month_without_inventing_it() -> No
     assert issue["candidate_value"]["printed_month_count"] == 2
     assert issue["candidate_value"]["printed_months"] == ["2024-01", "2024-02"]
     assert "target_record_id" not in issue
+
+
+def test_monthly_anchor_ledger_is_independent_and_account_bound() -> None:
+    accounts = [
+        {
+            "account_id": "account:1",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 20, "max_y": 300}]
+            },
+        },
+        {
+            "account_id": "account:2",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 300, "max_y": 700}]
+            },
+        },
+    ]
+    evidence = [
+        {
+            "page": 4,
+            "source_page": 2,
+            "lines": [
+                {
+                    "text": "2024年01月-2024年02月的还款记录",
+                    "bbox": [100, 120, 400, 140],
+                }
+            ],
+        }
+    ]
+
+    ledger = candidate_b_repayment_anchor_ledger(evidence, accounts)
+
+    assert len(ledger) == 1
+    assert ledger[0]["account_id"] == "account:1"
+    assert ledger[0]["date_range"] == {
+        "start_year": 2024,
+        "start_month": 1,
+        "end_year": 2024,
+        "end_month": 2,
+    }
+    assert ledger[0]["source_refs"][0]["source"] == "candidate_b_monthly_anchor_ledger"
+
+
+def test_monthly_visible_anchor_with_zero_detector_grids_is_localized_and_reported() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [
+        {
+            "account_id": "account:1",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 20, "max_y": 300}]
+            },
+        }
+    ]
+    ledger = candidate_b_repayment_anchor_ledger(
+        [
+            {
+                "page": 4,
+                "source_page": 2,
+                "lines": [
+                    {
+                        "text": "2024年01月-2024年02月的还款记录",
+                        "bbox": [100, 120, 400, 140],
+                    }
+                ],
+            }
+        ],
+        accounts,
+    )
+
+    linked = link_candidate_b_repayments(
+        [],
+        accounts,
+        [],
+        issue_context=context,
+        repayment_anchors=ledger,
+    )
+
+    assert linked == []
+    issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_anchor_grid_missing"
+    )
+    assert issue["target_record_id"] == "account:1"
+    assert issue["field_name"] == "account_id"
+    assert issue["observed_value"]["materialized_grid_count"] == 0
+    assert issue["observed_value"]["date_range"]["start_month"] == 1
+
+
+def test_monthly_visible_anchor_reconciles_to_materialized_grid() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [
+        {
+            "account_id": "account:1",
+            "_canonical_segment": {
+                "pages": [{"logical_page": 4, "min_y": 20, "max_y": 300}]
+            },
+        }
+    ]
+    ledger = candidate_b_repayment_anchor_ledger(
+        [
+            {
+                "page": 4,
+                "source_page": 2,
+                "lines": [
+                    {
+                        "text": "2024年01月-2024年01月的还款记录",
+                        "bbox": [100, 120, 400, 140],
+                    }
+                ],
+            }
+        ],
+        accounts,
+    )
+    grid = {
+        "grid_id": "grid:range",
+        "page": 4,
+        "bbox": [100, 140, 400, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 1,
+            }
+        },
+    }
+
+    linked = link_candidate_b_repayments(
+        [{"grid_id": "grid:range", "year": 2024, "month": 1, "status": "N"}],
+        accounts,
+        [grid],
+        issue_context=context,
+        repayment_anchors=ledger,
+    )
+
+    assert len(linked) == 1
+    assert linked[0]["account_id"] == "account:1"
+    assert not any(
+        issue["issue_code"] == "candidate_b_monthly_anchor_grid_missing"
+        for issue in context._personal_detail_extraction_issues
+    )

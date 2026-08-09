@@ -55,6 +55,41 @@ _LIABILITY_FIELDS = frozenset(
         "责任金额",
     }
 )
+_LIABILITY_ISSUE_FIELD_ALIASES = {
+    "管理机构": "institution",
+    "业务种类": "business_type",
+    "开立日期": "open_date",
+    "到期日期": "due_date",
+    "责任人类型": "responsibility_type",
+    "还款责任金额": "responsibility_amount",
+    "币种": "currency",
+    "保证合同编号": "contract_number",
+    "主业务借款人": "related_party_name",
+    "主业务借款人证件类型": "related_party_id_type",
+    "主业务借款人证件号码": "related_party_id_number",
+    "余额": "balance",
+    "五级分类": "five_tier_class",
+    "逾期月数": "overdue_months",
+    "还款状态": "repayment_status_code",
+    "reporting_amount_currency": "currency",
+    "status_code": "repayment_status_code",
+}
+_PACKED_LIABILITY_FIELDS = frozenset(
+    {
+        "institution",
+        "business_type",
+        "open_date",
+        "due_date",
+        "responsibility_type",
+        "responsibility_amount",
+        "currency",
+        "contract_number",
+    }
+)
+_LIABILITY_UNRESOLVED_VALUES = frozenset(
+    {"", "-", "--", "---", "未报告", "不详", "未知", "unknown", "unreadable"}
+)
+_FINAL_LIABILITY_ISSUE_RECORDS_ATTR = "_personal_detail_final_liability_issue_records"
 
 
 def _plain(value: Any) -> Any:
@@ -129,6 +164,24 @@ def make_issue(
         row["source_refs"] = refs
     row["extraction_issue_id"] = _issue_id(row)
     row["record_id"] = row["extraction_issue_id"]
+    return row
+
+
+def retarget_issue_record(
+    issue: Mapping[str, Any],
+    target_record_id: Any,
+) -> dict[str, Any]:
+    """Return one issue linked to a stable final record identity."""
+
+    row = deepcopy(dict(issue))
+    target = str(target_record_id or "").strip()
+    if target:
+        row["target_record_id"] = target
+    else:
+        row.pop("target_record_id", None)
+    issue_id = _issue_id(row)
+    row["extraction_issue_id"] = issue_id
+    row["record_id"] = issue_id
     return row
 
 
@@ -258,9 +311,15 @@ def _ocr_audit_issues(context: Any) -> list[dict[str, Any]]:
             continue
         path = str(anomaly.get("path") or "")
         withheld = bool(anomaly.get("normalized_value_withheld"))
+        reason_codes = tuple(str(code) for code in anomaly.get("reason_codes") or ())
+        category = (
+            "ocr_structure_correction"
+            if "candidate_b_immediate_amount_pair_required" in reason_codes
+            else "ocr_cell_level_error"
+        )
         result.append(
             make_issue(
-                category="ocr_cell_level_error",
+                category=category,
                 issue_code="pboc_cell_contract_unresolved",
                 message=(
                     "The OCR value does not satisfy its PBOC field contract; the normalized value was withheld "
@@ -274,7 +333,7 @@ def _ocr_audit_issues(context: Any) -> list[dict[str, Any]]:
                 field_name=str(anomaly.get("field_name") or anomaly.get("role") or "") or None,
                 observed_value=anomaly.get("value"),
                 source_refs=anomaly.get("source_refs") or (),
-                reason_codes=anomaly.get("reason_codes") or (),
+                reason_codes=reason_codes,
             )
         )
     for request in audit.get("page_reocr_failures") or []:
@@ -346,6 +405,246 @@ def _topology_issues(context: Any) -> list[dict[str, Any]]:
     return result
 
 
+def register_final_liability_issue_records(
+    context: Any,
+    records: Iterable[Mapping[str, Any]],
+) -> None:
+    """Register the final liability population used solely for issue linkage.
+
+    The registry is plugin-local diagnostic state.  It does not alter the
+    business rows or make an unresolved source observation authoritative.
+    """
+
+    setattr(
+        context,
+        _FINAL_LIABILITY_ISSUE_RECORDS_ATTR,
+        [deepcopy(dict(record)) for record in records if isinstance(record, Mapping)],
+    )
+
+
+def _liability_issue_field(value: Any) -> str:
+    field_name = str(value or "").strip()
+    return _LIABILITY_ISSUE_FIELD_ALIASES.get(field_name, field_name)
+
+
+def _liability_ref_keys(ref: Mapping[str, Any]) -> set[tuple[Any, ...]]:
+    """Return exact or bounded geometry identities for one source reference."""
+
+    logical_page = str(ref.get("logical_page") or "")
+    source_page = str(ref.get("source_page") or "")
+    table_id = str(ref.get("table_id") or "")
+    keys: set[tuple[Any, ...]] = set()
+    evidence_ids = {
+        str(value) for value in ref.get("evidence_ids") or () if value
+    }
+    keys.update(
+        ("evidence", logical_page, source_page, evidence_id)
+        for evidence_id in evidence_ids
+    )
+    row = ref.get("row")
+    column = ref.get("column")
+    if table_id and row is not None and column is not None:
+        keys.add(("table_cell", logical_page, source_page, table_id, int(row), int(column)))
+    bbox = ref.get("bbox")
+    if (
+        ref.get("geometry_scope") == "cell"
+        and isinstance(bbox, (list, tuple))
+        and len(bbox) == 4
+    ):
+        keys.add(
+            (
+                "cell_bbox",
+                logical_page,
+                source_page,
+                tuple(round(float(value), 3) for value in bbox),
+            )
+        )
+    return keys
+
+
+def _liability_refs_overlap(
+    issue_ref: Mapping[str, Any],
+    record_ref: Mapping[str, Any],
+) -> bool:
+    """Require compatible strong identities before accepting a locator match."""
+
+    issue_table = str(issue_ref.get("table_id") or "")
+    record_table = str(record_ref.get("table_id") or "")
+    if issue_table and record_table and issue_table != record_table:
+        return False
+    issue_evidence = {
+        str(value) for value in issue_ref.get("evidence_ids") or () if value
+    }
+    record_evidence = {
+        str(value) for value in record_ref.get("evidence_ids") or () if value
+    }
+    if issue_evidence and record_evidence and issue_evidence.isdisjoint(record_evidence):
+        return False
+    return bool(_liability_ref_keys(issue_ref) & _liability_ref_keys(record_ref))
+
+
+def _liability_record_refs(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    refs = [ref for ref in record.get("source_refs") or () if isinstance(ref, Mapping)]
+    refs_by_field = record.get("source_refs_by_field")
+    if isinstance(refs_by_field, Mapping):
+        refs.extend(
+            ref
+            for field_refs in refs_by_field.values()
+            for ref in field_refs or ()
+            if isinstance(ref, Mapping)
+        )
+    return refs
+
+
+def _packed_liability_issue_contract(issue: Mapping[str, Any]) -> str:
+    observed = issue.get("observed_value")
+    retained = observed.get("retained_typed_fields") if isinstance(observed, Mapping) else None
+    if not isinstance(retained, Mapping):
+        return ""
+    value = retained.get("保证合同编号") or retained.get("contract_number")
+    return "".join(str(value or "").split()).upper()
+
+
+def _packed_liability_issue_ordinal(issue: Mapping[str, Any]) -> int | None:
+    observed = issue.get("observed_value")
+    value = observed.get("printed_sequence") if isinstance(observed, Mapping) else None
+    return int(value) if str(value or "").isdigit() else None
+
+
+def _unique_final_liability_for_issue(
+    issue: Mapping[str, Any],
+    records: list[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    """Resolve one issue only when independent source identities agree."""
+
+    constraint_sets: list[set[int]] = []
+    target_id = str(issue.get("target_record_id") or "")
+    exact_targets = {
+        index
+        for index, record in enumerate(records)
+        if target_id and str(record.get("liability_id") or "") == target_id
+    }
+    if exact_targets:
+        constraint_sets.append(exact_targets)
+
+    contract = _packed_liability_issue_contract(issue)
+    contract_targets = {
+        index
+        for index, record in enumerate(records)
+        if contract
+        and "".join(str(record.get("contract_number") or "").split()).upper()
+        == contract
+    }
+    if contract_targets:
+        constraint_sets.append(contract_targets)
+
+    ordinal = _packed_liability_issue_ordinal(issue)
+    ordinal_targets = {
+        index
+        for index, record in enumerate(records)
+        if ordinal is not None
+        and str(record.get("_printed_sequence") or "").isdigit()
+        and int(record["_printed_sequence"]) == ordinal
+    }
+    if ordinal_targets:
+        constraint_sets.append(ordinal_targets)
+
+    issue_refs = [
+        ref for ref in issue.get("source_refs") or () if isinstance(ref, Mapping)
+    ]
+    provenance_targets = {
+        index
+        for index, record in enumerate(records)
+        if issue_refs
+        and any(
+            _liability_refs_overlap(issue_ref, record_ref)
+            for issue_ref in issue_refs
+            for record_ref in _liability_record_refs(record)
+        )
+    }
+    if provenance_targets:
+        constraint_sets.append(provenance_targets)
+
+    if not constraint_sets:
+        return None
+    candidates = set.intersection(*constraint_sets)
+    return records[next(iter(candidates))] if len(candidates) == 1 else None
+
+
+def _liability_issue_affected_fields(issue: Mapping[str, Any]) -> tuple[str, ...]:
+    if issue.get("issue_code") == "pboc_cell_contract_unresolved":
+        field_name = _liability_issue_field(issue.get("field_name"))
+        return (field_name,) if field_name else ()
+    observed = issue.get("observed_value")
+    if not isinstance(observed, Mapping):
+        return ()
+    explicit = observed.get("affected_fields")
+    if isinstance(explicit, (list, tuple, set, frozenset)):
+        return tuple(
+            dict.fromkeys(
+                _liability_issue_field(value) for value in explicit if str(value or "").strip()
+            )
+        )
+    retained = observed.get("retained_typed_fields")
+    retained_fields = {
+        _liability_issue_field(field_name)
+        for field_name in retained
+    } if isinstance(retained, Mapping) else set()
+    return tuple(sorted(_PACKED_LIABILITY_FIELDS - retained_fields))
+
+
+def _final_liability_field_resolved(record: Mapping[str, Any], field_name: str) -> bool:
+    value = record.get(field_name)
+    if value is None or str(value).strip().lower() in _LIABILITY_UNRESOLVED_VALUES:
+        return False
+    refs_by_field = record.get("source_refs_by_field")
+    field_refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
+    return bool(field_refs)
+
+
+def _localize_final_liability_issue(
+    issue: Mapping[str, Any],
+    records: list[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    row = dict(issue)
+    if (
+        row.get("target_dataset") != "repayment_liability_records"
+        or row.get("issue_code")
+        not in {
+            "candidate_b_packed_liability_row_unresolved",
+            "pboc_cell_contract_unresolved",
+        }
+    ):
+        return row
+    target = _unique_final_liability_for_issue(row, records)
+    if target is None:
+        return row
+    target_id = str(target.get("liability_id") or "")
+    if not target_id:
+        return row
+    row["target_record_id"] = target_id
+    affected_fields = _liability_issue_affected_fields(row)
+    if affected_fields and all(
+        _final_liability_field_resolved(target, field_name)
+        for field_name in affected_fields
+    ):
+        return None
+    if not affected_fields and row.get("issue_code") == "candidate_b_packed_liability_row_unresolved":
+        return None
+    row["reason_codes"] = list(
+        dict.fromkeys(
+            (
+                *(str(value) for value in row.get("reason_codes") or () if value),
+                "unique_final_liability_source_link",
+            )
+        )
+    )
+    issue_id = _issue_id(row)
+    row["extraction_issue_id"] = issue_id
+    row["record_id"] = issue_id
+    return row
+
+
 def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
     """Return deduplicated plugin diagnostics accumulated by every stage."""
     source_rows = [
@@ -354,6 +653,18 @@ def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
         *_topology_issues(context),
     ]
     rows = [_remap_issue_target(context, row) for row in source_rows]
+    final_liabilities = [
+        row
+        for row in getattr(context, _FINAL_LIABILITY_ISSUE_RECORDS_ATTR, ()) or ()
+        if isinstance(row, Mapping)
+    ]
+    if final_liabilities:
+        rows = [
+            localized
+            for row in rows
+            if (localized := _localize_final_liability_issue(row, final_liabilities))
+            is not None
+        ]
     precise_by_agreement_field: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         observed = row.get("observed_value")
@@ -490,5 +801,7 @@ __all__ = [
     "liability_record_is_substantive",
     "make_issue",
     "record_issue",
+    "register_final_liability_issue_records",
     "register_issue_target_remap",
+    "retarget_issue_record",
 ]

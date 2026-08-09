@@ -21,6 +21,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
     make_issue,
     record_issue,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+    is_explicit_source_absence,
+)
 
 _ALIASES: dict[str, tuple[str, ...]] = {
     "gender": ("性别",),
@@ -77,12 +80,117 @@ _NON_PROFILE_TABLE_ANCHOR_GROUPS = (
 )
 _DATE_RE = re.compile(r"(19|20)\d{2}[./年-]\d{1,2}[./月-]\d{1,2}日?")
 _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_EMAIL_SEARCH_RE = re.compile(r"[^\s@]+@[^\s@]+\.[A-Za-z]{2,}")
 _ADDRESS_MARKER_RE = re.compile(r"[省市县区镇乡村路街道巷号栋室楼]")
 _SYMBOL_NOISE_RE = re.compile(r"[#=*<>]{2,}|[\"“”]{2,}")
+_PROVINCE_LEVEL_RE = re.compile(
+    r"北京市|天津市|上海市|重庆市|"
+    r"(?:河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|"
+    r"湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾)省|"
+    r"内蒙古自治区|广西壮族自治区|西藏自治区|宁夏回族自治区|新疆维吾尔自治区|"
+    r"香港特别行政区|澳门特别行政区"
+)
+_SUBORDINATE_REGION_PREFIX_RE = re.compile(
+    r"^[\u3400-\u9fff]{1,10}(?:市|自治州|地区|盟|县|自治县|区|旗|镇|乡|街道|村)"
+)
+_ADDRESS_ADJACENT_FIELD_RE = re.compile(
+    r"通讯地址|通信地址|户籍地址|"
+    r"数据发生机构(?:名称)?|数据提供机构(?:名称)?|"
+    r"信息提供机构(?:名称)?|数据报送机构(?:名称)?"
+)
+_PROFILE_PROVIDER_LABEL = "数据发生机构名称"
+_PROFILE_PROVIDER_SUFFIX_RE = re.compile(
+    r"[A-Za-z0-9\u3400-\u9fff（）()·]{2,100}(?:银行|支行|分行|信用社|"
+    r"农村信用合作联社|农村信用社联合社|股份有限公司|"
+    r"有限责任公司|有限公司|征信中心|信用卡中心|个人信贷部|管理中心)"
+)
 
 
 def _compact(value: Any) -> str:
     return re.sub(r"[\s:：，,；;()（）\[\]【】]", "", str(value or "")).strip()
+
+
+def _address_has_region_or_provider_contamination(value: str) -> bool:
+    """Detect a second address/provider field without rejecting proper names.
+
+    Repeating a province name inside a community or government-compound name
+    is legitimate.  It becomes a second region sequence only when a repeated
+    province-level anchor starts another subordinate administrative chain.
+    A different province-level anchor is independently conflicting.
+    """
+
+    compact = _compact(value)
+    if _ADDRESS_ADJACENT_FIELD_RE.search(compact):
+        return True
+    anchors = list(_PROVINCE_LEVEL_RE.finditer(compact))
+    if len(anchors) < 2:
+        return False
+    first_region = anchors[0].group(0)
+    for anchor in anchors[1:]:
+        if anchor.group(0) != first_region:
+            return True
+        following = compact[anchor.end() :]
+        if _SUBORDINATE_REGION_PREFIX_RE.match(following):
+            return True
+    return False
+
+
+def _address_candidate_valid(value: str) -> bool:
+    text = str(value or "").strip()
+    compact = _compact(text)
+    return bool(
+        len(compact) >= 6
+        and _ADDRESS_MARKER_RE.search(text)
+        and not _SYMBOL_NOISE_RE.search(text)
+        and not _address_has_region_or_provider_contamination(text)
+    )
+
+
+def _profile_provider_evidence(value: str) -> dict[str, Any]:
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        institution_slot_is_unambiguous,
+        normalize_institution_name,
+    )
+
+    raw = str(value or "").strip()
+    if is_explicit_source_absence(raw):
+        return {"raw": raw, "normalized_value": None, "observation_status": "source_absent"}
+    normalized = normalize_institution_name(raw)
+    valid = bool(
+        institution_slot_is_unambiguous(raw)
+        and institution_slot_is_unambiguous(normalized)
+        and _PROFILE_PROVIDER_SUFFIX_RE.fullmatch(_compact(normalized))
+    )
+    return {
+        "raw": raw,
+        "normalized_value": normalized if valid else None,
+        "observation_status": (
+            "normalized" if valid and raw != normalized else "observed" if valid else "unreadable"
+        ),
+    }
+
+
+def _split_profile_address_provider(value: str) -> dict[str, Any] | None:
+    """Decode one exact address/provider boundary without losing either side."""
+
+    raw = str(value or "").strip()
+    marker_count = raw.count(_PROFILE_PROVIDER_LABEL)
+    if marker_count == 0:
+        return None
+    if marker_count != 1:
+        return {
+            "address": None,
+            "provider_evidence": {
+                "raw": raw,
+                "normalized_value": None,
+                "observation_status": "ambiguous",
+            },
+        }
+    address_raw, provider_raw = (part.strip() for part in raw.split(_PROFILE_PROVIDER_LABEL, 1))
+    return {
+        "address": address_raw if _address_candidate_valid(address_raw) else None,
+        "provider_evidence": _profile_provider_evidence(provider_raw),
+    }
 
 
 def _rows(table: Any) -> list[list[str]]:
@@ -217,19 +325,168 @@ def _candidate_valid(field: str, value: str) -> tuple[bool, str | None]:
     if field == "email":
         return bool(_EMAIL_RE.fullmatch(text)), text if _EMAIL_RE.fullmatch(text) else None
     if field in _ADDRESS_FIELDS:
-        provinces = re.findall(r"[\u3400-\u9fff]{2,8}省", text)
-        repeated_region = len(provinces) > 1
-        suspicious = (
-            len(compact) < 6
-            or not _ADDRESS_MARKER_RE.search(text)
-            or bool(_SYMBOL_NOISE_RE.search(text))
-            or repeated_region
-        )
-        return not suspicious, text if not suspicious else None
+        valid = _address_candidate_valid(text)
+        return valid, text if valid else None
     if field == "nationality":
         valid = bool(re.search(r"[\u3400-\u9fffA-Za-z]", compact)) and len(compact) <= 30
         return valid, text if valid else None
     return True, text
+
+
+def _label_fields(value: Any) -> list[str]:
+    """Return canonical roles printed in one possibly collapsed header cell."""
+
+    marker = _compact(value)
+    exact = _LABEL_TO_FIELD.get(marker)
+    if exact:
+        return [exact]
+    located: list[tuple[int, int, str]] = []
+    for field, aliases in _ALIASES.items():
+        for alias in aliases:
+            compact_alias = _compact(alias)
+            position = marker.find(compact_alias)
+            if position >= 0:
+                located.append((position, -len(compact_alias), field))
+                break
+    ordered: list[str] = []
+    for _position, _negative_length, field in sorted(located):
+        if field not in ordered:
+            ordered.append(field)
+    return ordered
+
+
+def _row_label_fields(row: list[str]) -> list[tuple[int, str]]:
+    """Apply the closed canonical identity-row signature to damaged headers."""
+
+    by_column = {column: _label_fields(value) for column, value in enumerate(row)}
+    observed = {field for fields in by_column.values() for field in fields}
+    if {"degree", "education_level", "email"} <= observed and "nationality" not in observed:
+        degree_column = next(
+            (column for column, fields in by_column.items() if {"degree", "education_level"} <= set(fields)),
+            None,
+        )
+        email_column = next(
+            (column for column, fields in by_column.items() if "email" in fields),
+            None,
+        )
+        if degree_column is not None and email_column is not None and email_column - degree_column == 2:
+            by_column.setdefault(degree_column + 1, []).append("nationality")
+    if "mailing_address" in observed and "household_address" not in observed:
+        mailing_column = next(
+            (column for column, fields in by_column.items() if "mailing_address" in fields),
+            None,
+        )
+        unknown_columns = [
+            column
+            for column, fields in by_column.items()
+            if mailing_column is not None
+            and column > mailing_column
+            and str(row[column] or "").strip()
+            and not fields
+        ]
+        if len(unknown_columns) == 1:
+            by_column[unknown_columns[0]].append("household_address")
+    return [
+        (column, field)
+        for column, fields in by_column.items()
+        for field in fields
+    ]
+
+
+def _field_fragments(field: str, value: str) -> list[tuple[str, str]]:
+    """Decode field-specific values from one OCR-collapsed canonical cell."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+        normalize_pboc_field,
+        pboc_controlled_vocabulary,
+        validate_pboc_field,
+    )
+
+    text = str(value or "").strip()
+    if not text:
+        return []
+    business_text = (
+        text
+        if field in _ADDRESS_FIELDS
+        else re.split(r"数据发生机构(?:名称)?", text, maxsplit=1)[0].strip()
+    )
+    if not business_text:
+        return []
+    text = business_text
+    role = _VOCAB_ROLES.get(field)
+    if role:
+        compact = _compact(text)
+        matches: list[tuple[int, int, str]] = []
+        for candidate in pboc_controlled_vocabulary(role):
+            marker = _compact(candidate)
+            position = compact.find(marker)
+            if position >= 0:
+                matches.append((position, -len(marker), candidate))
+        selected: list[str] = []
+        for _position, _negative_length, candidate in sorted(matches):
+            if any(_compact(candidate) in _compact(existing) for existing in selected):
+                continue
+            if any(_compact(existing) in _compact(candidate) for existing in selected):
+                selected = [existing for existing in selected if _compact(existing) not in _compact(candidate)]
+            if candidate not in selected:
+                selected.append(candidate)
+        if field == "education_level" and any(
+            candidate not in {"无", "未知", "其他"} for candidate in selected
+        ):
+            selected = [candidate for candidate in selected if candidate not in {"无", "未知", "其他"}]
+        decoded = [
+            (candidate, normalize_pboc_field(candidate, role))
+            for candidate in selected
+            if validate_pboc_field(candidate, role).valid
+        ]
+        if decoded:
+            return decoded
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            normalize_role_candidate,
+        )
+
+        corrected_tokens: list[tuple[str, str]] = []
+        for token in re.split(r"\s+", text):
+            token = token.strip("：:，,；;()（）[]【】")
+            if not token:
+                continue
+            corrected = normalize_role_candidate(token, role)
+            if (
+                corrected != token
+                and validate_pboc_field(corrected, role).valid
+                and corrected not in {value for _raw, value in corrected_tokens}
+            ):
+                corrected_tokens.append((token, corrected))
+        return corrected_tokens
+    if field == "birth_date":
+        match = _DATE_RE.search(text)
+        if match:
+            valid, normalized = _candidate_valid(field, match.group(0))
+            return [(match.group(0), str(normalized))] if valid and normalized else []
+    if field == "email":
+        match = _EMAIL_SEARCH_RE.search(text)
+        if match:
+            valid, normalized = _candidate_valid(field, match.group(0))
+            return [(match.group(0), str(normalized))] if valid and normalized else []
+    if field == "mobile_phone":
+        if any(character.isalpha() for character in text):
+            return []
+        match = re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", text)
+        if match:
+            return [(match.group(0), match.group(0))]
+    if field in {"work_phone", "residence_phone"}:
+        if any(character.isalpha() for character in text):
+            return []
+        match = re.search(r"(?<!\d)(?:\d{3,4}[-—]?)?\d{5,12}(?!\d)", text)
+        if match:
+            valid, normalized = _candidate_valid(field, match.group(0))
+            return [(match.group(0), str(normalized))] if valid and normalized else []
+    if field == "nationality":
+        match = re.search(r"中国(?:[（(]含港澳台[）)])?", text)
+        if match:
+            return [(match.group(0), match.group(0))]
+    valid, normalized = _candidate_valid(field, text)
+    return [(text, str(normalized))] if valid and normalized is not None else []
 
 
 def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
@@ -240,25 +497,26 @@ def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
             if not _is_profile_table(page, table, rows):
                 continue
             for row_index, row in enumerate(rows):
-                labels = [
-                    (column, _LABEL_TO_FIELD.get(_compact(value)))
-                    for column, value in enumerate(row)
-                    if _LABEL_TO_FIELD.get(_compact(value))
-                ]
+                labels = _row_label_fields(row)
+                fields_by_column: dict[int, set[str]] = defaultdict(set)
+                for label_column, label_field in labels:
+                    fields_by_column[label_column].add(label_field)
                 for column, field in labels:
-                    if field is None:
-                        continue
                     choices: list[tuple[str, int, int]] = []
                     next_label_column = next(
                         (candidate_column for candidate_column, _candidate_field in labels if candidate_column > column),
                         len(row),
                     )
-                    inline_values = [
-                        (str(row[candidate_column]), row_index, candidate_column)
-                        for candidate_column in range(column + 1, next_label_column)
-                        if str(row[candidate_column] or "").strip()
-                        and _compact(row[candidate_column]) not in _LABEL_TO_FIELD
-                    ]
+                    inline_values = (
+                        [
+                            (str(row[candidate_column]), row_index, candidate_column)
+                            for candidate_column in range(column + 1, next_label_column)
+                            if str(row[candidate_column] or "").strip()
+                            and not _label_fields(row[candidate_column])
+                        ]
+                        if len(fields_by_column[column]) == 1
+                        else []
+                    )
                     # An inline slot is exact only when exactly one physical
                     # cell lies between this label and the next canonical role.
                     if len(inline_values) == 1:
@@ -288,19 +546,55 @@ def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
                     for raw, value_row, value_col in choices:
                         if _compact(raw) in _LABEL_TO_FIELD:
                             continue
-                        valid, normalized = _candidate_valid(field, raw)
                         ref = _source_ref(page, table, value_row, value_col)
                         ref["field_name"] = field
-                        candidates[field].append(
-                            {
-                                "raw": raw.strip(),
-                                "normalized": normalized,
-                                "valid": valid,
-                                "source_absent": _compact(raw) in {"-", "--"},
-                                "source_refs": [ref],
-                                "confidence": ref.get("confidence"),
-                            }
+                        address_split = (
+                            _split_profile_address_provider(raw)
+                            if field in _ADDRESS_FIELDS
+                            else None
                         )
+                        if address_split is not None:
+                            provider_evidence = dict(address_split["provider_evidence"])
+                            provider_evidence["source_refs"] = [ref]
+                            address = address_split.get("address")
+                            candidates[field].append(
+                                {
+                                    "raw": raw.strip(),
+                                    "normalized": address,
+                                    "valid": address is not None,
+                                    "source_absent": False,
+                                    "provider_evidence": provider_evidence,
+                                    "source_refs": [ref],
+                                    "confidence": ref.get("confidence"),
+                                }
+                            )
+                            continue
+                        fragments = _field_fragments(field, raw)
+                        if not fragments:
+                            valid, normalized = _candidate_valid(field, raw)
+                            fragments = [(raw.strip(), str(normalized))] if valid and normalized is not None else []
+                        if not fragments:
+                            candidates[field].append(
+                                {
+                                    "raw": raw.strip(),
+                                    "normalized": None,
+                                    "valid": False,
+                                    "source_absent": is_explicit_source_absence(raw),
+                                    "source_refs": [ref],
+                                    "confidence": ref.get("confidence"),
+                                }
+                            )
+                        for fragment, normalized in fragments:
+                            candidates[field].append(
+                                {
+                                    "raw": fragment.strip(),
+                                    "normalized": normalized,
+                                    "valid": True,
+                                    "source_absent": is_explicit_source_absence(fragment),
+                                    "source_refs": [ref],
+                                    "confidence": ref.get("confidence"),
+                                }
+                            )
     return candidates
 
 
@@ -340,9 +634,55 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
             # A visible label with a missing value is represented above by an
             # explicit label-only candidate and remains reviewable.
             continue
+        for raw_candidate in raw_candidates:
+            provider_evidence = raw_candidate.get("provider_evidence")
+            if not isinstance(provider_evidence, Mapping):
+                continue
+            if provider_evidence.get("observation_status") not in {"unreadable", "ambiguous"}:
+                continue
+            record_issue(
+                context,
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_profile_provider_contract_unresolved",
+                    message="An exact profile provider boundary was observed, but its provider value was not unambiguous.",
+                    parser_stage="candidate_b_profile_extraction",
+                    target_dataset="personal_profile",
+                    target_record_id="personal_profile:1",
+                    field_name=f"{field}.data_provider",
+                    observed_value=provider_evidence.get("raw"),
+                    source_refs=provider_evidence.get("source_refs") or (),
+                    reason_codes=(
+                        "exact_profile_provider_boundary",
+                        "institution_contract_failed",
+                        "provider_value_withheld",
+                    ),
+                ),
+            )
         candidates = _dedupe_candidates(raw_candidates)
-        valid = [candidate for candidate in candidates if candidate.get("valid")]
+        valid = [
+            candidate
+            for candidate in candidates
+            if candidate.get("valid") and not candidate.get("source_absent")
+        ]
         normalized_values = {str(candidate.get("normalized") or "") for candidate in valid}
+        if candidates and all(candidate.get("source_absent") for candidate in candidates):
+            result[field] = {
+                "value": None,
+                "normalized_value": None,
+                "raw": [
+                    str(candidate.get("raw") or "")
+                    for candidate in candidates
+                    if candidate.get("raw")
+                ],
+                "source_refs": [
+                    ref
+                    for candidate in raw_candidates
+                    for ref in candidate.get("source_refs") or ()
+                ],
+                "observation_status": "source_absent",
+            }
+            continue
         selected = valid[0] if len(normalized_values) == 1 and valid else None
         if selected is not None:
             entry: dict[str, Any] = {
@@ -358,6 +698,8 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
             if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
                 entry["confidence"] = max(0.0, min(1.0, float(confidence)))
                 entry["confidence_basis"] = "canonical_table_cell"
+            if isinstance(selected.get("provider_evidence"), Mapping):
+                entry["provider_evidence"] = dict(selected["provider_evidence"])
             result[field] = entry
             continue
 
@@ -367,15 +709,6 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
             for candidate in raw_candidates
             for ref in candidate.get("source_refs") or ()
         ]
-        if candidates and all(candidate.get("source_absent") for candidate in candidates):
-            result[field] = {
-                "value": None,
-                "normalized_value": None,
-                "raw": observed,
-                "source_refs": refs,
-                "observation_status": "source_absent",
-            }
-            continue
         status = "ambiguous" if len(normalized_values) > 1 else "unreadable"
         result[field] = {
             "value": None,
@@ -385,6 +718,13 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
             "observation_status": status,
             "reason": "candidate_b_profile_contract_unresolved",
         }
+        provider_evidence = [
+            dict(candidate["provider_evidence"])
+            for candidate in candidates
+            if isinstance(candidate.get("provider_evidence"), Mapping)
+        ]
+        if provider_evidence:
+            result[field]["provider_evidence"] = provider_evidence
         record_issue(
             context,
             make_issue(

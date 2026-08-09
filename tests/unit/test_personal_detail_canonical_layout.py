@@ -282,8 +282,11 @@ def test_monthly_materialization_uses_canonical_page_lines_without_cell_ocr(monk
     assert all(call["enable_cell_ocr"] is False for call in observed)
     assert observed[0]["page_image_resolver"] is page_image_resolver
     assert observed[0]["enable_static_status_validation"] is True
+    assert observed[0]["enable_candidate_b_amount_pairing"] is True
+    assert all(call["extra_status_chars"] == {"A", "#"} for call in observed)
     assert observed[1]["page_image_resolver"] is None
     assert observed[1].get("enable_static_status_validation", False) is False
+    assert observed[1].get("enable_candidate_b_amount_pairing", False) is False
     assert observed[0]["lines"] == [canonical_line]
 
 
@@ -399,9 +402,64 @@ def test_canonical_inquiry_lines_correct_prefixed_sequence_noise_without_value_l
         ],
     }
 
-    rows = _canonical_inquiry_line_rows(SimpleNamespace(corrected_evidence_pages=lambda: [page]))
+    context = SimpleNamespace(corrected_evidence_pages=lambda: [page])
+    rows = _canonical_inquiry_line_rows(context)
 
     assert [row["sequence"] for row in rows] == [88, 89, 90]
     assert rows[1]["institution"] == "机构乙"
-    assert rows[1]["extraction_status"] == "review"
-    assert rows[1]["audit"]["raw_sequence"] == 789
+    assert "extraction_status" not in rows[1]
+    assert any(
+        issue.get("issue_code") == "candidate_b_inquiry_sequence_prefix_noise_corrected"
+        and issue.get("target_record_id") == rows[1]["inquiry_id"]
+        and issue.get("field_name") == "sequence"
+        and issue.get("observed_value", {}).get("raw_sequence") == 789
+        and issue.get("candidate_value", {}).get("normalized_sequence") == 89
+        and issue.get("severity") == "info"
+        and issue.get("status") == "resolved"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_canonical_inquiry_line_uses_longest_reason_suffix_and_final_boundary() -> None:
+    line = _line(
+        "1 2024.01.02 深圳前海微众银行股份有限公司 法人代表、负责人、高管等资信审查",
+        [10, 10, 580, 28],
+    )
+    evidence = {
+        "page": 28,
+        "source_page": 14,
+        "canonical_template_id": "annotations_and_inquiries",
+        "lines": [line],
+    }
+    table = SimpleNamespace(
+        table_id="inquiries",
+        bbox=[10, 5, 590, 40],
+        metadata={
+            "raw_rows": [
+                ["编号", "查询日期", "查询机构", "查询原因"],
+                [
+                    "1",
+                    "2024.01.02",
+                    "深圳前海微众银行股份有限公司 法人代表、负责人、高管等",
+                    "资信审查",
+                ],
+            ]
+        },
+        headers=[],
+        rows=[],
+        confidence=0.99,
+    )
+    page = _page(28, source=14, tables=[table])
+    page.canonical_template_id = "annotations_and_inquiries"
+    context = SimpleNamespace(
+        pages=[page],
+        corrected_evidence_pages=lambda: [evidence],
+    )
+
+    line_rows = _canonical_inquiry_line_rows(context)
+    final_rows = _extract_inquiries(context)
+
+    assert line_rows[0]["institution"] == "深圳前海微众银行股份有限公司"
+    assert line_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"
+    assert final_rows[0]["institution"] == "深圳前海微众银行股份有限公司"
+    assert final_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"

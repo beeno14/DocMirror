@@ -3,11 +3,6 @@ version: 1
 
 # These substitutions are intentionally scoped to typed personal-credit-report
 # fields. They must never be applied as an unrestricted whole-document rewrite.
-institution_substitutions:
-  蚂蚊消费金融: 蚂蚁消费金融
-  偏用卡中心: 信用卡中心
-  个大信贷部: 个人信贷部
-
 inquiry_reason_substitutions:
   费后管理: 贷后管理
   货后管理: 贷后管理

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     _printed_reading_order,
 )
@@ -14,6 +16,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import validate_pboc_field
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _apply_account_facts,
     _credible_sequence_endpoint,
     _dedupe_liability_records,
     _extract_credit_lines,
@@ -22,6 +25,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
     _inquiry_sequence_endpoint,
     _record_pre_repair_source_gaps,
     _source_completeness_ledger,
+    reconcile_candidate_b_credit_lines,
     reconcile_candidate_b_liabilities,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
@@ -78,6 +82,11 @@ def test_pboc_controlled_vocabulary_is_diagnostic_and_broad() -> None:
     assert validate_pboc_field("司法调查", "inquiry_reason").valid is True
     assert validate_pboc_field("保后管理", "inquiry_reason").valid is True
     assert validate_pboc_field("人民币元", "currency").valid is True
+    for currency in ("澳元", "加拿大元", "瑞士法郎", "新加坡元", "澳门元"):
+        assert validate_pboc_field(currency, "currency").valid is True
+    for currency in ("AUD", "CAD", "CHF", "SGD", "MOP"):
+        assert validate_pboc_field(currency, "currency").valid is True
+    assert validate_pboc_field("ZZZ", "currency").valid is False
     assert validate_pboc_field("专业技术人员", "employment_status").valid is True
     assert validate_pboc_field("中专、职高、技校", "education_level").valid is True
     assert validate_pboc_field("本人查询 (商业银行网上 银行)", "inquiry_reason").valid is True
@@ -174,7 +183,23 @@ def test_complete_liability_card_preserves_exact_slots_and_snapshot_date() -> No
     assert row["responsibility_amount"] == 200000
     assert row["snapshot_date"] == "2025-04-25"
     assert row["currency"] == "CNY"
+    assert row["repayment_status_code"] == "N"
+    assert row["overdue_months"] is None
     assert row["source_refs_by_field"]["institution"][0]["geometry_scope"] == "cell"
+    assert getattr(result, "_personal_detail_extraction_issues", []) == []
+
+
+def test_liability_overdue_month_label_is_not_reinterpreted_as_status_code() -> None:
+    table = _complete_liability_table("liability-overdue-months", status="0")
+    table.metadata["raw_rows"][-2][7] = "逾期月数"
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
+    )
+
+    row = _extract_liabilities(result)[0]
+
+    assert row["overdue_months"] == 0
+    assert row["repayment_status_code"] is None
     assert getattr(result, "_personal_detail_extraction_issues", []) == []
 
 
@@ -194,6 +219,26 @@ def test_liability_currency_is_unknown_and_reported_instead_of_defaulted() -> No
     assert len(currency_issues) == 1
     assert currency_issues[0]["issue_code"] == "candidate_b_repayment_responsibility_field_invalid"
     assert currency_issues[0]["target_record_id"] == rows[0]["liability_id"]
+
+
+def test_liability_extended_exact_currency_is_silent() -> None:
+    for index, (raw, expected) in enumerate(
+        (("新加坡元", "SGD"), ("MOP", "MOP")),
+        start=1,
+    ):
+        table = _complete_liability_table(f"liability-currency-{index}", currency=raw)
+        result = SimpleNamespace(
+            pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
+        )
+
+        rows = _extract_liabilities(result)
+
+        assert rows[0]["currency"] == expected
+        assert rows[0]["reporting_amount_currency"] == expected
+        assert not any(
+            issue.get("field_name") == "currency"
+            for issue in getattr(result, "_personal_detail_extraction_issues", [])
+        )
 
 
 def test_explicit_liability_placeholder_is_known_absence_not_failure() -> None:
@@ -267,6 +312,297 @@ def test_corrected_cell_slot_outranks_native_liability_observation() -> None:
     )
 
 
+def test_huaneng_complementary_liability_observations_merge_by_account_identity() -> None:
+    common = {
+        "institution": "华能贵诚信托有限公司",
+        "open_date": "2022-09-02",
+        "due_date": "2024-09-07",
+        "related_party_name": "厦门奕翔祥商贸有限公司",
+        "related_party_id_type": "中征码",
+        "related_party_id_number": "3502030011973425",
+        "balance": 46667,
+        "_party_category": "organization",
+        "source_refs": [],
+        "confidence": 0.98,
+    }
+    first = {**common, "responsibility_type": "保证人", "responsibility_amount": 56000}
+    second = {**common, "business_type": "企业经营贷款", "five_tier_class": "正常", "overdue_months": 0}
+    result = SimpleNamespace()
+
+    rows = reconcile_candidate_b_liabilities(result, [first, second])
+
+    assert len(rows) == 1
+    assert rows[0]["responsibility_amount"] == 56000
+    assert rows[0]["five_tier_class"] == "正常"
+    assert rows[0]["overdue_months"] == 0
+    assert rows[0]["related_party_category"] == "organization"
+
+
+def _lin_liability_candidate(
+    sequence: int,
+    *,
+    institution: str,
+    contract_number: str,
+    party_id_type: str,
+    party_id_number: str,
+    balance: str,
+    status_label: str = "逾期月数",
+    status: str = "0",
+) -> SimpleNamespace:
+    fields = {
+        "__printed_sequence": str(sequence),
+        "__party_category": "organization",
+        "管理机构": institution,
+        "业务种类": "企业经营贷款",
+        "开立日期": "2022.09.02",
+        "到期日期": "2024.09.07",
+        "责任人类型": "保证人",
+        "还款责任金额": "56000",
+        "币种": "人民币元",
+        "保证合同编号": contract_number,
+        "主业务借款人": "厦门奕翔祥商贸有限公司",
+        "主业务借款人证件类型": party_id_type,
+        "主业务借款人证件号码": party_id_number,
+        "__snapshot_date": "截至2023年1月13日",
+        "余额": balance,
+        "五级分类": "正常",
+        status_label: status,
+    }
+    field_ref = {
+        "logical_page": 23,
+        "source_page": 12,
+        "bbox": [20.0, float(sequence * 100), 240.0, float(sequence * 100 + 18)],
+        "geometry_scope": "cell",
+    }
+    printed_labels = {key for key in fields if not key.startswith("__")}
+    return SimpleNamespace(
+        fields=fields,
+        observed_labels=frozenset(printed_labels),
+        unresolved_labels=frozenset(),
+        source_refs=(field_ref,),
+        source_refs_by_field={label: (field_ref,) for label in printed_labels},
+        binding_quality_by_field={label: "canonical_cell_slot" for label in printed_labels},
+        confidence=0.98,
+    )
+
+
+def test_lin_party_id_contracts_corroborate_contaminated_zhongzheng_code_and_preserve_absence(
+    monkeypatch,
+) -> None:
+    candidates = [
+        _lin_liability_candidate(
+            1,
+            institution="梅赛德斯-奔驰汽车金融有限公司",
+            contract_number="LINCONTRACT0001",
+            party_id_type="中征码",
+            party_id_number="3502030011973425 2",
+            balance="348791",
+        ),
+        _lin_liability_candidate(
+            2,
+            institution="深圳前海微众银行股份有限公司",
+            contract_number="LINCONTRACT0002",
+            party_id_type="统一社会信用代码",
+            party_id_number="91350203MA33H1DP8L",
+            balance="258666",
+        ),
+        _lin_liability_candidate(
+            3,
+            institution="华能贵诚信托有限公司",
+            contract_number="LINCONTRACT0003",
+            party_id_type="中征码",
+            party_id_number="3502030011973425",
+            balance="46667",
+            status="--",
+        ),
+    ]
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda _self, _dataset: candidates)
+    result = SimpleNamespace()
+
+    rows = _extract_liabilities(result)
+
+    assert len(rows) == 3
+    assert rows[0]["related_party_id_number"] == "3502030011973425"
+    assert rows[0]["canonical_raw"]["related_party_id_number"] == "3502030011973425 2"
+    assert rows[1]["related_party_id_type"] == "统一社会信用代码"
+    assert rows[1]["related_party_id_number"] == "91350203MA33H1DP8L"
+    assert rows[2]["overdue_months"] is None
+    assert "overdue_months" in rows[2]["_source_absent_fields"]
+    assert rows[2]["canonical_raw"]["overdue_months"] == "--"
+    issues = getattr(result, "_personal_detail_extraction_issues", [])
+    correction = next(
+        issue for issue in issues if issue["issue_code"] == "candidate_b_liability_party_id_corroborated"
+    )
+    assert correction["status"] == "resolved"
+    assert correction["observed_value"] == ["3502030011973425 2"]
+    assert correction["candidate_value"] == "3502030011973425"
+    assert not any(
+        issue.get("field_name") in {"overdue_months", "repayment_status_code"} for issue in issues
+    )
+
+
+@pytest.mark.parametrize(
+    "party_id_number",
+    ("91350203MA33H1DP8", "91350203ma33h1dp8l"),
+)
+def test_unified_social_credit_code_requires_exact_18_uppercase_alphanumeric(
+    monkeypatch,
+    party_id_number: str,
+) -> None:
+    candidate = _lin_liability_candidate(
+        1,
+        institution="深圳前海微众银行股份有限公司",
+        contract_number="INVALIDUSCC0001",
+        party_id_type="统一社会信用代码",
+        party_id_number=party_id_number,
+        balance="258666",
+    )
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda _self, _dataset: [candidate])
+    result = SimpleNamespace()
+
+    row = _extract_liabilities(result)[0]
+
+    assert row["related_party_id_number"] is None
+    issue = next(
+        issue
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("field_name") == "related_party_id_number"
+    )
+    assert issue["issue_code"] == "candidate_b_liability_party_id_corroboration_unresolved"
+    assert issue["observed_value"] == [party_id_number]
+
+
+def test_liability_projection_withholds_type_invalid_party_identifier() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_liability_records": [
+                {
+                    "liability_id": "liability:invalid-id",
+                    "related_party_category": "organization",
+                    "related_party_id_type": "中征码",
+                    "related_party_id_number": "35020300119734252",
+                }
+            ]
+        }
+    )
+    values = projected["repayment_responsibilities"][0].get(
+        "normalized", projected["repayment_responsibilities"][0]
+    )
+
+    assert "related_party_id_number" not in values
+    assert values["source_related_party_id_number"] == "35020300119734252"
+    assert values["extraction_status"] == "review"
+
+
+def test_contaminated_zhongzheng_code_is_withheld_without_corroboration(monkeypatch) -> None:
+    candidate = _lin_liability_candidate(
+        1,
+        institution="梅赛德斯-奔驰汽车金融有限公司",
+        contract_number="NOCORROBORATION0001",
+        party_id_type="中征码",
+        party_id_number="3502030011973425 2",
+        balance="348791",
+    )
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda _self, _dataset: [candidate])
+    result = SimpleNamespace()
+
+    row = _extract_liabilities(result)[0]
+
+    assert row["related_party_id_number"] is None
+    issue = next(
+        issue
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("field_name") == "related_party_id_number"
+    )
+    assert "candidate_value" not in issue
+    assert "independent_party_identifier_missing" in issue["reason_codes"]
+
+
+def test_contaminated_zhongzheng_code_is_withheld_when_corroborators_disagree(monkeypatch) -> None:
+    candidates = [
+        _lin_liability_candidate(
+            1,
+            institution="梅赛德斯-奔驰汽车金融有限公司",
+            contract_number="AMBIGUOUS0001",
+            party_id_type="中征码",
+            party_id_number="3502030011973425 2",
+            balance="348791",
+        ),
+        _lin_liability_candidate(
+            2,
+            institution="某信托有限公司",
+            contract_number="AMBIGUOUS0002",
+            party_id_type="中征码",
+            party_id_number="3502030011973425",
+            balance="46667",
+        ),
+        _lin_liability_candidate(
+            3,
+            institution="某银行股份有限公司",
+            contract_number="AMBIGUOUS0003",
+            party_id_type="中征码",
+            party_id_number="3502030011973426",
+            balance="56667",
+        ),
+    ]
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda _self, _dataset: candidates)
+    result = SimpleNamespace()
+
+    rows = _extract_liabilities(result)
+
+    assert rows[0]["related_party_id_number"] is None
+    issue = next(
+        issue
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("target_record_id") == rows[0]["liability_id"]
+        and issue.get("field_name") == "related_party_id_number"
+    )
+    assert issue["candidate_value"] == ["3502030011973425", "3502030011973426"]
+    assert "ambiguous_independent_party_identifiers" in issue["reason_codes"]
+
+
+def test_similar_liabilities_with_distinct_source_identity_remain_distinct() -> None:
+    common = {
+        "institution": "某银行股份有限公司",
+        "open_date": "2020-01-02",
+        "due_date": "2030-01-02",
+        "related_party_name": "华能某能源有限公司",
+        "balance": 800000,
+        "_party_category": "organization",
+        "source_refs": [],
+        "confidence": 0.98,
+    }
+    first = {**common, "_printed_sequence": 1, "contract_number": "CONTRACT0001"}
+    second = {**common, "_printed_sequence": 2, "contract_number": "CONTRACT0002"}
+
+    rows = reconcile_candidate_b_liabilities(SimpleNamespace(), [first, second])
+
+    assert len(rows) == 2
+    assert [row["_printed_sequence"] for row in rows] == [1, 2]
+
+
+def test_liability_projection_preserves_heading_category_and_overdue_month_variant() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_liability_records": [
+                {
+                    "liability_id": "liability:enterprise:1",
+                    "related_party_category": "organization",
+                    "overdue_months": 0,
+                }
+            ]
+        }
+    )
+    values = projected["repayment_responsibilities"][0].get(
+        "normalized",
+        projected["repayment_responsibilities"][0],
+    )
+
+    assert values["related_party_category"] == "organization"
+    assert values["overdue_months"] == 0
+    assert values.get("repayment_status_code") in (None, "")
+
+
 def test_credit_line_limits_are_schema_typed_amounts() -> None:
     from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
         _is_valid_for_role,
@@ -317,6 +653,211 @@ def test_credit_agreement_does_not_invent_active_status(monkeypatch) -> None:
 
     assert len(rows) == 1
     assert "status" not in rows[0]
+
+
+def test_account_currency_unique_token_with_residue_is_retained_and_reported() -> None:
+    examples = (
+        ("人民币元 共同借款标志", "CNY", "共同借款标志"),
+        ("美元 江", "USD", "江"),
+        ("福 人民币元 第", "CNY", "福第"),
+        ("福 澳元 第", "AUD", "福第"),
+    )
+    for index, (raw, expected, residue) in enumerate(examples, start=1):
+        context = SimpleNamespace()
+        account = {"account_id": f"credit_account:loan:{index}"}
+        table = _table(f"account-currency-{index}", [["账户币种"], [raw]])
+        page = SimpleNamespace(page_number=6, source_page_number=3)
+
+        _apply_account_facts(
+            context,
+            account,
+            table.metadata["raw_rows"],
+            page=page,
+            table=table,
+        )
+
+        assert account["currency"] == expected
+        assert account["account_currency"] == expected
+        issues = collect_extraction_issues(context)
+        assert len(issues) == 1
+        assert issues[0]["issue_code"] == "candidate_b_currency_token_residue_corrected"
+        assert issues[0]["target_record_id"] == account["account_id"]
+        assert issues[0]["field_name"] == "currency"
+        assert issues[0]["observed_value"] == {"raw": raw, "residue": residue}
+        assert issues[0]["severity"] == "info"
+        assert issues[0]["status"] == "resolved"
+
+
+def test_account_exact_finite_currency_token_is_silent() -> None:
+    examples = (
+        ("港元", "HKD"),
+        ("澳元", "AUD"),
+        ("加拿大元", "CAD"),
+        ("瑞士法郎", "CHF"),
+        ("新加坡元", "SGD"),
+        ("澳门元", "MOP"),
+        ("AUD", "AUD"),
+        ("CAD", "CAD"),
+        ("CHF", "CHF"),
+        ("SGD", "SGD"),
+        ("MOP", "MOP"),
+    )
+    for index, (raw, expected) in enumerate(examples, start=1):
+        context = SimpleNamespace()
+        account = {"account_id": f"credit_account:loan:{index}"}
+        table = _table(f"account-currency-{index}", [["账户币种"], [raw]])
+        page = SimpleNamespace(page_number=6, source_page_number=3)
+
+        _apply_account_facts(
+            context,
+            account,
+            table.metadata["raw_rows"],
+            page=page,
+            table=table,
+        )
+
+        assert account["currency"] == expected
+        assert account["account_currency"] == expected
+        assert collect_extraction_issues(context) == []
+
+
+def test_account_currency_unknown_or_multiple_tokens_are_withheld_and_reported() -> None:
+    for index, raw in enumerate(("ZZZ", "人民币元美元", "澳元美元"), start=1):
+        context = SimpleNamespace()
+        account = {"account_id": f"credit_account:loan:{index}"}
+        table = _table(f"account-currency-{index}", [["账户币种"], [raw]])
+        page = SimpleNamespace(page_number=6, source_page_number=3)
+
+        _apply_account_facts(
+            context,
+            account,
+            table.metadata["raw_rows"],
+            page=page,
+            table=table,
+        )
+
+        assert "currency" not in account
+        assert "account_currency" not in account
+        issues = collect_extraction_issues(context)
+        assert len(issues) == 1
+        assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
+        assert issues[0]["target_record_id"] == account["account_id"]
+
+
+def test_credit_agreement_currency_residue_is_retained_and_field_reported(monkeypatch) -> None:
+    candidate = SimpleNamespace(
+        fields={
+            "授信协议标识": "T10151210H0001ABC12345",
+            "管理机构": "示例银行",
+            "授信额度用途": "循环额度",
+            "生效日期": "2020.01.01",
+            "到期日期": "2024.01.01",
+            "授信额度": "100000",
+            "授信限额": "100000",
+            "已用额度": "0",
+            "授信限额编号": "L10151210H0001ABC12345",
+            "币种": "美元 江",
+        },
+        source_refs=({"logical_page": 7},),
+        source_refs_by_field={"币种": ({"logical_page": 7, "column": 4},)},
+        binding_quality_by_field={"币种": "canonical_header_column"},
+        observed_labels=frozenset({"币种"}),
+        unresolved_labels=frozenset(),
+        confidence=0.98,
+    )
+    monkeypatch.setattr(
+        PBOCPersonalDetailNativeParser,
+        "records",
+        lambda _self, dataset_name: [candidate] if dataset_name == "credit_lines" else [],
+    )
+    context = SimpleNamespace()
+
+    rows = _extract_credit_lines(context)
+    rows = reconcile_candidate_b_credit_lines(context, rows)
+
+    assert rows[0]["currency"] == "USD"
+    assert rows[0]["account_currency"] == "USD"
+    assert rows[0]["reporting_amount_currency"] == "USD"
+    issues = [
+        issue
+        for issue in collect_extraction_issues(context)
+        if issue["issue_code"] == "candidate_b_currency_token_residue_corrected"
+    ]
+    assert len(issues) == 1
+    assert issues[0]["target_record_id"] == rows[0]["credit_line_id"]
+    assert issues[0]["observed_value"] == {"raw": "美元 江", "residue": "江"}
+    assert issues[0]["severity"] == "info"
+    assert issues[0]["status"] == "resolved"
+
+
+def test_credit_agreement_exact_extended_currency_is_silent_and_final(monkeypatch) -> None:
+    candidate = SimpleNamespace(
+        fields={
+            "授信协议标识": "T10151210H0001MOP12345",
+            "币种": "澳门元",
+        },
+        source_refs=({"logical_page": 7},),
+        source_refs_by_field={"币种": ({"logical_page": 7, "column": 4},)},
+        binding_quality_by_field={"币种": "canonical_header_column"},
+        observed_labels=frozenset({"币种"}),
+        unresolved_labels=frozenset(),
+        confidence=0.98,
+    )
+    monkeypatch.setattr(
+        PBOCPersonalDetailNativeParser,
+        "records",
+        lambda _self, dataset_name: [candidate] if dataset_name == "credit_lines" else [],
+    )
+    context = SimpleNamespace()
+
+    rows = reconcile_candidate_b_credit_lines(context, _extract_credit_lines(context))
+
+    assert rows[0]["currency"] == "MOP"
+    assert rows[0]["account_currency"] == "MOP"
+    assert rows[0]["reporting_amount_currency"] == "MOP"
+    assert not any(
+        issue.get("field_name") in {"currency", "account_currency", "reporting_amount_currency"}
+        for issue in collect_extraction_issues(context)
+    )
+
+
+def test_credit_agreement_multiple_or_arbitrary_currency_codes_are_withheld(monkeypatch) -> None:
+    for raw in ("人民币元美元", "澳元美元", "ZZZ"):
+        candidate = SimpleNamespace(
+            fields={
+                "授信协议标识": f"T10151210H0001{raw.encode().hex().upper()}",
+                "币种": raw,
+            },
+            source_refs=({"logical_page": 7},),
+            source_refs_by_field={"币种": ({"logical_page": 7, "column": 4},)},
+            binding_quality_by_field={"币种": "canonical_header_column"},
+            observed_labels=frozenset({"币种"}),
+            unresolved_labels=frozenset(),
+            confidence=0.98,
+        )
+        monkeypatch.setattr(
+            PBOCPersonalDetailNativeParser,
+            "records",
+            lambda _self, dataset_name, row=candidate: [row]
+            if dataset_name == "credit_lines"
+            else [],
+        )
+        context = SimpleNamespace()
+
+        rows = _extract_credit_lines(context)
+        rows = reconcile_candidate_b_credit_lines(context, rows)
+
+        assert rows[0]["currency"] is None
+        assert rows[0]["account_currency"] is None
+        assert rows[0]["reporting_amount_currency"] is None
+        assert "currency" in rows[0]["_unresolved_fields"]
+        issues = [
+            issue
+            for issue in collect_extraction_issues(context)
+            if issue["issue_code"] == "candidate_b_credit_agreement_currency_unresolved"
+        ]
+        assert len(issues) == 1
+        assert issues[0]["target_record_id"] == rows[0]["credit_line_id"]
 
 
 def test_final_grid_count_repairs_only_zero_expected_count() -> None:
@@ -835,6 +1376,64 @@ def test_header_consensus_reports_missing_fields_for_coordinated_page_repair(mon
             "primary_id_number",
         )
     } == {"report_metadata"}
+    metadata_id = metadata["personal_report_metadata_id"]
+    assert all(
+        issue["target_record_id"]
+        == (
+            f"report_query:{metadata_id}"
+            if issue["target_dataset"] == "report_query"
+            else metadata_id
+        )
+        for issue in result._personal_detail_extraction_issues
+    )
+    assert all(
+        issue["record_id"] == issue["extraction_issue_id"]
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+def test_page_one_issues_target_final_rows_without_duplicate_gate_issues(monkeypatch) -> None:
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[])],
+        _personal_detail_extraction_issues=[],
+    )
+    datasets = _extract_header_datasets(result, "")
+    datasets["personal_detail_extraction_issues"] = list(
+        result._personal_detail_extraction_issues
+    )
+
+    projected = project_personal_detail_datasets(datasets)
+
+    def values(record):
+        return record.get("normalized", record)
+
+    final_ids = {
+        dataset_name: {
+            str(values(record)[identity_field])
+            for record in projected[dataset_name]
+        }
+        for dataset_name, identity_field in (
+            ("report_metadata", "report_metadata_id"),
+            ("report_query", "report_query_id"),
+        )
+    }
+    issue_values = [values(issue) for issue in projected["extraction_issues"]]
+    page_one_keys: dict[tuple[str, str, str], int] = {}
+    for issue in issue_values:
+        target_dataset = str(issue["target_dataset"])
+        target_record_id = str(issue["target_record_id"])
+        field_name = str(issue["field_name"])
+        assert target_record_id in final_ids[target_dataset]
+        key = (target_dataset, target_record_id, field_name)
+        page_one_keys[key] = page_one_keys.get(key, 0) + 1
+
+    assert len(issue_values) == 12
+    assert set(page_one_keys.values()) == {1}
+    assert sum(
+        issue.get("issue_code") == "page_one_consensus_unresolved"
+        for issue in issue_values
+    ) == 7
 
 
 def test_withheld_typed_value_is_partial_and_has_field_observation() -> None:
@@ -947,6 +1546,207 @@ def test_native_agreement_parser_uses_template_and_heading_sequence() -> None:
     assert sequence_ref["bbox"] == [20, 60, 120, 80]
 
 
+def test_native_agreement_parser_assigns_each_heading_to_one_card_in_merged_table() -> None:
+    rows = [
+        ["管理机构", "授信协议标识", "生效日期", "到期日期", "授信额度用途"],
+        ["机构甲", "AGREEMENT0004", "2025.07.19", "2026.07.19", "循环贷款额度"],
+        ["授信额度", "授信限额", "授信限额编号", "已用额度", "币种"],
+        ["3,000", "--", "--", "--", "人民币元"],
+        ["管理机构", "授信协议标识", "生效日期", "到期日期", "授信额度用途"],
+        ["机构乙", "AGREEMENT0005", "2024.07.17", "长期", "信用卡共享额度"],
+        ["授信额度", "授信限额", "授信限额编号", "已用额度", "币种"],
+        ["12,000", "--", "--", "0", "人民币元"],
+    ]
+    table = _table("merged-agreement-cards", rows)
+    table.bbox = [20, 80, 580, 360]
+    table.metadata["canonical_template_id"] = "credit_agreement"
+    table.metadata["source_cell_bboxes"] = [
+        [[20 + column * 110, 100 + row * 28, 120 + column * 110, 120 + row * 28] for column in range(5)]
+        for row in range(len(rows))
+    ]
+    page = SimpleNamespace(
+        page_number=8,
+        source_page_number=4,
+        canonical_template_id="credit_agreement",
+        tables=[table],
+        texts=[
+            SimpleNamespace(content="授信协议4", bbox=[20, 70, 120, 90]),
+            SimpleNamespace(content="授信协议5", bbox=[20, 180, 120, 200]),
+        ],
+    )
+    context = SimpleNamespace(
+        pages=[page],
+        reading_order_by_logical={8: 8},
+        tables_continue=lambda _left, _right: None,
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert [record.fields["授信协议标识"] for record in records] == [
+        "AGREEMENT0004",
+        "AGREEMENT0005",
+    ]
+    assert [record.fields["__printed_sequence"] for record in records] == ["4", "5"]
+    refs = [record.source_refs_by_field["__printed_sequence"][0] for record in records]
+    assert [ref["bbox"] for ref in refs] == [[20, 70, 120, 90], [20, 180, 120, 200]]
+
+
+def test_native_agreement_parser_recovers_closed_schema_values_collapsed_with_labels() -> None:
+    def line(text: str, x: float, y: float, width: float = 520) -> dict[str, object]:
+        return {"text": text, "bbox": [x, y, x + width, y + 18], "confidence": 0.98}
+
+    context = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 8,
+                "source_page": 4,
+                "lines": [
+                    line("（四）授信协议信息", 20, 10),
+                    line("授信协议6", 20, 40, 120),
+                    line(
+                        "管理机构 中信消费金融有限公司 授信协议标识 "
+                        "T10151024H0002HT11202211122200008302277 "
+                        "生效日期 2022.11.12 到期日期 2031.02.12 授信额度用途 循环贷款额度",
+                        20,
+                        70,
+                    ),
+                    line(
+                        "授信额度 23,600 授信限额 -- 授信限额编号 -- 已用额度 0 币种 人民币元",
+                        20,
+                        100,
+                    ),
+                    line("查询记录", 20, 140, 120),
+                ],
+            }
+        ],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert len(records) == 1
+    assert records[0].fields == {
+        "管理机构": "中信消费金融有限公司",
+        "授信协议标识": "T10151024H0002HT11202211122200008302277",
+        "生效日期": "2022.11.12",
+        "到期日期": "2031.02.12",
+        "授信额度用途": "循环贷款额度",
+        "授信额度": "23,600",
+        "授信限额": "--",
+        "授信限额编号": "--",
+        "已用额度": "0",
+        "币种": "人民币元",
+        "__printed_sequence": "6",
+    }
+
+
+def test_native_agreement_table_recovers_values_embedded_in_exact_label_cells() -> None:
+    table = _table(
+        "collapsed-native-agreement",
+        [
+            [
+                "管理机构 中信消费金融有限公司 授信额度 23,600",
+                "授信协议标识",
+                "生效日期",
+                "到期日期 长期",
+                "授信额度用途",
+            ],
+            [
+                "",
+                "T10151024H0002HT11202211122200008302277",
+                "2022.11.12",
+                "",
+                "信用卡共享额度",
+            ],
+            ["", "授信限额", "授信限额编号", "已用额度", "币种"],
+            ["", "--", "--", "0", "人民币元"],
+        ],
+    )
+    table.bbox = [20, 100, 580, 300]
+    table.metadata["canonical_template_id"] = "credit_agreement"
+    page = SimpleNamespace(
+        page_number=8,
+        source_page_number=4,
+        canonical_template_id="credit_agreement",
+        tables=[table],
+        texts=[SimpleNamespace(content="授信协议6", bbox=[20, 60, 120, 80])],
+    )
+    context = SimpleNamespace(
+        pages=[page],
+        reading_order_by_logical={8: 8},
+        tables_continue=lambda _left, _right: None,
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert len(records) == 1
+    assert records[0].fields["管理机构"] == "中信消费金融有限公司"
+    assert records[0].fields["授信额度"] == "23,600"
+    assert records[0].fields["到期日期"] == "长期"
+    assert records[0].fields["已用额度"] == "0"
+    assert records[0].fields["__printed_sequence"] == "6"
+
+
+def test_credit_agreement_institution_disagreement_is_withheld_across_ocr_planes() -> None:
+    identifier = "X3501010000133CT6009127971477147648"
+    common = {
+        "credit_line_id": f"credit_line:{identifier}",
+        "account_identifier": identifier,
+        "_printed_sequence": 4,
+        "facility_type": "循环贷款额度",
+        "effective_date": "2025-07-19",
+        "due_date": "2026-07-19",
+        "total_limit": 3000,
+        "currency": "CNY",
+        "source_refs": [{"logical_page": 8, "source_page": 4}],
+    }
+    native = {
+        **common,
+        "institution": "福州奇高网络小额贷款有限公司",
+        "source_refs_by_field": {
+            "institution": [
+                {
+                    "logical_page": 8,
+                    "source_page": 4,
+                    "geometry_scope": "cell",
+                    "binding": "label_column",
+                }
+            ]
+        },
+        "_field_binding_quality": {"institution": "native_label_column"},
+        "confidence": 0.99,
+    }
+    corrected = {
+        **common,
+        "institution": "福州奇富网络小额贷款有限公司",
+        "source_refs_by_field": {
+            "institution": [
+                {
+                    "logical_page": 8,
+                    "source_page": 4,
+                    "geometry_scope": "cell",
+                    "binding": "canonical_label_slot",
+                }
+            ]
+        },
+        "_field_binding_quality": {"institution": "canonical_cell_slot"},
+        "confidence": 0.98,
+    }
+    context = SimpleNamespace()
+
+    rows = reconcile_candidate_b_credit_lines(context, [native, corrected])
+
+    assert len(rows) == 1
+    assert rows[0]["institution"] is None
+    assert "institution" in rows[0]["_unresolved_fields"]
+    issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_credit_agreement_observation_conflict"
+    )
+    assert issue["observed_value"]["conflicting_fields"] == ["institution"]
+
+
 def test_native_parser_defers_incomplete_cells_to_coordinated_page_evidence() -> None:
     table = _table(
         "credit-line-incomplete",
@@ -1055,6 +1855,38 @@ def test_native_parser_preserves_corrected_liability_snapshot_slot_and_family() 
     snapshot_ref = records[0].source_refs_by_field["__snapshot_date"][0]
     assert snapshot_ref["geometry_scope"] == "cell"
     assert snapshot_ref["bbox"] == [25.0, 155.0, 245.0, 173.0]
+
+
+def test_enterprise_liability_heading_sets_organization_category() -> None:
+    def line(text: str, x: float, y: float) -> dict[str, object]:
+        return {"text": text, "bbox": [x, y, x + 160, y + 18], "confidence": 0.98}
+
+    context = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 7,
+                "source_page": 4,
+                "lines": [
+                    line("(六)相关还款责任信息", 20, 10),
+                    line("有相关还款责任的企业借款", 20, 35),
+                    line("账户1", 20, 60),
+                    line("责任人类型", 20, 90),
+                    line("还款责任金额", 180, 90),
+                    line("保证合同编号", 340, 90),
+                    line("保证人", 20, 120),
+                    line("1,000,000", 180, 120),
+                    line("ORGCONTRACT0001", 340, 120),
+                    line("(七)授信协议信息", 20, 160),
+                ],
+            }
+        ],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("repayment_liability_records")
+
+    assert len(records) == 1
+    assert records[0].fields["__party_category"] == "organization"
 
 
 def test_native_parser_carries_credit_agreement_card_across_corrected_pages() -> None:

@@ -1011,7 +1011,8 @@ class PersonalDetailExtractionContext:
                 page_image_resolver=getattr(self, "_page_image_resolver", None),
                 enable_cell_ocr=False,
                 enable_static_status_validation=True,
-                extra_status_chars={"A"},
+                extra_status_chars={"A", "#"},
+                enable_candidate_b_amount_pairing=True,
             )
             corrected_grids = micro_grid_structures_from_domain_specific(detached)
             self._corrected_repayment_micro_grids = deepcopy(corrected_grids)
@@ -1042,7 +1043,7 @@ class PersonalDetailExtractionContext:
                 source_baseline,
                 page_image_resolver=None,
                 enable_cell_ocr=False,
-                extra_status_chars={"A"},
+                extra_status_chars={"A", "#"},
             )
             source_structure_records = dedupe_repayment_records(
                 [

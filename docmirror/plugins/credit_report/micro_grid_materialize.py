@@ -168,6 +168,7 @@ def materialize_credit_repayment_micro_grids(
     enable_cell_ocr: bool = False,
     enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
+    enable_candidate_b_amount_pairing: bool = False,
 ) -> list[dict[str, Any]]:
     line_list = list(lines or [])
     anchor_indices = [
@@ -189,6 +190,7 @@ def materialize_credit_repayment_micro_grids(
             enable_cell_ocr=enable_cell_ocr,
             enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
+            enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
             grid_index=grid_index,
         )
         grid = out.get("micro_grid")
@@ -213,6 +215,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
     enable_cell_ocr: bool = False,
     enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
+    enable_candidate_b_amount_pairing: bool = False,
 ) -> list[dict[str, Any]]:
     """Materialize credit-only grids on a post-seal read view."""
     from docmirror.models.mirror.page_evidence_bundles import (
@@ -232,6 +235,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
             enable_cell_ocr=enable_cell_ocr,
             enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
+            enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
         )
         if grids:
             merge_micro_grid_structures_into_bundles(domain_specific, grids)

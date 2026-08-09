@@ -16,21 +16,15 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Any
 
+from docmirror.plugins.credit_report.currency_codes import (
+    CURRENCY_CODE_BY_ALIAS,
+    ISO_4217_CURRENT_CODES,
+)
+
 _CURRENCY_CODES = {
-    "人民币": "CNY",
-    "人民币元": "CNY",
+    **CURRENCY_CODE_BY_ALIAS,
+    **{code: code for code in ISO_4217_CURRENT_CODES},
     "RMB": "CNY",
-    "CNY": "CNY",
-    "美元": "USD",
-    "USD": "USD",
-    "欧元": "EUR",
-    "EUR": "EUR",
-    "日元": "JPY",
-    "JPY": "JPY",
-    "港元": "HKD",
-    "HKD": "HKD",
-    "英镑": "GBP",
-    "GBP": "GBP",
 }
 
 _HEADER_LABEL_NOISE = (

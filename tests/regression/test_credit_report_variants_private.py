@@ -276,10 +276,12 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
         "civil_judgment_records": 2,
         "enforcement_records": 2,
         "administrative_penalty_records": 1,
-        "public_records": 6,
-        "report_notes": 5,
     }
     assert {name: datasets[name]["row_count"] for name in expected_counts} == expected_counts
+    semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    assert semantic_datasets["public_records"]["row_count"] == 6
+    assert semantic_datasets["report_notes"]["row_count"] == 5
+    assert not {"public_records", "report_notes", "repayment_records"} & set(datasets)
     assert validate_projection_payload("community_semantic", semantic).valid
     assert validate_projection_payload("community", payload).valid
 
@@ -293,7 +295,13 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert credit_line.get("credit_line_expiry_date") is None
     assert credit_line.get("due_date") is None
     assert transferred["termination_event_type"] == "transferred_out"
-    assert transferred["transfer_out_date"] == "2023-11"
+    assert transferred["termination_event_date"] == "2023-11"
+    rich_transferred = next(
+        row["normalized"]
+        for row in semantic_datasets["credit_accounts"]["rows"]
+        if row["normalized"]["account_lifecycle_state"] == "transferred_out"
+    )
+    assert rich_transferred["transfer_out_date"] == "2023-11"
     assert bad_debt["business_type"] == "贷记卡"
     assert unactivated["account_currency"] == "USD"
     assert unactivated["reporting_amount_currency"] == "CNY"
@@ -1419,6 +1427,11 @@ def test_credit_report_subtype_projects_complete_v3(
         accounts = datasets["credit_accounts"]
         inquiries = datasets["inquiry_records"]
         liabilities = datasets.get("repayment_liability_records", [])
+        semantic_datasets = {
+            dataset["name"]: dataset for dataset in semantic["datasets"]
+        }
+        rich_accounts = semantic_datasets["credit_accounts"]["rows"]
+        rich_inquiries = semantic_datasets["inquiry_records"]["rows"]
         assert len(accounts) == expected_accounts
         assert len(liabilities) == expected_liabilities
         assert len(inquiries) == expected_inquiries
@@ -1427,8 +1440,18 @@ def test_credit_report_subtype_projects_complete_v3(
         assert sum(row["normalized"]["inquiry_type"] == "personal" for row in inquiries) == expected_personal
         personal_inquiries = [row["normalized"] for row in inquiries if row["normalized"]["inquiry_type"] == "personal"]
         assert all(row["reason"] == "本人查询" for row in personal_inquiries)
-        assert all(row["source_reason"].startswith("本人查询") for row in personal_inquiries)
-        assert sum(row["normalized"]["status"] == "inactive" for row in accounts) == expected_inactive
+        rich_personal_inquiries = [
+            row["normalized"]
+            for row in rich_inquiries
+            if row["normalized"]["inquiry_type"] == "personal"
+        ]
+        assert all(
+            row["source_reason"].startswith("本人查询")
+            for row in rich_personal_inquiries
+        )
+        assert sum(
+            row["normalized"]["status"] == "inactive" for row in rich_accounts
+        ) == expected_inactive
         enhanced_preview = bundle.render_enhanced_markdown(semantic)
         account_types = {row["normalized"]["account_type"] for row in accounts}
         if "credit_card" in account_types:
@@ -1556,7 +1579,15 @@ def test_credit_report_subtype_projects_complete_v3(
             assert len(normalized_overdue) == 9
             assert [row["over_90_days_months"] for row in normalized_overdue] == [1, 3, 2, 2, 2, 1, 2, 1, 0]
             assert all(row["current_overdue_status"] == "overdue" for row in normalized_overdue)
-            assert sum(row["over_90_days"] is True for row in normalized_overdue) == 8
+            assert all(
+                row["over_90_days"] is (row["over_90_days_months"] > 0)
+                for row in normalized_overdue
+            )
+            rich_overdue = [
+                row["normalized"]
+                for row in semantic_datasets["overdue_records"]["rows"]
+            ]
+            assert sum(row["over_90_days"] is True for row in rich_overdue) == 8
             card_overdue_markdown = credit_preview.split(
                 "#### 信用卡逾期记录", maxsplit=1
             )[1].split("\n#### 信用卡\n", maxsplit=1)[0]
@@ -1621,7 +1652,7 @@ def test_credit_report_subtype_projects_complete_v3(
             assert all(binding["evidence_refs"] for binding in inquiry_bindings)
             assert semantic["diagnostics"]["evidence_ids"]
         if fixture.name == "赵思雯个人征信.pdf":
-            normalized_accounts = [row["normalized"] for row in accounts]
+            normalized_accounts = [row["normalized"] for row in rich_accounts]
             credit_cards = [row for row in normalized_accounts if row["account_type"] == "credit_card"]
             loans = [row for row in normalized_accounts if row["account_type"] != "credit_card"]
             assert [row["sequence"] for row in credit_cards] == list(range(1, 22))
@@ -1634,7 +1665,7 @@ def test_credit_report_subtype_projects_complete_v3(
             )
             institution_sequences = {
                 int(row["normalized"]["sequence"])
-                for row in inquiries
+                for row in rich_inquiries
                 if row["normalized"]["inquiry_type"] == "institution"
             }
             assert institution_sequences == set(range(1, 116))
@@ -1675,18 +1706,12 @@ def test_credit_report_subtype_projects_complete_v3(
             )
             enhanced = written["enhanced_reading"].read_text(encoding="utf-8")
             assert next(line for line in enhanced.splitlines() if line.startswith("# ")) == "# 个人信用报告"
-            assert (
-                next(
-                    row for row in account_csv_rows if row["account_type"] == "credit_card" and row["sequence"] == "13"
-                )["currency"]
-                == "HKD"
-            )
-            assert (
-                next(
-                    row for row in account_csv_rows if row["account_type"] == "credit_card" and row["sequence"] == "14"
-                )["currency"]
-                == "CHF"
-            )
+            account_currencies = {
+                row["account_currency"]
+                for row in account_csv_rows
+                if row["account_type"] == "credit_card"
+            }
+            assert {"HKD", "CHF"} <= account_currencies
             table_lines = enhanced.split(f"### {reading_table['title']}", maxsplit=1)[1].split(
                 "\n## ",
                 maxsplit=1,

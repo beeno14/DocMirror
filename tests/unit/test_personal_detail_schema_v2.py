@@ -7,16 +7,30 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult
 from docmirror.models.schemas.registry import (
+    _personal_detail_invariant_errors,
     get_projection_schema,
     validate_projection_payload,
 )
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.community_bundle import project_community_bundle
+from docmirror.plugins.credit_report.community_plugin import (
+    _apply_personal_detail_dataset_status,
+    _compact_personal_detail_public_projection,
+    _CreditReportCommunityBundle,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _extract_header_datasets,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+    PBOCPersonalDetailNativeParser,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
+    _CANONICAL_MONTHLY_STATUS_CODES,
     PBOC_DATASET_ORDER,
     personal_detail_data_dictionary,
     personal_detail_semantic_extensions,
@@ -25,10 +39,112 @@ from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
 from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
     prepare_personal_detail_source_collections,
 )
+from docmirror.plugins.credit_report.projection import _records
 
 
 def _record(record_id: str, **values: Any) -> dict[str, Any]:
     return {"record_id": record_id, **values}
+
+
+def _responsibility_invariant_payload(*rows: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "datasets": [
+            {"name": name, "row_count": 0, "rows": []}
+            for name in ("report_metadata", "report_query", "subject_profile")
+        ]
+        + [
+            {
+                "name": "repayment_responsibilities",
+                "row_count": len(rows),
+                "rows": [
+                    {"record_id": f"responsibility:{index}", "normalized": row}
+                    for index, row in enumerate(rows, start=1)
+                ],
+            }
+        ]
+    }
+
+
+def test_repayment_responsibility_source_label_controls_status_alternative() -> None:
+    payload = _responsibility_invariant_payload(
+        {
+            "related_party_category": "organization",
+            "source_status_value": "0",
+            "overdue_months": 0,
+            "repayment_status_code": None,
+        },
+        {
+            "related_party_category": "organization",
+            "source_status_value": "N",
+            "overdue_months": None,
+            "repayment_status_code": "N",
+        },
+        {
+            "related_party_category": "person",
+            "source_status_value": None,
+            "overdue_months": None,
+            "repayment_status_code": None,
+        },
+    )
+
+    assert _personal_detail_invariant_errors(payload) == ()
+
+
+def test_repayment_responsibility_status_alternatives_reject_loss_or_collision() -> None:
+    lost_source_value = _responsibility_invariant_payload(
+        {
+            "related_party_category": "organization",
+            "source_status_value": "0",
+            "overdue_months": None,
+            "repayment_status_code": None,
+        }
+    )
+    conflicting_fields = _responsibility_invariant_payload(
+        {
+            "related_party_category": "person",
+            "source_status_value": "N",
+            "overdue_months": 0,
+            "repayment_status_code": "N",
+        }
+    )
+
+    assert _personal_detail_invariant_errors(lost_source_value) == (
+        "repayment_responsibilities: source status requires separated overdue months or status",
+    )
+    assert _personal_detail_invariant_errors(conflicting_fields) == (
+        "repayment_responsibilities: overdue months and repayment status are mutually exclusive",
+    )
+
+
+def test_monthly_repayment_enum_is_identical_in_runtime_dictionary_and_json() -> None:
+    expected = set(_CANONICAL_MONTHLY_STATUS_CODES) | {"unknown"}
+    dictionary_codes = set(
+        personal_detail_data_dictionary()["enums"]["repayment_status_code"]
+    )
+    schema_path = (
+        Path(__file__).parents[2]
+        / "docmirror"
+        / "configs"
+        / "schemas"
+        / "personal_credit_report_detailed.schema.json"
+    )
+    json_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    monthly_branch = next(
+        branch
+        for branch in json_schema["$defs"]["canonicalDataset"]["allOf"]
+        if branch.get("if", {})
+        .get("properties", {})
+        .get("name", {})
+        .get("const")
+        == "credit_account_monthly_performance"
+    )
+    schema_codes = set(
+        monthly_branch["then"]["properties"]["rows"]["items"]["properties"]
+        ["normalized"]["properties"]["status_code"]["enum"]
+    )
+
+    assert dictionary_codes == expected
+    assert schema_codes == expected
 
 
 def test_v2_business_rows_quarantine_internal_ocr_metadata() -> None:
@@ -115,6 +231,15 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
                     status="?",
                 ),
                 _record(
+                    "grid:1:2024-01:duplicate-detector-candidate",
+                    repayment_id="grid:1:2024-01:duplicate-detector-candidate",
+                    grid_id="grid:1",
+                    account_id="account:1",
+                    year=2024,
+                    month=1,
+                    status="unknown",
+                ),
+                _record(
                     "grid:1:2024-03",
                     repayment_id="grid:1:2024-03",
                     grid_id="grid:1",
@@ -176,7 +301,7 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
         and row["evidence_kind"] == "observed"
     }
     assert observed["grid_id"] == "grid:1"
-    assert observed["withheld_candidate_count"] == 2
+    assert observed["withheld_candidate_count"] == 3
     assert observed["withheld_month_count"] == 2
     assert observed["withheld_months[0]"] == "2024-01"
     assert observed["withheld_months[1]"] == "2024-02"
@@ -189,6 +314,7 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
     )
     assert status_row["presence_status"] == "partial"
     assert status_row["observed_row_count"] == 1
+    assert status_row["expected_row_count"] == 3
 
 
 def test_v2_successful_monthly_row_drops_diagnostics_without_review() -> None:
@@ -221,6 +347,89 @@ def test_v2_successful_monthly_row_drops_diagnostics_without_review() -> None:
     assert "confidence" not in row
     assert row["status_code"] == "N"
     assert not ({"audit", "recognition_source", "status_bbox"} & set(row))
+
+
+def test_resolved_deterministic_corrections_remain_semantic_only() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:resolved-currency",
+                    account_id="account:resolved-currency",
+                    account_type="credit_card",
+                    account_identifier="ACCOUNT123456",
+                    management_institution="中国银行股份有限公司",
+                    open_date="2024-01-01",
+                    currency="CNY",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:resolved-currency",
+                    extraction_issue_id="issue:resolved-currency",
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_currency_token_residue_corrected",
+                    severity="info",
+                    status="resolved",
+                    target_dataset="credit_accounts",
+                    target_record_id="account:resolved-currency",
+                    field_name="currency",
+                    observed_value={"raw": "CNY 江", "residue": "江"},
+                    candidate_value={"currency": "CNY"},
+                )
+            ],
+        }
+    )
+
+    assert projected.get("extraction_issues") in (None, [])
+    assert projected.get("extraction_issue_evidence") in (None, [])
+    assert not any(
+        row.get("dataset_name") == "credit_accounts"
+        for row in projected.get("dataset_status") or ()
+    )
+
+
+def test_actionable_issue_does_not_downgrade_source_extraction_failure() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_dataset_status": [
+                _record(
+                    "status:accounts",
+                    dataset_status_id="status:accounts",
+                    dataset_name="credit_accounts",
+                    applicability="applicable",
+                    presence_status="extraction_failed",
+                    observed_row_count=0,
+                    expected_row_count=1,
+                    reason="source_extraction_failed",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:account-population",
+                    extraction_issue_id="issue:account-population",
+                    category="schema_incompleteness",
+                    issue_code="candidate_b_account_table_missing",
+                    severity="error",
+                    status="requires_review",
+                    target_dataset="credit_accounts",
+                    target_record_id="account:missing",
+                    field_name="account_identifier",
+                    observed_value=None,
+                )
+            ],
+        }
+    )
+
+    status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_accounts"
+    )
+    assert status["presence_status"] == "extraction_failed"
+    assert status["observed_row_count"] == 0
+    assert status["expected_row_count"] == 1
+    assert status["reason"] == "source_extraction_failed"
 
 
 def test_v2_preserves_canonical_slash_monthly_status_silently() -> None:
@@ -365,7 +574,7 @@ def test_v2_monthly_null_overlay_is_withheld_with_explicit_grid_issue() -> None:
     assert issue["field_name"] == "status_code"
 
 
-def test_v2_hash_monthly_marker_is_uncertainty_not_business_status() -> None:
+def test_v2_hash_monthly_marker_is_a_canonical_business_status() -> None:
     projected = project_personal_detail_datasets(
         {
             "credit_accounts": [
@@ -386,12 +595,9 @@ def test_v2_hash_monthly_marker_is_uncertainty_not_business_status() -> None:
         }
     )
 
-    assert "credit_account_monthly_performance" not in projected
-    assert any(
-        row.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
-        and row.get("field_name") == "status_code"
-        for row in projected["extraction_issues"]
-    )
+    row = projected["credit_account_monthly_performance"][0]
+    assert row["status_code"] == "#"
+    assert "extraction_issues" not in projected
 
 
 def test_v2_repayment_responsibility_removes_combined_field_from_all_pools() -> None:
@@ -399,7 +605,7 @@ def test_v2_repayment_responsibility_removes_combined_field_from_all_pools() -> 
         "liability_id": "responsibility:organization",
         "related_party_id_type": "统一社会信用代码",
         "related_party_id_number": "91110000123456789X",
-        "overdue_months_or_repayment_status": "N",
+        "repayment_status_code": "N",
     }
     projected = project_personal_detail_datasets(
         {
@@ -416,11 +622,33 @@ def test_v2_repayment_responsibility_removes_combined_field_from_all_pools() -> 
 
     row = projected["repayment_responsibilities"][0]
     assert row["normalized"]["repayment_status_code"] == "N"
-    assert row["normalized"]["source_status_value"] == "N"
+    assert "source_status_value" not in row["normalized"]
     assert all(
         "overdue_months_or_repayment_status" not in row.get(pool_name, {})
         for pool_name in ("normalized", "canonical_raw", "raw")
     )
+
+
+def test_unlabeled_legacy_liability_status_is_not_guessed_from_party_category() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_liability_records": [
+                _record(
+                    "responsibility:legacy",
+                    liability_id="responsibility:legacy",
+                    related_party_id_type="身份证",
+                    related_party_id_number="110101198108151111",
+                    overdue_months_or_repayment_status="0",
+                )
+            ]
+        }
+    )
+
+    row = projected["repayment_responsibilities"][0]
+    assert row["source_status_value"] == "0"
+    assert row["extraction_status"] == "review"
+    assert "overdue_months" not in row
+    assert "repayment_status_code" not in row
 
 
 def test_v2_neighbor_consensus_is_promoted_to_explicit_review() -> None:
@@ -483,7 +711,7 @@ def test_v2_successful_business_row_drops_redundant_evidence_snapshots() -> None
     assert "raw" not in row
 
 
-def test_v2_source_sentinel_and_noncanonical_monthly_dash_are_reported() -> None:
+def test_v2_source_sentinel_is_silent_absence_but_monthly_dash_is_reported() -> None:
     projected = project_personal_detail_datasets(
         {
             "residence_records": [
@@ -491,6 +719,13 @@ def test_v2_source_sentinel_and_noncanonical_monthly_dash_are_reported() -> None
                     "residence:sentinel",
                     residence_id="residence:sentinel",
                     residential_phone="-",
+                )
+            ],
+            "spouse_records": [
+                _record(
+                    "spouse:sentinel",
+                    spouse_record_id="spouse:sentinel",
+                    name="--",
                 )
             ],
             "repayment_records": [
@@ -507,16 +742,17 @@ def test_v2_source_sentinel_and_noncanonical_monthly_dash_are_reported() -> None
     )
 
     residence = projected["subject_residences"][0]
-    assert residence["normalized"]["residential_phone"] is None
-    assert residence["canonical_raw"]["residential_phone"] == "-"
+    assert residence["residential_phone"] is None
+    assert residence.get("canonical_raw", {}).get("residential_phone") is None
+    spouse = projected["subject_spouse"][0]
+    assert spouse["name"] is None
+    assert spouse.get("canonical_raw", {}).get("name") is None
     assert "credit_account_monthly_performance" not in projected
-    issue = next(
-        row
+    assert not any(
+        row.get("target_record_id") in {"residence:sentinel", "spouse:sentinel"}
+        and row.get("field_name") in {"residential_phone", "name"}
         for row in projected["extraction_issues"]
-        if row.get("field_name") == "residential_phone"
     )
-    assert issue["issue_code"] == "canonical_source_sentinel_withheld"
-    assert issue["target_record_id"] == "residence:sentinel"
     assert any(
         row.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
         for row in projected["extraction_issues"]
@@ -615,14 +851,14 @@ def test_v2_projection_corrects_business_semantics_and_reports_unmapped_values()
                 liability_id="responsibility:person",
                 related_party_id_type="身份证",
                 related_party_id_number="110101198108151111",
-                overdue_months_or_repayment_status="2",
+                overdue_months=2,
             ),
             _record(
                 "responsibility:organization",
                 liability_id="responsibility:organization",
                 related_party_id_type="统一社会信用代码",
                 related_party_id_number="91110000123456789X",
-                overdue_months_or_repayment_status="N",
+                repayment_status_code="N",
             ),
         ],
         "personal_housing_fund_records": [
@@ -1043,6 +1279,12 @@ def test_v2_schema_is_the_only_registered_detailed_personal_contract() -> None:
                     "personal_credit_report_detailed.schema.json"
                 ),
                 "compatibility": "canonical-v2; detailed-report-only",
+                "dataset_status_semantics": {
+                    "mode": "potentially_flawed_only",
+                    "present_dataset_without_status": "silently_trusted_complete",
+                    "absent_dataset_without_status": "silently_trusted_empty_or_not_applicable",
+                    "status_row_present": "partial_unknown_or_failed_extraction",
+                },
             },
         },
         "sections": [],
@@ -1078,7 +1320,9 @@ def test_v2_schema_is_the_only_registered_detailed_personal_contract() -> None:
     assert validation.valid, validation.errors
 
 
-def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
+def test_real_scanned_personal_detail_facts_activate_compact_community_projection(
+    tmp_path: Path,
+) -> None:
     source = {
         "personal_report_metadata": [
             _record(
@@ -1091,7 +1335,22 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
             )
         ],
         "personal_profile": [
-            _record("profile:1", personal_profile_id="profile:1", birth_date="1981-08-15")
+            {
+                "record_id": "profile:1",
+                "normalized": {
+                    "personal_profile_id": "profile:1",
+                    "birth_date": "1981-08-15",
+                    "employment_status": None,
+                },
+                "canonical_raw": {
+                    "birth_date": "1981.08.15",
+                    "employment_status": "职贝",
+                },
+                "raw": {
+                    "birth_date": "1981.08.15",
+                    "employment_status": "职贝",
+                },
+            }
         ],
         "personal_detail_field_observations": [
             _record(
@@ -1099,16 +1358,31 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
                 field_observation_id="field:1",
                 dataset_name="personal_profile",
                 business_record_id="profile:1",
-                field_name="work_phone",
+                field_name="employment_status",
                 observation_status="not_observed",
+                raw_value="职贝",
             )
         ],
         "credit_accounts": [
             _record(
                 "account:1",
                 account_id="account:1",
-                sequence=1,
+                category_sequence=1,
                 account_type="quasi_credit_card",
+                institution="示例银行",
+                currency="CNY",
+                account_status="active",
+                account_identifier_source="internal_anchor_diagnostic",
+            )
+        ],
+        "credit_lines": [
+            _record(
+                "agreement:1",
+                credit_line_id="agreement:1",
+                sequence=2,
+                limit_identifier="LIMIT-02",
+                institution="示例银行",
+                facility_type="循环贷款额度",
             )
         ],
         "repayment_records": [
@@ -1147,6 +1421,18 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
         ],
         "personal_detail_extraction_issues": [
             _record(
+                "issue:profile-employment",
+                extraction_issue_id="issue:profile-employment",
+                category="ocr_cell_level_error",
+                issue_code="pboc_cell_contract_unresolved",
+                severity="warning",
+                status="requires_review",
+                target_dataset="personal_profile",
+                target_record_id="profile:1",
+                field_name="employment_status",
+                observed_value="职贝",
+            ),
+            _record(
                 "issue:community-structured",
                 extraction_issue_id="issue:community-structured",
                 category="page_continuation",
@@ -1167,6 +1453,10 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
         "document_type": "personal_credit_report_detailed",
         "domain_facts": {
             "document_label": "个人信用报告",
+            # These are the exact stable facts emitted by the real variant
+            # router for scanned detailed reports.
+            "report_subtype": "personal_detail",
+            "content_mode": "scanned_ocr",
             "data_dictionary": personal_detail_data_dictionary(),
             **{
                 f"personal_detail_v2_expected_{name}_count": len(rows)
@@ -1192,19 +1482,104 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     source_pdf = tmp_path / "report.pdf"
     source_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
 
-    payload = project_community_bundle(
+    projected = project_community_bundle(
         seal_parse_result(result),
         file_path=str(source_pdf),
         projection_data=projection,
         projection_policy=dict(semantic["community_projection_overrides"]),
-    ).json_payload()
+    )
+    bundle = _CreditReportCommunityBundle(
+        schema=projected.schema,
+        document=projected.document,
+        sections=projected.sections,
+        datasets=projected.datasets,
+        files=projected.files,
+        warnings=projected.warnings,
+        result=projected.result,
+        source_fingerprint=projected.source_fingerprint,
+        parse_result_schema=projected.parse_result_schema,
+        classification=projected.classification,
+        domain=projected.domain,
+        diagnostics=projected.diagnostics,
+        content_markdown_override=projected.content_markdown_override,
+    )
+    payload = bundle.json_payload()
 
     assert payload["document"]["domain_schema"]["version"] == "2.0.0"
     assert validate_projection_payload("community", payload).valid
     v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     assert v2_validation.valid, v2_validation.errors
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
-    issue = datasets["extraction_issues"]["rows"][0]["normalized"]
+    dictionary_datasets = personal_detail_data_dictionary()["datasets"]
+    for name, dataset in datasets.items():
+        declared_fields = set(dictionary_datasets[name]["columns"])
+        assert all(
+            set(row["normalized"]) == declared_fields for row in dataset["rows"]
+        )
+        assert all(set(row["raw"]) <= declared_fields for row in dataset["rows"])
+        assert all(
+            set(row["canonical_raw"]) <= declared_fields
+            for row in dataset["rows"]
+        )
+
+    profile = datasets["subject_profile"]["rows"][0]
+    assert profile["canonical_raw"] == {"employment_status": "职贝"}
+    assert profile["raw"] == {"employment_status": "职贝"}
+    assert set(profile["canonical_raw"]) == set(profile["raw"]) == {"employment_status"}
+    assert "mobile_phone" not in profile["normalized"]
+    assert "work_phone" not in profile["normalized"]
+    assert "residence_phone" not in profile["normalized"]
+    account = datasets["credit_accounts"]["rows"][0]
+    assert account["canonical_raw"] == {}
+    assert account["raw"] == {}
+    assert account["source"] == {}
+    assert "confidence" not in account
+    assert "review" not in account
+    assert account["normalized"]["sequence"] == 1
+    assert account["normalized"]["management_institution"] == "示例银行"
+    assert account["normalized"]["account_currency"] == "CNY"
+    assert account["normalized"]["account_lifecycle_state"] == "open"
+    for private_field in (
+        "category_sequence",
+        "institution",
+        "currency",
+        "account_status",
+        "account_identifier_source",
+    ):
+        assert private_field not in account["normalized"]
+    agreement = datasets["credit_agreements"]["rows"][0]["normalized"]
+    assert agreement["sequence"] == 2
+    assert agreement["limit_identifier"] == "LIMIT-02"
+    profile_columns = {
+        column["key"]: column for column in datasets["subject_profile"]["columns"]
+    }
+    assert profile_columns["employment_status"]["raw_available"] is True
+    assert profile_columns["birth_date"]["raw_available"] is False
+    assert payload["document"]["domain_schema"]["dataset_status_semantics"] == {
+        "mode": "potentially_flawed_only",
+        "present_dataset_without_status": "silently_trusted_complete",
+        "absent_dataset_without_status": "silently_trusted_empty_or_not_applicable",
+        "status_row_present": "partial_unknown_or_failed_extraction",
+    }
+    assert datasets["dataset_status"]["sparse_status_semantics"] == payload["document"][
+        "domain_schema"
+    ]["dataset_status_semantics"]
+    profile_status = next(
+        row["normalized"]
+        for row in datasets["dataset_status"]["rows"]
+        if row["normalized"]["dataset_name"] == "subject_profile"
+    )
+    assert profile_status["presence_status"] == "partial"
+    assert datasets["subject_profile"]["status"] == profile_status["presence_status"]
+    assert datasets["subject_profile"]["completeness"]["verified"] is False
+    for key in ("expected_row_count", "emitted_row_count", "omitted_row_count"):
+        assert isinstance(datasets["subject_profile"]["completeness"][key], int)
+
+    issue = next(
+        row["normalized"]
+        for row in datasets["extraction_issues"]["rows"]
+        if row["record_id"] == "issue:community-structured"
+    )
     evidence = [row["normalized"] for row in datasets["extraction_issue_evidence"]["rows"]]
     assert issue["observed_value_type"] == "object"
     assert issue["candidate_value_type"] == "object"
@@ -1230,19 +1605,268 @@ def test_v2_projection_builds_a_valid_community_bundle(tmp_path: Path) -> None:
     )
     observation = datasets["field_observations"]["rows"][0]["normalized"]
     assert observation["dataset_name"] == "subject_profile"
-    assert observation["source_dataset_name"] is None
+    assert "source_dataset_name" not in observation
     statuses = [row["normalized"] for row in datasets["dataset_status"]["rows"]]
     assert all(
         row["presence_status"] in {"not_observed", "partial", "extraction_failed", "unknown"}
         for row in statuses
     )
-    # The incomplete header/profile copies are now explicitly partial instead
-    # of silently passing because each contained some optional data.
-    assert datasets["dataset_status"]["row_count"] == len(PBOC_DATASET_ORDER) - 8
+    # Sparse status rows name only sections that need attention: the uncertain
+    # profile is present, while the silently trusted account relation is absent.
+    status_names = {row["dataset_name"] for row in statuses}
+    assert "subject_profile" in status_names
+    assert "credit_accounts" not in status_names
     assert not {
         warning["code"]
         for warning in payload["warnings"]
         if warning["code"] in {"DATASET_COMPLETENESS_UNVERIFIED", "DATASET_ROW_COUNT_MISMATCH"}
+    }
+
+
+def test_wrapped_page_one_issues_target_final_community_rows_once(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Exercise the real metadata wrapper before v2 query derivation."""
+
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
+    parse_context = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[])],
+        _personal_detail_extraction_issues=[],
+    )
+    source = _extract_header_datasets(parse_context, "")
+    source["personal_report_metadata"] = _records(
+        "personal_report_metadata",
+        source["personal_report_metadata"],
+    )
+    source["personal_detail_extraction_issues"] = _records(
+        "personal_detail_extraction_issues",
+        parse_context._personal_detail_extraction_issues,
+    )
+    source["personal_profile"] = [
+        {
+            "record_id": "personal_profile:primary",
+            "personal_profile_id": "personal_profile:primary",
+        }
+    ]
+    projected_datasets = project_personal_detail_datasets(source)
+    semantic = personal_detail_semantic_extensions()
+    projection = {
+        "projector_id": "credit_report",
+        "document_type": "personal_credit_report_detailed",
+        "domain_facts": {
+            "document_label": "个人信用报告",
+            "report_subtype": "personal_detail",
+            "content_mode": "scanned_ocr",
+            "data_dictionary": personal_detail_data_dictionary(),
+            **{
+                f"personal_detail_v2_expected_{name}_count": len(rows)
+                for name, rows in projected_datasets.items()
+            },
+        },
+        "semantic": semantic,
+        "datasets": projected_datasets,
+        "sections": [],
+    }
+    parse_result = ParseResult(
+        entities=DocumentEntities(document_type="personal_credit_report_detailed"),
+        pages=[PageContent(page_number=1)],
+    )
+    source_pdf = tmp_path / "wrapped-page-one.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    projected = project_community_bundle(
+        seal_parse_result(parse_result),
+        file_path=str(source_pdf),
+        projection_data=projection,
+        projection_policy=dict(semantic["community_projection_overrides"]),
+    )
+    payload = _CreditReportCommunityBundle(
+        schema=projected.schema,
+        document=projected.document,
+        sections=projected.sections,
+        datasets=projected.datasets,
+        files=projected.files,
+        warnings=projected.warnings,
+        result=projected.result,
+        source_fingerprint=projected.source_fingerprint,
+        parse_result_schema=projected.parse_result_schema,
+        classification=projected.classification,
+        domain=projected.domain,
+        diagnostics=projected.diagnostics,
+        content_markdown_override=projected.content_markdown_override,
+    ).json_payload()
+
+    assert validate_projection_payload("community", payload).valid
+    v2_validation = validate_projection_payload("personal_credit_report_detailed", payload)
+    assert v2_validation.valid, v2_validation.errors
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    final_ids = {
+        name: {str(row["record_id"]) for row in datasets[name]["rows"]}
+        for name in ("report_metadata", "report_query")
+    }
+    query_row = datasets["report_query"]["rows"][0]
+    assert query_row["record_id"] == query_row["normalized"]["report_query_id"]
+
+    page_one_issues = [
+        row["normalized"]
+        for row in datasets["extraction_issues"]["rows"]
+        if row["normalized"].get("target_dataset")
+        in {"report_metadata", "report_query"}
+    ]
+    keys = [
+        (
+            str(issue["target_dataset"]),
+            str(issue["target_record_id"]),
+            str(issue["field_name"]),
+        )
+        for issue in page_one_issues
+    ]
+    assert len(page_one_issues) == 12
+    assert len(keys) == len(set(keys))
+    assert all(target_id in final_ids[dataset_name] for dataset_name, target_id, _ in keys)
+    assert sum(issue["target_dataset"] == "report_query" for issue in page_one_issues) == 7
+
+
+def test_public_projection_never_attaches_raw_evidence_from_a_different_record_id() -> None:
+    payload = {
+        "datasets": [
+            {
+                "name": "subject_profile",
+                "rows": [
+                    {
+                        "record_id": "profile:public",
+                        "normalized": {"subject_profile_id": "profile:public"},
+                        "raw": {},
+                        "canonical_raw": {},
+                        "source": {"logical_page": 1},
+                    }
+                ],
+                "columns": [
+                    {"key": "subject_profile_id", "raw_available": False},
+                    {"key": "gender", "raw_available": True},
+                ],
+            },
+            {
+                "name": "extraction_issues",
+                "rows": [
+                    {
+                        "record_id": "issue:gender",
+                        "normalized": {
+                            "status": "requires_review",
+                            "target_dataset": "subject_profile",
+                            "target_record_id": "profile:public",
+                            "field_name": "gender",
+                        },
+                    }
+                ],
+                "columns": [],
+            },
+        ]
+    }
+    source_datasets = [
+        SimpleNamespace(
+            public={"name": "subject_profile"},
+            rows=[
+                {
+                    "record_id": "profile:different",
+                    "raw": {"gender": "女"},
+                    "canonical_raw": {"gender": "女"},
+                }
+            ],
+        )
+    ]
+
+    _compact_personal_detail_public_projection(
+        payload,
+        source_datasets=source_datasets,
+    )
+
+    profile = payload["datasets"][0]
+    assert profile["rows"][0]["raw"] == {}
+    assert profile["rows"][0]["canonical_raw"] == {}
+    assert next(column for column in profile["columns"] if column["key"] == "gender")[
+        "raw_available"
+    ] is False
+
+
+def test_success_row_drops_nonrequired_review_metadata() -> None:
+    payload = {
+        "datasets": [
+            {
+                "name": "subject_profile",
+                "rows": [
+                    {
+                        "record_id": "profile:clean",
+                        "normalized": {"subject_profile_id": "profile:clean", "gender": "男"},
+                        "raw": {"gender": "男"},
+                        "canonical_raw": {"gender": "男"},
+                        "source": {"logical_page": 1},
+                        "confidence": 0.99,
+                        "review": {"required": False},
+                    }
+                ],
+                "columns": [
+                    {"key": "subject_profile_id", "raw_available": True},
+                    {"key": "gender", "raw_available": True},
+                ],
+            }
+        ]
+    }
+
+    _compact_personal_detail_public_projection(payload, source_datasets=[])
+
+    row = payload["datasets"][0]["rows"][0]
+    assert row["raw"] == {}
+    assert row["canonical_raw"] == {}
+    assert row["source"] == {}
+    assert "confidence" not in row
+    assert "review" not in row
+
+
+def test_dataset_status_expected_less_than_emitted_is_an_explicit_population_conflict() -> None:
+    payload = {
+        "datasets": [
+            {
+                "name": "subject_profile",
+                "status": "complete",
+                "row_count": 2,
+                "rows": [{}, {}],
+                "completeness": {
+                    "expected_row_count": 2,
+                    "emitted_row_count": 2,
+                    "omitted_row_count": 0,
+                    "verified": True,
+                    "basis": "row_conservation",
+                },
+            },
+            {
+                "name": "dataset_status",
+                "rows": [
+                    {
+                        "normalized": {
+                            "dataset_name": "subject_profile",
+                            "presence_status": "observed_nonempty",
+                            "expected_row_count": 1,
+                        }
+                    }
+                ],
+            },
+        ]
+    }
+
+    _apply_personal_detail_dataset_status(payload)
+
+    profile = payload["datasets"][0]
+    assert profile["status"] == "partial"
+    assert profile["completeness"] == {
+        "expected_row_count": 2,
+        "emitted_row_count": 2,
+        "omitted_row_count": 0,
+        "verified": False,
+        "basis": (
+            "personal_detail_dataset_status:observed_nonempty:"
+            "expected_less_than_emitted"
+        ),
     }
 
 
@@ -1348,6 +1972,28 @@ def test_v2_normalizes_valid_currency_and_suppresses_false_issue() -> None:
     assert "field_observations" not in projected
 
 
+def test_v2_normalizes_extended_currency_alias_and_declares_iso_codes() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:aud",
+                    account_id="account:aud",
+                    account_type="credit_card",
+                    account_currency="澳元",
+                    reporting_amount_currency="AUD",
+                )
+            ]
+        }
+    )
+
+    row = projected["credit_accounts"][0]
+    assert row["account_currency"] == "AUD"
+    assert row["reporting_amount_currency"] == "AUD"
+    currency_codes = personal_detail_data_dictionary()["enums"]["currency_code"]
+    assert {"AUD", "CAD", "CHF", "SGD", "MOP"}.issubset(currency_codes)
+
+
 def test_v2_withholds_yuan_units_for_non_cny_currency_with_exact_issues() -> None:
     projected = project_personal_detail_datasets(
         {
@@ -1367,7 +2013,7 @@ def test_v2_withholds_yuan_units_for_non_cny_currency_with_exact_issues() -> Non
     )
 
     row = projected["credit_accounts"][0]
-    assert row["currency"] == "USD"
+    assert "currency" not in row
     assert row["account_currency"] == "USD"
     assert row["reporting_amount_currency"] == "USD"
     assert row["amount_unit"] is None
@@ -1586,11 +2232,12 @@ def test_v2_withholds_unknown_account_status_and_removes_raw_detail_blob() -> No
     )
 
     row = projected["credit_accounts"][0]
-    assert row["account_status"] is None
+    assert "account_status" not in row
+    assert row["account_lifecycle_state"] is None
     assert "raw_detail_lines" not in row
     assert "raw_detail_lines" not in row.get("normalized", {})
     assert any(
-        issue.get("field_name") == "account_status"
+        issue.get("field_name") == "account_lifecycle_state"
         and issue["issue_code"] == "canonical_field_contract_failed"
         for issue in projected["extraction_issues"]
     )

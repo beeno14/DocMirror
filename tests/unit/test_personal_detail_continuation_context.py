@@ -631,7 +631,15 @@ def test_employment_fragments_join_by_header_columns_and_printed_sequence() -> N
         metadata={
             "raw_rows": [
                 ["编号", "职业", "行业", "职务", "职称", "进入本单位年份", "信息更新日期"],
-                ["2", "工程技术人员", "信息技术业", "一般员工", "工程师", "2020", "2025.01.02"],
+                [
+                    "2",
+                    "专业技术人员",
+                    "信息传输、计算机服务和软件业",
+                    "一般员工",
+                    "中级",
+                    "2020",
+                    "2025.01.02",
+                ],
             ]
         },
         headers=[],
@@ -663,7 +671,7 @@ def test_employment_fragments_join_by_header_columns_and_printed_sequence() -> N
     assert len(records) == 1
     assert records[0]["sequence"] == 2
     assert records[0]["employer"] == "样例科技有限公司"
-    assert records[0]["occupation"] == "工程技术人员"
+    assert records[0]["occupation"] == "专业技术人员"
     assert records[0]["entry_year"] == 2020
     assert records[0]["data_provider"] == "样例银行股份有限公司"
     assert not any(
@@ -1165,7 +1173,19 @@ def test_native_profile_tables_preserve_empty_cells_and_embedded_subtables() -> 
         ("某市某区一号", None, "示例银行一"),
         ("某市某区二号", "13800138000", None),
     ]
-    assert employments == []
+    assert len(employments) == 1
+    assert {
+        field: employments[0][field]
+        for field in ("employer", "employer_type", "employer_address", "employer_phone")
+    } == {
+        "employer": "示例粮油有限公司",
+        "employer_type": "国有企业",
+        "employer_address": "某市某路60号",
+        "employer_phone": "059100000000",
+    }
+    # The basic component is now safely retained, while the damaged detail and
+    # provider components remain explicitly reported instead of erasing it.
+    assert employments[0]["extraction_status"] == "review"
     assert details["mobile_phone_records"] == []
     assert details["spouse_records"][0]["name"] == "林航"
     assert details["spouse_records"][0]["phone"] == "13763822211"
@@ -1318,3 +1338,109 @@ def test_mobile_and_spouse_conflicts_do_not_create_duplicate_business_records() 
     }
     assert ("mobile_phone_records", "mobile_phone") in conflicts
     assert ("spouse_records", "name") in conflicts
+
+
+def test_mobile_row_decodes_when_canonical_labels_and_values_are_collapsed() -> None:
+    table = SimpleNamespace(
+        table_id="mobile-collapsed",
+        metadata={
+            "raw_rows": [
+                [
+                    "手机号码 编号 15260467509 1",
+                    "信息更新日期 2025.08.03",
+                    "数据发生机构名称 深圳市乐信融资担保有限公司",
+                    "",
+                ]
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[table])],
+        tables_continue=lambda _left, _right: False,
+    )
+
+    details = _extract_profile_detail_records(result)
+
+    assert details["mobile_phone_records"] == [
+        {
+            **details["mobile_phone_records"][0],
+            "sequence": 1,
+            "mobile_phone": "15260467509",
+            "information_updated_date": "2025-08-03",
+            "data_provider": "深圳市乐信融资担保有限公司",
+        }
+    ]
+    assert not hasattr(result, "_personal_detail_extraction_issues")
+
+
+def _mobile_date_details(raw_date: str) -> tuple[dict[str, object], SimpleNamespace]:
+    table = SimpleNamespace(
+        table_id="mobile-date-contract",
+        metadata={
+            "raw_rows": [
+                ["编号", "手机号码", "信息更新日期", "数据发生机构名称"],
+                ["1", "13800138000", raw_date, "样例银行股份有限公司"],
+            ]
+        },
+        headers=[],
+        rows=[],
+    )
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[table])],
+        tables_continue=lambda _left, _right: False,
+    )
+    record = _extract_profile_detail_records(result)["mobile_phone_records"][0]
+    return record, result
+
+
+def test_mobile_date_retains_one_valid_date_with_short_ascii_watermark_residue() -> None:
+    raw = "2022,09.15 A"
+
+    record, result = _mobile_date_details(raw)
+
+    assert record["information_updated_date"] == "2022-09-15"
+    assert record["canonical_raw"]["information_updated_date"] == raw
+    issue = next(
+        item
+        for item in result._personal_detail_extraction_issues
+        if item["issue_code"] == "candidate_b_date_ascii_residue_corrected"
+    )
+    assert issue["status"] == "resolved"
+    assert issue["target_record_id"] == record["mobile_phone_record_id"]
+    assert issue["field_name"] == "information_updated_date"
+    assert issue["observed_value"] == {"raw": raw, "residue": "A"}
+    assert issue["candidate_value"] == {"normalized_date": "2022-09-15"}
+
+
+def test_clean_mobile_date_stays_silent() -> None:
+    record, result = _mobile_date_details("2022.09.15")
+
+    assert record["information_updated_date"] == "2022-09-15"
+    assert not hasattr(result, "_personal_detail_extraction_issues")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "2022.09.15 信息更新日期",
+        "2022.09.15 2023.01.02",
+        "DATE 2022.09.15",
+    ),
+)
+def test_mobile_date_rejects_business_or_ambiguous_residue(raw: str) -> None:
+    record, result = _mobile_date_details(raw)
+
+    assert "information_updated_date" not in record
+    assert record["canonical_raw"]["information_updated_date"] == [raw]
+    assert any(
+        item["issue_code"] == "candidate_b_exact_slot_value_invalid"
+        and item["field_name"] == "information_updated_date"
+        and item["observed_value"] == [raw]
+        for item in result._personal_detail_extraction_issues
+    )
+    assert not any(
+        item["issue_code"] == "candidate_b_date_ascii_residue_corrected"
+        for item in result._personal_detail_extraction_issues
+    )

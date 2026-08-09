@@ -60,6 +60,87 @@ def test_public_rows_keep_physical_columns_and_report_missing_cell() -> None:
     )
 
 
+def test_public_unreadable_sequence_reports_row_and_keeps_later_rows() -> None:
+    result = _result(
+        _table(
+            "tax-sequence",
+            [
+                ["编号", "主管税务机关", "欠税总额", "欠税统计日期"],
+                ["X", "某市税务局", "100", "2024-01-31"],
+                ["2", "某区税务局", "500", "2024-02-29"],
+            ],
+        )
+    )
+
+    records = native_extraction._extract_public_records(result)
+
+    assert len(records) == 1
+    assert json.loads(records[0]["content"])["tax_authority"] == "某区税务局"
+    assert any(
+        issue.get("issue_code") == "candidate_b_sequence_cell_unresolved"
+        and issue.get("observed_value", {}).get("physical_cells", [None])[0] == "X"
+        for issue in _issues(result)
+    )
+
+
+def test_public_scalar_date_with_multiple_valid_spans_is_withheld_and_reported() -> None:
+    result = _result(
+        _table(
+            "tax-date",
+            [
+                ["编号", "主管税务机关", "欠税总额", "欠税统计日期"],
+                ["1", "某市税务局", "100", "2024-01-31 2024-02-29"],
+                ["2", "某区税务局", "500", "2024-02-29"],
+            ],
+        )
+    )
+
+    records = native_extraction._extract_public_records(result)
+    first, second = (json.loads(record["content"]) for record in records)
+
+    assert "statistics_date" not in first
+    assert second["statistics_date"] == "2024-02-29"
+    assert any(
+        issue.get("field_name") == "statistics_date"
+        and issue.get("observed_value") == ["2024-01-31 2024-02-29"]
+        for issue in _issues(result)
+    )
+
+
+def test_public_text_slots_reject_layout_labels_and_multiple_typed_markers() -> None:
+    result = _result(
+        _table(
+            "civil-text",
+            [
+                ["编号", "立案法院", "案由", "立案日期", "结案方式"],
+                ["1", "立案法院 某法院 立案日期 2024-01-01", "借款纠纷", "2024-01-01", "判决"],
+                ["2", "某法院 2024-02-01", "合同纠纷", "2024-02-01", "调解"],
+                ["3", "某法院", "劳动纠纷", "2024-03-01", "撤诉"],
+            ],
+        )
+    )
+
+    records = native_extraction._extract_public_records(result)
+    contents = [json.loads(record["content"]) for record in records]
+
+    assert "filing_court" not in contents[0]
+    assert "filing_court" not in contents[1]
+    assert contents[2]["filing_court"] == "某法院"
+    assert sum(issue.get("field_name") == "filing_court" for issue in _issues(result)) == 2
+
+
+def test_account_institution_exact_slot_rejects_contamination() -> None:
+    assert native_extraction._account_institution("中国银行股份有限公司厦门分行") == (
+        "中国银行股份有限公司厦门分行"
+    )
+    assert native_extraction._account_institution(
+        "甲银行股份有限公司 乙银行股份有限公司"
+    ) is None
+    assert native_extraction._account_institution(
+        "中国银行股份有限公司 开立日期"
+    ) is None
+
+
 def test_public_two_part_civil_record_joins_by_printed_sequence() -> None:
     result = _result(
         _table(
@@ -254,6 +335,30 @@ def test_schema_removes_noncatalog_public_scalar_and_reports_it() -> None:
     record = projected["tax_arrears_records"][0]
     assert "unmapped_content" not in record
     assert "unmapped_content" not in record.get("normalized", {})
+    assert any(
+        row["issue_code"] == "canonical_field_outside_closed_catalog"
+        and row["field_name"] == "unmapped_content"
+        for row in projected["extraction_issues"]
+    )
+
+
+def test_schema_does_not_treat_noncatalog_dash_as_business_absence() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "tax_arrears_records": [
+                {
+                    "record_id": "tax:dash",
+                    "tax_arrears_id": "tax:dash",
+                    "tax_authority": "某税务局",
+                    "arrears_amount": 100,
+                    "unmapped_content": "--",
+                }
+            ]
+        }
+    )
+
+    record = projected["tax_arrears_records"][0]
+    assert "unmapped_content" not in record
     assert any(
         row["issue_code"] == "canonical_field_outside_closed_catalog"
         and row["field_name"] == "unmapped_content"

@@ -9,6 +9,7 @@ import os
 import re
 from collections import Counter
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
@@ -45,7 +46,10 @@ _EXPECTED_SCHEMA_INPUT_COUNTS = {
     # three responsibility-table false cards removed from the former 48-row
     # oracle, logical page 12 proves that D10053310... is the sole type-R2
     # account: the former 46-row result emitted its table again as an R1 row.
-    "林岚挺征信.pdf": (45, 801),
+    # A source-grid audit counts all 40 printed repayment grids and their
+    # bounded date ranges: 944 printed month positions.  The former 801 oracle
+    # omitted valid grids and could make a silent population loss look healthy.
+    "林岚挺征信.pdf": (45, 944),
     "洪晓鑫征信报告2025.11.05.pdf": (8, 176),
     "王根镇征信.pdf": (61, 757),
 }
@@ -116,6 +120,10 @@ def test_personal_detail_ocr_correction_invariants(
         destination.mkdir(parents=True, exist_ok=True)
         (destination / f"{fixture.stem}.community.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (destination / f"{fixture.stem}.semantic.json").write_text(
+            json.dumps(semantic, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -307,7 +315,7 @@ def test_personal_detail_ocr_correction_invariants(
         assert len(record_ids) == len(set(record_ids))
     assert v2_datasets["credit_accounts"]["row_count"] == len(accounts)
     canonical_monthly_statuses = {
-        "*", "/", "N", "1", "2", "3", "4", "5", "6", "7",
+        "*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7",
         "A", "B", "C", "D", "G", "M", "Z",
     }
     typed_linked_repayments = [
@@ -342,6 +350,12 @@ def test_personal_detail_ocr_correction_invariants(
     account_rows = [row["normalized"] for row in v2_datasets["credit_accounts"]["rows"]]
     monthly_record_rows = v2_datasets["credit_account_monthly_performance"]["rows"]
     monthly_rows = [row["normalized"] for row in monthly_record_rows]
+    assert len(
+        {
+            (str(row.get("grid_id") or ""), str(row.get("performance_month") or ""))
+            for row in monthly_rows
+        }
+    ) == len(monthly_rows)
     assert all("raw_detail_lines" not in row and "raw_detail_text" not in row for row in account_rows)
     account_id_set = {item["account_id"] for item in account_rows}
     assert all(
@@ -352,7 +366,7 @@ def test_personal_detail_ocr_correction_invariants(
     )
     assert all(
         row.get("status_code") in {
-            "*", "/", "N", "1", "2", "3", "4", "5", "6", "7",
+            "*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7",
             "A", "B", "C", "D", "G", "M", "Z",
         }
         for row in monthly_rows
@@ -454,10 +468,12 @@ def test_personal_detail_ocr_correction_invariants(
     for row in monthly_rows:
         grid_key = str(row.get("grid_id") or row.get("account_id") or "unresolved")
         months_by_grid.setdefault(grid_key, []).append(str(row.get("performance_month") or ""))
-        if str(row.get("status_code") or "") in {"1", "2", "3", "4", "5", "6", "7"} and row.get(
-            "status_amount"
-        ) in (None, ""):
-            assert row.get("extraction_status") == "review"
+        if str(row.get("status_code") or "") in {"1", "2", "3", "4", "5", "6", "7"}:
+            try:
+                amount = Decimal(str(row.get("status_amount") or ""))
+            except InvalidOperation:
+                amount = Decimal(0)
+            assert amount > 0
     assert all(months == sorted(months) for months in months_by_grid.values())
     assert not any(
         row.get("field_name") == "housing_fund_record_id"
@@ -538,7 +554,7 @@ def test_personal_detail_ocr_correction_invariants(
         for row in evidence_rows
         if str(row.get("extraction_issue_id") or "") in status_grid_issue_ids
         and row.get("evidence_kind") == "observed"
-        and row.get("evidence_path") == "withheld_candidate_count"
+        and row.get("evidence_path") == "withheld_month_count"
     )
     assert reported_withheld_months == unresolved_source_months
     for issue_id in status_grid_issue_ids:
@@ -567,6 +583,7 @@ def test_personal_detail_ocr_correction_invariants(
         "not_emitted",
         "unresolved",
         "record_not_silently_dropped",
+        "silent_drop_prevented",
     )
     for row in issue_rows:
         dataset_name = str(row.get("target_dataset") or "")
@@ -580,6 +597,126 @@ def test_personal_detail_ocr_correction_invariants(
             for reason in reasons_by_issue.get(str(row["extraction_issue_id"]), set())
             for marker in non_emission_markers
         )
+
+    control_datasets = {
+        "field_observations",
+        "extraction_issues",
+        "extraction_issue_evidence",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
+    dash_only = re.compile(r"[-‐‑‒–—―－﹘﹣]+")
+    assert not any(
+        isinstance(value, str) and dash_only.fullmatch(value.strip())
+        for dataset_name, dataset in v2_datasets.items()
+        if dataset_name not in control_datasets
+        for wrapper in dataset.get("rows", [])
+        for value in (wrapper.get("normalized") or {}).values()
+    )
+
+    if expected_counts == (45, 944):
+        amount_issue_targets = {
+            str(row.get("target_record_id") or "")
+            for row in issue_rows
+            if row.get("target_dataset") == "credit_account_monthly_performance"
+            and row.get("field_name") == "status_amount"
+        }
+        assert all(
+            row.get("status_amount") not in (None, "")
+            or str(wrapper.get("record_id") or row.get("monthly_performance_id") or "")
+            in amount_issue_targets
+            for wrapper, row in zip(monthly_record_rows, monthly_rows, strict=True)
+        )
+
+        overview_rows = [
+            wrapper.get("normalized") or {}
+            for wrapper in v2_datasets["credit_business_overview"]["rows"]
+        ]
+        for row in overview_rows:
+            if row.get("metric_code") != "account_count" or row.get("numeric_value") in (None, ""):
+                continue
+            assert Decimal(str(row["numeric_value"])) <= Decimal(len(account_rows))
+
+        def has_field_issue(dataset_name: str, record_id: str, field_name: str) -> bool:
+            return any(
+                row.get("target_dataset") == dataset_name
+                and str(row.get("target_record_id") or "") == record_id
+                and row.get("field_name") == field_name
+                for row in issue_rows
+            )
+
+        account_12_february = [
+            (wrapper, row)
+            for wrapper, row in zip(monthly_record_rows, monthly_rows, strict=True)
+            if row.get("grid_id") == "mg_p8_repayment_1"
+            and row.get("performance_month") == "2020-02"
+        ]
+        if account_12_february:
+            wrapper, row = account_12_february[0]
+            assert row.get("status_code") == "C" or has_field_issue(
+                "credit_account_monthly_performance",
+                str(wrapper.get("record_id") or ""),
+                "status_code",
+            )
+        else:
+            unresolved_grid_issue_ids = {
+                str(row.get("extraction_issue_id") or "")
+                for row in final_status_grid_issues
+            }
+            grid_evidence = [
+                row
+                for row in evidence_rows
+                if str(row.get("extraction_issue_id") or "") in unresolved_grid_issue_ids
+            ]
+            assert any(
+                row.get("string_value") == "mg_p8_repayment_1"
+                for row in grid_evidence
+            ) and any(
+                row.get("string_value") == "2020-02"
+                and re.fullmatch(r"withheld_months\[\d+\]", str(row.get("evidence_path") or ""))
+                for row in grid_evidence
+            )
+
+        residence_wrapper = next(
+            wrapper
+            for wrapper in v2_datasets["subject_residences"]["rows"]
+            if (wrapper.get("normalized") or {}).get("sequence") == 5
+        )
+        residence = residence_wrapper.get("normalized") or {}
+        assert "卢滨路" in str(residence.get("address") or "") or has_field_issue(
+            "subject_residences",
+            str(residence_wrapper.get("record_id") or ""),
+            "address",
+        )
+
+        account_22_wrapper = next(
+            wrapper
+            for wrapper in v2_datasets["credit_accounts"]["rows"]
+            if (wrapper.get("normalized") or {}).get("account_id")
+            == "credit_account:non_revolving_loan:22"
+        )
+        account_22 = account_22_wrapper.get("normalized") or {}
+        assert "蚂蚁商诚" in str(account_22.get("management_institution") or "") or has_field_issue(
+            "credit_accounts",
+            str(account_22_wrapper.get("record_id") or ""),
+            "management_institution",
+        )
+
+        inquiry_1_wrapper = next(
+            wrapper
+            for wrapper in v2_datasets["inquiries"]["rows"]
+            if (wrapper.get("normalized") or {}).get("query_channel") == "institution"
+            and (wrapper.get("normalized") or {}).get("sequence") == 1
+        )
+        inquiry_1 = inquiry_1_wrapper.get("normalized") or {}
+        assert "中国建设银行股份有限公司北京市分行" in str(
+            inquiry_1.get("institution") or ""
+        ) or has_field_issue(
+            "inquiries",
+            str(inquiry_1_wrapper.get("record_id") or ""),
+            "institution",
+        )
+
     agreement_rows = [row["normalized"] for row in v2_datasets["credit_agreements"]["rows"]]
     agreement_ids = {
         str(row.get("credit_agreement_id") or "")
