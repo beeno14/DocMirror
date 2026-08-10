@@ -33,6 +33,7 @@ SourceKind = Literal[
     "stacked_text",
     "native_wide_table",
     "canonical_evidence_table",
+    "positioned_record_block",
     "ocr_implicit_table",
     "none",
 ]
@@ -48,6 +49,8 @@ class ReconstructionMeta:
     pages_scanned: int = 0
     spe_primary: str | None = None
     spe_table_extraction: str | None = None
+    expected_evidence_source: str = ""
+    expected_evidence_confidence: float = 0.0
 
 
 def reconstruct_tables(
@@ -81,9 +84,15 @@ def reconstruct_tables(
             parse_result=parse_result,
             structure_spe=structure_spe,
         )
-        from docmirror.plugins.bank_statement.wide_table_recovery import count_expected_rows_from_bank_footer
+        from docmirror.plugins.bank_statement.wide_table_recovery import (
+            count_expected_rows_from_bank_footer,
+            page_texts_from_parse_result,
+        )
 
-        source_reported = count_expected_rows_from_bank_footer(full_text)
+        source_reported = count_expected_rows_from_bank_footer(
+            full_text,
+            page_texts=page_texts_from_parse_result(parse_result),
+        )
         if source_reported > 0:
             expected = source_reported
         return canonical_tables, ReconstructionMeta(

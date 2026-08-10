@@ -12,7 +12,7 @@ raw behaviour via one synthetic block from ``ctx.tables``.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from docmirror.models.entities.parse_result import LogicalTable
@@ -31,6 +31,7 @@ class BLOMeta:
     tables_parsed: int = 0
     tables_skipped: int = 0
     logical_table_count: int = 0
+    candidate_diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -69,6 +70,24 @@ class BankLedgerOrchestrator:
         self._registry = registry
         self._detector = BankStyleDetector()
 
+    def _record_selection_diagnostics(self, meta: BLOMeta) -> None:
+        diagnostics = getattr(self._registry, "last_selection_diagnostics", None)
+        if isinstance(diagnostics, dict) and diagnostics:
+            meta.candidate_diagnostics.append(dict(diagnostics))
+
+    @staticmethod
+    def _merge_reconstruction_meta(ctx: StyleContext, sub_ctx: StyleContext) -> None:
+        """Retain the strongest row-count evidence from a logical-table run."""
+        if sub_ctx.reconstruction is None:
+            return
+        current_expected = int(getattr(ctx.reconstruction, "expected_primary_rows", 0) or 0)
+        candidate_expected = int(sub_ctx.reconstruction.expected_primary_rows or 0)
+        if ctx.reconstruction is None or candidate_expected >= current_expected:
+            ctx.reconstruction = replace(
+                sub_ctx.reconstruction,
+                expected_primary_rows=max(current_expected, candidate_expected),
+            )
+
     def run(
         self,
         detection: StyleDetectionResult,
@@ -94,6 +113,7 @@ class BankLedgerOrchestrator:
                     sub_ctx = replace(ctx, tables=sub_tables)
                     sub_detection = self._resolve_detection(detection, sub_ctx)
             records, identity = self._registry.run_parser_chain(sub_detection, sub_ctx, plugin)
+            self._record_selection_diagnostics(meta)
             if sub_ctx is not ctx and sub_ctx.reconstruction is not None:
                 ctx.reconstruction = sub_ctx.reconstruction
             if blocks and blocks[0][0] is not None and getattr(blocks[0][0], "quality_passed", True):
@@ -122,6 +142,8 @@ class BankLedgerOrchestrator:
             sub_ctx = replace(ctx, tables=sub_tables)
             sub_detection = self._resolve_detection(detection, sub_ctx)
             batch, batch_identity = self._registry.run_parser_chain(sub_detection, sub_ctx, plugin)
+            self._record_selection_diagnostics(meta)
+            self._merge_reconstruction_meta(ctx, sub_ctx)
             if batch_identity:
                 identity_fields = batch_identity
             records.extend(batch)
@@ -130,6 +152,7 @@ class BankLedgerOrchestrator:
         if not records and ctx.tables:
             logger.info("[BLO] no records from logical tables — fallback to ctx.tables")
             batch, batch_identity = self._registry.run_parser_chain(detection, ctx, plugin)
+            self._record_selection_diagnostics(meta)
             if batch_identity:
                 identity_fields = batch_identity
             records.extend(batch)

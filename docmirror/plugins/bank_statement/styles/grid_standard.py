@@ -89,6 +89,13 @@ _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
 
 
 def _cell_value(raw_txn: dict[str, str], *needles: str) -> str:
+    compact_needles = {
+        re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(needle or ""))).lower() for needle in needles
+    }
+    for key, value in raw_txn.items():
+        compact_key = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(key or ""))).lower()
+        if compact_key in compact_needles:
+            return str(value or "").strip()
     for key, value in raw_txn.items():
         norm_key = normalize_header_cell(key)
         for needle in needles:
@@ -123,7 +130,19 @@ def _normalize_source_counterparty_columns(
     raw_txn: dict[str, str],
     normalized: dict[str, Any],
 ) -> None:
-    """Prefer explicit source party/institution columns over fuzzy base matches."""
+    """Prefer explicit source columns over fuzzy base matches."""
+    summary = _explicit_source_column_value(raw_txn, ("摘要描述", "交易摘要", "摘要"))
+    if summary:
+        normalized["summary"] = _clean_wrapped_text(summary)
+
+    remark = _explicit_source_column_value(raw_txn, ("交易附言", "附言", "用途", "备注"))
+    if remark and re.match(r"^(?:用途|附言)\s*[:：]", remark):
+        normalized["purpose"] = _clean_wrapped_text(remark)
+
+    counter_account = _explicit_source_column_value(raw_txn, _COUNTER_ACCOUNT_KEYS)
+    if counter_account:
+        normalized["counter_account"] = _clean_account(counter_account)
+
     counter_party = _explicit_source_column_value(
         raw_txn,
         (
@@ -137,7 +156,18 @@ def _normalize_source_counterparty_columns(
         ),
     )
     if counter_party:
-        normalized["counter_party"] = _clean_wrapped_text(counter_party)
+        cleaned_party = _clean_wrapped_text(counter_party)
+        cleaned_party, embedded_account = _split_embedded_counter_account(cleaned_party)
+        if embedded_account and not normalized.get("counter_account"):
+            normalized["counter_account"] = embedded_account
+        compact_party = re.sub(r"\s+", "", cleaned_party)
+        if re.fullmatch(r"[0-9*＊]{6,32}", compact_party):
+            normalized["counter_account"] = compact_party
+            normalized["counter_party"] = ""
+        elif compact_party in {"--", "-"}:
+            normalized["counter_party"] = ""
+        else:
+            normalized["counter_party"] = cleaned_party
 
     counter_bank = _explicit_source_column_value(
         raw_txn,
@@ -218,8 +248,8 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
 
     normalized = plugin._normalize(raw_txn)
     _normalize_source_counterparty_columns(raw_txn, normalized)
-    normalized["amount"] = float(amount)
-    normalized["amount_cny"] = float(amount)
+    normalized["amount"] = abs(float(amount))
+    normalized["amount_cny"] = abs(float(amount))
     normalized["direction"] = direction
     balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
     if balance is not None:
@@ -283,7 +313,8 @@ def _normalize_direction_text(value: str) -> str:
 
 def _clean_wrapped_text(value: str) -> str:
     text = re.sub(r"\s+", " ", value or "").strip()
-    return re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff(（])", "", text)
+    return re.sub(r"(?<=[)）])\s+(?=[\u4e00-\u9fff])", "", text)
 
 
 def _clean_account(value: str) -> str:
@@ -291,6 +322,27 @@ def _clean_account(value: str) -> str:
     if re.fullmatch(r"[0-9*\s＊]+", text):
         return re.sub(r"\s+", "", text)
     return re.sub(r"\s+", " ", text)
+
+
+def _split_embedded_counter_account(value: str) -> tuple[str, str]:
+    """Split a trailing counterparty account from a collapsed source cell."""
+    text = _clean_wrapped_text(value)
+    compact = re.sub(r"\s+", "", text)
+    match = re.search(r"(?<!\d)([0-9*＊]{8,32})$", compact)
+    if match is None:
+        return text, ""
+
+    account = match.group(1)
+    prefix_length = match.start(1)
+    compact_seen = 0
+    prefix_chars: list[str] = []
+    for char in text:
+        if not char.isspace():
+            if compact_seen >= prefix_length:
+                break
+            compact_seen += 1
+        prefix_chars.append(char)
+    return "".join(prefix_chars).rstrip(), account
 
 
 def _extract_split_grid_records(
@@ -332,6 +384,7 @@ def _with_internal_row_sources(
         if isinstance(source, dict) and _positive_int(source.get("source_page")) is not None:
             source_page = _positive_int(source.get("source_page"))
             source.setdefault("page_range", [source_page, source_page])
+            _ensure_row_bbox_source_ref(source)
             continue
         source_page = _internal_source_page(transaction)
         if source_page is None:
@@ -339,7 +392,7 @@ def _with_internal_row_sources(
             if inferred is not None:
                 transaction["_source"] = inferred
             continue
-        transaction["_source"] = {
+        row_source: dict[str, Any] = {
             "source_page": source_page,
             "page_range": [source_page, source_page],
             **({"table_id": table_id} if (table_id := _internal_source_value(transaction, "_source_table_id")) else {}),
@@ -349,7 +402,37 @@ def _with_internal_row_sources(
                 else {}
             ),
         }
+        bbox_value = _internal_source_value(transaction, "_source_bbox")
+        try:
+            bbox = [float(value) for value in bbox_value.split(",")]
+        except ValueError:
+            bbox = []
+        if len(bbox) == 4:
+            row_source["bbox"] = bbox
+            _ensure_row_bbox_source_ref(row_source)
+        transaction["_source"] = row_source
     return transactions
+
+
+def _ensure_row_bbox_source_ref(source: dict[str, Any]) -> None:
+    """Expose a recovered row bbox through the standard audit source-ref path."""
+    bbox = source.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return
+    refs = source.get("source_refs")
+    if not isinstance(refs, list):
+        refs = []
+        source["source_refs"] = refs
+    if any(isinstance(ref, dict) and ref.get("bbox") == list(bbox) for ref in refs):
+        return
+    refs.append(
+        {
+            "source_page": source.get("source_page"),
+            "page_range": list(source.get("page_range") or []),
+            "bbox": list(bbox),
+            "source": "native_pdf_words",
+        }
+    )
 
 
 def _finalize_transactions(
@@ -995,6 +1078,8 @@ def _extract_internal_source_grid_records(
     tables: list[list[list[str]]],
     parse_result: Any | None = None,
     full_text: str = "",
+    *,
+    require_bbox: bool = False,
 ) -> list[dict[str, Any]]:
     transactions: list[dict[str, Any]] = []
     for tbl in tables:
@@ -1005,6 +1090,7 @@ def _extract_internal_source_grid_records(
                 idx
                 for idx, row in enumerate(tbl[:10])
                 if any(str(cell or "").strip() == "_source_page" for cell in row)
+                and (not require_bbox or any(str(cell or "").strip() == "_source_bbox" for cell in row))
                 and any("交易" in str(cell or "") for cell in row)
             ),
             -1,
@@ -1067,6 +1153,14 @@ def extract_transactions(ctx: StyleContext, plugin: Any) -> list[dict[str, Any]]
     if split_txns:
         return _finalize_transactions(split_txns, ctx.parse_result, ctx.full_text)
 
+    internal_source_batch = _extract_internal_source_grid_records(
+        ctx.tables,
+        ctx.parse_result,
+        ctx.full_text,
+        require_bbox=True,
+    )
+    if internal_source_batch:
+        return internal_source_batch
     tables = normalize_table_headers(ctx.tables, variant=variant)
     internal_source_batch = _extract_internal_source_grid_records(tables, ctx.parse_result, ctx.full_text)
     if internal_source_batch:
@@ -1135,7 +1229,7 @@ def _normalize_wrapped_temporal_fields(
         parsed = normalize_timestamp(temporal_candidate)
         if re.match(r"^\d{4}-\d{2}-\d{2}", parsed):
             out["date"] = parsed[:10]
-            if ":" in temporal_candidate:
+            if ":" in temporal_candidate or re.fullmatch(r"\d{6}", timestamp_compact):
                 out["timestamp"] = parsed
 
     balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
@@ -1174,29 +1268,76 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
 
 
 def refine_missing_directions_from_balance_chain(records: list[dict[str, Any]]) -> None:
-    """Infer only missing directions from adjacent balances in either row order."""
+    """Infer or correct directions when the source balance chain is unique."""
+    source_order = _record_source_order(records)
     for index, record in enumerate(records):
         normalized = record.get("normalized") or {}
-        if normalized.get("direction") in {"income", "expense"}:
-            continue
+        raw = record.get("raw") or {}
+        source_amount = _normalize_monetary_cell(_cell_value(raw, "交易金额", "金额", "发生额", "Amount"))
+        negative_reversal = source_amount is not None and source_amount < 0
         amount = _safe_float(normalized.get("amount"))
         balance = _safe_float(normalized.get("balance"))
-        if amount is None or amount <= 0 or balance is None:
-            continue
-
         candidates: set[str] = set()
-        if index > 0:
-            previous_balance = _safe_float((records[index - 1].get("normalized") or {}).get("balance"))
-            inferred = _direction_from_balance(previous_balance, amount, balance)
-            if inferred:
-                candidates.add(inferred)
-        if index + 1 < len(records):
-            next_balance = _safe_float((records[index + 1].get("normalized") or {}).get("balance"))
-            inferred = _direction_from_balance(next_balance, amount, balance)
-            if inferred:
-                candidates.add(inferred)
+        if amount is not None and amount > 0 and balance is not None:
+            if source_order != "reverse" and index > 0:
+                previous_balance = _safe_float((records[index - 1].get("normalized") or {}).get("balance"))
+                inferred = _direction_from_balance(previous_balance, amount, balance)
+                if inferred:
+                    candidates.add(inferred)
+            if source_order == "reverse" and index + 1 < len(records):
+                next_balance = _safe_float((records[index + 1].get("normalized") or {}).get("balance"))
+                inferred = _direction_from_balance(next_balance, amount, balance)
+                if inferred:
+                    candidates.add(inferred)
         if len(candidates) == 1:
             normalized["direction"] = candidates.pop()
+            continue
+        if normalized.get("direction") in {"income", "expense"} and not negative_reversal:
+            continue
+        if not negative_reversal:
+            semantic_direction = _direction_from_source_semantics(raw)
+            if semantic_direction:
+                normalized["direction"] = semantic_direction
+
+
+def _direction_from_source_semantics(raw: dict[str, Any]) -> str:
+    text = "".join(
+        _explicit_source_column_value(raw, aliases)
+        for aliases in (
+            ("摘要描述", "交易摘要", "摘要", "摘要/附言"),
+            ("交易附言", "附言", "用途", "备注"),
+        )
+    )
+    income = any(marker in text for marker in ("转入", "收入", "入账", "入息", "收款", "贷方"))
+    expense = any(marker in text for marker in ("转出", "支出", "出账", "付款", "支付", "借方"))
+    if income != expense:
+        return "income" if income else "expense"
+    return ""
+
+
+def _record_source_order(records: list[dict[str, Any]]) -> str:
+    dates = [str((record.get("normalized") or {}).get("date") or "") for record in records]
+    valid_dates = len(dates) >= 2 and all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) for value in dates)
+    date_increases = valid_dates and any(current > previous for previous, current in zip(dates, dates[1:]))
+    date_decreases = valid_dates and any(current < previous for previous, current in zip(dates, dates[1:]))
+    sequence_values: list[int] = []
+    for record in records:
+        value = str((record.get("normalized") or {}).get("sequence_no") or "").strip()
+        if re.fullmatch(r"\d{1,9}", value):
+            sequence_values.append(int(value))
+    if len(sequence_values) == len(records) and len(sequence_values) >= 2:
+        deltas = [current - previous for previous, current in zip(sequence_values, sequence_values[1:])]
+        if all(delta > 0 for delta in deltas) and not date_decreases:
+            return "forward"
+        if all(delta < 0 for delta in deltas) and not date_increases:
+            return "reverse"
+
+    if valid_dates:
+        if all(current >= previous for previous, current in zip(dates, dates[1:])):
+            return "forward"
+        if all(current <= previous for previous, current in zip(dates, dates[1:])):
+            return "reverse"
+    return "forward"
 
 
 def _direction_from_balance(previous_balance: float | None, amount: float, balance: float) -> str:

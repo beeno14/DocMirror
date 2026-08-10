@@ -65,6 +65,32 @@ def _titleless_bank_table(row_count: int = 10) -> TableBlock:
     return TableBlock(table_id="continuation", rows=rows)
 
 
+def _flattened_bank_ledger_result(row_count: int = 8) -> ParseResult:
+    header = TextBlock(
+        content=(
+            "交易日期 借方(出账) 贷方(入账) 余额摘要 "
+            "收(付)方名称 收(付)方账号 交易类型"
+        )
+    )
+    rows = [
+        TextBlock(
+            content=(
+                f"2025-01-{index + 1:02d} 10:20:30 {100 + index}.00 "
+                f"{5000 + index:,}.00 某某有限公司 1239173941100{index} 对公转账"
+            )
+        )
+        for index in range(row_count)
+    ]
+    collapsed_table = TableBlock(
+        table_id="collapsed",
+        rows=[TableRow(cells=[CellValue(text=row.content)]) for row in rows],
+    )
+    return ParseResult(
+        pages=[PageContent(page_number=1, texts=[header, *rows], tables=[collapsed_table])],
+        entities=DocumentEntities(document_type="unknown"),
+    )
+
+
 def test_bank_document_frame_survives_payment_channel_keyword_veto():
     document_text = "\n".join(
         [
@@ -439,6 +465,40 @@ def test_titleless_continuation_ledger_uses_strict_structure_fallback():
 
     assert structure_evidence[0].source == "bank_ledger_structure"
     assert classified.entities.document_type == "bank_statement"
+
+
+def test_flattened_debit_credit_ledger_uses_text_structure_fallback():
+    result = _flattened_bank_ledger_result()
+
+    structure_evidence = EvidenceEngine()._bank_ledger_structure_evidence(result, "")
+    classified = EvidenceEngine().process(result)
+
+    assert structure_evidence[0].source == "bank_ledger_structure"
+    assert "flattened bank ledger header" in structure_evidence[0].detail
+    assert classified.entities.document_type == "bank_statement"
+
+
+def test_sparse_flattened_debit_credit_ledger_stays_generic():
+    result = _flattened_bank_ledger_result(row_count=2)
+
+    evidence = EvidenceEngine()._bank_ledger_structure_evidence(result, "")
+
+    assert evidence == []
+
+
+def test_payment_platform_title_blocks_flattened_bank_structure_fallback():
+    result = _flattened_bank_ledger_result()
+    result.pages[0].texts.insert(
+        0,
+        TextBlock(content="微信支付交易明细证明", level=TextLevel.TITLE),
+    )
+
+    structure_evidence = EvidenceEngine()._bank_ledger_structure_evidence(
+        result,
+        "微信支付交易明细证明",
+    )
+
+    assert structure_evidence == []
 
 
 def test_payment_platform_title_blocks_bank_structure_fallback():
