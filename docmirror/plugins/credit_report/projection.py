@@ -19,11 +19,17 @@ _DEFAULT_RECORD_ID_KEYS = (
 )
 _REPAYMENT_RECORD_ID_KEYS = ("record_id", "repayment_id")
 _DATASET_RECORD_ID_KEYS = {
+    "enterprise_credit_detail_groups": ("record_id", "credit_detail_group_id"),
     "enterprise_credit_accounts": ("record_id", "account_id"),
     "enterprise_credit_facilities": ("record_id", "credit_line_id"),
     "enterprise_repayment_responsibility_accounts": (
         "record_id",
         "liability_id",
+    ),
+    "enterprise_account_annotations": ("record_id", "account_annotation_id"),
+    "enterprise_repayment_responsibility_group_details": (
+        "record_id",
+        "responsibility_group_detail_id",
     ),
     "enterprise_report_identity": ("record_id", "enterprise_identity_id"),
     "enterprise_dispute_overview": (
@@ -384,6 +390,7 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         )
 
         datasets = project_personal_detail_datasets(datasets)
+        variant.reconcile_final_v2_section_fields(domain_facts, field_details, datasets)
         # Compute row-conservation facts only after every assembled source
         # collection has entered v2. Source completeness remains explicit in
         # dataset_status and is not inferred from these projection counts.

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from docmirror.models.entities.parse_result import PageContent, ParserInfo, TableBlock
+from docmirror.models.entities.parse_result import PageContent, ParserInfo, TableBlock, TextBlock
 from docmirror.plugins.credit_report.business_assembly import assemble_credit_report_business
 from docmirror.plugins.credit_report.enterprise_native.pipeline import run_enterprise_pipeline
 from docmirror.plugins.credit_report.projection import _records
@@ -303,6 +303,7 @@ def test_assembly_quarantines_unresolved_repayment_status_from_ready_contract() 
 
 def test_enterprise_canonical_pipeline_preserves_physical_table_fields() -> None:
     result = _result()
+    result.pages[0].texts = [TextBlock(content="信贷记录明细")]
     result.pages[0].tables = [
         TableBlock(
             table_id="pt_1_0",

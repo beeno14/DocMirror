@@ -12,6 +12,9 @@ from typing import Any
 from docmirror.plugins.credit_report.repayment_grid import extract_credit_repayment_records
 
 _RANGE_ANCHOR_RE = re.compile(r"20\d{2}年\s*\d{1,2}月\s*[-—一至~～]\s*20\d{2}年\s*\d{1,2}月.*还款记录")
+_RANGE_ANCHOR_CANDIDATE_RE = re.compile(
+    r"\d{4}年\s*\d{1,2}月\s*[-—一至~～]\s*\d{4}年\s*\d{1,2}月.*还款记录"
+)
 _CONTINUATION_BOUNDARY_RE = re.compile(
     r"^\s*(?:[A-Za-z]\s*)?(?:[（(][一二三四五六七八九十]+[）)]|账户\s*\d*(?:[（(]|\s)|授信协议|查询记录)"
 )
@@ -40,16 +43,38 @@ def _date_range_only_grid(
     anchor_text = re.sub(r"\s+", "", _text(anchor))
     match = _RANGE_ANCHOR_RE.search(anchor_text)
     values = re.search(
-        r"(20\d{2})年(\d{1,2})月[-—一至~～](20\d{2})年(\d{1,2})月",
+        r"(\d{4})年(\d{1,2})月[-—一至~～](\d{4})年(\d{1,2})月",
         anchor_text,
     )
-    if match is None or values is None:
+    if values is None or _RANGE_ANCHOR_CANDIDATE_RE.search(anchor_text) is None:
         return None
     start_year, start_month, end_year, end_month = (int(value) for value in values.groups())
     width = max(float(page_width or 0.0), 120.0)
     left = min(40.0, width * 0.08)
     right = max(left + 12.0, width - left)
     step = (right - left) / 12.0
+    if match is None:
+        audit: dict[str, Any] = {
+            "reason": "repayment_date_range_unresolved",
+            "date_range_status": "unresolved",
+            "observed_date_components": {
+                "start_year": start_year,
+                "start_month": start_month,
+                "end_year": end_year,
+                "end_month": end_month,
+            },
+        }
+    else:
+        audit = {
+            "reason": "cross_page_or_unresolved_grid_geometry",
+            "date_range_status": "observed",
+            "date_range": {
+                "start_year": start_year,
+                "start_month": start_month,
+                "end_year": end_year,
+                "end_month": end_month,
+            },
+        }
     return {
         "grid_id": f"mg_p{page}_repayment_{grid_index}",
         "structure_kind": "micro_grid",
@@ -71,15 +96,7 @@ def _date_range_only_grid(
         "grid_type_hint": "credit_repayment_record",
         "geometry_source": "date_range_anchor_only",
         "confidence": 0.35,
-        "audit": {
-            "reason": "cross_page_or_unresolved_grid_geometry",
-            "date_range": {
-                "start_year": start_year,
-                "start_month": start_month,
-                "end_year": end_year,
-                "end_month": end_month,
-            },
-        },
+        "audit": audit,
     }
 
 
@@ -108,7 +125,7 @@ def augment_credit_repayment_evidence_bundles(
         if evidence.get("credit_cross_page_augmented"):
             continue
         lines = [dict(line) for line in evidence.get("lines") or [] if isinstance(line, dict)]
-        if not any(_RANGE_ANCHOR_RE.search(re.sub(r"\s+", "", _text(line))) for line in lines):
+        if not any(_RANGE_ANCHOR_CANDIDATE_RE.search(re.sub(r"\s+", "", _text(line))) for line in lines):
             continue
         leading: list[dict[str, Any]] = []
         for line in next_evidence.get("lines") or []:
@@ -116,7 +133,7 @@ def augment_credit_repayment_evidence_bundles(
                 continue
             text = _text(line)
             compact = re.sub(r"\s+", "", text)
-            if _RANGE_ANCHOR_RE.search(compact) or _CONTINUATION_BOUNDARY_RE.search(text):
+            if _RANGE_ANCHOR_CANDIDATE_RE.search(compact) or _CONTINUATION_BOUNDARY_RE.search(text):
                 break
             leading.append(dict(line))
         if not leading:
@@ -149,11 +166,15 @@ def materialize_credit_repayment_micro_grids(
     page_image: Any | None = None,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
+    enable_candidate_b_amount_pairing: bool = False,
 ) -> list[dict[str, Any]]:
     line_list = list(lines or [])
     anchor_indices = [
-        index for index, line in enumerate(line_list) if _RANGE_ANCHOR_RE.search(re.sub(r"\s+", "", _text(line)))
+        index
+        for index, line in enumerate(line_list)
+        if _RANGE_ANCHOR_CANDIDATE_RE.search(re.sub(r"\s+", "", _text(line)))
     ]
     grids: list[dict[str, Any]] = []
     for grid_index, start in enumerate(anchor_indices):
@@ -167,7 +188,9 @@ def materialize_credit_repayment_micro_grids(
             page_image=page_image,
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
+            enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
             grid_index=grid_index,
         )
         grid = out.get("micro_grid")
@@ -190,7 +213,9 @@ def materialize_credit_repayment_micro_grids_from_bundles(
     *,
     page_image_resolver: Any | None = None,
     enable_cell_ocr: bool = False,
+    enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
+    enable_candidate_b_amount_pairing: bool = False,
 ) -> list[dict[str, Any]]:
     """Materialize credit-only grids on a post-seal read view."""
     from docmirror.models.mirror.page_evidence_bundles import (
@@ -208,7 +233,9 @@ def materialize_credit_repayment_micro_grids_from_bundles(
             page_height=evidence.get("page_height"),
             page_image_resolver=page_image_resolver,
             enable_cell_ocr=enable_cell_ocr,
+            enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
+            enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
         )
         if grids:
             merge_micro_grid_structures_into_bundles(domain_specific, grids)

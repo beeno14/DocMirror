@@ -1,6 +1,8 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 from docmirror.models.mirror.page_evidence_bundles import (
     domain_specific_with_page_bundles,
     micro_grid_structures_from_bundles,
@@ -10,6 +12,9 @@ from docmirror.plugins.credit_report.micro_grid_materialize import (
     augment_credit_repayment_evidence_bundles,
     materialize_credit_repayment_micro_grids,
     materialize_credit_repayment_micro_grids_from_bundles,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+    link_candidate_b_repayments,
 )
 from docmirror.plugins.credit_report.repayment_grid import records_from_micro_grid_dict
 from tests.unit.test_scanned_micro_grid_repayment import _credit_page4_lines, _credit_page4_tokens
@@ -67,6 +72,44 @@ def test_multiple_date_range_anchors_materialize_without_dropping_unresolved_gri
     unresolved = records_from_micro_grid_dict(grids[1])
     assert len(unresolved) == 3
     assert {record["status"] for record in unresolved} == {"unknown"}
+
+
+def test_damaged_repayment_range_anchor_is_retained_as_unresolved_witness() -> None:
+    damaged_anchor = "2022\u5e7401\u6708-2124\u5e7407\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55"
+
+    grids = materialize_credit_repayment_micro_grids(
+        lines=[{"text": damaged_anchor, "bbox": [100, 100, 420, 120]}],
+        page=4,
+        page_width=600,
+        page_height=800,
+    )
+
+    assert len(grids) == 1
+    witness = grids[0]
+    assert witness["anchor_text"] == damaged_anchor
+    assert witness["audit"]["date_range_status"] == "unresolved"
+    assert "date_range" not in witness["audit"]
+    assert records_from_micro_grid_dict(witness) == []
+
+
+def test_unresolved_repayment_range_witness_emits_explicit_issue() -> None:
+    damaged_anchor = "2022\u5e7401\u6708-2124\u5e7407\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55"
+    grids = materialize_credit_repayment_micro_grids(
+        lines=[{"text": damaged_anchor, "bbox": [100, 100, 420, 120]}],
+        page=4,
+        page_width=600,
+        page_height=800,
+    )
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    assert link_candidate_b_repayments([], [], grids, issue_context=context) == []
+    assert len(context._personal_detail_extraction_issues) == 1
+    issue = context._personal_detail_extraction_issues[0]
+    assert issue["issue_code"] == "candidate_b_monthly_date_range_unresolved"
+    assert issue["target_dataset"] == "repayment_records"
+    assert issue["observed_value"]["grid_id"] == "mg_p4_repayment_0"
+    assert issue["observed_value"]["anchor_text"] == damaged_anchor
+    assert "corrected_date_range" not in issue.get("candidate_value", {})
 
 
 def test_cross_page_leading_rows_are_appended_only_to_micro_grid_evidence() -> None:

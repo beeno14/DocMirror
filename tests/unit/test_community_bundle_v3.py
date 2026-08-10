@@ -279,6 +279,94 @@ def test_enhanced_markdown_omits_sections_without_renderable_content() -> None:
     assert "**状态:** 正常" in enhanced
 
 
+def test_enhanced_markdown_hides_configured_datasets_and_empty_columns() -> None:
+    payload = {
+        "schema": {"name": "docmirror.community"},
+        "document": {"id": "doc_filtered", "title": "测试报告", "type": "generic"},
+        "domain": {
+            "extensions": {
+                "enhanced_markdown": {
+                    "suppress_empty_sections": True,
+                    "suppress_empty_columns": True,
+                    "dataset_layouts": {
+                        "diagnostics": {"hidden": True},
+                        "business": {
+                            "mode": "record_cards",
+                            "hide_record_titles": True,
+                            "columns": ["name", "unused"],
+                        },
+                    },
+                }
+            }
+        },
+        "sections": [
+            {
+                "id": "sec_diagnostics",
+                "title": "诊断",
+                "type": "diagnostics",
+                "items": [],
+                "groups": [],
+                "dataset_refs": ["ds_diagnostics"],
+            },
+            {
+                "id": "sec_business",
+                "title": "业务",
+                "type": "business",
+                "items": [],
+                "groups": [],
+                "dataset_refs": ["ds_business"],
+            },
+        ],
+        "datasets": [
+            {
+                "id": "ds_diagnostics",
+                "name": "diagnostics",
+                "label": "诊断数据",
+                "columns": [{"key": "status", "label": "状态", "type": "string"}],
+                "rows": [{"normalized": {"status": "debug"}}],
+            },
+            {
+                "id": "ds_business",
+                "name": "business",
+                "label": "业务数据",
+                "columns": [
+                    {"key": "name", "label": "名称", "type": "string"},
+                    {"key": "unused", "label": "空字段", "type": "string"},
+                ],
+                "rows": [{"normalized": {"name": "示例企业", "unused": None}}],
+            },
+        ],
+        "reading": {
+            "document_flow": [
+                {"order": 1, "kind": "document", "ref_id": "doc_filtered"},
+                {"order": 2, "kind": "section", "ref_id": "sec_diagnostics"},
+                {"order": 3, "kind": "dataset", "ref_id": "ds_diagnostics"},
+                {"order": 4, "kind": "section", "ref_id": "sec_business"},
+                {"order": 5, "kind": "dataset", "ref_id": "ds_business"},
+            ],
+            "tables": [
+                {"dataset_id": "ds_diagnostics", "title": "诊断数据", "column_keys": ["status"]},
+                {"dataset_id": "ds_business", "title": "业务数据", "column_keys": ["name", "unused"]},
+            ],
+        },
+    }
+
+    enhanced = render_community_reading_markdown(payload)
+
+    assert "## 诊断" not in enhanced
+    assert "debug" not in enhanced
+    assert "## 业务" in enhanced
+    assert "#### 记录 1" not in enhanced
+    assert "**名称:** 示例企业" in enhanced
+    assert "空字段" not in enhanced
+
+    payload["domain"]["extensions"] = {}
+    default_markdown = render_community_reading_markdown(payload)
+    assert "## 诊断" in default_markdown
+    assert "debug" in default_markdown
+    assert "空字段" in default_markdown
+
+
 def test_semantic_extension_can_override_dataset_reading_columns() -> None:
     result = _with_projection(
         ParseResult(entities=DocumentEntities(document_type="credit_report")),
@@ -342,7 +430,7 @@ def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None
         "projector_id": "bank_statement",
         "document_type": "bank_statement",
         "domain_facts": {
-            "source_reported_transaction_count": 2,
+            "expected_primary_rows": 2,
         },
         "datasets": {
             "records": [
@@ -361,7 +449,7 @@ def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None
         "emitted_row_count": 2,
         "omitted_row_count": 0,
         "verified": True,
-        "basis": "source_footer_transaction_count",
+        "basis": "bank_expected_primary_rows",
     }
     assert payload["warnings"] == []
 
@@ -931,6 +1019,145 @@ def test_partitioned_tables_use_declared_order_and_type_specific_columns() -> No
     assert "#### 其他账户" in enhanced
     assert "其他机构" in enhanced
     assert "2,240,000" not in enhanced
+
+
+def test_partitioned_tables_prepend_only_joined_companion_rows() -> None:
+    def render(overdue_rows: list[dict]) -> tuple[str, dict]:
+        candidate = _candidate()
+        candidate["data"]["credit_accounts"] = [
+            {
+                "account_id": "card:1",
+                "source_section": "credit_cards",
+                "sequence": 1,
+                "institution": "发卡银行",
+                "credit_limit": 10000,
+            },
+            {
+                "account_id": "loan:1",
+                "source_section": "loans",
+                "sequence": 1,
+                "institution": "贷款银行",
+                "loan_amount": 20000,
+            },
+        ]
+        candidate["data"]["overdue_records"] = overdue_rows
+        candidate["data"]["data_dictionary"]["datasets"].update(
+            {
+                "credit_accounts": {
+                    "columns": {
+                        "account_id": {"label": "账户记录ID", "type": "string"},
+                        "source_section": {"label": "来源章节", "type": "string"},
+                        "sequence": {"label": "组内序号", "type": "integer"},
+                        "institution": {"label": "管理机构", "type": "string"},
+                        "credit_limit": {"label": "信用额度", "type": "money"},
+                        "loan_amount": {"label": "贷款发放金额", "type": "money"},
+                    }
+                },
+                "overdue_records": {
+                    "columns": {
+                        "overdue_id": {"label": "逾期记录ID", "type": "string"},
+                        "account_id": {"label": "账户记录ID", "type": "string"},
+                        "sequence": {"label": "组内序号", "type": "integer"},
+                        "institution": {"label": "管理机构", "type": "string"},
+                        "overdue_months": {
+                            "label": "最近5年逾期月数",
+                            "type": "integer",
+                        },
+                    }
+                },
+            }
+        )
+        result = _with_projection(
+            ParseResult(entities=DocumentEntities(document_type="credit_report")),
+            candidate,
+        )
+        prepend_columns = ["sequence", "institution", "overdue_months"]
+        _PROJECTIONS[id(result)]["semantic"] = {
+            "enhanced_markdown": {
+                "dataset_layouts": {
+                    "overdue_records": {"hidden": True},
+                    "credit_accounts": {
+                        "mode": "partitioned_tables",
+                        "partition_by": "source_section",
+                        "partitions": [
+                            {
+                                "value": "credit_cards",
+                                "title": "信用卡",
+                                "prepend_partition": {
+                                    "dataset": "overdue_records",
+                                    "join_on": "account_id",
+                                    "title": "信用卡逾期记录",
+                                    "columns": prepend_columns,
+                                },
+                                "columns": [
+                                    "sequence",
+                                    "institution",
+                                    "credit_limit",
+                                ],
+                            },
+                            {
+                                "value": "loans",
+                                "title": "贷款",
+                                "prepend_partition": {
+                                    "dataset": "overdue_records",
+                                    "join_on": "account_id",
+                                    "title": "贷款逾期记录",
+                                    "columns": prepend_columns,
+                                },
+                                "columns": [
+                                    "sequence",
+                                    "institution",
+                                    "loan_amount",
+                                ],
+                            },
+                        ],
+                    },
+                }
+            }
+        }
+        bundle = project_community_bundle(result, document_id="doc_joined_prepend")
+        semantic = bundle.semantic_payload()
+        return bundle.render_enhanced_markdown(semantic), bundle.json_payload(semantic)
+
+    card_overdue = {
+        "overdue_id": "overdue:card:1",
+        "account_id": "card:1",
+        "sequence": 1,
+        "institution": "发卡银行",
+        "overdue_months": 2,
+    }
+    loan_overdue = {
+        "overdue_id": "overdue:loan:1",
+        "account_id": "loan:1",
+        "sequence": 1,
+        "institution": "贷款银行",
+        "overdue_months": 3,
+    }
+
+    enhanced, payload = render([card_overdue, loan_overdue])
+    assert enhanced.index("#### 信用卡逾期记录") < enhanced.index("#### 信用卡\n")
+    assert enhanced.index("#### 信用卡\n") < enhanced.index("#### 贷款逾期记录")
+    assert enhanced.index("#### 贷款逾期记录") < enhanced.index("#### 贷款\n")
+    assert enhanced.count("| 1 | 发卡银行 | 2 |") == 1
+    assert enhanced.count("| 1 | 贷款银行 | 3 |") == 1
+    assert "### overdue records" not in enhanced
+    assert next(
+        dataset for dataset in payload["datasets"] if dataset["name"] == "overdue_records"
+    )["row_count"] == 2
+
+    card_only, _payload = render([card_overdue])
+    assert "#### 信用卡逾期记录" in card_only
+    assert "#### 贷款逾期记录" not in card_only
+    assert "#### 贷款\n" in card_only
+
+    loan_only, _payload = render([loan_overdue])
+    assert "#### 信用卡逾期记录" not in loan_only
+    assert "#### 信用卡\n" in loan_only
+    assert "#### 贷款逾期记录" in loan_only
+
+    no_overdue, _payload = render([])
+    assert "信用卡逾期记录" not in no_overdue
+    assert "贷款逾期记录" not in no_overdue
 
 
 def test_audit_reconciliation_can_render_in_appendix_and_audit_csv_only() -> None:

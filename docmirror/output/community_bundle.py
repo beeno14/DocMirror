@@ -786,6 +786,11 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         privacy_mode = "full"
     sections = {str(section.get("id") or ""): section for section in payload.get("sections") or []}
     datasets = {str(dataset.get("id") or ""): dataset for dataset in payload.get("datasets") or []}
+    datasets_by_name = {
+        str(dataset.get("name") or ""): dataset
+        for dataset in datasets.values()
+        if dataset.get("name")
+    }
     reading = payload.get("reading") or {}
     tables = {str(table.get("dataset_id") or ""): table for table in reading.get("tables") or []}
     parts = [
@@ -865,17 +870,46 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         section: dict[str, Any],
         layout: dict[str, Any] | None,
     ) -> bool:
-        if section.get("items") or section.get("groups") or section.get("dataset_refs"):
+        if any(
+            not (
+                isinstance(dataset_layouts.get(str(datasets.get(str(ref_id), {}).get("name") or "")), dict)
+                and dataset_layouts[str(datasets.get(str(ref_id), {}).get("name") or "")].get("hidden", False)
+            )
+            for ref_id in section.get("dataset_refs") or []
+            if str(ref_id) in datasets
+        ):
             return True
         if not isinstance(layout, dict):
-            return False
-        return any(
+            return bool(section.get("items") or section.get("groups"))
+        items, groups = section_pools(section)
+        hidden_fields = {str(key) for key in layout.get("hidden_fields") or []}
+        hidden_groups = {str(key) for key in layout.get("hidden_groups") or []}
+        if not layout.get("omit_unlisted", False):
+            if any(key not in hidden_fields for key in items):
+                return True
+            if any(key not in hidden_groups and group.get("items") for key, group in groups.items()):
+                return True
+        if any(
             document_item(spec) is not None
             for group_spec in layout.get("groups") or []
             if isinstance(group_spec, dict)
             for spec in group_spec.get("document_fields") or []
             if isinstance(spec, dict)
-        )
+        ):
+            return True
+        for group_spec in layout.get("groups") or []:
+            if not isinstance(group_spec, dict):
+                continue
+            if any(configured_item(reference, items) is not None for reference in group_spec.get("fields") or []):
+                return True
+            if any(
+                str(group_key) in groups
+                and str(group_key) not in hidden_groups
+                and groups[str(group_key)].get("items")
+                for group_key in group_spec.get("nested_groups") or []
+            ):
+                return True
+        return False
 
     rendered_sections: set[str] = set()
     section_layouts = (
@@ -934,7 +968,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                             item_line(item) for item in group.get("items") or [] if isinstance(item, dict)
                         )
                     if group_parts:
-                        parts.append(f"### {_markdown_text(group_spec.get('title') or '概要')}")
+                        if not group_spec.get("hide_title", False):
+                            parts.append(f"### {_markdown_text(group_spec.get('title') or '概要')}")
                         parts.extend(group_parts)
                 if not layout.get("omit_unlisted", False):
                     parts.extend(item_line(item) for key, item in items.items() if key not in rendered_item_keys)
@@ -959,6 +994,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         dataset_layout = dataset_layouts.get(str(dataset.get("name") or ""))
         if not isinstance(dataset_layout, dict):
             dataset_layout = {}
+        if dataset_layout.get("hidden", False):
+            continue
         if dataset_layout.get("placement") == "appendix":
             deferred_appendix_datasets.append((dataset, table, dataset_layout))
             continue
@@ -967,15 +1004,26 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         column_by_key = {
             str(column.get("key") or ""): column for column in dataset.get("columns") or [] if column.get("key")
         }
-        configured_keys = dataset_layout.get("columns") or table.get("column_keys") or []
-        keys = [str(key) for key in configured_keys if str(key) in column_by_key]
-        if not keys:
-            parts.append("_No displayable columns._")
-            continue
         def row_value(row: dict[str, Any], key: str) -> Any:
             normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
             canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
             return normalized.get(key, canonical_raw.get(key))
+
+        dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
+        configured_keys = dataset_layout.get("columns") or table.get("column_keys") or []
+        keys = [str(key) for key in configured_keys if str(key) in column_by_key]
+        if dataset_layout.get(
+            "suppress_empty_columns",
+            presentation.get("suppress_empty_columns", False),
+        ):
+            keys = [
+                key
+                for key in keys
+                if any(row_value(row, key) not in (None, "", [], {}) for row in dataset_rows)
+            ]
+        if not keys:
+            parts.append("_No displayable columns._")
+            continue
 
         def display_value(row: dict[str, Any], key: str) -> str:
             return _markdown_display(
@@ -1001,7 +1049,6 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                 lines.append("| " + " | ".join(values) + " |")
             return "\n".join(lines)
 
-        dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
         if dataset_layout.get("mode") == "partitioned_tables":
             partition_by = str(dataset_layout.get("partition_by") or "")
             partition_specs = [
@@ -1016,6 +1063,100 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
             for row in dataset_rows:
                 partition_value = str(row_value(row, partition_by) or "unknown")
                 grouped.setdefault(partition_value, []).append(row)
+
+            def prepend_partition(
+                spec: dict[str, Any],
+                primary_rows: list[dict[str, Any]],
+            ) -> None:
+                config = spec.get("prepend_partition")
+                if not isinstance(config, dict):
+                    return
+                companion = datasets_by_name.get(str(config.get("dataset") or ""))
+                join_on = str(config.get("join_on") or "")
+                if companion is None or not join_on:
+                    return
+                join_values = {
+                    str(value)
+                    for row in primary_rows
+                    if (value := row_value(row, join_on)) not in (None, "")
+                }
+                if not join_values:
+                    return
+
+                companion_columns = {
+                    str(column.get("key") or ""): column
+                    for column in companion.get("columns") or []
+                    if column.get("key")
+                }
+
+                def companion_value(row: dict[str, Any], key: str) -> Any:
+                    normalized = (
+                        row.get("normalized")
+                        if isinstance(row.get("normalized"), dict)
+                        else {}
+                    )
+                    canonical_raw = (
+                        row.get("canonical_raw")
+                        if isinstance(row.get("canonical_raw"), dict)
+                        else {}
+                    )
+                    return normalized.get(key, canonical_raw.get(key))
+
+                companion_rows = [
+                    row
+                    for row in companion.get("rows") or []
+                    if isinstance(row, dict)
+                    and str(companion_value(row, join_on)) in join_values
+                ]
+                if not companion_rows:
+                    return
+                companion_table = tables.get(str(companion.get("id") or "")) or {}
+                configured_columns = (
+                    config.get("columns")
+                    or companion_table.get("column_keys")
+                    or []
+                )
+                companion_keys = [
+                    str(key)
+                    for key in configured_columns
+                    if str(key) in companion_columns
+                ]
+                if not companion_keys:
+                    return
+                parts.append(
+                    f"#### {_markdown_text(config.get('title') or companion_table.get('title') or companion.get('label'))}"
+                )
+                parts.append(
+                    "\n".join(
+                        [
+                            "| "
+                            + " | ".join(
+                                _markdown_text(
+                                    companion_columns[key].get("label") or key
+                                )
+                                for key in companion_keys
+                            )
+                            + " |",
+                            "| " + " | ".join("---" for _ in companion_keys) + " |",
+                            *[
+                                "| "
+                                + " | ".join(
+                                    _markdown_display(
+                                        companion_value(row, key),
+                                        key=key,
+                                        descriptor=companion_columns[key],
+                                        dictionary=dictionary,
+                                        privacy_mode=privacy_mode,
+                                    )
+                                    for key in companion_keys
+                                )
+                                + " |"
+                                for row in companion_rows
+                            ],
+                        ]
+                    )
+                )
+
             rendered_values: set[str] = set()
             for spec in partition_specs:
                 partition_value = str(spec["value"])
@@ -1027,6 +1168,7 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                     for key in spec.get("columns") or []
                     if str(key) in column_by_key
                 ]
+                prepend_partition(spec, rows)
                 parts.append(
                     f"#### {_markdown_text(spec.get('title') or partition_value)}"
                 )
@@ -1060,9 +1202,10 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
                     for key in title_fields
                     if row_value(row, key) not in (None, "", [], {})
                 ]
-                parts.append(
-                    f"#### {_markdown_text(title_separator.join(title_values) or f'记录 {index}')}"
-                )
+                if not dataset_layout.get("hide_record_titles", False):
+                    parts.append(
+                        f"#### {_markdown_text(title_separator.join(title_values) or f'记录 {index}')}"
+                    )
                 for key in keys:
                     value = row_value(row, key)
                     if value in (None, "", [], {}):
@@ -1546,6 +1689,14 @@ def _semantic_source_structure(
     def next_heading(index: int) -> int:
         return next((value for value in ordered_heading_indexes if value > index), len(blocks))
 
+    explicit_heading_claims = {
+        section_id: set(range(index, next_heading(index)))
+        for section_id, index in heading_indexes.items()
+    }
+    all_explicit_heading_claims = {
+        index for claimed in explicit_heading_claims.values() for index in claimed
+    }
+
     dataset_indexes_by_section: dict[str, list[int]] = {}
     for dataset in datasets:
         section_id = str(dataset.get("section_id") or "")
@@ -1618,7 +1769,16 @@ def _semantic_source_structure(
                 semantic_sections.append(public)
                 continue
             start, end = int(page_range[0]), int(page_range[1])
-            public["block_refs"] = [str(block["id"]) for block in blocks if start <= int(block.get("page") or 1) <= end]
+            section_indexes = {
+                index
+                for index, block in enumerate(blocks)
+                if start <= int(block.get("page") or 1) <= end
+            }
+            section_indexes.update(claimed_by_dataset_sections.get(section_id, set()))
+            section_indexes.difference_update(all_explicit_heading_claims)
+            public["block_refs"] = [
+                str(blocks[index]["id"]) for index in sorted(section_indexes)
+            ]
             public["source_table_refs"] = [
                 str(table["id"]) for table in source_tables if start <= int(table.get("page") or 1) <= end
             ]

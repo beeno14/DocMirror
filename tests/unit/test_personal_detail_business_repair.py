@@ -152,3 +152,62 @@ def test_structurally_missing_business_record_enters_the_page_repair_plan() -> N
     assert plan.affected_pages == (20,)
     assert plan.uncertainties[0].dataset_name == "credit_accounts"
     assert "candidate_b_unmatched_account_table_suppressed" in plan.uncertainties[0].reason_codes
+
+
+def test_numeric_monthly_status_without_amount_is_withheld_and_explicitly_reported() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "repayment_records": [
+            {
+                "repayment_id": "repayment:2024-01",
+                "year": 2024,
+                "month": 1,
+                "status": "2",
+                "overdue_amount": None,
+                "source_refs": [{"logical_page": 4, "geometry_scope": "table"}],
+                "source_cell_refs": [
+                    {
+                        "logical_page": 4,
+                        "bbox": [10, 20, 30, 40],
+                        "geometry_scope": "cell",
+                        "field_name": "status",
+                    },
+                    {
+                        "logical_page": 4,
+                        "bbox": [10, 40, 30, 60],
+                        "geometry_scope": "cell",
+                        "field_name": "overdue_amount",
+                    },
+                ],
+            }
+        ]
+    }
+
+    plan = BusinessUncertaintyRepairCoordinator(SimpleNamespace()).plan(
+        payload,
+        canonical_audit={"unresolved_pages": []},
+    )
+    corrected = overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
+    anomalies = overlay.audit()["cell_anomalies"]
+
+    assert corrected["repayment_records"][0]["status"] == "unknown"
+    assert corrected["repayment_records"][0]["canonical_raw"]["status"] == "2"
+    assert corrected["repayment_records"][0]["overdue_amount"] is None
+    status_issue = next(
+        anomaly
+        for anomaly in anomalies
+        if anomaly["field_name"] == "status_code"
+        and "monthly_status_amount_unresolved" in anomaly["reason_codes"]
+    )
+    assert status_issue["value"] == "2"
+    assert status_issue["normalized_value_withheld"] is True
+    assert status_issue["source_refs"][0]["field_name"] == "status"
+    amount_issue = next(
+        anomaly
+        for anomaly in anomalies
+        if anomaly["field_name"] == "overdue_amount"
+        and "monthly_status_amount_unresolved" in anomaly["reason_codes"]
+    )
+    assert amount_issue["source_refs"][0]["field_name"] == "overdue_amount"
+    amount_uncertainty = next(item for item in plan.uncertainties if item.field_name == "overdue_amount")
+    assert amount_uncertainty.source_refs[0]["bbox"] == [10, 40, 30, 60]

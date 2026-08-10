@@ -96,3 +96,29 @@ def test_visual_month_geometry_uses_table_rules_not_header_text_bbox():
     assert audit["source"] == "vertical_rule_projection"
     assert refined[0]["bbox"][0] == pytest.approx(40, abs=2)
     assert refined[-1]["bbox"][2] == pytest.approx(280, abs=2)
+
+
+def test_visual_month_geometry_rejects_collapsed_ocr_word_before_cropping():
+    image = np.full((600, 455, 3), 255, dtype=np.uint8)
+    for x in range(79, 404, 27):
+        cv2.line(image, (x, 210), (x, 330), (0, 0, 0), 2)
+    collapsed = equal_col_bands(
+        (282.64, 225.0, 298.10, 238.5),
+        count=12,
+        start_index=1,
+        role="month",
+    )
+
+    refined, audit = _visual_month_col_bands(
+        collapsed,
+        page_image=image,
+        page_width=455,
+        page_height=600,
+        y0=210,
+        y1=330,
+    )
+
+    assert refined == []
+    assert audit["source"] == "rejected_month_geometry"
+    assert audit["usable"] is False
+    assert audit["reason"] in {"implausible_page_coverage", "implausible_cell_aspect"}
