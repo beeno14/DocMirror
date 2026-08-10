@@ -13,6 +13,7 @@ OCR-confusion aliases may authorize a business field binding.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -937,6 +938,131 @@ class PBOCPersonalDetailNativeParser:
     def _ocr_rows(cls, page: dict[str, Any]) -> list[list[str]]:
         return [[cell.text for cell in row] for row in cls._ocr_positioned_rows(page)]
 
+    def _validated_evidence_page_order(
+        self,
+        pages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[int, int] | None]:
+        """Return corrected pages in one complete authoritative document order."""
+
+        materialized = list(pages)
+        logical_pages: list[int] = []
+        try:
+            for page in materialized:
+                logical_page = int(page.get("page") or 0)
+                if logical_page <= 0:
+                    return materialized, None
+                logical_pages.append(logical_page)
+        except (AttributeError, TypeError, ValueError):
+            return materialized, None
+        if len(set(logical_pages)) <= 1:
+            return materialized, {
+                logical_page: 1 for logical_page in set(logical_pages)
+            }
+
+        resolution = getattr(self.context, "reading_order_resolution", None)
+        raw_order = getattr(self.context, "reading_order_by_logical", None)
+        if not (
+            isinstance(resolution, Mapping)
+            and resolution.get("resolved") is True
+            and resolution.get("authoritative") is True
+            and isinstance(raw_order, Mapping)
+            and raw_order
+        ):
+            return materialized, None
+
+        order: dict[int, int] = {}
+        try:
+            for raw_logical, raw_position in raw_order.items():
+                if isinstance(raw_logical, bool) or isinstance(raw_position, bool):
+                    return materialized, None
+                logical_page = int(raw_logical)
+                position = int(raw_position)
+                if logical_page <= 0 or position <= 0 or logical_page in order:
+                    return materialized, None
+                order[logical_page] = position
+        except (TypeError, ValueError):
+            return materialized, None
+        positions = list(order.values())
+        if len(positions) != len(set(positions)) or sorted(positions) != list(
+            range(1, len(positions) + 1)
+        ):
+            return materialized, None
+
+        required_pages = set(logical_pages)
+        for page in getattr(self.context, "pages", None) or []:
+            try:
+                logical_page = int(getattr(page, "page_number", 0) or 0)
+            except (TypeError, ValueError):
+                return materialized, None
+            if logical_page <= 0:
+                return materialized, None
+            required_pages.add(logical_page)
+        if not required_pages.issubset(order):
+            return materialized, None
+
+        ordered = [
+            page
+            for _index, page in sorted(
+                enumerate(materialized),
+                key=lambda item: (order[int(item[1].get("page") or 0)], item[0]),
+            )
+        ]
+        return ordered, order
+
+    def _record_evidence_page_order_unresolved(
+        self,
+        dataset_name: str,
+        pages: list[dict[str, Any]],
+    ) -> None:
+        """Localize corrected-page evidence withheld from an unproven order."""
+
+        target_dataset = (
+            dataset_name
+            if dataset_name != "report_header"
+            else "personal_report_metadata"
+        )
+        refs = tuple(
+            {
+                "source": "personal_detail_corrected_page_rows",
+                "logical_page": int(page.get("page") or 0),
+                "source_page": int(page.get("source_page") or page.get("page") or 0),
+                "geometry_scope": "logical_page",
+            }
+            for page in pages
+            if isinstance(page, Mapping) and int(page.get("page") or 0) > 0
+        )
+        resolution = getattr(self.context, "reading_order_resolution", None)
+        raw_order = getattr(self.context, "reading_order_by_logical", None)
+        record_issue(
+            self.context,
+            make_issue(
+                category="page_continuation",
+                issue_code="candidate_b_native_evidence_page_order_unresolved",
+                message=(
+                    "Corrected-page native evidence was not joined or promoted because "
+                    "its document reading order was incomplete or non-authoritative."
+                ),
+                parser_stage="candidate_b_native_evidence_page_order",
+                target_dataset=target_dataset,
+                observed_value={
+                    "logical_pages": [int(page.get("page") or 0) for page in pages],
+                    "reading_order_resolution": (
+                        dict(resolution) if isinstance(resolution, Mapping) else None
+                    ),
+                    "registered_reading_order": (
+                        dict(raw_order) if isinstance(raw_order, Mapping) else None
+                    ),
+                },
+                source_refs=refs,
+                reason_codes=(
+                    "corrected_page_population",
+                    "authoritative_complete_order_required",
+                    "cross_page_state_not_carried",
+                    "record_not_invented",
+                ),
+            ),
+        )
+
     def _evidence_record_groups(
         self,
         dataset_name: str,
@@ -945,11 +1071,15 @@ class PBOCPersonalDetailNativeParser:
         loader = getattr(self.context, "corrected_evidence_pages", None)
         if not callable(loader):
             return []
-        pages = loader() or []
+        raw_pages = loader() or []
+        pages, reading_order = self._validated_evidence_page_order(raw_pages)
         if dataset_name == "report_header":
             if not pages:
                 return []
-            page = min(pages, key=lambda item: int(item.get("page") or 0))
+            if len({int(page.get("page") or 0) for page in pages}) > 1 and reading_order is None:
+                self._record_evidence_page_order_unresolved(dataset_name, pages)
+                return []
+            page = pages[0]
             logical_page = int(page.get("page") or 0)
             source_page = int(page.get("source_page") or logical_page)
             rows = self._ocr_positioned_rows(page)
@@ -979,6 +1109,7 @@ class PBOCPersonalDetailNativeParser:
         current_refs: list[dict[str, Any]] = []
         referenced_pages: set[tuple[int, int]] = set()
         liability_party_category = ""
+        previous_logical_page: int | None = None
 
         def flush() -> None:
             nonlocal current_rows, current_has_primary, current_refs, referenced_pages
@@ -996,6 +1127,42 @@ class PBOCPersonalDetailNativeParser:
         for page in pages:
             logical_page = int(page.get("page") or 0)
             source_page = int(page.get("source_page") or 0)
+            page_rows = self._ocr_positioned_rows(page)
+            page_compact_rows = [
+                _compact("".join(_cell_text(cell) for cell in row))
+                for row in page_rows
+            ]
+            same_page = bool(
+                logical_page > 0 and previous_logical_page == logical_page
+            )
+            adjacent_page = bool(
+                reading_order is not None
+                and previous_logical_page in reading_order
+                and logical_page in reading_order
+                and reading_order[logical_page]
+                == reading_order[previous_logical_page] + 1
+            )
+            if (
+                active
+                and previous_logical_page is not None
+                and not same_page
+                and not adjacent_page
+            ):
+                flush()
+                active = False
+                liability_party_category = ""
+                starts_new_section = any(heading in text for text in page_compact_rows)
+                fragment_labels = set(_SECTION_MARKERS.get(dataset_name, ()))
+                if dataset_name == "credit_lines":
+                    fragment_labels.update(_CREDIT_AGREEMENT_INLINE_LABELS)
+                elif dataset_name == "repayment_liability_records":
+                    fragment_labels.update(_PACKED_LIABILITY_LABEL_FIELDS)
+                if not starts_new_section and any(
+                    label in text
+                    for text in page_compact_rows
+                    for label in fragment_labels
+                ):
+                    self._record_evidence_page_order_unresolved(dataset_name, [page])
             page_key = (logical_page, source_page)
             page_ref = {
                 "source": "personal_detail_corrected_page_rows",
@@ -1003,7 +1170,7 @@ class PBOCPersonalDetailNativeParser:
                 "source_page": source_page,
                 "geometry_scope": "logical_page",
             }
-            for row in self._ocr_positioned_rows(page):
+            for row in page_rows:
                 compact = _compact("".join(_cell_text(cell) for cell in row))
                 if heading in compact:
                     flush()
@@ -1059,6 +1226,7 @@ class PBOCPersonalDetailNativeParser:
                         }
                     )
                     referenced_pages.add(page_key)
+            previous_logical_page = logical_page
         flush()
         return groups
 

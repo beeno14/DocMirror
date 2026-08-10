@@ -4,10 +4,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
+from docmirror.plugins.credit_report.personal_detail_scanned import (
+    native_extraction,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned import (
+    schema as personal_detail_schema,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     _printed_reading_order_resolution,
     build_personal_detail_extraction_context,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+    PBOCPersonalDetailNativeParser,
 )
 
 
@@ -229,6 +237,47 @@ def test_exact_inquiry_table_localizes_two_missing_ordinals_without_emission() -
     assert len(issues) == 2
     assert {issue["source_refs"][0]["row"] for issue in issues} == {2, 5}
     assert all(issue.get("field_name") == "sequence" for issue in issues)
+    unresolved_targets = {
+        str(issue.get("target_record_id") or "") for issue in issues
+    }
+    assert len(unresolved_targets) == 2
+    assert all(
+        target.startswith("credit_inquiry_unresolved_sequence:")
+        for target in unresolved_targets
+    )
+    emitted_inquiry_ids = {
+        str(record.get("inquiry_id") or "") for record in records
+    }
+    assert unresolved_targets.isdisjoint(emitted_inquiry_ids)
+
+    compact_issues, evidence_rows = personal_detail_schema._issue_evidence_rows(issues)
+    reasons_by_issue: dict[str, set[str]] = {}
+    for evidence in evidence_rows:
+        if evidence.get("evidence_kind") == "reason" and evidence.get("string_value"):
+            reasons_by_issue.setdefault(
+                str(evidence["extraction_issue_id"]), set()
+            ).add(str(evidence["string_value"]))
+    non_emission_markers = (
+        "withheld",
+        "suppressed",
+        "not_invented",
+        "not_emitted",
+        "unresolved",
+        "record_not_silently_dropped",
+        "silent_drop_prevented",
+    )
+    assert all(
+        issue.get("target_dataset") == "inquiries"
+        and str(issue.get("target_record_id") or "") not in emitted_inquiry_ids
+        and any(
+            marker in reason
+            for reason in reasons_by_issue.get(
+                str(issue["extraction_issue_id"]), set()
+            )
+            for marker in non_emission_markers
+        )
+        for issue in compact_issues
+    )
 
 
 def test_collapsed_four_column_personal_inquiry_header_recovers_one_bad_ordinal() -> None:
@@ -823,6 +872,285 @@ def test_agreement_source_ledger_keeps_same_page_section_state() -> None:
     ledger = native_extraction._source_completeness_ledger(context)
 
     assert ledger["credit_agreements"] == 2
+
+
+def _native_evidence_line(
+    text: str,
+    x: float,
+    y: float,
+    *,
+    width: float = 140.0,
+) -> dict[str, object]:
+    return {
+        "text": text,
+        "bbox": [x, y, x + width, y + 18.0],
+        "confidence": 0.99,
+    }
+
+
+def _split_credit_agreement_evidence() -> list[dict[str, object]]:
+    return [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                _native_evidence_line("\u6388\u4fe1\u534f\u8bae\u4fe1\u606f", 20, 10),
+                _native_evidence_line("\u6388\u4fe1\u534f\u8bae1", 20, 40),
+                _native_evidence_line("\u6388\u4fe1\u534f\u8bae\u6807\u8bc6", 20, 70),
+                _native_evidence_line("AGREEMENT0001", 20, 100),
+            ],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "lines": [
+                _native_evidence_line("\u6388\u4fe1\u989d\u5ea6\u7528\u9014", 20, 20),
+                _native_evidence_line("\u5faa\u73af\u989d\u5ea6", 20, 50),
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    "resolution, partial",
+    [
+        ({"resolved": False, "authoritative": False}, False),
+        ({"resolved": True, "authoritative": False}, False),
+        ({"resolved": True, "authoritative": True}, True),
+    ],
+)
+def test_native_parser_does_not_merge_credit_line_across_unproven_page_order(
+    resolution: dict[str, bool],
+    partial: bool,
+) -> None:
+    pages = [_page(1, []), _page(2, [])]
+    if partial:
+        pages.append(_page(3, []))
+    evidence = _split_credit_agreement_evidence()
+    context = SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical={1: 1, 2: 2},
+        reading_order_resolution=resolution,
+        corrected_evidence_pages=lambda: evidence,
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert len(records) == 1
+    assert records[0].fields["\u6388\u4fe1\u534f\u8bae\u6807\u8bc6"] == "AGREEMENT0001"
+    assert "\u6388\u4fe1\u989d\u5ea6\u7528\u9014" not in records[0].fields
+    assert {ref["logical_page"] for ref in records[0].source_refs} == {1}
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_native_evidence_page_order_unresolved"
+        and issue.get("target_dataset") == "credit_lines"
+        and issue.get("source_refs", [{}])[0].get("logical_page") == 2
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_native_parser_does_not_merge_liability_across_unresolved_page_order() -> None:
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                _native_evidence_line(
+                    "\u76f8\u5173\u8fd8\u6b3e\u8d23\u4efb\u4fe1\u606f",
+                    20,
+                    10,
+                ),
+                _native_evidence_line("\u8d26\u62371", 20, 40),
+                _native_evidence_line("\u8d23\u4efb\u4eba\u7c7b\u578b", 20, 70),
+                _native_evidence_line("\u8fd8\u6b3e\u8d23\u4efb\u91d1\u989d", 200, 70),
+                _native_evidence_line("\u4fdd\u8bc1\u4eba", 20, 100),
+                _native_evidence_line("200000", 200, 100),
+            ],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "lines": [
+                _native_evidence_line("\u4fdd\u8bc1\u5408\u540c\u7f16\u53f7", 20, 20),
+                _native_evidence_line("G-UNOWNED", 20, 50),
+            ],
+        },
+    ]
+    context = SimpleNamespace(
+        pages=[_page(1, []), _page(2, [])],
+        reading_order_by_logical={1: 1, 2: 2},
+        reading_order_resolution={"resolved": False, "authoritative": False},
+        corrected_evidence_pages=lambda: evidence,
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records(
+        "repayment_liability_records"
+    )
+
+    assert len(records) == 1
+    assert records[0].fields["\u8fd8\u6b3e\u8d23\u4efb\u91d1\u989d"] == "200000"
+    assert "\u4fdd\u8bc1\u5408\u540c\u7f16\u53f7" not in records[0].fields
+    assert {ref["logical_page"] for ref in records[0].source_refs} == {1}
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_native_evidence_page_order_unresolved"
+        and issue.get("target_dataset") == "repayment_liability_records"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_native_parser_merges_credit_line_across_authoritative_adjacency() -> None:
+    evidence = _split_credit_agreement_evidence()
+    context = SimpleNamespace(
+        pages=[_page(1, []), _page(2, [])],
+        reading_order_by_logical={1: 1, 2: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert len(records) == 1
+    assert records[0].fields["\u6388\u4fe1\u989d\u5ea6\u7528\u9014"] == "\u5faa\u73af\u989d\u5ea6"
+    assert {ref["logical_page"] for ref in records[0].source_refs} == {1, 2}
+    assert not context._personal_detail_extraction_issues
+
+
+def test_native_parser_merges_credit_line_fragments_on_the_same_page() -> None:
+    evidence = _split_credit_agreement_evidence()
+    evidence[1]["page"] = 1
+    evidence[1]["source_page"] = 1
+    context = SimpleNamespace(
+        pages=[_page(1, [])],
+        reading_order_by_logical={1: 1},
+        reading_order_resolution={"resolved": False, "authoritative": False},
+        corrected_evidence_pages=lambda: evidence,
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("credit_lines")
+
+    assert len(records) == 1
+    assert records[0].fields["\u6388\u4fe1\u989d\u5ea6\u7528\u9014"] == "\u5faa\u73af\u989d\u5ea6"
+    assert not context._personal_detail_extraction_issues
+
+
+def _report_header_evidence_page(logical_page: int) -> dict[str, object]:
+    labels = (
+        "\u88ab\u67e5\u8be2\u8005\u59d3\u540d",
+        "\u88ab\u67e5\u8be2\u8005\u8bc1\u4ef6\u7c7b\u578b",
+        "\u88ab\u67e5\u8be2\u8005\u8bc1\u4ef6\u53f7\u7801",
+        "\u67e5\u8be2\u673a\u6784",
+        "\u67e5\u8be2\u539f\u56e0",
+    )
+    values = (
+        "\u5f20\u4e09",
+        "\u8eab\u4efd\u8bc1",
+        "110101199001011234",
+        "\u4e2d\u56fd\u4eba\u6c11\u94f6\u884c\u5f81\u4fe1\u4e2d\u5fc3",
+        "\u672c\u4eba\u67e5\u8be2",
+    )
+    return {
+        "page": logical_page,
+        "source_page": logical_page,
+        "lines": [
+            *(
+                _native_evidence_line(label, index * 180.0, 20.0, width=160.0)
+                for index, label in enumerate(labels)
+            ),
+            *(
+                _native_evidence_line(value, index * 180.0, 50.0, width=160.0)
+                for index, value in enumerate(values)
+            ),
+        ],
+    }
+
+
+def test_native_parser_report_header_uses_authoritative_first_page() -> None:
+    report_header = _report_header_evidence_page(20)
+    summary = {
+        "page": 17,
+        "source_page": 17,
+        "lines": [_native_evidence_line("\u4fe1\u606f\u6982\u8981", 20, 20)],
+    }
+    context = SimpleNamespace(
+        pages=[_page(20, []), _page(17, [])],
+        reading_order_by_logical={20: 1, 17: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [summary, report_header],
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("report_header")
+
+    assert len(records) == 1
+    assert records[0].fields["\u88ab\u67e5\u8be2\u8005\u59d3\u540d"] == "\u5f20\u4e09"
+    assert {ref["logical_page"] for ref in records[0].source_refs} == {20}
+
+
+@pytest.mark.parametrize(
+    "resolution, order, extra_page",
+    [
+        ({"resolved": False, "authoritative": False}, {20: 1, 17: 2}, False),
+        ({"resolved": True, "authoritative": False}, {20: 1, 17: 2}, False),
+        ({"resolved": True, "authoritative": True}, {20: 1}, True),
+    ],
+)
+def test_native_parser_report_header_fails_closed_without_complete_authoritative_order(
+    resolution: dict[str, bool],
+    order: dict[int, int],
+    extra_page: bool,
+) -> None:
+    report_header = _report_header_evidence_page(20)
+    summary = {
+        "page": 17,
+        "source_page": 17,
+        "lines": [_native_evidence_line("\u4fe1\u606f\u6982\u8981", 20, 20)],
+    }
+    pages = [_page(20, []), _page(17, [])]
+    if extra_page:
+        pages.append(_page(18, []))
+    context = SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical=order,
+        reading_order_resolution=resolution,
+        corrected_evidence_pages=lambda: [report_header, summary],
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("report_header")
+
+    assert records == []
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_native_evidence_page_order_unresolved"
+        and issue.get("target_dataset") == "personal_report_metadata"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_native_parser_report_header_accepts_authoritative_identity_order() -> None:
+    report_header = _report_header_evidence_page(1)
+    summary = {
+        "page": 2,
+        "source_page": 2,
+        "lines": [_native_evidence_line("\u4fe1\u606f\u6982\u8981", 20, 20)],
+    }
+    context = SimpleNamespace(
+        pages=[_page(1, []), _page(2, [])],
+        reading_order_by_logical={1: 1, 2: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [report_header, summary],
+        _personal_detail_extraction_issues=[],
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records("report_header")
+
+    assert len(records) == 1
+    assert records[0].fields["\u88ab\u67e5\u8be2\u8005\u59d3\u540d"] == "\u5f20\u4e09"
 
 
 def test_account_endpoint_accepts_consecutive_high_tail_but_not_sparse_joined_value() -> None:
@@ -2025,3 +2353,429 @@ def test_full_context_attaches_pt6_and_exact_r1_r2_native_tables() -> None:
         for account in by_family.values()
         for ref in account.get("source_refs") or ()
     } >= {"pt_6_2", "pt_11_3", "pt_14_2"}
+
+
+_GEOMETRIC_LOAN_BASE_ROWS = [
+    [
+        "\u7ba1\u7406\u673a\u6784",
+        "\u8d26\u6237\u6807\u8bc6",
+        "\u5f00\u7acb\u65e5\u671f",
+        "\u5230\u671f\u65e5\u671f",
+        "\u501f\u6b3e\u91d1\u989d",
+        "\u8d26\u6237\u5e01\u79cd",
+    ],
+    [
+        "\u793a\u4f8b\u94f6\u884c",
+        "J10158510H000110000000640557",
+        "2021.01.12",
+        "2024.01.12",
+        "140000",
+        "\u4eba\u6c11\u5e01\u5143",
+    ],
+]
+_GEOMETRIC_LOAN_DETAIL_ROWS = [
+    [
+        "\u4e94\u7ea7\u5206\u7c7b",
+        "\u8d26\u6237\u72b6\u6001",
+        "\u4f59\u989d",
+        "\u5269\u4f59\u8fd8\u6b3e\u671f\u6570",
+    ],
+    ["\u6b63\u5e38", "\u6b63\u5e38", "55046", "13"],
+]
+
+
+def _geometric_continuation_context(
+    *,
+    left_logical_page: int,
+    right_logical_page: int,
+    page_order: list[int],
+    reading_order: dict[int, int] | None,
+    resolution: dict[str, bool] | None,
+) -> SimpleNamespace:
+    pages_by_logical = {
+        left_logical_page: _page(
+            left_logical_page,
+            [_table("geometric-base", _GEOMETRIC_LOAN_BASE_ROWS, top=100.0)],
+        ),
+        right_logical_page: _page(
+            right_logical_page,
+            [
+                _table(
+                    "geometric-detail",
+                    _GEOMETRIC_LOAN_DETAIL_ROWS,
+                    top=20.0,
+                ),
+                _table(
+                    "geometric-next-base",
+                    _GEOMETRIC_LOAN_BASE_ROWS,
+                    top=300.0,
+                ),
+            ],
+        ),
+    }
+    for logical_page in page_order:
+        pages_by_logical.setdefault(logical_page, _page(logical_page, []))
+    return SimpleNamespace(
+        pages=[pages_by_logical[logical_page] for logical_page in page_order],
+        reading_order_by_logical=reading_order,
+        reading_order_resolution=resolution,
+        corrected_evidence_pages=lambda: [],
+        tables_continue=lambda *_args: None,
+    )
+
+
+def test_geometric_account_continuation_requires_immediate_registered_page_edge() -> None:
+    context = _geometric_continuation_context(
+        left_logical_page=1,
+        right_logical_page=3,
+        page_order=[1, 2, 3],
+        reading_order={1: 1, 2: 2, 3: 3},
+        resolution={"resolved": True, "authoritative": True},
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert "balance" not in accounts[0]
+    assert {ref.get("table_id") for ref in accounts[0]["source_refs"]} == {
+        "geometric-base"
+    }
+
+
+def test_geometric_account_continuation_accepts_authoritative_adjacency() -> None:
+    context = _geometric_continuation_context(
+        left_logical_page=1,
+        right_logical_page=2,
+        page_order=[1, 2],
+        reading_order={1: 1, 2: 2},
+        resolution={"resolved": True, "authoritative": True},
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert accounts[0]["balance"] == 55046
+    assert {ref.get("table_id") for ref in accounts[0]["source_refs"]} == {
+        "geometric-base",
+        "geometric-detail",
+    }
+
+
+def test_geometric_account_continuation_accepts_reordered_authoritative_edge() -> None:
+    context = _geometric_continuation_context(
+        left_logical_page=20,
+        right_logical_page=17,
+        page_order=[17, 20],
+        reading_order={20: 1, 17: 2},
+        resolution={"resolved": True, "authoritative": True},
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert accounts[0]["balance"] == 55046
+    assert accounts[0]["source_refs"][0]["logical_page"] == 20
+
+
+@pytest.mark.parametrize(
+    ("reading_order", "resolution"),
+    [
+        ({1: 1, 2: 2}, {"resolved": False, "authoritative": False}),
+        ({1: 1, 2: 2}, {"resolved": True, "authoritative": False}),
+        ({1: 1, 2: 1}, {"resolved": True, "authoritative": True}),
+        (None, {"resolved": True, "authoritative": True}),
+        (None, None),
+    ],
+)
+def test_geometric_account_continuation_rejects_unproven_order(
+    reading_order: dict[int, int] | None,
+    resolution: dict[str, bool] | None,
+) -> None:
+    context = _geometric_continuation_context(
+        left_logical_page=1,
+        right_logical_page=2,
+        page_order=[1, 2],
+        reading_order=reading_order,
+        resolution=resolution,
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert "balance" not in accounts[0]
+
+
+_REVOLVING_PHASE_HEADER = [
+    "\u7ba1\u7406\u673a\u6784",
+    "\u8d26\u6237\u6807\u8bc6",
+    "\u5f00\u7acb\u65e5\u671f",
+    "\u8d26\u6237\u6388\u4fe1\u989d\u5ea6",
+    "\u5e01\u79cd",
+    "\u4e1a\u52a1\u79cd\u7c7b",
+    "\u62c5\u4fdd\u65b9\u5f0f",
+]
+
+
+def _phase_context(*, adjacent: bool) -> SimpleNamespace:
+    second_page = 2 if adjacent else 3
+    first = _table(
+        "phase-r1",
+        [
+            _REVOLVING_PHASE_HEADER,
+            [
+                "\u793a\u4f8b\u94f6\u884c",
+                "D10053310H00012022052901021012089466554314",
+                "2019.01.02",
+                "100000",
+                "\u4eba\u6c11\u5e01\u5143",
+                "\u4e2a\u4eba\u6d88\u8d39\u8d37\u6b3e",
+                "\u4fe1\u7528",
+            ],
+        ],
+    )
+    second_rows = [
+        _GEOMETRIC_LOAN_BASE_ROWS[0],
+        [
+            "\u793a\u4f8b\u94f6\u884c",
+            "D10123910H000115604050032149",
+            "2020.03.04",
+            "2025.03.04",
+            "200000",
+            "\u4eba\u6c11\u5e01\u5143",
+        ],
+    ]
+    pages = [_page(1, [first])]
+    if not adjacent:
+        pages.append(_page(2, []))
+    pages.append(_page(second_page, [_table("phase-next", second_rows)]))
+    return SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical={page.page_number: index for index, page in enumerate(pages, 1)},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [],
+        tables_continue=lambda *_args: None,
+    )
+
+
+def test_revolving_phase_does_not_cross_blank_registered_page() -> None:
+    context = _phase_context(adjacent=False)
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert [account["account_type"] for account in accounts] == [
+        "revolving_loan_subaccount",
+        "non_revolving_loan",
+    ]
+    assert accounts[1]["_table_account_family_basis"] == (
+        "non_revolving_table_signature"
+    )
+
+
+def test_revolving_phase_accepts_immediate_authoritative_page_edge() -> None:
+    context = _phase_context(adjacent=True)
+
+    accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert [account["account_type"] for account in accounts] == [
+        "revolving_loan_subaccount",
+        "revolving_loan_account",
+    ]
+    assert accounts[1]["_table_account_family_basis"] == "revolving_table_phase_carry"
+
+
+def _family_state_context(*, gap: bool) -> SimpleNamespace:
+    second_page = 3 if gap else 2
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                {
+                    "text": "\uff08\u4e00\uff09\u975e\u5faa\u73af\u8d37\u8d26\u6237",
+                    "bbox": [10, 10, 220, 25],
+                },
+                {"text": "\u8d26\u6237 1\uff1a", "bbox": [10, 40, 120, 55]},
+            ],
+        },
+        *(
+            [{"page": 2, "source_page": 2, "lines": []}]
+            if gap
+            else []
+        ),
+        {
+            "page": second_page,
+            "source_page": second_page,
+            "lines": [
+                {"text": "\u8d26\u6237 2\uff1a", "bbox": [10, 40, 120, 55]}
+            ],
+        },
+    ]
+    pages = [_page(1, [])]
+    if gap:
+        pages.append(_page(2, []))
+    pages.append(_page(second_page, []))
+    return SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical={page.page_number: index for index, page in enumerate(pages, 1)},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: False,
+    )
+
+
+def test_anchor_and_ledger_family_state_stop_at_blank_registered_page() -> None:
+    context = _family_state_context(gap=True)
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == [1]
+    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 1}
+    assert ledger["credit_accounts"] == 1
+
+
+def test_anchor_and_ledger_family_state_accept_immediate_authoritative_edge() -> None:
+    context = _family_state_context(gap=False)
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == [1, 2]
+    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 2}
+    assert ledger["credit_accounts"] == 2
+
+
+def test_page_local_account_table_family_uses_canonical_closed_signatures() -> None:
+    card = _table(
+        "canonical-card",
+        [_CARD_HEADER, _card_values("B10911000H000115603050013394541")],
+    )
+    revolving = _table(
+        "shared-revolving",
+        [
+            _REVOLVING_PHASE_HEADER,
+            [
+                "\u793a\u4f8b\u94f6\u884c",
+                "D10053310H00012022052901021012089466554314",
+                "2019.01.02",
+                "100000",
+                "\u4eba\u6c11\u5e01\u5143",
+                "\u4e2a\u4eba\u6d88\u8d39\u8d37\u6b3e",
+                "\u4fe1\u7528",
+            ],
+        ],
+    )
+    card_context = SimpleNamespace(pages=[_page(1, [card])])
+    revolving_context = SimpleNamespace(pages=[_page(1, [revolving])])
+
+    assert native_extraction._account_page_table_evidence(card_context, 1) == (
+        ("credit_card", "exact"),
+        False,
+    )
+    assert native_extraction._account_page_table_evidence(revolving_context, 1) == (
+        None,
+        True,
+    )
+
+
+def test_page_local_account_table_family_rejects_conflicting_exact_signatures() -> None:
+    card = _table(
+        "canonical-card",
+        [_CARD_HEADER, _card_values("B10911000H000115603050013394541")],
+    )
+    loan = _table("canonical-loan", _GEOMETRIC_LOAN_BASE_ROWS)
+    context = SimpleNamespace(pages=[_page(1, [card, loan])])
+
+    assert native_extraction._account_page_table_evidence(context, 1) == (None, False)
+
+
+def test_conflicting_table_families_cannot_refresh_anchor_or_ledger_state() -> None:
+    context = _family_state_context(gap=True)
+    card = _table(
+        "conflicting-card",
+        [_CARD_HEADER, _card_values("B10911000H000115603050013394541")],
+    )
+    loan = _table("conflicting-loan", _GEOMETRIC_LOAN_BASE_ROWS)
+    context.pages[1].tables = [card, loan]
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == [1]
+    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 1}
+    assert ledger["credit_accounts"] == 1
+
+
+@pytest.mark.parametrize(
+    ("heading", "expected_sequences"),
+    [
+        (
+            "\uff08\u4e8c\uff09\u5faa\u73af\u8d37\u8d26\u6237\u4e00",
+            [1, 2],
+        ),
+        ("\uff08\u4e00\uff09\u975e\u5faa\u73af\u8d37\u8d26\u6237", [1]),
+    ],
+)
+def test_shared_revolving_table_refreshes_only_compatible_family_state(
+    heading: str,
+    expected_sequences: list[int],
+) -> None:
+    shared_revolving = _table(
+        "shared-revolving-carry",
+        [
+            _REVOLVING_PHASE_HEADER,
+            [
+                "\u793a\u4f8b\u94f6\u884c",
+                "D10053310H00012022052901021012089466554314",
+                "2019.01.02",
+                "100000",
+                "\u4eba\u6c11\u5e01\u5143",
+                "\u4e2a\u4eba\u6d88\u8d39\u8d37\u6b3e",
+                "\u4fe1\u7528",
+            ],
+        ],
+    )
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                {"text": heading, "bbox": [10, 10, 220, 25]},
+                {"text": "\u8d26\u6237 1\uff1a", "bbox": [10, 40, 120, 55]},
+            ],
+        },
+        {"page": 2, "source_page": 2, "lines": []},
+        {
+            "page": 3,
+            "source_page": 3,
+            "lines": [
+                {"text": "\u8d26\u6237 2\uff1a", "bbox": [10, 40, 120, 55]}
+            ],
+        },
+    ]
+    context = SimpleNamespace(
+        pages=[_page(1, []), _page(2, [shared_revolving]), _page(3, [])],
+        reading_order_by_logical={1: 1, 2: 2, 3: 3},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: False,
+    )
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == expected_sequences
+    account_type = native_extraction._account_family_from_heading(
+        native_extraction._compact(heading)
+    )[0]
+    assert ledger["account_family_endpoints"] == {
+        account_type: max(expected_sequences)
+    }

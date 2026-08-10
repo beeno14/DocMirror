@@ -511,11 +511,18 @@ class _CreditReportCommunityBundle(CommunityBundle):
                     _merge_warning_page_range(warning, pages)
             payload["warnings"] = warning_rows
         elif personal_brief:
+            from docmirror.plugins.credit_report.personal_brief_native.audit import (
+                append_personal_brief_observational_warnings,
+            )
             from docmirror.plugins.credit_report.personal_brief_native.projector import (
                 project_personal_brief_community_json,
             )
 
             payload = project_personal_brief_community_json(payload)
+            payload = append_personal_brief_observational_warnings(
+                semantic_payload,
+                payload,
+            )
         elif scanned_personal_detail:
             _compact_personal_detail_public_projection(
                 payload,

@@ -124,6 +124,182 @@ def test_fragments_with_same_printed_page_join_one_canonical_canvas() -> None:
     assert projection.fragment_groups[0]["coverage_status"] == "full"
 
 
+def test_body_position_printed_page_duplicate_does_not_join_fragments() -> None:
+    result = SimpleNamespace(
+        pages=[_page(1, source=1), _page(2, source=2)]
+    )
+    evidence = [
+        {
+            "page": logical,
+            "source_page": logical,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [100, 100, 250, 125]),
+            ],
+        }
+        for logical in (1, 2)
+    ]
+
+    projection = _assembler(result, evidence).build()
+
+    assert len(projection.pages) == 2
+    assert all("printed_page" not in registration for registration in projection.registrations)
+    assert all(page.canonical_fragment_logical_pages in {(1,), (2,)} for page in projection.pages)
+
+
+def test_conflicting_templates_with_one_proved_printed_identity_fail_closed() -> None:
+    owner = SimpleNamespace()
+    result = SimpleNamespace(
+        pages=[_page(1, source=1), _page(2, source=2)]
+    )
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [220, 760, 380, 785]),
+            ],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4fe1\u606f\u6982\u8981", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [220, 760, 380, 785]),
+            ],
+        },
+    ]
+
+    projection = _assembler(result, evidence, owner=owner).build()
+
+    assert projection.pages == ()
+    assert projection.unresolved_pages == (1, 2)
+    assert {
+        registration["template_id"] for registration in projection.registrations
+    } == {"report_header_and_identity", "information_summary"}
+    assert owner._personal_detail_extraction_issues[0]["issue_code"] == (
+        "canonical_fragment_template_conflict"
+    )
+
+
+def test_static_split_does_not_inherit_missing_or_non_authoritative_identity() -> None:
+    result = SimpleNamespace(
+        pages=[_page(10, source=1, width=300), _page(20, source=1, width=300)]
+    )
+    evidence = [
+        {
+            "page": 10,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 280, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 4 \u9875", [100, 100, 250, 125]),
+            ],
+        },
+        {
+            "page": 20,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [300, 0, 600, 800],
+            "plugin_static_subpage": True,
+            "lines": [_line("\u4e2a\u4eba\u57fa\u672c\u4fe1\u606f", [10, 20, 200, 60])],
+        },
+    ]
+    resolutions = (
+        None,
+        {
+            "resolved": False,
+            "authoritative": False,
+            "identity_fallback": True,
+            "printed_total": 4,
+            "printed_page_by_logical": {10: 1},
+        },
+        {
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "printed_total": 4,
+            "printed_page_by_logical": {},
+        },
+    )
+
+    for resolution in resolutions:
+        owner = SimpleNamespace()
+        case_evidence = deepcopy(evidence)
+        if resolution is not None:
+            owner.reading_order_resolution = resolution
+            # Even an exact footer cannot override an available context
+            # resolution that rejected or omitted the logical page.
+            case_evidence[0]["lines"][1]["bbox"] = [100, 760, 250, 785]
+        projection = _assembler(result, case_evidence, owner=owner).build()
+
+        assert len(projection.pages) == 2
+        assert all(len(page.canonical_fragment_logical_pages) == 1 for page in projection.pages)
+
+
+def test_authoritative_context_identity_allows_valid_same_template_static_split() -> None:
+    owner = SimpleNamespace(
+        reading_order_resolution={
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "basis": "complete_unique_printed_page_permutation",
+            "printed_total": 4,
+            "printed_page_by_logical": {10: 1},
+            "unresolved_logical_pages": [],
+        }
+    )
+    result = SimpleNamespace(
+        pages=[_page(10, source=1, width=300), _page(20, source=1, width=300)]
+    )
+    evidence = [
+        {
+            "page": 10,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [0, 0, 300, 800],
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 280, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 4 \u9875", [100, 100, 250, 125]),
+            ],
+        },
+        {
+            "page": 20,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [300, 0, 600, 800],
+            "plugin_static_subpage": True,
+            "lines": [_line("\u4e2a\u4eba\u57fa\u672c\u4fe1\u606f", [10, 20, 200, 60])],
+        },
+    ]
+    topology = SimpleNamespace(
+        geometry=lambda logical: SimpleNamespace(
+            source_crop_bbox=(0.0, 0.0, 300.0, 800.0)
+            if logical == 10
+            else (300.0, 0.0, 600.0, 800.0)
+        )
+    )
+
+    projection = _assembler(result, evidence, topology=topology, owner=owner).build()
+
+    assert len(projection.pages) == 1
+    assert projection.pages[0].canonical_fragment_logical_pages == (10, 20)
+    assert projection.registrations[0]["printed_identity_basis"] == (
+        "context_authoritative_printed_order"
+    )
+
+
 def test_explicit_summary_heading_outranks_repeated_account_category_names() -> None:
     result = SimpleNamespace(pages=[_page(1, source=1)])
     evidence = [

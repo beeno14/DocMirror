@@ -2037,6 +2037,8 @@ def test_native_parser_carries_credit_agreement_card_across_corrected_pages() ->
 
     context = SimpleNamespace(
         pages=[],
+        reading_order_by_logical={8: 1, 9: 2, 10: 3},
+        reading_order_resolution={"resolved": True, "authoritative": True},
         corrected_evidence_pages=lambda: [
             {
                 "page": 8,

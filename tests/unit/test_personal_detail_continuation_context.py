@@ -48,6 +48,46 @@ def _unit(
     )
 
 
+def _same_entity_context(
+    table_order_by_id: dict[str, int],
+    *,
+    reading_order_by_logical: dict[int, int],
+) -> PersonalDetailExtractionContext:
+    context = object.__new__(PersonalDetailExtractionContext)
+    units_by_table = {
+        table_id: SimpleNamespace(
+            unit_id=f"unit:{table_id}",
+            page=order,
+        )
+        for table_id, order in table_order_by_id.items()
+    }
+    shared_entity = SimpleNamespace(entity_id="same-entity")
+    unit_ids = {unit.unit_id for unit in units_by_table.values()}
+    context.entity_context = SimpleNamespace(
+        units=tuple(units_by_table.values()),
+        table_unit_id=lambda table_id: (
+            units_by_table[table_id].unit_id
+            if table_id in units_by_table
+            else None
+        ),
+        entity_for_unit=lambda unit_id: (
+            shared_entity if unit_id in unit_ids else None
+        ),
+    )
+    context.reading_order_by_logical = dict(reading_order_by_logical)
+    context.source_page_by_logical = {
+        page: page for page in reading_order_by_logical
+    }
+    context.reading_order_resolution = {
+        "resolved": True,
+        "authoritative": True,
+        "basis": "complete_unique_printed_page_permutation",
+    }
+    context.evidence_unit_ids = {}
+    context.parse_result = SimpleNamespace()
+    return context
+
+
 @pytest.mark.parametrize(
     ("left", "right", "expected"),
     [
@@ -236,6 +276,122 @@ def test_personal_detail_context_uses_logical_pages_and_suppresses_table_owned_t
     assert context.tables_continue("account-head", "account-tail") is False
     assert context.allows_scanned_line_transition(10, evidence_line_1, 0, 11, evidence_line_2, 0) is False
     assert context.allows_scanned_line_transition(10, evidence_line_1, 0, 10, evidence_line_1, 0) is True
+
+
+def test_cross_page_entity_identity_requires_forward_registered_adjacency() -> None:
+    context = _same_entity_context(
+        {"page-1": 1, "page-2": 2, "page-3": 3},
+        reading_order_by_logical={1: 1, 2: 2, 3: 3},
+    )
+    lines = {
+        page: {
+            "text": f"page {page}",
+            "bbox": [20, 20, 200, 40],
+            "evidence_ids": [f"page-{page}"],
+        }
+        for page in (1, 2, 3)
+    }
+    context.evidence_unit_ids = {
+        f"evidence:page-{page}": f"unit:page-{page}" for page in (1, 2, 3)
+    }
+
+    assert context.tables_continue("page-1", "page-2") is True
+    assert context.tables_continue("page-1", "page-3") is False
+    assert context.tables_continue("page-2", "page-1") is False
+    assert (
+        context.allows_scanned_line_transition(1, lines[1], 0, 2, lines[2], 0)
+        is True
+    )
+    assert (
+        context.allows_scanned_line_transition(1, lines[1], 0, 3, lines[3], 0)
+        is False
+    )
+    assert (
+        context.allows_scanned_line_transition(2, lines[2], 0, 1, lines[1], 0)
+        is False
+    )
+
+    context.reading_order_by_logical = {1: 1, 3: 3}
+    assert context.pages_adjacent_in_reading_order(1, 2) is False
+    context.reading_order_by_logical = {1: 1, 2: 1, 3: 2}
+    assert context.pages_adjacent_in_reading_order(2, 3) is False
+    context.reading_order_by_logical = {1: 1, 2: 2, 3: 3}
+    assert context.pages_adjacent_in_reading_order(True, 2) is False
+
+
+def test_entity_unit_positions_preserve_nonidentity_logical_page_order() -> None:
+    context = _same_entity_context(
+        {"logical-20": 1, "logical-17": 2},
+        reading_order_by_logical={20: 1, 17: 2},
+    )
+    left = {
+        "text": "logical 20",
+        "bbox": [20, 700, 200, 720],
+        "evidence_ids": ["logical-20"],
+    }
+    right = {
+        "text": "logical 17",
+        "bbox": [20, 20, 200, 40],
+        "evidence_ids": ["logical-17"],
+    }
+    context.evidence_unit_ids = {
+        "evidence:logical-20": "unit:logical-20",
+        "evidence:logical-17": "unit:logical-17",
+    }
+
+    assert context.tables_continue("logical-20", "logical-17") is True
+    assert context.pages_adjacent_in_reading_order(20, 17) is True
+    assert context.allows_scanned_line_transition(20, left, 0, 17, right, 0) is True
+
+
+def test_residence_provider_does_not_join_across_authoritative_page_gap() -> None:
+    residence = SimpleNamespace(
+        table_id="residence-head",
+        metadata={
+            "raw_rows": [
+                ["编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"],
+                ["1", "某市某区一号", "--", "自置", "2025.01.02"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 600, 580, 780],
+    )
+    provider = SimpleNamespace(
+        table_id="residence-provider",
+        metadata={
+            "raw_rows": [
+                ["编号", "数据发生机构名称"],
+                ["1", "跨页错误银行"],
+            ]
+        },
+        headers=[],
+        rows=[],
+        bbox=[20, 20, 580, 180],
+    )
+    pages = (
+        SimpleNamespace(page_number=1, source_page_number=1, tables=[residence]),
+        SimpleNamespace(page_number=2, source_page_number=2, tables=[]),
+        SimpleNamespace(page_number=3, source_page_number=3, tables=[provider]),
+    )
+    context = _same_entity_context(
+        {"residence-head": 1, "residence-provider": 3},
+        reading_order_by_logical={1: 1, 2: 2, 3: 3},
+    )
+    context._canonical_layout_projection_cache = SimpleNamespace(pages=pages)
+    context._personal_detail_extraction_issues = []
+
+    records = _extract_residence_records(context)
+
+    assert len(records) == 1
+    assert records[0].get("data_provider") is None
+    assert records[0]["extraction_status"] == "review"
+    assert any(
+        issue["issue_code"] == "candidate_b_residence_provider_missing"
+        and issue["field_name"] == "data_provider"
+        and issue["target_record_id"] == records[0]["residence_record_id"]
+        for issue in context._personal_detail_extraction_issues
+    )
 
 
 def test_personal_detail_context_cache_is_single_pass_and_copy_on_read() -> None:

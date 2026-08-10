@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_brief_native.contracts import (
+    PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+    canonicalize_personal_brief_reporting_units,
+)
 from docmirror.plugins.credit_report.personal_brief_native.ir import (
     CANONICAL_PERSONAL_BRIEF_SECTIONS,
     CanonicalPersonalBriefComponent,
@@ -415,8 +419,8 @@ def _partial_account_record(
         "currency": "CNY",
         "account_currency": "CNY",
         "reporting_amount_currency": "CNY",
-        "amount_unit": "yuan",
-        "reporting_amount_unit": "yuan",
+        "amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+        "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
         "credit_limit": parse_number(limit_match.group(1)) if limit_match else None,
         "loan_amount": parse_number(loan_amount_match.group(1)) if loan_amount_match else None,
         "balance": parse_number(balance_match.group(1)) if balance_match else None,
@@ -640,8 +644,8 @@ def _repayment_liabilities_from_canonical_records(
                 "balance": parse_number(balance_match.group(1)) if balance_match else None,
                 "currency": "CNY",
                 "reporting_amount_currency": "CNY",
-                "amount_unit": "yuan",
-                "reporting_amount_unit": "yuan",
+                "amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "canonical_repayment_liability_record",
                 "source_refs": refs,
                 "extraction_status": extraction_status,
@@ -1551,6 +1555,10 @@ def extract_personal_brief_semantic_document(
         "institution_statement_records": institution_statements,
         "inquiry_records": inquiries,
     }
+    canonicalize_personal_brief_reporting_units(
+        datasets,
+        amount_policy=amount_policy,
+    )
     for dataset_name, rows in datasets.items():
         sections = _DATASET_SECTIONS.get(dataset_name)
         if sections and rows:
