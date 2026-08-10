@@ -130,7 +130,19 @@ class RapidOCREngine:
                 logger.debug(f"cpu_count detection: suppressed {exc}")
                 intra_threads = 4
 
-            logger.info(f"Initializing RapidOCR ONNX model on CPU (Threads={intra_threads})...")
+            onnxruntime = require_optional_module(
+                "onnxruntime",
+                feature="RapidOCR GPU execution",
+                extra="ocr",
+            )
+            cudnn_spec = find_spec("nvidia.cudnn")
+            if os.name == "nt" and cudnn_spec and cudnn_spec.submodule_search_locations:
+                cudnn_bin = os.path.join(next(iter(cudnn_spec.submodule_search_locations)), "bin")
+                os.environ["PATH"] = f"{cudnn_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+            if preload_dlls := getattr(onnxruntime, "preload_dlls", None):
+                preload_dlls(directory="")
+
+            logger.info(f"Initializing RapidOCR ONNX model on GPU (Threads={intra_threads})...")
 
             # Phase 6 Part 1: Hardware-Aware Engine Initialization
             # The underlying ONNX Runtime models (DET, REC, CLS) run completely sequentially in pure CPU loops.
@@ -144,12 +156,12 @@ class RapidOCREngine:
             }
 
             self._engine = RapidOCR(
-                det_use_cuda=False,
-                cls_use_cuda=False,
-                rec_use_cuda=False,
+                det_use_cuda=True,
+                cls_use_cuda=True,
+                rec_use_cuda=True,
                 **tuning_kwargs,
             )
-            logger.info("RapidOCR model loaded with Extreme CPU Tuning.")
+            logger.info("RapidOCR model loaded with CUDA acceleration.")
 
     def _detect_only(self, img: Any) -> Any | None:
         """Runs only the Detection (DET) model on an image and returns un-scaled bounding boxes."""
