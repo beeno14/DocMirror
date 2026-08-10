@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
@@ -288,6 +289,145 @@ def test_monthly_materialization_uses_canonical_page_lines_without_cell_ocr(monk
     assert observed[1].get("enable_static_status_validation", False) is False
     assert observed[1].get("enable_candidate_b_amount_pairing", False) is False
     assert observed[0]["lines"] == [canonical_line]
+
+
+def test_monthly_cross_page_augmentation_requires_authoritative_order(
+    monkeypatch,
+) -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    context._cache = {}
+    context.reading_order_by_logical = {1: 1, 2: 2}
+    context.reading_order_resolution = {
+        "resolved": False,
+        "authoritative": False,
+        "basis": "unresolved_identity_fallback",
+    }
+    context._page_image_resolver = None
+    anchor = _line("2024年01月-2024年12月的还款记录", [10, 700, 500, 730])
+    continuation = _line("2024 N N N N N N N N N N N N", [10, 20, 500, 40])
+    stale_shifted = {
+        **continuation,
+        "bbox": [10, 820, 500, 840],
+        "source_logical_page": 2,
+        "coordinate_status": "cross_page_y_shift",
+    }
+    bundles = [
+        {
+            "page": 1,
+            "local_structure_evidence": {
+                "page": 1,
+                "page_height": 800,
+                "lines": [anchor],
+            },
+            "micro_grid_evidence": {
+                "page": 1,
+                "page_height": 800,
+                "lines": [anchor, stale_shifted],
+                "credit_cross_page_augmented": True,
+                "continuation_logical_pages": [2],
+                "continuation_source_table_geometry_by_page": {
+                    "2": [{"table_id": "pt_2_0"}]
+                },
+            },
+        },
+        {
+            "page": 2,
+            "local_structure_evidence": {
+                "page": 2,
+                "page_height": 800,
+                "lines": [continuation],
+            },
+            "micro_grid_evidence": {
+                "page": 2,
+                "page_height": 800,
+                "lines": [continuation],
+                "source_table_geometry": [{"table_id": "pt_2_0"}],
+            },
+        },
+    ]
+    context.parse_result = SimpleNamespace(
+        pages=[],
+        entities=SimpleNamespace(
+            domain_specific={"_page_evidence_bundles": bundles}
+        ),
+    )
+    context.corrected_evidence_pages = lambda: [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [anchor],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [continuation],
+        },
+    ]
+    augmentation_calls: list[object] = []
+    materialized_inputs: list[dict[str, object]] = []
+
+    from docmirror.plugins.credit_report import micro_grid_materialize
+
+    real_augment = micro_grid_materialize.augment_credit_repayment_evidence_bundles
+
+    def augment(*args, **kwargs):
+        augmentation_calls.append(object())
+        return real_augment(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.micro_grid_materialize.augment_credit_repayment_evidence_bundles",
+        augment,
+    )
+
+    def materialize(detached, **_kwargs):
+        materialized_inputs.append(deepcopy(detached))
+        return []
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.micro_grid_materialize.materialize_credit_repayment_micro_grids_from_bundles",
+        materialize,
+    )
+
+    assert context.corrected_repayment_records() == []
+    assert augmentation_calls == []
+    assert len(materialized_inputs) == 2
+    for detached in materialized_inputs:
+        first = detached["_page_evidence_bundles"][0]["micro_grid_evidence"]
+        assert "credit_cross_page_augmented" not in first
+        assert "continuation_logical_pages" not in first
+        assert "continuation_source_table_geometry_by_page" not in first
+        assert not any(
+            line.get("source_logical_page") == 2
+            for line in first.get("lines") or []
+            if isinstance(line, dict)
+        )
+
+    context._cache = {}
+    context.reading_order_resolution = {
+        "resolved": True,
+        "authoritative": True,
+        "basis": "complete_unique_printed_page_permutation",
+    }
+    augmentation_calls.clear()
+    materialized_inputs.clear()
+
+    assert context.corrected_repayment_records() == []
+    assert len(augmentation_calls) == 2
+    assert len(materialized_inputs) == 2
+    for detached in materialized_inputs:
+        first = detached["_page_evidence_bundles"][0]["micro_grid_evidence"]
+        assert first["credit_cross_page_augmented"] is True
+        assert first["continuation_logical_pages"] == [2]
+        assert "2" in first["continuation_source_table_geometry_by_page"]
+        assert any(
+            line.get("source_logical_page") == 2
+            for line in first.get("lines") or []
+            if isinstance(line, dict)
+        )
 
 
 def test_monthly_sequence_holes_are_reported_from_schema_not_legacy_ocr(monkeypatch) -> None:

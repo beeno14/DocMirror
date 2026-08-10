@@ -8,6 +8,7 @@ import pytest
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailExtractionContext,
     _printed_reading_order,
+    _printed_reading_order_resolution,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
     PersonalDetailLogicalPageImageResolver,
@@ -48,18 +49,29 @@ def _page(
     crop: list[float],
     footer: str = "",
 ) -> SimpleNamespace:
+    width = crop[2] - crop[0]
+    height = crop[3] - crop[1]
     return SimpleNamespace(
         page_number=logical,
         source_page_number=source,
-        width=crop[2] - crop[0],
-        height=crop[3] - crop[1],
+        width=width,
+        height=height,
         coordinate_transform=_transform(
             source=source,
             kind="two_page_spread",
             segment=segment,
             crop=crop,
         ),
-        texts=[SimpleNamespace(content=footer)] if footer else [],
+        texts=(
+            [
+                SimpleNamespace(
+                    content=footer,
+                    bbox=[width * 0.35, height - 20.0, width * 0.65, height - 5.0],
+                )
+            ]
+            if footer
+            else []
+        ),
     )
 
 
@@ -111,6 +123,100 @@ def test_printed_page_inference_uses_geometry_instead_of_logical_ids() -> None:
     topology = PersonalDetailPageTopology(result)
 
     assert _printed_reading_order(result, topology) == {20: 1, 10: 2}
+
+
+@pytest.mark.parametrize("marker_bbox", ([200, 100, 400, 120], None))
+def test_printed_page_order_rejects_body_or_unlocated_markers(
+    marker_bbox: list[int] | None,
+) -> None:
+    def marker(content: str) -> SimpleNamespace:
+        return SimpleNamespace(content=content, **({"bbox": marker_bbox} if marker_bbox else {}))
+
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                width=600,
+                height=800,
+                texts=[marker("第2页，共2页")],
+            ),
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=2,
+                width=600,
+                height=800,
+                texts=[marker("第1页，共2页")],
+            ),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {1: 1, 2: 2}
+    assert resolution["resolved"] is False
+    assert resolution["authoritative"] is False
+
+
+def test_printed_page_order_accepts_bottom_full_and_page_only_footers() -> None:
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=20,
+                source_page_number=1,
+                width=600,
+                height=800,
+                texts=[SimpleNamespace(content="第1页，共2页", bbox=[200, 770, 400, 790])],
+            ),
+            SimpleNamespace(
+                page_number=10,
+                source_page_number=2,
+                width=600,
+                height=800,
+                texts=[SimpleNamespace(content="第2页", bbox=[200, 770, 400, 790])],
+            ),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {20: 1, 10: 2}
+    assert resolution["resolved"] is True
+    assert resolution["authoritative"] is True
+    assert resolution["page_only_footer_logical_pages"] == [10]
+
+
+def test_printed_page_order_rejects_conflicting_bottom_markers() -> None:
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=1,
+                source_page_number=1,
+                width=600,
+                height=800,
+                texts=[
+                    SimpleNamespace(content="第1页，共2页", bbox=[100, 765, 280, 785]),
+                    SimpleNamespace(content="第2页，共2页", bbox=[320, 765, 500, 785]),
+                ],
+            ),
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=2,
+                width=600,
+                height=800,
+                texts=[SimpleNamespace(content="第2页，共2页", bbox=[200, 770, 400, 790])],
+            ),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {1: 1, 2: 2}
+    assert resolution["resolved"] is False
+    assert resolution["reason"] == "ambiguous_full_footer"
 
 
 def test_ambiguous_spread_geometry_disables_sibling_page_inference() -> None:

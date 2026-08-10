@@ -173,6 +173,30 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
     return (x0, y0, x1, y1) if x1 > x0 and y1 > y0 else None
 
 
+def _bottom_furniture_geometry(value: Any, *, page_height: Any) -> bool:
+    """Require one exact local bbox in the page's narrow bottom band."""
+
+    box = _bbox(value)
+    height = _finite(page_height)
+    if box is None or height <= 0.0:
+        return False
+    tolerance = max(2.0, height * 0.01)
+    return bool(
+        box[1] >= height * 0.85
+        and box[3] >= height * 0.90
+        and box[3] <= height + tolerance
+        and box[3] - box[1] <= height * 0.08
+    )
+
+
+def _authoritative_reading_order(resolution: Any) -> bool:
+    return bool(
+        isinstance(resolution, Mapping)
+        and resolution.get("resolved") is True
+        and resolution.get("authoritative") is True
+    )
+
+
 def _matrix3(value: Any) -> list[list[float]] | None:
     if not (
         isinstance(value, (list, tuple))
@@ -480,7 +504,8 @@ def _printed_reading_order_resolution(
     identity order together with explicit unresolved provenance so downstream
     ownership code cannot mistake the fallback for an authoritative mapping.
     """
-    texts_by_page: dict[int, list[str]] = {}
+    text_evidence_by_page: dict[int, list[tuple[str, Any]]] = {}
+    page_heights_by_logical: dict[int, list[float]] = {}
     observed_pages: set[int] = set()
     source_by_logical: dict[int, int] = {}
 
@@ -491,8 +516,12 @@ def _printed_reading_order_resolution(
         source_by_logical[logical] = int(
             transform.get("source_page_number") or getattr(page, "source_page_number", 0) or logical
         )
-        texts_by_page.setdefault(logical, []).extend(
-            str(getattr(block, "content", "") or "") for block in getattr(page, "texts", None) or []
+        page_height = _finite(getattr(page, "height", 0))
+        if page_height > 0.0:
+            page_heights_by_logical.setdefault(logical, []).append(page_height)
+        text_evidence_by_page.setdefault(logical, []).extend(
+            (str(getattr(block, "content", "") or ""), block)
+            for block in getattr(page, "texts", None) or []
         )
 
     for bundle in _domain_specific(parse_result).get("_page_evidence_bundles") or []:
@@ -509,8 +538,16 @@ def _printed_reading_order_resolution(
             logical,
             int(bundle.get("source_page_number") or local.get("source_page") or logical),
         )
-        texts_by_page.setdefault(logical, []).extend(
-            str(line.get("text") or line.get("content") or "")
+        page_height = _finite(
+            local.get("page_height")
+            or bundle.get("page_height")
+            or local.get("height")
+            or bundle.get("height")
+        )
+        if page_height > 0.0:
+            page_heights_by_logical.setdefault(logical, []).append(page_height)
+        text_evidence_by_page.setdefault(logical, []).extend(
+            (str(line.get("text") or line.get("content") or ""), line)
             for line in local.get("lines") or []
             if isinstance(line, dict)
         )
@@ -573,9 +610,11 @@ def _printed_reading_order_resolution(
     full_footer_pages: set[int] = set()
     ambiguous_full_footer_pages: set[int] = set()
     for logical in sorted(observed_pages):
+        page_height = max(page_heights_by_logical.get(logical) or (0.0,))
         exact_matches = {
             (int(match.group("page")), int(match.group("total")))
-            for text in texts_by_page.get(logical, ())
+            for text, evidence in text_evidence_by_page.get(logical, ())
+            if _bottom_furniture_geometry(evidence, page_height=page_height)
             for match in _PRINTED_PAGE_RE.finditer(text)
         }
         if len(exact_matches) == 1:
@@ -594,23 +633,26 @@ def _printed_reading_order_resolution(
             full_footer_pages=full_footer_pages,
         )
 
-    coherent_totals = {
-        total for total in totals if total >= len(observed_pages)
-    }
-    if len(coherent_totals) != 1:
+    observed_totals = set(totals)
+    if (
+        len(observed_totals) != 1
+        or next(iter(observed_totals), 0) < len(observed_pages)
+    ):
         return unresolved(
             "printed_total_missing_or_conflicting",
             printed_by_logical=printed_by_logical,
             full_footer_pages=full_footer_pages,
         )
-    expected_total = next(iter(coherent_totals))
+    expected_total = next(iter(observed_totals))
 
     page_only_footer_pages: set[int] = set()
     ambiguous_page_only_pages: set[int] = set()
     for logical in sorted(observed_pages - set(printed_by_logical)):
+        page_height = max(page_heights_by_logical.get(logical) or (0.0,))
         page_only_matches = {
             int(match.group("page"))
-            for text in texts_by_page.get(logical, ())
+            for text, evidence in text_evidence_by_page.get(logical, ())
+            if _bottom_furniture_geometry(evidence, page_height=page_height)
             if (match := _PRINTED_PAGE_ONLY_RE.fullmatch(text)) is not None
             and 1 <= int(match.group("page")) <= expected_total
         }
@@ -1106,6 +1148,9 @@ class PersonalDetailExtractionContext:
 
             detached = deepcopy(_domain_specific(self.parse_result))
             detached.pop("credit_repayment_records", None)
+            cross_page_order_authoritative = _authoritative_reading_order(
+                getattr(self, "reading_order_resolution", None)
+            )
             for bundle in detached.get("_page_evidence_bundles") or []:
                 if isinstance(bundle, dict):
                     bundle.pop("micro_grid_structures", None)
@@ -1195,10 +1240,11 @@ class PersonalDetailExtractionContext:
                         },
                     }
                 )
-            augment_credit_repayment_evidence_bundles(
-                detached,
-                reading_order_by_logical=dict(self.reading_order_by_logical),
-            )
+            if cross_page_order_authoritative:
+                augment_credit_repayment_evidence_bundles(
+                    detached,
+                    reading_order_by_logical=dict(self.reading_order_by_logical),
+                )
             status_glyph_observations: list[dict[str, Any]] = []
             materialize_credit_repayment_micro_grids_from_bundles(
                 detached,
@@ -1234,10 +1280,37 @@ class PersonalDetailExtractionContext:
             for bundle in source_baseline.get("_page_evidence_bundles") or []:
                 if isinstance(bundle, dict):
                     bundle.pop("micro_grid_structures", None)
-            augment_credit_repayment_evidence_bundles(
-                source_baseline,
-                reading_order_by_logical=dict(self.reading_order_by_logical),
-            )
+                    grid_evidence = bundle.get("micro_grid_evidence")
+                    if isinstance(grid_evidence, dict):
+                        evidence_page = int(
+                            grid_evidence.get("page") or bundle.get("page") or 0
+                        )
+                        grid_evidence["lines"] = [
+                            line
+                            for line in grid_evidence.get("lines") or []
+                            if not (
+                                isinstance(line, dict)
+                                and (
+                                    line.get("coordinate_status")
+                                    == "cross_page_y_shift"
+                                    or (
+                                        str(line.get("source_logical_page") or "")
+                                        not in {"", str(evidence_page)}
+                                    )
+                                )
+                            )
+                        ]
+                        grid_evidence.pop("credit_cross_page_augmented", None)
+                        grid_evidence.pop("continuation_logical_pages", None)
+                        grid_evidence.pop(
+                            "continuation_source_table_geometry_by_page",
+                            None,
+                        )
+            if cross_page_order_authoritative:
+                augment_credit_repayment_evidence_bundles(
+                    source_baseline,
+                    reading_order_by_logical=dict(self.reading_order_by_logical),
+                )
             materialize_credit_repayment_micro_grids_from_bundles(
                 source_baseline,
                 page_image_resolver=None,
@@ -1442,9 +1515,18 @@ class PersonalDetailExtractionContext:
             pages=list(self._canonical_layout_projection_cache.pages),
             entities=SimpleNamespace(domain_specific={}),
         )
-        units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(
+        (
+            units,
+            furniture,
+            evidence_units,
+            source_pages,
+            _reading_order,
+            _reading_order_resolution,
+        ) = _collect_personal_detail_units(
             adapter,
             topology=self.page_topology,
+            registered_reading_order=self.reading_order_by_logical,
+            registered_reading_order_resolution=self.reading_order_resolution,
         )
         if units:
             policy = PersonalDetailTransitionPolicy()
@@ -1458,8 +1540,6 @@ class PersonalDetailExtractionContext:
             self.evidence_unit_ids = MappingProxyType(dict(evidence_units))
             self.source_page_by_logical.clear()
             self.source_page_by_logical.update(source_pages)
-            self.reading_order_by_logical.clear()
-            self.reading_order_by_logical.update(reading_order)
         self._canonical_entity_context_ready = True
 
     def _build_source_evidence_pages(self) -> list[dict[str, Any]]:
@@ -1899,18 +1979,36 @@ class PersonalDetailExtractionContext:
 
     def canonical_layout_audit(self) -> dict[str, Any]:
         """Return the detached template-registration and fragment audit."""
-        return deepcopy(self._canonical_layout_projection().audit())
+        audit = deepcopy(self._canonical_layout_projection().audit())
+        audit["reading_order_resolution"] = deepcopy(self.reading_order_resolution)
+        return audit
 
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)
         right_unit_id = self.entity_context.table_unit_id(right_table_id)
         if not left_unit_id or not right_unit_id:
             return None
+        units_by_id = {unit.unit_id: unit for unit in self.entity_context.units}
+        left_unit = units_by_id.get(left_unit_id)
+        right_unit = units_by_id.get(right_unit_id)
+        if (
+            left_unit is not None
+            and right_unit is not None
+            and left_unit.page != right_unit.page
+            and not _authoritative_reading_order(
+                getattr(self, "reading_order_resolution", None)
+            )
+        ):
+            return False
         left = self.entity_context.entity_for_unit(left_unit_id)
         right = self.entity_context.entity_for_unit(right_unit_id)
         return bool(left is not None and right is not None and left.entity_id == right.entity_id)
 
     def pages_adjacent_in_reading_order(self, left_page: int, right_page: int) -> bool:
+        if not _authoritative_reading_order(
+            getattr(self, "reading_order_resolution", None)
+        ):
+            return False
         left_order = self.reading_order_by_logical.get(int(left_page), int(left_page))
         right_order = self.reading_order_by_logical.get(int(right_page), int(right_page))
         return right_order == left_order + 1
@@ -1926,6 +2024,10 @@ class PersonalDetailExtractionContext:
     ) -> bool | None:
         if left_page == right_page:
             return True
+        if not _authoritative_reading_order(
+            getattr(self, "reading_order_resolution", None)
+        ):
+            return False
         left_id = self.evidence_unit_ids.get(_evidence_key(left_page, left_line, left_index))
         right_id = self.evidence_unit_ids.get(_evidence_key(right_page, right_line, right_index))
         if not left_id or not right_id:
@@ -1956,10 +2058,14 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
     if isinstance(parse_result, PersonalDetailExtractionContext):
         return parse_result
     page_topology = PersonalDetailPageTopology(parse_result)
-    units, furniture, evidence_units, source_pages, reading_order = _collect_personal_detail_units(
-        parse_result,
-        topology=page_topology,
-    )
+    (
+        units,
+        furniture,
+        evidence_units,
+        source_pages,
+        reading_order,
+        reading_order_resolution,
+    ) = _collect_personal_detail_units(parse_result, topology=page_topology)
     policy = PersonalDetailTransitionPolicy()
     entity_context = decode_credit_report_units(
         units,
@@ -1974,6 +2080,7 @@ def build_personal_detail_extraction_context(parse_result: Any) -> PersonalDetai
         evidence_unit_ids=evidence_units,
         source_page_by_logical=source_pages,
         reading_order_by_logical=reading_order,
+        reading_order_resolution=reading_order_resolution,
         page_topology=page_topology,
     )
 

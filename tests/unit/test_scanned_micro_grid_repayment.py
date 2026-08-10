@@ -2655,7 +2655,12 @@ def _base_source_geometry(*, page: int) -> dict:
     return geometry
 
 
-def _owned_visual_cols(*, shift: float) -> tuple[list[dict], dict]:
+def _owned_visual_cols(
+    *,
+    shift: float,
+    owned_rule_hits: int = 12,
+    residual_shift_months: float = 0.52,
+) -> tuple[list[dict], dict]:
     return (
         [
             {
@@ -2675,9 +2680,9 @@ def _owned_visual_cols(*, shift: float) -> tuple[list[dict], dict]:
             "source": "vertical_rule_projection",
             "usable": True,
             "selection_basis": "year_plus_twelve_rule_ownership",
-            "rule_hits": 12,
-            "owned_month_rule_hits": 12,
-            "residual_shift_months": 0.52,
+            "rule_hits": owned_rule_hits,
+            "owned_month_rule_hits": owned_rule_hits,
+            "residual_shift_months": residual_shift_months,
             "offset": shift,
             "right_offset": shift,
         },
@@ -2722,7 +2727,7 @@ def test_candidate_b_visual_lattice_source_requirement_is_disjunctive() -> None:
             "p18_2019_september",
         ),
 )
-def test_candidate_b_base_source_lattice_blocks_plus_one_month_status_shift(
+def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
     monkeypatch,
     page: int,
     year: int,
@@ -2753,27 +2758,38 @@ def test_candidate_b_base_source_lattice_blocks_plus_one_month_status_shift(
     }
 
     for month, formerly_shifted_value in targets:
-        assert rows[month]["status"] == "unknown"
+        assert rows[month]["status"] == status_by_month[month]
         assert rows[month]["status"] != formerly_shifted_value
-        assert rows[month]["extraction_status"] == "review"
         status_ref = next(
             ref
             for ref in rows[month]["source_cell_refs"]
             if ref["field_name"] == "status"
         )
-        assert status_ref["geometry_rejection"] == {
-            "source": "rejected_month_geometry",
-            "reason": "source_table_month_geometry_plane_conflict",
-            "source_table_id": f"pt_{page}_0",
-            "source_table_comparison": "disagree",
-            "logical_page": page,
-            "value_inputs_used": False,
-        }
+        provenance = status_ref["geometry_provenance"]
+        assert status_ref["col"] == month
+        assert status_ref["bbox"] == [
+            40.0 + (month - 1) * 20.0,
+            25.0,
+            40.0 + month * 20.0,
+            40.0,
+        ]
+        assert provenance["source"] == "source_table_geometry"
+        assert provenance["table_id"] == f"pt_{page}_0"
+        assert provenance["source_table_comparison"] == (
+            "source_over_ambiguous_visual"
+        )
+        assert provenance["visual_owned_month_rule_hits"] == 12
+        assert provenance["visual_residual_shift_months"] == 0.52
+        assert provenance["corroborated_by_source_table_geometry"] is False
+        assert provenance["ambiguous_visual_geometry_superseded"] is True
+        assert provenance["value_inputs_used"] is False
     audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][
         str(page)
     ]
-    assert audit["reason"] == "source_table_month_geometry_plane_conflict"
-    assert audit["source_table_comparison"] == "disagree"
+    assert audit["reason"] == "exact_source_table_month_lattice_calibration"
+    assert audit["source_table_comparison"] == "source_over_ambiguous_visual"
+    assert audit["corroborated_by_source_table_geometry"] is False
+    assert audit["ambiguous_visual_geometry_superseded"] is True
     assert audit["value_inputs_used"] is False
 
     from types import SimpleNamespace
@@ -2805,10 +2821,15 @@ def test_candidate_b_base_source_lattice_blocks_plus_one_month_status_shift(
         )
     )
     projected = project_personal_detail_datasets(corrected)
-    active_issues = projected["extraction_issues"]
+    active_issues = projected.get("extraction_issues", [])
     for month, _formerly_shifted_value in targets:
         target_record_id = f"mg_p{page}_repayment_0:{year:04d}-{month:02d}"
         assert any(
+            row.get("monthly_performance_id") == target_record_id
+            and row.get("status_code") == status_by_month[month]
+            for row in projected["credit_account_monthly_performance"]
+        ), target_record_id
+        assert not any(
             issue.get("target_dataset")
             == "credit_account_monthly_performance"
             and issue.get("target_record_id") == target_record_id
@@ -2818,6 +2839,57 @@ def test_candidate_b_base_source_lattice_blocks_plus_one_month_status_shift(
             not in {"resolved", "suppressed_redundant", "informational"}
             for issue in active_issues
         ), target_record_id
+
+
+def test_candidate_b_independently_exact_visual_source_disagreement_still_blocks(
+    monkeypatch,
+) -> None:
+    page = 10
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: _owned_visual_cols(
+            shift=20.0,
+            owned_rule_hits=13,
+            residual_shift_months=0.1,
+        ),
+    )
+
+    extracted = extract_credit_repayment_records(
+        _source_owned_base_lines(
+            year=2022,
+            status_text="NNNNNNCNNNNN",
+        ),
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={
+            str(page): [_base_source_geometry(page=page)]
+        },
+    )
+    rows = {
+        row["month"]: row
+        for row in records_from_micro_grid_dict(
+            extracted["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+    }
+
+    assert rows[6]["status"] == "unknown"
+    status_ref = next(
+        ref
+        for ref in rows[6]["source_cell_refs"]
+        if ref["field_name"] == "status"
+    )
+    assert status_ref["geometry_rejection"] == {
+        "source": "rejected_month_geometry",
+        "reason": "source_table_month_geometry_plane_conflict",
+        "source_table_id": "pt_10_0",
+        "source_table_comparison": "disagree",
+        "logical_page": 10,
+        "value_inputs_used": False,
+    }
 
 
 def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
@@ -2868,6 +2940,8 @@ def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
         )
         assert provenance["source_table_comparison"] == "agree"
         assert provenance["calibrated_from_source_table_geometry"] is True
+        assert provenance["corroborated_by_source_table_geometry"] is True
+        assert provenance["ambiguous_visual_geometry_superseded"] is False
         assert provenance["visual_owned_month_rule_hits"] == 12
         assert provenance["visual_residual_shift_months"] == 0.52
         assert provenance["value_inputs_used"] is False
@@ -3135,7 +3209,7 @@ def test_candidate_b_source_geometry_preserves_local_cell_conflict(monkeypatch) 
     )
 
 
-def test_candidate_b_visual_source_geometry_disagreement_fails_closed() -> None:
+def test_candidate_b_source_geometry_supersedes_high_residual_visual_lattice() -> None:
     import cv2
     import numpy as np
 
@@ -3168,10 +3242,14 @@ def test_candidate_b_visual_source_geometry_disagreement_fails_closed() -> None:
     )
     continuation = [row for row in rows if row["year"] == 2019]
 
-    assert all(row["status"] == "unknown" for row in continuation)
-    assert extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"][
-        "reason"
-    ] == "continuation_month_geometry_plane_conflict"
+    assert all(row["status"] == "N" for row in continuation)
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"]
+    assert audit["reason"] == "exact_source_table_month_lattice_calibration"
+    assert audit["source_table_comparison"] == "source_over_ambiguous_visual"
+    assert audit["visual_owned_month_rule_hits"] == 13
+    assert audit["visual_residual_shift_months"] >= 0.45
+    assert audit["corroborated_by_source_table_geometry"] is False
+    assert audit["ambiguous_visual_geometry_superseded"] is True
 
 
 def test_candidate_b_visual_source_geometry_allows_sub_cell_calibration_drift() -> None:

@@ -292,9 +292,51 @@ def _resolved_amount_unit(labels: Iterable[Any], *, report_default: str) -> str:
     return report_default
 
 
-def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
-    """Parse source institution and update date from a table footer."""
-    for row in rows:
+def _amount_unit_field_info(
+    labels: Iterable[Any],
+    *,
+    report_default: str,
+    source_refs: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Describe the evidence used by the extractor without changing its value."""
+
+    explicit_units = _explicit_amount_units(labels)
+    refs = [dict(ref) for ref in source_refs]
+    if len(explicit_units) > 1:
+        return {
+            "source_state": "unresolved",
+            "basis": "explicit_amount_unit_conflict",
+            "conflicts": sorted(explicit_units),
+            "source_refs": refs,
+        }
+    if explicit_units:
+        value = next(iter(explicit_units))
+        return {
+            "source_state": "reported",
+            "basis": "local_explicit_amount_unit",
+            "source_value": value,
+            "source_refs": refs,
+        }
+    if report_default:
+        return {
+            "source_state": "derived",
+            "basis": "report_default_amount_unit",
+            "source_value": report_default,
+            "source_refs": refs,
+        }
+    return {
+        "source_state": "unresolved",
+        "basis": "amount_unit_evidence_missing",
+        "source_refs": refs,
+    }
+
+
+def _table_source_metadata_evidence(
+    rows: list[list[str]],
+) -> tuple[tuple[int, dict[str, str]], ...]:
+    """Return every source-metadata footer and its physical row index."""
+    values: list[tuple[int, dict[str, str]]] = []
+    for row_index, row in enumerate(rows):
         text = "".join(_compact(value) for value in row)
         if "信息来源机构" not in text:
             continue
@@ -311,8 +353,14 @@ def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
             metadata["source_institution"] = _compact(source_match.group(1))
         if date_match:
             metadata["update_date"] = _date(date_match.group(1))
-        return metadata
-    return {}
+        values.append((row_index, metadata))
+    return tuple(values)
+
+
+def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
+    """Parse source institution and update date from a table footer."""
+    values = _table_source_metadata_evidence(rows)
+    return dict(values[0][1]) if values else {}
 
 
 def _source_ref(page: int, table_id: str, row: int) -> dict[str, Any]:
@@ -2530,6 +2578,7 @@ def extract_enterprise_non_credit_history_datasets(
             if len(row) < 5 or not re.fullmatch(r"(?:19|20)\d{2}-\d{2}", _compact(row[0])):
                 continue
             statistics_month = _compact(row[0])
+            source_refs = [_source_ref(page, table_id, row_index)]
             records.append(
                 {
                     f"{history_type}_history_id": _stable_id(
@@ -2549,7 +2598,14 @@ def extract_enterprise_non_credit_history_datasets(
                     "source_page": page,
                     "source_table_id": table_id,
                     "source": f"enterprise_{history_type}_history",
-                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "source_refs": source_refs,
+                    "field_info": {
+                        "amount_unit": _amount_unit_field_info(
+                            header_labels,
+                            report_default=default_amount_unit,
+                            source_refs=source_refs,
+                        )
+                    },
                     "confidence": 1.0,
                 }
             )
@@ -2607,27 +2663,99 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
     personnel_group_page: int | None = None
     headings = _table_headings(parse_result)
 
-    def close_personnel_group() -> None:
+    def close_personnel_group(*, unresolved_reason: str = "") -> None:
         nonlocal personnel_group_start, personnel_group_page
+        if personnel_group_start is not None and unresolved_reason:
+            for record in key_personnel[personnel_group_start:]:
+                field_info = record.setdefault("field_info", {})
+                for field_name in ("source_institution", "update_date"):
+                    if record.get(field_name) not in (None, ""):
+                        continue
+                    field_info.setdefault(
+                        field_name,
+                        {
+                            "source_state": "unresolved",
+                            "basis": unresolved_reason,
+                            "source_refs": [
+                                dict(ref)
+                                for ref in (record.get("source_refs") or ())
+                                if isinstance(ref, dict)
+                            ],
+                        },
+                    )
         personnel_group_start = None
         personnel_group_page = None
 
     def apply_personnel_metadata(
         metadata: dict[str, str],
+        *,
+        footer_refs: tuple[dict[str, Any], ...],
+        conflicts: dict[str, tuple[str, ...]],
     ) -> None:
-        if personnel_group_start is None or not metadata:
+        if personnel_group_start is None:
             return
         for record in key_personnel[personnel_group_start:]:
-            for key, value in metadata.items():
-                if record.get(key) in (None, ""):
-                    record[key] = value
+            field_info = record.setdefault("field_info", {})
+            record_refs = record.get("source_refs") or []
+            record_pages = {
+                int(ref.get("page"))
+                for ref in record_refs
+                if isinstance(ref, dict) and str(ref.get("page") or "").isdigit()
+            }
+            footer_pages = {
+                int(ref.get("page"))
+                for ref in footer_refs
+                if str(ref.get("page") or "").isdigit()
+            }
+            basis = (
+                "adjacent_continuation_footer"
+                if footer_pages.difference(record_pages)
+                else "table_footer"
+            )
+            for field_name in ("source_institution", "update_date"):
+                value = metadata.get(field_name)
+                if value not in (None, "") and record.get(field_name) in (None, ""):
+                    record[field_name] = value
+                info: dict[str, Any] = {
+                    "source_state": "derived" if value not in (None, "") else "unresolved",
+                    "basis": basis if value not in (None, "") else "footer_field_missing",
+                    "source_refs": [dict(ref) for ref in footer_refs],
+                }
+                if value not in (None, ""):
+                    info["source_value"] = value
+                field_conflicts = conflicts.get(field_name) or ()
+                if field_conflicts:
+                    info["conflicts"] = list(field_conflicts)
+                field_info[field_name] = info
 
     for page, table_id, rows in _table_stream(parse_result):
         if not rows:
             continue
         headers = rows[0]
         signature = "".join(headers)
-        source_metadata = _table_source_metadata(rows)
+        source_metadata_evidence = _table_source_metadata_evidence(rows)
+        source_metadata = (
+            dict(source_metadata_evidence[0][1])
+            if source_metadata_evidence
+            else {}
+        )
+        source_metadata_refs = tuple(
+            _source_ref(page, table_id, row_index)
+            for row_index, _ in source_metadata_evidence
+        )
+        source_metadata_conflicts = {
+            field_name: tuple(sorted(values))
+            for field_name in ("source_institution", "update_date")
+            if len(
+                values := {
+                    metadata.get(field_name)
+                    for _, metadata in source_metadata_evidence
+                    if metadata.get(field_name) not in (None, "")
+                }
+            )
+            > 1
+        }
+        source_footer_present = bool(source_metadata_evidence)
         contributor_header = all(
             marker in signature for marker in ("类型", "出资方", "身份标识号码")
         )
@@ -2690,14 +2818,14 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
         metadata_only_continuation = bool(
             personnel_group_start is not None
             and adjacent_to_personnel_group
-            and source_metadata
+            and source_footer_present
             and not management_header
             and not contributor_header
             and not relationship_headers
             and not non_footer_rows
         )
         if any(row and row[0] in _PROFILE_LABELS for row in rows):
-            close_personnel_group()
+            close_personnel_group(unresolved_reason="next_profile_table")
             for row_index, row in enumerate(rows):
                 if len(row) < 2 or row[0] not in _PROFILE_LABELS:
                     continue
@@ -2741,7 +2869,7 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                 profile["source_refs"].append(_source_ref(page, table_id, row_index))
             continue
         if contributor_header:
-            close_personnel_group()
+            close_personnel_group(unresolved_reason="next_contributor_table")
             for row_index, row in enumerate(rows[1:], start=1):
                 if len(row) < 4 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
                     continue
@@ -2771,6 +2899,8 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
             if personnel_group_start is None or (
                 management_header and not repeated_header_continuation
             ):
+                if personnel_group_start is not None:
+                    close_personnel_group(unresolved_reason="new_personnel_table")
                 personnel_group_start = len(key_personnel)
             for row_index, row in management_rows:
                 key_personnel.append(
@@ -2788,16 +2918,24 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                     }
                 )
             personnel_group_page = page
-            if source_metadata:
-                apply_personnel_metadata(source_metadata)
+            if source_footer_present:
+                apply_personnel_metadata(
+                    source_metadata,
+                    footer_refs=source_metadata_refs,
+                    conflicts=source_metadata_conflicts,
+                )
                 close_personnel_group()
             continue
         if metadata_only_continuation:
-            apply_personnel_metadata(source_metadata)
+            apply_personnel_metadata(
+                source_metadata,
+                footer_refs=source_metadata_refs,
+                conflicts=source_metadata_conflicts,
+            )
             close_personnel_group()
             continue
         if relationship_headers:
-            close_personnel_group()
+            close_personnel_group(unresolved_reason="next_relationship_table")
             for row_index, row in enumerate(rows[1:], start=1):
                 if len(row) < 3 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
                     continue
@@ -2824,7 +2962,8 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                 )
             continue
         if non_footer_rows:
-            close_personnel_group()
+            close_personnel_group(unresolved_reason="unrelated_table_boundary")
+    close_personnel_group(unresolved_reason="end_of_basic_information")
     return {
         "enterprise_profile": [profile] if profile["source_refs"] else [],
         "enterprise_contributors": contributors,
@@ -3893,7 +4032,19 @@ def _attachment_contexts_and_records(
                             "source_label": amount_source_label_raw,
                             "canonical_source_label": amount_source_label,
                             "source_refs": amount_resolution_refs,
-                        }
+                        },
+                        **(
+                            {
+                                amount_kind: {
+                                    **amount_resolution.field_info(),
+                                    "source_label": amount_source_label_raw,
+                                    "canonical_source_label": amount_source_label,
+                                    "source_refs": amount_resolution_refs,
+                                }
+                            }
+                            if amount_kind in _ATTACHMENT_TYPED_AMOUNT_FIELDS
+                            else {}
+                        ),
                     },
                     "amount_unit": "CNY_10K",
                     "close_date": _date(value("close_date")),
@@ -4502,10 +4653,12 @@ def project_enterprise_public_record_datasets(
         for key in ("source", "source_refs", "confidence"):
             if key in record:
                 typed_record[key] = record[key]
-        if record_type in {"housing_fund_payment", "social_security_payment"} and isinstance(
-            record.get("field_info"), dict
+        record_field_info = record.get("field_info")
+        if isinstance(record_field_info, dict) and (
+            record_type in {"housing_fund_payment", "social_security_payment"}
+            or "amount_unit" in record_field_info
         ):
-            typed_record["field_info"] = dict(record["field_info"])
+            typed_record["field_info"] = dict(record_field_info)
         typed_records.append(typed_record)
     return datasets
 
@@ -5072,6 +5225,12 @@ def extract_enterprise_public_records_from_tables(
             for source_ref in type_resolution.source_refs:
                 if source_ref not in source_refs:
                     source_refs.append(dict(source_ref))
+            if any(field in attributes for field in _PUBLIC_NUMBER_ATTRIBUTE_FIELDS):
+                field_info["amount_unit"] = _amount_unit_field_info(
+                    details,
+                    report_default=default_amount_unit,
+                    source_refs=source_refs,
+                )
             if history_resolution is not None:
                 history_info = history_resolution.field_info()
                 field_info["history_reference"] = history_info
@@ -5176,6 +5335,17 @@ def extract_enterprise_public_records_from_tables(
                 previous["source_refs"].extend(record["source_refs"])
                 previous["source_page_end"] = page
                 previous["source_table_id_end"] = table_id
+                if any(
+                    field in merged_attributes
+                    for field in _PUBLIC_NUMBER_ATTRIBUTE_FIELDS
+                ):
+                    previous.setdefault("field_info", {})["amount_unit"] = (
+                        _amount_unit_field_info(
+                            previous["details"],
+                            report_default=default_amount_unit,
+                            source_refs=previous["source_refs"],
+                        )
+                    )
                 continue
             records.append(record)
     for index, record in enumerate(records, start=1):

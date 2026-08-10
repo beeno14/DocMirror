@@ -16,6 +16,9 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docmirror.plugins.credit_report.enterprise_native.audit import (
+    safely_build_enterprise_audit_report,
+)
 from docmirror.plugins.credit_report.enterprise_native.canonical_records import (
     RECOVERED_BUSINESS_DATASET,
     extract_canonical_enterprise_record_families,
@@ -217,6 +220,7 @@ class EnterpriseSemanticDocument:
     quality_flags: tuple[dict[str, Any], ...]
     dataset_completeness: dict[str, dict[str, Any]]
     extraction_report: dict[str, Any]
+    audit_report: dict[str, Any]
 
     def to_debug_payload(self) -> dict[str, Any]:
         return {
@@ -228,6 +232,7 @@ class EnterpriseSemanticDocument:
             "quality_flags": list(self.quality_flags),
             "dataset_completeness": self.dataset_completeness,
             "extraction": self.extraction_report,
+            "audit": self.audit_report,
             "datasets": self.datasets,
             "sections": list(self.sections),
         }
@@ -936,13 +941,21 @@ def extract_enterprise_semantic_document(
         credit_summary=summary,
     )
     completeness = _dataset_completeness(datasets, continuation_audit, quality_flags)
-    extraction_report = build_enterprise_extraction_report(
+    extraction_validation = build_enterprise_extraction_report(
         document,
         datasets,
         continuation_audit=continuation_audit,
         dataset_completeness=completeness,
         data_dictionary=data_dictionary,
         public_records=public_records,
+    )
+    extraction_report = extraction_validation.to_payload()
+    audit_report = safely_build_enterprise_audit_report(
+        document,
+        datasets,
+        extraction_report=extraction_report,
+        quality_flags=quality_flags,
+        data_dictionary=data_dictionary,
     ).to_payload()
     return EnterpriseSemanticDocument(
         facts=facts,
@@ -954,6 +967,7 @@ def extract_enterprise_semantic_document(
         quality_flags=quality_flags,
         dataset_completeness=completeness,
         extraction_report=extraction_report,
+        audit_report=audit_report,
     )
 
 

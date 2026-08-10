@@ -362,6 +362,393 @@ def _vertical_edges(table: Mapping[str, Any]) -> tuple[float, ...] | None:
     return tuple(ordered)
 
 
+def _raw_column_geometry(
+    table: Mapping[str, Any],
+) -> tuple[tuple[BBox, ...], tuple[float, ...]] | None:
+    """Return the scanner's primitive column bands without assigning roles."""
+
+    if str(table.get("geometry_source") or "") != "scanned_image_line_grid":
+        return None
+    table_box = _table_bbox(table)
+    raw_lines = table.get("vertical_lines")
+    if table_box is None or not isinstance(raw_lines, (list, tuple)):
+        return None
+    lines: list[float] = []
+    for value in raw_lines:
+        if isinstance(value, Mapping):
+            value = value.get("x") or value.get("position")
+        try:
+            coordinate = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not isfinite(coordinate):
+            return None
+        lines.append(coordinate)
+    ordered = tuple(sorted(lines))
+    if (
+        not 14 <= len(ordered) <= 19
+        or any(right - left <= 1.0 for left, right in zip(ordered, ordered[1:]))
+    ):
+        return None
+    col_bands = _band_map(
+        table.get("col_bands"),
+        axis="col",
+        table_bbox=table_box,
+    )
+    column_count = len(ordered) - 1
+    if col_bands is None or set(col_bands) != set(range(column_count)):
+        return None
+    columns = tuple(col_bands[index] for index in range(column_count))
+    if not all(
+        abs(columns[index][0] - ordered[index]) <= 2.0
+        and abs(columns[index][2] - ordered[index + 1]) <= 2.0
+        for index in range(column_count)
+    ):
+        return None
+    return columns, ordered
+
+
+def _contiguous_column_partitions(
+    column_count: int,
+    *,
+    group_count: int = 13,
+) -> list[tuple[tuple[int, ...], ...]]:
+    """Enumerate small contiguous primitive-to-effective partitions."""
+
+    partitions: list[tuple[tuple[int, ...], ...]] = []
+
+    def visit(
+        start: int,
+        groups: list[tuple[int, ...]],
+    ) -> None:
+        remaining_columns = column_count - start
+        remaining_groups = group_count - len(groups)
+        if remaining_groups == 0:
+            if remaining_columns == 0:
+                partitions.append(tuple(groups))
+            return
+        if remaining_columns < remaining_groups or remaining_columns > remaining_groups * 2:
+            return
+        for width in (1, 2):
+            if start + width <= column_count:
+                visit(
+                    start + width,
+                    [*groups, tuple(range(start, start + width))],
+                )
+
+    visit(0, [])
+    return partitions
+
+
+def _uniform_effective_widths(
+    columns: Sequence[BBox],
+    groups: Sequence[Sequence[int]],
+) -> bool:
+    widths = [
+        columns[group[-1]][2] - columns[group[0]][0]
+        for group in groups
+        if group
+    ]
+    if len(widths) != 13:
+        return False
+    middle = median(widths)
+    return bool(
+        middle > 0.0
+        and all(abs(width - middle) / middle <= 0.15 for width in widths)
+    )
+
+
+def _exact_pair_span_rows(
+    table: Mapping[str, Any],
+    *,
+    first_col: int,
+    columns: Sequence[BBox],
+) -> set[int]:
+    table_box = _table_bbox(table)
+    row_bands = (
+        _band_map(
+            table.get("row_bands"),
+            axis="row",
+            table_bbox=table_box,
+        )
+        if table_box is not None
+        else None
+    )
+    if row_bands is None or first_col + 1 >= len(columns):
+        return set()
+    rows: set[int] = set()
+    for item in table.get("cell_spans") or ():
+        if not isinstance(item, Mapping):
+            continue
+        row = _integer(item.get("row"))
+        col = _integer(item.get("col"))
+        row_span = _integer(item.get("row_span")) or 1
+        col_span = _integer(item.get("col_span")) or 1
+        if (
+            row is None
+            or col != first_col
+            or row_span != 1
+            or col_span != 2
+            or _span_at(table, row, col) != (1, 2)
+            or row not in row_bands
+            or str(
+                _matrix_get(
+                    table.get("cell_geometry_status"),
+                    row,
+                    col,
+                )
+                or ""
+            )
+            != "exact"
+            or _cell_bbox(table, row, col) is None
+        ):
+            continue
+        observed = _cell_bbox(table, row, col)
+        expected = (
+            columns[first_col][0],
+            row_bands[row][1],
+            columns[first_col + 1][2],
+            row_bands[row][3],
+        )
+        if observed is None or not _same_cell(observed, expected):
+            continue
+        if any(
+            str(
+                _matrix_get(
+                    table.get("cell_geometry_status"),
+                    row,
+                    covered_col,
+                )
+                or ""
+            )
+            == "exact"
+            and _cell_bbox(table, row, covered_col) is not None
+            for covered_col in range(first_col + 1, first_col + col_span)
+        ):
+            continue
+        rows.add(row)
+    return rows
+
+
+def _partition_from_repeated_exact_spans(
+    table: Mapping[str, Any],
+    columns: Sequence[BBox],
+) -> tuple[tuple[int, ...], ...] | None:
+    valid: list[tuple[tuple[int, ...], ...]] = []
+    for groups in _contiguous_column_partitions(len(columns)):
+        if not _uniform_effective_widths(columns, groups):
+            continue
+        pair_rows = [
+            _exact_pair_span_rows(
+                table,
+                first_col=group[0],
+                columns=columns,
+            )
+            for group in groups
+            if len(group) == 2
+        ]
+        if not pair_rows:
+            continue
+        common_rows = set.intersection(*pair_rows)
+        if len(common_rows) < 3 or not any(
+            {start, start + 1, start + 2}.issubset(common_rows)
+            for start in common_rows
+        ):
+            continue
+        valid.append(groups)
+    return valid[0] if len(valid) == 1 else None
+
+
+def _terminal_sliver_partition(
+    table: Mapping[str, Any],
+    columns: Sequence[BBox],
+) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...]] | None:
+    if len(columns) != 14:
+        return None
+    candidates: list[tuple[tuple[tuple[int, ...], ...], tuple[int, ...]]] = []
+    for ignored_col, kept in (
+        (0, tuple(range(1, 14))),
+        (13, tuple(range(13))),
+    ):
+        groups = tuple((column,) for column in kept)
+        if not _uniform_effective_widths(columns, groups):
+            continue
+        kept_widths = [columns[column][2] - columns[column][0] for column in kept]
+        ignored_width = columns[ignored_col][2] - columns[ignored_col][0]
+        if ignored_width > median(kept_widths) * 0.20:
+            continue
+        kept_left = columns[kept[0]][0]
+        kept_right = columns[kept[-1]][2]
+        crossing_span = False
+        for item in table.get("cell_spans") or ():
+            if not isinstance(item, Mapping):
+                continue
+            col = _integer(item.get("col"))
+            col_span = _integer(item.get("col_span")) or 1
+            if col is None:
+                continue
+            owned = set(range(col, col + col_span))
+            if ignored_col in owned and owned.intersection(kept):
+                crossing_span = True
+                break
+        if crossing_span:
+            continue
+        disjoint = True
+        matrix = table.get("cell_bboxes")
+        if not isinstance(matrix, (list, tuple)):
+            continue
+        for row in matrix:
+            if not isinstance(row, (list, tuple)) or ignored_col >= len(row):
+                continue
+            box = _bbox(row[ignored_col])
+            if box is None:
+                continue
+            if ignored_col == 0:
+                disjoint = disjoint and box[2] <= kept_left + 1.0
+            else:
+                disjoint = disjoint and box[0] >= kept_right - 1.0
+        if disjoint:
+            candidates.append((groups, (ignored_col,)))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _remapped_span(
+    span: Mapping[str, Any],
+    groups: Sequence[Sequence[int]],
+) -> dict[str, int] | None:
+    row = _integer(span.get("row"))
+    col = _integer(span.get("col"))
+    row_span = _integer(span.get("row_span")) or 1
+    col_span = _integer(span.get("col_span")) or 1
+    if row is None or col is None:
+        return None
+    raw_columns = set(range(col, col + col_span))
+    matching = [
+        index
+        for index, group in enumerate(groups)
+        if raw_columns.intersection(group)
+    ]
+    if not matching:
+        return None
+    if matching != list(range(matching[0], matching[-1] + 1)):
+        return None
+    owned_groups = [groups[index] for index in matching]
+    if raw_columns != {
+        raw_col
+        for group in owned_groups
+        for raw_col in group
+    }:
+        return None
+    normalized = {
+        "row": row,
+        "col": matching[0],
+        "row_span": row_span,
+        "col_span": len(matching),
+    }
+    return normalized if row_span > 1 or len(matching) > 1 else None
+
+
+def _effective_column_table(
+    table: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Collapse only uniquely repeated physical subdivisions to 13 cells."""
+
+    raw_geometry = _raw_column_geometry(table)
+    if raw_geometry is None:
+        return None
+    columns, _raw_edges = raw_geometry
+    if len(columns) == 13:
+        return table
+    groups = _partition_from_repeated_exact_spans(table, columns)
+    ignored: tuple[int, ...] = ()
+    mode = "repeated_exact_span_partition"
+    if groups is None:
+        sliver = _terminal_sliver_partition(table, columns)
+        if sliver is None:
+            return None
+        groups, ignored = sliver
+        mode = "disjoint_terminal_sliver"
+
+    exact_pair_rows = {
+        group[0]: _exact_pair_span_rows(
+            table,
+            first_col=group[0],
+            columns=columns,
+        )
+        for group in groups
+        if len(group) == 2
+    }
+
+    matrix = table.get("cell_bboxes")
+    statuses = table.get("cell_geometry_status")
+    if not isinstance(matrix, (list, tuple)) or not isinstance(statuses, (list, tuple)):
+        return None
+    normalized_boxes: list[list[Any]] = []
+    normalized_statuses: list[list[Any]] = []
+    for row_index, row in enumerate(matrix):
+        if not isinstance(row, (list, tuple)):
+            return None
+        box_row: list[Any] = []
+        status_row: list[Any] = []
+        for group in groups:
+            first_col = group[0]
+            box = _matrix_get(matrix, row_index, first_col)
+            status = _matrix_get(statuses, row_index, first_col, "")
+            if len(group) == 2:
+                if row_index not in exact_pair_rows.get(first_col, set()):
+                    box = None
+                    status = "missing"
+            box_row.append(deepcopy(box))
+            status_row.append(deepcopy(status))
+        normalized_boxes.append(box_row)
+        normalized_statuses.append(status_row)
+
+    normalized_spans = [
+        remapped
+        for item in table.get("cell_spans") or ()
+        if isinstance(item, Mapping)
+        and (remapped := _remapped_span(item, groups)) is not None
+    ]
+    effective_bands = [
+        {
+            "index": index,
+            "x0": columns[group[0]][0],
+            "x1": columns[group[-1]][2],
+        }
+        for index, group in enumerate(groups)
+    ]
+    effective_edges = [effective_bands[0]["x0"]] + [
+        band["x1"] for band in effective_bands
+    ]
+    table_box = _table_bbox(table)
+    if table_box is None:
+        return None
+    normalized = dict(table)
+    normalized.update(
+        {
+            "bbox": [
+                effective_edges[0],
+                table_box[1],
+                effective_edges[-1],
+                table_box[3],
+            ],
+            "cell_bboxes": normalized_boxes,
+            "cell_geometry_status": normalized_statuses,
+            "cell_spans": normalized_spans,
+            "col_bands": effective_bands,
+            "vertical_lines": effective_edges,
+            "effective_column_canonicalization": {
+                "mode": mode,
+                "raw_column_count": len(columns),
+                "effective_column_count": len(groups),
+                "collapsed_group_count": sum(len(group) > 1 for group in groups),
+                "ignored_terminal_column_count": len(ignored),
+            },
+        }
+    )
+    return normalized
+
+
 def _owned_columns(
     table: Mapping[str, Any],
 ) -> tuple[tuple[BBox, ...], tuple[float, ...]] | None:
@@ -575,6 +962,23 @@ def _derived_cell(row_band: BBox, col_band: BBox) -> BBox:
     return col_band[0], row_band[1], col_band[2], row_band[3]
 
 
+def _target_matches_year_row_pair(target: BBox, row_pair_year_box: BBox) -> bool:
+    """Bind a pair-height year target to one exact physical row pair."""
+
+    target_coverage, pair_coverage, _iou = _intersection_ratio(
+        target,
+        row_pair_year_box,
+    )
+    center_x = (target[0] + target[2]) / 2.0
+    center_y = (target[1] + target[3]) / 2.0
+    return (
+        row_pair_year_box[0] - 1.0 <= center_x <= row_pair_year_box[2] + 1.0
+        and row_pair_year_box[1] - 2.0 <= center_y <= row_pair_year_box[3] + 2.0
+        and target_coverage >= 0.70
+        and pair_coverage >= 0.35
+    )
+
+
 def _year_anchor_for_pair(
     table: Mapping[str, Any],
     *,
@@ -674,7 +1078,60 @@ def _year_anchor_for_pair(
             matches.append((anchor_row, box, row_span, "spanning_year_cell"))
         elif row_span == 1 and anchor_row in {status_row, amount_row}:
             matches.append((anchor_row, box, row_span, "target_bound_singleton_year_cell"))
-    return matches[0] if len(matches) == 1 else None
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None
+
+    # Some exact scanner grids preserve the year column and both horizontal
+    # row rules but split the printed two-row year cell into singletons.  A
+    # pair-height target then covers only half of either singleton and fails
+    # the ordinary 70% target-to-cell check.  Bind the exact row-pair union
+    # only when at least one geometrically consistent singleton corroborates
+    # column zero; the caller still has to prove the global row/column rules
+    # and one unique status/amount lattice before this candidate is returned.
+    singleton_support = 0
+    for anchor_row in (status_row, amount_row):
+        row_span, col_span = _anchor_span(table, anchor_row, 0)
+        box = _cell_bbox(table, anchor_row, 0)
+        declared_box = (
+            (
+                year_column[0],
+                row_bands[anchor_row][1],
+                year_column[2],
+                row_bands[anchor_row][3],
+            )
+            if anchor_row in row_bands
+            else None
+        )
+        if (
+            row_span == 1
+            and col_span == 1
+            and box is not None
+            and declared_box is not None
+            and str(
+                _matrix_get(
+                    table.get("cell_geometry_status"),
+                    anchor_row,
+                    0,
+                )
+                or ""
+            )
+            == "exact"
+            and _same_cell(box, declared_box)
+        ):
+            singleton_support += 1
+    if singleton_support and _target_matches_year_row_pair(
+        year_bbox,
+        row_pair_year_box,
+    ):
+        return (
+            status_row,
+            row_pair_year_box,
+            2,
+            "row_pair_year_column",
+        )
+    return None
 
 
 def _same_x(first: BBox, second: BBox, *, tolerance: float = 1.5) -> bool:
@@ -757,6 +1214,10 @@ def _candidate_lattices(
     year_bbox: BBox,
     status_bbox: BBox,
 ) -> list[SourceTableMonthLattice]:
+    effective_table = _effective_column_table(table)
+    if effective_table is None:
+        return []
+    table = effective_table
     if (
         _integer(table.get("logical_page")) != logical_page
         or str(table.get("coordinate_system") or "") != "pdf_points_top_left"
@@ -850,6 +1311,7 @@ def _candidate_lattices(
                 )
                 and _vertical_neighbors(row_bands[header_row], row_bands[status_row])
             )
+        canonicalization = table.get("effective_column_canonicalization")
         row_pair = (
             year_cell[0],
             row_bands[status_row][1],
@@ -878,6 +1340,26 @@ def _candidate_lattices(
             "exact_preceding_header": exact_header,
             "active_months": sorted(active_months),
         }
+        if isinstance(canonicalization, Mapping):
+            provenance.update(
+                {
+                    "effective_column_canonicalization": str(
+                        canonicalization.get("mode") or ""
+                    ),
+                    "raw_column_count": _integer(
+                        canonicalization.get("raw_column_count")
+                    ),
+                    "effective_column_count": _integer(
+                        canonicalization.get("effective_column_count")
+                    ),
+                    "collapsed_raw_column_group_count": _integer(
+                        canonicalization.get("collapsed_group_count")
+                    ),
+                    "ignored_terminal_column_count": _integer(
+                        canonicalization.get("ignored_terminal_column_count")
+                    ),
+                }
+            )
         candidates.append(
             SourceTableMonthLattice(
                 table_id=str(table.get("table_id") or ""),

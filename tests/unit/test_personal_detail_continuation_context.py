@@ -185,7 +185,10 @@ def test_personal_detail_context_uses_logical_pages_and_suppresses_table_owned_t
                 width=600,
                 height=800,
                 tables=[table_1],
-                texts=[SimpleNamespace(content="账户标识 A1", bbox=[30, 620, 200, 650])],
+                texts=[
+                    SimpleNamespace(content="账户标识 A1", bbox=[30, 620, 200, 650]),
+                    SimpleNamespace(content="第1页，共2页", bbox=[250, 780, 350, 795]),
+                ],
             ),
             SimpleNamespace(
                 page_number=11,
@@ -193,7 +196,10 @@ def test_personal_detail_context_uses_logical_pages_and_suppresses_table_owned_t
                 width=600,
                 height=800,
                 tables=[table_2],
-                texts=[SimpleNamespace(content="账户状态 正常", bbox=[30, 40, 200, 70])],
+                texts=[
+                    SimpleNamespace(content="账户状态 正常", bbox=[30, 40, 200, 70]),
+                    SimpleNamespace(content="第2页，共2页", bbox=[250, 780, 350, 795]),
+                ],
             ),
         ],
         entities=SimpleNamespace(
@@ -211,9 +217,25 @@ def test_personal_detail_context_uses_logical_pages_and_suppresses_table_owned_t
     assert context.entity_context.content_conserved is True
     assert {unit.kind for unit in context.entity_context.units} == {"table"}
     assert context.source_page_by_logical == {10: 5, 11: 5}
+    assert context.reading_order_by_logical == {10: 1, 11: 2}
     assert context.tables_continue("account-head", "account-tail") is True
-    assert context.entity_context.entity_for_unit("personal_detail:table:p10:account-head").pages == (10, 11)
+    assert context.entity_context.entity_for_unit("personal_detail:table:p10:account-head").pages == (1, 2)
     assert context.allows_scanned_line_transition(10, evidence_line_1, 0, 11, evidence_line_2, 0) is True
+
+    # Entity identity is evidence, but it cannot authorize a cross-page edge
+    # after printed order has become explicitly non-authoritative.
+    context.reading_order_resolution = {
+        "resolved": False,
+        "authoritative": False,
+        "basis": "unresolved_identity_fallback",
+    }
+    assert (
+        context.entity_context.entity_for_unit("personal_detail:table:p10:account-head")
+        == context.entity_context.entity_for_unit("personal_detail:table:p11:account-tail")
+    )
+    assert context.tables_continue("account-head", "account-tail") is False
+    assert context.allows_scanned_line_transition(10, evidence_line_1, 0, 11, evidence_line_2, 0) is False
+    assert context.allows_scanned_line_transition(10, evidence_line_1, 0, 10, evidence_line_1, 0) is True
 
 
 def test_personal_detail_context_cache_is_single_pass_and_copy_on_read() -> None:

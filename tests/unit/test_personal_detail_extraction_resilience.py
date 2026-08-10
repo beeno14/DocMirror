@@ -2132,9 +2132,27 @@ def test_scanned_auxiliary_exposes_only_the_single_candidate_b_result() -> None:
 
 def test_printed_reading_order_tolerates_large_observed_page_gaps() -> None:
     pages = [
-        SimpleNamespace(page_number=30, source_page_number=3, texts=[SimpleNamespace(content="第 8 页，共 8 页")]),
-        SimpleNamespace(page_number=10, source_page_number=1, texts=[SimpleNamespace(content="第 1 页，共 8 页")]),
-        SimpleNamespace(page_number=20, source_page_number=2, texts=[SimpleNamespace(content="第 4 页，共 8 页")]),
+        SimpleNamespace(
+            page_number=30,
+            source_page_number=3,
+            width=600,
+            height=800,
+            texts=[SimpleNamespace(content="第 8 页，共 8 页", bbox=[220, 770, 380, 790])],
+        ),
+        SimpleNamespace(
+            page_number=10,
+            source_page_number=1,
+            width=600,
+            height=800,
+            texts=[SimpleNamespace(content="第 1 页，共 8 页", bbox=[220, 770, 380, 790])],
+        ),
+        SimpleNamespace(
+            page_number=20,
+            source_page_number=2,
+            width=600,
+            height=800,
+            texts=[SimpleNamespace(content="第 4 页，共 8 页", bbox=[220, 770, 380, 790])],
+        ),
     ]
     result = SimpleNamespace(pages=pages, entities=SimpleNamespace(domain_specific={}))
 

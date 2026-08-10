@@ -418,10 +418,12 @@ def _validate_record_fields(
     data_dictionary: dict[str, Any],
     table_rows: dict[tuple[int, str, int], tuple[str, ...]],
     labels: frozenset[str],
-) -> tuple[list[EnterpriseExtractionFailure], int, int]:
+) -> tuple[list[EnterpriseExtractionFailure], int, int, int, int]:
     failures: list[EnterpriseExtractionFailure] = []
     checked = 0
     satisfied = 0
+    verified_equal = 0
+    present_unverified = 0
     enum_fields = set((data_dictionary.get("enums") or {}).keys())
     for dataset, records in datasets.items():
         if dataset in _SINGLETON_DATASETS:
@@ -476,7 +478,11 @@ def _validate_record_fields(
                     )
                     continue
                 satisfied += 1
-    return failures, checked, satisfied
+                if comparable and any(result is True for result in comparable):
+                    verified_equal += 1
+                else:
+                    present_unverified += 1
+    return failures, checked, satisfied, verified_equal, present_unverified
 
 
 def _validate_singleton_fields(
@@ -485,10 +491,12 @@ def _validate_singleton_fields(
     data_dictionary: dict[str, Any],
     table_rows: dict[tuple[int, str, int], tuple[str, ...]],
     labels: frozenset[str],
-) -> tuple[list[EnterpriseExtractionFailure], int, int]:
+) -> tuple[list[EnterpriseExtractionFailure], int, int, int, int]:
     failures: list[EnterpriseExtractionFailure] = []
     checked = 0
     satisfied = 0
+    verified_equal = 0
+    present_unverified = 0
     enum_fields = set((data_dictionary.get("enums") or {}).keys())
     for dataset in _SINGLETON_DATASETS:
         columns = _field_columns(data_dictionary, dataset)
@@ -535,7 +543,11 @@ def _validate_singleton_fields(
                 )
                 continue
             satisfied += 1
-    return failures, checked, satisfied
+            if comparable and any(result is True for result in comparable):
+                verified_equal += 1
+            else:
+                present_unverified += 1
+    return failures, checked, satisfied, verified_equal, present_unverified
 
 
 def _record_contract_failures(
@@ -947,14 +959,26 @@ def build_enterprise_extraction_report(
     table_rows = _table_rows(document)
     labels = _all_labels(data_dictionary)
     failures = _input_and_component_failures(document)
-    singleton_failures, singleton_checked, singleton_satisfied = _validate_singleton_fields(
+    (
+        singleton_failures,
+        singleton_checked,
+        singleton_satisfied,
+        singleton_verified,
+        singleton_unverified,
+    ) = _validate_singleton_fields(
         document,
         datasets,
         data_dictionary,
         table_rows,
         labels,
     )
-    row_failures, row_checked, row_satisfied = _validate_record_fields(
+    (
+        row_failures,
+        row_checked,
+        row_satisfied,
+        row_verified,
+        row_unverified,
+    ) = _validate_record_fields(
         document,
         datasets,
         data_dictionary,
@@ -994,6 +1018,8 @@ def build_enterprise_extraction_report(
             "checked_field_count": checked_fields,
             "satisfied_field_count": satisfied_fields,
             "failed_field_count": max(0, checked_fields - satisfied_fields),
+            "verified_equal_field_count": singleton_verified + row_verified,
+            "present_unverified_field_count": singleton_unverified + row_unverified,
             "record_contract_count": record_checked,
             "semantic_resolution_check_count": amount_checked + public_checked,
             "source_component_count": len(document.components),

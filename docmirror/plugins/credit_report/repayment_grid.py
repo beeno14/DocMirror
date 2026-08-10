@@ -1341,6 +1341,7 @@ def _accepted_month_geometry_provenance(audit: Mapping[str, Any]) -> dict[str, A
         "coordinate_system",
         "value_inputs_used",
         "corroborated_by_source_table_geometry",
+        "ambiguous_visual_geometry_superseded",
         "source_table_comparison",
         "calibrated_from_source_table_geometry",
         "visual_selection_basis",
@@ -2911,9 +2912,23 @@ def reconstruct_repayment_micro_grid_from_lines(
                 and row_geometry_audit.get("source")
                 == "vertical_rule_projection"
             )
-            if visual_physical_lattice and not _month_geometry_planes_agree(
-                year_visual_cols,
-                source_month_cols,
+            visual_requires_source = bool(
+                visual_physical_lattice
+                and _candidate_b_visual_lattice_needs_source_table(
+                    row_geometry_audit
+                )
+            )
+            visual_source_agree = bool(
+                visual_physical_lattice
+                and _month_geometry_planes_agree(
+                    year_visual_cols,
+                    source_month_cols,
+                )
+            )
+            if (
+                visual_physical_lattice
+                and not visual_source_agree
+                and not visual_requires_source
             ):
                 row_geometry_audit = {
                     "source": "rejected_month_geometry",
@@ -2974,11 +2989,20 @@ def reconstruct_repayment_micro_grid_from_lines(
                     "amount_row_index": source_lattice.amount_row_index,
                     "coordinate_system": source_lattice.coordinate_system,
                     "source_table_comparison": (
-                        "agree" if visual_physical_lattice else "source_only"
+                        "agree"
+                        if visual_source_agree
+                        else (
+                            "source_over_ambiguous_visual"
+                            if visual_requires_source
+                            else "source_only"
+                        )
                     ),
                     "calibrated_from_source_table_geometry": True,
                     "corroborated_by_source_table_geometry": bool(
-                        visual_physical_lattice
+                        visual_source_agree
+                    ),
+                    "ambiguous_visual_geometry_superseded": bool(
+                        visual_requires_source and not visual_source_agree
                     ),
                     "visual_selection_basis": row_geometry_audit.get(
                         "selection_basis"
