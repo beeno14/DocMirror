@@ -2182,6 +2182,12 @@ def test_personal_detail_ocr_correction_invariants(
         }
         assert set(recovered_card_types) == _YE_RECOVERED_CARD_IDS
         assert set(recovered_card_types.values()) == {"credit_card"}
+        ye_account_failures: list[str] = []
+        _append_ye_account_identity_oracle_failures(v2_datasets, ye_account_failures)
+        _append_ye_mg_p12_owner_oracle_failures(v2_datasets, ye_account_failures)
+        assert not ye_account_failures, "Live Ye account oracle failures:\n- " + "\n- ".join(
+            ye_account_failures
+        )
         assert account_completeness["expected_row_count"] == 42
         assert account_completeness["emitted_row_count"] == len(account_rows)
         assert account_completeness["expected_row_count"] == (
@@ -2210,22 +2216,31 @@ def test_personal_detail_ocr_correction_invariants(
         ):
             _assert_monthly_status_value_or_reported(payload, record_id, "N")
 
-        # Population shortfalls are governed by the structured checks above;
-        # this block pins the quality of values that were safely emitted.
-        assert len(institutional) >= 94
-        if len(institutional) < 96:
-            gap = next(
-                issue
-                for issue in collect_extraction_issues(context)
-                if issue.get("issue_code") == "canonical_inquiry_sequence_gap"
-                and (issue.get("observed_value") or {}).get("inquiry_type") == "institution"
-            )
-            assert gap["candidate_value"]["missing_sequences"]
-            assert "dataset_incomplete" in gap["reason_codes"]
+        assert len(institutional) == 96
         assert len(personal) == 16
-        if len(institutional) == 96:
-            assert [row["sequence"] for row in institutional] == list(range(1, 97))
+        assert [row["sequence"] for row in institutional] == list(range(1, 97))
         assert [row["sequence"] for row in personal] == list(range(1, 17))
+        institutional_by_sequence = {int(row["sequence"]): row for row in institutional}
+        assert len(institutional_by_sequence) == 96
+        assert (
+            institutional_by_sequence[5]["inquiry_date"],
+            institutional_by_sequence[5]["institution"],
+            institutional_by_sequence[5]["reason"],
+        ) == ("2024-02-07", "兴业银行股份有限公司", "贷后管理")
+        assert (
+            institutional_by_sequence[27]["inquiry_date"],
+            institutional_by_sequence[27]["institution"],
+            institutional_by_sequence[27]["reason"],
+        ) == ("2023-09-09", "兴业银行股份有限公司", "贷后管理")
+        assert (
+            institutional_by_sequence[69]["inquiry_date"],
+            institutional_by_sequence[69]["institution"],
+            institutional_by_sequence[69]["reason"],
+        ) == (
+            "2022-10-11",
+            "中信银行股份有限公司个人信贷部",
+            "贷后管理",
+        )
         assert audit["applied_count"] >= 70
 
 
@@ -2297,21 +2312,6 @@ def _append_ye_account_identity_oracle_failures(
             f"R1 account IDs={sorted(observed_r1_ids)!r}, expected={sorted(expected_r1_ids)!r}"
         )
     for account_id, expected_identifier in _YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS.items():
-        matches = accounts_by_id.get(account_id, [])
-        if len(matches) != 1:
-            failures.append(f"{account_id}: emitted account count={len(matches)}, expected 1")
-            continue
-        _, account = matches[0]
-        if account.get("account_type") != "revolving_loan_subaccount":
-            failures.append(
-                f"{account_id}: family={account.get('account_type')!r}, expected R1"
-            )
-        if account.get("account_identifier") != expected_identifier:
-            failures.append(
-                f"{account_id}: identifier={account.get('account_identifier')!r}, "
-                f"expected={expected_identifier!r}"
-            )
-
         wrong_publications = [
             {
                 "account_id": row.get("account_id"),
@@ -2328,6 +2328,20 @@ def _append_ye_account_identity_oracle_failures(
             failures.append(
                 f"{account_id}: identifier also published under wrong identity/family "
                 f"{wrong_publications!r}"
+            )
+        matches = accounts_by_id.get(account_id, [])
+        if len(matches) != 1:
+            failures.append(f"{account_id}: emitted account count={len(matches)}, expected 1")
+            continue
+        _, account = matches[0]
+        if account.get("account_type") != "revolving_loan_subaccount":
+            failures.append(
+                f"{account_id}: family={account.get('account_type')!r}, expected R1"
+            )
+        if account.get("account_identifier") != expected_identifier:
+            failures.append(
+                f"{account_id}: identifier={account.get('account_identifier')!r}, "
+                f"expected={expected_identifier!r}"
             )
 
     def _check_card(

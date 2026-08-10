@@ -193,24 +193,54 @@ def test_document_local_inquiry_repair_preserves_real_high_ordinals() -> None:
     ]
 
 
-def test_document_local_inquiry_repair_withholds_two_missing_ordinals() -> None:
+def test_document_local_inquiry_repair_resolves_independent_isolated_gaps() -> None:
     assert native_extraction._document_local_inquiry_ordinals(
         [1, None, 3, 4, None, 6]
     ) == [
         (1, None),
-        (None, "multiple_missing"),
+        (2, "missing"),
         (3, None),
         (4, None),
-        (None, "multiple_missing"),
+        (5, "missing"),
         (6, None),
     ]
 
 
-def test_exact_inquiry_table_localizes_two_missing_ordinals_without_emission() -> None:
+@pytest.mark.parametrize(
+    ("raw_sequences", "expected_repair"),
+    [
+        ([None, 2, 3], "leading_boundary_missing"),
+        ([1, 2, None], "trailing_boundary_missing"),
+    ],
+)
+def test_document_local_inquiry_repair_localizes_single_boundary_gap(
+    raw_sequences: list[int | None],
+    expected_repair: str,
+) -> None:
+    normalized = native_extraction._document_local_inquiry_ordinals(raw_sequences)
+
+    assert [value for value, _repair in normalized if value is None] == [None]
+    assert [repair for value, repair in normalized if value is None] == [
+        expected_repair
+    ]
+
+
+def test_document_local_inquiry_repair_marks_adjacent_run_as_multiple() -> None:
+    assert native_extraction._document_local_inquiry_ordinals(
+        [1, None, None, 4]
+    ) == [
+        (1, None),
+        (None, "multiple_missing"),
+        (None, "multiple_missing"),
+        (4, None),
+    ]
+
+
+def test_exact_inquiry_table_withholds_adjacent_missing_run() -> None:
     rows = [["\u7f16\u53f7", "\u67e5\u8be2\u65e5\u671f", "\u67e5\u8be2\u673a\u6784", "\u67e5\u8be2\u539f\u56e0"]]
     rows.extend(
         [
-            "\u574f" if sequence in {2, 5} else str(sequence),
+            "\u574f" if sequence in {2, 3} else str(sequence),
             f"2024.01.{sequence:02d}",
             "\u672c\u4eba",
             "\u672c\u4eba\u67e5\u8be2",
@@ -226,8 +256,8 @@ def test_exact_inquiry_table_localizes_two_missing_ordinals_without_emission() -
     records = native_extraction._extract_inquiries(context)
     coverage = native_extraction._inquiry_source_coverage(context)
 
-    assert [record["sequence"] for record in records] == [1, 3, 4, 6]
-    assert coverage["observed_sequences"] == {"personal": [1, 3, 4, 6]}
+    assert [record["sequence"] for record in records] == [1, 4, 5, 6]
+    assert coverage["observed_sequences"] == {"personal": [1, 4, 5, 6]}
     issues = [
         issue
         for issue in context._personal_detail_extraction_issues
@@ -235,7 +265,7 @@ def test_exact_inquiry_table_localizes_two_missing_ordinals_without_emission() -
         == "candidate_b_inquiry_multiple_missing_sequences_unresolved"
     ]
     assert len(issues) == 2
-    assert {issue["source_refs"][0]["row"] for issue in issues} == {2, 5}
+    assert {issue["source_refs"][0]["row"] for issue in issues} == {2, 3}
     assert all(issue.get("field_name") == "sequence" for issue in issues)
     unresolved_targets = {
         str(issue.get("target_record_id") or "") for issue in issues
@@ -2779,3 +2809,702 @@ def test_shared_revolving_table_refreshes_only_compatible_family_state(
     assert ledger["account_family_endpoints"] == {
         account_type: max(expected_sequences)
     }
+
+
+def _exact_two_cell_card_table(*, trailing_residue: str = "爱") -> SimpleNamespace:
+    rows = [
+        [
+            "发卡机构 账户标识 开立日期 账户授信额度",
+            "共享授信额度 币种 业务种类 担保方式",
+        ],
+        [
+            "D10123910H 福建海峡银行 00011560405 2017.02.04 30,000 "
+            "股份有限公司 0032149",
+            f"人民币元 贷记卡 信用/无担保 {trailing_residue}".strip(),
+        ],
+    ]
+    geometry = {
+        "cell_bboxes": [
+            [[51.5, 386.5, 226.0, 401.0], [226.0, 386.5, 401.5, 401.0]],
+            [[51.5, 401.0, 226.0, 426.5], [226.0, 401.0, 401.5, 426.5]],
+        ],
+        "cell_geometry_status": [["exact", "exact"], ["exact", "exact"]],
+        "cell_evidence_ids": [
+            [["card6:h0"], ["card6:h1"]],
+            [["card6:v0"], ["card6:v1"]],
+        ],
+        "cell_spans": [],
+        "row_bands": [
+            {"index": 0, "y0": 386.5, "y1": 401.0},
+            {"index": 1, "y0": 401.0, "y1": 426.5},
+        ],
+        "col_bands": [
+            {"index": 0, "x0": 51.5, "x1": 226.0},
+            {"index": 1, "x0": 226.0, "x1": 401.5},
+        ],
+    }
+    return SimpleNamespace(
+        table_id="pt_18_1",
+        metadata={"raw_rows": rows, "geometry": geometry},
+        headers=[],
+        rows=[],
+        bbox=[51.5, 386.5, 401.5, 426.5],
+        confidence=0.99,
+    )
+
+
+def test_exact_two_cell_card_cluster_recovers_card6_without_xau() -> None:
+    table = _exact_two_cell_card_table()
+    evidence = [
+        {
+            "page": 18,
+            "source_page": 9,
+            "lines": [
+                {
+                    "text": "（四）贷记卡账户",
+                    "bbox": [51.5, 350.0, 180.0, 365.0],
+                    "evidence_ids": ["card-family"],
+                },
+                {
+                    "text": "账户 6：",
+                    "bbox": [51.5, 368.0, 150.0, 382.0],
+                    "evidence_ids": ["card6-anchor"],
+                },
+            ],
+        }
+    ]
+    context = SimpleNamespace(
+        pages=[_page(18, [table])],
+        reading_order_by_logical={18: 1},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: False,
+        tables_continue=lambda *_args: None,
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    card6 = next(
+        account
+        for account in accounts
+        if account.get("account_type") == "credit_card"
+        and account.get("category_sequence") == 6
+    )
+
+    assert card6["management_institution"] == "福建海峡银行股份有限公司"
+    assert card6["account_identifier"] == "D10123910H000115604050032149"
+    assert card6["open_date"] == "2017-02-04"
+    assert card6["credit_limit"] == 30000
+    assert card6["currency"] == "CNY"
+    assert card6["account_currency"] == "CNY"
+    assert card6["business_type"] == "贷记卡"
+    assert card6["guarantee_type"] == "信用/无担保"
+    assert card6.get("shared_credit_limit") is None
+    assert "XAU" not in str(card6)
+    assert any(
+        issue.get("issue_code") == "candidate_b_account_cluster_field_unresolved"
+        and issue.get("field_name") == "shared_credit_limit"
+        and issue.get("source_refs", [{}])[0].get("row") == 1
+        and issue.get("source_refs", [{}])[0].get("column") == 1
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert any(
+        issue.get("issue_code") == "candidate_b_account_cluster_residue_unresolved"
+        and issue.get("observed_value", {}).get("unconsumed_residue") == "爱"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+@pytest.mark.parametrize("defect", ["two_han_residue", "spanned_value", "derived_cell"])
+def test_exact_two_cell_card_cluster_rejects_nearby_shapes(defect: str) -> None:
+    table = _exact_two_cell_card_table(
+        trailing_residue="爱福" if defect == "two_han_residue" else "爱"
+    )
+    geometry = table.metadata["geometry"]
+    if defect == "spanned_value":
+        geometry["cell_spans"] = [
+            {"row": 1, "col": 0, "row_span": 1, "col_span": 2}
+        ]
+    elif defect == "derived_cell":
+        geometry["cell_geometry_status"][1][1] = "derived"
+
+    assert (
+        native_extraction._exact_two_cell_card_cluster_values(
+            table, table.metadata["raw_rows"]
+        )
+        is None
+    )
+
+
+def _ye_family_population_context(*, insert_gap: bool = False) -> SimpleNamespace:
+    evidence: list[dict[str, object]] = []
+    pages: list[SimpleNamespace] = []
+
+    def evidence_page(page: int, lines: list[tuple[str, float]]) -> None:
+        evidence.append(
+            {
+                "page": page,
+                "source_page": page,
+                "lines": [
+                    {
+                        "text": text,
+                        "bbox": [20.0, top, 260.0, top + 12.0],
+                        "evidence_ids": [f"p{page}:{index}"],
+                    }
+                    for index, (text, top) in enumerate(lines)
+                ],
+            }
+        )
+
+    nr_lines = [("（一）非循环贷账户", 10.0)] + [
+        (f"账户 {sequence}：", 30.0 + sequence * 18.0)
+        for sequence in range(1, 19)
+    ]
+    evidence_page(1, nr_lines)
+    pages.append(_page(1, []))
+
+    page11_table = _table("r1-1", _GEOMETRIC_LOAN_BASE_ROWS, top=535.0)
+    pages.append(_page(11, [page11_table]))
+    evidence_page(
+        11,
+        [("（二）循环贷账户一", 501.5), ("账户 1：", 516.5)],
+    )
+
+    continuation_pages = [(12, (2, 3)), (13, (4, 5))]
+    for page_number, ordinals in continuation_pages:
+        pages.append(
+            _page(
+                page_number,
+                [
+                    _table(
+                        f"r1-{ordinal}",
+                        _GEOMETRIC_LOAN_BASE_ROWS,
+                        top=80.0 + index * 220.0,
+                    )
+                    for index, ordinal in enumerate(ordinals)
+                ],
+            )
+        )
+        evidence_page(
+            page_number,
+            [
+                (f"账户 {ordinal}：", 60.0 + index * 220.0)
+                for index, ordinal in enumerate(ordinals)
+            ],
+        )
+
+    page14_tables = [
+        _table("r1-6", _GEOMETRIC_LOAN_BASE_ROWS, top=170.0),
+        *[
+            _table(
+                f"r2-{sequence}",
+                _GEOMETRIC_LOAN_BASE_ROWS,
+                top=380.0 + sequence * 55.0,
+            )
+            for sequence in range(1, 7)
+        ],
+    ]
+    pages.append(_page(14, page14_tables))
+    evidence_page(
+        14,
+        [
+            ("账户 6：", 148.0),
+            ("（三）循环贷账户二", 349.5),
+            *[
+                (f"账户 {sequence}：", 365.0 + sequence * 55.0)
+                for sequence in range(1, 7)
+            ],
+        ],
+    )
+    pages.append(_page(17, []))
+    evidence_page(
+        17,
+        [("（四）贷记卡账户", 10.0)]
+        + [
+            (f"账户 {sequence}：", 30.0 + sequence * 18.0)
+            for sequence in range(1, 13)
+        ],
+    )
+
+    if insert_gap:
+        pages.insert(3, _page(120, []))
+        evidence.insert(
+            3,
+            {"page": 120, "source_page": 120, "lines": []},
+        )
+    reading_order = {
+        page.page_number: index for index, page in enumerate(pages, 1)
+    }
+    return SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical=reading_order,
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: False,
+    )
+
+
+def test_generic_loan_morphology_preserves_exact_ye_family_populations() -> None:
+    context = _ye_family_population_context()
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+    counts: dict[str, int] = {}
+    for skeleton in skeletons:
+        family = str(skeleton["account_type"])
+        counts[family] = counts.get(family, 0) + 1
+
+    assert counts == {
+        "non_revolving_loan": 18,
+        "revolving_loan_subaccount": 6,
+        "revolving_loan_account": 6,
+        "credit_card": 12,
+    }
+    assert ledger["account_family_endpoints"] == {
+        "non_revolving_loan": 18,
+        "revolving_loan_subaccount": 6,
+        "revolving_loan_account": 6,
+        "credit_card": 12,
+    }
+    assert ledger["credit_accounts"] == 42
+
+
+def test_generic_loan_family_carry_stops_at_registered_blank_gap() -> None:
+    context = _ye_family_population_context(insert_gap=True)
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    r1_sequences = [
+        row.get("category_sequence")
+        for row in skeletons
+        if row.get("account_type") == "revolving_loan_subaccount"
+    ]
+
+    assert r1_sequences == [1, 2, 3]
+
+
+def _exact_sparse_card8_table() -> SimpleNamespace:
+    values = ["" for _column in range(13)]
+    values[0] = "中信银行股份 有限公司信用 卡中心"
+    values[2] = "B10611000H 00016226880 21919136860 7"
+    values[4] = "2018.10.24"
+    values[5] = "13,000 福"
+    values[8] = "人民币元"
+    values[10] = "贷记卡"
+    values[12] = "信用/无担保"
+    column_bands = [
+        {"index": index, "x0": 52.5 + 27.0 * index, "x1": 79.5 + 27.0 * index}
+        for index in range(13)
+    ]
+    geometry = {
+        "cell_bboxes": [
+            [
+                [band["x0"], 51.0, band["x1"], 84.0]
+                for band in column_bands
+            ]
+        ],
+        "cell_geometry_status": [["exact" for _column in range(13)]],
+        "cell_evidence_ids": [
+            [
+                [f"card8:value:{column}"] if values[column] else []
+                for column in range(13)
+            ]
+        ],
+        "cell_spans": [],
+        "row_bands": [{"index": 0, "y0": 51.0, "y1": 84.0}],
+        "col_bands": column_bands,
+    }
+    return SimpleNamespace(
+        table_id="pt_24_0",
+        metadata={"raw_rows": [values], "geometry": geometry},
+        headers=[],
+        rows=[],
+        bbox=[52.5, 51.0, 403.5, 84.0],
+        confidence=0.99,
+    )
+
+
+def _real_headerless_card8_context(
+    *,
+    header_defect: str = "",
+    continuation_decision: bool = True,
+) -> SimpleNamespace:
+    card7_identifier = "B10411000H000115602800002159651279117266"
+    card9_identifier = "B11911000H000115661000042356833"
+    previous = _table(
+        "pt_23_1",
+        [_CARD_HEADER, _card_values(card7_identifier)],
+        top=220.0,
+    )
+    card8 = _exact_sparse_card8_table()
+    card9 = _table(
+        "pt_24_1",
+        [_CARD_HEADER, _card_values(card9_identifier)],
+        top=300.0,
+    )
+    header_columns = [0, 2, 4, 5, 7, 8, 10, 12]
+    header_lines = []
+    for index, (label, column) in enumerate(zip(_CARD_HEADER, header_columns, strict=True)):
+        left = 52.5 + 27.0 * column + 2.0
+        evidence_ids = [] if header_defect == f"missing_evidence_{index}" else [f"card8:h:{index}"]
+        header_lines.append(
+            {
+                "text": label,
+                "bbox": [left, 546.0 + (index % 2), left + 20.0, 558.0 + (index % 2)],
+                "evidence_ids": evidence_ids,
+            }
+        )
+    if header_defect == "transposed_currency_business":
+        header_lines[5]["bbox"], header_lines[6]["bbox"] = (
+            header_lines[6]["bbox"],
+            header_lines[5]["bbox"],
+        )
+    evidence = [
+        {
+            "page": 23,
+            "source_page": 12,
+            "lines": [
+                {
+                    "text": "（四）贷记卡账户",
+                    "bbox": [52.5, 180.0, 200.0, 192.0],
+                    "evidence_ids": ["card-family"],
+                },
+                {
+                    "text": "账户 7：",
+                    "bbox": [52.5, 200.0, 150.0, 213.0],
+                    "evidence_ids": ["card7-anchor"],
+                },
+                {
+                    "text": "账户 8（授信协议标识:B10611000H00016226880219191368607）",
+                    "bbox": [52.5, 534.5, 360.0, 545.0],
+                    "evidence_ids": ["card8-anchor"],
+                },
+                *header_lines,
+            ],
+        },
+        {
+            "page": 24,
+            "source_page": 12,
+            "lines": [
+                {
+                    "text": "账户 9：",
+                    "bbox": [52.5, 280.0, 150.0, 293.0],
+                    "evidence_ids": ["card9-anchor"],
+                }
+            ],
+        },
+    ]
+    return SimpleNamespace(
+        pages=[_page(23, [previous]), _page(24, [card8, card9])],
+        reading_order_by_logical={23: 1, 24: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        tables_continue=lambda left, right: (
+            continuation_decision
+            if (left, right) == ("pt_23_1", "pt_24_0")
+            else None
+        ),
+        allows_scanned_line_transition=lambda *_args: False,
+    )
+
+
+@pytest.mark.parametrize("continuation_decision", [False, True])
+def test_real_anchor_header_lattice_splits_card8_from_card7(
+    continuation_decision: bool,
+) -> None:
+    context = _real_headerless_card8_context(
+        continuation_decision=continuation_decision
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    by_sequence = {
+        int(account["category_sequence"]): account
+        for account in accounts
+        if account.get("account_type") == "credit_card"
+    }
+
+    assert sorted(by_sequence) == [7, 8, 9]
+    assert by_sequence[8]["account_identifier"] == "B10611000H00016226880219191368607"
+    assert by_sequence[8]["management_institution"] == "中信银行股份有限公司信用卡中心"
+    assert by_sequence[8]["open_date"] == "2018-10-24"
+    assert by_sequence[8]["credit_limit"] == 13000
+    assert by_sequence[8]["currency"] == "CNY"
+    assert by_sequence[8]["business_type"] == "贷记卡"
+    assert by_sequence[8]["guarantee_type"] == "信用/无担保"
+    card7_tables = {
+        ref.get("table_id") for ref in by_sequence[7].get("source_refs") or ()
+    }
+    card8_tables = {
+        ref.get("table_id") for ref in by_sequence[8].get("source_refs") or ()
+    }
+    assert "pt_24_0" not in card7_tables
+    assert "pt_24_0" in card8_tables
+    assert any(
+        issue.get("issue_code") == "candidate_b_headerless_account_owner_resolved"
+        and issue.get("observed_value", {}).get("ownership_basis")
+        == "printed_anchor_header_lattice"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+@pytest.mark.parametrize(
+    "header_defect",
+    ["missing_evidence_3", "transposed_currency_business"],
+)
+def test_real_anchor_header_lattice_rejects_incomplete_or_transposed_header(
+    header_defect: str,
+) -> None:
+    context = _real_headerless_card8_context(header_defect=header_defect)
+
+    table_accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert not any(
+        account.get("_pending_anchor_account_id")
+        and any(
+            ref.get("table_id") == "pt_24_0"
+            for ref in account.get("source_refs") or ()
+        )
+        for account in table_accounts
+    )
+
+
+def _inquiry_value_row(sequence: int, raw_sequence: str) -> list[str]:
+    return [
+        raw_sequence,
+        f"2024.{1 + (sequence - 1) // 28:02d}.{1 + (sequence - 1) % 28:02d}",
+        f"示例银行{sequence}股份有限公司",
+        "贷后管理",
+    ]
+
+
+def _exact_collapsed_inquiry_table(rows: list[list[str]]) -> SimpleNamespace:
+    x_bands = [(44.5, 84.0), (84.0, 161.5), (161.5, 316.0), (316.0, 395.0)]
+    row_bands = [
+        {"index": index, "y0": 93.5 + index * 13.0, "y1": 106.5 + index * 13.0}
+        for index in range(len(rows))
+    ]
+    cell_bboxes: list[list[list[float] | None]] = []
+    cell_status: list[list[str]] = []
+    cell_evidence_ids: list[list[list[str]]] = []
+    for row_index, band in enumerate(row_bands):
+        if row_index == 0:
+            cell_bboxes.append(
+                [
+                    [44.5, band["y0"], 84.0, band["y1"]],
+                    [84.0, band["y0"], 316.0, band["y1"]],
+                    None,
+                    [316.0, band["y0"], 395.0, band["y1"]],
+                ]
+            )
+            cell_status.append(["exact", "exact", "derived", "exact"])
+            cell_evidence_ids.append(
+                [["inq:h:0"], ["inq:h:1", "inq:h:2"], [], ["inq:h:3"]]
+            )
+            continue
+        cell_bboxes.append(
+            [
+                [left, band["y0"], right, band["y1"]]
+                for left, right in x_bands
+            ]
+        )
+        cell_status.append(["exact", "exact", "exact", "exact"])
+        cell_evidence_ids.append(
+            [[f"inq:{row_index}:{column}"] for column in range(4)]
+        )
+    geometry = {
+        "cell_bboxes": cell_bboxes,
+        "cell_geometry_status": cell_status,
+        "cell_evidence_ids": cell_evidence_ids,
+        "cell_spans": [
+            {"row": 0, "col": 1, "row_span": 1, "col_span": 2}
+        ],
+        "row_bands": row_bands,
+        "col_bands": [
+            {"index": index, "x0": left, "x1": right}
+            for index, (left, right) in enumerate(x_bands)
+        ],
+    }
+    return SimpleNamespace(
+        table_id="pt_27_0",
+        metadata={"raw_rows": rows, "geometry": geometry},
+        headers=[],
+        rows=[],
+        bbox=[44.5, 93.5, 395.0, row_bands[-1]["y1"]],
+        confidence=0.99,
+    )
+
+
+def _full_ye_inquiry_context() -> SimpleNamespace:
+    pt27_rows = [["编号", "? 查询日期 查询机构 X", "", "查询原因"]]
+    for sequence in range(1, 37):
+        raw_sequence = (
+            ""
+            if sequence in {5, 8, 9, 29}
+            else "27 多"
+            if sequence == 27
+            else str(sequence)
+        )
+        pt27_rows.append(_inquiry_value_row(sequence, raw_sequence))
+    pt28_rows = []
+    for sequence in range(37, 77):
+        raw_sequence = (
+            "芬 48"
+            if sequence == 48
+            else ""
+            if sequence == 67
+            else "K69"
+            if sequence == 69
+            else str(sequence)
+        )
+        pt28_rows.append(_inquiry_value_row(sequence, raw_sequence))
+    pt29_rows = [
+        _inquiry_value_row(sequence, str(sequence))
+        for sequence in range(77, 97)
+    ]
+    pages = [
+        _page(27, [_exact_collapsed_inquiry_table(pt27_rows)], template="annotations_and_inquiries"),
+        _page(28, [_table("pt_28_0", pt28_rows)], template="annotations_and_inquiries"),
+        _page(29, [_table("pt_29_0", pt29_rows)], template="annotations_and_inquiries"),
+    ]
+    witness_sequences = {27: (8, 9)}
+    evidence = []
+    for page_number, sequences in witness_sequences.items():
+        evidence.append(
+            {
+                "page": page_number,
+                "source_page": page_number,
+                "canonical_template_id": "annotations_and_inquiries",
+                "lines": [
+                    {
+                        "text": " ".join(_inquiry_value_row(sequence, str(sequence))),
+                        "bbox": [
+                            44.5,
+                            93.5 + sequence * 13.0,
+                            395.0,
+                            106.5 + sequence * 13.0,
+                        ],
+                        "evidence_ids": [f"inq:{sequence}:1"],
+                        "confidence": 0.99,
+                    }
+                    for sequence in sequences
+                ],
+            }
+        )
+    return SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical={27: 1, 28: 2, 29: 3},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+    )
+
+
+def test_ye_inquiry_planes_emit_all_institution_sequences_one_to_96() -> None:
+    context = _full_ye_inquiry_context()
+
+    records = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+    institution = sorted(
+        int(record["sequence"])
+        for record in records
+        if record.get("inquiry_type") == "institution"
+    )
+
+    assert institution == list(range(1, 97))
+    assert coverage["sequence_endpoints"] == {"institution": 96}
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_inquiry_sequence_inferred_from_row_order"
+        and issue.get("candidate_value", {}).get("normalized_sequence") == 5
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_inquiry_sequence_suffix_noise_corrected"
+        and issue.get("candidate_value", {}).get("normalized_sequence") == 27
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_inquiry_sequence_prefix_noise_corrected"
+        and issue.get("candidate_value", {}).get("normalized_sequence") == 69
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert sorted(
+        int(record["sequence"])
+        for record in native_extraction._extract_inquiries(context)
+        if record.get("inquiry_type") == "institution"
+    ) == list(range(1, 97))
+
+
+def test_inquiry_line_witness_rejects_duplicate_fingerprint_on_different_row() -> None:
+    rows = [
+        ["缂栧彿", "? 鏌ヨ鏃ユ湡 鏌ヨ鏈烘瀯 X", "", "鏌ヨ鍘熷洜"],
+        _inquiry_value_row(1, "1"),
+        _inquiry_value_row(2, ""),
+        _inquiry_value_row(3, "3"),
+    ]
+    table = _exact_collapsed_inquiry_table(rows)
+    target = rows[2]
+    duplicate_business_row = {
+        "inquiry_id": "credit_inquiry:institution:2",
+        "sequence": 2,
+        "inquiry_date": target[1],
+        "institution": target[2],
+        "reason": target[3],
+        "source_refs": [
+            {
+                "source": "candidate_b_canonical_inquiry_line",
+                "logical_page": 27,
+                "bbox": [44.5, 132.5, 395.0, 145.5],
+                "geometry_scope": "row",
+                "evidence_ids": ["inq:3:1"],
+            }
+        ],
+    }
+
+    assert (
+        native_extraction._exact_inquiry_line_sequence_witness(
+            [duplicate_business_row],
+            table=table,
+            row_index=2,
+            repaired_line_ids=set(),
+            logical_page=27,
+            observed={
+                "inquiry_date": target[1],
+                "institution": target[2],
+                "reason": target[3],
+            },
+            already_observed_sequences={1, 3},
+        )
+        is None
+    )
+
+
+def test_noisy_inquiry_candidate_leaves_one_uniquely_bracketed_blank() -> None:
+    assert native_extraction._document_local_inquiry_ordinals(
+        [4, None, 6, 68, None, 70],
+        noisy_candidates=[None, None, None, None, (69, "prefixed_noise"), None],
+    ) == [
+        (4, None),
+        (5, "missing"),
+        (6, None),
+        (68, None),
+        (69, "prefixed_noise"),
+        (70, None),
+    ]
+
+
+def test_collapsed_inquiry_header_rejects_nonexact_middle_span() -> None:
+    rows = [
+        ["编号", "? 查询日期 查询机构 X", "", "查询原因"],
+        *[_inquiry_value_row(sequence, str(sequence)) for sequence in range(1, 4)],
+    ]
+    table = _exact_collapsed_inquiry_table(rows)
+    table.metadata["geometry"]["cell_spans"][0]["col_span"] = 3
+
+    assert (
+        native_extraction._bounded_collapsed_inquiry_header_slots(
+            rows, table=table
+        )
+        is None
+    )

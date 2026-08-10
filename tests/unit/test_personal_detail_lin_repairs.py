@@ -434,15 +434,36 @@ def test_inferred_inquiry_sequence_uncertainty_is_field_scoped() -> None:
 
     rows = native_extraction._canonical_inquiry_line_rows(context)
 
-    inferred = rows[1]
-    assert inferred["sequence"] == 2
-    assert inferred["institution"] == "银行乙"
-    assert inferred["reason"] == "贷后管理"
-    assert "extraction_status" not in inferred
-    assert "audit" not in inferred
-    issue = context._personal_detail_extraction_issues[0]
-    assert issue["target_record_id"] == inferred["inquiry_id"]
+    assert [row["sequence"] for row in rows] == [1]
+    assert all(row["institution"] != "银行乙" for row in rows)
+    issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code")
+        == "candidate_b_inquiry_boundary_sequence_unresolved"
+    ]
+    assert len(issues) == 1
+    issue = issues[0]
     assert issue["field_name"] == "sequence"
+    assert issue["target_record_id"].startswith(
+        "credit_inquiry_unresolved_sequence:"
+    )
+    assert issue["observed_value"] == {
+        "inquiry_type": "institution",
+        "missing_ocr_sequence": True,
+        "boundary": "trailing",
+    }
+    assert "record_not_emitted" in issue["reason_codes"]
+    assert issue["source_refs"] == [
+        {
+            "source": "candidate_b_canonical_inquiry_line",
+            "logical_page": 8,
+            "source_page": 4,
+            "bbox": [110.0, 29.0, 390.0, 39.0],
+            "geometry_scope": "row",
+            "evidence_ids": [],
+        }
+    ]
 
 
 def test_monthly_status_contract_accepts_slash_and_hash() -> None:

@@ -530,11 +530,16 @@ def _source_ref(
         "source_page": int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0),
         "table_id": str(getattr(table, "table_id", "") or ""),
     }
+    metadata = getattr(table, "metadata", None) or {}
+    geometry = metadata.get("geometry") if isinstance(metadata, dict) else None
+    if isinstance(geometry, dict):
+        coordinate_system = geometry.get("coordinate_system")
+        if isinstance(coordinate_system, str) and coordinate_system.strip():
+            ref["coordinate_system"] = coordinate_system.strip()
     if row is not None:
         ref["row"] = row
     if column is not None:
         ref["column"] = column
-    metadata = getattr(table, "metadata", None) or {}
     bbox = None
     if row is not None and column is not None and isinstance(metadata, dict):
         # Canonical projection keeps both registered-page coordinates and the
@@ -2467,6 +2472,22 @@ def _apply_collapsed_account_clusters(
                     column,
                     binding="closed_exact_two_cell_card_cluster",
                 )
+        shared_limit_ref = _source_ref(
+            page,
+            table,
+            row=physical(1),
+            column=1,
+        )
+        shared_limit_ref["binding"] = "closed_exact_two_cell_card_cluster"
+        shared_limit_ref["binding_quality"] = "closed_exact_two_cell_card_cluster"
+        _report_account_cell_cluster_unresolved(
+            parse_result,
+            account,
+            target_record_id=target_record_id,
+            field_names=("shared_credit_limit",),
+            raw=str(rows[1][1]),
+            source_ref=shared_limit_ref,
+        )
         residue = str(exact_two_cell_card.get("residue") or "")
         if residue:
             residue_ref = _source_ref(page, table, row=physical(1), column=1)
@@ -4263,6 +4284,10 @@ def _bounded_headerless_card_values(
         _business_text(raw_guarantee_type),
         "guarantee_type",
     )
+    guarantee_valid = bool(guarantee_type) and validate_pboc_field(
+        guarantee_type,
+        "guarantee_type",
+    ).valid
     if (
         not institution
         or not identifier
@@ -4274,20 +4299,20 @@ def _bounded_headerless_card_values(
         or currency_resolution != "exact"
         or not business_type
         or not validate_pboc_field(business_type, "account_business_type").valid
-        or not guarantee_type
-        or not validate_pboc_field(guarantee_type, "guarantee_type").valid
     ):
         return None
-    return {
+    result = {
         "management_institution": institution,
         "account_identifier": identifier,
         "open_date": open_date,
         "credit_limit": credit_limit,
         "currency": currency,
         "business_type": business_type,
-        "guarantee_type": guarantee_type,
         "_credit_limit_residue": credit_limit_residue,
     }
+    if guarantee_valid:
+        result["guarantee_type"] = guarantee_type
+    return result
 
 
 def _exact_anchor_evidence_card_header(
@@ -10715,10 +10740,11 @@ def _document_local_inquiry_ordinals(
 ) -> list[tuple[int | None, str | None]]:
     """Normalize inquiry ordinals only from exact adjacent-row proof.
 
-    A damaged middle row may be inferred when its two immediate neighbours
-    prove the sole missing ordinal; a final complete row may continue its one
-    immediate predecessor. Likewise, a high OCR value may shed a leading
-    prefix only when both neighbours prove its complete suffix
+    Each isolated damaged middle row may be inferred when its two immediate
+    neighbours prove the missing ordinal, even when another independently
+    bracketed gap exists elsewhere. Adjacent missing runs and boundary gaps
+    remain unresolved. Likewise, a high OCR value may shed a leading prefix
+    only when both neighbours prove its complete suffix
     (``88, 789, 90`` -> ``88, 89, 90``). This deliberately preserves isolated
     high values, legitimate 100+ populations, and genuine ``788, 789, 790``.
     """
@@ -10734,17 +10760,8 @@ def _document_local_inquiry_ordinals(
     )
     if len(bounded_noise) != len(observed):
         return [(value, None) for value in observed]
-    missing_indices = [
-        index for index, value in enumerate(observed) if value is None
-    ]
     normalized: list[tuple[int | None, str | None]] = [
-        (
-            value,
-            "multiple_missing"
-            if value is None and len(missing_indices) > 1
-            else None,
-        )
-        for value in observed
+        (value, None) for value in observed
     ]
     for index in range(1, len(observed) - 1):
         previous = observed[index - 1]
@@ -10763,24 +10780,30 @@ def _document_local_inquiry_ordinals(
             ):
                 normalized[index] = (expected, str(noisy[1]))
                 continue
-            # More than one unreadable ordinal admits multiple equally
-            # plausible assignments. Keep every missing value unresolved,
-            # while still allowing independent nonmissing prefix-noise proof
-            # elsewhere in the same canonical population.
-            if len(missing_indices) == 1:
-                normalized[index] = (expected, "missing")
+            normalized[index] = (expected, "missing")
             continue
         if current == expected or current < 300 or current <= expected:
             continue
         if str(current).endswith(str(expected)):
             normalized[index] = (expected, "prefixed_noise")
-    if (
-        len(missing_indices) == 1
-        and len(observed) >= 2
-        and observed[-1] is None
-        and observed[-2] is not None
-    ):
-        normalized[-1] = (int(observed[-2]) + 1, "missing")
+
+    unresolved = [
+        index for index, (value, _repair_kind) in enumerate(normalized) if value is None
+    ]
+    if len(unresolved) > 1:
+        for index in unresolved:
+            normalized[index] = (None, "multiple_missing")
+    elif unresolved:
+        index = unresolved[0]
+        if len(normalized) == 1:
+            repair_kind = "boundary_missing"
+        elif index == 0:
+            repair_kind = "leading_boundary_missing"
+        elif index == len(normalized) - 1:
+            repair_kind = "trailing_boundary_missing"
+        else:
+            repair_kind = "single_unbracketed_missing"
+        normalized[index] = (None, repair_kind)
     return normalized
 
 
@@ -11073,7 +11096,11 @@ def _record_inquiry_ordinal_repair(
                 (
                     "sequence_requires_review"
                     if inferred
-                    else "deterministic_sequence_prefix_removed"
+                    else (
+                        "deterministic_sequence_suffix_removed"
+                        if suffix_noise
+                        else "deterministic_sequence_prefix_removed"
+                    )
                 ),
                 "other_row_fields_verified_independently",
             ),
@@ -11087,13 +11114,29 @@ def _record_inquiry_ordinal_unresolved(
     inquiry_type: str,
     source_ref: Mapping[str, Any],
     observed_row: Any,
+    repair_kind: str,
 ) -> None:
-    """Localize a row withheld because its population has two missing ordinals."""
+    """Localize one withheld row with a truthful ordinal-gap diagnostic."""
 
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
         make_issue,
         record_issue,
     )
+
+    boundary = {
+        "leading_boundary_missing": "leading",
+        "trailing_boundary_missing": "trailing",
+        "boundary_missing": "leading_and_trailing",
+    }.get(repair_kind)
+    multiple_missing = repair_kind == "multiple_missing"
+    observed_value: dict[str, Any] = {
+        "inquiry_type": inquiry_type,
+        "missing_ocr_sequence": True,
+    }
+    if boundary is not None:
+        observed_value["boundary"] = boundary
+    else:
+        observed_value["row"] = observed_row
 
     target_record_id = stable_record_id(
         "credit_inquiry_unresolved_sequence",
@@ -11108,10 +11151,26 @@ def _record_inquiry_ordinal_unresolved(
         parse_result,
         make_issue(
             category="ocr_structure_correction",
-            issue_code="candidate_b_inquiry_multiple_missing_sequences_unresolved",
+            issue_code=(
+                "candidate_b_inquiry_multiple_missing_sequences_unresolved"
+                if multiple_missing
+                else (
+                    "candidate_b_inquiry_boundary_sequence_unresolved"
+                    if boundary is not None
+                    else "candidate_b_inquiry_sequence_unresolved"
+                )
+            ),
             message=(
                 "More than one ordinal was unreadable in one canonical inquiry population; "
                 "the affected row was retained only as localized unresolved source evidence."
+                if multiple_missing
+                else (
+                    "A single ordinal was unreadable at the canonical inquiry population "
+                    "boundary, so its row was withheld because no adjacent-row bracket "
+                    "can prove the sequence."
+                    if boundary is not None
+                    else "A single inquiry ordinal lacked exact adjacent-row proof, so its row was withheld."
+                )
             ),
             severity="warning",
             status="requires_review",
@@ -11119,15 +11178,19 @@ def _record_inquiry_ordinal_unresolved(
             target_dataset="inquiry_records",
             target_record_id=target_record_id,
             field_name="sequence",
-            observed_value={
-                "inquiry_type": inquiry_type,
-                "missing_ocr_sequence": True,
-                "row": observed_row,
-            },
+            observed_value=observed_value,
             source_refs=(dict(source_ref),),
             reason_codes=(
                 "canonical_four_column_table",
-                "multiple_missing_ordinals_in_population",
+                (
+                    "multiple_missing_ordinals_in_population"
+                    if multiple_missing
+                    else (
+                        "ordinal_missing_at_population_boundary"
+                        if boundary is not None
+                        else "single_unbracketed_ordinal"
+                    )
+                ),
                 "ordinal_assignment_not_unique",
                 "record_not_emitted",
             ),
@@ -11386,7 +11449,7 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
             inquiry_type,
             None if document_order_is_authoritative else logical_page,
         )
-        if sequence is None and repair_kind == "multiple_missing":
+        if sequence is None and repair_kind:
             _record_inquiry_ordinal_unresolved(
                 parse_result,
                 inquiry_type=inquiry_type,
@@ -11397,6 +11460,7 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
                     "institution": candidate.get("institution"),
                     "reason": candidate.get("reason"),
                 },
+                repair_kind=repair_kind,
             )
         if sequence is None or sequence <= last_sequence[sequence_scope]:
             continue
@@ -11487,6 +11551,124 @@ def _inquiry_business_equivalent(
     return bool(left_institution) and left_institution == right_institution
 
 
+def _exact_inquiry_table_row_geometry(
+    table: Any,
+    *,
+    row_index: int,
+) -> tuple[tuple[float, float, float, float], frozenset[str]] | None:
+    """Return one exact inquiry row bbox and its source evidence identity."""
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    if not all(
+        isinstance(grid, list)
+        and 0 <= row_index < len(grid)
+        and isinstance(grid[row_index], list)
+        for grid in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return None
+    widths = {
+        len(cell_bboxes[row_index]),
+        len(cell_status[row_index]),
+        len(cell_evidence_ids[row_index]),
+    }
+    if len(widths) != 1:
+        return None
+    boxes: list[tuple[float, float, float, float]] = []
+    evidence_ids: set[str] = set()
+    for column in range(next(iter(widths))):
+        if str(cell_status[row_index][column] or "") != "exact":
+            continue
+        bbox = _exact_geometry_bbox(cell_bboxes[row_index][column])
+        raw_evidence_ids = cell_evidence_ids[row_index][column]
+        if bbox is None or not isinstance(raw_evidence_ids, list):
+            continue
+        normalized_ids = {
+            str(value) for value in raw_evidence_ids if str(value or "")
+        }
+        if not normalized_ids:
+            continue
+        boxes.append(bbox)
+        evidence_ids.update(normalized_ids)
+    if len(boxes) < 3 or not evidence_ids:
+        return None
+    return (
+        (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ),
+        frozenset(evidence_ids),
+    )
+
+
+def _exact_inquiry_line_sequence_witness(
+    line_rows: Iterable[Mapping[str, Any]],
+    *,
+    table: Any,
+    row_index: int,
+    repaired_line_ids: set[str],
+    logical_page: int,
+    observed: Mapping[str, Any],
+    already_observed_sequences: set[int],
+) -> int | None:
+    """Reconcile a blank ordinal only from the same exact physical row."""
+
+    table_geometry = _exact_inquiry_table_row_geometry(
+        table,
+        row_index=row_index,
+    )
+    if table_geometry is None:
+        return None
+    table_bbox, table_evidence_ids = table_geometry
+
+    matches: set[int] = set()
+    for line_row in line_rows:
+        inquiry_id = str(line_row.get("inquiry_id") or "")
+        sequence = int(line_row.get("sequence") or 0)
+        if (
+            not inquiry_id
+            or inquiry_id in repaired_line_ids
+            or sequence <= 0
+            or sequence in already_observed_sequences
+            or not _inquiry_business_equivalent(observed, line_row)
+        ):
+            continue
+        refs = [
+            ref
+            for ref in line_row.get("source_refs") or ()
+            if isinstance(ref, Mapping)
+        ]
+        exact_row_refs: list[Mapping[str, Any]] = []
+        for ref in refs:
+            bbox = _exact_geometry_bbox(ref.get("bbox"))
+            evidence_ids = {
+                str(value)
+                for value in ref.get("evidence_ids") or ()
+                if str(value or "")
+            }
+            if (
+                int(ref.get("logical_page") or 0) != int(logical_page or 0)
+                or ref.get("source") != "candidate_b_canonical_inquiry_line"
+                or bbox is None
+                or not evidence_ids.intersection(table_evidence_ids)
+                or (bbox[1] + bbox[3]) / 2.0 < table_bbox[1] - 1.0
+                or (bbox[1] + bbox[3]) / 2.0 > table_bbox[3] + 1.0
+                or min(bbox[2], table_bbox[2]) <= max(bbox[0], table_bbox[0])
+            ):
+                continue
+            exact_row_refs.append(ref)
+        if len(exact_row_refs) != 1:
+            continue
+        matches.add(sequence)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, float]:
     from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import role_candidate_is_valid
 
@@ -11514,6 +11696,22 @@ def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, flo
 
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    canonical_line_rows = _canonical_inquiry_line_rows(parse_result)
+    repaired_line_ids = {
+        str(issue.get("target_record_id") or "")
+        for issue in getattr(parse_result, "_personal_detail_extraction_issues", [])
+        if issue.get("issue_code")
+        in {
+            "candidate_b_inquiry_sequence_inferred_from_row_order",
+            "candidate_b_inquiry_sequence_prefix_noise_corrected",
+            "candidate_b_inquiry_sequence_suffix_noise_corrected",
+        }
+        and any(
+            isinstance(ref, Mapping)
+            and ref.get("source") == "candidate_b_canonical_inquiry_line"
+            for ref in issue.get("source_refs") or ()
+        )
+    }
     active_canonical_table = False
     active_slots: dict[str, int] = {}
     active_schema_page: int | None = None
@@ -11615,9 +11813,52 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 for row_index, row in enumerate(rows[start:], start=start)
                 if _nonempty(row)
             ]
-            normalized_ordinals = _document_local_inquiry_ordinals(
-                _inquiry_sequence_token(_slot_value(cells, slots, "sequence"))
+            raw_sequence_cells = [
+                _slot_value(cells, slots, "sequence")
                 for _row_index, cells in table_rows
+            ]
+            raw_sequences = [
+                _inquiry_sequence_token(value) for value in raw_sequence_cells
+            ]
+            noisy_sequences = [
+                _bounded_inquiry_sequence_noise_candidate(value)
+                for value in raw_sequence_cells
+            ]
+            observed_sequence_values = {
+                int(value) for value in raw_sequences if value is not None
+            }
+            for index, ((row_index, cells), raw_cell) in enumerate(
+                zip(table_rows, raw_sequence_cells, strict=True)
+            ):
+                if raw_sequences[index] is not None or _compact(raw_cell):
+                    continue
+                date_value = _bounded_inquiry_date(
+                    _slot_value(cells, slots, "inquiry_date")
+                )
+                institution_value = _slot_value(cells, slots, "institution")
+                reason_value = _slot_value(cells, slots, "reason")
+                if date_value is None or not institution_value or not reason_value:
+                    continue
+                witnessed = _exact_inquiry_line_sequence_witness(
+                    canonical_line_rows,
+                    table=table,
+                    row_index=row_index,
+                    repaired_line_ids=repaired_line_ids,
+                    logical_page=page_number,
+                    observed={
+                        "inquiry_date": date_value,
+                        "institution": institution_value,
+                        "reason": reason_value,
+                    },
+                    already_observed_sequences=observed_sequence_values,
+                )
+                if witnessed is None:
+                    continue
+                raw_sequences[index] = witnessed
+                observed_sequence_values.add(witnessed)
+            normalized_ordinals = _document_local_inquiry_ordinals(
+                raw_sequences,
+                noisy_candidates=noisy_sequences,
             )
             for (row_index, cells), (sequence, repair_kind) in zip(
                 table_rows, normalized_ordinals, strict=True
@@ -11626,7 +11867,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     _slot_value(cells, slots, "sequence")
                 )
                 if sequence is None:
-                    if repair_kind == "multiple_missing":
+                    if repair_kind:
                         unresolved_institution = _slot_value(
                             cells, slots, "institution"
                         )
@@ -11642,6 +11883,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                             inquiry_type=unresolved_type,
                             source_ref=_source_ref(page, table, row=row_index),
                             observed_row=list(cells),
+                            repair_kind=repair_kind,
                         )
                     continue
                 date_cell = _slot_value(cells, slots, "inquiry_date")
@@ -11728,7 +11970,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             active_canonical_table = False
             active_slots = {}
             active_schema_page = None
-    records.extend(_canonical_inquiry_line_rows(parse_result))
+    records.extend(canonical_line_rows)
     grouped: defaultdict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
@@ -15292,7 +15534,7 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
             )
             has_exact_header = has_header and set(header_slots) == set(aliases)
             repaired_header_slots = (
-                _bounded_collapsed_inquiry_header_slots(rows)
+                _bounded_collapsed_inquiry_header_slots(rows, table=table)
                 if has_header and not has_exact_header
                 else None
             )
@@ -15354,6 +15596,9 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 raw_sequence = _inquiry_sequence_token(
                     _slot_value(cells, active_slots, "sequence")
                 )
+                noisy_sequence = _bounded_inquiry_sequence_noise_candidate(
+                    _slot_value(cells, active_slots, "sequence")
+                )
                 institution = _slot_value(cells, active_slots, "institution")
                 reason = _slot_value(cells, active_slots, "reason")
                 inquiry_date = _slot_value(cells, active_slots, "inquiry_date")
@@ -15375,6 +15620,7 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 active_group["observations"].append(
                     {
                         "raw_sequence": raw_sequence,
+                        "noisy_sequence": noisy_sequence,
                         "sequence": raw_sequence,
                         "inquiry_type": inquiry_type,
                         "inquiry_date": inquiry_date,
@@ -15392,7 +15638,10 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
     for group in groups:
         observations = group["observations"]
         normalized_ordinals = _document_local_inquiry_ordinals(
-            observation.get("raw_sequence") for observation in observations
+            (observation.get("raw_sequence") for observation in observations),
+            noisy_candidates=(
+                observation.get("noisy_sequence") for observation in observations
+            ),
         )
         for observation, (sequence, repair_kind) in zip(
             observations, normalized_ordinals, strict=True
