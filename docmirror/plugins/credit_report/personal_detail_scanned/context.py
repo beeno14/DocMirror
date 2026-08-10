@@ -71,6 +71,9 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
 _PRINTED_PAGE_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页")
+_PRINTED_PAGE_ONLY_RE = re.compile(
+    r"^\s*第\s*(?P<page>\d{1,3})\s*页\s*[,，。.]?\s*$"
+)
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
 _ACCOUNT_ANCHOR_RE = re.compile(r"(?:账户|业务)\s*[（(]?\s*(\d{1,3})\s*[）)]?")
 _BUSINESS_HEADING_RE = re.compile(
@@ -459,21 +462,23 @@ def _domain_specific(parse_result: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _printed_reading_order(
+def _printed_reading_order_resolution(
     parse_result: Any,
     topology: PersonalDetailPageTopology | None = None,
-) -> dict[int, int]:
-    """Map sealed logical pages to the report's printed reading order.
+) -> tuple[dict[int, int], dict[str, Any]]:
+    """Resolve printed reading order without disguising fallback as proof.
 
     Detailed reports are commonly scanned as two-page spreads. Physical
     sheets can be out of order even though each half retains the report's own
     ``第 N 页，共 M 页`` footer. Provenance page numbers remain unchanged; only
     continuation and evidence traversal use this order.
 
-    Reordering is deliberately conservative: every observed logical page must
-    resolve to one unique printed number, either from its footer or from the
-    adjacent half of the same source spread, and the observed totals must be
-    coherent. Partial OCR therefore cannot invent an isolated page position.
+    A page-only ``第 N 页`` marker is accepted only after other complete
+    footers establish one coherent document total. Its other spread half may
+    then be inferred from frozen topology. Every observed logical page must
+    ultimately own one unique, in-range printed number. Failure returns sealed
+    identity order together with explicit unresolved provenance so downstream
+    ownership code cannot mistake the fallback for an authoritative mapping.
     """
     texts_by_page: dict[int, list[str]] = {}
     observed_pages: set[int] = set()
@@ -510,13 +515,64 @@ def _printed_reading_order(
             if isinstance(line, dict)
         )
 
-    identity = {page: page for page in observed_pages}
+    identity = {page: page for page in sorted(observed_pages)}
+
+    def unresolved(
+        reason: str,
+        *,
+        printed_by_logical: Mapping[int, int] | None = None,
+        expected_total: int | None = None,
+        full_footer_pages: Iterable[int] = (),
+        page_only_footer_pages: Iterable[int] = (),
+        paired_inferred_pages: Iterable[int] = (),
+    ) -> tuple[dict[int, int], dict[str, Any]]:
+        observed = sorted(observed_pages)
+        printed = {
+            int(logical): int(page)
+            for logical, page in (printed_by_logical or {}).items()
+        }
+        duplicate_printed_pages = sorted(
+            page
+            for page, count in Counter(printed.values()).items()
+            if count > 1
+        )
+        return identity, {
+            "resolved": False,
+            "authoritative": False,
+            "basis": "unresolved_identity_fallback",
+            "reason": reason,
+            "observed_logical_pages": observed,
+            "identity_fallback": True,
+            "printed_page_by_logical": printed,
+            "unresolved_logical_pages": sorted(set(observed) - set(printed)),
+            "duplicate_printed_pages": duplicate_printed_pages,
+            "full_footer_logical_pages": sorted(set(full_footer_pages)),
+            "page_only_footer_logical_pages": sorted(set(page_only_footer_pages)),
+            "paired_inferred_logical_pages": sorted(set(paired_inferred_pages)),
+            **({"printed_total": expected_total} if expected_total is not None else {}),
+        }
+
     if len(observed_pages) < 2:
-        return identity
+        return identity, {
+            "resolved": True,
+            "authoritative": True,
+            "basis": "single_or_empty_page",
+            "reason": "cross_page_order_not_required",
+            "observed_logical_pages": sorted(observed_pages),
+            "identity_fallback": False,
+            "printed_page_by_logical": dict(identity),
+            "unresolved_logical_pages": [],
+            "duplicate_printed_pages": [],
+            "full_footer_logical_pages": [],
+            "page_only_footer_logical_pages": [],
+            "paired_inferred_logical_pages": [],
+        }
 
     printed_by_logical: dict[int, int] = {}
     totals: list[int] = []
-    for logical in observed_pages:
+    full_footer_pages: set[int] = set()
+    ambiguous_full_footer_pages: set[int] = set()
+    for logical in sorted(observed_pages):
         exact_matches = {
             (int(match.group("page")), int(match.group("total")))
             for text in texts_by_page.get(logical, ())
@@ -527,30 +583,118 @@ def _printed_reading_order(
             if 1 <= printed <= total:
                 printed_by_logical[logical] = printed
                 totals.append(total)
+                full_footer_pages.add(logical)
+        elif len(exact_matches) > 1:
+            ambiguous_full_footer_pages.add(logical)
 
-    _infer_paired_printed_pages(
+    if ambiguous_full_footer_pages:
+        return unresolved(
+            "ambiguous_full_footer",
+            printed_by_logical=printed_by_logical,
+            full_footer_pages=full_footer_pages,
+        )
+
+    coherent_totals = {
+        total for total in totals if total >= len(observed_pages)
+    }
+    if len(coherent_totals) != 1:
+        return unresolved(
+            "printed_total_missing_or_conflicting",
+            printed_by_logical=printed_by_logical,
+            full_footer_pages=full_footer_pages,
+        )
+    expected_total = next(iter(coherent_totals))
+
+    page_only_footer_pages: set[int] = set()
+    ambiguous_page_only_pages: set[int] = set()
+    for logical in sorted(observed_pages - set(printed_by_logical)):
+        page_only_matches = {
+            int(match.group("page"))
+            for text in texts_by_page.get(logical, ())
+            if (match := _PRINTED_PAGE_ONLY_RE.fullmatch(text)) is not None
+            and 1 <= int(match.group("page")) <= expected_total
+        }
+        if len(page_only_matches) == 1:
+            printed_by_logical[logical] = next(iter(page_only_matches))
+            page_only_footer_pages.add(logical)
+        elif len(page_only_matches) > 1:
+            ambiguous_page_only_pages.add(logical)
+
+    if ambiguous_page_only_pages:
+        return unresolved(
+            "ambiguous_page_only_footer",
+            printed_by_logical=printed_by_logical,
+            expected_total=expected_total,
+            full_footer_pages=full_footer_pages,
+            page_only_footer_pages=page_only_footer_pages,
+        )
+
+    paired_inferred_pages = _infer_paired_printed_pages(
         printed_by_logical,
         source_by_logical,
         topology=topology,
     )
     if len(printed_by_logical) != len(observed_pages):
-        return identity
+        return unresolved(
+            "logical_page_footer_unresolved",
+            printed_by_logical=printed_by_logical,
+            expected_total=expected_total,
+            full_footer_pages=full_footer_pages,
+            page_only_footer_pages=page_only_footer_pages,
+            paired_inferred_pages=paired_inferred_pages,
+        )
     if len(set(printed_by_logical.values())) != len(observed_pages):
-        return identity
+        return unresolved(
+            "printed_page_nonunique",
+            printed_by_logical=printed_by_logical,
+            expected_total=expected_total,
+            full_footer_pages=full_footer_pages,
+            page_only_footer_pages=page_only_footer_pages,
+            paired_inferred_pages=paired_inferred_pages,
+        )
 
-    total_counts = Counter(total for total in totals if total >= len(observed_pages))
-    expected_total = total_counts.most_common(1)[0][0] if total_counts else len(observed_pages)
     printed_pages = set(printed_by_logical.values())
     if max(printed_pages, default=0) > expected_total or min(printed_pages, default=1) < 1:
-        return identity
+        return unresolved(
+            "printed_page_out_of_range",
+            printed_by_logical=printed_by_logical,
+            expected_total=expected_total,
+            full_footer_pages=full_footer_pages,
+            page_only_footer_pages=page_only_footer_pages,
+            paired_inferred_pages=paired_inferred_pages,
+        )
 
-    return {
+    order = {
         logical: index
         for index, logical in enumerate(
             sorted(observed_pages, key=lambda page: (printed_by_logical[page], page)),
             start=1,
         )
     }
+    return order, {
+        "resolved": True,
+        "authoritative": True,
+        "basis": "complete_unique_printed_page_permutation",
+        "reason": "full_page_total_and_bounded_pair_resolution",
+        "observed_logical_pages": sorted(observed_pages),
+        "identity_fallback": False,
+        "printed_page_by_logical": dict(sorted(printed_by_logical.items())),
+        "unresolved_logical_pages": [],
+        "duplicate_printed_pages": [],
+        "full_footer_logical_pages": sorted(full_footer_pages),
+        "page_only_footer_logical_pages": sorted(page_only_footer_pages),
+        "paired_inferred_logical_pages": sorted(paired_inferred_pages),
+        "printed_total": expected_total,
+    }
+
+
+def _printed_reading_order(
+    parse_result: Any,
+    topology: PersonalDetailPageTopology | None = None,
+) -> dict[int, int]:
+    """Compatibility view of the authoritative order or sealed fallback."""
+
+    return _printed_reading_order_resolution(parse_result, topology)[0]
 
 
 def _infer_paired_printed_pages(
@@ -558,8 +702,9 @@ def _infer_paired_printed_pages(
     source_by_logical: dict[int, int],
     *,
     topology: PersonalDetailPageTopology | None = None,
-) -> None:
+) -> set[int]:
     """Infer one unread footer from a geometry-confirmed adjacent half."""
+    inferred: set[int] = set()
     logicals_by_source: dict[int, list[int]] = {}
     for logical, source in source_by_logical.items():
         logicals_by_source.setdefault(source, []).append(logical)
@@ -570,8 +715,11 @@ def _infer_paired_printed_pages(
         left, right = ordered
         if left in printed_by_logical and right not in printed_by_logical:
             printed_by_logical[right] = printed_by_logical[left] + 1
+            inferred.add(right)
         elif right in printed_by_logical and left not in printed_by_logical:
             printed_by_logical[left] = printed_by_logical[right] - 1
+            inferred.add(left)
+    return inferred
 
 
 def _evidence_key(page: int, line: dict[str, Any], index: int) -> str:
@@ -587,12 +735,15 @@ def _collect_personal_detail_units(
     parse_result: Any,
     *,
     topology: PersonalDetailPageTopology | None = None,
+    registered_reading_order: Mapping[int, int] | None = None,
+    registered_reading_order_resolution: Mapping[str, Any] | None = None,
 ) -> tuple[
     tuple[CreditReportUnit, ...],
     tuple[str, ...],
     dict[str, str],
     dict[int, int],
     dict[int, int],
+    dict[str, Any],
 ]:
     candidates: list[CreditReportUnit] = []
     furniture: set[str] = set()
@@ -602,7 +753,19 @@ def _collect_personal_detail_units(
     table_owners: dict[int, list[tuple[tuple[float, float, float, float], str]]] = {}
     text_owners: dict[int, list[tuple[str, tuple[float, float, float, float] | None, str]]] = {}
     edge_occurrences: dict[str, list[tuple[int, str]]] = {}
-    reading_order = _printed_reading_order(parse_result, topology)
+    if registered_reading_order is None:
+        reading_order, reading_order_resolution = _printed_reading_order_resolution(
+            parse_result,
+            topology,
+        )
+    else:
+        reading_order = {
+            int(logical): int(position)
+            for logical, position in registered_reading_order.items()
+        }
+        reading_order_resolution = deepcopy(
+            dict(registered_reading_order_resolution or {})
+        )
 
     for page_index, page in enumerate(pages, start=1):
         logical = int(getattr(page, "page_number", 0) or page_index)
@@ -755,7 +918,14 @@ def _collect_personal_detail_units(
             ),
         )
         active.extend(replace(unit, order=order) for order, unit in enumerate(page_units))
-    return tuple(active), tuple(sorted(furniture)), evidence_units, source_pages, reading_order
+    return (
+        tuple(active),
+        tuple(sorted(furniture)),
+        evidence_units,
+        source_pages,
+        reading_order,
+        reading_order_resolution,
+    )
 
 
 class PersonalDetailExtractionContext:
@@ -769,6 +939,7 @@ class PersonalDetailExtractionContext:
         evidence_unit_ids: dict[str, str],
         source_page_by_logical: dict[int, int],
         reading_order_by_logical: dict[int, int],
+        reading_order_resolution: Mapping[str, Any],
         page_topology: PersonalDetailPageTopology,
     ) -> None:
         self.parse_result = parse_result
@@ -779,6 +950,7 @@ class PersonalDetailExtractionContext:
         # the sealed ParseResult and evidence IDs stay immutable.
         self.source_page_by_logical = dict(source_page_by_logical)
         self.reading_order_by_logical = dict(reading_order_by_logical)
+        self.reading_order_resolution = deepcopy(dict(reading_order_resolution))
         self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
         self._frozen_logical_pages: dict[int, Any] = {
@@ -928,6 +1100,9 @@ class PersonalDetailExtractionContext:
                 dedupe_repayment_records,
                 records_from_micro_grid_dict,
             )
+            from docmirror.plugins.credit_report.source_table_month_lattice import (
+                detached_source_table_geometry_by_page,
+            )
 
             detached = deepcopy(_domain_specific(self.parse_result))
             detached.pop("credit_repayment_records", None)
@@ -940,6 +1115,9 @@ class PersonalDetailExtractionContext:
                 for page in self.corrected_evidence_pages()
                 if isinstance(page, dict) and int(page.get("page") or 0) > 0
             }
+            source_table_geometry_by_page = (
+                detached_source_table_geometry_by_page(self.parse_result)
+            )
             observed_pages: set[int] = set()
             for bundle in detached.get("_page_evidence_bundles") or []:
                 if not isinstance(bundle, dict):
@@ -967,6 +1145,15 @@ class PersonalDetailExtractionContext:
                 if not isinstance(grid_evidence, dict):
                     grid_evidence = {}
                     bundle["micro_grid_evidence"] = grid_evidence
+                # Canonical lines replace the prior evidence view, so any
+                # augmentation marker on that prior view is stale. Rebuild the
+                # adjacent continuation and its detached geometry atomically.
+                grid_evidence.pop("credit_cross_page_augmented", None)
+                grid_evidence.pop("continuation_logical_pages", None)
+                grid_evidence.pop(
+                    "continuation_source_table_geometry_by_page",
+                    None,
+                )
                 grid_evidence.update(
                     {
                         "page": page,
@@ -976,6 +1163,9 @@ class PersonalDetailExtractionContext:
                         # Tokens from the sealed pre-registration page must not
                         # outrank the canonical complete-page evidence.
                         "tokens": deepcopy(lines),
+                        "source_table_geometry": deepcopy(
+                            source_table_geometry_by_page.get(page) or []
+                        ),
                     }
                 )
             for page, canonical in canonical_pages.items():
@@ -999,6 +1189,9 @@ class PersonalDetailExtractionContext:
                             "page_height": canonical.get("page_height"),
                             "lines": lines,
                             "tokens": deepcopy(lines),
+                            "source_table_geometry": deepcopy(
+                                source_table_geometry_by_page.get(page) or []
+                            ),
                         },
                     }
                 )
@@ -1006,6 +1199,7 @@ class PersonalDetailExtractionContext:
                 detached,
                 reading_order_by_logical=dict(self.reading_order_by_logical),
             )
+            status_glyph_observations: list[dict[str, Any]] = []
             materialize_credit_repayment_micro_grids_from_bundles(
                 detached,
                 page_image_resolver=getattr(self, "_page_image_resolver", None),
@@ -1013,7 +1207,12 @@ class PersonalDetailExtractionContext:
                 enable_static_status_validation=True,
                 extra_status_chars={"A", "#"},
                 enable_candidate_b_amount_pairing=True,
+                candidate_b_status_glyph_observations=status_glyph_observations,
             )
+            # Ephemeral visual evidence is held only on this plugin context.
+            # It is never inserted into the detached ParseResult view or any
+            # micro-grid/dataset projection.
+            self._candidate_b_status_glyph_observations = status_glyph_observations
             corrected_grids = micro_grid_structures_from_domain_specific(detached)
             self._corrected_repayment_micro_grids = deepcopy(corrected_grids)
             records = [
@@ -1197,6 +1396,13 @@ class PersonalDetailExtractionContext:
         """Return the exact canonical grids used to materialize monthly rows."""
         self.corrected_repayment_records()
         return deepcopy(getattr(self, "_corrected_repayment_micro_grids", []))
+
+    def candidate_b_status_glyph_observations(self) -> list[dict[str, Any]]:
+        """Return private document-local glyph evidence for the final gate."""
+        self.corrected_repayment_records()
+        return deepcopy(
+            getattr(self, "_candidate_b_status_glyph_observations", [])
+        )
 
     def section_content(self, full_text: str) -> dict[str, Any]:
         """Return supplemental datasets from the same Candidate B result."""

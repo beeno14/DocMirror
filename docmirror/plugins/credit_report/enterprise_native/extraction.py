@@ -11,7 +11,7 @@ physical tables without changing or supplementing ``ParseResult``.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -251,6 +251,45 @@ def _page_texts(parse_result: Any) -> dict[int, str]:
             if getattr(block, "content", None)
         )
     return values
+
+
+def _explicit_amount_units(labels: Iterable[Any]) -> frozenset[str]:
+    """Return the units explicitly printed in a table's business labels."""
+    text = "".join(_compact(label) for label in labels if _compact(label))
+    units: set[str] = set()
+    if re.search(r"[（(](?:人民币)?万元[）)]", text) or re.search(
+        r"单位[:：]?(?:人民币)?万元", text
+    ):
+        units.add("CNY_10K")
+    if re.search(r"[（(](?:人民币)?元[）)]", text) or re.search(
+        r"单位[:：]?(?:人民币)?元(?:整)?(?:$|[，。；;])", text
+    ):
+        units.add("CNY_1")
+    return frozenset(units)
+
+
+def extract_enterprise_report_default_amount_unit(parse_result: Any) -> str:
+    """Resolve the report-wide money unit stated in the report notes."""
+    text = str(getattr(parse_result, "full_text", "") or "")
+    if not text:
+        text = "\n".join(_page_texts(parse_result).values())
+    match = re.search(
+        r"金额类(?:汇总)?数据项单位(?:均)?为(?:人民币)?(万元|元)",
+        _compact(text),
+    )
+    if not match:
+        return ""
+    return "CNY_10K" if match.group(1) == "万元" else "CNY_1"
+
+
+def _resolved_amount_unit(labels: Iterable[Any], *, report_default: str) -> str:
+    """Apply explicit-table-over-report-default unit precedence."""
+    explicit_units = _explicit_amount_units(labels)
+    if len(explicit_units) == 1:
+        return next(iter(explicit_units))
+    if explicit_units:
+        return ""
+    return report_default
 
 
 def _table_source_metadata(rows: list[list[str]]) -> dict[str, str]:
@@ -2453,6 +2492,8 @@ def extract_enterprise_interest_arrears(
 
 def extract_enterprise_non_credit_history_datasets(
     parse_result: Any,
+    *,
+    default_amount_unit: str = "",
 ) -> dict[str, list[dict[str, Any]]]:
     """Return monthly utility and housing-fund attachment histories."""
     datasets: dict[str, list[dict[str, Any]]] = {}
@@ -2468,6 +2509,15 @@ def extract_enterprise_non_credit_history_datasets(
         )
         if not history_type:
             continue
+        header_labels: list[str] = []
+        for row in rows:
+            if row and re.fullmatch(r"(?:19|20)\d{2}-\d{2}", _compact(row[0])):
+                break
+            header_labels.extend(row)
+        amount_unit = _resolved_amount_unit(
+            header_labels,
+            report_default=default_amount_unit,
+        )
         records = datasets.setdefault(
             (
                 "enterprise_housing_fund_history"
@@ -2495,7 +2545,7 @@ def extract_enterprise_non_credit_history_datasets(
                     "amount_paid": _number(row[3]),
                     "cumulative_arrears": _number(row[4]),
                     "currency": "CNY",
-                    "amount_unit": "CNY_1",
+                    **({"amount_unit": amount_unit} if amount_unit else {}),
                     "source_page": page,
                     "source_table_id": table_id,
                     "source": f"enterprise_{history_type}_history",
@@ -2553,14 +2603,101 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
     contributors: list[dict[str, Any]] = []
     key_personnel: list[dict[str, Any]] = []
     relationships: list[dict[str, Any]] = []
+    personnel_group_start: int | None = None
+    personnel_group_page: int | None = None
     headings = _table_headings(parse_result)
+
+    def close_personnel_group() -> None:
+        nonlocal personnel_group_start, personnel_group_page
+        personnel_group_start = None
+        personnel_group_page = None
+
+    def apply_personnel_metadata(
+        metadata: dict[str, str],
+    ) -> None:
+        if personnel_group_start is None or not metadata:
+            return
+        for record in key_personnel[personnel_group_start:]:
+            for key, value in metadata.items():
+                if record.get(key) in (None, ""):
+                    record[key] = value
+
     for page, table_id, rows in _table_stream(parse_result):
         if not rows:
             continue
         headers = rows[0]
         signature = "".join(headers)
         source_metadata = _table_source_metadata(rows)
+        contributor_header = all(
+            marker in signature for marker in ("类型", "出资方", "身份标识号码")
+        )
+        relationship_headers = all(
+            marker in signature for marker in ("类型", "名称", "身份标识号码")
+        ) or all(
+            marker in signature for marker in ("名称", "身份标识类型", "身份标识号码")
+        )
+        management_header = all(
+            marker in signature for marker in ("职位", "姓名", "证件号码")
+        )
+        candidate_management_rows = list(
+            enumerate(
+                rows[1:] if management_header else rows,
+                start=1 if management_header else 0,
+            )
+        )
+        explicit_management_rows = [
+            (row_index, row)
+            for row_index, row in candidate_management_rows
+            if len(row) >= 4
+            and any(_compact(value) for value in row)
+            and not _compact(row[0]).startswith("信息来源")
+            and not _placeholder_row(row)
+        ]
+        continuation_management_rows = [
+            (row_index, row)
+            for row_index, row in candidate_management_rows
+            if len(row) >= 4
+            and _compact(row[0])
+            and _compact(row[1])
+            and _compact(row[2])
+            and _identifier(row[3])
+            and not _placeholder_row(row)
+        ]
+        management_rows = (
+            explicit_management_rows
+            if management_header
+            else continuation_management_rows
+        )
+        non_footer_rows = [
+            row
+            for row in (rows[1:] if management_header else rows)
+            if any(_compact(value) for value in row)
+            and not _compact(row[0] if row else "").startswith("信息来源")
+        ]
+        adjacent_to_personnel_group = bool(
+            personnel_group_page is not None
+            and page in {personnel_group_page, personnel_group_page + 1}
+        )
+        management_continuation = bool(
+            personnel_group_start is not None
+            and adjacent_to_personnel_group
+            and not management_header
+            and not contributor_header
+            and not relationship_headers
+            and management_rows
+            and len(management_rows) == len(non_footer_rows)
+        )
+        metadata_only_continuation = bool(
+            personnel_group_start is not None
+            and adjacent_to_personnel_group
+            and source_metadata
+            and not management_header
+            and not contributor_header
+            and not relationship_headers
+            and not non_footer_rows
+        )
         if any(row and row[0] in _PROFILE_LABELS for row in rows):
+            close_personnel_group()
             for row_index, row in enumerate(rows):
                 if len(row) < 2 or row[0] not in _PROFILE_LABELS:
                     continue
@@ -2603,7 +2740,8 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                 profile["field_info"][field] = field_source
                 profile["source_refs"].append(_source_ref(page, table_id, row_index))
             continue
-        if all(marker in signature for marker in ("类型", "出资方", "身份标识号码")):
+        if contributor_header:
+            close_personnel_group()
             for row_index, row in enumerate(rows[1:], start=1):
                 if len(row) < 4 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
                     continue
@@ -2623,16 +2761,18 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                     }
                 )
             continue
-        management_header = all(marker in signature for marker in ("职位", "姓名", "证件号码"))
-        management_continuation = not management_header and any(
-            len(row) >= 4 and row[2] in {"身份证", "护照", "港澳居民来往内地通行证"} and len(_identifier(row[3])) >= 8
-            for row in rows
-        )
         if management_header or management_continuation:
-            start_index = 1 if management_header else 0
-            for row_index, row in enumerate(rows[start_index:], start=start_index):
-                if len(row) < 4 or not row[0] or row[0].startswith("信息来源"):
-                    continue
+            repeated_header_continuation = bool(
+                management_header
+                and personnel_group_start is not None
+                and personnel_group_page is not None
+                and page == personnel_group_page + 1
+            )
+            if personnel_group_start is None or (
+                management_header and not repeated_header_continuation
+            ):
+                personnel_group_start = len(key_personnel)
+            for row_index, row in management_rows:
                 key_personnel.append(
                     {
                         "sequence": len(key_personnel) + 1,
@@ -2647,11 +2787,17 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                         "confidence": 1.0,
                     }
                 )
+            personnel_group_page = page
+            if source_metadata:
+                apply_personnel_metadata(source_metadata)
+                close_personnel_group()
             continue
-        relationship_headers = all(marker in signature for marker in ("类型", "名称", "身份标识号码")) or all(
-            marker in signature for marker in ("名称", "身份标识类型", "身份标识号码")
-        )
+        if metadata_only_continuation:
+            apply_personnel_metadata(source_metadata)
+            close_personnel_group()
+            continue
         if relationship_headers:
+            close_personnel_group()
             for row_index, row in enumerate(rows[1:], start=1):
                 if len(row) < 3 or not row[0] or row[0].startswith("信息来源") or _placeholder_row(row):
                     continue
@@ -2676,6 +2822,9 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                         "confidence": 1.0,
                     }
                 )
+            continue
+        if non_footer_rows:
+            close_personnel_group()
     return {
         "enterprise_profile": [profile] if profile["source_refs"] else [],
         "enterprise_contributors": contributors,
@@ -4046,7 +4195,7 @@ _PUBLIC_ATTRIBUTE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
         "utility_type": ("业务类型", "公用事业类型"),
         "utility_account_identifier": ("账户编号", "用户编号"),
         "payment_status": ("缴费状态",),
-        "cumulative_arrears": ("累计欠费金额（元）", "累计欠费金额", "累计欠费"),
+        "cumulative_arrears": ("累计欠费金额", "累计欠费金额（元）", "累计欠费"),
         "statistics_month": ("统计年月",),
         "history_status": ("查看过去24个月缴费情况", "查看过去 24 个月缴费情况"),
     },
@@ -4253,6 +4402,9 @@ def enterprise_public_record_dataset_specs() -> dict[str, dict[str, Any]]:
             else:
                 field_type = "string"
             columns[field] = {"label": labels[0], "type": field_type}
+        if set(field_map) & _PUBLIC_NUMBER_ATTRIBUTE_FIELDS:
+            columns["currency"] = {"label": "币种", "type": "string"}
+            columns["amount_unit"] = {"label": "金额单位", "type": "string"}
         label = _PUBLIC_RECORD_TYPE_LABELS.get(record_type, record_type)
         specs[record_type] = {
             "dataset_id": dataset_id,
@@ -4287,6 +4439,23 @@ def _public_attributes(record_type: str, details: dict[str, Any]) -> dict[str, A
             value = _compact(raw)
         if value not in (None, ""):
             attributes[field] = value
+    return attributes
+
+
+def _public_attributes_with_amount_unit(
+    record_type: str,
+    details: dict[str, Any],
+    *,
+    report_default: str,
+) -> dict[str, Any]:
+    """Decode typed public fields and attach their resolved money context."""
+    attributes = _public_attributes(record_type, details)
+    if not any(field in attributes for field in _PUBLIC_NUMBER_ATTRIBUTE_FIELDS):
+        return attributes
+    amount_unit = _resolved_amount_unit(details, report_default=report_default)
+    attributes["currency"] = "CNY"
+    if amount_unit:
+        attributes["amount_unit"] = amount_unit
     return attributes
 
 
@@ -4808,7 +4977,11 @@ def _public_date(details: dict[str, Any], *labels: str) -> str:
     return ""
 
 
-def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dict[str, Any]]:
+def extract_enterprise_public_records_from_tables(
+    parse_result: Any,
+    *,
+    default_amount_unit: str = "",
+) -> list[dict[str, Any]]:
     """Project typed public-record tables without cross-section text bleed."""
     records: list[dict[str, Any]] = []
     resolver = EnterpriseContinuationResolver(parse_result)
@@ -4861,7 +5034,11 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             )
             entries.append((0, {"unparsed_table_text": retained_text or "unlabeled_public_table"}))
         for row_index, details in entries:
-            attributes = _public_attributes(record_type, details)
+            attributes = _public_attributes_with_amount_unit(
+                record_type,
+                details,
+                report_default=default_amount_unit,
+            )
             history_resolution: _SemanticResolution | None = None
             if record_type in {"housing_fund_payment", "social_security_payment"}:
                 history_attributes, history_resolution = _public_history_reference(
@@ -4985,8 +5162,15 @@ def extract_enterprise_public_records_from_tables(parse_result: Any) -> list[dic
             if guarded_continuation:
                 previous = records[-1]
                 previous["details"].update(details)
-                merged_attributes = _public_attributes(record_type, previous["details"])
+                merged_attributes = _public_attributes_with_amount_unit(
+                    record_type,
+                    previous["details"],
+                    report_default=default_amount_unit,
+                )
                 previous["attributes"] = merged_attributes
+                for key in ("currency", "amount_unit"):
+                    if key not in merged_attributes:
+                        previous.pop(key, None)
                 previous.update(merged_attributes)
                 previous["content"] = "；".join(f"{key}：{value}" for key, value in previous["details"].items())
                 previous["source_refs"].extend(record["source_refs"])
@@ -5031,6 +5215,7 @@ def _reported_account_summary(parse_result: Any) -> dict[str, Any]:
                         }
     return {}
 
+
 __all__ = [
     "extract_enterprise_accounts_from_tables",
     "extract_enterprise_credit_lines_from_tables",
@@ -5046,6 +5231,7 @@ __all__ = [
     "extract_enterprise_profile_status",
     "extract_enterprise_public_records_from_tables",
     "extract_enterprise_repayment_liability_records",
+    "extract_enterprise_report_default_amount_unit",
     "extract_enterprise_report_metadata",
     "extract_enterprise_report_metadata_records",
     "extract_enterprise_report_identity_records",

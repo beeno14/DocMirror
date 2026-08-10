@@ -72,6 +72,123 @@ def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
     assert all(decision.action == "applied" for decision in overlay.decisions)
 
 
+def test_final_overlay_uses_closed_employment_vocabularies() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    corrected = overlay.correct_business_candidates(
+        {
+            "employment_records": [
+                {
+                    "record_id": "employment:canonical",
+                    "employment_record_id": "employment:canonical",
+                    "industry": "批发和零售业",
+                    "occupation": "商业、服务业人员",
+                    "position": "一般员工",
+                    "professional_title": "中级",
+                },
+                {
+                    "record_id": "employment:polluted",
+                    "employment_record_id": "employment:polluted",
+                    "occupation": "商业、服务业人员X",
+                },
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    canonical, polluted = corrected["employment_records"]
+    assert canonical["industry"] == "批发和零售业"
+    assert canonical["occupation"] == "商业、服务业人员"
+    assert canonical["position"] == "一般员工"
+    assert canonical["professional_title"] == "中级"
+    assert polluted["occupation"] is None
+    anomalies = overlay.audit()["cell_anomalies"]
+    assert not any(
+        item["record_id"] == "employment:canonical"
+        and item["field_name"]
+        in {"industry", "occupation", "position", "professional_title"}
+        for item in anomalies
+    )
+    assert any(
+        item["record_id"] == "employment:polluted"
+        and item["field_name"] == "occupation"
+        and item["normalized_value_withheld"] is True
+        for item in anomalies
+    )
+
+
+def test_final_overlay_validates_identity_number_against_exact_document_type() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    corrected = overlay.correct_business_candidates(
+        {
+            "identity_documents": [
+                {
+                    "record_id": "identity:passport",
+                    "document_type": "护照",
+                    "document_number": "E12345678",
+                },
+                {
+                    "record_id": "identity:bad-passport",
+                    "document_type": "护照",
+                    "document_number": "E12?345",
+                },
+                {
+                    "record_id": "identity:cn",
+                    "document_type": "身份证",
+                    "document_number": "11010519491231002X",
+                },
+                {
+                    "record_id": "identity:bad-cn",
+                    "document_type": "身份证",
+                    "document_number": "110105194912310021",
+                },
+                {
+                    "record_id": "identity:passport-with-cn",
+                    "document_type": "护照",
+                    "document_number": "11010519491231002X",
+                },
+                {
+                    "record_id": "identity:cn-with-passport",
+                    "document_type": "身份证",
+                    "document_number": "E12345678",
+                },
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    rows = {
+        row["record_id"]: row for row in corrected["identity_documents"]
+    }
+    assert rows["identity:passport"]["document_number"] == "E12345678"
+    assert rows["identity:cn"]["document_number"] == "11010519491231002X"
+    for record_id in (
+        "identity:bad-passport",
+        "identity:bad-cn",
+        "identity:passport-with-cn",
+        "identity:cn-with-passport",
+    ):
+        assert rows[record_id]["document_number"] is None
+        assert rows[record_id]["canonical_raw"]["document_number"]
+
+    anomalies = overlay.audit()["cell_anomalies"]
+    assert not any(
+        item["record_id"] in {"identity:passport", "identity:cn"}
+        and item["field_name"] == "document_number"
+        for item in anomalies
+    )
+    assert {
+        item["record_id"]
+        for item in anomalies
+        if item["field_name"] == "document_number"
+        and item["normalized_value_withheld"] is True
+    } == {
+        "identity:bad-passport",
+        "identity:bad-cn",
+        "identity:passport-with-cn",
+        "identity:cn-with-passport",
+    }
+
+
 def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -> None:
     assert normalize_institution_name("重庆蚂蚊消费金融有限公司 Ss") == "重庆蚂蚊消费金融有限公司"
     assert normalize_institution_name("福 中信银行股份有限公司个人信贷部") == (
@@ -1253,3 +1370,40 @@ def test_explicit_unknown_monthly_status_is_withheld_and_reported() -> None:
     )
     assert anomaly["value"] == "unknown"
     assert anomaly["normalized_value_withheld"] is True
+
+
+def test_final_validation_skips_internal_binding_metadata_but_checks_business_scalar() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    payload = {
+        "credit_lines": [
+            {
+                "record_id": "credit_line:1",
+                "effective_date": "not-a-date",
+                "_field_binding_quality": {
+                    "institution": "native_label_column",
+                    "effective_date": "canonical_cell_slot",
+                },
+                "_private_probe": {"institution": "native_label_column"},
+                "source_refs_by_field": {
+                    "effective_date": [{"binding": "canonical_cell_slot"}]
+                },
+            }
+        ]
+    }
+
+    corrected = overlay.correct_business_candidates(
+        payload, stage="candidate_b_final_validation"
+    )
+    anomalies = overlay.audit()["cell_anomalies"]
+
+    assert corrected["credit_lines"][0]["effective_date"] is None
+    assert corrected["credit_lines"][0]["canonical_raw"]["effective_date"] == "not-a-date"
+    assert len(anomalies) == 1
+    assert anomalies[0]["record_id"] == "credit_line:1"
+    assert anomalies[0]["field_name"] == "effective_date"
+    assert anomalies[0]["value"] == "not-a-date"
+    assert not any(
+        anomaly["value"]
+        in {"native_label_column", "canonical_cell_slot", "canonical_packed_liability_row"}
+        for anomaly in anomalies
+    )

@@ -7,7 +7,10 @@ from typing import Any
 
 import pytest
 
-from docmirror.plugins.credit_report.projection import _compact_public_datasets
+from docmirror.plugins.credit_report.projection import (
+    _compact_public_datasets,
+    _source_page_range,
+)
 
 
 def _private_keys(value: Any) -> set[str]:
@@ -132,3 +135,72 @@ def test_public_credit_datasets_keep_required_empty_source_object() -> None:
         "text": "无来源页的业务说明",
         "source": {},
     }
+
+
+def test_source_page_range_prefers_logical_page_within_each_ref() -> None:
+    assert _source_page_range({"logical_page": 19, "source_page": 10}) == [19, 19]
+    assert _source_page_range(
+        {
+            "source_refs": [
+                {
+                    "logical_page": 19,
+                    "page": 19,
+                    "page_id": "p19",
+                    "page_number": 19,
+                    "source_page": 10,
+                }
+            ]
+        }
+    ) == [19, 19]
+
+
+def test_source_page_range_keeps_physical_source_page_as_fallback() -> None:
+    assert _source_page_range(
+        {
+            "source_refs": [
+                {
+                    "logical_page": None,
+                    "page": "invalid",
+                    "page_id": None,
+                    "page_number": 0,
+                    "source_page": "p10",
+                }
+            ]
+        }
+    ) == [10, 10]
+
+
+def test_source_page_range_traverses_nested_refs_and_explicit_range() -> None:
+    assert _source_page_range(
+        {
+            "source": {
+                "page_range": [4, "p6"],
+                "provenance": {
+                    "refs": [
+                        {"logical_page": 3, "source_page": 2},
+                        {"page_id": "p7", "source_page": 4},
+                    ]
+                },
+            }
+        }
+    ) == [3, 7]
+
+
+def test_source_page_range_preserves_default_page_key_behavior() -> None:
+    assert _source_page_range(
+        {
+            "source_refs": [
+                {"page": 8, "page_id": "p9", "page_number": 10, "source_page": 7}
+            ]
+        }
+    ) == [8, 8]
+    assert _source_page_range(
+        {
+            "source_cell_refs": [
+                {"page": 8},
+                {"page_id": "p9"},
+                {"page_number": 10},
+            ],
+            "source_anchor": {"page": 8},
+        }
+    ) == [8, 10]

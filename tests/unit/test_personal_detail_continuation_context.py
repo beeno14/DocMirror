@@ -1195,6 +1195,88 @@ def test_native_profile_tables_preserve_empty_cells_and_embedded_subtables() -> 
     assert "candidate_b_continuation_sequence_unresolved" in issue_codes
 
 
+def test_mobile_and_spouse_partial_headers_ignore_other_canonical_sections() -> None:
+    rows = (
+        ["被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构", "查询原因"],
+        ["编号", "居住地址 G", "住宅电话", "居住状况", "信息更新日期"],
+        ["编号", "? 职业 行业", "", "职务 职称 进入本单位年份", "信息更新日期", ""],
+        [
+            "主业务借款人",
+            "",
+            "",
+            "主业务借款人证件类型",
+            "",
+            "",
+            "",
+            "主业务借款人证件号码",
+            "",
+            "",
+        ],
+    )
+    tables = [
+        SimpleNamespace(
+            table_id=f"other-canonical-section:{index}",
+            bbox=[20, 20, 580, 100],
+            metadata={"raw_rows": [row]},
+            headers=[],
+            rows=[],
+        )
+        for index, row in enumerate(rows, start=1)
+    ]
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=tables)],
+        tables_continue=lambda _left, _right: False,
+        _personal_detail_extraction_issues=[],
+    )
+
+    details = _extract_profile_detail_records(result)
+
+    assert details == {"mobile_phone_records": [], "spouse_records": []}
+    assert not any(
+        issue["issue_code"] == "candidate_b_canonical_header_graph_unresolved"
+        and issue["target_dataset"] in {"mobile_phone_records", "spouse_records"}
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+def test_mobile_and_spouse_exclusive_merged_headers_remain_reported() -> None:
+    tables = [
+        SimpleNamespace(
+            table_id="mobile-merged-header",
+            bbox=[20, 20, 580, 100],
+            metadata={
+                "raw_rows": [
+                    ["编号 手机号码", "", "信息更新日期", "数据发生机构名称"]
+                ]
+            },
+            headers=[],
+            rows=[],
+        ),
+        SimpleNamespace(
+            table_id="spouse-merged-header",
+            bbox=[20, 120, 580, 200],
+            metadata={
+                "raw_rows": [["姓名 证件类型", "证件号码", "工作单位", "联系电话"]]
+            },
+            headers=[],
+            rows=[],
+        ),
+    ]
+    result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=tables)],
+        tables_continue=lambda _left, _right: False,
+        _personal_detail_extraction_issues=[],
+    )
+
+    _extract_profile_detail_records(result)
+
+    assert {
+        issue["target_dataset"]
+        for issue in result._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_canonical_header_graph_unresolved"
+    } == {"mobile_phone_records", "spouse_records"}
+
+
 def test_account_fact_graph_never_shifts_values_across_an_empty_cell() -> None:
     table = SimpleNamespace(
         table_id="account",

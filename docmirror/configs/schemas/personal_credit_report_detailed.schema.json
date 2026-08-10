@@ -254,7 +254,7 @@
             "required": ["monthly_performance_id", "account_id", "performance_month", "status_code"],
             "properties": {
               "performance_month": {"$ref": "#/$defs/month"},
-              "status_code": {"enum": ["*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "unknown"]},
+              "status_code": {"enum": ["*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "unknown", null]},
               "status_amount": {"$ref": "#/$defs/decimalString"},
               "status_amount_semantics": {"enum": ["delinquent_amount", "overdraft_balance", null]}
             }

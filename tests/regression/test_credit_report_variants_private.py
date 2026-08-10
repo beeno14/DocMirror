@@ -23,6 +23,12 @@ from scripts.validate.validate_community_artifacts import validate_community_art
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 _FIXTURE_DIR = Path("tests/fixtures-private/credit_report")
 _DIGITAL_PERSONAL_BRIEF_DIR = _FIXTURE_DIR / "Digital Personal Brief"
+_SUPPLIED_PERSONAL_BRIEF_DIR = (
+    Path(__file__).resolve().parents[4]
+    / "documents"
+    / "征信测试集"
+    / "Digital Personal Brief"
+)
 _DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
 _KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
 _PERSONAL_BRIEF_DISPLAY_SAMPLE = _FIXTURE_DIR / "个人信用报告（本人简版）展示样本.pdf"
@@ -67,6 +73,7 @@ _DIGITAL_PERSONAL_BRIEF_EXPECTED = {
     "汪婧妍征信.pdf": (39, 6, 170, 13, 0),
     "沈俊艺个人征信.pdf": (83, 3, 90, 6, 1),
     "赵思雯个人征信.pdf": (45, 4, 124, 9, 1),
+    "征信简版.pdf": (87, 5, 108, 4, 0),
     "陈是兴_征信报告_中国建设银行_20101012.pdf": (87, 5, 108, 4, 0),
     "陈是兴_征信报告_中国建设银行_20101012_1.pdf": (87, 5, 108, 4, 0),
 }
@@ -77,6 +84,7 @@ _DIGITAL_PERSONAL_BRIEF_MARITAL_STATUS = {
     "汪婧妍征信.pdf": ("married", "已婚"),
     "沈俊艺个人征信.pdf": ("divorced", "离婚"),
     "赵思雯个人征信.pdf": ("married", "已婚"),
+    "征信简版.pdf": ("married", "已婚"),
     "陈是兴_征信报告_中国建设银行_20101012.pdf": ("married", "已婚"),
     "陈是兴_征信报告_中国建设银行_20101012_1.pdf": ("married", "已婚"),
 }
@@ -94,6 +102,15 @@ CASES = [
     *[
         pytest.param(path, "personal_brief", "personal_credit_report_brief", id=f"digital-personal-brief-{index}")
         for index, path in enumerate(sorted(_DIGITAL_PERSONAL_BRIEF_DIR.glob("*.pdf")), 1)
+    ],
+    *[
+        pytest.param(
+            path,
+            "personal_brief",
+            "personal_credit_report_brief",
+            id=f"supplied-personal-brief-{index}",
+        )
+        for index, path in enumerate(sorted(_SUPPLIED_PERSONAL_BRIEF_DIR.glob("*.pdf")), 1)
     ],
     *_cases("*_个人详版征信报告.pdf", "personal_detail", "personal_credit_report_detailed"),
     *[
@@ -307,6 +324,13 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert unactivated["reporting_amount_currency"] == "CNY"
     assert quasi_card["business_type"] == "准贷记卡"
     assert all(account["reporting_amount_currency"] == "CNY" for account in accounts)
+    overdue = [row["normalized"] for row in datasets["overdue_records"]["rows"]]
+    assert [row.get("overdue_months") for row in overdue] == [None, 1, 2, 2, 2, 4, 16, 12]
+    bad_debt_overdue = next(
+        row for row in overdue if row["account_id"] == bad_debt["account_id"]
+    )
+    assert "overdue_months" not in bad_debt_overdue
+    assert bad_debt_overdue["current_overdue_status"] == "not_reported"
 
     summary = semantic["domain"]["facts"]["credit_summary"]
     assert summary["source_account_count"] == summary["account_count"] == 15
@@ -1615,6 +1639,31 @@ def test_credit_report_subtype_projects_complete_v3(
                 assert "overdue id" not in overdue_markdown
                 assert "last_5_years" not in overdue_markdown
                 assert "当前有逾期" in overdue_markdown
+        if fixture.name == "汪婧妍征信.pdf":
+            liability = liabilities[2]["normalized"]
+            assert liability == {
+                "liability_date": "2024-10-30",
+                "related_party_name": "斯菲尔(上海)智能科技股份有限公司",
+                "related_party_id_type": "中征码",
+                "related_party_id_number": "3101150013301231",
+                "institution": "上海银行股份有限公司宝山支行",
+                "business_type": "贷款",
+                "underlying_business_type": "贷款",
+                "snapshot_balance_business_type": "贷款",
+                "responsibility_type": "保证人",
+                "responsibility_amount": "4800000",
+                "responsibility_amount_reported": True,
+                "contract_number": "D10112900H0001SubCon2410224551428",
+                "snapshot_date": "2025-06-30",
+                "balance": "4800000",
+                "reporting_amount_currency": "CNY",
+                "reporting_amount_unit": "yuan",
+            }
+            rich_liability = semantic_datasets["repayment_liability_records"]["rows"][2]
+            assert rich_liability["source"]["page_range"] == [2, 3]
+            assert {
+                ref["page"] for ref in rich_liability["source"]["source_refs"]
+            } == {2, 3}
         if (expected_accounts, expected_liabilities, expected_inquiries) == (45, 4, 124):
             semantic_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
             summary = semantic["domain"]["facts"]["credit_summary"]

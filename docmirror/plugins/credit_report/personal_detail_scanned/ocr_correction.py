@@ -31,6 +31,11 @@ _DATE_LOOSE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[.,/-]?(\d{2})[.,/-](\d{2})
 _MONTH_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})(?![\d./-])")
 _DATETIME_DIGITS_RE = re.compile(r"(?<!\d)(20\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})(?!\d)")
 _CN_ID_RE = re.compile(r"^\d{17}[0-9X]$")
+_IDENTITY_NUMBER_TYPE_FIELDS: dict[str, tuple[str, ...]] = {
+    "primary_id_number": ("primary_id_type", "id_type", "document_type"),
+    "id_number": ("id_type", "primary_id_type", "document_type"),
+    "document_number": ("document_type", "primary_id_type", "id_type"),
+}
 _MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
 _ACCOUNT_IDENTIFIER_RE = re.compile(r"^[A-Z0-9-]{8,80}$")
 _AMOUNT_RE = re.compile(r"^-?(?:0|[1-9]\d{0,14})(?:\.\d{1,2})?$")
@@ -218,9 +223,11 @@ _FIELD_ROLES: dict[str, str] = {
     "guarantee_type": "guarantee_type",
     "repayment_frequency": "repayment_frequency",
     "repayment_method": "repayment_method",
-    "position": "employment_descriptor",
+    "industry": "employment_industry",
+    "occupation": "employment_occupation",
+    "position": "employment_position",
     "job_title": "employment_descriptor",
-    "occupation": "employment_descriptor",
+    "professional_title": "employment_professional_title",
     "primary_id_type": "identity_document_type",
     "document_type": "identity_document_type",
     "related_party_id_type": "identity_document_type",
@@ -240,6 +247,8 @@ _RAW_OR_PROVENANCE_KEYS = frozenset(
         "raw_detail_lines",
         "source_refs",
         "source_cell_refs",
+        "source_refs_by_field",
+        "_field_binding_quality",
         "audit",
         "ocr_correction",
         "ocr_corrections",
@@ -623,6 +632,37 @@ def _is_valid_for_role(value: str, role: str) -> bool:
             return True
         except ValueError:
             return False
+    if role.startswith("identity_document_number::"):
+        document_type = role.partition("::")[2]
+        compact = re.sub(r"\s+", "", _plain_text(value)).upper()
+        if document_type in {"身份证", "居民身份证"}:
+            return _cn_id_checksum_valid(compact)
+        if document_type == "护照":
+            return bool(
+                re.fullmatch(r"(?=.{5,20}$)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+", compact)
+            ) and not bool(_CN_ID_RE.fullmatch(compact))
+        if document_type in {"军官证", "士兵证"}:
+            return bool(
+                re.fullmatch(
+                    r"(?:[A-Z](?=[A-Z0-9-]{4,19}$)(?=.*\d)[A-Z0-9-]+|"
+                    r"[\u3400-\u9fff]{1,4}字第?\d{4,12}号?)",
+                    compact,
+                )
+            )
+        if document_type == "港澳居民来往内地通行证":
+            return bool(re.fullmatch(r"[HM]\d{8,10}", compact))
+        if document_type == "台湾居民来往大陆通行证":
+            return bool(re.fullmatch(r"(?:[A-Z]\d{7,9}|\d{8,10})", compact))
+        if document_type == "外国人永久居留证":
+            return bool(re.fullmatch(r"(?:[A-Z]{3}\d{12}|9\d{16}[0-9X])", compact))
+        if document_type == "统一社会信用代码":
+            return bool(re.fullmatch(r"[0-9A-HJ-NPQRTUWXY]{18}", compact))
+        if document_type == "中征码":
+            return bool(re.fullmatch(r"\d{16}", compact))
+        if document_type == "组织机构代码":
+            return bool(re.fullmatch(r"[A-Z0-9]{8}-?[A-Z0-9]", compact))
+        # `其他证件` and `未知` do not identify a safe number grammar.
+        return False
     if role == "identity_document_number":
         return _cn_id_checksum_valid(value)
     if role == "mobile_phone":
@@ -665,6 +705,25 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         return value != "unknown" and value in _ACCOUNT_STATUS_CODES
     if role == "five_tier_class":
         return value != "unknown" and value in _FIVE_TIER_CLASSES
+    if role.startswith("employment_"):
+        # The native extractor and the final correction plane must share the
+        # same closed PBOC vocabularies.  A generic text-shape contract both
+        # rejected canonical comma-delimited occupations and admitted
+        # arbitrary Han near-matches after extraction had finished.
+        from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+            _EMPLOYMENT_INDUSTRIES,
+            _EMPLOYMENT_OCCUPATIONS,
+            _EMPLOYMENT_POSITIONS,
+            _EMPLOYMENT_TITLES,
+        )
+
+        vocabulary = {
+            "employment_industry": _EMPLOYMENT_INDUSTRIES,
+            "employment_occupation": _EMPLOYMENT_OCCUPATIONS,
+            "employment_position": _EMPLOYMENT_POSITIONS,
+            "employment_professional_title": _EMPLOYMENT_TITLES,
+        }.get(role)
+        return vocabulary is not None and value in vocabulary
     if role == "inquiry_row":
         return bool(_DATE_TOKEN_RE.search(value) and any(marker in value for marker in _VALID_INQUIRY_REASONS))
     return bool(value)
@@ -690,6 +749,13 @@ def _normalize_role(value: str, role: str) -> str:
         return _normalize_date_or_month(value)
     if role == "report_datetime":
         return _normalize_datetime(value)
+    if role.startswith("identity_document_number::"):
+        document_type = role.partition("::")[2]
+        if document_type in {"身份证", "居民身份证"}:
+            return _normalize_identity(value)
+        return re.sub(r"\s+", "", _plain_text(value)).upper().translate(
+            str.maketrans({"―": "-", "‐": "-", "‑": "-", "–": "-", "—": "-", "－": "-"})
+        )
     if role == "identity_document_number":
         return _normalize_identity(value)
     if role == "mobile_phone":
@@ -776,6 +842,24 @@ def _mapping_role(owner: Mapping[str, Any], key: str) -> str | None:
         "ocr_corrected",
     }:
         return None
+    if key in _IDENTITY_NUMBER_TYPE_FIELDS:
+        from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+            normalize_pboc_field,
+            validate_pboc_field,
+        )
+
+        document_type = next(
+            (
+                str(owner.get(type_field) or "")
+                for type_field in _IDENTITY_NUMBER_TYPE_FIELDS[key]
+                if owner.get(type_field) not in (None, "")
+            ),
+            "",
+        )
+        normalized_type = normalize_pboc_field(document_type, "identity_document_type")
+        if not validate_pboc_field(normalized_type, "identity_document_type").valid:
+            normalized_type = "unknown"
+        return f"identity_document_number::{normalized_type}"
     if key == "value":
         return _summary_cell_role(owner)
     if key == "reason" and any(name in owner for name in ("inquiry_date", "inquiry_type")):
@@ -1585,7 +1669,11 @@ class PersonalDetailOCRCorrectionOverlay:
                     valid=valid,
                     normalized_value_withheld=withhold_invalid,
                 )
-            if isinstance(item, (dict, list)) and str(key) not in _RAW_OR_PROVENANCE_KEYS:
+            if (
+                isinstance(item, (dict, list))
+                and str(key) not in _RAW_OR_PROVENANCE_KEYS
+                and not str(key).startswith("_")
+            ):
                 self._walk(item, parent=field_path, refs=local_refs, stage=stage)
 
     def _promote_account_identifier_candidates(self, payload: dict[str, Any]) -> None:

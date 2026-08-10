@@ -115,7 +115,8 @@ def test_unknown_summary_title_is_preserved_unmapped_and_reported(observed_title
     issue = next(
         row for row in issues if row["issue_code"] == "canonical_summary_cell_unmapped"
     )
-    assert issue["target_record_id"] == "cell:unknown"
+    assert issue.get("target_record_id") is None
+    assert issue["target_dataset"] == "credit_business_overview"
     assert issue["observed_value"] == "2"
 
 

@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from typing import Any
 
 from docmirror.plugins.credit_report.repayment_grid import extract_credit_repayment_records
@@ -31,6 +32,34 @@ def _bbox(item: Any) -> list[float]:
     if raw and len(raw) == 4:
         return [float(value) for value in raw]
     return [0.0, 0.0, 0.0, 0.0]
+
+
+def _detached_source_table_geometry_pages(
+    evidence: Mapping[str, Any],
+) -> dict[str, list[Mapping[str, Any]]]:
+    """Expose base and continuation geometry through one value-blind channel."""
+
+    result: dict[str, list[Mapping[str, Any]]] = {}
+
+    def add(logical_page: Any, tables: Any) -> None:
+        try:
+            page_key = str(int(logical_page))
+        except (TypeError, ValueError):
+            return
+        if not isinstance(tables, Iterable) or isinstance(
+            tables, (str, bytes, Mapping)
+        ):
+            return
+        detached = [table for table in tables if isinstance(table, Mapping)]
+        if detached:
+            result.setdefault(page_key, []).extend(detached)
+
+    add(evidence.get("page"), evidence.get("source_table_geometry"))
+    continuation = evidence.get("continuation_source_table_geometry_by_page")
+    if isinstance(continuation, Mapping):
+        for logical_page, tables in continuation.items():
+            add(logical_page, tables)
+    return result
 
 
 def _date_range_only_grid(
@@ -154,6 +183,14 @@ def augment_credit_repayment_evidence_bundles(
         evidence["lines"] = [*lines, *shifted]
         evidence["credit_cross_page_augmented"] = True
         evidence["continuation_logical_pages"] = [next_page]
+        continuation_geometry = evidence.setdefault(
+            "continuation_source_table_geometry_by_page",
+            {},
+        )
+        if isinstance(continuation_geometry, dict):
+            continuation_geometry[str(next_page)] = deepcopy(
+                next_evidence.get("source_table_geometry") or []
+            )
 
 
 def materialize_credit_repayment_micro_grids(
@@ -169,6 +206,13 @@ def materialize_credit_repayment_micro_grids(
     enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
     enable_candidate_b_amount_pairing: bool = False,
+    candidate_b_status_glyph_observations: list[dict[str, Any]] | None = None,
+    continuation_logical_pages: Iterable[int] = (),
+    source_table_geometry_by_page: Mapping[
+        str | int,
+        Iterable[Mapping[str, Any]],
+    ]
+    | None = None,
 ) -> list[dict[str, Any]]:
     line_list = list(lines or [])
     anchor_indices = [
@@ -191,6 +235,11 @@ def materialize_credit_repayment_micro_grids(
             enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
             enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
+            candidate_b_status_glyph_observations=(
+                candidate_b_status_glyph_observations
+            ),
+            continuation_logical_pages=continuation_logical_pages,
+            source_table_geometry_by_page=source_table_geometry_by_page,
             grid_index=grid_index,
         )
         grid = out.get("micro_grid")
@@ -216,6 +265,7 @@ def materialize_credit_repayment_micro_grids_from_bundles(
     enable_static_status_validation: bool = False,
     extra_status_chars: Iterable[str] = (),
     enable_candidate_b_amount_pairing: bool = False,
+    candidate_b_status_glyph_observations: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Materialize credit-only grids on a post-seal read view."""
     from docmirror.models.mirror.page_evidence_bundles import (
@@ -236,6 +286,14 @@ def materialize_credit_repayment_micro_grids_from_bundles(
             enable_static_status_validation=enable_static_status_validation,
             extra_status_chars=extra_status_chars,
             enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
+            candidate_b_status_glyph_observations=(
+                candidate_b_status_glyph_observations
+            ),
+            continuation_logical_pages=evidence.get("continuation_logical_pages")
+            or (),
+            source_table_geometry_by_page=(
+                _detached_source_table_geometry_pages(evidence)
+            ),
         )
         if grids:
             merge_micro_grid_structures_into_bundles(domain_specific, grids)

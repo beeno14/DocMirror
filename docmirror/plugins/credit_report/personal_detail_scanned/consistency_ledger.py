@@ -31,6 +31,7 @@ _INSTITUTION_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 _IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
+    "personal_profile": ("subject_profile_id", "personal_profile_id"),
     "personal_report_metadata": ("personal_report_metadata_id",),
     "credit_accounts": ("account_id",),
     "credit_lines": ("credit_line_id", "credit_agreement_id"),
@@ -44,6 +45,7 @@ _IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
 }
 
 _DATASET_TARGET_ALIASES: dict[str, frozenset[str]] = {
+    "personal_profile": frozenset({"personal_profile", "subject_profile"}),
     "personal_report_metadata": frozenset({"personal_report_metadata", "report_metadata", "report_query"}),
     "credit_accounts": frozenset({"credit_accounts"}),
     "credit_lines": frozenset({"credit_lines", "credit_agreements"}),
@@ -85,7 +87,7 @@ _LEGAL_ROOT_MARKERS = (
     "银行",
     "公司",
 )
-_BRANCH_SUFFIXES = ("分行", "支行", "中心")
+_BRANCH_SUFFIXES = ("分行", "支行")
 _STALE_RESOLVED_FIELD_ISSUES = frozenset(
     {
         "pboc_cell_contract_unresolved",
@@ -107,6 +109,49 @@ _ADDRESS_DIRECTION_GLYPHS = frozenset("东西南北前后上下内外左右甲�
 def _values(record: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
     normalized = record.get("normalized")
     return normalized if isinstance(normalized, MutableMapping) else record
+
+
+def _nested_field_observation(
+    record: Mapping[str, Any], field_name: str
+) -> Mapping[str, Any] | None:
+    """Return a Candidate-B profile observation stored in one field slot.
+
+    Most ledger inputs are already flat business records.  Candidate-B profile
+    extraction is intentionally different: each profile field retains its
+    value and OCR evidence in a small observation mapping until source-schema
+    projection.  Keep that private representation readable here without
+    changing the flat-record contract used by every other dataset.
+    """
+
+    values = record.get("normalized") if isinstance(record.get("normalized"), Mapping) else record
+    candidate = values.get(field_name) if isinstance(values, Mapping) else None
+    return candidate if isinstance(candidate, Mapping) else None
+
+
+def _field_value(record: Mapping[str, Any], field_name: str) -> Any | None:
+    """Read a finalized scalar from either a flat row or profile observation."""
+
+    values = record.get("normalized") if isinstance(record.get("normalized"), Mapping) else record
+    value = values.get(field_name) if isinstance(values, Mapping) else None
+    if not isinstance(value, Mapping):
+        return value
+
+    status = str(value.get("observation_status") or "").strip().lower()
+    if status in {"ambiguous", "failed", "source_absent", "unreadable", "unknown"}:
+        return None
+    for key in ("normalized_value", "value"):
+        candidate = value.get(key)
+        if candidate not in (None, "") and not isinstance(candidate, (Mapping, list, tuple, set)):
+            return candidate
+    # A clean observation produced by an older extractor can carry only raw.
+    # Never promote raw text from an explicitly uncertain observation.
+    raw = value.get("canonical_raw", value.get("raw"))
+    if status in {"observed", "normalized", "ocr_corrected", "resolved"} and raw not in (
+        None,
+        "",
+    ) and not isinstance(raw, (Mapping, list, tuple, set)):
+        return raw
+    return None
 
 
 def _compact(value: Any) -> str:
@@ -139,6 +184,10 @@ def _field_refs(record: Mapping[str, Any], field_name: str) -> list[dict[str, An
             refs = refs_by_field[field_name]
             break
     if not refs:
+        observation = _nested_field_observation(record, field_name)
+        if observation is not None:
+            refs = observation.get("source_refs") or observation.get("source_cell_refs")
+    if not refs:
         for owner in (values, record):
             if not isinstance(owner, Mapping):
                 continue
@@ -161,7 +210,137 @@ def _raw_field_values(record: Mapping[str, Any], field_name: str) -> list[str]:
                 observed.append(value.strip())
             elif isinstance(value, (list, tuple)):
                 observed.extend(str(item).strip() for item in value if str(item).strip())
+    observation = _nested_field_observation(record, field_name)
+    if observation is not None:
+        value = observation.get("canonical_raw", observation.get("raw"))
+        if isinstance(value, str) and value.strip():
+            observed.append(value.strip())
+        elif isinstance(value, (list, tuple)):
+            observed.extend(str(item).strip() for item in value if str(item).strip())
     return list(dict.fromkeys(observed))
+
+
+def _field_has_marker(
+    record: Mapping[str, Any],
+    field_name: str,
+    marker_name: str,
+) -> bool:
+    values = record.get("normalized") if isinstance(record.get("normalized"), Mapping) else record
+    for owner in (record, values):
+        if not isinstance(owner, Mapping):
+            continue
+        marked = owner.get(marker_name)
+        if isinstance(marked, str):
+            if marked == field_name:
+                return True
+        elif isinstance(marked, Iterable) and field_name in {str(item) for item in marked}:
+            return True
+    return False
+
+
+def _clean_finalized_field_value(record: Mapping[str, Any], field_name: str) -> Any | None:
+    value = _field_value(record, field_name)
+    if value in (None, ""):
+        return None
+    if any(
+        _field_has_marker(record, field_name, marker_name)
+        for marker_name in (
+            "_unresolved_fields",
+            "_reported_field_conflicts",
+            "_source_absent_fields",
+        )
+    ):
+        return None
+    return value
+
+
+def _coordinate_token(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(_coordinate_token(item) for item in value)
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _canonical_source_field_locator(
+    refs: Iterable[Mapping[str, Any]],
+) -> tuple[str, ...] | None:
+    candidates: list[tuple[int, tuple[str, ...]]] = []
+    for ref in refs:
+        page = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in (
+                    "logical_page",
+                    "page",
+                    "source_page",
+                    "subpage_id",
+                    "subpage_index",
+                )
+                if ref.get(name) not in (None, "")
+            ),
+            "",
+        )
+        cell_id = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in ("source_cell_id", "cell_id")
+                if ref.get(name) not in (None, "")
+            ),
+            "",
+        )
+        if cell_id:
+            candidates.append((0, ("cell", page, cell_id)))
+            continue
+
+        table_id = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in ("table_id", "grid_id")
+                if ref.get(name) not in (None, "")
+            ),
+            "",
+        )
+        row = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in ("row", "row_index")
+                if ref.get(name) is not None
+            ),
+            "",
+        )
+        column = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in ("column", "column_index")
+                if ref.get(name) is not None
+            ),
+            "",
+        )
+        if table_id and row:
+            candidates.append((1, ("table_cell", page, table_id, row, column)))
+            continue
+
+        bbox = _coordinate_token(ref.get("bbox"))
+        if bbox and page:
+            candidates.append((2, ("bbox", page, bbox)))
+            continue
+
+        line_id = next(
+            (
+                _coordinate_token(ref.get(name))
+                for name in ("line_id", "line_index", "span_id")
+                if ref.get(name) not in (None, "")
+            ),
+            "",
+        )
+        if line_id and page:
+            candidates.append((3, ("line", page, line_id)))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], item[1]))[1]
 
 
 def _preserve_raw(record: MutableMapping[str, Any], field_name: str, value: Any) -> None:
@@ -283,8 +462,63 @@ def _address_pair_is_structural(left: str, right: str) -> bool:
     return bool(left_numbers and left_numbers == right_numbers)
 
 
+def _street_suffixes(value: str) -> tuple[str, ...]:
+    """Return bounded street-name suffixes without guessing word boundaries."""
+
+    compact = _compact(value)
+    return tuple(
+        compact[index - 2 : index + 1]
+        for index, char in enumerate(compact)
+        if char in "路街巷道" and index >= 2
+    )
+
+
+def _cross_format_address_pair_is_structural(left: str, right: str) -> bool:
+    """Detect one-glyph street conflicts across differently formatted addresses.
+
+    A profile address and a residence address can describe the same location
+    with different village/building words, so whole-string Hamming distance is
+    not useful.  The comparison remains deliberately narrow: both addresses
+    must share a substantial administrative prefix, have the exact same
+    numeric components, and contain one uniquely matching three-Han street
+    suffix whose only difference is not a directional glyph.
+    """
+
+    left = _compact(left)
+    right = _compact(right)
+    if not left or not right or left == right:
+        return False
+    common_prefix = 0
+    for left_char, right_char in zip(left, right, strict=False):
+        if left_char != right_char:
+            break
+        common_prefix += 1
+    if common_prefix < 6:
+        return False
+    left_numbers = re.findall(r"\d+", left)
+    right_numbers = re.findall(r"\d+", right)
+    if len(left_numbers) < 2 or left_numbers != right_numbers:
+        return False
+    matches: list[tuple[str, str]] = []
+    for left_street in _street_suffixes(left):
+        for right_street in _street_suffixes(right):
+            difference = _one_han_substitution(left_street, right_street)
+            if difference is None:
+                continue
+            _index, left_char, right_char = difference
+            if left_char in _ADDRESS_DIRECTION_GLYPHS or right_char in _ADDRESS_DIRECTION_GLYPHS:
+                continue
+            matches.append((left_street, right_street))
+    return len(set(matches)) == 1
+
+
 def _field_confidence(record: Mapping[str, Any], field_name: str) -> float | None:
     values = record.get("normalized") if isinstance(record.get("normalized"), Mapping) else record
+    observation = _nested_field_observation(record, field_name)
+    if observation is not None:
+        confidence = observation.get("confidence")
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            return max(0.0, min(1.0, float(confidence)))
     for owner in (values, record):
         if not isinstance(owner, Mapping):
             continue
@@ -414,7 +648,7 @@ def _institution_observations(
 
 def _institution_root_witnesses(datasets: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
     witnesses: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, tuple[str, ...]]] = set()
     for dataset, field_names in _INSTITUTION_FIELDS.items():
         for index, raw_record in enumerate(datasets.get(dataset) or (), start=1):
             if not isinstance(raw_record, MutableMapping):
@@ -424,28 +658,33 @@ def _institution_root_witnesses(datasets: Mapping[str, Any]) -> dict[str, list[d
                 refs = _field_refs(raw_record, field_name)
                 if not refs:
                     continue
-                values = _values(raw_record)
-                candidates = [values.get(field_name), *_raw_field_values(raw_record, field_name)]
-                for candidate in candidates:
-                    if candidate in (None, "") or _separated_prefix_candidate(candidate) is not None:
-                        continue
-                    compact = _compact(candidate)
-                    if not _valid_complete_institution(compact):
-                        continue
-                    root = _legal_root(compact)
-                    marker = (root or "", dataset, record_id)
-                    if not root or marker in seen:
-                        continue
-                    seen.add(marker)
-                    witnesses[root].append(
-                        {
-                            "dataset": dataset,
-                            "record_id": record_id,
-                            "field_name": field_name,
-                            "value": compact,
-                            "refs": refs,
-                        }
-                    )
+                candidate = _clean_finalized_field_value(raw_record, field_name)
+                if candidate is None or _separated_prefix_candidate(candidate) is not None:
+                    continue
+                compact = _compact(candidate)
+                if not _valid_complete_institution(compact):
+                    continue
+                root = _legal_root(compact)
+                locator = _canonical_source_field_locator(refs) or (
+                    "record",
+                    dataset,
+                    record_id,
+                    field_name,
+                )
+                marker = (root or "", locator)
+                if not root or marker in seen:
+                    continue
+                seen.add(marker)
+                witnesses[root].append(
+                    {
+                        "dataset": dataset,
+                        "record_id": record_id,
+                        "field_name": field_name,
+                        "value": compact,
+                        "refs": refs,
+                        "source_field_locator": locator,
+                    }
+                )
     return witnesses
 
 
@@ -481,9 +720,13 @@ def _repair_separated_institution_prefixes(
                         witness["dataset"] == dataset and witness["record_id"] == record_id
                     )
                 ]
+                witness_locators = {
+                    tuple(witness["source_field_locator"])
+                    for witness in witnesses
+                }
                 refs = _field_refs(raw_record, field_name)
                 raw = candidates[0][0]
-                if root and len({(item["dataset"], item["record_id"]) for item in witnesses}) >= 2:
+                if root and len(witness_locators) >= 2:
                     values[field_name] = remainder
                     _preserve_raw(raw_record, field_name, raw)
                     _clear_resolved_marker(raw_record, field_name)
@@ -508,7 +751,7 @@ def _repair_separated_institution_prefixes(
                         candidate_value={
                             "normalized_institution": remainder,
                             "legal_root": root,
-                            "independent_witness_count": len(witnesses),
+                            "independent_witness_count": len(witness_locators),
                         },
                         source_refs=[
                             *refs,
@@ -548,7 +791,7 @@ def _repair_separated_institution_prefixes(
                     candidate_value={
                         "withheld_remainder": remainder,
                         "legal_root": root,
-                        "independent_witness_count": len(witnesses),
+                        "independent_witness_count": len(witness_locators),
                     },
                     source_refs=refs,
                     reason_codes=(
@@ -687,6 +930,71 @@ def _apply_one_glyph_conflicts(
         )
 
 
+def _apply_pairwise_cross_format_address_conflicts(
+    context: Any,
+    observations: list[dict[str, Any]],
+    audit: Counter[str],
+) -> None:
+    """Report a unique two-record street-glyph conflict without choosing truth."""
+
+    value_counts = Counter(observation["key"] for observation in observations)
+    candidate_pairs: list[tuple[int, int]] = []
+    for left_index, left in enumerate(observations):
+        if value_counts[left["key"]] != 1:
+            continue
+        left_locator = _canonical_source_field_locator(left["refs"])
+        for right_index in range(left_index + 1, len(observations)):
+            right = observations[right_index]
+            if value_counts[right["key"]] != 1:
+                continue
+            right_locator = _canonical_source_field_locator(right["refs"])
+            if left_locator is not None and left_locator == right_locator:
+                continue
+            if _cross_format_address_pair_is_structural(left["key"], right["key"]):
+                candidate_pairs.append((left_index, right_index))
+
+    participation = Counter(index for pair in candidate_pairs for index in pair)
+    for left_index, right_index in candidate_pairs:
+        if participation[left_index] != 1 or participation[right_index] != 1:
+            continue
+        left = observations[left_index]
+        right = observations[right_index]
+        for current, peer in ((left, right), (right, left)):
+            _mark_reported_conflict(current["record"], current["field_name"])
+            _record_issue(
+                context,
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_document_local_address_glyph_conflict",
+                message=(
+                    "Two independently bound addresses described the same administrative and "
+                    "numeric location but disagreed by one non-directional street glyph; neither "
+                    "value was used to correct the other."
+                ),
+                dataset=current["dataset"],
+                record_id=current["record_id"],
+                field_name=current["field_name"],
+                observed_value={
+                    "address": current["value"],
+                    "document_local_variant": peer["value"],
+                },
+                candidate_value={"action": "retained_with_localized_uncertainty"},
+                source_refs=[
+                    *current["refs"],
+                    *[
+                        {**ref, "consistency_witness_record_id": peer["record_id"]}
+                        for ref in peer["refs"][:1]
+                    ],
+                ],
+                reason_codes=(
+                    "same_administrative_prefix",
+                    "same_numeric_address_components",
+                    "one_han_street_glyph_conflict",
+                    "candidate_value_retained_with_uncertainty",
+                ),
+            )
+            audit["address_cross_format_glyph_conflict_retained_with_issue"] += 1
+
+
 def _check_individualized_conflicts(
     context: Any,
     datasets: MutableMapping[str, Any],
@@ -707,25 +1015,30 @@ def _check_individualized_conflicts(
     )
 
     addresses: list[dict[str, Any]] = []
-    for index, raw_record in enumerate(datasets.get("residence_records") or (), start=1):
-        if not isinstance(raw_record, MutableMapping):
-            continue
-        values = _values(raw_record)
-        value = values.get("address")
-        refs = _field_refs(raw_record, "address")
-        if value in (None, "") or not refs:
-            continue
-        addresses.append(
-            {
-                "dataset": "residence_records",
-                "record": raw_record,
-                "record_id": _record_id("residence_records", raw_record, index),
-                "field_name": "address",
-                "value": str(value),
-                "key": _compact(value),
-                "refs": refs,
-            }
-        )
+    address_fields = {
+        "residence_records": ("address",),
+        "personal_profile": ("mailing_address", "household_address"),
+    }
+    for dataset, field_names in address_fields.items():
+        for index, raw_record in enumerate(datasets.get(dataset) or (), start=1):
+            if not isinstance(raw_record, MutableMapping):
+                continue
+            for field_name in field_names:
+                value = _field_value(raw_record, field_name)
+                refs = _field_refs(raw_record, field_name)
+                if value in (None, "") or not refs:
+                    continue
+                addresses.append(
+                    {
+                        "dataset": dataset,
+                        "record": raw_record,
+                        "record_id": _record_id(dataset, raw_record, index),
+                        "field_name": field_name,
+                        "value": str(value),
+                        "key": _compact(value),
+                        "refs": refs,
+                    }
+                )
     _apply_one_glyph_conflicts(
         context,
         addresses,
@@ -734,6 +1047,7 @@ def _check_individualized_conflicts(
         audit_key="address_glyph_conflict",
         audit=audit,
     )
+    _apply_pairwise_cross_format_address_conflicts(context, addresses, audit)
 
 
 def _summary_family(value: Any) -> str | None:

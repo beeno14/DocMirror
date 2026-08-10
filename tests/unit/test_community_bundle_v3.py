@@ -690,6 +690,63 @@ def test_dataset_and_audit_csv_use_nested_source_page_range() -> None:
     assert {row["page_end"] for row in audit_rows} == {"7"}
 
 
+def test_community_page_range_prefers_nested_refs_over_stale_parent_range() -> None:
+    records = [
+        {
+            "repayment_id": "rep_mixed",
+            "normalized": {"month": "2025-01", "status": "N"},
+            "raw": {"month": "2025-01", "status": "N"},
+            "source": {
+                "page_range": [10, 19],
+                "source_refs": [{"logical_page": 19, "source_page": 10}],
+            },
+        },
+        {
+            "repayment_id": "rep_physical_fallback",
+            "normalized": {"month": "2025-02", "status": "N"},
+            "raw": {"month": "2025-02", "status": "N"},
+            "source": {
+                "source_refs": [
+                    {
+                        "logical_page": None,
+                        "page": "invalid",
+                        "source_page_number": 10,
+                    }
+                ]
+            },
+        },
+        {
+            "repayment_id": "rep_distinct_refs",
+            "normalized": {"month": "2025-03", "status": "N"},
+            "raw": {"month": "2025-03", "status": "N"},
+            "source": {
+                "source_refs": [
+                    {"logical_page": 19, "source_page": 10},
+                    {"page_id": "p21", "source_page": 11},
+                ]
+            },
+        },
+    ]
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate(records),
+    )
+
+    payload = project_community_bundle(result, document_id="doc_source_pages").json_payload()
+    dataset = next(
+        dataset
+        for dataset in payload["datasets"]
+        if dataset["name"] == "repayment_records"
+    )
+    rows_by_month = {
+        row["normalized"]["month"]: row for row in dataset.get("rows") or []
+    }
+
+    assert rows_by_month["2025-01"]["source"]["page_range"] == [19, 19]
+    assert rows_by_month["2025-02"]["source"]["page_range"] == [10, 10]
+    assert rows_by_month["2025-03"]["source"]["page_range"] == [19, 21]
+
+
 def test_csv_preserves_signed_numbers_but_neutralizes_text_formulas() -> None:
     candidate = _candidate(
         [

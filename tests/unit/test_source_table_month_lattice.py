@@ -1,0 +1,540 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+
+from docmirror.plugins.credit_report.source_table_month_lattice import (
+    detached_source_table_geometry_by_page,
+    resolve_unique_source_table_year_plus_twelve_ownership,
+)
+
+
+def _x_edges() -> list[float]:
+    return [45.0, 73.0, *[100.0 + 27.0 * index for index in range(12)]]
+
+
+def _scanner_table(
+    *,
+    year_anchor_row: int = 1,
+    year_row_span: int = 2,
+    status_row: int = 1,
+    active_months: range = range(1, 13),
+) -> dict[str, object]:
+    edges = _x_edges()
+    row_edges = [150.0, 163.0, 176.0, 189.0, 202.0]
+    row_count = len(row_edges) - 1
+    cells: list[list[list[float] | None]] = [[None for _column in range(13)] for _row in range(row_count)]
+    statuses = [["missing" for _column in range(13)] for _row in range(row_count)]
+    year_bottom = row_edges[year_anchor_row + year_row_span]
+    cells[year_anchor_row][0] = [45.0, row_edges[year_anchor_row], 73.0, year_bottom]
+    statuses[year_anchor_row][0] = "exact"
+    header_row = status_row - 1
+    if header_row >= 0:
+        for month in range(1, 13):
+            cells[header_row][month] = [
+                edges[month],
+                row_edges[header_row],
+                edges[month + 1],
+                row_edges[header_row + 1],
+            ]
+            statuses[header_row][month] = "exact"
+    for month in active_months:
+        cells[status_row][month] = [
+            edges[month],
+            row_edges[status_row],
+            edges[month + 1],
+            row_edges[status_row + 1],
+        ]
+        statuses[status_row][month] = "exact"
+        cells[status_row + 1][month] = [
+            edges[month],
+            row_edges[status_row + 1],
+            edges[month + 1],
+            row_edges[status_row + 2],
+        ]
+        statuses[status_row + 1][month] = "exact"
+    return {
+        "table_id": "pt_test_0",
+        "logical_page": 19,
+        "source_page": 10,
+        "bbox": [45.0, row_edges[0], edges[-1], row_edges[-1]],
+        "geometry_source": "scanned_image_line_grid",
+        "coordinate_system": "pdf_points_top_left",
+        "cell_bboxes": cells,
+        "cell_geometry_status": statuses,
+        "cell_spans": [
+            {
+                "row": year_anchor_row,
+                "col": 0,
+                "row_span": year_row_span,
+                "col_span": 1,
+            }
+        ],
+        # These are the actual scanned-table metadata shapes: axis bounds,
+        # not synthetic full bboxes.
+        "row_bands": [
+            {"index": index, "y0": row_edges[index], "y1": row_edges[index + 1]} for index in range(row_count)
+        ],
+        "col_bands": [{"index": index, "x0": edges[index], "x1": edges[index + 1]} for index in range(13)],
+        "vertical_lines": edges,
+        "horizontal_lines": row_edges,
+    }
+
+
+def test_resolver_accepts_exact_scanner_shape_and_returns_consumer_bands() -> None:
+    table = _scanner_table()
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is not None
+    assert lattice.year_anchor_row_index == 1
+    assert lattice.status_row_index == 1
+    assert lattice.amount_row_index == 2
+    assert lattice.header_row_index == 0
+    bands = lattice.month_col_bands()
+    assert [band["index"] for band in bands] == list(range(1, 13))
+    assert [int(band["header"]) for band in bands] == list(range(1, 13))
+    assert all(band["role"] == "month" for band in bands)
+    assert lattice.provenance_dict()["selection_basis"] == ("source_table_year_plus_twelve_ownership")
+    assert lattice.provenance_dict()["value_inputs_used"] is False
+
+
+def test_resolver_supports_headerless_span_three_and_sparse_active_months() -> None:
+    table = _scanner_table(
+        year_anchor_row=0,
+        year_row_span=3,
+        status_row=1,
+        active_months=range(5, 13),
+    )
+    # Row zero is a spanning year anchor, not a complete month header.
+    for month in range(1, 5):
+        table["cell_bboxes"][0][month] = None  # type: ignore[index]
+        table["cell_geometry_status"][0][month] = "missing"  # type: ignore[index]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2021,
+        active_months=range(5, 13),
+        year_bbox=[50.0, 151.0, 69.0, 187.0],
+        status_bbox=[181.0, 163.0, 208.0, 177.0],
+    )
+
+    assert lattice is not None
+    assert lattice.year_anchor_row_index == 0
+    assert lattice.header_row_index == -1
+    assert lattice.provenance_dict()["year_row_span"] == 3
+    assert len(lattice.month_bboxes) == 12
+
+
+@pytest.mark.parametrize("year_anchor_row", (1, 2))
+def test_resolver_binds_split_year_cell_by_target_geometry_only(
+    year_anchor_row: int,
+) -> None:
+    table = _scanner_table(
+        year_anchor_row=year_anchor_row,
+        year_row_span=1,
+        status_row=1,
+    )
+    row_edges = [150.0, 163.0, 176.0, 189.0, 202.0]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, row_edges[year_anchor_row] + 1.0, 69.0, row_edges[year_anchor_row + 1] - 1.0],
+        status_bbox=[73.0, 164.0, 397.0, 175.0],
+    )
+
+    assert lattice is not None
+    assert lattice.year_anchor_row_index == year_anchor_row
+    assert lattice.provenance_dict()["year_anchor_mode"] == (
+        "target_bound_singleton_year_cell"
+    )
+    assert lattice.provenance_dict()["value_inputs_used"] is False
+
+
+def test_resolver_uses_global_rules_for_one_explicitly_merged_active_cell() -> None:
+    table = _scanner_table(year_anchor_row=1, year_row_span=1, status_row=1)
+    table["cell_bboxes"][1][1] = [73.0, 163.0, 100.0, 189.0]  # type: ignore[index]
+    table["cell_bboxes"][2][1] = None  # type: ignore[index]
+    table["cell_geometry_status"][2][1] = "derived"  # type: ignore[index]
+    table["cell_spans"].append(  # type: ignore[union-attr]
+        {"row": 1, "col": 1, "row_span": 2, "col_span": 1}
+    )
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, 164.0, 69.0, 175.0],
+        status_bbox=[73.0, 163.0, 397.0, 176.0],
+    )
+
+    assert lattice is not None
+    provenance = lattice.provenance_dict()
+    assert provenance["active_cell_geometry_exact"] is False
+    assert provenance["active_cell_rule_derived_count"] == 2
+    assert provenance["horizontal_rule_count"] == 5
+    assert provenance["year_anchor_mode"] == "target_bound_singleton_year_cell"
+    assert provenance["value_inputs_used"] is False
+
+
+def test_resolver_does_not_invent_month_cells_inside_a_wide_merged_row() -> None:
+    table = _scanner_table()
+    table["cell_bboxes"][1][1] = [73.0, 163.0, 397.0, 189.0]  # type: ignore[index]
+    for row in (1, 2):
+        for month in range(2 if row == 1 else 1, 13):
+            table["cell_bboxes"][row][month] = None  # type: ignore[index]
+            table["cell_geometry_status"][row][month] = "derived"  # type: ignore[index]
+    table["cell_spans"].append(  # type: ignore[union-attr]
+        {"row": 1, "col": 1, "row_span": 2, "col_span": 12}
+    )
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[73.0, 163.0, 397.0, 176.0],
+    )
+
+    assert lattice is None
+
+
+@pytest.mark.parametrize("contradiction", ("wide_span", "extra_exact_cell"))
+def test_resolver_rejects_competing_geometry_over_intact_month_cells(
+    contradiction: str,
+) -> None:
+    table = _scanner_table()
+    if contradiction == "wide_span":
+        table["cell_spans"].append(  # type: ignore[union-attr]
+            {"row": 1, "col": 1, "row_span": 2, "col_span": 12}
+        )
+    else:
+        table["cell_bboxes"][1].append(  # type: ignore[index]
+            deepcopy(table["cell_bboxes"][1][8])  # type: ignore[index]
+        )
+        table["cell_geometry_status"][1].append("exact")  # type: ignore[index]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is None
+
+
+def test_resolver_rejects_declared_spanning_year_cell_with_inset_bbox() -> None:
+    table = _scanner_table()
+    # The metadata still declares a two-row span, but its exact bbox covers
+    # only the status row.  The target glyph fitting that inset must not make
+    # the contradictory ownership proof valid.
+    table["cell_bboxes"][1][0] = [45.0, 163.0, 73.0, 176.0]  # type: ignore[index]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 175.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is None
+
+
+def test_resolver_rejects_split_year_cell_when_target_geometry_is_ambiguous() -> None:
+    table = _scanner_table(year_anchor_row=1, year_row_span=1, status_row=1)
+    table["cell_bboxes"][2][0] = [45.0, 163.0, 73.0, 189.0]  # type: ignore[index]
+    table["cell_geometry_status"][2][0] = "exact"  # type: ignore[index]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 175.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is None
+
+
+def test_resolver_accepts_a_wide_partial_status_row_inside_the_month_lattice() -> None:
+    table = _scanner_table(active_months=range(5, 13))
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(5, 13),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[181.0, 163.0, 397.0, 176.0],
+    )
+
+    assert lattice is not None
+    assert lattice.status_row_index == 1
+
+
+@pytest.mark.parametrize(
+    "status_bbox",
+    (
+        [0.0, 163.0, 60.0, 176.0],
+        [500.0, 163.0, 600.0, 176.0],
+    ),
+)
+def test_resolver_rejects_wide_same_y_targets_outside_the_month_lattice(
+    status_bbox: list[float],
+) -> None:
+    table = _scanner_table()
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=status_bbox,
+    )
+
+    assert lattice is None
+
+
+def test_resolver_rejects_ambiguous_shifted_and_non_exact_lattices() -> None:
+    clean = _scanner_table()
+    duplicate = deepcopy(clean)
+    duplicate["table_id"] = "pt_test_duplicate"
+    shifted = deepcopy(clean)
+    shifted["cell_bboxes"][1][8] = [289.0, 163.0, 316.0, 176.0]  # type: ignore[index]
+    extra_rule = deepcopy(clean)
+    extra_rule["vertical_lines"] = [*extra_rule["vertical_lines"], 410.0]  # type: ignore[index]
+    missing_column = deepcopy(clean)
+    missing_column["col_bands"] = missing_column["col_bands"][:-1]  # type: ignore[index]
+    wrong_source = deepcopy(clean)
+    wrong_source["geometry_source"] = "estimated"
+    missing_horizontal_rule = deepcopy(clean)
+    missing_horizontal_rule["horizontal_lines"] = missing_horizontal_rule[
+        "horizontal_lines"
+    ][:-1]  # type: ignore[index]
+
+    kwargs = {
+        "logical_page": 19,
+        "expected_year": 2022,
+        "active_months": (8,),
+        "year_bbox": [50.0, 164.0, 69.0, 187.0],
+        "status_bbox": [262.03, 162.0, 289.03, 177.0],
+    }
+    assert resolve_unique_source_table_year_plus_twelve_ownership([clean, duplicate], **kwargs) is None
+    for invalid in (
+        shifted,
+        extra_rule,
+        missing_column,
+        wrong_source,
+        missing_horizontal_rule,
+    ):
+        assert resolve_unique_source_table_year_plus_twelve_ownership([invalid], **kwargs) is None
+
+
+def test_resolver_malformed_public_arguments_fail_closed() -> None:
+    table = _scanner_table()
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [table],
+            logical_page="bad",  # type: ignore[arg-type]
+            expected_year="bad",  # type: ignore[arg-type]
+            active_months=(8,),
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+            status_bbox=[262.03, 162.0, 289.03, 177.0],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    (
+        ("logical_page", 19),
+        ("expected_year", 2022),
+        ("active_month", 8),
+    ),
+)
+def test_resolver_accepts_only_native_integer_public_ordinals(
+    argument: str,
+    value: object,
+) -> None:
+    table = _scanner_table()
+    kwargs: dict[str, object] = {
+        "logical_page": 19,
+        "expected_year": 2022,
+        "active_months": (8,),
+        "year_bbox": [50.0, 164.0, 69.0, 187.0],
+        "status_bbox": [262.03, 162.0, 289.03, 177.0],
+    }
+    if argument == "active_month":
+        kwargs["active_months"] = (value,)
+    else:
+        kwargs[argument] = value
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [table],
+            **kwargs,  # type: ignore[arg-type]
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    (
+        ("logical_page", True),
+        ("logical_page", 19.0),
+        ("logical_page", 19.5),
+        ("logical_page", float("nan")),
+        ("logical_page", float("inf")),
+        ("logical_page", "19"),
+        ("logical_page", " +19 "),
+        ("logical_page", "19.5"),
+        ("logical_page", "junk"),
+        ("logical_page", 0),
+        ("logical_page", -19),
+        ("expected_year", True),
+        ("expected_year", 2022.0),
+        ("expected_year", 2022.5),
+        ("expected_year", float("nan")),
+        ("expected_year", float("inf")),
+        ("expected_year", "2022"),
+        ("expected_year", " +2022 "),
+        ("expected_year", "2022.5"),
+        ("expected_year", "junk"),
+        ("expected_year", 1899),
+        ("expected_year", 2100),
+        ("active_month", True),
+        ("active_month", 8.0),
+        ("active_month", 8.5),
+        ("active_month", float("nan")),
+        ("active_month", float("inf")),
+        ("active_month", "8"),
+        ("active_month", "+8"),
+        ("active_month", "8.5"),
+        ("active_month", "junk"),
+        ("active_month", 0),
+        ("active_month", 13),
+    ),
+)
+def test_resolver_rejects_inexact_or_invalid_public_ordinals(
+    argument: str,
+    value: object,
+) -> None:
+    table = _scanner_table()
+    kwargs: dict[str, object] = {
+        "logical_page": 19,
+        "expected_year": 2022,
+        "active_months": (8,),
+        "year_bbox": [50.0, 164.0, 69.0, 187.0],
+        "status_bbox": [262.03, 162.0, 289.03, 177.0],
+    }
+    if argument == "active_month":
+        kwargs["active_months"] = (value,)
+    else:
+        kwargs[argument] = value
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [table],
+            **kwargs,  # type: ignore[arg-type]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "active_months",
+    (None, 8, "8", b"8", {"month": 8}, (8, "junk")),
+)
+def test_resolver_invalid_active_month_collections_fail_closed(
+    active_months: object,
+) -> None:
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [_scanner_table()],
+            logical_page=19,
+            expected_year=2022,
+            active_months=active_months,  # type: ignore[arg-type]
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+            status_bbox=[262.03, 162.0, 289.03, 177.0],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("tables", (None, 17, 19.0, True, "table", b"table", {}))
+def test_resolver_invalid_table_collections_fail_closed(tables: object) -> None:
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            tables,  # type: ignore[arg-type]
+            logical_page=19,
+            expected_year=2022,
+            active_months=(8,),
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+            status_bbox=[262.03, 162.0, 289.03, 177.0],
+        )
+        is None
+    )
+
+
+def test_sanitizer_prefers_logical_cell_geometry_and_emits_no_values() -> None:
+    geometry = _scanner_table()
+    table = SimpleNamespace(
+        table_id="pt_test_0",
+        bbox=geometry["bbox"],
+        extraction_layer="scanned_image_line_grid",
+        metadata={
+            "geometry": {
+                key: deepcopy(value)
+                for key, value in geometry.items()
+                if key
+                in {
+                    "cell_bboxes",
+                    "cell_geometry_status",
+                    "cell_spans",
+                    "row_bands",
+                    "col_bands",
+                    "vertical_lines",
+                    "horizontal_lines",
+                    "geometry_source",
+                    "coordinate_system",
+                }
+            },
+            "source_cell_bboxes": [[[1.0, 1.0, 2.0, 2.0]]],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[table],
+    )
+
+    detached = detached_source_table_geometry_by_page([page])[19][0]
+
+    assert detached["cell_bboxes"][1][8] == geometry["cell_bboxes"][1][8]
+    assert detached["source_cell_bboxes"] == [[[1.0, 1.0, 2.0, 2.0]]]
+    assert not {"text", "raw_rows", "evidence_ids", "token_ids"}.intersection(detached)

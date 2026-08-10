@@ -1031,17 +1031,17 @@ def _complete_liability_table(
     }
 
 
-def test_inquiry_endpoint_trusts_sparse_exact_ordinals_but_suppresses_prefix_bleed() -> None:
+def test_inquiry_endpoint_trusts_sparse_exact_ordinals_but_rejects_proven_prefix_bleed() -> None:
     endpoint, outliers = _inquiry_sequence_endpoint(
         {1, 88, 89, 90, 117, 789},
-        {89: {"2024.01.01"}, 789: {"2024.01.01"}},
+        {789},
     )
 
     assert endpoint == 117
     assert outliers == [789]
-    assert _inquiry_sequence_endpoint(
-        {17, 117}, {17: {"2024.01.01"}, 117: {"2024.01.01"}}
-    ) == (117, [])
+    assert _inquiry_sequence_endpoint({17, 117}, ()) == (117, [])
+    assert _inquiry_sequence_endpoint({89, 789}, ()) == (789, [])
+    assert _inquiry_sequence_endpoint({788, 789, 790}, ()) == (790, [])
 
 
 def test_inquiry_source_gap_is_repair_eligible_without_orphan_record_target() -> None:
@@ -1142,6 +1142,148 @@ def test_source_ledger_rejects_isolated_account_sequence_outlier() -> None:
 
     assert endpoint == 27
     assert outliers == [115]
+
+
+def test_account_source_ledger_counts_lin_numbered_and_unnumbered_families() -> None:
+    lines = [
+        {"text": "（一）非循环贷账户"},
+        *({"text": f"账户{sequence}"} for sequence in range(1, 23)),
+        {"text": "（二）循环贷账户二"},
+        {
+            "text": (
+                "账户（授信协议标识："
+                "D10053310H00011022661000153960931220220529）"
+            )
+        },
+        {"text": "（三）贷记卡账户"},
+        *({"text": f"账户{sequence}"} for sequence in range(1, 23)),
+        {"text": "（五）授信协议信息"},
+    ]
+    result = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: [
+            {"page": 1, "source_page": 1, "lines": lines}
+        ],
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["credit_accounts"] == 45
+    assert ledger["account_family_endpoints"] == {
+        "non_revolving_loan": 22,
+        "credit_card": 22,
+    }
+    assert ledger["account_family_source_populations"] == {
+        "credit_card": 22,
+        "non_revolving_loan": 22,
+        "revolving_loan_account": 1,
+    }
+    assert ledger["account_family_unnumbered_anchor_counts"] == {
+        "revolving_loan_account": 1
+    }
+
+
+def test_account_source_ledger_is_conservative_for_sparse_and_weak_anchors() -> None:
+    result = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 1,
+                "source_page": 1,
+                "lines": [
+                    {"text": "（一）非循环贷账户"},
+                    {"text": "账户1"},
+                    {"text": "账户3"},
+                    {"text": "账户115"},
+                    {"text": "（二）循环贷账户二"},
+                    {"text": "账户（授信协议标识：R2ACCOUNT0001）"},
+                    # Repeated source text with the same strong identity is one account.
+                    {"text": "账户（授信协议标识：R2ACCOUNT0001）"},
+                    {"text": "账户（授信协议标识：R2ACCOUNT0002）"},
+                    {"text": "（三）贷记卡账户"},
+                    # Multiple weak, unnumbered anchors could be overlapping OCR
+                    # evidence and therefore cannot establish a population of two.
+                    {"text": "账户"},
+                    {"text": "账户"},
+                    {"text": "（五）授信协议信息"},
+                    {"text": "账户99"},
+                ],
+            }
+        ],
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["credit_accounts"] == 5
+    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 3}
+    assert ledger["account_family_sequence_outliers"] == {
+        "non_revolving_loan": [115]
+    }
+    assert ledger["account_family_source_populations"] == {
+        "non_revolving_loan": 3,
+        "revolving_loan_account": 2,
+    }
+    assert "credit_card" not in ledger["account_family_source_populations"]
+
+
+def test_exact_single_weak_account_anchor_is_a_bounded_source_witness() -> None:
+    result = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 7,
+                "source_page": 4,
+                "lines": [
+                    {"text": "（二）循环贷账户二"},
+                    {
+                        "text": "账户",
+                        "bbox": [20.0, 40.0, 60.0, 52.0],
+                        "evidence_ids": ["ocr:sp0004:lp0007:0001"],
+                    },
+                ],
+            }
+        ],
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["credit_accounts"] == 1
+    assert ledger["account_family_source_populations"] == {
+        "revolving_loan_account": 1
+    }
+    assert ledger["account_family_unnumbered_anchor_counts"] == {
+        "revolving_loan_account": 1
+    }
+
+
+def test_account_source_ledger_does_not_mutate_final_business_rows() -> None:
+    source_rows = [
+        {"record_id": f"account:{sequence}", "account_id": f"account:{sequence}"}
+        for sequence in range(1, 46)
+    ]
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_accounts": 45,
+                    "account_family_source_populations": {
+                        "non_revolving_loan": 22,
+                        "revolving_loan_account": 1,
+                        "credit_card": 22,
+                    },
+                }
+            },
+            "datasets": {"credit_accounts": list(source_rows)},
+        },
+        final_dataset_counts={"credit_accounts": 45},
+    )
+
+    assert content["datasets"]["credit_accounts"] == source_rows
+    assert not any(
+        issue.get("issue_code") == "source_sequence_or_count_gap"
+        and issue.get("target_dataset") == "credit_accounts"
+        for issue in content["datasets"].get("personal_detail_extraction_issues", [])
+    )
 
 
 def test_agreement_ledger_does_not_count_account_heading_identifiers() -> None:
