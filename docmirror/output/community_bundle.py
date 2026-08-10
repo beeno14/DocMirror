@@ -791,11 +791,18 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     parts = [
         '<!-- docmirror:markdown-profile version="1.0" -->',
         '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->',
-        f"# {_markdown_text(document.get('title') or document.get('type') or 'Document')}",
+        f"# {_markdown_text(document.get('title') or document.get('type') or '文档')}",
     ]
+    dictionary_enums = dictionary.get("enums") if isinstance(dictionary.get("enums"), dict) else {}
+    document_type_labels = (
+        dictionary_enums.get("document_type")
+        if isinstance(dictionary_enums.get("document_type"), dict)
+        else {}
+    )
+    document_type = document.get("type")
     metadata = [
-        ("Document type", document.get("type")),
-        ("Pages", document.get("page_count")),
+        ("文档类型", document_type_labels.get(document_type, document_type)),
+        ("页数", document.get("page_count")),
     ]
     if presentation.get("show_top_document_metadata", True):
         for label, value in metadata:
@@ -970,7 +977,7 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         configured_keys = dataset_layout.get("columns") or table.get("column_keys") or []
         keys = [str(key) for key in configured_keys if str(key) in column_by_key]
         if not keys:
-            parts.append("_No displayable columns._")
+            parts.append("_暂无可展示字段。_")
             continue
         def row_value(row: dict[str, Any], key: str) -> Any:
             normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}

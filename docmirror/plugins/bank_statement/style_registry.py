@@ -74,6 +74,19 @@ _COVERAGE_THRESHOLD = 0.80
 _INDEPENDENT_ROW_COUNT_SOURCES = frozenset(
     {"split_footer", "header_total", "page_footer", "page_transaction_anchors", "physical_rows"}
 )
+_SOURCE_DATE_RE = re.compile(r"20\d{2}(?:[-/.]?\d{1,2}){2}")
+_SOURCE_DATE_HEADERS = frozenset(
+    {
+        "date",
+        "datetime",
+        "timestamp",
+        "日期",
+        "交易日期",
+        "交易时间",
+        "记账日期",
+        "记账时间",
+    }
+)
 
 
 def _field_completeness(records: list[dict[str, Any]], sample: int = 8) -> float:
@@ -411,7 +424,7 @@ def _candidate_from_batch(
         normalized_rows.append(normalized)
         if normalized.get("direction") in {"income", "expense"}:
             directional_rows += 1
-        if is_canonical_row(normalized):
+        if is_canonical_row(normalized) and not _source_row_contains_multiple_transaction_dates(transaction):
             canonical_rows += 1
     expected_count = int(expected_rows.count or 0) if expected_rows is not None else 0
     if expected_count > 0 and (expected_rows is not None and expected_rows.confidence >= 0.85):
@@ -448,6 +461,25 @@ def _candidate_from_batch(
         source_column_width=source_column_width,
         sequence_continuity=sequence_continuity,
     )
+
+
+def _source_row_contains_multiple_transaction_dates(transaction: dict[str, Any]) -> bool:
+    """Reject a column-aggregated page masquerading as one transaction row.
+
+    A genuine transaction may expose both a date and a timestamp column, so
+    occurrences are checked per source cell. Two complete dates inside one
+    date-like cell prove that physical row boundaries were lost.
+    """
+    for raw_header, value in transaction.items():
+        if str(raw_header).startswith("_"):
+            continue
+        header = re.sub(r"\s+", "", str(raw_header or "")).lower()
+        normalized_header = re.sub(r"\s+", "", grid_standard.normalize_header_cell(str(raw_header or ""))).lower()
+        if header not in _SOURCE_DATE_HEADERS and normalized_header not in _SOURCE_DATE_HEADERS:
+            continue
+        if len(_SOURCE_DATE_RE.findall(str(value or ""))) > 1:
+            return True
+    return False
 
 
 def _candidate_reliable_count_coverage(candidate: BankTableCandidate) -> float | None:

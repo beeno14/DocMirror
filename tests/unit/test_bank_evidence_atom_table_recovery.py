@@ -26,7 +26,11 @@ from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     recovered_evidence_atom_expected_row_evidence,
     recovered_evidence_atom_row_sources,
 )
-from docmirror.plugins.bank_statement.style_registry import BankTableCandidate, _select_candidate
+from docmirror.plugins.bank_statement.style_registry import (
+    BankTableCandidate,
+    _candidate_from_batch,
+    _select_candidate,
+)
 from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence
 
 pytestmark = pytest.mark.unit
@@ -122,6 +126,63 @@ def test_candidate_selection_prefers_continuous_source_sequence_over_noisy_extra
     assert selected is not None
     assert selected.candidate_id == "evidence_atom"
     assert diagnostics["selected_candidate"] == "evidence_atom"
+
+
+def test_candidate_scoring_rejects_column_aggregated_dates_copied_as_rows() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "amount_cny", "direction", "balance"],
+        _normalize=lambda raw: _normalized_candidate_row(raw),
+    )
+    collapsed_date = "2025-09-2100:07:462025-10-2716:36:242025-10-2814:44:10"
+    collapsed = [{"交易日期": collapsed_date, "金额": "0.04", "方向": "收入", "余额": "306.09"} for _ in range(3)]
+
+    candidate = _candidate_from_batch(
+        candidate_id="evidence_atom",
+        transactions=collapsed,
+        normalize_fn=_normalized_candidate_row,
+        plugin=plugin,
+        source="canonical_evidence_table",
+        expected_rows=RowCountEvidence(count=3, source="positioned_date_anchors", confidence=0.80),
+        extraction_confidence=0.90,
+    )
+
+    assert candidate.canonical_rows == 0
+    assert candidate.canonical_coverage == 0.0
+
+
+def test_candidate_scoring_preserves_distinct_rows_with_same_business_values() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "amount_cny", "direction", "balance"],
+        _normalize=lambda raw: _normalized_candidate_row(raw),
+    )
+    repeated_business_rows = [
+        {"交易日期": "2025-09-21", "金额": "0.04", "方向": "收入", "余额": "306.09"},
+        {"交易日期": "2025-09-21", "金额": "0.04", "方向": "收入", "余额": "306.09"},
+    ]
+
+    candidate = _candidate_from_batch(
+        candidate_id="native_wide_table",
+        transactions=repeated_business_rows,
+        normalize_fn=_normalized_candidate_row,
+        plugin=plugin,
+        source="native_wide_table",
+        expected_rows=RowCountEvidence(count=2, source="native_wide_rows", confidence=0.70),
+        extraction_confidence=0.85,
+    )
+
+    assert candidate.canonical_rows == 2
+    assert candidate.canonical_coverage == 1.0
+
+
+def _normalized_candidate_row(raw: dict) -> dict:
+    direction = "income" if raw["方向"] == "收入" else "expense"
+    return {
+        "date": raw["交易日期"][:10],
+        "amount": float(raw["金额"]),
+        "amount_cny": float(raw["金额"]),
+        "direction": direction,
+        "balance": float(raw["余额"]),
+    }
 
 
 def test_geometry_direction_repair_uses_summary_and_cross_page_balance() -> None:
@@ -465,6 +526,59 @@ def test_positioned_page_text_uses_actual_source_page_number():
 
     assert [source["source_page"] for source in recovery.row_sources] == [5, 5, 5]
     assert all(source["page_range"] == [5, 5] for source in recovery.row_sources)
+
+
+def test_geometry_orientation_uses_transaction_columns_instead_of_header_dates():
+    atoms = [
+        _atom("h-seq", "序号", 20.0, 100.0, 40.0),
+        _atom("h-date", "交易日期", 60.0, 100.0, 92.0),
+        _atom("h-time", "交易时间", 110.0, 100.0, 142.0),
+        _atom("h-type", "交易类型", 160.0, 100.0, 192.0),
+        _atom("h-direction", "借贷", 210.0, 100.0, 226.0),
+        _atom("h-amount", "交易金额", 250.0, 100.0, 282.0),
+        _atom("h-balance", "余额", 320.0, 100.0, 336.0),
+        _atom("h-account", "对方账号", 370.0, 100.0, 402.0),
+        _atom("h-party", "对方户名", 430.0, 100.0, 462.0),
+        _atom("h-channel", "交易地点", 490.0, 100.0, 522.0),
+        _atom("h-summary", "摘要", 550.0, 100.0, 566.0),
+    ]
+    for index in range(6):
+        atoms.append(_atom(f"query-date-{index}", f"2024-01-{index + 1:02d}", 300.0, 20.0 + index * 10.0, 340.0))
+    atoms.extend(
+        [
+            _atom("r1-seq", "1", 25.0, 130.0, 29.0),
+            _atom("r1-date", "2022-08-05", 60.0, 130.0, 100.0),
+            _atom("r1-time", "14:05:18", 110.0, 130.0, 142.0),
+            _atom("r1-type", "跨行汇款", 160.0, 130.0, 192.0),
+            _atom("r1-direction", "贷 Cr", 210.0, 130.0, 230.0),
+            _atom("r1-amount", "40.00", 250.0, 130.0, 272.0),
+            _atom("r1-balance", "41.06", 320.0, 130.0, 342.0),
+            _atom("r1-account", "6214857212810271", 370.0, 130.0, 426.0),
+            _atom("r1-party", "周深", 440.0, 130.0, 456.0),
+            _atom("r1-channel", "网上银行", 490.0, 130.0, 522.0),
+            _atom("r1-summary", "转账", 550.0, 130.0, 566.0),
+            _atom("r2-seq", "2", 25.0, 150.0, 29.0),
+            _atom("r2-date", "2022-08-06", 60.0, 150.0, 100.0),
+            _atom("r2-time", "16:14:05", 110.0, 150.0, 142.0),
+            _atom("r2-type", "网上支付", 160.0, 150.0, 192.0),
+            _atom("r2-direction", "借 Dr", 210.0, 150.0, 230.0),
+            _atom("r2-amount", "37.98", 250.0, 150.0, 272.0),
+            _atom("r2-balance", "3.08", 320.0, 150.0, 338.0),
+            _atom("r2-account", "301440373999502", 370.0, 150.0, 426.0),
+            _atom("r2-party", "江苏欧飞电子商务有限公司", 430.0, 150.0, 482.0),
+            _atom("r2-channel", "网上支付", 490.0, 150.0, 522.0),
+            _atom("r2-summary", "消费", 550.0, 150.0, 566.0),
+        ]
+    )
+    result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(result)
+
+    assert recovered_evidence_atom_expected_row_count(result) == 2
+    assert len(tables) == 1
+    assert tables[0][1][0:7] == ["1", "2022-08-05", "14:05:18", "跨行汇款", "贷 Cr", "40.00", "41.06"]
+    assert tables[0][2][0:7] == ["2", "2022-08-06", "16:14:05", "网上支付", "借 Dr", "37.98", "3.08"]
+    assert [source["source_page"] for source in recovered_evidence_atom_row_sources(result)] == [1, 1]
 
 
 def test_positioned_recovery_uses_evidence_atoms_for_pages_without_text_blocks():

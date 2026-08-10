@@ -140,6 +140,85 @@ BANK_STANDARD_FIELDS = [
     "counterparty_status",
 ]
 
+BANK_DATA_DICTIONARY: dict[str, Any] = {
+    "fields": {
+        "organization": {"label": "银行名称", "type": "string"},
+        "subject_name": {"label": "账户名称", "type": "string"},
+        "subject_id": {"label": "账户标识", "type": "long_id", "sensitive": True, "display": "masked"},
+        "account_holder": {"label": "账户名称", "type": "string"},
+        "account_number": {"label": "账号", "type": "long_id", "sensitive": True, "display": "masked"},
+        "bank_name": {"label": "开户银行", "type": "string"},
+        "query_period": {"label": "查询期间", "type": "string"},
+        "period_start": {"label": "账期开始", "type": "date"},
+        "period_end": {"label": "账期结束", "type": "date"},
+        "print_date": {"label": "打印日期", "type": "date"},
+        "total_transactions": {"label": "交易总笔数", "type": "integer"},
+        "currency": {"label": "币种", "type": "string"},
+        "statement_title": {"label": "流水标题", "type": "string"},
+        "style_id": {"label": "版式标识", "type": "string"},
+        "style_confidence": {"label": "版式置信度", "type": "number"},
+        "parser_chain": {"label": "解析链", "type": "string"},
+        "institution_hint": {"label": "识别银行", "type": "string"},
+        "secondary_styles": {"label": "备选版式", "type": "string"},
+        "reconstruction_source": {"label": "重建来源", "type": "string"},
+        "expected_primary_rows": {"label": "预期交易笔数", "type": "integer"},
+        "extracted_rows": {"label": "实际提取笔数", "type": "integer"},
+        "coverage_ratio": {"label": "交易覆盖率", "type": "percentage"},
+        "institution_authority": {"label": "银行识别依据", "type": "string"},
+        "pipe_parse_failed": {"label": "管道表解析失败", "type": "boolean"},
+        "canonical_expected": {"label": "Canonical 预期笔数", "type": "integer"},
+        "canonical_extracted": {"label": "Canonical 提取笔数", "type": "integer"},
+        "canonical_ratio": {"label": "Canonical 覆盖率", "type": "percentage"},
+        "extract_status": {"label": "提取状态", "type": "string"},
+        "blo_tables_parsed": {"label": "BLO 已解析表数", "type": "integer"},
+        "blo_tables_skipped": {"label": "BLO 已跳过表数", "type": "integer"},
+        "source_reported_transaction_count": {"label": "原文报告交易笔数", "type": "integer"},
+        "document_scene_refined": {"label": "修正文档场景", "type": "string"},
+        "layout_profile_id_refined": {"label": "修正版式配置", "type": "string"},
+        "layout_profile_refine_confidence": {"label": "版式修正置信度", "type": "number"},
+    },
+    "record_columns": {
+        "amount": {"label": "交易金额", "type": "money"},
+        "amount_cny": {"label": "折合人民币金额", "type": "money", "unit": "CNY"},
+        "balance": {"label": "账户余额", "type": "money"},
+        "channel": {"label": "交易渠道", "type": "string"},
+        "counter_account": {"label": "对方账号", "type": "long_id"},
+        "counter_bank_code": {"label": "对方银行代码", "type": "string"},
+        "counter_bank_name": {"label": "对方银行名称", "type": "string"},
+        "counter_party": {"label": "对方户名", "type": "string"},
+        "counterparty_status": {"label": "对方信息状态", "type": "string"},
+        "date": {"label": "交易日期", "type": "date"},
+        "direction": {"label": "收支方向", "type": "string"},
+        "purpose": {"label": "交易用途", "type": "string"},
+        "reference": {"label": "交易参考号", "type": "string"},
+        "sequence_no": {"label": "序号", "type": "long_id"},
+        "summary": {"label": "摘要", "type": "string"},
+        "timestamp": {"label": "交易时间", "type": "datetime"},
+    },
+    "enums": {
+        "direction": {"income": "收入", "expense": "支出"},
+        "counterparty_status": {"present": "已提供", "source_null": "原文未提供"},
+        "extract_status": {
+            "success": "成功",
+            "low_coverage": "覆盖率偏低",
+            "degraded": "降级",
+            "failed": "失败",
+        },
+        "pipe_parse_failed": {"true": "是", "false": "否"},
+        "document_type": {
+            "bank_statement": "银行流水",
+            "bank_reconciliation": "银行对账单",
+        },
+        "document_scene_refined": {
+            "bank_statement": "银行流水",
+            "bank_reconciliation": "银行对账单",
+        },
+        "layout_profile_id_refined": {
+            "borderless_ledger_bank": "无框银行流水版式",
+        },
+    },
+}
+
 BANK_IDENTITY_FIELDS: Sequence[tuple[str, Sequence[str]]] = (
     ("account_holder", ("Account holder", "Account name", "Card holder", "Customer name", "户名", "账户名")),
     ("account_number", ("Account number", "Card number", "Customer account number", "账号", "账户号", "卡号")),
@@ -527,6 +606,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
             if len(period_dates) >= 2:
                 period = {"start": period_dates[0], "end": period_dates[1]}
         extra_domain_facts = result.style_meta.to_properties()
+        extra_domain_facts["data_dictionary"] = BANK_DATA_DICTIONARY
         bank_detail = result.identity_fields.get("bank_name")
         if isinstance(bank_detail, dict):
             bank_value = next(

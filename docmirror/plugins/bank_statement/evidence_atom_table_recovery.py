@@ -1040,9 +1040,7 @@ def _recover_geometry_bank_tables(
             ]
             row: list[str] = []
             for col_idx in range(len(header_cells)):
-                selected = [
-                    atom for atom in row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]
-                ]
+                selected = [atom for atom in row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]]
                 row.append(
                     _join_geometry_atoms(
                         selected,
@@ -1457,42 +1455,27 @@ def _stacked_text_parts(text: str) -> list[str]:
 
 
 def _orientation_score(atoms: list[dict[str, Any]]) -> float:
-    labelled = [(atom, _header_roles(str(atom.get("text") or ""))) for atom in atoms]
-    labelled = [(atom, roles) for atom, roles in labelled if roles]
-    best = -1.0
-    for anchor, _anchor_roles in labelled:
-        baseline = _y_center(anchor)
-        group = [(atom, roles) for atom, roles in labelled if abs(_y_center(atom) - baseline) <= 8.0]
-        roles = set().union(*(roles for _atom, roles in group))
-        if not {"date", "amount", "balance"}.issubset(roles):
-            continue
-        xs = [_x_center(atom) for atom, _roles in group]
-        spread = max(xs, default=0.0) - min(xs, default=0.0)
-        following_dates = sum(
-            bool(_DATE_ANY_RE.search(str(atom.get("text") or ""))) and _y_center(atom) > baseline
-            for atom in atoms
-        )
-        score = len(roles) * 10.0 + min(spread / 20.0, 20.0) + min(following_dates, 20) * 2.0
-        best = max(best, score)
-    return best
-
-
-def _header_roles(text: str) -> set[str]:
-    normalized = re.sub(r"\s+", "", text)
-    roles: set[str] = set()
-    if any(marker in normalized for marker in ("交易日期", "记账日期", "交易时间", "日期")):
-        roles.add("date")
-    if any(marker in normalized for marker in ("交易金额", "发生额", "支出金额", "收入金额", "借方", "贷方")):
-        roles.add("amount")
-    if "余额" in normalized:
-        roles.add("balance")
-    if any(marker in normalized for marker in ("收入/支出", "收/支", "借贷", "借/贷", "借方", "贷方")):
-        roles.add("direction")
-    if "序号" in normalized:
-        roles.add("sequence")
-    if any(marker in normalized for marker in ("对方账号", "对方账户", "对方户名", "交易对手")):
-        roles.add("counterparty")
-    return roles
+    header = _geometry_header(atoms)
+    if header is None:
+        return -1.0
+    header_atoms, col_map = header
+    centers = [_x_center(atom) for atom in header_atoms]
+    bounds = [float("-inf"), *((left + right) / 2 for left, right in zip(centers, centers[1:])), float("inf")]
+    header_bottom = max(float(atom["bbox"][3]) for atom in header_atoms)
+    row_anchors, anchor_type = _geometry_row_anchors(
+        atoms,
+        bounds,
+        col_map,
+        header_bottom=header_bottom,
+        table_bottom=float("inf"),
+    )
+    spread = max(centers, default=0.0) - min(centers, default=0.0)
+    return (
+        len(col_map) * 10.0
+        + min(spread / 20.0, 20.0)
+        + min(len(row_anchors), 20) * 5.0
+        + (10.0 if anchor_type == "sequence" else 0.0)
+    )
 
 
 def _row_source(page_id: str, atoms: list[dict[str, Any]], row: list[str]) -> dict[str, Any]:
@@ -1571,8 +1554,10 @@ def _store_geometry_recovery_cache(
     row_sources: list[dict[str, Any]],
     expected_row_count: int,
 ) -> None:
-    sequence_complete = bool(expected_row_count) and len(row_sources) == expected_row_count and all(
-        source.get("row_anchor_type") == "sequence" for source in row_sources
+    sequence_complete = (
+        bool(expected_row_count)
+        and len(row_sources) == expected_row_count
+        and all(source.get("row_anchor_type") == "sequence" for source in row_sources)
     )
     _store_recovery_cache(
         parse_result,
