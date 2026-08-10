@@ -71,6 +71,7 @@ _OBSERVATION_STATUSES = frozenset(
         "not_applicable",
     }
 )
+_PROFILE_OBSERVATION_STATUS_ALIASES = {"source_absent": "explicitly_absent"}
 _DATASET_PRESENCE_STATUSES = frozenset(
     {
         "observed_nonempty",
@@ -103,6 +104,26 @@ _SUMMARY_CODES = {
     "后付费业务欠费": "postpaid_arrears",
     "公共": "public_records",
     "查询记录概要": "inquiry_overview",
+}
+
+# Closed catalog of the printed summary headings used by the canonical PBOC
+# personal detailed report.  Matching below never edits a heading or applies
+# an OCR-distance heuristic: it only recognizes one of these exact phrases
+# inside otherwise contaminated title text.
+_SUMMARY_TITLE_CATALOG: dict[str, tuple[str, ...]] = {
+    "信用业务概要": ("信用业务概要",),
+    "呆账": ("呆账信息汇总",),
+    "逾期（透支）": ("逾期（透支）信息汇总",),
+    "被追偿": ("被追偿信息汇总",),
+    "非循环贷账户": ("非循环贷账户信息汇总",),
+    "循环贷账户一": ("循环贷账户一信息汇总",),
+    "循环贷账户二": ("循环贷账户二信息汇总",),
+    "贷记卡账户": ("贷记卡账户信息汇总",),
+    "准贷记卡账户": ("准贷记卡账户信息汇总",),
+    "相关还款责任": ("相关还款责任信息汇总",),
+    "后付费业务欠费": ("后付费业务欠费信息汇总",),
+    "公共": ("公共信息概要", "公共信息汇总"),
+    "查询记录概要": ("查询记录概要",),
 }
 
 _METRIC_CODES = {
@@ -177,6 +198,60 @@ _MONEY_METRIC_CODES = frozenset(
 _TEXT_METRIC_CODES = frozenset({"business_type", "account_type", "information_type"})
 _DATE_METRIC_CODES = frozenset({"first_business_issue_month"})
 
+# Text-valued summary cells are categorical business dimensions, not free
+# text.  Keep the catalog scoped by both the canonical summary and the printed
+# metric so that a valid value from one PBOC table cannot silently contaminate
+# another table.  These are the categories printed by the canonical personal
+# detailed report; no person- or document-specific value belongs here.
+_SUMMARY_TEXT_VALUE_CATALOG: dict[tuple[str, str], tuple[str, ...]] = {
+    (
+        "credit_business_overview",
+        "business_type",
+    ): (
+        "个人住房贷款",
+        "个人商用房贷款（包括商住两用房）",
+        "其他类贷款",
+        "贷记卡",
+        "准贷记卡",
+        "合计",
+    ),
+    (
+        "delinquency_overdraft",
+        "account_type",
+    ): (
+        "非循环贷账户",
+        "循环贷账户一",
+        "循环贷账户二",
+        "贷记卡账户",
+        "准贷记卡账户",
+    ),
+    (
+        "recovery",
+        "business_type",
+    ): (
+        "资产处置业务",
+        "垫款业务",
+        "合计",
+    ),
+    (
+        "postpaid_arrears",
+        "business_type",
+    ): (
+        "电信业务",
+        "水电气等公用事业",
+    ),
+    (
+        "public_records",
+        "information_type",
+    ): (
+        "欠税信息",
+        "民事判决信息",
+        "强制执行信息",
+        "行政处罚信息",
+    ),
+}
+_SUMMARY_EXACT_ONLY_TEXT_VALUES = frozenset({"合计"})
+
 _PUBLIC_RECORD_SPECS: dict[str, tuple[str, str, dict[str, str]]] = {
     "tax_arrears": (
         "tax_arrears_records",
@@ -249,6 +324,122 @@ def _compact_label(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip()
 
 
+def _summary_catalog_text(value: Any) -> str:
+    """Normalize typography only; do not guess or repair title glyphs."""
+    return _compact_label(value).translate(
+        str.maketrans({"(": "（", ")": "）", "﹙": "（", "﹚": "）"})
+    )
+
+
+def _summary_catalog_candidate(value: Any) -> tuple[int, str, str] | None:
+    """Return the longest exact catalog phrase contained in one OCR title.
+
+    Longest-match semantics are required because ``准贷记卡账户`` contains
+    ``贷记卡账户``.  Equal-length matches for different summary types are
+    intentionally rejected as ambiguous.
+    """
+    observed = _summary_catalog_text(value)
+    if not observed:
+        return None
+    matches: list[tuple[int, int, str, str]] = []
+    for summary_type, titles in _SUMMARY_TITLE_CATALOG.items():
+        candidates = (summary_type, *titles)
+        for rank, phrase in enumerate(candidates):
+            token = _summary_catalog_text(phrase)
+            # A bare type such as ``公共`` is too short to accept inside an
+            # arbitrary heading. Only the complete printed title may carry
+            # prefix/suffix OCR contamination; a bare type must be exact.
+            matched = observed == token if rank == 0 else token in observed
+            if token and matched:
+                canonical_title = titles[0] if rank == 0 else phrase
+                matches.append((len(token), rank, summary_type, canonical_title))
+    if not matches:
+        return None
+    longest = max(match[0] for match in matches)
+    winners = [match for match in matches if match[0] == longest]
+    if len({match[2] for match in winners}) != 1:
+        return None
+    length, _rank, summary_type, canonical_title = min(
+        winners,
+        key=lambda match: match[1],
+    )
+    return length, summary_type, canonical_title
+
+
+def _canonical_summary_identity(*values: Any) -> tuple[str, str] | None:
+    """Resolve mutually consistent title evidence to one finite summary type."""
+    candidates = [
+        candidate
+        for value in values
+        if (candidate := _summary_catalog_candidate(value)) is not None
+    ]
+    if not candidates or len({candidate[1] for candidate in candidates}) != 1:
+        return None
+    _length, summary_type, canonical_title = max(
+        candidates,
+        key=lambda candidate: candidate[0],
+    )
+    return summary_type, _summary_catalog_text(canonical_title)
+
+
+def _canonical_summary_text_value(
+    value: Any,
+    *,
+    summary_code: str | None,
+    metric_code: str | None,
+) -> tuple[str | None, str]:
+    """Resolve one categorical summary value without OCR-distance guessing.
+
+    An exact catalog value is trusted.  A catalog token surrounded only by
+    ASCII OCR debris is normalized when it is the sole semantic match.  The
+    latter safely covers cells such as ``2 贷记卡 n`` while rejecting Chinese
+    prefix/suffix text, cross-category concatenation, and unknown values.
+    """
+
+    observed = _summary_catalog_text(value)
+    if observed in _PLACEHOLDERS:
+        return None, "placeholder"
+    catalog = _SUMMARY_TEXT_VALUE_CATALOG.get(
+        (str(summary_code or ""), str(metric_code or "")),
+        (),
+    )
+    if not observed or not catalog:
+        return None, "unknown"
+
+    normalized_catalog = {
+        _summary_catalog_text(candidate): candidate for candidate in catalog
+    }
+    if observed in normalized_catalog:
+        return normalized_catalog[observed], "exact"
+
+    contained = {
+        token: canonical
+        for token, canonical in normalized_catalog.items()
+        if token
+        and canonical not in _SUMMARY_EXACT_ONLY_TEXT_VALUES
+        and token in observed
+    }
+    # Remove lexical submatches such as ``贷记卡`` inside ``准贷记卡``.  Two
+    # unrelated surviving categories are real ambiguity, regardless of their
+    # relative lengths.
+    semantic_matches = {
+        token: canonical
+        for token, canonical in contained.items()
+        if not any(token != other and token in other for other in contained)
+    }
+    if len(semantic_matches) != 1:
+        return None, "ambiguous" if semantic_matches else "unknown"
+
+    token, canonical = next(iter(semantic_matches.items()))
+    if observed.count(token) != 1:
+        return None, "ambiguous"
+    prefix, suffix = observed.split(token, 1)
+    residual = f"{prefix}{suffix}"
+    if residual and not residual.isascii():
+        return None, "unsafe_noise"
+    return canonical, "normalized"
+
+
 def _iso_date(value: Any) -> Any:
     text = str(value or "").strip()
     match = re.fullmatch(r"(\d{4})[-./](\d{1,2})[-./](\d{1,2})", text)
@@ -313,7 +504,10 @@ def _profile_contract(
             normalized = _iso_date(normalized)
         refs = _source_refs(entry_map)
         all_refs.extend(refs)
-        explicit_status = str(entry_map.get("observation_status") or "")
+        explicit_status = _PROFILE_OBSERVATION_STATUS_ALIASES.get(
+            str(entry_map.get("observation_status") or ""),
+            str(entry_map.get("observation_status") or ""),
+        )
         absence_proven = bool(entry_map.get("source_statement") or entry_map.get("absence_evidence"))
         if explicit_status == "not_observed" and not absence_proven:
             if raw in (None, "") and not refs:
@@ -382,7 +576,7 @@ def _summary_value(value: Any) -> tuple[str, str | None, str]:
 
 
 def _validate_summary_scalar_cells(datasets: dict[str, Any]) -> None:
-    """Withhold mapped scalar cells whose OCR text violates the metric type."""
+    """Withhold mapped summary cells whose OCR text violates the metric type."""
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
 
     issues = datasets.setdefault("personal_detail_extraction_issues", [])
@@ -394,13 +588,72 @@ def _validate_summary_scalar_cells(datasets: dict[str, Any]) -> None:
         for issue in issues
         if isinstance(issue, Mapping)
     }
+    summary_rows = {
+        str(values.get("summary_record_id") or ""): values
+        for row in (datasets.get("personal_detail_summary_records") or ())
+        if (values := _record_values(row)).get("summary_record_id")
+    }
     for index, source_row in enumerate(datasets.get("personal_detail_summary_cells") or (), start=1):
         if not isinstance(source_row, dict):
             continue
         cell = _record_values(source_row)
         metric_code = _METRIC_CODES.get(_compact_label(str(cell.get("column_label") or "")))
-        if not metric_code or metric_code in _TEXT_METRIC_CODES:
+        if not metric_code:
             continue
+
+        if metric_code in _TEXT_METRIC_CODES:
+            if _summary_value(cell.get("value"))[2] == "not_reported":
+                continue
+            parent = summary_rows.get(str(cell.get("summary_record_id") or ""), {})
+            identity = _canonical_summary_identity(
+                cell.get("summary_type"),
+                cell.get("title"),
+                parent.get("summary_type"),
+                parent.get("title"),
+            )
+            # Unmapped summary identities are quarantined and diagnosed by the
+            # existing summary-mapping contract.  Avoid a redundant value
+            # diagnostic until the table itself has a canonical identity.
+            if identity is None:
+                continue
+            summary_code = _SUMMARY_CODES.get(identity[0])
+            canonical, resolution = _canonical_summary_text_value(
+                cell.get("value"),
+                summary_code=summary_code,
+                metric_code=metric_code,
+            )
+            if canonical is not None:
+                continue
+            cell["value_status"] = "unreadable"
+            if isinstance(source_row.get("normalized"), dict):
+                source_row["normalized"] = cell
+            else:
+                source_row.update(cell)
+            issue = make_issue(
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_summary_text_dimension_unresolved",
+                message=(
+                    "A mapped summary dimension was outside its finite canonical "
+                    "business catalog; no normalized business value was emitted."
+                ),
+                parser_stage="candidate_b_summary_schema",
+                target_dataset="personal_detail_summary_cells",
+                target_record_id=str(cell.get("summary_cell_id") or f"summary_cell:{index}"),
+                field_name="value",
+                observed_value=cell.get("value"),
+                source_refs=_source_refs(source_row),
+                reason_codes=(
+                    "mapped_text_dimension",
+                    "finite_category_contract_failed",
+                    f"text_value_{resolution}",
+                    "normalized_value_withheld",
+                ),
+            )
+            if issue["extraction_issue_id"] not in existing:
+                issues.append(issue)
+                existing.add(issue["extraction_issue_id"])
+            continue
+
         value_type, _numeric, reporting_status = _summary_value(cell.get("value"))
         valid = reporting_status == "not_reported" or (
             value_type == "date" if metric_code in _DATE_METRIC_CODES else value_type in {"integer", "decimal"}
@@ -447,11 +700,25 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         ),
     ):
         key = (str(cell.get("summary_record_id") or ""), int(cell.get("row_index") or 0))
-        if key not in dimensions and str(cell.get("value") or "").strip() not in _PLACEHOLDERS:
-            dimensions[key] = (
-                str(cell.get("column_label") or "").strip(),
-                str(cell.get("value") or "").strip(),
-            )
+        label = str(cell.get("column_label") or "").strip()
+        metric_code = _METRIC_CODES.get(_compact_label(label))
+        if metric_code not in _TEXT_METRIC_CODES or cell.get("value_status") == "unreadable":
+            continue
+        parent = summary_rows.get(key[0], {})
+        identity = _canonical_summary_identity(
+            cell.get("summary_type"),
+            cell.get("title"),
+            parent.get("summary_type"),
+            parent.get("title"),
+        )
+        summary_code = _SUMMARY_CODES.get(identity[0]) if identity is not None else None
+        canonical_value, _resolution = _canonical_summary_text_value(
+            cell.get("value"),
+            summary_code=summary_code,
+            metric_code=metric_code,
+        )
+        if canonical_value is not None:
+            dimensions.setdefault(key, (label, canonical_value))
 
     metrics: list[dict[str, Any]] = []
     for index, source_row in enumerate(datasets.get("personal_detail_summary_cells") or [], start=1):
@@ -459,17 +726,38 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         summary_record_id = str(cell.get("summary_record_id") or "")
         row_index = int(cell.get("row_index") or 0)
         column_index = int(cell.get("column_index") or 0)
-        source_value = cell.get("value")
-        value_type, numeric_value, reporting_status = _summary_value(source_value)
-        if cell.get("value_status") == "unreadable":
-            value_type, numeric_value, reporting_status = "unknown", None, "unknown"
         source_id = str(cell.get("summary_cell_id") or f"summary_cell:{index}")
         metric_id = f"credit_summary_metric:{source_id}"
         dimension_name, dimension_value = dimensions.get((summary_record_id, row_index), ("", ""))
-        summary_type = str(cell.get("summary_type") or "").strip()
+        parent = summary_rows.get(summary_record_id, {})
+        identity = _canonical_summary_identity(
+            cell.get("summary_type"),
+            cell.get("title"),
+            parent.get("summary_type"),
+            parent.get("title"),
+        )
+        raw_summary_type = str(cell.get("summary_type") or "").strip()
+        summary_type = identity[0] if identity is not None else raw_summary_type
+        title = identity[1] if identity is not None else cell.get("title")
         metric_name = str(cell.get("column_label") or "").strip()
         summary_code = _SUMMARY_CODES.get(summary_type)
         metric_code = _METRIC_CODES.get(_compact_label(metric_name))
+        source_value = cell.get("value")
+        value_type, numeric_value, reporting_status = _summary_value(source_value)
+        projected_text_value = source_value
+        if metric_code in _TEXT_METRIC_CODES and reporting_status == "reported":
+            canonical_value, _resolution = _canonical_summary_text_value(
+                source_value,
+                summary_code=summary_code,
+                metric_code=metric_code,
+            )
+            if canonical_value is None:
+                value_type, numeric_value, reporting_status = "unknown", None, "unknown"
+            else:
+                value_type, numeric_value = "text", None
+                projected_text_value = canonical_value
+        if cell.get("value_status") == "unreadable":
+            value_type, numeric_value, reporting_status = "unknown", None, "unknown"
         if metric_code in _MONEY_METRIC_CODES and reporting_status == "reported":
             value_type = "money"
         metric: dict[str, Any] = {
@@ -478,7 +766,7 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
             "summary_record_id": summary_record_id,
             "summary_type": summary_type,
             "summary_code": summary_code,
-            "title": cell.get("title"),
+            "title": title,
             "row_index": row_index,
             "column_index": column_index,
             "metric_name": metric_name,
@@ -491,15 +779,14 @@ def _summary_metric_contract(datasets: Mapping[str, Any]) -> list[dict[str, Any]
         }
         if any(marker in dimension_name for marker in ("账户类型", "业务类型", "业务类别", "责任类型")):
             metric["business_category"] = dimension_value
-        parent = summary_rows.get(summary_record_id, {})
         if parent.get("source_table_id"):
             metric["source_table_id"] = parent["source_table_id"]
         if numeric_value is not None:
             metric["numeric_value"] = numeric_value
         elif value_type == "date" and source_value not in (None, ""):
             metric["date_value"] = _iso_date(source_value)
-        elif reporting_status == "reported" and source_value not in (None, ""):
-            metric["text_value"] = source_value
+        elif reporting_status == "reported" and projected_text_value not in (None, ""):
+            metric["text_value"] = projected_text_value
         if value_type == "money":
             metric["currency"] = reporting_currency
             metric["amount_unit"] = reporting_amount_unit
@@ -556,6 +843,10 @@ def project_typed_public_records(
                 continue
             if value not in (None, ""):
                 projected[target] = value
+            elif candidates.get(f"{key}_status") == "not_reported":
+                # Preserve the canonical distinction between an explicitly
+                # printed "--" and a field that silently disappeared.
+                projected[target] = None
         if any(key.endswith("_amount") or key == "monthly_contribution" for key in projected):
             projected.setdefault("reporting_amount_currency", reporting_currency)
             projected.setdefault("reporting_amount_unit", reporting_amount_unit)
@@ -735,13 +1026,26 @@ def _apply_source_completeness_ledger(
 
     inquiry_rows = datasets.get("inquiry_records") or ()
     inquiry_observed = sum(isinstance(row, Mapping) for row in inquiry_rows)
-    inquiry_expected, inquiry_contiguous = _sequence_evidence(inquiry_rows, grouped=True)
+    emitted_inquiry_expected, inquiry_contiguous = _sequence_evidence(inquiry_rows, grouped=True)
+    source_inquiry_expected = ledger_map.get("inquiry_records")
+    inquiry_expected = max(
+        emitted_inquiry_expected,
+        int(source_inquiry_expected)
+        if isinstance(source_inquiry_expected, int) and not isinstance(source_inquiry_expected, bool)
+        else 0,
+    )
     checks["inquiry_records"] = (inquiry_observed, inquiry_expected, inquiry_contiguous)
 
     account_observed = int(final_dataset_counts.get("credit_accounts") or 0)
     account_expected = ledger_map.get("credit_accounts")
     if isinstance(account_expected, int) and not isinstance(account_expected, bool):
         checks["credit_accounts"] = (account_observed, account_expected, True)
+
+    agreement_rows = datasets.get("credit_lines") or ()
+    agreement_observed = sum(isinstance(row, Mapping) for row in agreement_rows)
+    agreement_expected = ledger_map.get("credit_agreements")
+    if isinstance(agreement_expected, int) and not isinstance(agreement_expected, bool):
+        checks["credit_lines"] = (agreement_observed, agreement_expected, True)
 
     existing_ids = {
         str(row.get("extraction_issue_id") or "")
@@ -761,7 +1065,26 @@ def _apply_source_completeness_ledger(
             parser_stage="source_completeness_ledger",
             target_dataset=dataset_name,
             observed_value={"observed_row_count": observed},
-            candidate_value={"source_expected_row_count": expected},
+            candidate_value={
+                "source_expected_row_count": expected,
+                **(
+                    {
+                        "source_sequence_endpoints": ledger_map.get(
+                            "inquiry_sequence_endpoints", {}
+                        ),
+                        "unclassified_sequence_endpoints": ledger_map.get(
+                            "inquiry_unclassified_sequence_endpoints", []
+                        ),
+                    }
+                    if dataset_name == "inquiry_records"
+                    else {}
+                ),
+            },
+            source_refs=(
+                (ledger_map.get("source_refs") or {}).get(dataset_name) or ()
+                if isinstance(ledger_map.get("source_refs"), Mapping)
+                else ()
+            ),
             reason_codes=("independent_source_ledger", "dataset_incomplete", "no_missing_row_invented"),
         )
         if issue["extraction_issue_id"] not in existing_ids:
@@ -842,9 +1165,25 @@ def prepare_personal_detail_source_collections(
         observation_rows.append(row)
     datasets["personal_detail_field_observations"] = observation_rows
 
-    summary_metrics = _summary_metric_contract(datasets)
+    all_summary_metrics = _summary_metric_contract(datasets)
+    summary_metrics = [
+        row
+        for row in all_summary_metrics
+        if str(row.get("mapping_status") or "") == "mapped"
+    ]
     if summary_metrics:
         datasets["personal_detail_credit_summary_metrics"] = summary_metrics
+    else:
+        datasets.pop("personal_detail_credit_summary_metrics", None)
+    if len(summary_metrics) < len(all_summary_metrics):
+        states = facts.setdefault("personal_detail_dataset_states", {})
+        if isinstance(states, dict):
+            states["personal_detail_credit_summary_metrics"] = {
+                "presence_status": "partial",
+                "reason": "unmapped_summary_cells_quarantined",
+                "expected_row_count": len(all_summary_metrics),
+                "observed_row_count": len(summary_metrics),
+            }
 
     reporting_currency, reporting_amount_unit = _reporting_context(datasets)
     public_records = datasets.get("public_records") or auxiliary.get("public_records") or []

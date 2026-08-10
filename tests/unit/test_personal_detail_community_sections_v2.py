@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib
 from types import SimpleNamespace
 
+from docmirror.plugins.credit_report.community_plugin import (
+    _apply_personal_detail_dataset_status,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
 )
@@ -83,7 +86,7 @@ def test_final_v2_nulls_clear_stale_generic_identity() -> None:
     assert not {"subject_name", "id_number", "subject_id"} & field_details.keys()
 
 
-def test_personal_basic_section_exists_when_ocr_classification_misses_heading(monkeypatch) -> None:
+def test_build_sections_does_not_synthesize_missing_basic_section(monkeypatch) -> None:
     variant_module = importlib.import_module(
         "docmirror.plugins.credit_report.personal_detail_scanned.variant"
     )
@@ -104,11 +107,126 @@ def test_personal_basic_section_exists_when_ocr_classification_misses_heading(mo
 
     sections = PersonalDetailScannedVariant().build_sections(SimpleNamespace(pages=pages), "")
 
-    assert sections[0] == {
-        "id": "sec_personal_basic",
-        "title": "个人基本信息",
-        "type": "basic_information",
-        "page_start": 1,
-        "page_end": 2,
+    assert sections == (
+        {
+            "id": "sec_credit_summary",
+            "title": "信息概要",
+            "type": "credit_summary",
+            "page_start": 2,
+            "page_end": 2,
+        },
+    )
+
+
+def test_build_sections_does_not_infer_ranges_from_page_count() -> None:
+    pages = [SimpleNamespace(page_number=page) for page in range(1, 16)]
+
+    sections = PersonalDetailScannedVariant().build_sections(SimpleNamespace(pages=pages), "")
+
+    assert sections == ()
+
+
+def test_build_sections_uses_only_registered_canonical_audit_entries() -> None:
+    parse_result = SimpleNamespace(
+        pages=[],
+        canonical_layout_audit=lambda: {
+            "registrations": [
+                {
+                    "status": "registered",
+                    "template_id": "report_header_and_identity",
+                    "logical_page": 2,
+                },
+                {
+                    "status": "registered",
+                    "template_id": "information_summary",
+                    "logical_page": 4,
+                },
+                {
+                    "status": "unresolved",
+                    "template_id": "public_information",
+                    "logical_page": 8,
+                },
+            ]
+        },
+    )
+
+    sections = PersonalDetailScannedVariant().build_sections(parse_result, "")
+
+    assert [(section["id"], section["page_start"]) for section in sections] == [
+        ("sec_personal_basic", 2),
+        ("sec_credit_summary", 4),
+    ]
+
+
+def test_public_dataset_envelope_obeys_personal_detail_source_status() -> None:
+    payload = {
+        "datasets": [
+            {
+                "name": "credit_agreements",
+                "row_count": 4,
+                "rows": [{}, {}, {}, {}],
+                "status": "complete",
+                "completeness": {
+                    "expected_row_count": 4,
+                    "emitted_row_count": 4,
+                    "omitted_row_count": 0,
+                    "verified": True,
+                    "basis": "source_report_summary",
+                },
+            },
+            {
+                "name": "dataset_status",
+                "rows": [
+                    {
+                        "normalized": {
+                            "dataset_name": "credit_agreements",
+                            "presence_status": "partial",
+                            "expected_row_count": 7,
+                            "observed_row_count": 4,
+                        }
+                    }
+                ],
+            },
+        ]
     }
-    assert sum(section.get("id") == "sec_personal_basic" for section in sections) == 1
+
+    _apply_personal_detail_dataset_status(payload)
+
+    dataset = payload["datasets"][0]
+    assert dataset["status"] == "partial"
+    assert dataset["completeness"] == {
+        "expected_row_count": 7,
+        "emitted_row_count": 4,
+        "omitted_row_count": 3,
+        "verified": False,
+        "basis": "personal_detail_dataset_status:partial",
+    }
+
+
+def test_public_dataset_envelope_accepts_explicit_source_completeness() -> None:
+    payload = {
+        "datasets": [
+            {"name": "inquiries", "row_count": 2, "rows": [{}, {}]},
+            {
+                "name": "dataset_status",
+                "rows": [
+                    {
+                        "normalized": {
+                            "dataset_name": "inquiries",
+                            "presence_status": "observed_nonempty",
+                            "observed_row_count": 2,
+                        }
+                    }
+                ],
+            },
+        ]
+    }
+
+    _apply_personal_detail_dataset_status(payload)
+
+    dataset = payload["datasets"][0]
+    assert dataset["status"] == "complete"
+    assert dataset["completeness"]["verified"] is True
+    assert dataset["completeness"]["basis"] == (
+        "personal_detail_dataset_status:observed_nonempty"
+    )

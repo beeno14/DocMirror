@@ -307,6 +307,11 @@ class BusinessUncertaintyRepairCoordinator:
         if not refs:
             return False
         for ref in refs:
+            if ref.get("geometry_scope") != "cell" and ref.get("binding") != "canonical_field_slot":
+                # A table/page rectangle contains several values with the same
+                # semantic role.  Finding one valid number or date somewhere
+                # inside it cannot prove the requested field is supported.
+                return False
             target = _bbox(ref)
             if target is None:
                 return False

@@ -818,7 +818,13 @@ def test_attachment_detail_inherits_classification_and_maps_active_fields() -> N
 
     assert inherited["five_tier_class"] == "正常"
     assert inherited["five_tier_class_source"] == "parent_attachment_heading"
+    assert inherited["amount"] == 10
+    assert inherited["amount_kind"] == "instrument_amount"
+    assert inherited["instrument_amount"] == 10
     assert len(inherited["source_refs"]) == 2
+    assert active_discount["amount"] == 5.68
+    assert active_discount["amount_kind"] == "discount_amount"
+    assert active_discount["discount_amount"] == 5.68
     assert active_discount["guarantee_type"] == "信用/无担保"
     assert active_discount["snapshot_date"] == "2025-07-01"
     assert active_discount["credit_agreement_identifier"] == ""
@@ -882,6 +888,9 @@ def test_attachment_detail_pairs_double_headers_with_double_data_rows() -> None:
     assert reported["guarantee_type"] == ""
     assert reported["counter_guarantee_type"] == "信用/无担保/保证金"
     assert reported["deposit_ratio"] == 0.5
+    assert reported["amount"] == 2000
+    assert reported["amount_kind"] == "instrument_amount"
+    assert reported["instrument_amount"] == 2000
     assert reported["balance"] == 2000
     assert reported["risk_exposure_amount"] == 1000
     assert reported["credit_agreement_identifier"] == "G10423771H00065879024720250329"
@@ -889,6 +898,8 @@ def test_attachment_detail_pairs_double_headers_with_double_data_rows() -> None:
     assert reported["snapshot_date"] == "2025-03-29"
     assert len(reported["source_refs"]) == 3
     assert not_reported["deposit_ratio"] == 0.5
+    assert not_reported["amount"] == 2500
+    assert not_reported["instrument_amount"] == 2500
     assert not_reported["balance"] == 2500
     assert not_reported["risk_exposure_amount"] is None
     assert not_reported["credit_agreement_identifier"] == ""
@@ -964,12 +975,82 @@ def test_attachment_detail_keeps_schema_across_headerless_final_page() -> None:
     ]
     assert [record["source_page"] for record in details] == [12, 12, 13]
     assert all(record["account_status"] == "settled" for record in details)
+    assert all(record["amount_kind"] == "instrument_amount" for record in details)
+    assert [record["instrument_amount"] for record in details] == [100, 200, 300]
+
+
+def test_attachment_detail_types_generic_guarantee_amount_from_business_context() -> None:
+    result = _flow_result(
+        (
+            12,
+            [
+                _text("附件", 0),
+                _text("银行保函及其他业务的信贷明细", 10),
+                _text(
+                    "1.未结清业务\n授信机构：示例银行\n业务种类：融资性保函\n五级分类：正常",
+                    20,
+                ),
+            ],
+            [
+                _table(
+                    "guarantee_detail",
+                    [
+                        ["账户编号", "开立日期", "到期日", "币种", "金额"],
+                        ["G10000000000000000000000000001", "2025-01-01", "2026-01-01", "人民币元", "88.5"],
+                    ],
+                    bbox=[0, 50, 100, 90],
+                )
+            ],
+        )
+    )
+
+    detail = extract_enterprise_attachment_datasets(result)["enterprise_attachment_credit_details"][0]
+
+    assert detail["amount"] == 88.5
+    assert detail["amount_kind"] == "guarantee_amount"
+    assert detail["guarantee_amount"] == 88.5
+    assert detail["instrument_amount"] is None
+
+
+def test_attachment_detail_does_not_guess_an_ambiguous_generic_amount() -> None:
+    result = _flow_result(
+        (
+            12,
+            [
+                _text("附件", 0),
+                _text("1.未结清业务\n授信机构：示例银行\n业务种类：其他业务", 20),
+            ],
+            [
+                _table(
+                    "ambiguous_detail",
+                    [
+                        ["账户编号", "开立日期", "到期日", "币种", "金额"],
+                        ["X10000000000000000000000000001", "2025-01-01", "2026-01-01", "人民币元", "12"],
+                    ],
+                    bbox=[0, 50, 100, 90],
+                )
+            ],
+        )
+    )
+
+    detail = extract_enterprise_attachment_datasets(result)["enterprise_attachment_credit_details"][0]
+
+    assert detail["amount"] == 12
+    assert detail["amount_kind"] == "amount"
+    assert detail["discount_amount"] is None
+    assert detail["instrument_amount"] is None
+    assert detail["guarantee_amount"] is None
 
 
 def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
-    result = _result(
+    result = _flow_result(
         (
             6,
+            [
+                _text("住房公积金缴费记录", 0),
+                _text("过去24个月缴费情况见附件", 70),
+                _text("获得许可记录", 90),
+            ],
             [
                 _table(
                     "housing_fund",
@@ -985,6 +1066,7 @@ def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
                             "累计欠费金额（元）：0",
                         ]
                     ],
+                    bbox=[0, 10, 100, 60],
                 ),
                 _table(
                     "license",
@@ -992,6 +1074,7 @@ def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
                         ["许可部门", "许可类型", "许可日期", "截止日期", "许可内容"],
                         ["南京市行政审批局", "登记", "2024-01-11", "2099-12-31", "登字"],
                     ],
+                    bbox=[0, 100, 100, 160],
                 ),
             ],
         )
@@ -999,13 +1082,15 @@ def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
 
     housing, license_record = extract_enterprise_public_records_from_tables(result)
 
-    assert housing["record_type"] == "social_security_payment"
+    assert housing["record_type"] == "housing_fund_payment"
     assert housing["statistics_month"] == "2021-06"
     assert housing["employee_count"] == 3
     assert housing["contribution_base"] == 9040
     assert housing["last_contribution_date"] == "2021-06-28"
     assert housing["cumulative_arrears"] == 0
     assert housing["attributes"]["payment_status"] == "正常缴费"
+    assert housing["history_status"] == "见附件"
+    assert housing["history_period_months"] == 24
     assert housing["details"]["初缴年月"] == "2021-02"
     assert license_record["licensing_authority"] == "南京市行政审批局"
     assert license_record["license_date"] == "2024-01-11"
@@ -1013,9 +1098,14 @@ def test_public_records_expose_typed_fields_and_raw_attributes() -> None:
 
 
 def test_public_records_are_projected_as_lossless_source_chart_datasets() -> None:
-    result = _result(
+    result = _flow_result(
         (
             6,
+            [
+                _text("住房公积金缴费记录", 0),
+                _text("过去24个月缴费情况见附件", 70),
+                _text("获得许可记录", 90),
+            ],
             [
                 _table(
                     "housing_fund",
@@ -1031,6 +1121,7 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
                             "累计欠费金额（元）：0",
                         ]
                     ],
+                    bbox=[0, 10, 100, 60],
                 ),
                 _table(
                     "license",
@@ -1038,11 +1129,13 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
                         ["许可部门", "许可类型", "许可日期", "截止日期", "许可内容"],
                         ["南京市行政审批局", "登记", "2024-01-11", "2099-12-31", "登字"],
                     ],
+                    bbox=[0, 100, 100, 160],
                 ),
             ],
         ),
         (
             7,
+            [],
             [
                 _table(
                     "certification",
@@ -1058,11 +1151,14 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
     datasets = extract_enterprise_public_record_datasets(result)
 
     assert list(datasets) == [
-        "enterprise_public_social_security_payment_records",
+        "enterprise_public_housing_fund_payment_records",
         "enterprise_public_license_records",
         "enterprise_public_certification_records",
     ]
-    assert datasets["enterprise_public_social_security_payment_records"][0]["contribution_base"] == 9040
+    housing = datasets["enterprise_public_housing_fund_payment_records"][0]
+    assert housing["contribution_base"] == 9040
+    assert housing["history_status"] == "见附件"
+    assert housing["history_period_months"] == 24
     license_record = datasets["enterprise_public_license_records"][0]
     assert set(license_record) == {
         "public_record_id",
@@ -1084,6 +1180,90 @@ def test_public_records_are_projected_as_lossless_source_chart_datasets() -> Non
     assert license_record["license_expiry_date"] == "2099-12-31"
     assert license_record["license_content"] == "登字"
     assert datasets["enterprise_public_certification_records"][0]["certification_date"] == "--"
+
+
+def test_public_record_heading_overrides_ambiguous_contribution_fields() -> None:
+    result = _flow_result(
+        (
+            6,
+            [_text("社会保险缴费记录", 0)],
+            [
+                _table(
+                    "social_security",
+                    [
+                        [
+                            "统计年月：2021-06",
+                            "初缴年月：2021-02",
+                            "职工人数：3",
+                            "缴费基数（元）：9,040",
+                        ]
+                    ],
+                    bbox=[0, 10, 100, 60],
+                )
+            ],
+        )
+    )
+
+    records = extract_enterprise_public_records_from_tables(result)
+
+    assert len(records) == 1
+    assert records[0]["record_type"] == "social_security_payment"
+
+
+def test_housing_fund_attachment_pointer_can_follow_on_the_next_page() -> None:
+    result = _flow_result(
+        (
+            6,
+            [_text("住房公积金缴费记录", 0)],
+            [
+                _table(
+                    "housing_fund",
+                    [["统计年月：2021-06", "职工人数：3", "缴费基数（元）：9,040"]],
+                    bbox=[0, 10, 100, 60],
+                )
+            ],
+        ),
+        (7, [_text("过去24个月的缴费情况详见附件", 0)], []),
+    )
+
+    record = extract_enterprise_public_records_from_tables(result)[0]
+
+    assert record["record_type"] == "housing_fund_payment"
+    assert record["history_status"] == "详见附件"
+    assert record["history_period_months"] == 24
+
+
+def test_headingless_contribution_fields_are_quarantined_as_unresolved() -> None:
+    result = _result(
+        (
+            6,
+            [
+                _table(
+                    "ambiguous_contribution",
+                    [
+                        [
+                            "统计年月：2021-06",
+                            "初缴年月：2021-02",
+                            "职工人数：3",
+                            "缴费基数（元）：9,040",
+                        ]
+                    ],
+                )
+            ],
+        )
+    )
+
+    records = extract_enterprise_public_records_from_tables(result)
+
+    assert len(records) == 1
+    assert records[0]["record_type"] == "unknown"
+    assert records[0]["field_info"]["record_type"] == {
+        "source_state": "unresolved",
+        "basis": "ambiguous_contribution_signature",
+        "source_value": "shared_contribution_signature",
+        "conflicts": ["missing_contribution_section_heading"],
+    }
+    assert extract_enterprise_public_record_datasets(result) == {}
 
 
 def test_attachment_detail_audit_reconciles_reported_settled_business_count() -> None:

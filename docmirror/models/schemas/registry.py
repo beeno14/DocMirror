@@ -197,19 +197,17 @@ def _personal_detail_invariant_errors(payload: dict[str, Any]) -> tuple[str, ...
             errors.append(
                 "repayment_responsibilities: combined overdue/status field is forbidden"
             )
-        if normalized.get("related_party_category") == "person" and normalized.get(
-            "source_status_value"
-        ) not in (None, "") and normalized.get("overdue_months") is None and not normalized.get(
-            "repayment_status_code"
-        ):
+        has_overdue_months = normalized.get("overdue_months") is not None
+        has_repayment_status = normalized.get("repayment_status_code") not in (None, "")
+        if has_overdue_months and has_repayment_status:
             errors.append(
-                "repayment_responsibilities: person row requires separated overdue months or status"
+                "repayment_responsibilities: overdue months and repayment status are mutually exclusive"
             )
-        if normalized.get("related_party_category") == "organization" and not normalized.get(
-            "repayment_status_code"
+        if normalized.get("source_status_value") not in (None, "") and not (
+            has_overdue_months or has_repayment_status
         ):
             errors.append(
-                "repayment_responsibilities: organization row requires repayment_status_code"
+                "repayment_responsibilities: source status requires separated overdue months or status"
             )
 
     for dataset_name, dataset in by_name.items():

@@ -9,20 +9,24 @@ from typing import Any, cast
 
 from docmirror.plugins.credit_report.shared.variant import CreditReportVariantAdapter
 
-_SECTION_CLASSIFIERS = (
-    ("sec_personal_basic", "个人基本信息", "basic_information", ("个人基本信息",)),
-    ("sec_credit_summary", "信息概要", "credit_summary", ("信息概要",)),
-    ("sec_credit_details", "信贷交易信息明细", "credit_details", ("信贷交易信息明细",)),
-    ("sec_non_credit_transactions", "非信贷交易信息明细", "non_credit_transactions", ("非信贷交易信息明细",)),
+_CANONICAL_SECTION_ROLES = (
+    (("report_header_and_identity",), "sec_personal_basic", "个人基本信息", "basic_information"),
+    (("information_summary",), "sec_credit_summary", "信息概要", "credit_summary"),
     (
-        "sec_public_records",
-        "公共信息明细",
-        "public_records",
-        ("公共信息明细", "欠税记录", "民事判决记录", "强制执行记录"),
+        ("credit_account_detail", "repayment_responsibility", "credit_agreement"),
+        "sec_credit_details",
+        "信贷交易信息明细",
+        "credit_details",
     ),
-    ("sec_inquiries", "查询记录", "inquiries", ("查询记录", "机构查询记录明细", "本人查询记录明细")),
-    ("sec_report_explanation", "报告说明与编制说明", "report_explanation", ("报告说明", "编制说明")),
+    (("postpaid_detail",), "sec_non_credit_transactions", "非信贷交易信息明细", "non_credit_transactions"),
+    (("public_information",), "sec_public_records", "公共信息明细", "public_records"),
+    (("report_explanation",), "sec_report_explanation", "报告说明与编制说明", "report_explanation"),
 )
+_CANONICAL_TEMPLATE_IDS = frozenset(
+    template_id
+    for template_ids, _section_id, _title, _section_type in _CANONICAL_SECTION_ROLES
+    for template_id in template_ids
+) | {"annotations_and_inquiries"}
 
 _FINAL_V2_SECTION_FIELD_SOURCES: dict[str, tuple[tuple[str, str], ...]] = {
     "subject_name": (
@@ -58,60 +62,89 @@ def _page_source_text(page: Any) -> str:
 
 
 def _classified_sections(parse_result: Any) -> tuple[dict[str, Any], ...]:
+    """Advertise only sections backed by a registered canonical page role.
+
+    Raw page-count ranges and generic section reconstruction are intentionally
+    excluded.  The annotations/inquiries template contains three optional
+    source sections, so those are additionally gated by an observed canonical
+    heading inside a page already registered to that template.
+    """
+
     pages = list(getattr(parse_result, "pages", None) or ())
-    if not pages:
-        return ()
-    page_text = {
-        int(getattr(page, "page_number", 0) or index): _page_source_text(page)
-        for index, page in enumerate(pages, start=1)
-    }
-    starts: list[tuple[int, str, str, str]] = []
-    for section_id, title, section_type, markers in _SECTION_CLASSIFIERS:
-        matches = []
-        for page, text in page_text.items():
-            if not any(marker in text for marker in markers):
+    template_text: dict[str, list[tuple[int, str]]] = {}
+    registered: dict[str, set[int]] = {}
+    for index, page in enumerate(pages, start=1):
+        page_number = int(getattr(page, "page_number", 0) or index)
+        text = _page_source_text(page)
+        template_id = str(getattr(page, "canonical_template_id", "") or "")
+        if template_id not in _CANONICAL_TEMPLATE_IDS:
+            continue
+        registered.setdefault(template_id, set()).add(page_number)
+        template_text.setdefault(template_id, []).append((page_number, text))
+
+    audit_loader = getattr(parse_result, "canonical_layout_audit", None)
+    if callable(audit_loader):
+        audit = audit_loader()
+        registrations = audit.get("registrations") if isinstance(audit, dict) else ()
+        for registration in registrations or ():
+            if not isinstance(registration, dict) or registration.get("status") != "registered":
                 continue
-            if section_id == "sec_inquiries" and "查询记录概要" in text:
-                if not any(marker in text for marker in ("机构查询记录明细", "本人查询记录明细")) and not re.search(
-                    r"(?:^|[一二三四五六七八九十])[、.．)）]?查询记录(?!概要)", text
-                ):
-                    continue
-            matches.append(page)
-        if matches:
-            starts.append((min(matches), section_id, title, section_type))
-    # One damaged marker must not replace the full fallback hierarchy. Two or
-    # more ordered anchors are sufficient to derive source-relative ranges.
-    if len(starts) < 2:
+            template_id = str(registration.get("template_id") or "")
+            logical_page = int(registration.get("logical_page") or 0)
+            if template_id in _CANONICAL_TEMPLATE_IDS and logical_page > 0:
+                registered.setdefault(template_id, set()).add(logical_page)
+
+    if not registered:
         return ()
-    ordered = sorted(starts, key=lambda item: (item[0], item[1]))
-    page_count = max(page_text)
+
     sections: list[dict[str, Any]] = []
-    for page_start, section_id, title, section_type in ordered:
+    for template_ids, section_id, title, section_type in _CANONICAL_SECTION_ROLES:
+        matches = sorted(
+            page_number
+            for template_id in template_ids
+            for page_number in registered.get(template_id, ())
+        )
+        if not matches:
+            continue
         sections.append(
             {
                 "id": section_id,
                 "title": title,
                 "type": section_type,
-                "page_start": page_start,
-                # Dataset provenance extends populated sections below. Starting
-                # at the root anchor avoids absorbing a summary or the first
-                # page of the following section merely because both share a
-                # physical page in the canonical layout.
-                "page_end": page_count if section_id == "sec_report_explanation" else page_start,
+                "page_start": min(matches),
+                "page_end": max(matches),
             }
         )
-    report_start = next(
-        (page for page, section_id, _title, _type in ordered if section_id == "sec_report_explanation"),
-        page_count + 1,
+
+    optional_roles = (
+        (
+            "sec_inquiries",
+            "查询记录",
+            "inquiries",
+            ("机构查询记录明细", "本人查询记录明细"),
+            frozenset({"annotations_and_inquiries"}),
+        ),
+        (
+            "sec_statements",
+            "机构说明与本人声明",
+            "statements",
+            ("机构说明", "本人声明"),
+            _CANONICAL_TEMPLATE_IDS - {"report_explanation"},
+        ),
+        (
+            "sec_annotations",
+            "异议标注",
+            "annotations",
+            ("异议标注", "异议处理中"),
+            _CANONICAL_TEMPLATE_IDS - {"report_explanation"},
+        ),
     )
-    for section_id, title, section_type, markers in (
-        ("sec_statements", "机构说明与本人声明", "statements", ("机构说明", "本人声明")),
-        ("sec_annotations", "异议标注", "annotations", ("异议标注", "异议处理中")),
-    ):
+    for section_id, title, section_type, markers, allowed_templates in optional_roles:
         matches = [
-            page
-            for page, text in page_text.items()
-            if page < report_start and any(marker in text for marker in markers)
+            page_number
+            for template_id in allowed_templates
+            for page_number, text in template_text.get(template_id, ())
+            if any(marker in text for marker in markers)
         ]
         if matches:
             sections.append(
@@ -123,7 +156,7 @@ def _classified_sections(parse_result: Any) -> tuple[dict[str, Any], ...]:
                     "page_end": max(matches),
                 }
             )
-    return tuple(sections)
+    return tuple(sorted(sections, key=lambda section: (section["page_start"], section["id"])))
 
 
 class PersonalDetailScannedVariant(CreditReportVariantAdapter):
@@ -346,108 +379,9 @@ class PersonalDetailScannedVariant(CreditReportVariantAdapter):
         return personal_detail_data_dictionary()
 
     def build_sections(self, parse_result: Any, full_text: str) -> tuple[dict[str, Any], ...]:
-        """Return the source-faithful detailed-report section hierarchy."""
+        """Return only source-observed sections from canonical registrations."""
         del full_text
-        pages = list(getattr(parse_result, "pages", None) or [])
-        page_count = max(
-            (int(getattr(page, "page_number", 0) or index) for index, page in enumerate(pages, start=1)),
-            default=0,
-        )
-        classified = _classified_sections(parse_result)
-        if classified:
-            sections = classified
-        elif page_count < 13:
-            sections = super().build_sections(parse_result, "")
-        else:
-            sections = (
-                {
-                    "id": "sec_personal_basic",
-                    "title": "个人基本信息",
-                    "type": "basic_information",
-                    "page_start": 1,
-                    "page_end": 2,
-                },
-                {
-                    "id": "sec_credit_summary",
-                    "title": "信息概要",
-                    "type": "credit_summary",
-                    "page_start": 2,
-                    "page_end": 4,
-                },
-                {
-                    "id": "sec_credit_details",
-                    "title": "信贷交易信息明细",
-                    "type": "credit_details",
-                    "page_start": 4,
-                    "page_end": 12,
-                },
-                {
-                    "id": "sec_non_credit_transactions",
-                    "title": "非信贷交易信息明细",
-                    "type": "non_credit_transactions",
-                    "page_start": 12,
-                    "page_end": 12,
-                },
-                {
-                    "id": "sec_public_records",
-                    "title": "公共信息明细",
-                    "type": "public_records",
-                    "page_start": 12,
-                    "page_end": 13,
-                },
-                {
-                    "id": "sec_statements",
-                    "title": "机构说明与本人声明",
-                    "type": "statements",
-                    "page_start": 6,
-                    "page_end": 6,
-                },
-                {
-                    "id": "sec_annotations",
-                    "title": "异议标注",
-                    "type": "annotations",
-                    "page_start": 2,
-                    "page_end": 13,
-                },
-                {
-                    "id": "sec_inquiries",
-                    "title": "查询记录",
-                    "type": "inquiries",
-                    "page_start": 13,
-                    "page_end": 13,
-                },
-            )
-        if not any(section.get("type") in {"basic_information", "identity"} for section in sections):
-            sections = (
-                {
-                    "id": "sec_personal_basic",
-                    "title": "个人基本信息",
-                    "type": "basic_information",
-                    "page_start": 1,
-                    "page_end": max(1, min(2, page_count or 1)),
-                },
-                *sections,
-            )
-        if not classified and page_count >= 15:
-            sections += (
-                {
-                    "id": "sec_report_explanation",
-                    "title": "报告说明与编制说明",
-                    "type": "report_explanation",
-                    "page_start": 14,
-                    "page_end": 15,
-                },
-            )
-        sections += (
-            {
-                "id": "sec_extraction_review",
-                "title": "提取问题与人工复核",
-                "type": "extraction_review",
-                "page_start": 1,
-                "page_end": page_count,
-            },
-        )
-        return sections
+        return _classified_sections(parse_result)
 
     def semantic_extensions(self) -> dict[str, Any]:
         """Declare PBOC v2 datasets as the detailed report's canonical storage."""

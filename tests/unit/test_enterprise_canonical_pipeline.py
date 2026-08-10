@@ -179,6 +179,95 @@ def test_f6_semantic_document_contains_only_canonical_enterprise_views() -> None
     assert semantic.continuation_audit
 
 
+def test_accuracy_scope_preserves_profile_source_institution_per_field() -> None:
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="企业信用报告（自主查询版）\n基本信息")],
+                tables=[
+                    TableBlock(
+                        table_id="profile",
+                        metadata={
+                            "raw_rows": [
+                                ["所属行业", "批发业", "信息来源机构", "甲银行"],
+                                ["成立年份", "2019", "信息来源机构", "乙银行"],
+                                ["存续状态", "--", "信息来源机构", "--"],
+                            ]
+                        },
+                    )
+                ],
+            )
+        ],
+        confidence=1.0,
+    )
+
+    profile_record = run_enterprise_pipeline(result).semantic_document.datasets[
+        "enterprise_profile"
+    ][0]
+    profile = profile_record["normalized"]
+
+    assert profile["industry"] == "批发业"
+    assert profile["industry_status"] == "reported"
+    assert profile["establishment_year"] == 2019
+    assert profile["establishment_year_status"] == "reported"
+    assert profile["operating_status"] is None
+    assert profile["operating_status_status"] == "not_reported"
+    assert profile["industry_source_institution"] == "甲银行"
+    assert profile["establishment_year_source_institution"] == "乙银行"
+    assert profile["operating_status_source_institution"] is None
+    assert profile["operating_status_source_institution_status"] == "not_reported"
+    assert profile_record["field_info"]["industry"]["source_institution"] == "甲银行"
+    assert "field_info" not in profile
+
+
+def test_accuracy_scope_emits_all_canonical_sections_and_precise_counts() -> None:
+    semantic = run_enterprise_pipeline(_enterprise_result()).semantic_document
+    section_rows = semantic.datasets["enterprise_section_presence"]
+    by_key = {row["normalized"]["section_key"]: row["normalized"] for row in section_rows}
+
+    assert len(section_rows) == 10
+    assert by_key["identity"]["presence_status"] == "present_with_records"
+    assert by_key["identity"]["source_state"] == "reported"
+    assert by_key["public_records"]["presence_status"] == "absent_from_report"
+    assert by_key["public_records"]["source_state"] == "section_absent"
+    assert semantic.dataset_completeness["enterprise_section_presence"] == {
+        "expected_row_count": 10,
+        "emitted_row_count": 10,
+        "omitted_row_count": 0,
+        "verified": True,
+        "basis": "canonical_section_contract",
+        "status": "complete",
+    }
+    assert semantic.credit_summary["extracted_public_record_count"] == 0
+    assert semantic.credit_summary["extracted_public_record_type_counts"] == {}
+    assert semantic.credit_summary["attachment_history_row_count"] == 0
+    assert semantic.credit_summary["attachment_detail_card_count"] == 0
+    assert "public_record_count" not in semantic.credit_summary
+    assert "attachment_credit_detail_count" not in semantic.credit_summary
+
+
+def test_accuracy_scope_distinguishes_empty_section_from_absent_section() -> None:
+    result = _enterprise_result()
+    result.pages.append(
+        PageContent(
+            page_number=2,
+            texts=[TextBlock(content="公共记录明细")],
+        )
+    )
+
+    semantic = run_enterprise_pipeline(result).semantic_document
+    by_key = {
+        row["normalized"]["section_key"]: row["normalized"]
+        for row in semantic.datasets["enterprise_section_presence"]
+    }
+
+    assert by_key["public_records"]["presence_status"] == "present_no_records"
+    assert by_key["public_records"]["source_state"] == "reported"
+    assert by_key["non_credit_records"]["presence_status"] == "absent_from_report"
+    assert by_key["non_credit_records"]["source_state"] == "section_absent"
+
+
 def test_f4_flags_source_truncation_without_inventing_missing_text() -> None:
     document = build_canonical_enterprise_document(_enterprise_result())
     address = "福建省福州市仓山区临江街道六一南路与朝阳路交叉处中"

@@ -144,6 +144,75 @@ def test_explicit_summary_heading_outranks_repeated_account_category_names() -> 
     assert projection.registrations[0]["confidence"] >= 0.92
 
 
+def test_unanchored_table_page_does_not_inherit_previous_template_by_shape_alone() -> None:
+    summary_table = SimpleNamespace(table_id="summary:1", metadata={"raw_rows": [["A", "B"]]}, bbox=[10, 80, 590, 300])
+    unrelated_table = SimpleNamespace(table_id="unknown:2", metadata={"raw_rows": [["X", "Y"]]}, bbox=[10, 80, 590, 300])
+    result = SimpleNamespace(
+        pages=[
+            _page(1, source=1, tables=[summary_table]),
+            _page(2, source=2, tables=[unrelated_table]),
+        ]
+    )
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [_line("\u4fe1\u606f\u6982\u8981", [20, 20, 220, 50])],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [_line("\u672a\u6ce8\u518c\u7684\u4e1a\u52a1\u8868\u683c\u5185\u5bb9", [20, 20, 400, 50])],
+        },
+    ]
+
+    projection = _assembler(result, evidence).build()
+
+    assert projection.registrations[0]["template_id"] == "information_summary"
+    assert projection.registrations[1]["template_id"] == "unresolved"
+    assert projection.registrations[1]["basis"] == "canonical_registration_exhausted"
+    assert projection.unresolved_pages == (2,)
+
+
+def test_explicit_table_continuation_can_inherit_previous_canonical_template() -> None:
+    summary_table = SimpleNamespace(table_id="summary:left", metadata={"raw_rows": [["A", "B"]]}, bbox=[10, 80, 590, 300])
+    continuation_table = SimpleNamespace(table_id="summary:right", metadata={"raw_rows": [["C", "D"]]}, bbox=[10, 80, 590, 300])
+    result = SimpleNamespace(
+        pages=[
+            _page(1, source=1, tables=[summary_table]),
+            _page(2, source=2, tables=[continuation_table]),
+        ]
+    )
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [_line("\u4fe1\u606f\u6982\u8981", [20, 20, 220, 50])],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [_line("\u8868\u683c\u7684\u65e0\u6807\u9898\u7eed\u9875", [20, 20, 400, 50])],
+        },
+    ]
+    owner = SimpleNamespace(tables_continue=lambda left, right: (left, right) == ("summary:left", "summary:right"))
+
+    projection = _assembler(result, evidence, owner=owner).build()
+
+    assert projection.registrations[1]["template_id"] == "information_summary"
+    assert projection.registrations[1]["basis"] == "canonical_flow_continuation"
+    assert "explicit_table_continuation" in projection.registrations[1]["signals"]
+    assert projection.unresolved_pages == ()
+
+
 def test_unregistered_page_is_reported_and_not_generically_extracted() -> None:
     owner = SimpleNamespace()
     result = SimpleNamespace(pages=[_page(1, source=1)])
@@ -171,6 +240,8 @@ def test_monthly_materialization_uses_canonical_page_lines_without_cell_ocr(monk
     context = object.__new__(PersonalDetailExtractionContext)
     context._cache = {}
     context.reading_order_by_logical = {1: 1}
+    page_image_resolver = object()
+    context._page_image_resolver = page_image_resolver
     context.parse_result = SimpleNamespace(
         entities=SimpleNamespace(
             domain_specific={
@@ -209,7 +280,13 @@ def test_monthly_materialization_uses_canonical_page_lines_without_cell_ocr(monk
     assert context.corrected_repayment_records() == []
     assert len(observed) == 2
     assert all(call["enable_cell_ocr"] is False for call in observed)
-    assert all(call["page_image_resolver"] is None for call in observed)
+    assert observed[0]["page_image_resolver"] is page_image_resolver
+    assert observed[0]["enable_static_status_validation"] is True
+    assert observed[0]["enable_candidate_b_amount_pairing"] is True
+    assert all(call["extra_status_chars"] == {"A", "#"} for call in observed)
+    assert observed[1]["page_image_resolver"] is None
+    assert observed[1].get("enable_static_status_validation", False) is False
+    assert observed[1].get("enable_candidate_b_amount_pairing", False) is False
     assert observed[0]["lines"] == [canonical_line]
 
 
@@ -246,7 +323,7 @@ def test_monthly_sequence_holes_are_reported_from_schema_not_legacy_ocr(monkeypa
     )
     monkeypatch.setattr(
         "docmirror.plugins.credit_report.repayment_grid.records_from_micro_grid_dict",
-        lambda _grid: list(records),
+        lambda _grid, **_kwargs: list(records),
     )
     monkeypatch.setattr(
         "docmirror.plugins.credit_report.repayment_grid.dedupe_repayment_records",
@@ -276,7 +353,7 @@ def test_page_orientation_score_prefers_horizontal_rows_on_portrait_page() -> No
     )
 
 
-def test_inquiry_schema_joins_headerless_pages_and_splits_merged_date_cell() -> None:
+def test_inquiry_schema_joins_headerless_pages_but_withholds_merged_date_cell() -> None:
     def table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
         return SimpleNamespace(table_id=table_id, metadata={"raw_rows": rows}, bbox=[10, 10, 590, 700])
 
@@ -299,13 +376,18 @@ def test_inquiry_schema_joins_headerless_pages_and_splits_merged_date_cell() -> 
     for page in pages:
         page.canonical_template_id = "annotations_and_inquiries"
 
-    rows = _extract_inquiries(SimpleNamespace(pages=pages))
+    context = SimpleNamespace(pages=pages)
+    rows = _extract_inquiries(context)
 
     institutional = [row for row in rows if row["inquiry_type"] == "institution"]
     personal = [row for row in rows if row["inquiry_type"] == "personal"]
-    assert [row["sequence"] for row in institutional] == [1, 2, 3]
-    assert institutional[-1]["institution"] == "机构丙"
+    assert [row["sequence"] for row in institutional] == [1, 2]
     assert [row["sequence"] for row in personal] == [1]
+    assert any(
+        issue.get("issue_code") == "candidate_b_inquiry_row_cells_unresolved"
+        and issue.get("observed_value", {}).get("sequence") == 3
+        for issue in context._personal_detail_extraction_issues
+    )
 
 
 def test_canonical_inquiry_lines_correct_prefixed_sequence_noise_without_value_lexicon() -> None:
@@ -320,9 +402,64 @@ def test_canonical_inquiry_lines_correct_prefixed_sequence_noise_without_value_l
         ],
     }
 
-    rows = _canonical_inquiry_line_rows(SimpleNamespace(corrected_evidence_pages=lambda: [page]))
+    context = SimpleNamespace(corrected_evidence_pages=lambda: [page])
+    rows = _canonical_inquiry_line_rows(context)
 
     assert [row["sequence"] for row in rows] == [88, 89, 90]
     assert rows[1]["institution"] == "机构乙"
-    assert rows[1]["extraction_status"] == "review"
-    assert rows[1]["audit"]["raw_sequence"] == 789
+    assert "extraction_status" not in rows[1]
+    assert any(
+        issue.get("issue_code") == "candidate_b_inquiry_sequence_prefix_noise_corrected"
+        and issue.get("target_record_id") == rows[1]["inquiry_id"]
+        and issue.get("field_name") == "sequence"
+        and issue.get("observed_value", {}).get("raw_sequence") == 789
+        and issue.get("candidate_value", {}).get("normalized_sequence") == 89
+        and issue.get("severity") == "info"
+        and issue.get("status") == "resolved"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_canonical_inquiry_line_uses_longest_reason_suffix_and_final_boundary() -> None:
+    line = _line(
+        "1 2024.01.02 深圳前海微众银行股份有限公司 法人代表、负责人、高管等资信审查",
+        [10, 10, 580, 28],
+    )
+    evidence = {
+        "page": 28,
+        "source_page": 14,
+        "canonical_template_id": "annotations_and_inquiries",
+        "lines": [line],
+    }
+    table = SimpleNamespace(
+        table_id="inquiries",
+        bbox=[10, 5, 590, 40],
+        metadata={
+            "raw_rows": [
+                ["编号", "查询日期", "查询机构", "查询原因"],
+                [
+                    "1",
+                    "2024.01.02",
+                    "深圳前海微众银行股份有限公司 法人代表、负责人、高管等",
+                    "资信审查",
+                ],
+            ]
+        },
+        headers=[],
+        rows=[],
+        confidence=0.99,
+    )
+    page = _page(28, source=14, tables=[table])
+    page.canonical_template_id = "annotations_and_inquiries"
+    context = SimpleNamespace(
+        pages=[page],
+        corrected_evidence_pages=lambda: [evidence],
+    )
+
+    line_rows = _canonical_inquiry_line_rows(context)
+    final_rows = _extract_inquiries(context)
+
+    assert line_rows[0]["institution"] == "深圳前海微众银行股份有限公司"
+    assert line_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"
+    assert final_rows[0]["institution"] == "深圳前海微众银行股份有限公司"
+    assert final_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"

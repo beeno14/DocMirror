@@ -42,14 +42,28 @@
         "domain_schema": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["id", "version", "contract_uri", "compatibility"],
+          "required": ["id", "version", "contract_uri", "compatibility", "dataset_status_semantics"],
           "properties": {
             "id": {"const": "personal_credit_report_detailed"},
             "version": {"const": "2.0.0"},
             "contract_uri": {
               "const": "https://valuemapglobal.github.io/DocMirror/schemas/personal_credit_report_detailed.schema.json"
             },
-            "compatibility": {"type": "string", "minLength": 1}
+            "compatibility": {"type": "string", "minLength": 1},
+            "dataset_status_semantics": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode", "present_dataset_without_status",
+                "absent_dataset_without_status", "status_row_present"
+              ],
+              "properties": {
+                "mode": {"const": "potentially_flawed_only"},
+                "present_dataset_without_status": {"const": "silently_trusted_complete"},
+                "absent_dataset_without_status": {"const": "silently_trusted_empty_or_not_applicable"},
+                "status_row_present": {"const": "partial_unknown_or_failed_extraction"}
+              }
+            }
           }
         }
       },
@@ -173,6 +187,20 @@
           }
         },
         "reading_columns": {"type": "array", "items": {"type": "string"}},
+        "sparse_status_semantics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode", "present_dataset_without_status",
+            "absent_dataset_without_status", "status_row_present"
+          ],
+          "properties": {
+            "mode": {"const": "potentially_flawed_only"},
+            "present_dataset_without_status": {"const": "silently_trusted_complete"},
+            "absent_dataset_without_status": {"const": "silently_trusted_empty_or_not_applicable"},
+            "status_row_present": {"const": "partial_unknown_or_failed_extraction"}
+          }
+        },
         "representation_role": {"enum": ["source_canonical", "business_canonical", "control"]},
         "derived_from": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "foreign_keys": {
@@ -226,7 +254,7 @@
             "required": ["monthly_performance_id", "account_id", "performance_month", "status_code"],
             "properties": {
               "performance_month": {"$ref": "#/$defs/month"},
-              "status_code": {"enum": ["*", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "#", "unknown"]},
+              "status_code": {"enum": ["*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z", "unknown"]},
               "status_amount": {"$ref": "#/$defs/decimalString"},
               "status_amount_semantics": {"enum": ["delinquent_amount", "overdraft_balance", null]}
             }

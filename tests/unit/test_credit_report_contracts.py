@@ -8,6 +8,7 @@ from docmirror.plugins.credit_report.contracts import CONTENT_MODE_SCANNED
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     PBOC_DATASET_ORDER,
     personal_detail_semantic_extensions,
+    project_personal_detail_datasets,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
     _summary_value,
@@ -176,7 +177,7 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
             "personal_detail_summary_records": [
                 {
                     "summary_record_id": "summary:1",
-                    "summary_type": "account_count",
+                    "summary_type": "信用业务概要",
                     "title": "信贷交易信息提示",
                     "source_table_id": "table:1",
                 }
@@ -185,17 +186,17 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
                 {
                     "summary_cell_id": "cell:1",
                     "summary_record_id": "summary:1",
-                    "summary_type": "account_count",
+                    "summary_type": "信用业务概要",
                     "title": "信贷交易信息提示",
                     "row_index": 1,
                     "column_index": 1,
-                    "column_label": "账户类型",
-                    "value": "贷款",
+                    "column_label": "业务类型",
+                    "value": "其他类贷款",
                 },
                 {
                     "summary_cell_id": "cell:2",
                     "summary_record_id": "summary:1",
-                    "summary_type": "account_count",
+                    "summary_type": "信用业务概要",
                     "title": "信贷交易信息提示",
                     "row_index": 1,
                     "column_index": 2,
@@ -238,9 +239,9 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
 
     metrics = datasets["personal_detail_credit_summary_metrics"]
     account_count = next(row for row in metrics if row["metric_name"] == "账户数")
-    assert account_count["row_dimension_name"] == "账户类型"
-    assert account_count["row_dimension_value"] == "贷款"
-    assert account_count["business_category"] == "贷款"
+    assert account_count["row_dimension_name"] == "业务类型"
+    assert account_count["row_dimension_value"] == "其他类贷款"
+    assert account_count["business_category"] == "其他类贷款"
     assert account_count["numeric_value"] == "23505"
     assert account_count["reporting_status"] == "reported"
     assert account_count["metric_code"] == "account_count"
@@ -256,3 +257,33 @@ def test_personal_detail_contract_projects_values_without_inventing_absence() ->
     assert statuses["mobile_phone_records"]["presence_status"] == "unknown"
     assert statuses["mobile_phone_records"]["reason"] == "source_presence_not_established"
     assert "spouse_records" not in statuses
+
+
+def test_unmapped_summary_cells_are_quarantined_from_typed_business_overview() -> None:
+    content = {
+        "facts": {},
+        "datasets": {
+            "personal_detail_summary_cells": [
+                {
+                    "summary_cell_id": "cell:unknown",
+                    "summary_record_id": "summary:unknown",
+                    "summary_type": "未知概要表",
+                    "row_index": 1,
+                    "column_index": 1,
+                    "column_label": "未知业务字段",
+                    "value": "原始业务值",
+                    "source_refs": [{"logical_page": 2, "bbox": [1, 2, 3, 4]}],
+                }
+            ]
+        },
+    }
+
+    prepared = prepare_personal_detail_source_collections(content)
+    projected = project_personal_detail_datasets(prepared["datasets"])
+
+    assert "credit_business_overview" not in projected
+    assert "pboc_extension_fields" not in projected
+    issues = [row.get("normalized", row) for row in projected["extraction_issues"]]
+    issue = next(row for row in issues if row["issue_code"] == "canonical_summary_cell_unmapped")
+    assert issue["target_dataset"] == "credit_business_overview"
+    assert issue["field_name"] == "未知业务字段"

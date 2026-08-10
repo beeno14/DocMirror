@@ -692,6 +692,248 @@ def _unstructured_content_failures(
     return failures
 
 
+_ATTACHMENT_TYPED_AMOUNT_FIELDS = (
+    "credit_limit",
+    "loan_amount",
+    "discount_amount",
+    "instrument_amount",
+    "guarantee_amount",
+)
+_ATTACHMENT_AMOUNT_KINDS = frozenset({"amount", *_ATTACHMENT_TYPED_AMOUNT_FIELDS})
+
+
+def _field_resolution_info(record: dict[str, Any], field_name: str) -> dict[str, Any]:
+    field_info = record.get("field_info")
+    if not isinstance(field_info, dict):
+        return {}
+    details = field_info.get(field_name)
+    return dict(details) if isinstance(details, dict) else {}
+
+
+def _attachment_amount_resolution_failures(
+    datasets: dict[str, list[dict[str, Any]]],
+) -> tuple[list[EnterpriseExtractionFailure], int]:
+    """Enforce one authoritative amount meaning without attempting re-extraction."""
+
+    dataset = "enterprise_attachment_credit_details"
+    failures: list[EnterpriseExtractionFailure] = []
+    checked = 0
+    for index, record in enumerate(datasets.get(dataset) or (), start=1):
+        checked += 1
+        record_id = _record_id(dataset, record, index)
+        amount = _record_value(record, "amount")
+        amount_kind = str(_record_value(record, "amount_kind") or "")
+        info = _field_resolution_info(record, "amount_kind")
+        basis = str(info.get("basis") or "")
+        populated = [
+            field_name
+            for field_name in _ATTACHMENT_TYPED_AMOUNT_FIELDS
+            if not _is_missing(_record_value(record, field_name))
+        ]
+        statuses = {
+            field_name: str(_record_value(record, f"{field_name}_status") or "")
+            for field_name in _ATTACHMENT_TYPED_AMOUNT_FIELDS
+        }
+        evidence = {
+            "amount": amount,
+            "amount_kind": amount_kind,
+            "business_category": _record_value(record, "business_category"),
+            "business_type": _record_value(record, "business_type"),
+            "source_label": info.get("source_label"),
+            "resolution_basis": basis,
+            "populated_typed_fields": populated,
+            "typed_statuses": statuses,
+        }
+
+        invariant_errors: list[str] = []
+        if amount_kind not in _ATTACHMENT_AMOUNT_KINDS:
+            invariant_errors.append("invalid_amount_kind")
+        if _is_missing(amount):
+            invariant_errors.append("compatibility_amount_missing")
+        if amount_kind == "amount":
+            if populated:
+                invariant_errors.append("generic_amount_has_typed_value")
+            if any(status != "unresolved" for status in statuses.values()):
+                invariant_errors.append("generic_amount_status_not_unresolved")
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_ATTACHMENT_AMOUNT_KIND_UNRESOLVED",
+                    message="Attachment detail retained 金额 but its authoritative business meaning is unresolved.",
+                    stage="canonical_extraction",
+                    path=f"/data/{dataset}/{record_id}/amount_kind",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="amount_kind",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence=evidence,
+                )
+            )
+        elif amount_kind in _ATTACHMENT_TYPED_AMOUNT_FIELDS:
+            if populated != [amount_kind]:
+                invariant_errors.append("typed_amount_population_mismatch")
+            elif _numeric(_record_value(record, amount_kind)) != _numeric(amount):
+                invariant_errors.append("typed_amount_value_mismatch")
+            expected_selected_status = (
+                "reported"
+                if basis == "source_header"
+                else "derived"
+                if basis in {"business_category", "business_type"}
+                else ""
+            )
+            if expected_selected_status and statuses[amount_kind] != expected_selected_status:
+                invariant_errors.append("selected_amount_status_mismatch")
+            if any(
+                status != "not_applicable"
+                for field_name, status in statuses.items()
+                if field_name != amount_kind
+            ):
+                invariant_errors.append("non_selected_amount_status_mismatch")
+
+        if invariant_errors:
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_ATTACHMENT_AMOUNT_INVARIANT_VIOLATION",
+                    message="Attachment detail amount alias, typed value, or source status is inconsistent.",
+                    stage="canonical_validation",
+                    path=f"/data/{dataset}/{record_id}/amount",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="amount",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence={**evidence, "violations": invariant_errors},
+                )
+            )
+
+        conflicts = [str(value) for value in (info.get("conflicts") or ()) if str(value)]
+        if conflicts:
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_ATTACHMENT_AMOUNT_CONTEXT_CONFLICT",
+                    message="Authoritative amount evidence disagrees with a lower-precedence business context.",
+                    stage="canonical_extraction",
+                    severity="warning",
+                    path=f"/data/{dataset}/{record_id}/amount_kind",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="amount_kind",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence={**evidence, "conflicts": conflicts},
+                )
+            )
+    return failures, checked
+
+
+def _public_resolution_failures(
+    public_records: Iterable[dict[str, Any]],
+) -> tuple[list[EnterpriseExtractionFailure], int]:
+    """Expose unresolved public typing and pointer provenance instead of guessing silently."""
+
+    failures: list[EnterpriseExtractionFailure] = []
+    checked = 0
+    for index, record in enumerate(public_records, start=1):
+        if not isinstance(record, dict):
+            continue
+        checked += 1
+        record_type = str(record.get("record_type") or "")
+        dataset = f"enterprise_public_{record_type}_records" if record_type else "enterprise_public_records"
+        record_id = str(record.get("public_record_id") or f"public_record:r{index:06d}")
+        type_info = _field_resolution_info(record, "record_type")
+        type_state = str(type_info.get("source_state") or "")
+        if type_state == "unresolved":
+            dataset = "enterprise_public_records"
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_PUBLIC_RECORD_TYPE_UNRESOLVED",
+                    message="A public-record table has no unique authoritative business type.",
+                    stage="canonical_extraction",
+                    path=f"/data/{dataset}/{record_id}/record_type",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="record_type",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence={
+                        "record_type": record_type,
+                        "resolution_basis": type_info.get("basis"),
+                        "source_value": type_info.get("source_value"),
+                    },
+                )
+            )
+        type_conflicts = [str(value) for value in (type_info.get("conflicts") or ()) if str(value)]
+        if type_conflicts:
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_PUBLIC_CONTEXT_CONFLICT",
+                    message="Public table text conflicts with the bound canonical section heading.",
+                    stage="canonical_extraction",
+                    severity="warning",
+                    path=f"/data/{dataset}/{record_id}/record_type",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="record_type",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence={"conflicts": type_conflicts, "record_type": record_type},
+                )
+            )
+        if (
+            type_state == "derived"
+            and type_info.get("basis") == "canonical_section_heading"
+            and not type_info.get("source_refs")
+        ):
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_PUBLIC_CLASSIFICATION_PROVENANCE_MISSING",
+                    message="Derived public-record classification is missing its section-heading source reference.",
+                    stage="canonical_validation",
+                    path=f"/data/{dataset}/{record_id}/record_type",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="record_type",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                )
+            )
+
+        history_info = _field_resolution_info(record, "history_reference")
+        if history_info.get("source_state") == "unresolved":
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_PUBLIC_HISTORY_POINTER_AMBIGUOUS",
+                    message="A contribution-history pointer could not be parsed and bound uniquely.",
+                    stage="canonical_extraction",
+                    path=f"/data/{dataset}/{record_id}/history_reference",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="history_reference",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                    evidence={
+                        "resolution_basis": history_info.get("basis"),
+                        "source_value": history_info.get("source_value"),
+                    },
+                )
+            )
+        elif history_info and not history_info.get("source_refs"):
+            failures.append(
+                EnterpriseExtractionFailure(
+                    code="ENTERPRISE_PUBLIC_HISTORY_POINTER_PROVENANCE_MISSING",
+                    message="Structured contribution-history pointer is missing its source text reference.",
+                    stage="canonical_validation",
+                    path=f"/data/{dataset}/{record_id}/history_reference",
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name="history_reference",
+                    source_pages=_source_pages(record),
+                    source_refs=_source_refs(record),
+                )
+            )
+    return failures, checked
+
+
 def build_enterprise_extraction_report(
     document: CanonicalEnterpriseDocumentIR,
     datasets: dict[str, list[dict[str, Any]]],
@@ -699,6 +941,7 @@ def build_enterprise_extraction_report(
     continuation_audit: Iterable[dict[str, Any]],
     dataset_completeness: dict[str, dict[str, Any]],
     data_dictionary: dict[str, Any],
+    public_records: Iterable[dict[str, Any]] = (),
 ) -> EnterpriseExtractionReport:
     """Validate the canonical extraction without attempting a second extraction."""
     table_rows = _table_rows(document)
@@ -723,9 +966,13 @@ def build_enterprise_extraction_report(
         continuation_audit,
         dataset_completeness,
     )
+    amount_failures, amount_checked = _attachment_amount_resolution_failures(datasets)
+    public_failures, public_checked = _public_resolution_failures(public_records)
     failures.extend(singleton_failures)
     failures.extend(row_failures)
     failures.extend(record_failures)
+    failures.extend(amount_failures)
+    failures.extend(public_failures)
     failures.extend(_unstructured_content_failures(datasets, labels))
 
     deduplicated: list[EnterpriseExtractionFailure] = []
@@ -748,6 +995,7 @@ def build_enterprise_extraction_report(
             "satisfied_field_count": satisfied_fields,
             "failed_field_count": max(0, checked_fields - satisfied_fields),
             "record_contract_count": record_checked,
+            "semantic_resolution_check_count": amount_checked + public_checked,
             "source_component_count": len(document.components),
             "source_components_conserved": bool(document.entity_context.content_conserved),
         },

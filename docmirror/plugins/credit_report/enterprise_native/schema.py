@@ -12,7 +12,7 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
     """Return an enterprise-owned dictionary with no personal-report fields."""
     return {
         "schema_id": "enterprise_credit_report",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "definitions": {
             "authoritative_business_records": "datasets",
             "amount_storage": (
@@ -21,7 +21,18 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
             ),
             "missing_values": (
                 "JSON null means no normalized value. Reporting-status fields distinguish "
-                "not_reported, not_applicable, derived, and unresolved source values."
+                "reported, not_reported, not_applicable, section_absent, derived, and "
+                "unresolved source values."
+            ),
+            "field_provenance": (
+                "Profile business fields use explicit *_source_institution and "
+                "*_source_institution_status columns. Private semantic debug data also "
+                "retains field_info source coordinates. This is report business data, "
+                "separate from DocMirror capture provenance."
+            ),
+            "section_presence": (
+                "enterprise_section_presence emits every canonical PBOC enterprise section "
+                "as present_with_records, present_no_records, or absent_from_report."
             ),
             "date_semantics": (
                 "maturity_date is contractual 到期日; expiry_date is a validity/许可截止日期; "
@@ -67,8 +78,22 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
                 "reported": "已报告",
                 "not_reported": "未报告",
                 "not_applicable": "不适用",
+                "section_absent": "源报告不含该章节",
                 "derived": "派生值",
                 "unresolved": "未解析",
+            },
+            "source_state": {
+                "reported": "源报告已报告",
+                "not_reported": "字段存在但源报告未提供值",
+                "not_applicable": "字段不适用于该业务记录",
+                "section_absent": "源报告不含字段所属章节",
+                "derived": "由源报告字段确定性派生",
+                "unresolved": "源内容存在但尚未可靠解析",
+            },
+            "section_presence_status": {
+                "present_with_records": "章节存在且包含业务记录",
+                "present_no_records": "章节存在并明确无业务记录",
+                "absent_from_report": "源报告不含该章节",
             },
             "document_type": {
                 "enterprise_credit_report": "企业信用报告",

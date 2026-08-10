@@ -83,7 +83,7 @@ def test_enterprise_facility_detail_emits_every_declared_row_pair() -> None:
 
     rows = extract_enterprise_credit_lines_from_tables(result, [])
 
-    assert [row["account_identifier"] for row in rows] == [
+    assert [row["credit_agreement_identifier"] for row in rows] == [
         "B11215800H0001N24044608",
         "B11215800H0001N25027358",
     ]
@@ -371,13 +371,13 @@ def test_enterprise_public_overview_and_detail_type_counts_are_both_preserved() 
                 page_number=3,
                 source_page_number=3,
                 tables=[overview],
-                texts=[],
+                texts=[_native_text("信息概要", top=0)],
             ),
             SimpleNamespace(
                 page_number=10,
                 source_page_number=10,
                 tables=[license_record],
-                texts=[],
+                texts=[_native_text("公共记录明细", top=0)],
             ),
         ]
     )
@@ -385,14 +385,15 @@ def test_enterprise_public_overview_and_detail_type_counts_are_both_preserved() 
     document = build_canonical_enterprise_document(result)
     refined = extract_enterprise_semantic_document(document).credit_summary
 
-    assert refined["public_record_counts"] == {
+    assert refined["public_record_overview_counts"] == {
         "non_credit_accounts": 0,
         "tax_arrears": 0,
         "civil_judgments": 0,
         "enforcements": 0,
         "administrative_penalties": 0,
     }
-    assert refined["public_record_type_counts"] == {"license": 1}
+    assert refined["extracted_public_record_type_counts"] == {"license": 1}
+    assert refined["extracted_public_record_count"] == 1
 
 
 def test_enterprise_attachment_history_binds_to_visual_account_context() -> None:
@@ -1095,7 +1096,15 @@ def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=1, tables=[table, balances])])
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=1,
+                texts=[TextBlock(content="信息概要")],
+                tables=[table, balances],
+            )
+        ]
+    )
 
     semantic = _enterprise_semantic(result)
 
@@ -1105,9 +1114,9 @@ def test_enterprise_summary_uses_canonical_table_when_markdown_separates_headers
         "active_credit_institution_count": 2,
         "first_repayment_responsibility_year": 2024,
     }.items() <= semantic.credit_summary.items()
-    assert semantic.credit_summary["credit_balance"] == 37311.68
-    assert semantic.credit_summary["guarantee_balance"] == 6000
-    assert semantic.credit_summary["recovered_debt_balance"] == 0
+    assert semantic.credit_summary["credit_balance"] == "37311.68"
+    assert semantic.credit_summary["guarantee_balance"] == "6000"
+    assert semantic.credit_summary["recovered_debt_balance"] == "0"
 
 
 def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility_values() -> None:
@@ -1213,8 +1222,16 @@ def test_enterprise_canonical_cards_join_page_continuation_and_preserve_facility
     )
     result = SimpleNamespace(
         pages=[
-            PageContent(page_number=3, tables=[summary, facilities]),
-            PageContent(page_number=4, tables=[first_page]),
+            PageContent(
+                page_number=3,
+                texts=[TextBlock(content="信息概要")],
+                tables=[summary, facilities],
+            ),
+            PageContent(
+                page_number=4,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[first_page],
+            ),
             PageContent(page_number=5, tables=[continuation, revolving, facility_detail]),
         ]
     )
@@ -1292,7 +1309,15 @@ def test_enterprise_settled_cards_keep_closed_status_and_do_not_absorb_later_tab
             ]
         },
     )
-    result = SimpleNamespace(pages=[PageContent(page_number=8, tables=[settled, unrelated])])
+    result = SimpleNamespace(
+        pages=[
+            PageContent(
+                page_number=8,
+                texts=[TextBlock(content="信贷记录明细")],
+                tables=[settled, unrelated],
+            )
+        ]
+    )
 
     semantic = _enterprise_semantic(result)
     accounts = semantic.datasets["enterprise_credit_accounts"]
