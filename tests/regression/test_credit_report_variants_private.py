@@ -301,6 +301,11 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert not {"public_records", "report_notes", "repayment_records"} & set(datasets)
     assert validate_projection_payload("community_semantic", semantic).valid
     assert validate_projection_payload("community", payload).valid
+    assert not [
+        warning
+        for warning in payload["warnings"]
+        if warning["code"].startswith("PERSONAL_BRIEF_AUDIT_")
+    ]
 
     accounts = [row["normalized"] for row in datasets["credit_accounts"]["rows"]]
     credit_line = next(account for account in accounts if account["account_type"] == "credit_line")
@@ -1413,6 +1418,15 @@ def test_credit_report_subtype_projects_complete_v3(
     document_order = semantic["domain"]["extensions"].get("dataset_document_order")
     if document_order:
         assert dataset_names == [name for name in document_order if name in dataset_names]
+    personal_brief_audit_warnings = [
+        warning
+        for warning in payload["warnings"]
+        if warning["code"].startswith("PERSONAL_BRIEF_AUDIT_")
+    ]
+    if fixture.name in _DIGITAL_PERSONAL_BRIEF_EXPECTED:
+        assert personal_brief_audit_warnings == []
+    elif subtype != "personal_brief":
+        assert personal_brief_audit_warnings == []
     if subtype == "enterprise":
         enterprise_datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
         extraction = semantic["extraction"]
@@ -1657,7 +1671,7 @@ def test_credit_report_subtype_projects_complete_v3(
                 "snapshot_date": "2025-06-30",
                 "balance": "4800000",
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": "CNY_1",
             }
             rich_liability = semantic_datasets["repayment_liability_records"]["rows"][2]
             assert rich_liability["source"]["page_range"] == [2, 3]

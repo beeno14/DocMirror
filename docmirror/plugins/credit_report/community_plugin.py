@@ -46,6 +46,21 @@ _PERSONAL_DETAIL_SPARSE_STATUS_SEMANTICS = {
 }
 
 
+def _merge_warning_page_range(
+    warning: dict[str, Any],
+    pages: Sequence[int],
+) -> None:
+    """Conserve all cited pages when compact findings share one warning row."""
+
+    positive_pages = [
+        int(page)
+        for page in [*(warning.get("page_range") or []), *pages]
+        if isinstance(page, int) and page > 0
+    ]
+    if positive_pages:
+        warning["page_range"] = [min(positive_pages), max(positive_pages)]
+
+
 def _personal_detail_source_rows(
     source_datasets: Sequence[Any],
 ) -> dict[str, list[dict[str, Any]]]:
@@ -370,6 +385,9 @@ class _CreditReportCommunityBundle(CommunityBundle):
         extraction = facts.pop("extraction_report", None)
         if isinstance(extraction, dict):
             payload["extraction"] = extraction
+        audit = facts.pop("audit_report", None)
+        if isinstance(audit, dict):
+            payload["audit"] = audit
         for key in tuple(facts):
             if key.startswith("enterprise_expected_"):
                 facts.pop(key, None)
@@ -435,12 +453,76 @@ class _CreditReportCommunityBundle(CommunityBundle):
             )
 
             payload = project_enterprise_community_json(payload)
+            audit = (
+                semantic_payload.get("audit")
+                if isinstance(semantic_payload.get("audit"), dict)
+                else {}
+            )
+            datasets_by_name = {
+                str(dataset.get("name") or ""): str(dataset.get("id") or "")
+                for dataset in payload.get("datasets") or []
+                if isinstance(dataset, dict)
+            }
+            warning_rows = [
+                warning
+                for warning in (payload.get("warnings") or [])
+                if isinstance(warning, dict)
+            ]
+            for finding in audit.get("findings") or []:
+                if not isinstance(finding, dict) or finding.get("severity") not in {
+                    "warning",
+                    "error",
+                }:
+                    continue
+                code = str(finding.get("code") or "ENTERPRISE_AUDIT_REVIEW")
+                path = str(finding.get("path") or "")
+                message = (
+                    f"{code}: {str(finding.get('message') or '').strip()}"
+                    f"{' Review ' + path + '.' if path else ''}"
+                )
+                warning = next(
+                    (
+                        row
+                        for row in warning_rows
+                        if row.get("code") == code and row.get("message") == message
+                    ),
+                    None,
+                )
+                if warning is None:
+                    warning = {
+                        "code": code,
+                        "level": (
+                            "error" if finding.get("severity") == "error" else "warning"
+                        ),
+                        "message": message,
+                    }
+                    warning_rows.append(warning)
+                dataset_id = datasets_by_name.get(str(finding.get("dataset") or ""))
+                if dataset_id:
+                    warning["dataset_id"] = dataset_id
+                pages = sorted(
+                    {
+                        int(page)
+                        for page in (finding.get("source_pages") or [])
+                        if str(page).isdigit() and int(page) > 0
+                    }
+                )
+                if pages:
+                    _merge_warning_page_range(warning, pages)
+            payload["warnings"] = warning_rows
         elif personal_brief:
+            from docmirror.plugins.credit_report.personal_brief_native.audit import (
+                append_personal_brief_observational_warnings,
+            )
             from docmirror.plugins.credit_report.personal_brief_native.projector import (
                 project_personal_brief_community_json,
             )
 
             payload = project_personal_brief_community_json(payload)
+            payload = append_personal_brief_observational_warnings(
+                semantic_payload,
+                payload,
+            )
         elif scanned_personal_detail:
             _compact_personal_detail_public_projection(
                 payload,

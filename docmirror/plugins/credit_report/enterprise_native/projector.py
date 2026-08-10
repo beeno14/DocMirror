@@ -10,8 +10,8 @@ from copy import deepcopy
 from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
+from docmirror.plugins.credit_report.enterprise_native.audit import audit_warning_strings
 from docmirror.plugins.credit_report.enterprise_native.pipeline import run_enterprise_pipeline
-from docmirror.plugins.credit_report.enterprise_native.quality import quality_warning
 from docmirror.plugins.credit_report.projection import (
     _account_structure_warnings,
     _records,
@@ -1236,6 +1236,7 @@ def derive_enterprise_projection(plugin: Any, parse_result: Any, full_text: str 
     domain_facts["content_mode"] = content_mode
     domain_facts["credit_summary"] = semantic_document.credit_summary
     domain_facts["extraction_report"] = semantic_document.extraction_report
+    domain_facts["audit_report"] = semantic_document.audit_report
     domain_facts["source_information_quality"] = {
         "status": (
             "bad_input"
@@ -1252,7 +1253,13 @@ def derive_enterprise_projection(plugin: Any, parse_result: Any, full_text: str 
             "confidence": document.confidence,
         }
         for key, value in domain_facts.items()
-        if key not in {"credit_summary", "extraction_report", "source_information_quality"}
+        if key
+        not in {
+            "credit_summary",
+            "extraction_report",
+            "audit_report",
+            "source_information_quality",
+        }
         and value not in (None, "")
     }
     domain_facts["data_dictionary"] = variant.data_dictionary()
@@ -1269,17 +1276,7 @@ def derive_enterprise_projection(plugin: Any, parse_result: Any, full_text: str 
             [
                 *list(getattr(getattr(parse_result, "parser_info", None), "warnings", None) or []),
                 *_account_structure_warnings(accounts),
-                *[
-                    quality_warning(flag)
-                    for flag in semantic_document.quality_flags
-                    if flag.get("severity") in {"warning", "error"}
-                ],
-                *[
-                    f"{failure.get('code', 'ENTERPRISE_EXTRACTION_FAILURE')}: "
-                    f"{failure.get('message', '')}".strip()
-                    for failure in semantic_document.extraction_report.get("failures") or []
-                    if isinstance(failure, dict)
-                ],
+                *audit_warning_strings(semantic_document.audit_report),
             ]
         )
     )

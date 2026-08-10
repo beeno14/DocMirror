@@ -83,6 +83,9 @@ _LIN_EXPECTED_SOURCE_VETTED_ACCOUNT_TYPES = {
 _LIN_EXPECTED_MONTH_POSITIONS = 944
 _LIN_EXPECTED_INQUIRIES = 90
 _LIN_EXPECTED_LIABILITIES = 3
+_YE_EXPECTED_MONTH_POSITIONS = 951
+_YE_EXPECTED_STATUS_WITHHELD = 121
+_YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS = 42
 _YE_RECOVERED_CARD_IDS = {
     "B10911000H000115603050013394541",
     "B11313900H000115603090424251222",
@@ -91,6 +94,57 @@ _YE_RECOVERED_CARD_IDS = {
     "B10611000H00016226880219191368607",
     "B11911000H000115661000042356833",
 }
+_YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS = {
+    "credit_account:revolving_loan_subaccount:1": "B10611000H0001811132129417001",
+    "credit_account:revolving_loan_subaccount:2": (
+        "B10111000H0001140201019800104930030100000661000020000001"
+    ),
+    "credit_account:revolving_loan_subaccount:3": (
+        "B10111000H0001140201019800104930030100000661000030000001"
+    ),
+    "credit_account:revolving_loan_subaccount:4": (
+        "B10111000H0001140201019800104930030100000661000010000001"
+    ),
+    "credit_account:revolving_loan_subaccount:5": (
+        "D10123970H0001HTM93505010211211293881001"
+    ),
+    "credit_account:revolving_loan_subaccount:6": "B10611000H0001811132137961001",
+}
+_YE_CARD6_EXPECTED_FIELDS = {
+    "account_identifier": "D10123910H000115604050032149",
+    "credit_agreement_identifier": "D10123910H00010405000000032149",
+    "management_institution": "福建海峡银行股份有限公司",
+    "open_date": "2017-02-04",
+    "credit_limit": "30000",
+    "shared_credit_limit": None,
+    "account_currency": "CNY",
+    "business_type": "贷记卡",
+    "guarantee_type": "信用/无担保",
+}
+_YE_CARD7_EXPECTED_FIELDS = {
+    "account_identifier": "B10411000H000115602800002159651279117266",
+    "management_institution": "中国建设银行股份有限公司福州城北支行",
+    "open_date": "2018-02-01",
+    "credit_limit": "1000",
+    "snapshot_date": "2024-02-25",
+}
+_YE_CARD8_EXPECTED_FIELDS = {
+    "account_identifier": "B10611000H00016226880219191368607",
+    "management_institution": "中信银行股份有限公司信用卡中心",
+    "open_date": "2018-10-24",
+    "credit_limit": "13000",
+    "account_currency": "CNY",
+    "snapshot_date": "2024-02-15",
+    "balance": "12968",
+    "scheduled_payment": "639",
+    "actual_payment": "12780",
+    "last_repayment_date": "2024-02-02",
+}
+_YE_EXPECTED_MG_P12_MONTHS = (
+    *(f"2022-{month:02d}" for month in range(6, 13)),
+    *(f"2023-{month:02d}" for month in range(1, 13)),
+    *(f"2024-{month:02d}" for month in range(1, 4)),
+)
 _LIN_ACCOUNT_REQUIRED_FIELDS = {
     "management_institution": ("management_institution", {"management_institution"}),
     "account_identifier": ("account_identifier", {"account_identifier"}),
@@ -824,6 +878,198 @@ def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
         and evidence.get("evidence_path") == "withheld_month_count"
     )
     assert reported_withheld == omitted
+
+
+def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
+    """Partition every printed Ye month into one mutually exclusive outcome."""
+
+    datasets = _dataset_map(community)
+    monthly_dataset = datasets["credit_account_monthly_performance"]
+    monthly_wrappers = monthly_dataset.get("rows") or []
+    completeness = monthly_dataset.get("completeness") or {}
+    emitted = int(completeness.get("emitted_row_count") or 0)
+    omitted = int(completeness.get("omitted_row_count") or 0)
+    expected = int(completeness.get("expected_row_count") or 0)
+    assert monthly_dataset.get("row_count") == len(monthly_wrappers) == emitted
+    assert expected == emitted + omitted == _YE_EXPECTED_MONTH_POSITIONS
+
+    emitted_ids = {
+        str(
+            wrapper.get("record_id")
+            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+            or ""
+        )
+        for wrapper in monthly_wrappers
+    }
+    assert "" not in emitted_ids
+    assert len(emitted_ids) == emitted
+
+    issue_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issues"].get("rows") or []
+    ]
+    evidence_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issue_evidence"].get("rows") or []
+    ]
+    evidence_by_issue: dict[str, list[dict]] = {}
+    for evidence in evidence_rows:
+        evidence_by_issue.setdefault(
+            str(evidence.get("extraction_issue_id") or ""), []
+        ).append(evidence)
+
+    active_status_issue_codes = {
+        "pboc_cell_contract_unresolved",
+        "candidate_b_independent_plane_repayment_status_conflict",
+    }
+    status_issues = [
+        issue
+        for issue in issue_rows
+        if issue.get("target_dataset") == "credit_account_monthly_performance"
+        and issue.get("field_name") in {"status", "status_code"}
+        and issue.get("issue_code") in active_status_issue_codes
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    status_withheld_ids = {
+        str(issue.get("target_record_id") or "") for issue in status_issues
+    }
+    assert "" not in status_withheld_ids
+    assert len(status_withheld_ids) == len(status_issues) == _YE_EXPECTED_STATUS_WITHHELD
+    assert status_withheld_ids.isdisjoint(emitted_ids)
+
+    status_grid_issues = [
+        issue
+        for issue in issue_rows
+        if issue.get("target_dataset") == "credit_account_monthly_performance"
+        and issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    aggregate_status_ids: set[str] = set()
+    reported_status_count = 0
+    for issue in status_grid_issues:
+        issue_id = str(issue.get("extraction_issue_id") or "")
+        evidence = evidence_by_issue.get(issue_id, [])
+        grid_ids = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "grid_id"
+        }
+        months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and re.fullmatch(r"withheld_months\[\d+\]", str(row.get("evidence_path") or ""))
+        }
+        reported_counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "withheld_month_count"
+        ]
+        assert len(grid_ids) == len(reported_counts) == 1, issue_id
+        assert reported_counts[0] == len(months), issue_id
+        reported_status_count += reported_counts[0]
+        grid_id = next(iter(grid_ids))
+        record_ids = {f"{grid_id}:{month}" for month in months}
+        assert aggregate_status_ids.isdisjoint(record_ids), issue_id
+        aggregate_status_ids.update(record_ids)
+    assert reported_status_count == _YE_EXPECTED_STATUS_WITHHELD
+    assert aggregate_status_ids == status_withheld_ids
+
+    structural_issues = [
+        issue
+        for issue in issue_rows
+        if issue.get("target_dataset") == "credit_account_monthly_performance"
+        and issue.get("issue_code") == "canonical_monthly_reconstruction_incomplete"
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    assert len(structural_issues) == 1
+    structural_evidence = evidence_by_issue.get(
+        str(structural_issues[0].get("extraction_issue_id") or ""), []
+    )
+    unlocalized_counts = [
+        int(row.get("integer_value") or 0)
+        for row in structural_evidence
+        if row.get("evidence_kind") == "candidate"
+        and row.get("evidence_path") == "missing_month_count"
+    ]
+    localization_statuses = {
+        str(row.get("string_value") or "")
+        for row in structural_evidence
+        if row.get("evidence_kind") == "candidate"
+        and row.get("evidence_path") == "localization_status"
+    }
+    within_series_counts = [
+        int(row.get("integer_value") or 0)
+        for row in structural_evidence
+        if row.get("evidence_kind") == "candidate"
+        and row.get("evidence_path") == "within_series_missing_position_count"
+    ]
+    assert unlocalized_counts == [_YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS]
+    assert localization_statuses == {"unresolved_from_detached_source_structure"}
+    assert within_series_counts == [0]
+    unlocalized = unlocalized_counts[0]
+
+    owner_issues = [
+        issue
+        for issue in issue_rows
+        if issue.get("target_dataset") == "credit_account_monthly_performance"
+        and issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    unowned_ids: set[str] = set()
+    for issue in owner_issues:
+        issue_id = str(issue.get("extraction_issue_id") or "")
+        evidence = evidence_by_issue.get(issue_id, [])
+        grid_ids = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "grid_id"
+        }
+        expected_counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "candidate"
+            and row.get("evidence_path") == "expected_month_count"
+        ]
+        observed_counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "observed_candidate_count"
+        ]
+        expected_months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "candidate"
+            and re.fullmatch(r"expected_months\[\d+\]", str(row.get("evidence_path") or ""))
+        }
+        observed_months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and re.fullmatch(
+                r"observed_candidate_months\[\d+\]",
+                str(row.get("evidence_path") or ""),
+            )
+        }
+        assert len(grid_ids) == len(expected_counts) == len(observed_counts) == 1, issue_id
+        assert expected_counts[0] == observed_counts[0] == len(expected_months), issue_id
+        assert observed_months == expected_months, issue_id
+        grid_id = next(iter(grid_ids))
+        record_ids = {f"{grid_id}:{month}" for month in expected_months}
+        assert unowned_ids.isdisjoint(record_ids), issue_id
+        unowned_ids.update(record_ids)
+    assert unowned_ids.isdisjoint(emitted_ids | status_withheld_ids)
+
+    assert omitted == len(status_withheld_ids) + unlocalized + len(unowned_ids)
+    assert expected == emitted + len(status_withheld_ids) + unlocalized + len(unowned_ids)
 
 
 def _assert_lin_risky_zero_amount_cells_oracle(community: dict) -> None:
@@ -1936,6 +2182,12 @@ def test_personal_detail_ocr_correction_invariants(
         }
         assert set(recovered_card_types) == _YE_RECOVERED_CARD_IDS
         assert set(recovered_card_types.values()) == {"credit_card"}
+        ye_account_failures: list[str] = []
+        _append_ye_account_identity_oracle_failures(v2_datasets, ye_account_failures)
+        _append_ye_mg_p12_owner_oracle_failures(v2_datasets, ye_account_failures)
+        assert not ye_account_failures, "Live Ye account oracle failures:\n- " + "\n- ".join(
+            ye_account_failures
+        )
         assert account_completeness["expected_row_count"] == 42
         assert account_completeness["emitted_row_count"] == len(account_rows)
         assert account_completeness["expected_row_count"] == (
@@ -1964,22 +2216,31 @@ def test_personal_detail_ocr_correction_invariants(
         ):
             _assert_monthly_status_value_or_reported(payload, record_id, "N")
 
-        # Population shortfalls are governed by the structured checks above;
-        # this block pins the quality of values that were safely emitted.
-        assert len(institutional) >= 94
-        if len(institutional) < 96:
-            gap = next(
-                issue
-                for issue in collect_extraction_issues(context)
-                if issue.get("issue_code") == "canonical_inquiry_sequence_gap"
-                and (issue.get("observed_value") or {}).get("inquiry_type") == "institution"
-            )
-            assert gap["candidate_value"]["missing_sequences"]
-            assert "dataset_incomplete" in gap["reason_codes"]
+        assert len(institutional) == 96
         assert len(personal) == 16
-        if len(institutional) == 96:
-            assert [row["sequence"] for row in institutional] == list(range(1, 97))
+        assert [row["sequence"] for row in institutional] == list(range(1, 97))
         assert [row["sequence"] for row in personal] == list(range(1, 17))
+        institutional_by_sequence = {int(row["sequence"]): row for row in institutional}
+        assert len(institutional_by_sequence) == 96
+        assert (
+            institutional_by_sequence[5]["inquiry_date"],
+            institutional_by_sequence[5]["institution"],
+            institutional_by_sequence[5]["reason"],
+        ) == ("2024-02-07", "兴业银行股份有限公司", "贷后管理")
+        assert (
+            institutional_by_sequence[27]["inquiry_date"],
+            institutional_by_sequence[27]["institution"],
+            institutional_by_sequence[27]["reason"],
+        ) == ("2023-09-09", "兴业银行股份有限公司", "贷后管理")
+        assert (
+            institutional_by_sequence[69]["inquiry_date"],
+            institutional_by_sequence[69]["institution"],
+            institutional_by_sequence[69]["reason"],
+        ) == (
+            "2022-10-11",
+            "中信银行股份有限公司个人信贷部",
+            "贷后管理",
+        )
         assert audit["applied_count"] >= 70
 
 
@@ -2021,6 +2282,223 @@ def test_saved_lin_semantic_account_fragment_oracle() -> None:
     assert not saved_oracle_failures, "Saved Lin oracle failures:\n- " + "\n- ".join(
         saved_oracle_failures
     )
+
+
+def _append_ye_account_identity_oracle_failures(
+    datasets: dict[str, dict], failures: list[str]
+) -> None:
+    account_wrappers = [
+        wrapper
+        for wrapper in datasets["credit_accounts"].get("rows") or []
+        if isinstance(wrapper, dict)
+    ]
+    account_pairs = [
+        (wrapper, wrapper.get("normalized") or {}) for wrapper in account_wrappers
+    ]
+    accounts_by_id: dict[str, list[tuple[dict, dict]]] = {}
+    for wrapper, account in account_pairs:
+        accounts_by_id.setdefault(str(account.get("account_id") or ""), []).append(
+            (wrapper, account)
+        )
+
+    expected_r1_ids = set(_YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS)
+    observed_r1_ids = {
+        str(account.get("account_id") or "")
+        for _, account in account_pairs
+        if account.get("account_type") == "revolving_loan_subaccount"
+    }
+    if observed_r1_ids != expected_r1_ids:
+        failures.append(
+            f"R1 account IDs={sorted(observed_r1_ids)!r}, expected={sorted(expected_r1_ids)!r}"
+        )
+    for account_id, expected_identifier in _YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS.items():
+        wrong_publications = [
+            {
+                "account_id": row.get("account_id"),
+                "account_type": row.get("account_type"),
+            }
+            for _, row in account_pairs
+            if row.get("account_identifier") == expected_identifier
+            and (
+                row.get("account_id") != account_id
+                or row.get("account_type") != "revolving_loan_subaccount"
+            )
+        ]
+        if wrong_publications:
+            failures.append(
+                f"{account_id}: identifier also published under wrong identity/family "
+                f"{wrong_publications!r}"
+            )
+        matches = accounts_by_id.get(account_id, [])
+        if len(matches) != 1:
+            failures.append(f"{account_id}: emitted account count={len(matches)}, expected 1")
+            continue
+        _, account = matches[0]
+        if account.get("account_type") != "revolving_loan_subaccount":
+            failures.append(
+                f"{account_id}: family={account.get('account_type')!r}, expected R1"
+            )
+        if account.get("account_identifier") != expected_identifier:
+            failures.append(
+                f"{account_id}: identifier={account.get('account_identifier')!r}, "
+                f"expected={expected_identifier!r}"
+            )
+
+    def _check_card(
+        account_id: str,
+        expected_fields: dict[str, object],
+        expected_page_range: list[int],
+    ) -> tuple[dict, dict] | None:
+        matches = accounts_by_id.get(account_id, [])
+        if len(matches) != 1:
+            failures.append(f"{account_id}: emitted account count={len(matches)}, expected 1")
+            return None
+        wrapper, account = matches[0]
+        field_mismatches = {
+            field_name: {
+                "observed": account.get(field_name),
+                "expected": expected_value,
+            }
+            for field_name, expected_value in expected_fields.items()
+            if account.get(field_name) != expected_value
+        }
+        if account.get("account_type") != "credit_card":
+            field_mismatches["account_type"] = {
+                "observed": account.get("account_type"),
+                "expected": "credit_card",
+            }
+        if field_mismatches:
+            failures.append(f"{account_id}: field mismatches={field_mismatches!r}")
+        page_range = (wrapper.get("source") or {}).get("page_range")
+        if page_range != expected_page_range:
+            failures.append(
+                f"{account_id}: page_range={page_range!r}, expected={expected_page_range!r}"
+            )
+        return wrapper, account
+
+    card6_pair = _check_card(
+        "credit_account:credit_card:6", _YE_CARD6_EXPECTED_FIELDS, [18, 18]
+    )
+    card7_pair = _check_card(
+        "credit_account:credit_card:7", _YE_CARD7_EXPECTED_FIELDS, [23, 23]
+    )
+    _check_card("credit_account:credit_card:8", _YE_CARD8_EXPECTED_FIELDS, [23, 24])
+
+    if card6_pair is not None:
+        _, card6 = card6_pair
+        if card6.get("account_identifier") == card6.get("credit_agreement_identifier"):
+            failures.append("card6 account identifier was copied from its agreement identifier")
+    card6_shared_observations = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["field_observations"].get("rows") or []
+        if (wrapper.get("normalized") or {}).get("dataset_name") == "credit_accounts"
+        and (wrapper.get("normalized") or {}).get("business_record_id")
+        == "credit_account:credit_card:6"
+        and (wrapper.get("normalized") or {}).get("field_name") == "shared_credit_limit"
+    ]
+    if not card6_shared_observations:
+        failures.append(
+            "card6 shared_credit_limit lacks an explicit ambiguous/unreadable observation"
+        )
+    else:
+        invalid_observations = [
+            observation
+            for observation in card6_shared_observations
+            if observation.get("observation_status") not in {"ambiguous", "unreadable"}
+            or observation.get("normalized_value") not in (None, "")
+        ]
+        if invalid_observations:
+            failures.append(
+                "card6 shared_credit_limit must remain explicitly unknown; invalid "
+                f"observations={invalid_observations!r}"
+            )
+
+    if card7_pair is not None:
+        _, card7 = card7_pair
+        card8_only_values = {
+            "snapshot_date": "2024-02-15",
+            "balance": "12968",
+            "scheduled_payment": "639",
+            "actual_payment": "12780",
+            "last_repayment_date": "2024-02-02",
+        }
+        contaminated = {
+            field_name: value
+            for field_name, value in card8_only_values.items()
+            if card7.get(field_name) == value
+        }
+        if contaminated:
+            failures.append(f"card7 absorbed card8-only detail values={contaminated!r}")
+
+
+def _append_ye_mg_p12_owner_oracle_failures(
+    datasets: dict[str, dict], failures: list[str]
+) -> None:
+    grid_id = "mg_p12_repayment_0"
+    expected_account_id = "credit_account:revolving_loan_subaccount:1"
+    expected_account_identifier = _YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS[expected_account_id]
+    expected_record_ids = {
+        f"{grid_id}:{performance_month}"
+        for performance_month in _YE_EXPECTED_MG_P12_MONTHS
+    }
+    monthly_wrappers = [
+        wrapper
+        for wrapper in datasets["credit_account_monthly_performance"].get("rows") or []
+        if (wrapper.get("normalized") or {}).get("grid_id") == grid_id
+    ]
+    observed_record_ids = {
+        str(
+            wrapper.get("record_id")
+            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+            or ""
+        )
+        for wrapper in monthly_wrappers
+    }
+    if observed_record_ids != expected_record_ids:
+        failures.append(
+            f"{grid_id}: monthly record IDs={sorted(observed_record_ids)!r}, "
+            f"expected={sorted(expected_record_ids)!r}"
+        )
+    wrong_owners = sorted(
+        {
+            (
+                str((wrapper.get("normalized") or {}).get("account_id") or ""),
+                str((wrapper.get("normalized") or {}).get("account_identifier") or ""),
+            )
+            for wrapper in monthly_wrappers
+            if (wrapper.get("normalized") or {}).get("account_id") != expected_account_id
+            or (wrapper.get("normalized") or {}).get("account_identifier")
+            != expected_account_identifier
+        }
+    )
+    if wrong_owners:
+        failures.append(
+            f"{grid_id}: wrong account owner/identifier pairs={wrong_owners!r}, "
+            f"expected={(expected_account_id, expected_account_identifier)!r}"
+        )
+
+    active_owner_issue_ids = {
+        str(issue.get("extraction_issue_id") or "")
+        for wrapper in datasets["extraction_issues"].get("rows") or []
+        for issue in [wrapper.get("normalized") or {}]
+        if issue.get("target_dataset") == "credit_account_monthly_performance"
+        and issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    }
+    mg_p12_owner_issue_ids = {
+        str(evidence.get("extraction_issue_id") or "")
+        for wrapper in datasets["extraction_issue_evidence"].get("rows") or []
+        for evidence in [wrapper.get("normalized") or {}]
+        if evidence.get("evidence_path") == "grid_id"
+        and evidence.get("string_value") == grid_id
+        and str(evidence.get("extraction_issue_id") or "") in active_owner_issue_ids
+    }
+    if mg_p12_owner_issue_ids:
+        failures.append(
+            f"{grid_id}: still has active unresolved-owner issues="
+            f"{sorted(mg_p12_owner_issue_ids)!r}"
+        )
 
 
 def test_saved_ye_population_and_month_geometry_oracle() -> None:
@@ -2103,8 +2581,23 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
         )
     if set(recovered_card_types.values()) - {"credit_card"}:
         failures.append(f"recovered cards have wrong families={recovered_card_types!r}")
+    _append_ye_account_identity_oracle_failures(datasets, failures)
+    _append_ye_mg_p12_owner_oracle_failures(datasets, failures)
 
-    inquiry_rows = [wrapper.get("normalized") or {} for wrapper in datasets["inquiries"]["rows"]]
+    inquiry_dataset = datasets["inquiries"]
+    inquiry_completeness = inquiry_dataset["completeness"]
+    if inquiry_dataset["row_count"] != 112:
+        failures.append(f"inquiries row_count={inquiry_dataset['row_count']!r}, expected 112")
+    if inquiry_completeness["emitted_row_count"] != 112:
+        failures.append(
+            f"inquiries emitted={inquiry_completeness['emitted_row_count']!r}, expected 112"
+        )
+    if inquiry_completeness["omitted_row_count"] != 0:
+        failures.append(
+            f"inquiries omitted={inquiry_completeness['omitted_row_count']!r}, expected 0"
+        )
+
+    inquiry_rows = [wrapper.get("normalized") or {} for wrapper in inquiry_dataset["rows"]]
     institutional_sequences = sorted(
         int(row["sequence"])
         for row in inquiry_rows
@@ -2115,7 +2608,7 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
         for row in inquiry_rows
         if row.get("query_channel") == "personal"
     )
-    expected_institutional = [*range(1, 27), *range(28, 97)]
+    expected_institutional = list(range(1, 97))
     if institutional_sequences != expected_institutional:
         failures.append(
             f"institution inquiry sequences={institutional_sequences!r}, "
@@ -2126,11 +2619,43 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
         failures.append(
             f"personal inquiry sequences={personal_sequences!r}, expected={expected_personal!r}"
         )
+    expected_institutional_rows = {
+        5: ("2024-02-07", "兴业银行股份有限公司", "贷后管理"),
+        27: ("2023-09-09", "兴业银行股份有限公司", "贷后管理"),
+        69: ("2022-10-11", "中信银行股份有限公司个人信贷部", "贷后管理"),
+    }
+    institutional_rows_by_sequence: dict[int, list[dict]] = {}
+    for row in inquiry_rows:
+        if row.get("query_channel") != "institution":
+            continue
+        institutional_rows_by_sequence.setdefault(int(row["sequence"]), []).append(row)
+    for sequence, expected_values in expected_institutional_rows.items():
+        matches = institutional_rows_by_sequence.get(sequence, [])
+        if len(matches) != 1:
+            failures.append(
+                f"institution inquiry {sequence}: emitted row count={len(matches)}, expected 1"
+            )
+            continue
+        row = matches[0]
+        observed_values = (
+            row.get("inquiry_date"),
+            row.get("institution"),
+            row.get("reason"),
+        )
+        if observed_values != expected_values:
+            failures.append(
+                f"institution inquiry {sequence}: values={observed_values!r}, "
+                f"expected={expected_values!r}"
+            )
 
     geometry_defects, compared_month_refs = _lin_month_ref_physical_ownership(semantic)
     if not compared_month_refs:
         failures.append("Ye physical month-column oracle compared no exact refs")
     failures.extend(geometry_defects)
+    try:
+        _assert_ye_monthly_position_conservation_oracle(community)
+    except AssertionError as exc:
+        failures.append(str(exc))
     for record_id in (
         "mg_p10_repayment_0:2022-06",
         "mg_p10_repayment_0:2020-08",

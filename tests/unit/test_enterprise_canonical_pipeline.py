@@ -574,4 +574,27 @@ def test_enterprise_semantic_schema_requires_the_failure_protocol() -> None:
         },
         "failures": [],
     }
+    missing_audit = validate_projection_payload("community_semantic", payload)
+    assert missing_audit.valid
+    payload["audit"] = {
+        "protocol": "pboc-enterprise-observational-audit",
+        "version": "1.0.0",
+        "mode": "observational",
+        "mutates_extraction": False,
+        "status": "clear",
+        "summary": {
+            "finding_count": 0,
+            "info_count": 0,
+            "warning_count": 0,
+            "error_count": 0,
+            "extraction_values_changed": 0,
+        },
+        "findings": [],
+    }
+    assert validate_projection_payload("community_semantic", payload).valid
+
+    payload["schema"]["document_type"] = "generic"
+    assert not validate_projection_payload("community_semantic", payload).valid
+    payload.pop("extraction")
+    payload.pop("audit")
     assert validate_projection_payload("community_semantic", payload).valid

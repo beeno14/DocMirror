@@ -12,6 +12,13 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_brief_native.contracts import (
+    PERSONAL_BRIEF_AMOUNT_UNIT_LABELS,
+    PERSONAL_BRIEF_ENUM_CONTRACT,
+    PERSONAL_BRIEF_MONEY_FIELDS,
+    PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+)
+
 
 def personal_brief_data_dictionary() -> dict[str, Any]:
     from docmirror.plugins.credit_report.semantic_enrichment import (
@@ -36,13 +43,8 @@ def personal_brief_data_dictionary() -> dict[str, Any]:
     ):
         enums[field_name] = dict(currency_labels)
 
-    amount_unit_labels = {
-        "yuan": "元",
-        "CNY_1": "元",
-        "CNY_10K": "万元（人民币）",
-    }
     for field_name in ("amount_unit", "reporting_amount_unit"):
-        enums[field_name] = dict(amount_unit_labels)
+        enums[field_name] = dict(PERSONAL_BRIEF_AMOUNT_UNIT_LABELS)
 
     dictionary["datasets"]["personal_report_metadata"]["columns"][
         "marital_status"
@@ -133,6 +135,25 @@ def personal_brief_data_dictionary() -> dict[str, Any]:
         "all": "全部",
     }
     enums.setdefault("account_type", {})["other_business"] = "其他业务"
+
+    # Dataset-qualified enum domains are the public contract.  Keep the
+    # top-level union for legacy display lookup, while publishing the precise
+    # domain on each dataset column for downstream consumers.
+    for (dataset_name, field_name), labels in PERSONAL_BRIEF_ENUM_CONTRACT.items():
+        descriptor = dictionary["datasets"][dataset_name]["columns"][field_name]
+        descriptor["enum"] = deepcopy(labels)
+        enums.setdefault(field_name, {}).update(deepcopy(labels))
+
+    for dataset_name, money_fields in PERSONAL_BRIEF_MONEY_FIELDS.items():
+        columns = dictionary["datasets"][dataset_name]["columns"]
+        columns["reporting_amount_unit"]["enum"] = deepcopy(
+            PERSONAL_BRIEF_AMOUNT_UNIT_LABELS
+        )
+        for field_name in money_fields:
+            columns[field_name]["unit"] = PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT
+    dictionary["datasets"]["personal_report_metadata"]["columns"][
+        "reporting_amount_unit"
+    ]["enum"] = deepcopy(PERSONAL_BRIEF_AMOUNT_UNIT_LABELS)
     return dictionary
 
 

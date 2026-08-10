@@ -83,6 +83,110 @@ def _scanner_table(
     }
 
 
+def _primitive_split_table(
+    split_effective_columns: tuple[int, ...],
+    *,
+    terminal_sliver: bool = False,
+) -> dict[str, object]:
+    """Represent one 13-cell lattice with exact scanner subdivisions."""
+
+    table = _scanner_table()
+    original_boxes = table["cell_bboxes"]
+    original_statuses = table["cell_geometry_status"]
+    original_bands = table["col_bands"]
+    assert isinstance(original_boxes, list)
+    assert isinstance(original_statuses, list)
+    assert isinstance(original_bands, list)
+
+    groups: list[tuple[int, ...]] = []
+    raw_bands: list[dict[str, float | int]] = []
+    raw_index = 0
+    for effective_col, band in enumerate(original_bands):
+        x0 = float(band["x0"])
+        x1 = float(band["x1"])
+        if effective_col in split_effective_columns:
+            midpoint = x0 + (x1 - x0) * 0.48
+            raw_bands.extend(
+                (
+                    {"index": raw_index, "x0": x0, "x1": midpoint},
+                    {"index": raw_index + 1, "x0": midpoint, "x1": x1},
+                )
+            )
+            groups.append((raw_index, raw_index + 1))
+            raw_index += 2
+        else:
+            raw_bands.append({"index": raw_index, "x0": x0, "x1": x1})
+            groups.append((raw_index,))
+            raw_index += 1
+
+    raw_boxes: list[list[list[float] | None]] = []
+    raw_statuses: list[list[str]] = []
+    spans: list[dict[str, int]] = []
+    original_spans = {
+        (int(span["row"]), int(span["col"])): span
+        for span in table["cell_spans"]  # type: ignore[union-attr]
+    }
+    for row_index, (box_row, status_row) in enumerate(
+        zip(original_boxes, original_statuses, strict=True)
+    ):
+        next_boxes: list[list[float] | None] = [None] * len(raw_bands)
+        next_statuses = ["missing"] * len(raw_bands)
+        for effective_col, group in enumerate(groups):
+            next_boxes[group[0]] = deepcopy(box_row[effective_col])
+            next_statuses[group[0]] = str(status_row[effective_col])
+            original_span = original_spans.get((row_index, effective_col))
+            row_span = int(original_span.get("row_span", 1)) if original_span else 1
+            if len(group) == 2 and str(status_row[effective_col]) == "exact":
+                next_statuses[group[1]] = "derived"
+                spans.append(
+                    {
+                        "row": row_index,
+                        "col": group[0],
+                        "row_span": row_span,
+                        "col_span": 2,
+                    }
+                )
+            elif original_span is not None:
+                spans.append(
+                    {
+                        "row": row_index,
+                        "col": group[0],
+                        "row_span": row_span,
+                        "col_span": 1,
+                    }
+                )
+        raw_boxes.append(next_boxes)
+        raw_statuses.append(next_statuses)
+
+    if terminal_sliver:
+        sliver_left = float(raw_bands[-1]["x1"])
+        raw_bands.append(
+            {
+                "index": len(raw_bands),
+                "x0": sliver_left,
+                "x1": sliver_left + 4.0,
+            }
+        )
+        for row_index, row in enumerate(raw_boxes):
+            row.append(
+                [
+                    sliver_left,
+                    150.0 + 13.0 * row_index,
+                    sliver_left + 4.0,
+                    163.0 + 13.0 * row_index,
+                ]
+            )
+            raw_statuses[row_index].append("exact")
+
+    table["cell_bboxes"] = raw_boxes
+    table["cell_geometry_status"] = raw_statuses
+    table["cell_spans"] = spans
+    table["col_bands"] = raw_bands
+    table["vertical_lines"] = [raw_bands[0]["x0"], *[band["x1"] for band in raw_bands]]
+    table["bbox"] = [45.0, 150.0, raw_bands[-1]["x1"], 202.0]
+    return table
+
+
 def test_resolver_accepts_exact_scanner_shape_and_returns_consumer_bands() -> None:
     table = _scanner_table()
 
@@ -106,6 +210,267 @@ def test_resolver_accepts_exact_scanner_shape_and_returns_consumer_bands() -> No
     assert all(band["role"] == "month" for band in bands)
     assert lattice.provenance_dict()["selection_basis"] == ("source_table_year_plus_twelve_ownership")
     assert lattice.provenance_dict()["value_inputs_used"] is False
+
+
+@pytest.mark.parametrize(
+    ("saved_shape", "split_columns", "expected_collapses"),
+    (
+        ("p5_raw_18", (2, 4, 6, 8, 10), 5),
+        ("p6_raw_14", (6,), 1),
+        ("p9_grid_0_raw_14", (6,), 1),
+        ("p10_grid_1_raw_14", (6,), 1),
+    ),
+)
+def test_resolver_collapses_only_repeated_exact_saved_shape_subdivisions(
+    saved_shape: str,
+    split_columns: tuple[int, ...],
+    expected_collapses: int,
+) -> None:
+    table = _primitive_split_table(split_columns)
+    table["table_id"] = saved_shape
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is not None
+    provenance = lattice.provenance_dict()
+    assert provenance["effective_column_canonicalization"] == (
+        "repeated_exact_span_partition"
+    )
+    assert provenance["raw_column_count"] == 13 + expected_collapses
+    assert provenance["effective_column_count"] == 13
+    assert provenance["collapsed_raw_column_group_count"] == expected_collapses
+    assert provenance["value_inputs_used"] is False
+
+
+def test_resolver_ignores_only_a_strictly_disjoint_p17_terminal_sliver() -> None:
+    table = _primitive_split_table((), terminal_sliver=True)
+    table["table_id"] = "pt_17_saved_shape"
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is not None
+    provenance = lattice.provenance_dict()
+    assert provenance["effective_column_canonicalization"] == (
+        "disjoint_terminal_sliver"
+    )
+    assert provenance["ignored_terminal_column_count"] == 1
+    assert lattice.month_bboxes[-1][2] == pytest.approx(397.0)
+
+
+@pytest.mark.parametrize("saved_shape", ("p17", "p18"))
+def test_resolver_binds_unique_saved_shape_pair_height_year_target(
+    saved_shape: str,
+) -> None:
+    table = _scanner_table(
+        year_anchor_row=2,
+        year_row_span=1,
+        status_row=1,
+    )
+    table["table_id"] = f"pt_{saved_shape}_singleton_year"
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=[45.0, 163.0, 73.0, 189.0],
+        status_bbox=[262.03, 162.0, 289.03, 177.0],
+    )
+
+    assert lattice is not None
+    provenance = lattice.provenance_dict()
+    assert provenance["year_anchor_mode"] == "row_pair_year_column"
+    assert provenance["year_row_span"] == 2
+    assert provenance["value_inputs_used"] is False
+
+
+def test_resolver_rejects_non_repeated_or_competing_primitive_split() -> None:
+    missing_amount_span = _primitive_split_table((6,))
+    missing_amount_span["cell_spans"] = [  # type: ignore[index]
+        span
+        for span in missing_amount_span["cell_spans"]  # type: ignore[union-attr]
+        if not (span["row"] == 2 and span["col"] == 6)
+    ]
+    competing = _primitive_split_table((6,))
+    competing["cell_bboxes"][1][7] = [  # type: ignore[index]
+        235.5,
+        163.0,
+        249.0,
+        176.0,
+    ]
+    competing["cell_geometry_status"][1][7] = "exact"  # type: ignore[index]
+    mismatched_union = _primitive_split_table((6,))
+    mismatched_union["cell_bboxes"][0][6][2] = (  # type: ignore[index]
+        mismatched_union["col_bands"][6]["x1"]  # type: ignore[index]
+    )
+    duplicate_span = _primitive_split_table((6,))
+    duplicated = next(
+        span
+        for span in duplicate_span["cell_spans"]  # type: ignore[union-attr]
+        if span["row"] == 1 and span["col"] == 6
+    )
+    duplicate_span["cell_spans"].append(deepcopy(duplicated))  # type: ignore[union-attr]
+
+    kwargs = {
+        "logical_page": 19,
+        "expected_year": 2022,
+        "active_months": range(1, 13),
+        "year_bbox": [50.0, 164.0, 69.0, 187.0],
+        "status_bbox": [262.03, 162.0, 289.03, 177.0],
+    }
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [missing_amount_span],
+            **kwargs,
+        )
+        is None
+    )
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [competing],
+            **kwargs,
+        )
+        is None
+    )
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [mismatched_union],
+            **kwargs,
+        )
+        is None
+    )
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [duplicate_span],
+            **kwargs,
+        )
+        is None
+    )
+
+
+def test_resolver_rejects_disjoint_row_evidence_for_collapsed_groups() -> None:
+    table = _primitive_split_table((2, 6))
+    boxes = table["cell_bboxes"]
+    statuses = table["cell_geometry_status"]
+    spans = table["cell_spans"]
+    row_bands = table["row_bands"]
+    col_bands = table["col_bands"]
+    assert isinstance(boxes, list)
+    assert isinstance(statuses, list)
+    assert isinstance(spans, list)
+    assert isinstance(row_bands, list)
+    assert isinstance(col_bands, list)
+
+    split_anchors = sorted(
+        {
+            int(span["col"])
+            for span in spans
+            if span.get("col_span") == 2
+        }
+    )
+    assert split_anchors == [2, 7]
+    second_anchor = split_anchors[1]
+    spans[:] = [
+        span
+        for span in spans
+        if not (span.get("col") == second_anchor and int(span["row"]) < 3)
+    ]
+    for row in range(3):
+        boxes[row][second_anchor] = None
+        statuses[row][second_anchor] = "missing"
+
+    for row, (y0, y1) in enumerate(
+        ((189.0, 202.0), (202.0, 215.0), (215.0, 228.0)),
+        start=3,
+    ):
+        if row >= len(boxes):
+            boxes.append([None] * len(col_bands))
+            statuses.append(["missing"] * len(col_bands))
+            row_bands.append({"index": row, "y0": y0, "y1": y1})
+        boxes[row][second_anchor] = [
+            col_bands[second_anchor]["x0"],
+            y0,
+            col_bands[second_anchor + 1]["x1"],
+            y1,
+        ]
+        statuses[row][second_anchor] = "exact"
+        statuses[row][second_anchor + 1] = "derived"
+        spans.append(
+            {
+                "row": row,
+                "col": second_anchor,
+                "row_span": 1,
+                "col_span": 2,
+            }
+        )
+    table["horizontal_lines"] = [150.0, 163.0, 176.0, 189.0, 202.0, 215.0, 228.0]
+    table["bbox"][3] = 228.0  # type: ignore[index]
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [table],
+            logical_page=19,
+            expected_year=2022,
+            active_months=(2,),
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+            status_bbox=[127.0, 162.0, 154.0, 177.0],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("table_id", "column_count"),
+    (
+        ("pt_9_1", 3),
+        ("pt_13_1", 6),
+        ("pt_14_2", 6),
+        ("pt_16_1", 6),
+    ),
+)
+def test_resolver_preserves_saved_coarse_table_withholding(
+    table_id: str,
+    column_count: int,
+) -> None:
+    coarse = _scanner_table()
+    coarse["table_id"] = table_id
+    coarse["cell_bboxes"] = [  # type: ignore[index]
+        row[:column_count] for row in coarse["cell_bboxes"]
+    ]
+    coarse["cell_geometry_status"] = [  # type: ignore[index]
+        row[:column_count]
+        for row in coarse["cell_geometry_status"]  # type: ignore[union-attr]
+    ]
+    coarse["cell_spans"] = []
+    coarse["col_bands"] = coarse["col_bands"][:column_count]  # type: ignore[index]
+    coarse["vertical_lines"] = coarse["vertical_lines"][: column_count + 1]  # type: ignore[index]
+    coarse["bbox"][2] = coarse["vertical_lines"][-1]  # type: ignore[index]
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            [coarse],
+            logical_page=19,
+            expected_year=2022,
+            active_months=(1, 2),
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+            status_bbox=[73.0, 163.0, 127.0, 176.0],
+        )
+        is None
+    )
 
 
 def test_resolver_supports_headerless_span_three_and_sparse_active_months() -> None:

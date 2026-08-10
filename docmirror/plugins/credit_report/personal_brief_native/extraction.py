@@ -8,6 +8,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_brief_native.contracts import (
+    PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+    canonicalize_personal_brief_reporting_units,
+)
+
 _MARITAL_STATUS_CODES = {
     "未婚": "unmarried",
     "已婚": "married",
@@ -253,7 +258,7 @@ def _personal_header_datasets(
             )
     amount_policy = {
         "reporting_currency": "CNY",
-        "reporting_amount_unit": "yuan",
+        "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
         "reporting_amount_precision": 0,
         "amount_policy_source": (
             "source_statement"
@@ -501,7 +506,7 @@ def _asset_and_compensation_records(
                 "balance": _number(match.group(6)),
                 "last_repayment_date": _iso_date(match.group(7)),
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_asset_disposition",
                 "source_refs": _source_refs(page, "native_text_narrative"),
                 "confidence": 0.97,
@@ -530,7 +535,7 @@ def _asset_and_compensation_records(
                 "settlement_date": _iso_month(match.group(5) or ""),
                 "settlement_state": "settled" if match.group(6) else "not_reported",
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_guarantor_compensation",
                 "source_refs": _source_refs(page, "native_text_narrative"),
                 "confidence": 0.97,
@@ -591,7 +596,7 @@ def _postpaid_records(blocks: list[tuple[int, str]]) -> list[dict[str, Any]]:
                 "payment_status": _reported_text(fields.get("当前缴费状态")),
                 "current_arrears_amount": _number(fields.get("当前欠费金额", "")),
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_postpaid_record",
                 "source_refs": [
                     *_source_refs(page, "native_text_labeled_record"),
@@ -665,7 +670,7 @@ def _personal_public_records(
                 "arrears_amount": _number(fields.get("欠税总额", "")),
                 "taxpayer_identifier": _reported_text(fields.get("纳税人识别号")),
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_public_record",
                 "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.98,
@@ -696,7 +701,7 @@ def _personal_public_records(
                 "judgment_result": _reported_text(fields.get("判决/调解结果")),
                 "judgment_effective_date": _date_or_month(fields.get("判决/调解生效日期", "")),
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_public_record",
                 "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.97,
@@ -740,7 +745,7 @@ def _personal_public_records(
                 "executed_subject": _reported_text(fields.get("已执行标的")),
                 "executed_amount": _number(fields.get("已执行标的金额", "")),
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_public_record",
                 "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.96,
@@ -770,7 +775,7 @@ def _personal_public_records(
                 "administrative_review_result": review_result,
                 "administrative_review_result_status": "reported" if review_result else "not_reported",
                 "reporting_amount_currency": "CNY",
-                "reporting_amount_unit": "yuan",
+                "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
                 "source": "personal_brief_public_record",
                 "source_refs": _public_record_refs(page, detail_page),
                 "confidence": 0.98,
@@ -841,7 +846,7 @@ def extract_personal_brief_native_business(
         summary_text,
         expected_account_count=len(accounts) if accounts else None,
     )
-    return {
+    result = {
         "credit_accounts": accounts,
         "credit_lines": credit_lines,
         "repayment_liability_records": liabilities,
@@ -880,6 +885,14 @@ def extract_personal_brief_native_business(
             **source_summary,
         },
     }
+    canonicalize_personal_brief_reporting_units(
+        {
+            name: rows
+            for name, rows in result.items()
+            if isinstance(rows, list)
+        }
+    )
+    return result
 
 
 def extract_personal_brief_section_content(

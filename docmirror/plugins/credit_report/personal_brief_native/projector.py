@@ -9,6 +9,12 @@ from copy import deepcopy
 from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
+from docmirror.plugins.credit_report.personal_brief_native.contracts import (
+    PERSONAL_BRIEF_ENUM_CONTRACT,
+    PERSONAL_BRIEF_MONEY_FIELDS,
+    PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
+    validate_personal_brief_public_record,
+)
 from docmirror.plugins.credit_report.personal_brief_native.pipeline import (
     run_personal_brief_pipeline,
 )
@@ -306,10 +312,13 @@ def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
         raise RuntimeError(f"personal-brief public dataset policy is out of sync: missing={missing}, extra={extra}")
 
     dictionary = personal_brief_data_dictionary().get("datasets") or {}
+    declared_enum_fields: set[tuple[str, str]] = set()
+    declared_money_fields: set[tuple[str, str]] = set()
     for dataset_name, fields in policy.items():
         if fields is None:
             continue
-        schema_fields = set((dictionary.get(dataset_name) or {}).get("columns") or {})
+        columns = (dictionary.get(dataset_name) or {}).get("columns") or {}
+        schema_fields = set(columns)
         classified = set(fields) | set(_NON_BUSINESS_FIELDS.get(dataset_name, ()))
         unclassified = sorted(schema_fields - classified)
         unknown = sorted(classified - schema_fields)
@@ -317,6 +326,54 @@ def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
             raise RuntimeError(
                 f"personal-brief field policy is out of sync for {dataset_name}: "
                 f"unclassified={unclassified}, unknown={unknown}"
+            )
+        declared_enum_fields.update(
+            (dataset_name, field_name)
+            for field_name in fields
+            if str((columns.get(field_name) or {}).get("type") or "") == "enum"
+        )
+        declared_money_fields.update(
+            (dataset_name, field_name)
+            for field_name in fields
+            if str((columns.get(field_name) or {}).get("type") or "")
+            in {"amount", "money"}
+        )
+    contract_fields = set(PERSONAL_BRIEF_ENUM_CONTRACT)
+    missing_enum_contracts = sorted(declared_enum_fields - contract_fields)
+    extra_enum_contracts = sorted(contract_fields - declared_enum_fields)
+    if missing_enum_contracts or extra_enum_contracts:
+        raise RuntimeError(
+            "personal-brief enum contract is out of sync: "
+            f"missing={missing_enum_contracts}, extra={extra_enum_contracts}"
+        )
+    for dataset_name, field_name in sorted(declared_enum_fields):
+        published = (dictionary[dataset_name]["columns"][field_name].get("enum") or {})
+        expected_labels = PERSONAL_BRIEF_ENUM_CONTRACT[(dataset_name, field_name)]
+        if published != expected_labels:
+            raise RuntimeError(
+                "personal-brief enum metadata is out of sync for "
+                f"{dataset_name}.{field_name}: published={published!r}, "
+                f"expected={expected_labels!r}"
+            )
+    contract_money_fields = {
+        (dataset_name, field_name)
+        for dataset_name, field_names in PERSONAL_BRIEF_MONEY_FIELDS.items()
+        for field_name in field_names
+    }
+    missing_money_contracts = sorted(declared_money_fields - contract_money_fields)
+    extra_money_contracts = sorted(contract_money_fields - declared_money_fields)
+    if missing_money_contracts or extra_money_contracts:
+        raise RuntimeError(
+            "personal-brief money contract is out of sync: "
+            f"missing={missing_money_contracts}, extra={extra_money_contracts}"
+        )
+    for dataset_name, field_name in sorted(declared_money_fields):
+        unit = dictionary[dataset_name]["columns"][field_name].get("unit")
+        if unit != PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT:
+            raise RuntimeError(
+                "personal-brief money-unit metadata is out of sync for "
+                f"{dataset_name}.{field_name}: unit={unit!r}, "
+                f"expected={PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT!r}"
             )
     return {name: policy[name] for name in expected}
 
@@ -492,6 +549,11 @@ def _project_business_dataset(
         record_id = str(row.get("record_id") or "")
         if not record_id:
             raise ValueError(f"missing personal-brief record_id in {dataset_name}")
+        validate_personal_brief_public_record(
+            dataset_name,
+            record_id,
+            source_normalized,
+        )
         rows.append(
             {
                 "record_id": record_id,

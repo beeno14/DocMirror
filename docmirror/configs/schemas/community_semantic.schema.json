@@ -22,11 +22,15 @@
       "then": {
         "required": ["extraction"],
         "properties": {
-          "extraction": {"$ref": "#/$defs/enterpriseExtraction"}
+          "extraction": {"$ref": "#/$defs/enterpriseExtraction"},
+          "audit": {"$ref": "#/$defs/enterpriseAudit"}
         }
       },
       "else": {
-        "not": {"required": ["extraction"]}
+        "allOf": [
+          {"not": {"required": ["extraction"]}},
+          {"not": {"required": ["audit"]}}
+        ]
       }
     }
   ],
@@ -191,6 +195,61 @@
         "failures": {
           "type": "array",
           "items": {"type": "object", "additionalProperties": true}
+        }
+      }
+    },
+    "enterpriseAudit": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "protocol",
+        "version",
+        "mode",
+        "mutates_extraction",
+        "status",
+        "summary",
+        "findings"
+      ],
+      "properties": {
+        "protocol": {"const": "pboc-enterprise-observational-audit"},
+        "version": {"const": "1.0.0"},
+        "mode": {"const": "observational"},
+        "mutates_extraction": {"const": false},
+        "status": {"enum": ["clear", "review_required"]},
+        "summary": {"type": "object", "additionalProperties": true},
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": [
+              "code",
+              "severity",
+              "category",
+              "message",
+              "recommended_action"
+            ],
+            "properties": {
+              "code": {"type": "string", "pattern": "^[A-Z0-9_]+$"},
+              "severity": {"enum": ["info", "warning", "error"]},
+              "category": {"type": "string", "minLength": 1},
+              "message": {"type": "string", "minLength": 1},
+              "recommended_action": {"type": "string", "minLength": 1},
+              "path": {"type": "string"},
+              "dataset": {"type": "string"},
+              "record_id": {"type": "string"},
+              "field": {"type": "string"},
+              "source_pages": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1}
+              },
+              "source_refs": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": true}
+              },
+              "evidence": {"type": "object", "additionalProperties": true}
+            }
+          }
         }
       }
     },

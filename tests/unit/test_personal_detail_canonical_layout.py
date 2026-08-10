@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
@@ -121,6 +122,182 @@ def test_fragments_with_same_printed_page_join_one_canonical_canvas() -> None:
     assert projection.pages[0].width == 600
     assert projection.fragment_groups[0]["joined_fragment_count"] == 2
     assert projection.fragment_groups[0]["coverage_status"] == "full"
+
+
+def test_body_position_printed_page_duplicate_does_not_join_fragments() -> None:
+    result = SimpleNamespace(
+        pages=[_page(1, source=1), _page(2, source=2)]
+    )
+    evidence = [
+        {
+            "page": logical,
+            "source_page": logical,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [100, 100, 250, 125]),
+            ],
+        }
+        for logical in (1, 2)
+    ]
+
+    projection = _assembler(result, evidence).build()
+
+    assert len(projection.pages) == 2
+    assert all("printed_page" not in registration for registration in projection.registrations)
+    assert all(page.canonical_fragment_logical_pages in {(1,), (2,)} for page in projection.pages)
+
+
+def test_conflicting_templates_with_one_proved_printed_identity_fail_closed() -> None:
+    owner = SimpleNamespace()
+    result = SimpleNamespace(
+        pages=[_page(1, source=1), _page(2, source=2)]
+    )
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [220, 760, 380, 785]),
+            ],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("\u4fe1\u606f\u6982\u8981", [10, 20, 300, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 2 \u9875", [220, 760, 380, 785]),
+            ],
+        },
+    ]
+
+    projection = _assembler(result, evidence, owner=owner).build()
+
+    assert projection.pages == ()
+    assert projection.unresolved_pages == (1, 2)
+    assert {
+        registration["template_id"] for registration in projection.registrations
+    } == {"report_header_and_identity", "information_summary"}
+    assert owner._personal_detail_extraction_issues[0]["issue_code"] == (
+        "canonical_fragment_template_conflict"
+    )
+
+
+def test_static_split_does_not_inherit_missing_or_non_authoritative_identity() -> None:
+    result = SimpleNamespace(
+        pages=[_page(10, source=1, width=300), _page(20, source=1, width=300)]
+    )
+    evidence = [
+        {
+            "page": 10,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 280, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 4 \u9875", [100, 100, 250, 125]),
+            ],
+        },
+        {
+            "page": 20,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [300, 0, 600, 800],
+            "plugin_static_subpage": True,
+            "lines": [_line("\u4e2a\u4eba\u57fa\u672c\u4fe1\u606f", [10, 20, 200, 60])],
+        },
+    ]
+    resolutions = (
+        None,
+        {
+            "resolved": False,
+            "authoritative": False,
+            "identity_fallback": True,
+            "printed_total": 4,
+            "printed_page_by_logical": {10: 1},
+        },
+        {
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "printed_total": 4,
+            "printed_page_by_logical": {},
+        },
+    )
+
+    for resolution in resolutions:
+        owner = SimpleNamespace()
+        case_evidence = deepcopy(evidence)
+        if resolution is not None:
+            owner.reading_order_resolution = resolution
+            # Even an exact footer cannot override an available context
+            # resolution that rejected or omitted the logical page.
+            case_evidence[0]["lines"][1]["bbox"] = [100, 760, 250, 785]
+        projection = _assembler(result, case_evidence, owner=owner).build()
+
+        assert len(projection.pages) == 2
+        assert all(len(page.canonical_fragment_logical_pages) == 1 for page in projection.pages)
+
+
+def test_authoritative_context_identity_allows_valid_same_template_static_split() -> None:
+    owner = SimpleNamespace(
+        reading_order_resolution={
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "basis": "complete_unique_printed_page_permutation",
+            "printed_total": 4,
+            "printed_page_by_logical": {10: 1},
+            "unresolved_logical_pages": [],
+        }
+    )
+    result = SimpleNamespace(
+        pages=[_page(10, source=1, width=300), _page(20, source=1, width=300)]
+    )
+    evidence = [
+        {
+            "page": 10,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [0, 0, 300, 800],
+            "lines": [
+                _line("\u4e2a\u4eba\u4fe1\u7528\u62a5\u544a \u62a5\u544a\u7f16\u53f7", [10, 20, 280, 60]),
+                _line("\u7b2c 1 \u9875\uff0c\u5171 4 \u9875", [100, 100, 250, 125]),
+            ],
+        },
+        {
+            "page": 20,
+            "source_page": 1,
+            "page_width": 300,
+            "page_height": 800,
+            "source_crop_bbox": [300, 0, 600, 800],
+            "plugin_static_subpage": True,
+            "lines": [_line("\u4e2a\u4eba\u57fa\u672c\u4fe1\u606f", [10, 20, 200, 60])],
+        },
+    ]
+    topology = SimpleNamespace(
+        geometry=lambda logical: SimpleNamespace(
+            source_crop_bbox=(0.0, 0.0, 300.0, 800.0)
+            if logical == 10
+            else (300.0, 0.0, 600.0, 800.0)
+        )
+    )
+
+    projection = _assembler(result, evidence, topology=topology, owner=owner).build()
+
+    assert len(projection.pages) == 1
+    assert projection.pages[0].canonical_fragment_logical_pages == (10, 20)
+    assert projection.registrations[0]["printed_identity_basis"] == (
+        "context_authoritative_printed_order"
+    )
 
 
 def test_explicit_summary_heading_outranks_repeated_account_category_names() -> None:
@@ -288,6 +465,145 @@ def test_monthly_materialization_uses_canonical_page_lines_without_cell_ocr(monk
     assert observed[1].get("enable_static_status_validation", False) is False
     assert observed[1].get("enable_candidate_b_amount_pairing", False) is False
     assert observed[0]["lines"] == [canonical_line]
+
+
+def test_monthly_cross_page_augmentation_requires_authoritative_order(
+    monkeypatch,
+) -> None:
+    context = object.__new__(PersonalDetailExtractionContext)
+    context._cache = {}
+    context.reading_order_by_logical = {1: 1, 2: 2}
+    context.reading_order_resolution = {
+        "resolved": False,
+        "authoritative": False,
+        "basis": "unresolved_identity_fallback",
+    }
+    context._page_image_resolver = None
+    anchor = _line("2024年01月-2024年12月的还款记录", [10, 700, 500, 730])
+    continuation = _line("2024 N N N N N N N N N N N N", [10, 20, 500, 40])
+    stale_shifted = {
+        **continuation,
+        "bbox": [10, 820, 500, 840],
+        "source_logical_page": 2,
+        "coordinate_status": "cross_page_y_shift",
+    }
+    bundles = [
+        {
+            "page": 1,
+            "local_structure_evidence": {
+                "page": 1,
+                "page_height": 800,
+                "lines": [anchor],
+            },
+            "micro_grid_evidence": {
+                "page": 1,
+                "page_height": 800,
+                "lines": [anchor, stale_shifted],
+                "credit_cross_page_augmented": True,
+                "continuation_logical_pages": [2],
+                "continuation_source_table_geometry_by_page": {
+                    "2": [{"table_id": "pt_2_0"}]
+                },
+            },
+        },
+        {
+            "page": 2,
+            "local_structure_evidence": {
+                "page": 2,
+                "page_height": 800,
+                "lines": [continuation],
+            },
+            "micro_grid_evidence": {
+                "page": 2,
+                "page_height": 800,
+                "lines": [continuation],
+                "source_table_geometry": [{"table_id": "pt_2_0"}],
+            },
+        },
+    ]
+    context.parse_result = SimpleNamespace(
+        pages=[],
+        entities=SimpleNamespace(
+            domain_specific={"_page_evidence_bundles": bundles}
+        ),
+    )
+    context.corrected_evidence_pages = lambda: [
+        {
+            "page": 1,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [anchor],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [continuation],
+        },
+    ]
+    augmentation_calls: list[object] = []
+    materialized_inputs: list[dict[str, object]] = []
+
+    from docmirror.plugins.credit_report import micro_grid_materialize
+
+    real_augment = micro_grid_materialize.augment_credit_repayment_evidence_bundles
+
+    def augment(*args, **kwargs):
+        augmentation_calls.append(object())
+        return real_augment(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.micro_grid_materialize.augment_credit_repayment_evidence_bundles",
+        augment,
+    )
+
+    def materialize(detached, **_kwargs):
+        materialized_inputs.append(deepcopy(detached))
+        return []
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.micro_grid_materialize.materialize_credit_repayment_micro_grids_from_bundles",
+        materialize,
+    )
+
+    assert context.corrected_repayment_records() == []
+    assert augmentation_calls == []
+    assert len(materialized_inputs) == 2
+    for detached in materialized_inputs:
+        first = detached["_page_evidence_bundles"][0]["micro_grid_evidence"]
+        assert "credit_cross_page_augmented" not in first
+        assert "continuation_logical_pages" not in first
+        assert "continuation_source_table_geometry_by_page" not in first
+        assert not any(
+            line.get("source_logical_page") == 2
+            for line in first.get("lines") or []
+            if isinstance(line, dict)
+        )
+
+    context._cache = {}
+    context.reading_order_resolution = {
+        "resolved": True,
+        "authoritative": True,
+        "basis": "complete_unique_printed_page_permutation",
+    }
+    augmentation_calls.clear()
+    materialized_inputs.clear()
+
+    assert context.corrected_repayment_records() == []
+    assert len(augmentation_calls) == 2
+    assert len(materialized_inputs) == 2
+    for detached in materialized_inputs:
+        first = detached["_page_evidence_bundles"][0]["micro_grid_evidence"]
+        assert first["credit_cross_page_augmented"] is True
+        assert first["continuation_logical_pages"] == [2]
+        assert "2" in first["continuation_source_table_geometry_by_page"]
+        assert any(
+            line.get("source_logical_page") == 2
+            for line in first.get("lines") or []
+            if isinstance(line, dict)
+        )
 
 
 def test_monthly_sequence_holes_are_reported_from_schema_not_legacy_ocr(monkeypatch) -> None:

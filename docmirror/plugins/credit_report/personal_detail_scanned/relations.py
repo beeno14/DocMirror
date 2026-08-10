@@ -10,6 +10,7 @@ assembly code.
 
 from __future__ import annotations
 
+import math
 import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -20,6 +21,7 @@ _REPAYMENT_RANGE_RE = re.compile(
     r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?\s*[-—–－至到]\s*"
     r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?"
 )
+_PERFORMANCE_MONTH_RE = re.compile(r"((?:19|20)\d{2})-(0[1-9]|1[0-2])\Z")
 
 
 def _geometry_box(value: Any) -> list[float] | None:
@@ -34,7 +36,12 @@ def _geometry_box(value: Any) -> list[float] | None:
                     box = [float(item) for item in raw]
                 except (TypeError, ValueError):
                     box = []
-                if len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
+                if (
+                    len(box) == 4
+                    and all(math.isfinite(item) for item in box)
+                    and box[2] > box[0]
+                    and box[3] > box[1]
+                ):
                     boxes.append(box)
             for key in ("cells", "rows", "col_bands", "row_bands"):
                 collect(node.get(key))
@@ -53,14 +60,21 @@ def _geometry_box(value: Any) -> list[float] | None:
     ]
 
 
+def _positive_native_int(value: Any) -> int | None:
+    """Accept only positive JSON/Python integer identities, never coercions."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def _grid_months(grid: dict[str, Any]) -> set[tuple[int, int]]:
     date_range = (grid.get("audit") or {}).get("date_range") or {}
-    try:
-        start_year = int(date_range.get("start_year") or 0)
-        start_month = int(date_range.get("start_month") or 0)
-        end_year = int(date_range.get("end_year") or 0)
-        end_month = int(date_range.get("end_month") or 0)
-    except (TypeError, ValueError):
+    start_year = _positive_native_int(date_range.get("start_year"))
+    start_month = _positive_native_int(date_range.get("start_month"))
+    end_year = _positive_native_int(date_range.get("end_year"))
+    end_month = _positive_native_int(date_range.get("end_month"))
+    if None in (start_year, start_month, end_year, end_month):
         return set()
     if start_year < 1900 or end_year < start_year or not 1 <= start_month <= 12 or not 1 <= end_month <= 12:
         return set()
@@ -69,6 +83,255 @@ def _grid_months(grid: dict[str, Any]) -> set[tuple[int, int]]:
     if end < start or end - start > 120:
         return set()
     return {(value // 12, value % 12 + 1) for value in range(start, end + 1)}
+
+
+def _exact_performance_month(record: Any) -> tuple[int, int] | None:
+    """Require an exact YYYY-MM identity and non-coerced matching aliases."""
+
+    if not isinstance(record, dict):
+        return None
+    raw_performance_month = record.get("performance_month")
+    if not isinstance(raw_performance_month, str):
+        return None
+    match = _PERFORMANCE_MONTH_RE.fullmatch(raw_performance_month)
+    if match is None:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    for key, expected in (("year", year), ("month", month)):
+        if key not in record or record.get(key) is None:
+            continue
+        alias = _positive_native_int(record.get(key))
+        if alias != expected:
+            return None
+    return year, month
+
+
+def _canonical_account_identifier(value: Any) -> str | None:
+    """Accept only a role-valid identifier already in canonical form."""
+
+    if not isinstance(value, str) or not value:
+        return None
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        normalize_role_candidate,
+        role_candidate_is_valid,
+    )
+
+    normalized = normalize_role_candidate(value, "account_identifier")
+    if normalized != value or not role_candidate_is_valid(value, "account_identifier"):
+        return None
+    return value
+
+
+def _source_table_identity(source_ref: Any) -> tuple[int, str] | None:
+    """Return an exact logical-page/table key without inspecting cell values."""
+
+    if not isinstance(source_ref, dict):
+        return None
+    provenance = (
+        source_ref.get("geometry_provenance")
+        if isinstance(source_ref.get("geometry_provenance"), dict)
+        else {}
+    )
+    table_ids: set[str] = set()
+    for owner in (source_ref, provenance):
+        if "table_id" not in owner:
+            continue
+        raw_table_id = owner.get("table_id")
+        if not isinstance(raw_table_id, str) or not raw_table_id.strip():
+            return None
+        table_ids.add(raw_table_id.strip())
+    pages: set[int] = set()
+    for owner, key in (
+        (source_ref, "logical_page"),
+        (source_ref, "page"),
+        (provenance, "logical_page"),
+    ):
+        if key not in owner:
+            continue
+        page = _positive_native_int(owner.get(key))
+        if page is None:
+            return None
+        pages.add(page)
+    if len(pages) != 1 or len(table_ids) != 1:
+        return None
+    return next(iter(pages)), next(iter(table_ids))
+
+
+def _exact_month_source_table_identity(source_ref: Any) -> tuple[int, str] | None:
+    """Accept only value-free, exact source-table month-cell provenance."""
+
+    if not isinstance(source_ref, dict):
+        return None
+    provenance = source_ref.get("geometry_provenance")
+    if not (
+        isinstance(provenance, dict)
+        and provenance.get("source") == "source_table_geometry"
+        and source_ref.get("coordinate_system") == "pdf_points_top_left"
+        and provenance.get("coordinate_system") == "pdf_points_top_left"
+        and "page" in source_ref
+        and "logical_page" in source_ref
+        and "logical_page" in provenance
+        and isinstance(provenance.get("table_id"), str)
+        and bool(str(provenance.get("table_id") or "").strip())
+        and provenance.get("calibrated_from_source_table_geometry") is True
+        and provenance.get("active_cell_geometry_exact") is True
+        and provenance.get("value_inputs_used") is False
+        and source_ref.get("geometry_scope") == "cell"
+        and _geometry_box({"bbox": source_ref.get("bbox")}) is not None
+    ):
+        return None
+    return _source_table_identity(source_ref)
+
+
+def _exact_grid_source_table_identity(grid: Any) -> tuple[int, str] | None:
+    """Read one exact source-table key from a grid's geometry-only audit."""
+
+    if not isinstance(grid, dict):
+        return None
+    page = _positive_native_int(grid.get("page"))
+    if page is None:
+        return None
+    audit = grid.get("audit") if isinstance(grid.get("audit"), dict) else {}
+    by_page = (
+        audit.get("visual_month_geometry_by_page")
+        if isinstance(audit.get("visual_month_geometry_by_page"), dict)
+        else {}
+    )
+    provenance_aliases = [
+        by_page[key]
+        for key in (str(page), page)
+        if key in by_page
+    ]
+    if not provenance_aliases or any(
+        candidate != provenance_aliases[0]
+        for candidate in provenance_aliases[1:]
+    ):
+        return None
+    provenance = provenance_aliases[0]
+    if not (
+        page > 0
+        and grid.get("coordinate_system") == "pdf_points_top_left"
+        and isinstance(provenance, dict)
+        and provenance.get("source") == "source_table_geometry"
+        and provenance.get("coordinate_system") == "pdf_points_top_left"
+        and "logical_page" in provenance
+        and isinstance(provenance.get("table_id"), str)
+        and bool(str(provenance.get("table_id") or "").strip())
+        and provenance.get("calibrated_from_source_table_geometry") is True
+        and provenance.get("active_cell_geometry_exact") is True
+        and provenance.get("value_inputs_used") is False
+    ):
+        return None
+    return _source_table_identity(
+        {
+            "logical_page": page,
+            "geometry_provenance": provenance,
+        }
+    )
+
+
+def _box_contains(outer: list[float], inner: list[float], *, tolerance: float = 1.0) -> bool:
+    return bool(
+        inner[0] + tolerance >= outer[0]
+        and inner[1] + tolerance >= outer[1]
+        and inner[2] <= outer[2] + tolerance
+        and inner[3] <= outer[3] + tolerance
+    )
+
+
+def _exact_grid_month_x_bands(grid: Any) -> dict[int, tuple[float, float]] | None:
+    """Require twelve exact, ordered physical month bands for table rescue."""
+
+    if not isinstance(grid, dict) or grid.get("coordinate_system") != "pdf_points_top_left":
+        return None
+    grid_box = _geometry_box({"bbox": grid.get("bbox")})
+    if grid_box is None:
+        return None
+    month_bands: dict[int, tuple[float, float]] = {}
+    for band in grid.get("col_bands") or ():
+        if not isinstance(band, dict) or band.get("role") != "month":
+            continue
+        raw_index = band.get("index")
+        raw_header = str(band.get("header") or "").strip()
+        if (
+            isinstance(raw_index, bool)
+            or not isinstance(raw_index, int)
+            or not raw_header.isdigit()
+        ):
+            return None
+        month = raw_index
+        if (
+            month != int(raw_header)
+            or month not in range(1, 13)
+            or month in month_bands
+            or band.get("geometry_status") != "exact"
+            or band.get("geometry_source") != "source_table_geometry"
+        ):
+            return None
+        bbox = _geometry_box({"bbox": band.get("bbox")})
+        if (
+            bbox is None
+            or bbox[0] + 1.0 < grid_box[0]
+            or bbox[2] > grid_box[2] + 1.0
+        ):
+            return None
+        month_bands[month] = (bbox[0], bbox[2])
+    if set(month_bands) != set(range(1, 13)):
+        return None
+    ordered = [month_bands[month] for month in range(1, 13)]
+    if any(
+        left[0] >= right[0] or left[1] > right[0] + 1e-6
+        for left, right in zip(ordered, ordered[1:])
+    ):
+        return None
+    return month_bands
+
+
+def _account_has_exact_anchor_ownership(account: Any) -> bool:
+    if not isinstance(account, dict) or account.get("_ownership_status"):
+        return False
+    segment = account.get("_canonical_segment")
+    pages = segment.get("pages") if isinstance(segment, dict) else None
+    if not (
+        isinstance(segment, dict)
+        and segment.get("ownership_basis") == "printed_anchor_to_next_anchor"
+        and isinstance(pages, list)
+        and pages
+    ):
+        return False
+    anchor_page = _positive_native_int(segment.get("anchor_logical_page"))
+    if anchor_page is None:
+        return False
+    anchor_box = _geometry_box({"bbox": segment.get("anchor_bbox")})
+    if anchor_page <= 0 or anchor_box is None:
+        return False
+    anchor_owned = False
+    for page_segment in pages:
+        if not isinstance(page_segment, dict):
+            return False
+        page = _positive_native_int(page_segment.get("logical_page"))
+        try:
+            minimum = float(page_segment["min_y"])
+            maximum = (
+                float(page_segment["max_y"])
+                if page_segment.get("max_y") is not None
+                else None
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not (
+            page is not None
+            and math.isfinite(minimum)
+            and (maximum is None or math.isfinite(maximum) and maximum > minimum)
+        ):
+            return False
+        if (
+            page == anchor_page
+            and anchor_box[1] + 1.0 >= minimum
+            and (maximum is None or anchor_box[1] < maximum)
+        ):
+            anchor_owned = True
+    return anchor_owned
 
 
 def _monthly_business_signature(record: dict[str, Any]) -> tuple[str, str | None]:
@@ -92,11 +355,16 @@ def _monthly_record_id(record: dict[str, Any], grid_id: str) -> str | None:
     existing = str(record.get("repayment_id") or record.get("record_id") or "").strip()
     if existing:
         return existing
-    try:
-        year = int(record.get("year") or str(record.get("performance_month") or "")[:4])
-        month = int(record.get("month") or str(record.get("performance_month") or "")[5:7])
-    except (TypeError, ValueError):
+    calendar_identity = _exact_performance_month(record)
+    if calendar_identity is not None:
+        year, month = calendar_identity
+    elif record.get("performance_month") not in (None, ""):
         return None
+    else:
+        year = _positive_native_int(record.get("year"))
+        month = _positive_native_int(record.get("month"))
+        if year is None or month is None:
+            return None
     if not grid_id or year < 1900 or not 1 <= month <= 12:
         return None
     return f"{grid_id}:{year:04d}-{month:02d}"
@@ -279,11 +547,18 @@ def link_candidate_b_repayments(
 ) -> list[dict[str, Any]]:
     """Attach monthly grids only to their exact canonical account segment."""
     del reading_order_by_logical
-    grids = {
-        str(grid.get("grid_id") or ""): grid
-        for grid in micro_grids
-        if isinstance(grid, dict) and grid.get("grid_id")
-    }
+    grids: dict[str, dict[str, Any]] = {}
+    duplicate_grid_ids: set[str] = set()
+    for grid in micro_grids:
+        if not isinstance(grid, dict):
+            continue
+        grid_id = str(grid.get("grid_id") or "")
+        if not grid_id:
+            continue
+        if grid_id in grids:
+            duplicate_grid_ids.add(grid_id)
+            continue
+        grids[grid_id] = grid
     valid_ids: set[str] = set()
     account_segments: dict[str, list[tuple[int, float, float | None]]] = {}
     fallback_anchors_by_page: dict[int, list[tuple[float, str]]] = {}
@@ -293,6 +568,8 @@ def link_candidate_b_repayments(
         account_id = str(account.get("account_id") or "")
         if account_id:
             valid_ids.add(account_id)
+        if account.get("_ownership_status"):
+            continue
         canonical_segment = account.get("_canonical_segment")
         segment_pages = canonical_segment.get("pages") if isinstance(canonical_segment, dict) else None
         exact_segments: list[tuple[int, float, float | None]] = []
@@ -353,7 +630,53 @@ def link_candidate_b_repayments(
         for account in accounts
         if isinstance(account, dict) and account.get("account_id")
     }
+    account_table_owners: dict[
+        tuple[int, str],
+        list[tuple[dict[str, Any], list[list[float]]]],
+    ] = {}
+    conflicting_account_table_geometry: set[tuple[int, str]] = set()
+    invalid_account_table_geometry: set[tuple[int, str]] = set()
+    for account in accounts:
+        if not (
+            isinstance(account, dict)
+            and account.get("account_id")
+            and _account_has_exact_anchor_ownership(account)
+        ):
+            continue
+        boxes_by_table: dict[tuple[int, str], list[list[float]]] = {}
+        invalid_table_ref = False
+        for source_ref in account.get("source_refs") or ():
+            if not (
+                isinstance(source_ref, dict)
+                and source_ref.get("source") == "native_detail_table"
+                and source_ref.get("geometry_scope") == "table"
+            ):
+                continue
+            identity = _source_table_identity(source_ref)
+            bbox = _geometry_box({"bbox": source_ref.get("bbox")})
+            if (
+                identity is None
+                or bbox is None
+                or source_ref.get("coordinate_system") != "pdf_points_top_left"
+            ):
+                if identity is not None:
+                    invalid_account_table_geometry.add(identity)
+                invalid_table_ref = True
+                break
+            boxes_by_table.setdefault(identity, []).append(bbox)
+        if invalid_table_ref:
+            continue
+        for identity, boxes in boxes_by_table.items():
+            first_box = boxes[0]
+            if any(
+                any(abs(left - right) > 1e-6 for left, right in zip(first_box, box, strict=True))
+                for box in boxes[1:]
+            ):
+                conflicting_account_table_geometry.add(identity)
+                continue
+            account_table_owners.setdefault(identity, []).append((account, boxes))
     explicit_ids_by_grid: dict[str, set[str]] = {}
+    observed_explicit_ids_by_grid: dict[str, set[str]] = {}
     source_candidates_by_grid: dict[str, list[dict[str, Any]]] = {}
     for record in repayments:
         refs = record.get("source_cell_refs") if isinstance(record.get("source_cell_refs"), list) else []
@@ -362,8 +685,16 @@ def link_candidate_b_repayments(
         if grid_id:
             source_candidates_by_grid.setdefault(grid_id, []).append(record)
         explicit_id = str(record.get("account_id") or "")
+        if grid_id and explicit_id:
+            observed_explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
         if grid_id and explicit_id in valid_ids:
             explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
+    for grid_id, grid in grids.items():
+        explicit_id = str(grid.get("account_id") or "")
+        if explicit_id:
+            observed_explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
+            if explicit_id in valid_ids:
+                explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
 
     def segment_candidates(page: int, top: float, *, geometry_known: bool) -> list[dict[str, Any]]:
         if not geometry_known or page <= 0:
@@ -381,6 +712,151 @@ def link_candidate_b_repayments(
                     candidates.append(account)
         return candidates
 
+    def exact_source_table_owner(
+        grid_id: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        if grid_id in duplicate_grid_ids:
+            return None, "duplicate_grid_id"
+        grid = grids.get(grid_id)
+        source_candidates = source_candidates_by_grid.get(grid_id, [])
+        if not isinstance(grid, dict) or not source_candidates:
+            return None, "source_table_grid_not_observed"
+        grid_page = _positive_native_int(grid.get("page"))
+        if grid_page is None:
+            return None, "source_table_page_conflict"
+        grid_box = _geometry_box({"bbox": grid.get("bbox")})
+        expected_months = _grid_months(grid)
+        if grid_page <= 0 or grid_box is None:
+            return None, "source_table_grid_geometry_unresolved"
+        if not expected_months:
+            return None, "source_table_grid_month_contract_unresolved"
+        month_x_bands = _exact_grid_month_x_bands(grid)
+        if month_x_bands is None:
+            return None, "source_table_grid_month_geometry_unresolved"
+
+        observed_months: list[tuple[int, int]] = []
+        record_table_identities: set[tuple[int, str]] = set()
+        source_ref_boxes: list[list[float]] = []
+        for candidate in source_candidates:
+            refs = (
+                candidate.get("source_cell_refs")
+                if isinstance(candidate.get("source_cell_refs"), list)
+                else []
+            )
+            grid_id_aliases = {
+                str(value)
+                for value in (
+                    candidate.get("grid_id"),
+                    *(
+                        source_ref.get("grid_id")
+                        for source_ref in refs
+                        if isinstance(source_ref, dict)
+                    ),
+                )
+                if value not in (None, "")
+            }
+            calendar_identity = _exact_performance_month(candidate)
+            if calendar_identity is None:
+                return None, "source_table_grid_month_contract_unresolved"
+            year, month = calendar_identity
+            if grid_id_aliases != {grid_id}:
+                return None, "source_table_grid_identity_conflict"
+            if (
+                year < 1900
+                or not 1 <= month <= 12
+                or _monthly_record_id(candidate, grid_id) != f"{grid_id}:{year:04d}-{month:02d}"
+                or not refs
+            ):
+                return None, "source_table_grid_month_contract_unresolved"
+            observed_months.append((year, month))
+            for source_ref in refs:
+                raw_identity = _source_table_identity(source_ref)
+                if raw_identity is not None and raw_identity[0] != grid_page:
+                    return None, "source_table_page_conflict"
+                identity = _exact_month_source_table_identity(source_ref)
+                if identity is None:
+                    return None, "source_table_exact_provenance_unresolved"
+                if (
+                    identity[0] != grid_page
+                    or str(source_ref.get("grid_id") or "") != grid_id
+                ):
+                    return None, "source_table_page_conflict"
+                raw_source_month = source_ref.get("col")
+                if (
+                    isinstance(raw_source_month, bool)
+                    or not isinstance(raw_source_month, int)
+                ):
+                    return None, "source_table_grid_month_contract_unresolved"
+                source_month = raw_source_month
+                if source_month != month:
+                    return None, "source_table_grid_month_contract_unresolved"
+                record_table_identities.add(identity)
+                ref_box = _geometry_box({"bbox": source_ref.get("bbox")})
+                if ref_box is None:
+                    return None, "source_table_exact_provenance_unresolved"
+                expected_x_band = month_x_bands.get(month)
+                if (
+                    not _box_contains(grid_box, ref_box, tolerance=0.0)
+                    or expected_x_band is None
+                    or abs(ref_box[0] - expected_x_band[0]) > 1e-6
+                    or abs(ref_box[2] - expected_x_band[1]) > 1e-6
+                ):
+                    return None, "source_table_grid_geometry_conflict"
+                source_ref_boxes.append(ref_box)
+
+        if len(observed_months) != len(expected_months) or set(observed_months) != expected_months:
+            return None, "source_table_grid_month_contract_unresolved"
+        grid_identity = _exact_grid_source_table_identity(grid)
+        if grid_identity is None:
+            return None, "source_table_exact_provenance_unresolved"
+        if grid_identity[0] != grid_page:
+            return None, "source_table_page_conflict"
+        if record_table_identities != {grid_identity}:
+            return None, "source_table_grid_provenance_conflict"
+
+        if grid_identity in (
+            conflicting_account_table_geometry | invalid_account_table_geometry
+        ):
+            return None, "source_table_account_geometry_conflict"
+        owners = account_table_owners.get(grid_identity, [])
+        if not owners:
+            return None, "source_table_account_owner_not_observed"
+        if len(owners) != 1:
+            return None, "ambiguous_source_table_account_owners"
+        owner, table_boxes = owners[0]
+        matching_table_boxes = [
+            table_box
+            for table_box in table_boxes
+            if _box_contains(table_box, grid_box)
+            and all(_box_contains(table_box, source_ref_box) for source_ref_box in source_ref_boxes)
+        ]
+        if not matching_table_boxes:
+            return None, "source_table_grid_geometry_conflict"
+
+        owner_id = str(owner.get("account_id") or "")
+        explicit_ids = observed_explicit_ids_by_grid.get(grid_id, set())
+        if explicit_ids and explicit_ids != {owner_id}:
+            return None, "explicit_owner_source_table_conflict"
+        owner_identifier = _canonical_account_identifier(owner.get("account_identifier"))
+        if owner_identifier is None:
+            return None, "source_table_account_identifier_unresolved"
+        observed_identifiers = {
+            str(candidate.get("account_identifier") or "")
+            for candidate in source_candidates
+            if candidate.get("account_identifier")
+        }
+        grid_identifier = str(grid.get("account_identifier") or "")
+        if grid_identifier:
+            observed_identifiers.add(grid_identifier)
+        if observed_identifiers and observed_identifiers != {owner_identifier}:
+            return None, "account_identifier_source_table_conflict"
+        return owner, "exact_source_table_account_owner"
+
+    source_table_owner_by_grid = {
+        grid_id: exact_source_table_owner(grid_id)
+        for grid_id in grids
+    }
+
     for record in repayments:
         item = dict(record)
         refs = item.get("source_cell_refs") if isinstance(item.get("source_cell_refs"), list) else []
@@ -396,7 +872,10 @@ def link_candidate_b_repayments(
         grid_y = float(box[1])
         candidates = segment_candidates(page, grid_y, geometry_known=box_is_known)
         candidate_ids = {str(candidate.get("account_id") or "") for candidate in candidates}
-        if grid_id and grid_id in owner_by_grid:
+        if grid_id in duplicate_grid_ids:
+            selected = None
+            linkage_basis = "duplicate_grid_id"
+        elif grid_id and grid_id in owner_by_grid:
             selected, linkage_basis = owner_by_grid[grid_id]
         else:
             explicit_owner = accounts_by_id.get(str(item.get("account_id") or ""))
@@ -411,8 +890,22 @@ def link_candidate_b_repayments(
                 selected = explicit_owner
                 linkage_basis = "explicit_account_id_confirmed_by_canonical_segment"
             elif explicit_owner is not None:
-                selected = None
-                linkage_basis = "explicit_owner_without_segment_proof"
+                table_owner, table_basis = source_table_owner_by_grid.get(
+                    grid_id,
+                    (None, "source_table_grid_not_observed"),
+                )
+                if table_owner is not None and str(table_owner.get("account_id") or "") == str(
+                    explicit_owner.get("account_id") or ""
+                ):
+                    selected = table_owner
+                    linkage_basis = table_basis
+                else:
+                    selected = None
+                    linkage_basis = (
+                        "explicit_owner_source_table_conflict"
+                        if table_owner is not None
+                        else table_basis
+                    )
             elif len(candidates) == 1:
                 selected = candidates[0]
                 linkage_basis = "canonical_account_segment"
@@ -420,8 +913,10 @@ def link_candidate_b_repayments(
                 selected = None
                 linkage_basis = "ambiguous_account_segments"
             else:
-                selected = None
-                linkage_basis = "account_segment_not_observed"
+                selected, linkage_basis = source_table_owner_by_grid.get(
+                    grid_id,
+                    (None, "account_segment_not_observed"),
+                )
         if grid_id and grid_id not in owner_by_grid:
             owner_by_grid[grid_id] = selected, linkage_basis
         if selected is not None:
@@ -478,7 +973,8 @@ def link_candidate_b_repayments(
                         issue_code="candidate_b_monthly_grid_owner_unresolved",
                         message=(
                             "A canonical monthly grid could not be assigned to exactly one printed account "
-                            "segment; its monthly rows were withheld from the typed relation."
+                            "segment or exact account-owned physical table; its monthly rows were withheld "
+                            "from the typed relation."
                         ),
                         parser_stage="candidate_b_relationship_schema",
                         target_dataset="repayment_records",
@@ -499,7 +995,7 @@ def link_candidate_b_repayments(
                         },
                         source_refs=ownership_refs,
                         reason_codes=(
-                            "exact_account_segment_owner_required",
+                            "exact_account_segment_or_source_table_owner_required",
                             linkage_basis,
                             "nearest_or_single_account_inference_disabled",
                             "relation_withheld",

@@ -289,11 +289,31 @@ def _template_spec(template_id: str) -> CanonicalTemplateSpec | None:
     return next((spec for spec in _TEMPLATES if spec.template_id == template_id), None)
 
 
+def _bottom_footer_geometry(value: Any, *, page_height: Any) -> bool:
+    """Mirror the context's exact narrow bottom-furniture proof."""
+
+    box = _bbox(value)
+    height = _finite(page_height)
+    if box is None or height <= 0.0:
+        return False
+    tolerance = max(2.0, height * 0.01)
+    return bool(
+        box[1] >= height * 0.85
+        and box[3] >= height * 0.90
+        and box[3] <= height + tolerance
+        and box[3] - box[1] <= height * 0.08
+    )
+
+
 def _printed_identity(evidence: Mapping[str, Any]) -> tuple[int, int] | None:
+    """Return one full printed-page footer proved by local geometry."""
+
+    page_height = evidence.get("page_height") or evidence.get("height")
     matches = {
         (int(match.group("page")), int(match.group("total")))
         for line in evidence.get("lines") or []
         if isinstance(line, Mapping)
+        if _bottom_footer_geometry(line, page_height=page_height)
         for match in _PRINTED_PAGE_RE.finditer(str(line.get("text") or line.get("content") or ""))
     }
     valid = {(page, total) for page, total in matches if 1 <= page <= total}
@@ -515,6 +535,22 @@ class PBOCCanonicalTemplateAssembler:
             self._record_registration_failure(logical, registrations[logical])
 
         groups = self._fragment_groups(evidence, registrations)
+        conflicting_group_pages = {
+            int(logical)
+            for group in groups
+            if group.get("reason") == "conflicting_registered_template_ids"
+            for logical in group.get("logical_pages") or ()
+        }
+        if conflicting_group_pages:
+            unresolved_pages = set(unresolved) | conflicting_group_pages
+            unresolved = tuple(
+                logical
+                for logical in ordered
+                if logical in unresolved_pages
+            )
+            for group in groups:
+                if group.get("reason") == "conflicting_registered_template_ids":
+                    self._record_fragment_group_conflict(group, registrations)
         canonical_pages: list[Any] = []
         canonical_evidence: list[dict[str, Any]] = []
         group_audits: list[dict[str, Any]] = []
@@ -548,7 +584,7 @@ class PBOCCanonicalTemplateAssembler:
         *,
         status: str = "registered",
     ) -> dict[str, Any]:
-        printed = _printed_identity(evidence)
+        printed, printed_basis = self._authoritative_printed_identity(logical, evidence)
         spec = _template_spec(template_id)
         return {
             "logical_page": logical,
@@ -558,41 +594,115 @@ class PBOCCanonicalTemplateAssembler:
             "confidence": round(float(confidence), 4),
             "basis": basis,
             "signals": list(signals),
-            **({"printed_page": printed[0], "printed_total": printed[1]} if printed else {}),
+            **(
+                {
+                    "printed_page": printed[0],
+                    "printed_total": printed[1],
+                    "printed_identity_authoritative": True,
+                    "printed_identity_basis": printed_basis,
+                }
+                if printed
+                else {}
+            ),
             **({"affected_source_datasets": list(spec.datasets)} if spec else {}),
         }
+
+    def _authoritative_printed_identity(
+        self,
+        logical: int,
+        evidence: Mapping[str, Any],
+    ) -> tuple[tuple[int, int] | None, str]:
+        """Use context provenance when present, otherwise prove footer geometry."""
+
+        resolution = getattr(self.issue_owner, "reading_order_resolution", None)
+        if isinstance(resolution, Mapping):
+            if (
+                resolution.get("resolved") is True
+                and resolution.get("authoritative") is True
+                and resolution.get("identity_fallback") is not True
+            ):
+                printed_by_logical = resolution.get("printed_page_by_logical")
+                printed_total = resolution.get("printed_total")
+                if isinstance(printed_by_logical, Mapping):
+                    printed_raw = printed_by_logical.get(logical)
+                    if printed_raw is None:
+                        printed_raw = printed_by_logical.get(str(logical))
+                    if (
+                        isinstance(printed_raw, int)
+                        and not isinstance(printed_raw, bool)
+                        and isinstance(printed_total, int)
+                        and not isinstance(printed_total, bool)
+                        and 1 <= printed_raw <= printed_total
+                    ):
+                        return (
+                            (printed_raw, printed_total),
+                            "context_authoritative_printed_order",
+                        )
+            # A present context resolution is the authority boundary.  Its
+            # explicit rejection or omission cannot be bypassed by rescanning
+            # the same local evidence inside canonical assembly.
+            return None, ""
+
+        printed = _printed_identity(evidence)
+        if printed is not None:
+            return printed, "bottom_footer_geometry"
+        return None, ""
 
     def _fragment_groups(
         self,
         evidence: Mapping[int, Mapping[str, Any]],
         registrations: Mapping[int, Mapping[str, Any]],
     ) -> list[dict[str, Any]]:
-        printed_by_source: dict[int, list[tuple[int, int, str]]] = {}
+        printed_by_source: dict[int, list[tuple[int, int, int, str]]] = {}
         for logical, registration in registrations.items():
             printed_page = int(registration.get("printed_page") or 0)
+            printed_total = int(registration.get("printed_total") or 0)
             source_page = int(registration.get("source_page") or 0)
-            if printed_page and source_page:
+            if (
+                printed_page
+                and printed_total
+                and source_page
+                and registration.get("printed_identity_authoritative") is True
+            ):
                 printed_by_source.setdefault(source_page, []).append(
-                    (printed_page, logical, str(registration.get("template_id") or ""))
+                    (
+                        printed_page,
+                        printed_total,
+                        logical,
+                        str(registration.get("template_id") or ""),
+                    )
                 )
-        grouped: dict[tuple[str, int], list[int]] = {}
+        grouped: dict[tuple[str, int, int], list[int]] = {}
         for logical in sorted(evidence, key=lambda value: self.reading_order.get(value, value)):
             registration = registrations[logical]
-            printed_page = int(registration.get("printed_page") or 0)
+            printed_page = (
+                int(registration.get("printed_page") or 0)
+                if registration.get("printed_identity_authoritative") is True
+                else 0
+            )
+            printed_total = (
+                int(registration.get("printed_total") or 0)
+                if registration.get("printed_identity_authoritative") is True
+                else 0
+            )
             if not printed_page and evidence[logical].get("plugin_static_subpage"):
                 source_page = int(registration.get("source_page") or evidence[logical].get("source_page") or 0)
                 template_id = str(registration.get("template_id") or "")
                 compatible = {
-                    page
-                    for page, _seed_logical, seed_template in printed_by_source.get(source_page, ())
+                    (page, total)
+                    for page, total, _seed_logical, seed_template in printed_by_source.get(source_page, ())
                     if seed_template == template_id
                 }
                 if len(compatible) == 1:
                     # This is another crop of the same canonical printed page,
                     # not a new template variant.  Its source crop determines
                     # where it lands on the virtual page canvas.
-                    printed_page = next(iter(compatible))
-            key = ("printed", printed_page) if printed_page else ("logical", logical)
+                    printed_page, printed_total = next(iter(compatible))
+            key = (
+                ("printed", printed_page, printed_total)
+                if printed_page and printed_total
+                else ("logical", logical, 0)
+            )
             grouped.setdefault(key, []).append(logical)
         result: list[dict[str, Any]] = []
         for key, logicals in grouped.items():
@@ -603,14 +713,30 @@ class PBOCCanonicalTemplateAssembler:
                 for logical in logicals
                 if registrations[logical].get("status") == "registered"
             ]
-            template_id = template_ids[0] if template_ids else "unresolved"
+            unique_template_ids = sorted(set(template_ids))
+            template_conflict = len(unique_template_ids) > 1
+            if template_conflict:
+                status = "unresolved"
+            template_id = unique_template_ids[0] if len(unique_template_ids) == 1 else "unresolved"
             result.append(
                 {
-                    "group_key": f"{key[0]}:{key[1]}",
+                    "group_key": (
+                        f"{key[0]}:{key[1]}/{key[2]}"
+                        if key[0] == "printed"
+                        else f"{key[0]}:{key[1]}"
+                    ),
                     "canonical_page": key[1] if key[0] == "printed" else self.reading_order.get(logicals[0], logicals[0]),
                     "logical_pages": logicals,
                     "template_id": template_id,
                     "status": status,
+                    **(
+                        {
+                            "reason": "conflicting_registered_template_ids",
+                            "conflicting_template_ids": unique_template_ids,
+                        }
+                        if template_conflict
+                        else {}
+                    ),
                 }
             )
         return result
@@ -808,6 +934,52 @@ class PBOCCanonicalTemplateAssembler:
                     "canonical_layout_unresolved_from_source_evidence",
                     "schema_triggered_page_repair_eligible",
                     "no_generic_layout_fallback",
+                    "normalized_values_withheld_for_page",
+                ),
+            ),
+        )
+
+    def _record_fragment_group_conflict(
+        self,
+        group: Mapping[str, Any],
+        registrations: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            make_issue,
+            record_issue,
+        )
+
+        logicals = tuple(int(value) for value in group.get("logical_pages") or ())
+        source_refs = tuple(
+            {
+                "source": "canonical_template_registration",
+                "logical_page": logical,
+                "source_page": int(registrations[logical].get("source_page") or logical),
+                "geometry_scope": "logical_page",
+            }
+            for logical in logicals
+        )
+        record_issue(
+            self.issue_owner,
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="canonical_fragment_template_conflict",
+                message=(
+                    "Fragments with one authoritative printed-page identity registered to conflicting "
+                    "canonical templates; the complete group was withheld."
+                ),
+                parser_stage="canonical_template_registration",
+                observed_value={
+                    "group_key": group.get("group_key"),
+                    "logical_pages": list(logicals),
+                    "template_ids": list(group.get("conflicting_template_ids") or ()),
+                },
+                confidence=0.0,
+                source_refs=source_refs,
+                reason_codes=(
+                    "authoritative_printed_identity_template_conflict",
+                    "canonical_group_withheld",
+                    "no_first_template_fallback",
                     "normalized_values_withheld_for_page",
                 ),
             ),

@@ -13,6 +13,7 @@ the scanned/OCR path and also emits a lossless source-row ledger.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections import Counter, defaultdict
 from copy import deepcopy
@@ -529,11 +530,16 @@ def _source_ref(
         "source_page": int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0),
         "table_id": str(getattr(table, "table_id", "") or ""),
     }
+    metadata = getattr(table, "metadata", None) or {}
+    geometry = metadata.get("geometry") if isinstance(metadata, dict) else None
+    if isinstance(geometry, dict):
+        coordinate_system = geometry.get("coordinate_system")
+        if isinstance(coordinate_system, str) and coordinate_system.strip():
+            ref["coordinate_system"] = coordinate_system.strip()
     if row is not None:
         ref["row"] = row
     if column is not None:
         ref["column"] = column
-    metadata = getattr(table, "metadata", None) or {}
     bbox = None
     if row is not None and column is not None and isinstance(metadata, dict):
         # Canonical projection keeps both registered-page coordinates and the
@@ -1256,6 +1262,19 @@ _ACCOUNT_CELL_CLUSTER_LABEL_SETS = frozenset(
         _ACCOUNT_CELL_LOAN_CLASSIFICATION | _ACCOUNT_CELL_REPAYMENT_TERMS,
     }
 )
+_ACCOUNT_CELL_ORDERED_LABEL_GROUPS = (
+    ("管理机构", "账户标识", "开立日期"),
+    ("发卡机构", "账户标识", "开立日期"),
+    ("到期日期", "借款金额", "账户币种"),
+    ("账户授信额度", "币种", "业务种类", "担保方式"),
+    ("业务种类", "担保方式", "还款期数"),
+    ("还款频率", "还款方式", "共同借款标志"),
+)
+_ACCOUNT_CELL_ORDERED_COMBINED_LABEL_GROUPS = (
+    _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[0] + _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[2],
+    _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[1] + _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[3],
+    _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[4] + _ACCOUNT_CELL_ORDERED_LABEL_GROUPS[5],
+)
 _ACCOUNT_CELL_CLUSTER_LABELS = tuple(
     sorted(
         {label for labels in _ACCOUNT_CELL_CLUSTER_LABEL_SETS for label in labels},
@@ -1304,6 +1323,404 @@ def _exact_account_cell_header_labels(value: Any) -> frozenset[str] | None:
             residue = residue.replace(marker, "", 1)
     labels = frozenset(observed)
     return labels if not residue and labels in _ACCOUNT_CELL_CLUSTER_LABEL_SETS else None
+
+
+def _exact_account_cell_header_order(value: Any) -> tuple[str, ...] | None:
+    """Return one canonical physical label order for a closed merged header."""
+
+    marker = _compact(value)
+    matches = [
+        labels
+        for labels in (
+            *_ACCOUNT_CELL_ORDERED_LABEL_GROUPS,
+            *_ACCOUNT_CELL_ORDERED_COMBINED_LABEL_GROUPS,
+        )
+        if marker == "".join(_compact(label) for label in labels)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _exact_geometry_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in (left, top, right, bottom)):
+        return None
+    return (left, top, right, bottom) if right > left and bottom > top else None
+
+
+def _account_merged_header_geometry_values(
+    table: Any,
+    rows: list[list[str]],
+    *,
+    header_row: int,
+    header_column: int,
+    labels: frozenset[str],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Bind a closed merged header only through its exact physical grid.
+
+    ``not_applicable`` preserves the existing whole-cell decoder for legacy
+    tables without a physical geometry plane. Once an exact merged span is
+    present, every ambiguity is ``rejected`` and cannot fall back to text
+    order. ``resolved`` requires one unmerged exact value cell in each ordered
+    physical header partition on the immediately following row.
+    """
+
+    if not (0 <= header_row < len(rows)) or not (
+        0 <= header_column < len(rows[header_row])
+    ):
+        return "not_applicable", []
+    ordered_labels = _exact_account_cell_header_order(
+        rows[header_row][header_column]
+    )
+    if ordered_labels is None or frozenset(ordered_labels) != labels:
+        return "not_applicable", []
+
+    metadata = getattr(table, "metadata", None) or {}
+    if not isinstance(metadata, Mapping):
+        return "not_applicable", []
+    geometry = metadata.get("geometry")
+    if not isinstance(geometry, Mapping):
+        geometry = metadata
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    row_bands = geometry.get("row_bands")
+    column_bands = geometry.get("col_bands")
+    cell_spans = geometry.get("cell_spans")
+    if not all(
+        isinstance(value, list)
+        for value in (
+            cell_bboxes,
+            cell_status,
+            row_bands,
+            column_bands,
+            cell_spans,
+        )
+    ):
+        return "not_applicable", []
+
+    def exact_span_integer(
+        span: Mapping[str, Any],
+        key: str,
+        *,
+        minimum: int,
+    ) -> int | None:
+        value = span.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            return None
+        return value
+
+    header_spans: list[Mapping[str, Any]] = []
+    for span in cell_spans:
+        if not isinstance(span, Mapping):
+            return "rejected", []
+        span_row = exact_span_integer(span, "row", minimum=0)
+        span_column = exact_span_integer(span, "col", minimum=0)
+        if span_row is None or span_column is None:
+            return "rejected", []
+        if span_row == header_row and span_column == header_column:
+            header_spans.append(span)
+    if not header_spans:
+        return "not_applicable", []
+    if len(header_spans) != 1:
+        return "rejected", []
+    header_span = header_spans[0]
+    row_span = exact_span_integer(header_span, "row_span", minimum=1)
+    column_span = exact_span_integer(header_span, "col_span", minimum=1)
+    if row_span is None or column_span is None:
+        return "rejected", []
+    if row_span != 1 or column_span <= 1 or column_span < len(ordered_labels):
+        return "rejected", []
+    if header_row + 1 >= len(rows):
+        return "rejected", []
+
+    def grid_value(grid: Any, row: int, column: int) -> Any:
+        if not (
+            isinstance(grid, list)
+            and 0 <= row < len(grid)
+            and isinstance(grid[row], list)
+            and 0 <= column < len(grid[row])
+        ):
+            return None
+        return grid[row][column]
+
+    header_bbox = _exact_geometry_bbox(
+        grid_value(cell_bboxes, header_row, header_column)
+    )
+    span_bbox = _exact_geometry_bbox(header_span.get("bbox"))
+    header_status = str(
+        grid_value(cell_status, header_row, header_column) or ""
+    )
+    if header_bbox is None or span_bbox != header_bbox or header_status != "exact":
+        return "rejected", []
+    if len(rows[header_row]) < header_column + column_span:
+        return "rejected", []
+    for covered_column in range(
+        header_column + 1,
+        header_column + column_span,
+    ):
+        if _clean(rows[header_row][covered_column]):
+            return "rejected", []
+        if grid_value(cell_bboxes, header_row, covered_column) is not None:
+            return "rejected", []
+        if str(grid_value(cell_status, header_row, covered_column) or "") != "derived":
+            return "rejected", []
+        covered_evidence = grid_value(
+            cell_evidence_ids,
+            header_row,
+            covered_column,
+        )
+        if isinstance(covered_evidence, list) and covered_evidence:
+            return "rejected", []
+        if any(
+            exact_span_integer(span, "row", minimum=0) == header_row
+            and exact_span_integer(span, "col", minimum=0) == covered_column
+            for span in cell_spans
+        ):
+            return "rejected", []
+
+    def indexed_geometry_bands(
+        bands: list[Any],
+    ) -> dict[int, Mapping[str, Any]] | None:
+        indexed: dict[int, Mapping[str, Any]] = {}
+        for band in bands:
+            if not isinstance(band, Mapping) or "index" not in band:
+                return None
+            raw_index = band.get("index")
+            if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                return None
+            index = raw_index
+            if index < 0 or index in indexed:
+                return None
+            indexed[index] = band
+        return indexed
+
+    indexed_bands = indexed_geometry_bands(row_bands)
+    indexed_column_bands = indexed_geometry_bands(column_bands)
+    if indexed_bands is None or indexed_column_bands is None:
+        return "rejected", []
+    header_band = indexed_bands.get(header_row)
+    value_band = indexed_bands.get(header_row + 1)
+    first_column_band = indexed_column_bands.get(header_column)
+    last_column_band = indexed_column_bands.get(
+        header_column + column_span - 1
+    )
+    try:
+        header_top = float((header_band or {}).get("y0"))
+        header_bottom = float((header_band or {}).get("y1"))
+        value_top = float((value_band or {}).get("y0"))
+        value_bottom = float((value_band or {}).get("y1"))
+        span_left = float((first_column_band or {}).get("x0"))
+        span_right = float((last_column_band or {}).get("x1"))
+    except (TypeError, ValueError):
+        return "rejected", []
+    if not all(
+        math.isfinite(value)
+        for value in (
+            header_top,
+            header_bottom,
+            value_top,
+            value_bottom,
+            span_left,
+            span_right,
+        )
+    ):
+        return "rejected", []
+    if abs(header_bottom - value_top) > 0.5:
+        return "rejected", []
+    declared_header_bbox = (
+        span_left,
+        header_top,
+        span_right,
+        header_bottom,
+    )
+    if any(
+        abs(observed - declared) > 1e-6
+        for observed, declared in zip(
+            header_bbox,
+            declared_header_bbox,
+            strict=True,
+        )
+    ):
+        return "rejected", []
+
+    span_by_cell: dict[tuple[int, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for span in cell_spans:
+        span_row = exact_span_integer(span, "row", minimum=0)
+        span_column = exact_span_integer(span, "col", minimum=0)
+        if span_row is None or span_column is None:
+            return "rejected", []
+        key = (span_row, span_column)
+        span_by_cell[key].append(span)
+
+    value_row = rows[header_row + 1]
+    populated_columns_in_span = [
+        column
+        for column, raw_value in enumerate(value_row)
+        if _clean(raw_value)
+        and header_column <= column < header_column + column_span
+    ]
+    if populated_columns_in_span == [header_column]:
+        # A single value cell aligned with the merged header is the existing
+        # whole-cell cluster grammar. Its shape-unique typed values remain
+        # governed by that decoder; this path is only for detached siblings.
+        return "not_applicable", []
+    contiguous_columns = list(
+        range(header_column, header_column + len(ordered_labels))
+    )
+    interleaved_columns = [
+        header_column + 1 + index * 2
+        for index in range(len(ordered_labels))
+    ]
+    if populated_columns_in_span not in (
+        contiguous_columns
+        if column_span == len(ordered_labels)
+        else [],
+        interleaved_columns
+        if column_span == len(ordered_labels) * 2 + 1
+        else [],
+    ):
+        return "rejected", []
+    candidates: list[dict[str, Any]] = []
+    header_left, _header_top, header_right, _header_bottom = header_bbox
+    for column, raw_value in enumerate(value_row):
+        raw = _clean(raw_value)
+        if not raw:
+            continue
+        bbox = _exact_geometry_bbox(
+            grid_value(cell_bboxes, header_row + 1, column)
+        )
+        if bbox is None:
+            continue
+        overlap = max(0.0, min(header_right, bbox[2]) - max(header_left, bbox[0]))
+        center = (bbox[0] + bbox[2]) / 2.0
+        if overlap <= 0.0 and not header_left < center < header_right:
+            continue
+        if not (header_column <= column < header_column + column_span):
+            return "rejected", []
+        if str(grid_value(cell_status, header_row + 1, column) or "") != "exact":
+            return "rejected", []
+        primitive_column_band = indexed_column_bands.get(column)
+        try:
+            primitive_bbox = (
+                float((primitive_column_band or {}).get("x0")),
+                value_top,
+                float((primitive_column_band or {}).get("x1")),
+                value_bottom,
+            )
+        except (TypeError, ValueError):
+            return "rejected", []
+        if _exact_geometry_bbox(primitive_bbox) != primitive_bbox:
+            return "rejected", []
+        if any(
+            abs(observed - declared) > 1e-6
+            for observed, declared in zip(bbox, primitive_bbox, strict=True)
+        ):
+            return "rejected", []
+        spans = span_by_cell.get((header_row + 1, column), [])
+        if len(spans) > 1:
+            return "rejected", []
+        if spans:
+            value_row_span = exact_span_integer(
+                spans[0],
+                "row_span",
+                minimum=1,
+            )
+            value_column_span = exact_span_integer(
+                spans[0],
+                "col_span",
+                minimum=1,
+            )
+            if value_row_span is None or value_column_span is None:
+                return "rejected", []
+            if value_row_span != 1 or value_column_span != 1:
+                return "rejected", []
+        if not header_left < center < header_right:
+            return "rejected", []
+        if bbox[1] < value_top - 0.5:
+            return "rejected", []
+        evidence_ids = grid_value(
+            cell_evidence_ids, header_row + 1, column
+        )
+        candidates.append(
+            {
+                "raw": raw,
+                "column": column,
+                "bbox": bbox,
+                "center": center,
+                "evidence_ids": [
+                    str(value) for value in evidence_ids or () if value
+                ]
+                if isinstance(evidence_ids, list)
+                else [],
+            }
+        )
+
+    if len(candidates) != len(ordered_labels):
+        return "rejected", []
+    candidates.sort(key=lambda item: (float(item["center"]), int(item["column"])))
+    partition_width = (header_right - header_left) / len(ordered_labels)
+    partitions: list[int] = []
+    for item in candidates:
+        offset = (float(item["center"]) - header_left) / partition_width
+        nearest_boundary = round(offset)
+        if 0 < nearest_boundary < len(ordered_labels) and abs(
+            offset - nearest_boundary
+        ) <= 0.03:
+            return "rejected", []
+        partitions.append(min(len(ordered_labels) - 1, int(offset)))
+    if partitions != list(range(len(ordered_labels))):
+        return "rejected", []
+
+    return "resolved", [
+        {
+            **candidate,
+            "label": label,
+            "field_name": _ACCOUNT_CELL_LABEL_FIELDS[label],
+        }
+        for label, candidate in zip(ordered_labels, candidates, strict=True)
+    ]
+
+
+def _decode_account_geometry_field_value(
+    field_name: str,
+    raw: str,
+) -> Any | None:
+    """Apply one field contract to an already geometry-bound exact cell."""
+
+    if not raw or is_explicit_source_absence(raw):
+        return None
+    if field_name == "management_institution":
+        return _account_institution(raw)
+    if field_name == "account_identifier":
+        return _typed_identifier(raw)
+    if field_name in {"open_date", "due_date"}:
+        normalized, residue, resolution = _canonical_date_slot(raw)
+        return normalized if normalized and not residue and resolution == "exact" else None
+    if field_name in {"loan_amount", "credit_limit"}:
+        compact = _clean(raw)
+        if re.fullmatch(r"[+-]?\d[\d,]*(?:\.\d+)?", compact) is None:
+            return None
+        value = _number(compact)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    if field_name == "currency":
+        currency, residue, resolution = _currency_token(raw)
+        return currency if currency and not residue and resolution == "exact" else None
+    if field_name == "repayment_periods":
+        compact = _clean(raw)
+        if re.fullmatch(r"\d{1,4}", compact) is None:
+            return None
+        value = _number(compact)
+        return value if isinstance(value, int) and 0 <= value <= 1200 else None
+    contract_role = _ACCOUNT_CELL_FINITE_ROLES.get(field_name)
+    if contract_role:
+        value = normalize_pboc_field(raw, contract_role)
+        return value if validate_pboc_field(value, contract_role).valid else None
+    return None
 
 
 def _account_cluster_signature(value: Any) -> str:
@@ -1737,6 +2154,248 @@ def _report_collapsed_cluster_fields(
         )
 
 
+def _native_table_geometry(table: Any) -> Mapping[str, Any] | None:
+    metadata = getattr(table, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    geometry = metadata.get("geometry")
+    return geometry if isinstance(geometry, Mapping) else None
+
+
+def _indexed_geometry_bands(
+    geometry: Mapping[str, Any],
+    key: str,
+    *,
+    lower_key: str,
+    upper_key: str,
+) -> dict[int, tuple[float, float]] | None:
+    raw_bands = geometry.get(key)
+    if not isinstance(raw_bands, list):
+        return None
+    bands: dict[int, tuple[float, float]] = {}
+    for raw_band in raw_bands:
+        if not isinstance(raw_band, Mapping):
+            return None
+        index = raw_band.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            return None
+        try:
+            lower = float(raw_band.get(lower_key))
+            upper = float(raw_band.get(upper_key))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
+            return None
+        if index in bands:
+            return None
+        bands[index] = (lower, upper)
+    return bands
+
+
+def _exact_native_table_cell(
+    table: Any,
+    *,
+    row: int,
+    column: int,
+) -> tuple[tuple[float, float, float, float], tuple[str, ...]] | None:
+    """Return one exact, unspanned cell on an indexed native lattice."""
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    row_bands = _indexed_geometry_bands(
+        geometry,
+        "row_bands",
+        lower_key="y0",
+        upper_key="y1",
+    )
+    column_bands = _indexed_geometry_bands(
+        geometry,
+        "col_bands",
+        lower_key="x0",
+        upper_key="x1",
+    )
+    if row_bands is None or column_bands is None:
+        return None
+    if row not in row_bands or column not in column_bands:
+        return None
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    if not all(
+        isinstance(value, list)
+        for value in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return None
+    if any(
+        row >= len(grid)
+        or not isinstance(grid[row], list)
+        or column >= len(grid[row])
+        for grid in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return None
+    if str(cell_status[row][column] or "") != "exact":
+        return None
+    bbox = _exact_geometry_bbox(cell_bboxes[row][column])
+    evidence_ids = cell_evidence_ids[row][column]
+    if bbox is None or not isinstance(evidence_ids, list):
+        return None
+    normalized_evidence = tuple(
+        dict.fromkeys(str(value) for value in evidence_ids if str(value or ""))
+    )
+    if not normalized_evidence:
+        return None
+    expected = (
+        column_bands[column][0],
+        row_bands[row][0],
+        column_bands[column][1],
+        row_bands[row][1],
+    )
+    if any(abs(left - right) > 1.0 for left, right in zip(bbox, expected, strict=True)):
+        return None
+    spans = geometry.get("cell_spans")
+    if spans is not None:
+        if not isinstance(spans, list):
+            return None
+        for span in spans:
+            if not isinstance(span, Mapping):
+                return None
+            try:
+                span_row = int(span.get("row"))
+                span_column = int(span.get("col"))
+                row_span = int(span.get("row_span"))
+                column_span = int(span.get("col_span"))
+            except (TypeError, ValueError):
+                return None
+            if (
+                span_row <= row < span_row + row_span
+                and span_column <= column < span_column + column_span
+            ):
+                return None
+    return bbox, normalized_evidence
+
+
+_EXACT_TWO_CELL_CARD_HEADERS = (
+    "发卡机构账户标识开立日期账户授信额度",
+    "共享授信额度币种业务种类担保方式",
+)
+
+
+def _exact_two_cell_card_cluster_values(
+    table: Any,
+    rows: list[list[str]],
+) -> dict[str, Any] | None:
+    """Decode the one observed two-wide-cell card identity layout."""
+
+    if (
+        len(rows) < 2
+        or len(rows[0]) != 2
+        or len(rows[1]) != 2
+        or tuple(_compact(value) for value in rows[0])
+        != _EXACT_TWO_CELL_CARD_HEADERS
+    ):
+        return None
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    column_bands = _indexed_geometry_bands(
+        geometry,
+        "col_bands",
+        lower_key="x0",
+        upper_key="x1",
+    )
+    if column_bands is None or set(column_bands) != {0, 1}:
+        return None
+    cell_geometry = {
+        (row, column): _exact_native_table_cell(table, row=row, column=column)
+        for row in (0, 1)
+        for column in (0, 1)
+    }
+    if any(value is None for value in cell_geometry.values()):
+        return None
+
+    left_raw = _clean(rows[1][0])
+    left = left_raw.split()
+    if (
+        len(left) != 7
+        or re.fullmatch(r"[A-Z]\d{8}[A-Z]", left[0], re.I) is None
+        or re.fullmatch(r"[\u3400-\u9fff]+", left[1]) is None
+        or re.fullmatch(r"\d{4,20}", left[2]) is None
+        or _date(left[3]) is None
+        or re.fullmatch(r"\d{1,3}(?:,\d{3})+", left[4]) is None
+        or re.fullmatch(r"[\u3400-\u9fff]+", left[5]) is None
+        or re.fullmatch(r"\d{4,20}", left[6]) is None
+    ):
+        return None
+    institution = _account_institution(f"{left[1]}{left[5]}")
+    identifier = _canonical_pboc_account_identifier(f"{left[0]}{left[2]}{left[6]}")
+    open_date = _date(left[3])
+    credit_limit = _number(left[4])
+    if (
+        not institution
+        or not identifier
+        or open_date is None
+        or not isinstance(credit_limit, int)
+        or isinstance(credit_limit, bool)
+        or credit_limit < 0
+    ):
+        return None
+
+    right_raw = _clean(rows[1][1])
+    right = right_raw.split()
+    if len(right) not in {3, 4}:
+        return None
+    currency, currency_residue, currency_resolution = _currency_token(right[0])
+    business_type = normalize_pboc_field(
+        _business_text(right[1]),
+        "account_business_type",
+    )
+    guarantee_type = normalize_pboc_field(
+        _business_text(right[2]),
+        "guarantee_type",
+    )
+    residue = "".join(right[3:])
+    if (
+        currency is None
+        or currency_resolution != "exact"
+        or currency_residue
+        or not validate_pboc_field(business_type, "account_business_type").valid
+        or not validate_pboc_field(guarantee_type, "guarantee_type").valid
+        or (residue and re.fullmatch(r"[\u3400-\u9fff]", residue) is None)
+    ):
+        return None
+    return {
+        "values": {
+            "management_institution": institution,
+            "account_identifier": identifier,
+            "open_date": open_date,
+            "credit_limit": credit_limit,
+            "currency": currency,
+            "business_type": business_type,
+            "guarantee_type": guarantee_type,
+        },
+        "raw_by_field": {
+            "management_institution": left_raw,
+            "account_identifier": left_raw,
+            "open_date": left_raw,
+            "credit_limit": left_raw,
+            "currency": right_raw,
+            "business_type": right_raw,
+            "guarantee_type": right_raw,
+        },
+        "column_by_field": {
+            "management_institution": 0,
+            "account_identifier": 0,
+            "open_date": 0,
+            "credit_limit": 0,
+            "currency": 1,
+            "business_type": 1,
+            "guarantee_type": 1,
+        },
+        "residue": residue,
+    }
+
+
 def _apply_collapsed_account_clusters(
     parse_result: Any,
     account: dict[str, Any],
@@ -1786,8 +2445,68 @@ def _apply_collapsed_account_clusters(
         for field_name, value in _status_fields(raw).items():
             bind(field_name, value, raw, row_index, column)
 
+    exact_two_cell_card = (
+        _exact_two_cell_card_cluster_values(table, rows)
+        if str(account.get("account_type") or "")
+        in {"credit_card", "quasi_credit_card"}
+        else None
+    )
+    if exact_two_cell_card is not None:
+        for field_name, value in exact_two_cell_card["values"].items():
+            column = int(exact_two_cell_card["column_by_field"][field_name])
+            raw = str(exact_two_cell_card["raw_by_field"][field_name])
+            bind(
+                field_name,
+                value,
+                raw,
+                1,
+                column,
+                binding="closed_exact_two_cell_card_cluster",
+            )
+            if field_name == "currency":
+                bind(
+                    "account_currency",
+                    value,
+                    raw,
+                    1,
+                    column,
+                    binding="closed_exact_two_cell_card_cluster",
+                )
+        shared_limit_ref = _source_ref(
+            page,
+            table,
+            row=physical(1),
+            column=1,
+        )
+        shared_limit_ref["binding"] = "closed_exact_two_cell_card_cluster"
+        shared_limit_ref["binding_quality"] = "closed_exact_two_cell_card_cluster"
+        _report_account_cell_cluster_unresolved(
+            parse_result,
+            account,
+            target_record_id=target_record_id,
+            field_names=("shared_credit_limit",),
+            raw=str(rows[1][1]),
+            source_ref=shared_limit_ref,
+        )
+        residue = str(exact_two_cell_card.get("residue") or "")
+        if residue:
+            residue_ref = _source_ref(page, table, row=physical(1), column=1)
+            residue_ref["binding"] = "closed_exact_two_cell_card_cluster"
+            residue_ref["binding_quality"] = "closed_exact_two_cell_card_cluster"
+            _report_account_cluster_residue(
+                parse_result,
+                account,
+                target_record_id=target_record_id,
+                field_names=("currency", "business_type", "guarantee_type"),
+                raw=str(rows[1][1]),
+                residue=residue,
+                source_ref=residue_ref,
+            )
+
     for header_index in range(len(rows) - 1):
         for value_column, raw_header in enumerate(rows[header_index]):
+            if exact_two_cell_card is not None and header_index == 0 and value_column in {0, 1}:
+                continue
             header_raw = _clean(raw_header)
             if not header_raw:
                 continue
@@ -1830,6 +2549,139 @@ def _apply_collapsed_account_clusters(
 
             labels = _exact_account_cell_header_labels(header_raw)
             if labels is not None:
+                geometry_status, geometry_values = (
+                    _account_merged_header_geometry_values(
+                        table,
+                        rows,
+                        header_row=header_index,
+                        header_column=value_column,
+                        labels=labels,
+                    )
+                )
+                if geometry_status == "rejected":
+                    cluster_ref = _source_ref(
+                        page,
+                        table,
+                        row=physical(header_index),
+                        column=value_column,
+                    )
+                    cluster_ref["binding"] = (
+                        "closed_canonical_account_merged_header_geometry"
+                    )
+                    cluster_ref["binding_quality"] = (
+                        "closed_canonical_account_merged_header_geometry_rejected"
+                    )
+                    _report_account_cell_cluster_unresolved(
+                        parse_result,
+                        account,
+                        target_record_id=target_record_id,
+                        raw=_clean(" ".join(rows[header_index + 1])),
+                        source_ref=cluster_ref,
+                        field_names=(
+                            _ACCOUNT_CELL_LABEL_FIELDS[label] for label in labels
+                        ),
+                    )
+                    continue
+                if geometry_status == "resolved":
+                    source_row = physical(header_index + 1)
+                    if source_row is None:
+                        continue
+                    for item in geometry_values:
+                        field_name = str(item["field_name"])
+                        raw = str(item["raw"])
+                        source_ref = _source_ref(
+                            page,
+                            table,
+                            row=source_row,
+                            column=int(item["column"]),
+                        )
+                        source_ref.update(
+                            {
+                                "source": "native_detail_table_cell",
+                                "geometry_scope": "cell",
+                                "bbox": list(item["bbox"]),
+                                "evidence_ids": list(item["evidence_ids"]),
+                                "binding": (
+                                    "closed_canonical_account_merged_header_geometry"
+                                ),
+                                "binding_quality": (
+                                    "closed_canonical_account_merged_header_geometry"
+                                ),
+                                "header_row": physical(header_index),
+                                "header_column": value_column,
+                            }
+                        )
+                        value = _decode_account_geometry_field_value(
+                            field_name,
+                            raw,
+                        )
+                        if value is None:
+                            _reject_exact_observation(
+                                parse_result,
+                                account,
+                                dataset="credit_accounts",
+                                target_record_id=target_record_id,
+                                field_name=field_name,
+                                raw=raw,
+                                source_ref=source_ref,
+                                parser_stage=(
+                                    "candidate_b_account_merged_header_geometry"
+                                ),
+                            )
+                            continue
+                        if field_name == "management_institution":
+                            _merge_account_institution_observation(
+                                parse_result,
+                                account,
+                                raw=raw,
+                                source_ref=source_ref,
+                                parser_stage=(
+                                    "candidate_b_account_merged_header_geometry"
+                                ),
+                            )
+                            continue
+                        if field_name in {"open_date", "due_date"}:
+                            _merge_canonical_date_observation(
+                                parse_result,
+                                account,
+                                dataset="credit_accounts",
+                                target_record_id=target_record_id,
+                                field_name=field_name,
+                                raw=raw,
+                                source_ref=source_ref,
+                                parser_stage=(
+                                    "candidate_b_account_merged_header_geometry"
+                                ),
+                            )
+                            continue
+                        _merge_exact_observation(
+                            parse_result,
+                            account,
+                            dataset="credit_accounts",
+                            target_record_id=target_record_id,
+                            field_name=field_name,
+                            value=value,
+                            raw=raw,
+                            source_ref=source_ref,
+                            parser_stage=(
+                                "candidate_b_account_merged_header_geometry"
+                            ),
+                        )
+                        if field_name == "currency":
+                            _merge_exact_observation(
+                                parse_result,
+                                account,
+                                dataset="credit_accounts",
+                                target_record_id=target_record_id,
+                                field_name="account_currency",
+                                value=value,
+                                raw=raw,
+                                source_ref=source_ref,
+                                parser_stage=(
+                                    "candidate_b_account_merged_header_geometry"
+                                ),
+                            )
+                    continue
                 fields, unresolved_fields, residue = _decode_account_cell_cluster(
                     labels,
                     value_raw,
@@ -2666,6 +3518,17 @@ def _account_reading_order_resolution(
 
     materialized = list(pages)
     raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    registered_resolution = getattr(parse_result, "reading_order_resolution", None)
+    legacy_sealed = not hasattr(
+        parse_result, "reading_order_by_logical"
+    ) and not hasattr(parse_result, "reading_order_resolution")
+    provenance_resolved = legacy_sealed or not hasattr(
+        parse_result, "reading_order_resolution"
+    ) or bool(
+        isinstance(registered_resolution, Mapping)
+        and registered_resolution.get("resolved") is True
+        and registered_resolution.get("authoritative") is True
+    )
     normalized_order: dict[int, int] = {}
     if isinstance(raw_order, Mapping):
         for raw_logical, raw_position in raw_order.items():
@@ -2738,11 +3601,12 @@ def _account_reading_order_resolution(
     # treated their sealed page list as authoritative.  Preserve that explicit
     # legacy contract.  Once a context exposes the plane, however, empty,
     # partial, or non-unique registration is unresolved and must fail closed.
-    resolved = raw_order is None or bool(
+    resolved = legacy_sealed or bool(
         isinstance(raw_order, Mapping)
         and normalized_order
         and not missing
         and not duplicate_positions
+        and provenance_resolved
     )
     return normalized_order, logical_pages, missing, duplicate_positions, resolved
 
@@ -2762,10 +3626,13 @@ def _account_ordered_pages(parse_result: Any, pages: Iterable[Any]) -> list[Any]
         return materialized
 
     raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    registered_resolution = getattr(parse_result, "reading_order_resolution", None)
     # Small unit/legacy contexts created before the reading-order plane existed
     # retain their sealed order without manufacturing a diagnostic.  A real
     # context that exposes an empty/invalid plane is explicitly auditable.
-    if raw_order is None:
+    if raw_order is None and not hasattr(
+        parse_result, "reading_order_by_logical"
+    ) and not hasattr(parse_result, "reading_order_resolution"):
         return materialized
     (
         normalized_order,
@@ -2799,6 +3666,11 @@ def _account_ordered_pages(parse_result: Any, pages: Iterable[Any]) -> list[Any]
                     observed_value={
                         "logical_pages": logical_pages,
                         "registered_reading_order": normalized_order,
+                        "reading_order_resolution": (
+                            dict(registered_resolution)
+                            if isinstance(registered_resolution, Mapping)
+                            else None
+                        ),
                         "missing_logical_pages": missing,
                         "duplicate_reading_positions": duplicate_positions,
                     },
@@ -2833,6 +3705,7 @@ def _account_ordered_pages(parse_result: Any, pages: Iterable[Any]) -> list[Any]
 
 def _geometric_prior_account_continuation(
     *,
+    parse_result: Any,
     page: Any,
     table: Any,
     page_tables: list[Any],
@@ -2840,6 +3713,7 @@ def _geometric_prior_account_continuation(
     current_table_top: float | None,
     rows: list[list[str]],
     pending_labels: list[str] | None,
+    cross_page_order_resolved: bool,
 ) -> bool:
     """Authorize the unique prior-account interval around a split table.
 
@@ -2858,7 +3732,14 @@ def _geometric_prior_account_continuation(
         return False
     if logical_page == current_logical_page:
         return current_table_top is not None and top + 1.0 >= current_table_top
-    if logical_page < current_logical_page:
+    if not (
+        cross_page_order_resolved
+        and _registered_account_pages_are_adjacent(
+            parse_result,
+            current_logical_page,
+            logical_page,
+        )
+    ):
         return False
     next_body_tops = [
         candidate_top
@@ -3284,7 +4165,24 @@ def _registered_account_pages_are_adjacent(
 ) -> bool:
     """Require exact adjacency in the already-validated reading-order plane."""
 
+    registered_resolution = getattr(parse_result, "reading_order_resolution", None)
+    if hasattr(parse_result, "reading_order_resolution") and not (
+        isinstance(registered_resolution, Mapping)
+        and registered_resolution.get("resolved") is True
+        and registered_resolution.get("authoritative") is True
+    ):
+        return False
     raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    if raw_order is None:
+        # Sealed unit/legacy contexts predate the document order plane.  Their
+        # only cross-page contract is the immediate logical edge; an explicit
+        # plane below always takes the stricter complete/unique path.
+        return bool(
+            not hasattr(parse_result, "reading_order_by_logical")
+            and not hasattr(parse_result, "reading_order_resolution")
+            and int(left_logical_page or 0) > 0
+            and int(right_logical_page or 0) == int(left_logical_page or 0) + 1
+        )
     if not isinstance(raw_order, Mapping):
         return False
     normalized: dict[int, int] = {}
@@ -3303,6 +4201,30 @@ def _registered_account_pages_are_adjacent(
     left = normalized.get(int(left_logical_page or 0))
     right = normalized.get(int(right_logical_page or 0))
     return bool(left is not None and right == left + 1)
+
+
+def _bounded_card_credit_limit(value: Any) -> tuple[int, str] | None:
+    """Return one money token with at most one trailing Han OCR glyph."""
+
+    raw = _clean(value)
+    tokens = list(
+        dict.fromkeys(
+            re.findall(r"(?<![A-Za-z0-9])\d[\d,]*(?![A-Za-z0-9])", raw)
+        )
+    )
+    if len(tokens) != 1:
+        return None
+    parsed = _number(tokens[0])
+    if (
+        not isinstance(parsed, int)
+        or isinstance(parsed, bool)
+        or parsed < 0
+    ):
+        return None
+    residue = _account_cluster_residue(raw, (tokens[0],))
+    if residue and re.fullmatch(r"[\u3400-\u9fff]", residue) is None:
+        return None
+    return parsed, residue
 
 
 def _bounded_headerless_card_values(
@@ -3346,15 +4268,26 @@ def _bounded_headerless_card_values(
     raw_limit = _clean(body[columns["credit_limit"]])
     raw_currency = _clean(body[columns["currency"]])
     raw_business_type = _clean(body[columns["business_type"]])
+    raw_guarantee_type = _clean(body[columns["guarantee_type"]])
     institution = _account_institution(raw_institution)
     identifier = _canonical_pboc_account_identifier(raw_identifier)
     open_date = _date(raw_open_date)
-    credit_limit = _number(raw_limit)
+    bounded_limit = _bounded_card_credit_limit(raw_limit)
+    credit_limit = bounded_limit[0] if bounded_limit is not None else None
+    credit_limit_residue = bounded_limit[1] if bounded_limit is not None else ""
     currency, _currency_residue, currency_resolution = _currency_token(raw_currency)
     business_type = normalize_pboc_field(
         _business_text(raw_business_type),
         "account_business_type",
     )
+    guarantee_type = normalize_pboc_field(
+        _business_text(raw_guarantee_type),
+        "guarantee_type",
+    )
+    guarantee_valid = bool(guarantee_type) and validate_pboc_field(
+        guarantee_type,
+        "guarantee_type",
+    ).valid
     if (
         not institution
         or not identifier
@@ -3368,14 +4301,115 @@ def _bounded_headerless_card_values(
         or not validate_pboc_field(business_type, "account_business_type").valid
     ):
         return None
-    return {
+    result = {
         "management_institution": institution,
         "account_identifier": identifier,
         "open_date": open_date,
         "credit_limit": credit_limit,
         "currency": currency,
         "business_type": business_type,
+        "_credit_limit_residue": credit_limit_residue,
     }
+    if guarantee_valid:
+        result["guarantee_type"] = guarantee_type
+    return result
+
+
+def _exact_anchor_evidence_card_header(
+    skeleton: Mapping[str, Any],
+    *,
+    table: Any,
+    rows: list[list[str]],
+    prior_logical_page: int,
+) -> tuple[list[str], list[dict[str, Any]]] | None:
+    """Project one exact post-anchor card header onto the next table lattice."""
+
+    if not rows or not rows[0]:
+        return None
+    anchor_bbox = _exact_geometry_bbox(skeleton.get("bbox"))
+    if anchor_bbox is None:
+        return None
+    header_lines: list[tuple[dict[str, Any], str, tuple[float, float, float, float]]] = []
+    for raw_line in skeleton.get("raw_detail_lines") or ():
+        if not isinstance(raw_line, Mapping):
+            continue
+        if int(raw_line.get("logical_page") or 0) != int(prior_logical_page or 0):
+            continue
+        role = _ACCOUNT_BASIC_HEADER_ROLES.get(_compact(raw_line.get("text") or ""))
+        bbox = _exact_geometry_bbox(raw_line.get("bbox"))
+        evidence_ids = tuple(
+            dict.fromkeys(
+                str(value)
+                for value in raw_line.get("evidence_ids") or ()
+                if str(value or "")
+            )
+        )
+        if (
+            role not in _ACCOUNT_BASIC_CARD_TEMPLATE
+            or bbox is None
+            or not evidence_ids
+            or bbox[1] + 1.0 < anchor_bbox[3]
+            or bbox[1] > anchor_bbox[3] + 36.0
+        ):
+            continue
+        header_lines.append((dict(raw_line), str(role), bbox))
+    roles = [role for _line, role, _bbox in header_lines]
+    if (
+        len(header_lines) != len(_ACCOUNT_BASIC_CARD_TEMPLATE)
+        or tuple(sorted(roles)) != tuple(sorted(_ACCOUNT_BASIC_CARD_TEMPLATE))
+        or any(roles.count(role) != 1 for role in _ACCOUNT_BASIC_CARD_TEMPLATE)
+    ):
+        return None
+    ordered = sorted(header_lines, key=lambda item: (item[2][0] + item[2][2]) / 2.0)
+    if tuple(item[1] for item in ordered) != _ACCOUNT_BASIC_CARD_TEMPLATE:
+        return None
+    centers_y = [(item[2][1] + item[2][3]) / 2.0 for item in ordered]
+    if max(centers_y) - min(centers_y) > 18.0:
+        return None
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    column_bands = _indexed_geometry_bands(
+        geometry,
+        "col_bands",
+        lower_key="x0",
+        upper_key="x1",
+    )
+    width = len(rows[0])
+    if column_bands is None or set(column_bands) != set(range(width)):
+        return None
+    labels = ["" for _column in range(width)]
+    refs: list[dict[str, Any]] = []
+    for line, role, bbox in ordered:
+        center = (bbox[0] + bbox[2]) / 2.0
+        matching_columns = [
+            column
+            for column, (left, right) in column_bands.items()
+            if left <= center <= right
+        ]
+        if len(matching_columns) != 1:
+            return None
+        column = matching_columns[0]
+        if labels[column]:
+            return None
+        labels[column] = _compact(line.get("text") or "")
+        raw_value = _clean(rows[0][column] if column < len(rows[0]) else "")
+        if role != "shared_credit_limit":
+            if not raw_value or _exact_native_table_cell(table, row=0, column=column) is None:
+                return None
+        refs.append(
+            {
+                "source": "candidate_b_account_anchor_header",
+                "logical_page": int(prior_logical_page or 0),
+                "source_page": int(line.get("source_page") or 0),
+                "bbox": list(bbox),
+                "evidence_ids": list(line.get("evidence_ids") or ()),
+                "field_name": role,
+                "binding": "printed_anchor_exact_card_header_lattice",
+            }
+        )
+    return labels, refs
 
 
 def _bounded_headerless_card_owner(
@@ -3385,12 +4419,13 @@ def _bounded_headerless_card_owner(
     prior_logical_page: int,
     prior_table_top: float | None,
     candidate_page: Any,
+    candidate_table: Any,
     source_table_index: int,
     pending_labels: list[str] | None,
     rows: list[list[str]],
     prior_accounts: Iterable[Mapping[str, Any]],
     cross_page_order_resolved: bool,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    ) -> dict[str, Any] | None:
     """Resolve a headerless top-of-page card only from a pending exact anchor."""
 
     if not cross_page_order_resolved:
@@ -3406,12 +4441,6 @@ def _bounded_headerless_card_owner(
         candidate_logical_page,
     ):
         return None
-    strong_values = _bounded_headerless_card_values(pending_labels, rows)
-    if strong_values is None:
-        return None
-    strong_identifier = _canonical_pboc_account_identifier(
-        strong_values.get("account_identifier")
-    )
     prior_identifiers = {
         identifier
         for record in prior_accounts
@@ -3421,9 +4450,6 @@ def _bounded_headerless_card_owner(
             )
         )
     }
-    if strong_identifier in prior_identifiers:
-        return None
-
     candidates: list[dict[str, Any]] = []
     for skeleton in _account_anchor_skeletons(parse_result):
         if str(skeleton.get("account_type") or "") not in {
@@ -3444,13 +4470,44 @@ def _bounded_headerless_card_owner(
             continue
         if anchor_top <= prior_table_top + 1.0:
             continue
+        header_labels = list(pending_labels) if pending_labels is not None else None
+        header_refs: list[dict[str, Any]] = []
+        ownership_basis = "pending_table_header_row"
+        strong_values = _bounded_headerless_card_values(header_labels, rows)
+        if strong_values is None:
+            projected = _exact_anchor_evidence_card_header(
+                skeleton,
+                table=candidate_table,
+                rows=rows,
+                prior_logical_page=prior_logical_page,
+            )
+            if projected is None:
+                continue
+            header_labels, header_refs = projected
+            strong_values = _bounded_headerless_card_values(header_labels, rows)
+            ownership_basis = "printed_anchor_header_lattice"
+        if strong_values is None or header_labels is None:
+            continue
+        strong_identifier = _canonical_pboc_account_identifier(
+            strong_values.get("account_identifier")
+        )
+        if strong_identifier in prior_identifiers:
+            continue
         anchor_identifier = _account_card_identifier(skeleton)
         if anchor_identifier and anchor_identifier != strong_identifier:
             continue
-        candidates.append(skeleton)
+        candidates.append(
+            {
+                "skeleton": skeleton,
+                "strong_values": strong_values,
+                "header_labels": header_labels,
+                "header_refs": header_refs,
+                "ownership_basis": ownership_basis,
+            }
+        )
     if len(candidates) != 1:
         return None
-    return candidates[0], strong_values
+    return candidates[0]
 
 
 def _extract_table_accounts(
@@ -3467,6 +4524,7 @@ def _extract_table_accounts(
     current_table_id = ""
     current_logical_page = 0
     current_table_top: float | None = None
+    phase_logical_page = 0
     continuation_check = getattr(parse_result, "tables_continue", None)
 
     def flush_pending_fact_labels(boundary: str) -> None:
@@ -3584,6 +4642,7 @@ def _extract_table_accounts(
             current_logical_page = 0
             current_table_top = None
             phase = "non_revolving_loan"
+            phase_logical_page = 0
         page_tables = list(getattr(page, "tables", None) or [])
         page_tables.sort(
             key=lambda candidate: (
@@ -3605,6 +4664,7 @@ def _extract_table_accounts(
                     account_type = "credit_card" if "业务种类" in compact else "quasi_credit_card"
                     account_family_basis = "card_table_signature"
                     phase = account_type
+                    phase_logical_page = int(getattr(page, "page_number", 0) or 0)
                 elif "账户授信额度" in compact:
                     account_type = "revolving_loan_subaccount"
                     # R1 and R2 share this canonical first-row label.  The
@@ -3612,13 +4672,27 @@ def _extract_table_accounts(
                     # but it does not distinguish the printed family variant.
                     account_family_basis = "shared_revolving_credit_limit_signature"
                     phase = account_type
-                elif phase in {"revolving_loan_subaccount", "revolving_loan_account"}:
+                    phase_logical_page = int(getattr(page, "page_number", 0) or 0)
+                elif phase in {"revolving_loan_subaccount", "revolving_loan_account"} and (
+                    int(getattr(page, "page_number", 0) or 0) == phase_logical_page
+                    or (
+                        cross_page_order_resolved
+                        and _registered_account_pages_are_adjacent(
+                            parse_result,
+                            phase_logical_page,
+                            int(getattr(page, "page_number", 0) or 0),
+                        )
+                    )
+                ):
                     account_type = "revolving_loan_account"
                     account_family_basis = "revolving_table_phase_carry"
                     phase = account_type
+                    phase_logical_page = int(getattr(page, "page_number", 0) or 0)
                 else:
                     account_type = "non_revolving_loan"
                     account_family_basis = "non_revolving_table_signature"
+                    phase = account_type
+                    phase_logical_page = int(getattr(page, "page_number", 0) or 0)
 
                 table_ref = _source_ref(page, table)
                 table_observation_id = stable_record_id(
@@ -3692,6 +4766,7 @@ def _extract_table_accounts(
                     prior_logical_page=current_logical_page,
                     prior_table_top=current_table_top,
                     candidate_page=page,
+                    candidate_table=table,
                     source_table_index=source_table_index,
                     pending_labels=pending_labels,
                     rows=rows,
@@ -3701,11 +4776,22 @@ def _extract_table_accounts(
                 if current is not None and not _other_entity_table(rows)
                 else None
             )
-            if headerless_owner is not None and pending_labels is not None:
-                owner_skeleton, strong_values = headerless_owner
+            if headerless_owner is not None:
+                owner_skeleton = dict(headerless_owner["skeleton"])
+                strong_values = dict(headerless_owner["strong_values"])
+                header_labels = list(headerless_owner["header_labels"])
+                header_refs = [
+                    dict(ref) for ref in headerless_owner.get("header_refs") or ()
+                ]
+                ownership_basis = str(
+                    headerless_owner.get("ownership_basis") or ""
+                )
                 prior_account_id = str(current.get("account_id") or "")
-                header_labels = list(pending_labels)
-                header_source = pending_label_source
+                header_source = (
+                    pending_label_source
+                    if ownership_basis == "pending_table_header_row"
+                    else None
+                )
                 flush_pending_event("next_account", candidate_table=table)
                 flush_pending_institution("next_account")
                 pending_labels = None
@@ -3737,7 +4823,7 @@ def _extract_table_accounts(
                     "account_type": account_type,
                     "credit_card_type": account_type,
                     "_table_account_family_basis": (
-                        "pending_printed_card_anchor_exact_header"
+                        "printed_card_anchor_exact_header_lattice"
                     ),
                     "source": "native_detail_account_table",
                     "source_refs": [
@@ -3751,14 +4837,60 @@ def _extract_table_accounts(
                     "confidence": 1.0,
                     "canonical_raw": {},
                 }
+                fact_rows = [list(row) for row in rows]
+                credit_limit_residue = str(
+                    strong_values.pop("_credit_limit_residue", "") or ""
+                )
+                credit_limit_column = next(
+                    (
+                        column
+                        for column, label in enumerate(header_labels)
+                        if _ACCOUNT_BASIC_HEADER_ROLES.get(_compact(label))
+                        == "credit_limit"
+                    ),
+                    None,
+                )
+                raw_credit_limit = ""
+                if (
+                    credit_limit_residue
+                    and credit_limit_column is not None
+                    and fact_rows
+                    and credit_limit_column < len(fact_rows[0])
+                ):
+                    raw_credit_limit = str(fact_rows[0][credit_limit_column])
+                    fact_rows[0][credit_limit_column] = str(
+                        strong_values["credit_limit"]
+                    )
                 _apply_account_facts(
                     parse_result,
                     current,
-                    [header_labels, *rows],
+                    [header_labels, *fact_rows],
                     page=page,
                     table=table,
                     physical_row_indices=[None, *range(len(rows))],
                 )
+                if raw_credit_limit:
+                    current.setdefault("canonical_raw", {})[
+                        "credit_limit"
+                    ] = raw_credit_limit
+                    residue_ref = _source_ref(
+                        page,
+                        table,
+                        row=0,
+                        column=int(credit_limit_column),
+                    )
+                    residue_ref["binding"] = (
+                        "printed_anchor_exact_card_header_lattice"
+                    )
+                    _report_account_cluster_residue(
+                        parse_result,
+                        current,
+                        target_record_id=table_observation_id,
+                        field_names=("credit_limit",),
+                        raw=raw_credit_limit,
+                        residue=credit_limit_residue,
+                        source_ref=residue_ref,
+                    )
                 accounts.append(current)
                 repayment_rows, _context = _repayment_records(page, table, rows, current)
                 repayments.extend(repayment_rows)
@@ -3794,6 +4926,7 @@ def _extract_table_accounts(
                         if header_source is not None
                         else ()
                     ),
+                    *header_refs,
                     table_ref,
                 ]
                 record_issue(
@@ -3802,7 +4935,7 @@ def _extract_table_accounts(
                         category="ocr_structure_correction",
                         issue_code="candidate_b_headerless_account_owner_resolved",
                         message=(
-                            "A complete pending card header and exact printed anchor assigned the "
+                            "A complete exact card header and printed anchor assigned the "
                             "adjacent page's headerless value table to a new account."
                         ),
                         severity="info",
@@ -3816,6 +4949,7 @@ def _extract_table_accounts(
                             "pending_anchor_account_id": owner_skeleton.get("account_id"),
                             "candidate_table_id": candidate_table_id,
                             "strong_identity": strong_values,
+                            "ownership_basis": ownership_basis,
                         },
                         candidate_value={
                             "account_type": account_type,
@@ -3827,7 +4961,8 @@ def _extract_table_accounts(
                             "complete_card_header_in_template_order",
                             "finite_card_identity_contracts",
                             "distinct_account_identifier",
-                            "unique_pending_printed_anchor",
+                            "unique_printed_anchor",
+                            ownership_basis,
                         ),
                     ),
                 )
@@ -3841,6 +4976,7 @@ def _extract_table_accounts(
                 current is not None
                 and not _other_entity_table(rows)
                 and _geometric_prior_account_continuation(
+                    parse_result=parse_result,
                     page=page,
                     table=table,
                     page_tables=page_tables,
@@ -3848,6 +4984,7 @@ def _extract_table_accounts(
                     current_table_top=current_table_top,
                     rows=rows,
                     pending_labels=pending_labels,
+                    cross_page_order_resolved=cross_page_order_resolved,
                 )
             )
 
@@ -5604,6 +6741,202 @@ def _account_identifier_from_detail(detail: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _account_page_table_evidence(
+    parse_result: Any,
+    logical_page: int,
+) -> tuple[tuple[str, str] | None, bool]:
+    """Return one exact page-local family or a compatible shared-R1/R2 carry.
+
+    Family headings may legitimately be followed by an account-bearing page
+    whose OCR line plane contains only cell values.  A closed native account
+    table is sufficient to start or refresh that family, while an empty page
+    remains a hard boundary.  Shared R1/R2 signatures are deliberately not
+    classified here because their subtype is not page-local.
+    """
+
+    target = int(logical_page or 0)
+    if target <= 0:
+        return None, False
+    families: set[str] = set()
+    account_base_count = 0
+    shared_revolving_count = 0
+    shared_revolving_has_identity = False
+    for page in getattr(parse_result, "pages", None) or ():
+        if int(getattr(page, "page_number", 0) or 0) != target:
+            continue
+        for table in getattr(page, "tables", None) or ():
+            rows = _table_rows(table)
+            if not rows or _other_entity_table(rows):
+                continue
+            if not _account_base(rows):
+                continue
+            account_base_count += 1
+            compact = _compact(" ".join(cell for row in rows[:6] for cell in row))
+            if "\u53d1\u5361\u673a\u6784" in compact:
+                families.add(
+                    "credit_card"
+                    if "\u4e1a\u52a1\u79cd\u7c7b" in compact
+                    else "quasi_credit_card"
+                )
+            elif "\u8d26\u6237\u6388\u4fe1\u989d\u5ea6" in compact:
+                shared_revolving_count += 1
+                shared_revolving_has_identity = (
+                    shared_revolving_has_identity
+                    or any(
+                        bool(_canonical_pboc_account_identifier(cell))
+                        for row in rows
+                        for cell in row
+                    )
+                )
+            else:
+                families.add("non_revolving_loan")
+    if len(families) == 1 and shared_revolving_count == 0:
+        return (next(iter(families)), "exact"), False
+    shared_revolving_carry = bool(
+        not families
+        and account_base_count > 0
+        and shared_revolving_count == account_base_count
+        and shared_revolving_has_identity
+    )
+    return None, shared_revolving_carry
+
+
+def _bounded_revolving_family_carry_over_generic_table(
+    parse_result: Any,
+    *,
+    page: Mapping[str, Any],
+    active_family: str,
+    active_family_quality: str,
+    active_family_logical_page: int,
+    active_family_last_ordinal: int,
+    local_table_family: tuple[str, str] | None,
+    cross_page_order_resolved: bool,
+) -> bool:
+    """Keep an exact printed R1/R2 family across one generic loan page.
+
+    The six-column management-institution/identifier/date/amount morphology is
+    shared by non-revolving loans and Ye's later R1 rows.  It therefore cannot
+    override an already exact printed revolving family on its own.  The carry
+    remains deliberately narrow: the registered page edge must be adjacent,
+    the account anchors before the next family heading must be the dense next
+    ordinals, and exactly the same number of generic account-base tables must
+    occur before that heading.
+    """
+
+    logical_page = int(page.get("page") or 0)
+    if (
+        active_family not in {
+            "revolving_loan_subaccount",
+            "revolving_loan_account",
+        }
+        or active_family_quality != "exact"
+        or active_family_last_ordinal <= 0
+        or local_table_family != ("non_revolving_loan", "exact")
+        or not cross_page_order_resolved
+        or not _registered_account_pages_are_adjacent(
+            parse_result,
+            active_family_logical_page,
+            logical_page,
+        )
+    ):
+        return False
+
+    prefix_ordinals: list[int] = []
+    next_heading_top: float | None = None
+    for line in page.get("lines") or ():
+        if not isinstance(line, Mapping):
+            continue
+        raw_text = str(line.get("text") or line.get("content") or "")
+        compact = _compact(raw_text)
+        if any(marker in compact for marker in _ACCOUNT_SECTION_END):
+            break
+        if _account_family_from_heading(compact) is not None:
+            bbox = _account_evidence_bbox(line)
+            if bbox is None:
+                return False
+            next_heading_top = bbox[1]
+            break
+        anchor = _ACCOUNT_ANCHOR_RE.search(raw_text)
+        if anchor is None:
+            continue
+        if not anchor.group(1):
+            return False
+        prefix_ordinals.append(int(anchor.group(1)))
+
+    expected = list(
+        range(
+            active_family_last_ordinal + 1,
+            active_family_last_ordinal + 1 + len(prefix_ordinals),
+        )
+    )
+    if not prefix_ordinals or prefix_ordinals != expected:
+        return False
+
+    generic_table_count = 0
+    for native_page in getattr(parse_result, "pages", None) or ():
+        if int(getattr(native_page, "page_number", 0) or 0) != logical_page:
+            continue
+        for table in getattr(native_page, "tables", None) or ():
+            rows = _table_rows(table)
+            if not rows or _other_entity_table(rows) or not _account_base(rows):
+                continue
+            if next_heading_top is not None:
+                table_top = _table_top_value(table)
+                if table_top is None:
+                    return False
+                if table_top >= next_heading_top:
+                    continue
+            generic_table_count += 1
+    return generic_table_count == len(prefix_ordinals)
+
+
+def _account_segment_has_exact_two_cell_card_table(
+    parse_result: Any,
+    *,
+    account_type: str,
+    page_segments: Iterable[Mapping[str, Any]],
+) -> bool:
+    """Identify the unique table whose closed geometry owns a card segment."""
+
+    if account_type not in {"credit_card", "quasi_credit_card"}:
+        return False
+    segments = {
+        int(segment.get("logical_page") or 0): segment
+        for segment in page_segments
+        if int(segment.get("logical_page") or 0) > 0
+    }
+    if not segments:
+        return False
+    candidates: list[Any] = []
+    for page in getattr(parse_result, "pages", None) or ():
+        logical_page = int(getattr(page, "page_number", 0) or 0)
+        segment = segments.get(logical_page)
+        if segment is None:
+            continue
+        for table in getattr(page, "tables", None) or ():
+            rows = _table_rows(table)
+            if _exact_two_cell_card_cluster_values(table, rows) is None:
+                continue
+            table_top = _table_top_value(table)
+            if table_top is None:
+                continue
+            try:
+                minimum = float(segment.get("min_y") or 0.0)
+                maximum = (
+                    float(segment["max_y"])
+                    if segment.get("max_y") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                continue
+            if table_top + 1.0 < minimum:
+                continue
+            if maximum is not None and table_top >= maximum:
+                continue
+            candidates.append(table)
+    return len(candidates) == 1
+
+
 def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
     """Build the canonical account row skeleton from printed account anchors."""
     cached = getattr(parse_result, "_candidate_b_account_anchor_skeleton_cache", None)
@@ -5615,6 +6948,8 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
     flattened: list[dict[str, Any]] = []
     active_type = ""
     active_family_quality = ""
+    active_family_logical_page = 0
+    active_family_last_ordinal = 0
     evidence_pages = list(evidence_loader())
     cross_page_order_resolved = _account_reading_order_resolution(
         parse_result, evidence_pages
@@ -5622,9 +6957,52 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
     for page_offset, page in enumerate(
         _account_ordered_pages(parse_result, evidence_pages)
     ):
-        if page_offset > 0 and not cross_page_order_resolved:
+        logical_page = int(page.get("page") or 0)
+        local_table_family, shared_revolving_carry = _account_page_table_evidence(
+            parse_result,
+            logical_page,
+        )
+        family_carry_allowed = bool(
+            logical_page > 0
+            and active_family_logical_page > 0
+            and (
+                logical_page == active_family_logical_page
+                or (
+                    cross_page_order_resolved
+                    and _registered_account_pages_are_adjacent(
+                        parse_result,
+                        active_family_logical_page,
+                        logical_page,
+                    )
+                )
+            )
+        )
+        if page_offset > 0 and active_type and not family_carry_allowed:
             active_type = ""
             active_family_quality = ""
+            active_family_logical_page = 0
+            active_family_last_ordinal = 0
+        preserve_revolving_family = _bounded_revolving_family_carry_over_generic_table(
+            parse_result,
+            page=page,
+            active_family=active_type,
+            active_family_quality=active_family_quality,
+            active_family_logical_page=active_family_logical_page,
+            active_family_last_ordinal=active_family_last_ordinal,
+            local_table_family=local_table_family,
+            cross_page_order_resolved=cross_page_order_resolved,
+        )
+        if local_table_family is not None and not preserve_revolving_family:
+            active_type, active_family_quality = local_table_family
+            active_family_logical_page = logical_page
+            active_family_last_ordinal = 0
+        elif preserve_revolving_family:
+            active_family_logical_page = logical_page
+        elif active_type in {
+            "revolving_loan_subaccount",
+            "revolving_loan_account",
+        } and shared_revolving_carry:
+            active_family_logical_page = logical_page
         lines = [line for line in page.get("lines") or () if isinstance(line, dict)]
         for index, line in enumerate(lines):
             text = str(line.get("text") or line.get("content") or "")
@@ -5632,16 +7010,25 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             if active_type and any(marker in compact for marker in _ACCOUNT_SECTION_END):
                 active_type = ""
                 active_family_quality = ""
+                active_family_logical_page = 0
+                active_family_last_ordinal = 0
             family = _account_family_from_heading(compact)
             marker = family[0] if family else None
             if marker is not None:
                 active_type = marker
                 active_family_quality = family[1]
+                active_family_logical_page = logical_page
+                active_family_last_ordinal = 0
+            anchor_match = _ACCOUNT_ANCHOR_RE.search(text)
+            if active_type and anchor_match:
+                active_family_logical_page = logical_page
+                if anchor_match.group(1):
+                    active_family_last_ordinal = int(anchor_match.group(1))
             flattened.append(
                 {
                     **line,
                     "text": text,
-                    "page": int(page.get("page") or 0),
+                    "page": logical_page,
                     "source_page": int(page.get("source_page") or 0),
                     "account_type": active_type,
                     "account_family_quality": active_family_quality,
@@ -5791,7 +7178,19 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
                 ],
                 "confidence": float(anchor.get("confidence") or 0.0),
             }
-        header_found, basic_observations = _account_basic_geometry_observations(detail)
+        exact_two_cell_card_owner = _account_segment_has_exact_two_cell_card_table(
+            parse_result,
+            account_type=account_type,
+            page_segments=page_segments,
+        )
+        if exact_two_cell_card_owner:
+            # The table's exact two-cell lattice is the stronger source plane.
+            # Do not let weak line fragments pre-empt it with invalid/XAU slots.
+            header_found, basic_observations = True, {}
+        else:
+            header_found, basic_observations = _account_basic_geometry_observations(
+                detail
+            )
         _apply_account_anchor_basic_observations(
             parse_result,
             skeleton,
@@ -5973,6 +7372,42 @@ def _match_account_table_observations(
         ),
         key=lambda item: item[0],
     )
+    owned_family_candidates: dict[int, list[int]] = defaultdict(list)
+    for (page, top), table_index in positioned_tables:
+        table = table_accounts[table_index]
+        for skeleton_index, skeleton in enumerate(skeletons):
+            if not owns(skeleton_index, page, top):
+                continue
+            if _owned_account_table_family_is_compatible(
+                skeleton,
+                table,
+            ) or _exact_printed_revolving_anchor_signature_candidate(
+                skeleton,
+                table,
+            ):
+                owned_family_candidates[skeleton_index].append(table_index)
+
+    def compatible_in_owned_interval(
+        skeleton_index: int,
+        table_index: int,
+    ) -> bool:
+        skeleton = skeletons[skeleton_index]
+        table = table_accounts[table_index]
+        if _owned_account_table_family_is_compatible(skeleton, table):
+            return True
+        if not _owned_account_table_family_is_compatible(
+            skeleton,
+            table,
+            exact_interval_owned=True,
+        ):
+            return False
+        # The interval-only alias is deliberately unavailable when any table
+        # that could directly bind this family, or any other named alias,
+        # competes inside the same printed anchor's physical segment. Direct
+        # exact-family/strong-identity matching above remains independent of
+        # this positional uniqueness proof.
+        return owned_family_candidates.get(skeleton_index) == [table_index]
+
     for (page, top), table_index in positioned_tables:
         if table_index in consumed_tables:
             continue
@@ -5982,9 +7417,7 @@ def _match_account_table_observations(
             for skeleton_index in range(len(skeletons))
             if owns(skeleton_index, page, top)
             and table_type
-            and _owned_account_table_family_is_compatible(
-                skeletons[skeleton_index], table_accounts[table_index]
-            )
+            and compatible_in_owned_interval(skeleton_index, table_index)
         ]
         if len(candidates) != 1:
             continue
@@ -6012,16 +7445,70 @@ _REVOLVING_ACCOUNT_FAMILY_PAIR = frozenset(
 )
 
 
-def _owned_account_table_family_is_compatible(
-    skeleton: Mapping[str, Any], table: Mapping[str, Any]
+def _exact_printed_revolving_anchor_signature_candidate(
+    skeleton: Mapping[str, Any],
+    table: Mapping[str, Any],
 ) -> bool:
-    """Accept only source-owned exact-family tables or one proven R1/R2 alias.
+    """Recognize one bounded native signature eligible for interval resolution."""
+
+    anchor_type = str(skeleton.get("account_type") or "")
+    table_type = str(table.get("account_type") or "")
+    if (
+        anchor_type not in _REVOLVING_ACCOUNT_FAMILY_PAIR
+        or skeleton.get("account_family_quality") != "exact"
+        or skeleton.get("_printed_ordinal_status") != "printed_unique"
+        or skeleton.get("source") != "candidate_b_account_anchor"
+    ):
+        return False
+    segment = skeleton.get("_canonical_segment")
+    if not (
+        isinstance(segment, Mapping)
+        and segment.get("ownership_basis") == "printed_anchor_to_next_anchor"
+        and isinstance(segment.get("pages"), list)
+        and segment.get("pages")
+    ):
+        return False
+    if (
+        table.get("source") != "native_detail_account_table"
+        or not table.get("_table_observation_id")
+        or table.get("_pending_anchor_account_id")
+    ):
+        return False
+    anchor_identifier = _account_card_identifier(skeleton)
+    table_identifier = _account_card_identifier(table)
+    if (
+        anchor_identifier
+        and table_identifier
+        and anchor_identifier != table_identifier
+    ):
+        return False
+    basis = str(table.get("_table_account_family_basis") or "")
+    return bool(
+        (
+            table_type == "non_revolving_loan"
+            and basis == "non_revolving_table_signature"
+        )
+        or (
+            table_type in _REVOLVING_ACCOUNT_FAMILY_PAIR
+            and basis == "shared_revolving_credit_limit_signature"
+        )
+    )
+
+
+def _owned_account_table_family_is_compatible(
+    skeleton: Mapping[str, Any],
+    table: Mapping[str, Any],
+    *,
+    exact_interval_owned: bool = False,
+) -> bool:
+    """Accept source-owned exact-family tables or one tightly proven alias.
 
     The canonical R1 and R2 first rows both use ``账户授信额度``.  Native table
     morphology can therefore identify the revolving-loan superfamily without
-    distinguishing its printed variant.  An exact printed anchor may resolve
-    that one ambiguity only when both observations carry the same strong
-    account identifier.  Geometry ownership is checked by the caller.
+    distinguishing its printed variant. Strong matching remains available when
+    both observations carry the same account identifier. Separately, the
+    caller may prove a unique native table lies inside an exact printed R1/R2
+    anchor interval; only the two named native signatures can use that path.
     """
 
     anchor_type = str(skeleton.get("account_type") or "")
@@ -6030,20 +7517,22 @@ def _owned_account_table_family_is_compatible(
         return False
     if anchor_type == table_type:
         return True
-    if frozenset({anchor_type, table_type}) != _REVOLVING_ACCOUNT_FAMILY_PAIR:
-        return False
-    if skeleton.get("account_family_quality") != "exact":
-        return False
-    if (
-        table.get("source") != "native_detail_account_table"
-        or not table.get("_table_observation_id")
-        or table.get("_table_account_family_basis")
-        != "shared_revolving_credit_limit_signature"
-    ):
-        return False
-    anchor_identifier = _account_card_identifier(skeleton)
-    table_identifier = _account_card_identifier(table)
-    return bool(anchor_identifier and anchor_identifier == table_identifier)
+    if frozenset({anchor_type, table_type}) == _REVOLVING_ACCOUNT_FAMILY_PAIR:
+        if (
+            skeleton.get("account_family_quality") == "exact"
+            and table.get("source") == "native_detail_account_table"
+            and table.get("_table_observation_id")
+            and table.get("_table_account_family_basis")
+            == "shared_revolving_credit_limit_signature"
+        ):
+            anchor_identifier = _account_card_identifier(skeleton)
+            table_identifier = _account_card_identifier(table)
+            if anchor_identifier and anchor_identifier == table_identifier:
+                return True
+    return bool(
+        exact_interval_owned
+        and _exact_printed_revolving_anchor_signature_candidate(skeleton, table)
+    )
 
 
 def _resolve_owned_revolving_table_families(
@@ -6051,7 +7540,7 @@ def _resolve_owned_revolving_table_families(
     table_accounts: list[dict[str, Any]],
     table_matches: Mapping[int, int],
 ) -> None:
-    """Let an exact printed anchor resolve the one shared R1/R2 table shape."""
+    """Let an exact printed R1/R2 anchor resolve one owned native signature."""
 
     for skeleton_index, table_index in table_matches.items():
         skeleton = skeletons[skeleton_index]
@@ -6060,11 +7549,23 @@ def _resolve_owned_revolving_table_families(
         table_type = str(table.get("account_type") or "")
         if anchor_type == table_type:
             continue
-        if not _owned_account_table_family_is_compatible(skeleton, table):
+        strong_identity_resolution = _owned_account_table_family_is_compatible(
+            skeleton,
+            table,
+        )
+        if not strong_identity_resolution and not (
+            _owned_account_table_family_is_compatible(
+                skeleton,
+                table,
+                exact_interval_owned=True,
+            )
+        ):
             continue
         table["_table_account_type_candidate"] = table_type
         table["_table_account_family_resolution"] = (
             "exact_anchor_strong_identifier_in_owned_interval"
+            if strong_identity_resolution
+            else "exact_printed_anchor_unique_native_signature_interval"
         )
         table["account_type"] = anchor_type
 
@@ -9204,22 +10705,46 @@ def _inquiry_geometry_groups(lines: Any) -> list[list[dict[str, Any]]]:
 def _inquiry_sequence_token(value: Any) -> int | None:
     """Return one exact printed inquiry ordinal, without guessing its value."""
 
-    match = re.fullmatch(r"\D*(\d{1,4})\D*", _clean(value))
+    match = re.fullmatch(
+        r"[\s.,，。:：;；()（）\[\]【】]*(\d{1,4})"
+        r"[\s.,，。:：;；()（）\[\]【】]*",
+        _clean(value),
+    )
     if match is None:
         return None
     sequence = int(match.group(1))
     return sequence if sequence > 0 else None
 
 
+def _bounded_inquiry_sequence_noise_candidate(
+    value: Any,
+) -> tuple[int, str] | None:
+    """Keep one edge glyph only as a neighbour-proven ordinal candidate."""
+
+    marker = _clean(value)
+    prefixed = re.fullmatch(r"[A-Za-z\u3400-\u9fff]\s*(\d{1,4})", marker)
+    if prefixed is not None:
+        sequence = int(prefixed.group(1))
+        return (sequence, "prefixed_noise") if sequence > 0 else None
+    suffixed = re.fullmatch(r"(\d{1,4})\s*[A-Za-z\u3400-\u9fff]", marker)
+    if suffixed is not None:
+        sequence = int(suffixed.group(1))
+        return (sequence, "suffix_noise") if sequence > 0 else None
+    return None
+
+
 def _document_local_inquiry_ordinals(
     raw_sequences: Iterable[int | None],
+    *,
+    noisy_candidates: Iterable[tuple[int, str] | None] | None = None,
 ) -> list[tuple[int | None, str | None]]:
     """Normalize inquiry ordinals only from exact adjacent-row proof.
 
-    A damaged middle row may be inferred when its two immediate neighbours
-    prove the sole missing ordinal; a final complete row may continue its one
-    immediate predecessor. Likewise, a high OCR value may shed a leading
-    prefix only when both neighbours prove its complete suffix
+    Each isolated damaged middle row may be inferred when its two immediate
+    neighbours prove the missing ordinal, even when another independently
+    bracketed gap exists elsewhere. Adjacent missing runs and boundary gaps
+    remain unresolved. Likewise, a high OCR value may shed a leading prefix
+    only when both neighbours prove its complete suffix
     (``88, 789, 90`` -> ``88, 89, 90``). This deliberately preserves isolated
     high values, legitimate 100+ populations, and genuine ``788, 789, 790``.
     """
@@ -9228,17 +10753,13 @@ def _document_local_inquiry_ordinals(
         int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
         for value in raw_sequences
     ]
-    missing_indices = [
-        index for index, value in enumerate(observed) if value is None
-    ]
-    if len(missing_indices) > 1:
-        # More than one unreadable ordinal admits multiple equally plausible
-        # assignments.  Withhold every missing value so choosing the first
-        # repair cannot make the second appear independently proven.
-        return [
-            (value, "multiple_missing" if value is None else None)
-            for value in observed
-        ]
+    bounded_noise = (
+        list(noisy_candidates)
+        if noisy_candidates is not None
+        else [None for _value in observed]
+    )
+    if len(bounded_noise) != len(observed):
+        return [(value, None) for value in observed]
     normalized: list[tuple[int | None, str | None]] = [
         (value, None) for value in observed
     ]
@@ -9250,19 +10771,172 @@ def _document_local_inquiry_ordinals(
             continue
         expected = previous + 1
         if current is None:
+            noisy = bounded_noise[index]
+            if (
+                isinstance(noisy, tuple)
+                and len(noisy) == 2
+                and noisy[0] == expected
+                and noisy[1] in {"prefixed_noise", "suffix_noise"}
+            ):
+                normalized[index] = (expected, str(noisy[1]))
+                continue
             normalized[index] = (expected, "missing")
             continue
         if current == expected or current < 300 or current <= expected:
             continue
         if str(current).endswith(str(expected)):
             normalized[index] = (expected, "prefixed_noise")
-    if len(observed) >= 2 and observed[-1] is None and observed[-2] is not None:
-        normalized[-1] = (int(observed[-2]) + 1, "missing")
+
+    unresolved = [
+        index for index, (value, _repair_kind) in enumerate(normalized) if value is None
+    ]
+    if len(unresolved) > 1:
+        for index in unresolved:
+            normalized[index] = (None, "multiple_missing")
+    elif unresolved:
+        index = unresolved[0]
+        if len(normalized) == 1:
+            repair_kind = "boundary_missing"
+        elif index == 0:
+            repair_kind = "leading_boundary_missing"
+        elif index == len(normalized) - 1:
+            repair_kind = "trailing_boundary_missing"
+        else:
+            repair_kind = "single_unbracketed_missing"
+        normalized[index] = (None, repair_kind)
     return normalized
+
+
+_BOUNDED_INQUIRY_DATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[./:-]?(\d{2})[./:-](\d{2})(?!\d)"
+)
+
+
+def _bounded_inquiry_date(value: Any) -> str | None:
+    """Recover one valid date token with only tiny edge OCR residue."""
+
+    exact = _date(value)
+    if exact is not None:
+        return exact
+    text = str(value or "")
+    matches = list(_BOUNDED_INQUIRY_DATE_RE.finditer(text))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    candidate = _date(f"{match.group(1)}-{match.group(2)}-{match.group(3)}")
+    if candidate is None:
+        return None
+    residue = re.sub(
+        r"[\W_]+",
+        "",
+        f"{text[:match.start()]}{text[match.end():]}",
+        flags=re.UNICODE,
+    )
+    if len(residue) > 3 or len(re.findall(r"[\u3400-\u9fff]", residue)) > 1:
+        return None
+    return candidate
+
+
+def _collapsed_inquiry_header_geometry_exact(table: Any) -> bool | None:
+    """Validate the observed 4-column header with its middle two-cell span."""
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    row_bands = _indexed_geometry_bands(
+        geometry,
+        "row_bands",
+        lower_key="y0",
+        upper_key="y1",
+    )
+    column_bands = _indexed_geometry_bands(
+        geometry,
+        "col_bands",
+        lower_key="x0",
+        upper_key="x1",
+    )
+    if (
+        row_bands is None
+        or 0 not in row_bands
+        or column_bands is None
+        or set(column_bands) != {0, 1, 2, 3}
+    ):
+        return False
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    if not all(
+        isinstance(grid, list)
+        and grid
+        and isinstance(grid[0], list)
+        and len(grid[0]) == 4
+        for grid in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return False
+    if tuple(str(value or "") for value in cell_status[0]) != (
+        "exact",
+        "exact",
+        "derived",
+        "exact",
+    ):
+        return False
+    if not all(
+        isinstance(cell_evidence_ids[0][column], list)
+        and any(str(value or "") for value in cell_evidence_ids[0][column])
+        for column in (0, 1, 3)
+    ):
+        return False
+    if cell_evidence_ids[0][2] not in ([], None):
+        return False
+    expected_boxes = {
+        0: (
+            column_bands[0][0],
+            row_bands[0][0],
+            column_bands[0][1],
+            row_bands[0][1],
+        ),
+        1: (
+            column_bands[1][0],
+            row_bands[0][0],
+            column_bands[2][1],
+            row_bands[0][1],
+        ),
+        3: (
+            column_bands[3][0],
+            row_bands[0][0],
+            column_bands[3][1],
+            row_bands[0][1],
+        ),
+    }
+    for column, expected in expected_boxes.items():
+        bbox = _exact_geometry_bbox(cell_bboxes[0][column])
+        if bbox is None or any(
+            abs(left - right) > 1.0
+            for left, right in zip(bbox, expected, strict=True)
+        ):
+            return False
+    if cell_bboxes[0][2] is not None:
+        return False
+    spans = geometry.get("cell_spans")
+    if not isinstance(spans, list):
+        return False
+    header_spans = [
+        span
+        for span in spans
+        if isinstance(span, Mapping) and span.get("row") == 0
+    ]
+    return bool(
+        len(header_spans) == 1
+        and header_spans[0].get("col") == 1
+        and header_spans[0].get("row_span") == 1
+        and header_spans[0].get("col_span") == 2
+    )
 
 
 def _bounded_collapsed_inquiry_header_slots(
     rows: list[list[str]],
+    *,
+    table: Any | None = None,
 ) -> dict[str, int] | None:
     """Recover the fixed four-column header only when its body proves it.
 
@@ -9275,6 +10949,13 @@ def _bounded_collapsed_inquiry_header_slots(
     """
 
     if not rows or len(rows[0]) != 4:
+        return None
+    geometry_exact = (
+        _collapsed_inquiry_header_geometry_exact(table)
+        if table is not None
+        else None
+    )
+    if geometry_exact is False:
         return None
     header_text = _compact("".join(str(value or "") for value in rows[0]))
     sequence_labels = [label for label in ("编号", "序号") if header_text.count(label) == 1]
@@ -9296,19 +10977,31 @@ def _bounded_collapsed_inquiry_header_slots(
     if len(body) < 3 or any(len(row) != 4 for row in body):
         return None
     raw_sequences = [_inquiry_sequence_token(row[0]) for row in body]
-    normalized_ordinals = _document_local_inquiry_ordinals(raw_sequences)
+    normalized_ordinals = _document_local_inquiry_ordinals(
+        raw_sequences,
+        noisy_candidates=(
+            _bounded_inquiry_sequence_noise_candidate(row[0]) for row in body
+        ),
+    )
     sequences = [sequence for sequence, _repair in normalized_ordinals]
-    if any(sequence is None for sequence in sequences):
+    observed_sequences = [
+        int(sequence) for sequence in sequences if sequence is not None
+    ]
+    if len(observed_sequences) < 3:
         return None
-    dense_sequences = [int(sequence) for sequence in sequences if sequence is not None]
-    if dense_sequences != list(range(dense_sequences[0], dense_sequences[-1] + 1)):
-        return None
-    if sum(repair == "missing" for _sequence, repair in normalized_ordinals) > 1:
+    if any(
+        right <= left
+        for left, right in zip(
+            observed_sequences[:-1],
+            observed_sequences[1:],
+            strict=True,
+        )
+    ):
         return None
 
     inquiry_types: set[str] = set()
     for row in body:
-        if _date(row[1]) is None:
+        if _bounded_inquiry_date(row[1]) is None:
             return None
         institution = _compact(_normalized_inquiry_field("institution", row[2]))
         reason = _normalized_inquiry_field("reason", row[3])
@@ -9352,6 +11045,7 @@ def _record_inquiry_ordinal_repair(
     )
 
     inferred = repair_kind == "missing"
+    suffix_noise = repair_kind == "suffix_noise"
     record_issue(
         parse_result,
         make_issue(
@@ -9359,12 +11053,20 @@ def _record_inquiry_ordinal_repair(
             issue_code=(
                 "candidate_b_inquiry_sequence_inferred_from_row_order"
                 if inferred
-                else "candidate_b_inquiry_sequence_prefix_noise_corrected"
+                else (
+                    "candidate_b_inquiry_sequence_suffix_noise_corrected"
+                    if suffix_noise
+                    else "candidate_b_inquiry_sequence_prefix_noise_corrected"
+                )
             ),
             message=(
                 "An inquiry row number was unreadable and was inferred from canonical table order."
                 if inferred
-                else "A prefixed OCR glyph in an inquiry sequence was removed by exact adjacent-row proof."
+                else (
+                    "A suffixed OCR glyph in an inquiry sequence was removed by exact adjacent-row proof."
+                    if suffix_noise
+                    else "A prefixed OCR glyph in an inquiry sequence was removed by exact adjacent-row proof."
+                )
             ),
             severity="warning" if inferred else "info",
             status="requires_review" if inferred else "resolved",
@@ -9385,12 +11087,20 @@ def _record_inquiry_ordinal_repair(
                 (
                     "sequence_missing_in_source_ocr"
                     if inferred
-                    else "sequence_prefixed_ocr_noise"
+                    else (
+                        "sequence_suffixed_ocr_noise"
+                        if suffix_noise
+                        else "sequence_prefixed_ocr_noise"
+                    )
                 ),
                 (
                     "sequence_requires_review"
                     if inferred
-                    else "deterministic_sequence_prefix_removed"
+                    else (
+                        "deterministic_sequence_suffix_removed"
+                        if suffix_noise
+                        else "deterministic_sequence_prefix_removed"
+                    )
                 ),
                 "other_row_fields_verified_independently",
             ),
@@ -9404,13 +11114,29 @@ def _record_inquiry_ordinal_unresolved(
     inquiry_type: str,
     source_ref: Mapping[str, Any],
     observed_row: Any,
+    repair_kind: str,
 ) -> None:
-    """Localize a row withheld because its population has two missing ordinals."""
+    """Localize one withheld row with a truthful ordinal-gap diagnostic."""
 
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
         make_issue,
         record_issue,
     )
+
+    boundary = {
+        "leading_boundary_missing": "leading",
+        "trailing_boundary_missing": "trailing",
+        "boundary_missing": "leading_and_trailing",
+    }.get(repair_kind)
+    multiple_missing = repair_kind == "multiple_missing"
+    observed_value: dict[str, Any] = {
+        "inquiry_type": inquiry_type,
+        "missing_ocr_sequence": True,
+    }
+    if boundary is not None:
+        observed_value["boundary"] = boundary
+    else:
+        observed_value["row"] = observed_row
 
     target_record_id = stable_record_id(
         "credit_inquiry_unresolved_sequence",
@@ -9425,10 +11151,26 @@ def _record_inquiry_ordinal_unresolved(
         parse_result,
         make_issue(
             category="ocr_structure_correction",
-            issue_code="candidate_b_inquiry_multiple_missing_sequences_unresolved",
+            issue_code=(
+                "candidate_b_inquiry_multiple_missing_sequences_unresolved"
+                if multiple_missing
+                else (
+                    "candidate_b_inquiry_boundary_sequence_unresolved"
+                    if boundary is not None
+                    else "candidate_b_inquiry_sequence_unresolved"
+                )
+            ),
             message=(
                 "More than one ordinal was unreadable in one canonical inquiry population; "
                 "the affected row was retained only as localized unresolved source evidence."
+                if multiple_missing
+                else (
+                    "A single ordinal was unreadable at the canonical inquiry population "
+                    "boundary, so its row was withheld because no adjacent-row bracket "
+                    "can prove the sequence."
+                    if boundary is not None
+                    else "A single inquiry ordinal lacked exact adjacent-row proof, so its row was withheld."
+                )
             ),
             severity="warning",
             status="requires_review",
@@ -9436,17 +11178,150 @@ def _record_inquiry_ordinal_unresolved(
             target_dataset="inquiry_records",
             target_record_id=target_record_id,
             field_name="sequence",
-            observed_value={
-                "inquiry_type": inquiry_type,
-                "missing_ocr_sequence": True,
-                "row": observed_row,
-            },
+            observed_value=observed_value,
             source_refs=(dict(source_ref),),
             reason_codes=(
                 "canonical_four_column_table",
-                "multiple_missing_ordinals_in_population",
+                (
+                    "multiple_missing_ordinals_in_population"
+                    if multiple_missing
+                    else (
+                        "ordinal_missing_at_population_boundary"
+                        if boundary is not None
+                        else "single_unbracketed_ordinal"
+                    )
+                ),
                 "ordinal_assignment_not_unique",
-                "record_not_materialized",
+                "record_not_emitted",
+            ),
+        ),
+    )
+
+
+def _inquiry_order_plane_is_authoritative(parse_result: Any) -> bool:
+    """Validate an explicitly registered inquiry reading-order plane.
+
+    Tiny legacy/unit contexts that predate the plane retain their sealed input
+    order. Once a context exposes resolution metadata, however, cross-page
+    inquiry logic may use it only when both resolution and authority are
+    affirmative and the registered positions are positive and unique.
+    """
+
+    if not hasattr(parse_result, "reading_order_resolution"):
+        return True
+    resolution = getattr(parse_result, "reading_order_resolution", None)
+    if not (
+        isinstance(resolution, Mapping)
+        and resolution.get("resolved") is True
+        and resolution.get("authoritative") is True
+    ):
+        return False
+    raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    if not isinstance(raw_order, Mapping) or not raw_order:
+        return False
+    positions: list[int] = []
+    try:
+        for raw_logical, raw_position in raw_order.items():
+            logical = int(raw_logical)
+            position = int(raw_position)
+            if logical <= 0 or position <= 0:
+                return False
+            positions.append(position)
+    except (TypeError, ValueError):
+        return False
+    if len(positions) != len(set(positions)):
+        return False
+    registered_pages = list(getattr(parse_result, "pages", None) or [])
+    return not registered_pages or _account_reading_order_resolution(
+        parse_result,
+        registered_pages,
+    )[-1]
+
+
+def _document_page_carry_allowed(
+    parse_result: Any,
+    left_logical_page: int | None,
+    right_logical_page: int,
+) -> bool:
+    """Allow same-page reuse or one complete authoritative adjacent page edge."""
+
+    left = int(left_logical_page or 0)
+    right = int(right_logical_page or 0)
+    if left <= 0 or right <= 0:
+        return False
+    if left == right:
+        return True
+    if not hasattr(parse_result, "reading_order_resolution"):
+        # Compatibility for sealed contexts created before the order plane:
+        # retain their former explicit-map/logical adjacency contract.  Every
+        # real context publishing resolution metadata takes the strict path.
+        raw_order = getattr(parse_result, "reading_order_by_logical", None)
+        if isinstance(raw_order, Mapping) and raw_order:
+            return _registered_account_pages_are_adjacent(parse_result, left, right)
+        return right == left + 1
+    if not _inquiry_order_plane_is_authoritative(parse_result):
+        return False
+    return _registered_account_pages_are_adjacent(parse_result, left, right)
+
+
+def _inquiry_schema_carry_allowed(
+    parse_result: Any,
+    left_logical_page: int | None,
+    right_logical_page: int,
+) -> bool:
+    """Apply the shared document-page ownership contract to inquiry schemas."""
+
+    return _document_page_carry_allowed(
+        parse_result,
+        left_logical_page,
+        right_logical_page,
+    )
+
+
+def _record_inquiry_schema_carry_unresolved(
+    parse_result: Any,
+    *,
+    left_logical_page: int | None,
+    page: Any,
+    table: Any,
+) -> None:
+    """Localize one headerless inquiry row withheld at an unproven page edge."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    right_logical_page = int(getattr(page, "page_number", 0) or 0)
+    resolution = getattr(parse_result, "reading_order_resolution", None)
+    raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_inquiry_cross_page_schema_unresolved",
+            message=(
+                "A headerless inquiry row was withheld because its preceding "
+                "four-column schema was not adjacent in an authoritative "
+                "reading-order plane."
+            ),
+            parser_stage="candidate_b_inquiry_schema",
+            target_dataset="inquiry_records",
+            observed_value={
+                "schema_logical_page": int(left_logical_page or 0),
+                "candidate_logical_page": right_logical_page,
+                "reading_order_resolution": (
+                    dict(resolution) if isinstance(resolution, Mapping) else None
+                ),
+                "registered_reading_order": (
+                    dict(raw_order) if isinstance(raw_order, Mapping) else None
+                ),
+            },
+            source_refs=(_source_ref(page, table, row=0),),
+            reason_codes=(
+                "headerless_inquiry_schema_carry",
+                "authoritative_adjacent_page_edge_required",
+                "record_not_emitted",
             ),
         ),
     )
@@ -9482,8 +11357,11 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
                 institution = "本人"
             if not institution:
                 continue
-            sequence_tokens = re.findall(r"\d{1,4}", text[: date_match.start()])
-            detected = int(sequence_tokens[-1]) if sequence_tokens else None
+            raw_sequence_text = text[: date_match.start()].strip()
+            detected = _inquiry_sequence_token(raw_sequence_text)
+            noisy_sequence = _bounded_inquiry_sequence_noise_candidate(
+                raw_sequence_text
+            )
             inquiry_date = _date(date_match.group(0).replace(",", "."))
             if inquiry_date is None:
                 continue
@@ -9516,6 +11394,7 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
             candidates.append(
                 {
                     "_raw_sequence": detected,
+                    "_noisy_sequence": noisy_sequence,
                     "_source_ref": source_ref,
                     "_confidence": min(
                         min(
@@ -9535,25 +11414,42 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
                 }
             )
 
+    document_order_is_authoritative = _inquiry_order_plane_is_authoritative(
+        parse_result
+    )
+    normalization_groups: defaultdict[tuple[str, int | None], list[int]] = (
+        defaultdict(list)
+    )
+    for index, candidate in enumerate(candidates):
+        inquiry_type = str(candidate["inquiry_type"])
+        source_ref = candidate.get("_source_ref") or {}
+        logical_page = int(source_ref.get("logical_page") or 0)
+        normalization_groups[
+            (inquiry_type, None if document_order_is_authoritative else logical_page)
+        ].append(index)
+
     normalized_by_index: dict[int, tuple[int | None, str | None]] = {}
-    for inquiry_type in ("institution", "personal"):
-        indices = [
-            index
-            for index, candidate in enumerate(candidates)
-            if candidate["inquiry_type"] == inquiry_type
-        ]
+    for indices in normalization_groups.values():
         normalized = _document_local_inquiry_ordinals(
-            candidates[index].get("_raw_sequence") for index in indices
+            (candidates[index].get("_raw_sequence") for index in indices),
+            noisy_candidates=(
+                candidates[index].get("_noisy_sequence") for index in indices
+            ),
         )
         normalized_by_index.update(zip(indices, normalized, strict=True))
 
     rows: list[dict[str, Any]] = []
-    last_sequence = {"institution": 0, "personal": 0}
+    last_sequence: defaultdict[tuple[str, int | None], int] = defaultdict(int)
     for index, candidate in enumerate(candidates):
         sequence, repair_kind = normalized_by_index.get(index, (None, None))
         inquiry_type = str(candidate["inquiry_type"])
         source_ref = dict(candidate["_source_ref"])
-        if sequence is None and repair_kind == "multiple_missing":
+        logical_page = int(source_ref.get("logical_page") or 0)
+        sequence_scope = (
+            inquiry_type,
+            None if document_order_is_authoritative else logical_page,
+        )
+        if sequence is None and repair_kind:
             _record_inquiry_ordinal_unresolved(
                 parse_result,
                 inquiry_type=inquiry_type,
@@ -9564,10 +11460,11 @@ def _canonical_inquiry_line_rows(parse_result: Any) -> list[dict[str, Any]]:
                     "institution": candidate.get("institution"),
                     "reason": candidate.get("reason"),
                 },
+                repair_kind=repair_kind,
             )
-        if sequence is None or sequence <= last_sequence[inquiry_type]:
+        if sequence is None or sequence <= last_sequence[sequence_scope]:
             continue
-        last_sequence[inquiry_type] = sequence
+        last_sequence[sequence_scope] = sequence
         inquiry_id = stable_record_id("credit_inquiry", inquiry_type, sequence)
         rows.append(
             {
@@ -9654,6 +11551,124 @@ def _inquiry_business_equivalent(
     return bool(left_institution) and left_institution == right_institution
 
 
+def _exact_inquiry_table_row_geometry(
+    table: Any,
+    *,
+    row_index: int,
+) -> tuple[tuple[float, float, float, float], frozenset[str]] | None:
+    """Return one exact inquiry row bbox and its source evidence identity."""
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return None
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    if not all(
+        isinstance(grid, list)
+        and 0 <= row_index < len(grid)
+        and isinstance(grid[row_index], list)
+        for grid in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return None
+    widths = {
+        len(cell_bboxes[row_index]),
+        len(cell_status[row_index]),
+        len(cell_evidence_ids[row_index]),
+    }
+    if len(widths) != 1:
+        return None
+    boxes: list[tuple[float, float, float, float]] = []
+    evidence_ids: set[str] = set()
+    for column in range(next(iter(widths))):
+        if str(cell_status[row_index][column] or "") != "exact":
+            continue
+        bbox = _exact_geometry_bbox(cell_bboxes[row_index][column])
+        raw_evidence_ids = cell_evidence_ids[row_index][column]
+        if bbox is None or not isinstance(raw_evidence_ids, list):
+            continue
+        normalized_ids = {
+            str(value) for value in raw_evidence_ids if str(value or "")
+        }
+        if not normalized_ids:
+            continue
+        boxes.append(bbox)
+        evidence_ids.update(normalized_ids)
+    if len(boxes) < 3 or not evidence_ids:
+        return None
+    return (
+        (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        ),
+        frozenset(evidence_ids),
+    )
+
+
+def _exact_inquiry_line_sequence_witness(
+    line_rows: Iterable[Mapping[str, Any]],
+    *,
+    table: Any,
+    row_index: int,
+    repaired_line_ids: set[str],
+    logical_page: int,
+    observed: Mapping[str, Any],
+    already_observed_sequences: set[int],
+) -> int | None:
+    """Reconcile a blank ordinal only from the same exact physical row."""
+
+    table_geometry = _exact_inquiry_table_row_geometry(
+        table,
+        row_index=row_index,
+    )
+    if table_geometry is None:
+        return None
+    table_bbox, table_evidence_ids = table_geometry
+
+    matches: set[int] = set()
+    for line_row in line_rows:
+        inquiry_id = str(line_row.get("inquiry_id") or "")
+        sequence = int(line_row.get("sequence") or 0)
+        if (
+            not inquiry_id
+            or inquiry_id in repaired_line_ids
+            or sequence <= 0
+            or sequence in already_observed_sequences
+            or not _inquiry_business_equivalent(observed, line_row)
+        ):
+            continue
+        refs = [
+            ref
+            for ref in line_row.get("source_refs") or ()
+            if isinstance(ref, Mapping)
+        ]
+        exact_row_refs: list[Mapping[str, Any]] = []
+        for ref in refs:
+            bbox = _exact_geometry_bbox(ref.get("bbox"))
+            evidence_ids = {
+                str(value)
+                for value in ref.get("evidence_ids") or ()
+                if str(value or "")
+            }
+            if (
+                int(ref.get("logical_page") or 0) != int(logical_page or 0)
+                or ref.get("source") != "candidate_b_canonical_inquiry_line"
+                or bbox is None
+                or not evidence_ids.intersection(table_evidence_ids)
+                or (bbox[1] + bbox[3]) / 2.0 < table_bbox[1] - 1.0
+                or (bbox[1] + bbox[3]) / 2.0 > table_bbox[3] + 1.0
+                or min(bbox[2], table_bbox[2]) <= max(bbox[0], table_bbox[0])
+            ):
+                continue
+            exact_row_refs.append(ref)
+        if len(exact_row_refs) != 1:
+            continue
+        matches.add(sequence)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, float]:
     from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import role_candidate_is_valid
 
@@ -9681,8 +11696,25 @@ def _inquiry_observation_score(record: Mapping[str, Any]) -> tuple[int, int, flo
 
 def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    canonical_line_rows = _canonical_inquiry_line_rows(parse_result)
+    repaired_line_ids = {
+        str(issue.get("target_record_id") or "")
+        for issue in getattr(parse_result, "_personal_detail_extraction_issues", [])
+        if issue.get("issue_code")
+        in {
+            "candidate_b_inquiry_sequence_inferred_from_row_order",
+            "candidate_b_inquiry_sequence_prefix_noise_corrected",
+            "candidate_b_inquiry_sequence_suffix_noise_corrected",
+        }
+        and any(
+            isinstance(ref, Mapping)
+            and ref.get("source") == "candidate_b_canonical_inquiry_line"
+            for ref in issue.get("source_refs") or ()
+        )
+    }
     active_canonical_table = False
     active_slots: dict[str, int] = {}
+    active_schema_page: int | None = None
     inquiry_aliases = {
         "sequence": ("编号", "序号"),
         "inquiry_date": ("查询日期",),
@@ -9690,6 +11722,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
         "reason": ("查询原因",),
     }
     for page in getattr(parse_result, "pages", None) or []:
+        page_number = int(getattr(page, "page_number", 0) or 0)
         page_is_canonical_inquiry = (
             str(getattr(page, "canonical_template_id", "") or "") == "annotations_and_inquiries"
         )
@@ -9704,12 +11737,12 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             header_slots = _canonical_header_slots(tuple(str(value or "") for value in rows[0]), inquiry_aliases)
             has_exact_header = has_header and set(header_slots) == set(inquiry_aliases)
             repaired_header_slots = (
-                _bounded_collapsed_inquiry_header_slots(rows)
+                _bounded_collapsed_inquiry_header_slots(rows, table=table)
                 if has_header and not has_exact_header
                 else None
             )
             has_repaired_header = repaired_header_slots is not None
-            is_continuation = (
+            looks_like_continuation = (
                 not has_header
                 and page_is_canonical_inquiry
                 and active_canonical_table
@@ -9717,6 +11750,23 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 and bool(_nonempty(rows[0]))
                 and re.fullmatch(r"\d{1,4}", _nonempty(rows[0])[0]) is not None
             )
+            carry_allowed = _inquiry_schema_carry_allowed(
+                parse_result,
+                active_schema_page,
+                page_number,
+            )
+            is_continuation = looks_like_continuation and carry_allowed
+            if looks_like_continuation and not carry_allowed:
+                _record_inquiry_schema_carry_unresolved(
+                    parse_result,
+                    left_logical_page=active_schema_page,
+                    page=page,
+                    table=table,
+                )
+                active_canonical_table = False
+                active_slots = {}
+                active_schema_page = None
+                continue
             if has_header and not has_exact_header and not has_repaired_header:
                 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
                     make_issue,
@@ -9742,6 +11792,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 )
                 active_canonical_table = False
                 active_slots = {}
+                active_schema_page = None
                 continue
             if not has_exact_header and not has_repaired_header and not is_continuation:
                 continue
@@ -9749,8 +11800,12 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             active_canonical_table = True
             if has_exact_header:
                 active_slots = header_slots
+                active_schema_page = page_number
             elif has_repaired_header:
                 active_slots = dict(repaired_header_slots)
+                active_schema_page = page_number
+            elif is_continuation:
+                active_schema_page = page_number
             slots = dict(active_slots)
             start = 1 if has_exact_header or has_repaired_header else 0
             table_rows = [
@@ -9758,9 +11813,52 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 for row_index, row in enumerate(rows[start:], start=start)
                 if _nonempty(row)
             ]
-            normalized_ordinals = _document_local_inquiry_ordinals(
-                _inquiry_sequence_token(_slot_value(cells, slots, "sequence"))
+            raw_sequence_cells = [
+                _slot_value(cells, slots, "sequence")
                 for _row_index, cells in table_rows
+            ]
+            raw_sequences = [
+                _inquiry_sequence_token(value) for value in raw_sequence_cells
+            ]
+            noisy_sequences = [
+                _bounded_inquiry_sequence_noise_candidate(value)
+                for value in raw_sequence_cells
+            ]
+            observed_sequence_values = {
+                int(value) for value in raw_sequences if value is not None
+            }
+            for index, ((row_index, cells), raw_cell) in enumerate(
+                zip(table_rows, raw_sequence_cells, strict=True)
+            ):
+                if raw_sequences[index] is not None or _compact(raw_cell):
+                    continue
+                date_value = _bounded_inquiry_date(
+                    _slot_value(cells, slots, "inquiry_date")
+                )
+                institution_value = _slot_value(cells, slots, "institution")
+                reason_value = _slot_value(cells, slots, "reason")
+                if date_value is None or not institution_value or not reason_value:
+                    continue
+                witnessed = _exact_inquiry_line_sequence_witness(
+                    canonical_line_rows,
+                    table=table,
+                    row_index=row_index,
+                    repaired_line_ids=repaired_line_ids,
+                    logical_page=page_number,
+                    observed={
+                        "inquiry_date": date_value,
+                        "institution": institution_value,
+                        "reason": reason_value,
+                    },
+                    already_observed_sequences=observed_sequence_values,
+                )
+                if witnessed is None:
+                    continue
+                raw_sequences[index] = witnessed
+                observed_sequence_values.add(witnessed)
+            normalized_ordinals = _document_local_inquiry_ordinals(
+                raw_sequences,
+                noisy_candidates=noisy_sequences,
             )
             for (row_index, cells), (sequence, repair_kind) in zip(
                 table_rows, normalized_ordinals, strict=True
@@ -9769,7 +11867,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     _slot_value(cells, slots, "sequence")
                 )
                 if sequence is None:
-                    if repair_kind == "multiple_missing":
+                    if repair_kind:
                         unresolved_institution = _slot_value(
                             cells, slots, "institution"
                         )
@@ -9785,10 +11883,11 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                             inquiry_type=unresolved_type,
                             source_ref=_source_ref(page, table, row=row_index),
                             observed_row=list(cells),
+                            repair_kind=repair_kind,
                         )
                     continue
                 date_cell = _slot_value(cells, slots, "inquiry_date")
-                inquiry_date = _date(date_cell)
+                inquiry_date = _bounded_inquiry_date(date_cell)
                 institution = _slot_value(cells, slots, "institution")
                 source_reason = _slot_value(cells, slots, "reason")
                 if not institution or not source_reason or inquiry_date is None:
@@ -9870,7 +11969,8 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
         if not page_is_canonical_inquiry and not page_had_inquiry_table:
             active_canonical_table = False
             active_slots = {}
-    records.extend(_canonical_inquiry_line_rows(parse_result))
+            active_schema_page = None
+    records.extend(canonical_line_rows)
     grouped: defaultdict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
@@ -10325,6 +12425,20 @@ def _consume_public_canonical_row(
         )
 
 
+def _public_record_continuation_allowed(
+    parse_result: Any,
+    left_logical_page: int,
+    right_logical_page: int,
+) -> bool:
+    """Bind a split public record only across one proven page edge."""
+
+    return _document_page_carry_allowed(
+        parse_result,
+        left_logical_page,
+        right_logical_page,
+    )
+
+
 def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
     # All accepted layouts are enumerated from the canonical PBOC report.  A
     # missed physical cell therefore becomes uncertainty, never a left-shifted
@@ -10332,7 +12446,6 @@ def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
     working: dict[tuple[str, int], dict[str, Any]] = {}
     optional_sequence_counters: defaultdict[str, int] = defaultdict(int)
     pending_optional_sequences: dict[str, dict[str, int]] = {}
-    reading_order = dict(getattr(parse_result, "reading_order_by_logical", {}) or {})
 
     def report_pending(record_type: str) -> None:
         pending = pending_optional_sequences.pop(record_type, None)
@@ -10414,9 +12527,6 @@ def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
                             pending_optional_sequences[record_type] = {
                                 "sequence": sequence,
                                 "logical_page": logical_page,
-                                "reading_order": int(
-                                    reading_order.get(logical_page, logical_page) or logical_page
-                                ),
                             }
                         elif boundary == "continuation":
                             pending = pending_optional_sequences.get(record_type)
@@ -10431,12 +12541,11 @@ def _extract_public_records(parse_result: Any) -> list[dict[str, Any]]:
                                 )
                                 break
                             logical_page = int(getattr(page, "page_number", 0) or 0)
-                            current_order = int(
-                                reading_order.get(logical_page, logical_page) or logical_page
-                            )
                             start_page = int(pending["logical_page"])
-                            adjacent = logical_page == start_page or (
-                                current_order == int(pending["reading_order"]) + 1
+                            adjacent = _public_record_continuation_allowed(
+                                parse_result,
+                                start_page,
+                                logical_page,
                             )
                             if not adjacent:
                                 report_pending(record_type)
@@ -13402,8 +15511,10 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
     groups: list[dict[str, Any]] = []
     active_group: dict[str, Any] | None = None
     active_slots: dict[str, int] = {}
+    active_group_page: int | None = None
 
     for page in getattr(parse_result, "pages", None) or []:
+        page_number = int(getattr(page, "page_number", 0) or 0)
         canonical_page = (
             str(getattr(page, "canonical_template_id", "") or "")
             == "annotations_and_inquiries"
@@ -13423,18 +15534,35 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
             )
             has_exact_header = has_header and set(header_slots) == set(aliases)
             repaired_header_slots = (
-                _bounded_collapsed_inquiry_header_slots(rows)
+                _bounded_collapsed_inquiry_header_slots(rows, table=table)
                 if has_header and not has_exact_header
                 else None
             )
             first_value = _clean(rows[0][0] if rows[0] else "")
-            is_continuation = bool(
+            looks_like_continuation = bool(
                 not has_header
                 and canonical_page
                 and active_group is not None
                 and "sequence" in active_slots
                 and re.fullmatch(r"\D*\d{1,4}\D*", first_value)
             )
+            carry_allowed = _inquiry_schema_carry_allowed(
+                parse_result,
+                active_group_page,
+                page_number,
+            )
+            is_continuation = looks_like_continuation and carry_allowed
+            if looks_like_continuation and not carry_allowed:
+                _record_inquiry_schema_carry_unresolved(
+                    parse_result,
+                    left_logical_page=active_group_page,
+                    page=page,
+                    table=table,
+                )
+                active_group = None
+                active_slots = {}
+                active_group_page = None
+                continue
             if has_header:
                 # Even a damaged/merged header is useful as a section boundary.
                 # A body-proven collapsed header may recover all four fixed
@@ -13442,10 +15570,18 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 # leftmost ordinal contribute to this independent inventory.
                 active_slots = dict(repaired_header_slots or header_slots)
                 active_slots.setdefault("sequence", 0)
-                active_group = {"observations": [], "source_refs": []}
+                active_group = {
+                    "logical_page": page_number,
+                    "last_logical_page": page_number,
+                    "observations": [],
+                    "source_refs": [],
+                }
                 groups.append(active_group)
+                active_group_page = page_number
                 start = 1
             elif is_continuation:
+                active_group_page = page_number
+                active_group["last_logical_page"] = page_number
                 start = 0
             else:
                 continue
@@ -13458,6 +15594,9 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 if not _nonempty(cells):
                     continue
                 raw_sequence = _inquiry_sequence_token(
+                    _slot_value(cells, active_slots, "sequence")
+                )
+                noisy_sequence = _bounded_inquiry_sequence_noise_candidate(
                     _slot_value(cells, active_slots, "sequence")
                 )
                 institution = _slot_value(cells, active_slots, "institution")
@@ -13481,6 +15620,7 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 active_group["observations"].append(
                     {
                         "raw_sequence": raw_sequence,
+                        "noisy_sequence": noisy_sequence,
                         "sequence": raw_sequence,
                         "inquiry_type": inquiry_type,
                         "inquiry_date": inquiry_date,
@@ -13493,11 +15633,15 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
         if not canonical_page and not page_had_inquiry_table:
             active_group = None
             active_slots = {}
+            active_group_page = None
 
     for group in groups:
         observations = group["observations"]
         normalized_ordinals = _document_local_inquiry_ordinals(
-            observation.get("raw_sequence") for observation in observations
+            (observation.get("raw_sequence") for observation in observations),
+            noisy_candidates=(
+                observation.get("noisy_sequence") for observation in observations
+            ),
         )
         for observation, (sequence, repair_kind) in zip(
             observations, normalized_ordinals, strict=True
@@ -13526,12 +15670,24 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
             if int(observation.get("sequence") or 0) > 0
         }
         if sequences and min(sequences) > 1:
-            preceding = next(
-                (group_types[cursor] for cursor in range(index - 1, -1, -1) if group_types[cursor]),
+            preceding_index = next(
+                (
+                    cursor
+                    for cursor in range(index - 1, -1, -1)
+                    if group_types[cursor]
+                ),
                 None,
             )
-            if preceding:
-                group_types[index] = preceding
+            if preceding_index is not None and _inquiry_schema_carry_allowed(
+                parse_result,
+                int(
+                    groups[preceding_index].get("last_logical_page")
+                    or groups[preceding_index].get("logical_page")
+                    or 0
+                ),
+                int(group.get("logical_page") or 0),
+            ):
+                group_types[index] = group_types[preceding_index]
 
     sequences_by_type: defaultdict[str, set[int]] = defaultdict(set)
     rejected_by_type: defaultdict[str, set[int]] = defaultdict(set)
@@ -13634,6 +15790,8 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
     # the whole singleton family.
     family = ""
     family_quality = ""
+    family_logical_page = 0
+    family_last_ordinal = 0
     family_sequences: defaultdict[str, set[int]] = defaultdict(set)
     family_numbered_identifiers: defaultdict[str, set[str]] = defaultdict(set)
     family_unnumbered_identifiers: defaultdict[str, set[str]] = defaultdict(set)
@@ -13645,10 +15803,52 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
     )[-1]
     pages = _account_ordered_pages(parse_result, evidence_pages)
     for page_offset, page in enumerate(pages):
-        if page_offset > 0 and not cross_page_order_resolved:
+        logical_page = int(page.get("page") or 0)
+        local_table_family, shared_revolving_carry = _account_page_table_evidence(
+            parse_result,
+            logical_page,
+        )
+        family_carry_allowed = bool(
+            logical_page > 0
+            and family_logical_page > 0
+            and (
+                logical_page == family_logical_page
+                or (
+                    cross_page_order_resolved
+                    and _registered_account_pages_are_adjacent(
+                        parse_result,
+                        family_logical_page,
+                        logical_page,
+                    )
+                )
+            )
+        )
+        if page_offset > 0 and family and not family_carry_allowed:
             family = ""
             family_quality = ""
-        logical_page = int(page.get("page") or 0)
+            family_logical_page = 0
+            family_last_ordinal = 0
+        preserve_revolving_family = _bounded_revolving_family_carry_over_generic_table(
+            parse_result,
+            page=page,
+            active_family=family,
+            active_family_quality=family_quality,
+            active_family_logical_page=family_logical_page,
+            active_family_last_ordinal=family_last_ordinal,
+            local_table_family=local_table_family,
+            cross_page_order_resolved=cross_page_order_resolved,
+        )
+        if local_table_family is not None and not preserve_revolving_family:
+            family, family_quality = local_table_family
+            family_logical_page = logical_page
+            family_last_ordinal = 0
+        elif preserve_revolving_family:
+            family_logical_page = logical_page
+        elif family in {
+            "revolving_loan_subaccount",
+            "revolving_loan_account",
+        } and shared_revolving_carry:
+            family_logical_page = logical_page
         source_page = int(page.get("source_page") or logical_page)
         for line_index, line in enumerate(page.get("lines") or []):
             if not isinstance(line, Mapping):
@@ -13658,13 +15858,23 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
             if family and any(marker in text for marker in _ACCOUNT_SECTION_END):
                 family = ""
                 family_quality = ""
+                family_logical_page = 0
+                family_last_ordinal = 0
             heading = _account_family_from_heading(text)
             if heading is not None:
                 family, family_quality = heading
+                family_logical_page = logical_page
+                family_last_ordinal = 0
             match = re.match(r"^(?:账户|业务)[（(]?(\d{1,3})(?:[）)]|\D|$)", text)
             if match and family:
-                family_sequences[family].add(int(match.group(1)))
+                ordinal_value = int(match.group(1))
+                family_sequences[family].add(ordinal_value)
+                family_last_ordinal = ordinal_value
             anchor = _ACCOUNT_ANCHOR_RE.search(raw_text)
+            if family and (match is not None or anchor is not None):
+                family_logical_page = logical_page
+                if anchor is not None and anchor.group(1):
+                    family_last_ordinal = int(anchor.group(1))
             if anchor is None or not family:
                 continue
             ordinal = int(anchor.group(1)) if anchor.group(1) else None
@@ -13714,6 +15924,7 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
     agreement_label_count = 0
     agreement_refs: list[dict[str, Any]] = []
     active_agreements = False
+    previous_agreement_page: int | None = None
     agreement_heading = "授信协议信息"
     agreement_label = "授信协议标识"
     agreement_anchor = re.compile(r"授信协议\s*(\d{1,3})")
@@ -13727,6 +15938,23 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
     for page in pages or []:
         logical_page = int(page.get("page") or 0)
         source_page = int(page.get("source_page") or logical_page)
+        agreement_page_carry = bool(
+            previous_agreement_page == logical_page
+            or (
+                hasattr(parse_result, "reading_order_resolution")
+                and _document_page_carry_allowed(
+                    parse_result,
+                    previous_agreement_page,
+                    logical_page,
+                )
+            )
+        )
+        if (
+            active_agreements
+            and previous_agreement_page is not None
+            and not agreement_page_carry
+        ):
+            active_agreements = False
         page_observed = False
         for line in page.get("lines") or []:
             if not isinstance(line, Mapping):
@@ -13761,6 +15989,7 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
                     "geometry_scope": "logical_page",
                 }
             )
+        previous_agreement_page = logical_page
 
     endpoints: dict[str, int] = {}
     sequence_outliers: dict[str, list[int]] = {}

@@ -109,7 +109,7 @@ def _payload() -> dict[str, object]:
                         "marital_status": "married",
                         "marital_status_raw": "已婚",
                         "reporting_currency": "CNY",
-                        "reporting_amount_unit": "yuan",
+                        "reporting_amount_unit": "CNY_1",
                         "reporting_amount_precision": 0,
                         "amount_policy_source": "personal_brief_standard",
                     },
@@ -138,8 +138,8 @@ def _payload() -> dict[str, object]:
                         "account_currency": "CNY",
                         "currency": "CNY",
                         "reporting_amount_currency": "CNY",
-                        "amount_unit": "yuan",
-                        "reporting_amount_unit": "yuan",
+                        "amount_unit": "CNY_1",
+                        "reporting_amount_unit": "CNY_1",
                         "reporting_amount_precision": 0,
                         "credit_limit": "10000",
                         "credit_limit_status": "reported",
@@ -150,7 +150,7 @@ def _payload() -> dict[str, object]:
                         "activation_state": "active",
                         "card_activation_state": "activated",
                         "payoff_state": "not_applicable",
-                        "credit_quality_status": "normal",
+                        "credit_quality_status": "not_reported",
                         "ever_overdue": True,
                         "current_overdue": False,
                         "overdue_months": 1,
@@ -202,7 +202,7 @@ def _payload() -> dict[str, object]:
                         "arrears_amount": "100",
                         "taxpayer_identifier": "TAX-1",
                         "reporting_amount_currency": "CNY",
-                        "reporting_amount_unit": "yuan",
+                        "reporting_amount_unit": "CNY_1",
                     },
                 )
             ],
@@ -377,7 +377,7 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
         "marital_status": "married",
         "marital_status_raw": "\u5df2\u5a5a",
         "reporting_currency": "CNY",
-        "reporting_amount_unit": "yuan",
+        "reporting_amount_unit": "CNY_1",
         "reporting_amount_precision": 0,
     }
     account = datasets["credit_accounts"]["rows"][0]
@@ -398,6 +398,19 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
     assert [column["key"] for column in datasets["credit_accounts"]["columns"]] == list(
         personal_brief_public_dataset_policy()["credit_accounts"]
     )
+    account_columns = {
+        column["key"]: column for column in datasets["credit_accounts"]["columns"]
+    }
+    assert account_columns["account_type"]["enum"] == {
+        "credit_card": "信用卡",
+        "loan": "贷款",
+        "credit_line": "贷款授信",
+        "other_business": "其他业务",
+    }
+    assert account_columns["credit_limit"]["unit"] == "CNY_1"
+    assert account_columns["reporting_amount_unit"]["enum"] == {
+        "CNY_1": "元（人民币）"
+    }
     assert "account_identifier" not in account["normalized"]
     assert "account_identifier" in {
         column["key"] for column in datasets["credit_accounts"]["columns"]

@@ -2573,6 +2573,807 @@ def test_monthly_explicit_cross_page_owner_requires_segment_proof() -> None:
     )
 
 
+def test_native_table_source_ref_propagates_only_declared_coordinate_system() -> None:
+    page = SimpleNamespace(page_number=12, source_page_number=6)
+    declared = SimpleNamespace(
+        table_id="pt_12_0",
+        bbox=[52.0, 55.0, 402.0, 252.0],
+        metadata={"geometry": {"coordinate_system": "pdf_points_top_left"}},
+    )
+    undeclared = SimpleNamespace(
+        table_id="pt_12_1",
+        bbox=[52.0, 274.0, 402.0, 500.0],
+        metadata={"geometry": {}},
+    )
+
+    assert native_extraction._source_ref(page, declared)["coordinate_system"] == (
+        "pdf_points_top_left"
+    )
+    assert "coordinate_system" not in native_extraction._source_ref(page, undeclared)
+
+
+def _exact_source_table_monthly_link_fixture() -> tuple[list[dict], list[dict], list[dict]]:
+    grid_id = "mg_p12_repayment_0"
+    table_id = "pt_12_0"
+
+    def source_ref(*, month: int, field_name: str, row: int, y0: float) -> dict:
+        x0 = 80.0 + 26.5 * (month - 1)
+        return {
+            "page": 12,
+            "logical_page": 12,
+            "geometry_scope": "cell",
+            "coordinate_system": "pdf_points_top_left",
+            "grid_id": grid_id,
+            "row": row,
+            "col": month,
+            "field_name": field_name,
+            "bbox": [x0, y0, x0 + 26.5, y0 + 12.0],
+            "geometry_provenance": {
+                "source": "source_table_geometry",
+                "selection_basis": "source_table_year_plus_twelve_ownership",
+                "reason": "exact_source_table_month_lattice_calibration",
+                "table_id": table_id,
+                "logical_page": 12,
+                "coordinate_system": "pdf_points_top_left",
+                "calibrated_from_source_table_geometry": True,
+                "active_cell_geometry_exact": True,
+                "value_inputs_used": False,
+            },
+        }
+
+    accounts = [
+        {
+            "account_id": "credit_account:revolving_loan_subaccount:1",
+            "account_identifier": "B10611000H0001811132129417001",
+            "_canonical_segment": {
+                "ownership_basis": "printed_anchor_to_next_anchor",
+                "anchor_logical_page": 11,
+                "anchor_bbox": [47.0, 514.5, 280.5, 527.0],
+                "pages": [{"logical_page": 11, "min_y": 514.5, "max_y": None}]
+            },
+            "source_refs": [
+                {
+                    "source": "native_detail_table",
+                    "logical_page": 12,
+                    "source_page": 6,
+                    "table_id": table_id,
+                    "geometry_scope": "table",
+                    "coordinate_system": "pdf_points_top_left",
+                    "bbox": [52.0, 55.0, 402.0, 252.0],
+                }
+            ],
+        }
+    ]
+    month_positions = [
+        (value // 12, value % 12 + 1)
+        for value in range(2022 * 12 + 5, 2024 * 12 + 3)
+    ]
+    repayments = [
+        {
+            "repayment_id": f"{grid_id}:{year:04d}-{month:02d}",
+            "grid_id": grid_id,
+            "year": year,
+            "month": month,
+            "performance_month": f"{year:04d}-{month:02d}",
+            "status": "N",
+            "overdue_amount": "0",
+            "source_cell_refs": [
+                source_ref(
+                    month=month,
+                    field_name="status",
+                    row=2 + 2 * (year - 2022),
+                    y0=100.0 + 45.0 * (year - 2022),
+                ),
+                source_ref(
+                    month=month,
+                    field_name="overdue_amount",
+                    row=3 + 2 * (year - 2022),
+                    y0=112.0 + 45.0 * (year - 2022),
+                ),
+            ],
+        }
+        for year, month in month_positions
+    ]
+    grids = [
+        {
+            "grid_id": grid_id,
+            "page": 12,
+            "bbox": [52.0, 55.5, 401.5, 251.0],
+            "coordinate_system": "pdf_points_top_left",
+            "col_bands": [
+                {
+                    "index": month,
+                    "header": str(month),
+                    "role": "month",
+                    "bbox": [
+                        80.0 + 26.5 * (month - 1),
+                        80.0,
+                        80.0 + 26.5 * month,
+                        90.0,
+                    ],
+                    "geometry_status": "exact",
+                    "geometry_source": "source_table_geometry",
+                }
+                for month in range(1, 13)
+            ],
+            "audit": {
+                "date_range": {
+                    "start_year": 2022,
+                    "start_month": 6,
+                    "end_year": 2024,
+                    "end_month": 3,
+                },
+                "visual_month_geometry_by_page": {
+                    "12": {
+                        "source": "source_table_geometry",
+                        "selection_basis": "source_table_year_plus_twelve_ownership",
+                        "reason": "exact_source_table_month_lattice_calibration",
+                        "table_id": table_id,
+                        "logical_page": 12,
+                        "coordinate_system": "pdf_points_top_left",
+                        "calibrated_from_source_table_geometry": True,
+                        "active_cell_geometry_exact": True,
+                        "value_inputs_used": False,
+                    }
+                },
+            },
+        }
+    ]
+    return accounts, repayments, grids
+
+
+def test_monthly_exact_source_table_owner_recovers_headerless_continuation() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert len(linked) == 22
+    assert linked[0]["repayment_id"] == "mg_p12_repayment_0:2022-06"
+    assert linked[-1]["repayment_id"] == "mg_p12_repayment_0:2024-03"
+    assert {row["account_id"] for row in linked} == {
+        "credit_account:revolving_loan_subaccount:1"
+    }
+    assert {row["account_identifier"] for row in linked} == {
+        "B10611000H0001811132129417001"
+    }
+    assert context._personal_detail_extraction_issues == []
+
+
+def test_monthly_exact_source_table_owner_accepts_absent_year_month_aliases() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    for repayment in repayments:
+        repayment.pop("year")
+        repayment.pop("month")
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert len(linked) == 22
+    assert context._personal_detail_extraction_issues == []
+
+
+def _monthly_owner_issue_basis(context: SimpleNamespace) -> str:
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    return str(owner_issue["observed_value"]["linkage_basis"])
+
+
+def test_monthly_source_table_owner_rejects_unowned_partial_account() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    accounts[0].pop("_canonical_segment")
+    accounts[0]["_ownership_status"] = "printed_category_anchor_missing"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_account_owner_not_observed"
+
+
+def test_monthly_source_table_owner_requires_canonical_owner_identifier() -> None:
+    canonical = "B10611000H0001811132129417001"
+    for invalid_identifier in (None, "NOT_CANONICAL", f" {canonical} "):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        if invalid_identifier is None:
+            accounts[0].pop("account_identifier")
+        else:
+            accounts[0]["account_identifier"] = invalid_identifier
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_account_identifier_unresolved"
+        )
+
+
+def test_monthly_source_table_owner_requires_native_int_anchor_page_identity() -> None:
+    for field in ("anchor_logical_page", "segment_logical_page"):
+        for invalid_page in (11.5, "11", True):
+            context = SimpleNamespace(_personal_detail_extraction_issues=[])
+            accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+            segment = accounts[0]["_canonical_segment"]
+            if field == "anchor_logical_page":
+                segment["anchor_logical_page"] = invalid_page
+            else:
+                segment["pages"][0]["logical_page"] = invalid_page
+
+            linked = link_candidate_b_repayments(
+                repayments,
+                accounts,
+                grids,
+                issue_context=context,
+            )
+
+            assert linked == []
+            assert _monthly_owner_issue_basis(context) == (
+                "source_table_account_owner_not_observed"
+            )
+
+
+def test_monthly_source_table_owner_fails_closed_for_duplicate_account_owners() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    duplicate = {
+        **accounts[0],
+        "account_id": "credit_account:revolving_loan_subaccount:2",
+        "account_identifier": "B10111000H0001140201019800104930030100000661000020000001",
+        "source_refs": [dict(accounts[0]["source_refs"][0])],
+    }
+    accounts.append(duplicate)
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "ambiguous_source_table_account_owners"
+    )
+
+
+def test_monthly_source_table_owner_rejects_conflicting_account_table_boxes() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    accounts[0]["source_refs"].append(
+        {
+            **accounts[0]["source_refs"][0],
+            "bbox": [200.0, 55.0, 550.0, 252.0],
+        }
+    )
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_account_geometry_conflict"
+
+
+def test_monthly_source_table_owner_fails_closed_without_exact_cell_provenance() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["geometry_provenance"].pop("table_id")
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "source_table_exact_provenance_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_rejects_conflicting_table_id_aliases() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["table_id"] = "pt_12_conflict"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_exact_provenance_unresolved"
+
+
+def test_monthly_source_table_owner_never_uses_value_based_provenance() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["geometry_provenance"]["value_inputs_used"] = True
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "source_table_exact_provenance_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_rejects_image_pixel_cell_coordinates() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    source_ref = repayments[0]["source_cell_refs"][0]
+    source_ref["coordinate_system"] = "image_pixels"
+    source_ref["geometry_provenance"]["coordinate_system"] = "image_pixels"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_exact_provenance_unresolved"
+
+
+def test_monthly_source_table_owner_rejects_non_pdf_grid_coordinates() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    grids[0]["coordinate_system"] = "image_pixels"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == (
+        "source_table_grid_month_geometry_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_rejects_non_pdf_account_table_coordinates() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    accounts[0]["source_refs"][0]["coordinate_system"] = "image_pixels"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_account_geometry_conflict"
+
+
+def test_monthly_source_table_owner_fails_closed_for_page_mismatch() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    source_ref = repayments[0]["source_cell_refs"][0]
+    source_ref["page"] = 13
+    source_ref["logical_page"] = 13
+    source_ref["geometry_provenance"]["logical_page"] = 13
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == "source_table_page_conflict"
+
+
+def test_monthly_source_table_owner_rejects_conflicting_page_aliases() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["page"] = 13
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_exact_provenance_unresolved"
+
+
+def test_monthly_source_table_owner_requires_native_int_cell_page_aliases() -> None:
+    for invalid_page in (12.5, "12", True):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        repayments[0]["source_cell_refs"][0]["page"] = invalid_page
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_exact_provenance_unresolved"
+        )
+
+
+def test_monthly_source_table_owner_requires_native_int_grid_page() -> None:
+    for invalid_page in (12.5, "12", True):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        grids[0]["page"] = invalid_page
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == "source_table_page_conflict"
+
+
+def test_monthly_source_table_owner_requires_native_int_account_table_page() -> None:
+    for invalid_page in (12.5, "12", True):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        accounts[0]["source_refs"][0]["logical_page"] = invalid_page
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_account_owner_not_observed"
+        )
+
+
+def test_monthly_source_table_owner_rejects_conflicting_grid_id_aliases() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["grid_id"] = "mg_p12_repayment_conflict"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_grid_identity_conflict"
+
+
+def test_monthly_source_table_owner_rejects_duplicate_grid_ids() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    grids.append(dict(grids[0]))
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "duplicate_grid_id"
+
+
+def test_monthly_source_table_owner_fails_closed_for_shifted_month_ref() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["col"] = 7
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "source_table_grid_month_contract_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_requires_native_int_month_column() -> None:
+    for invalid_column in (6.0, "6", True):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        repayments[0]["source_cell_refs"][0]["col"] = invalid_column
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_grid_month_contract_unresolved"
+        )
+
+
+def test_monthly_source_table_owner_requires_exact_performance_month() -> None:
+    for invalid_performance_month in (None, "2022-6", "2022-07", "2022-06 "):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        repayments[0]["performance_month"] = invalid_performance_month
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_grid_month_contract_unresolved"
+        )
+
+
+def test_monthly_source_table_owner_requires_native_int_grid_date_range() -> None:
+    for invalid_start_year in ("2022", 2022.5, True):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        grids[0]["audit"]["date_range"]["start_year"] = invalid_start_year
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_grid_month_contract_unresolved"
+        )
+
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    date_range = grids[0]["audit"]["date_range"]
+    for field_name, value in list(date_range.items()):
+        date_range[field_name] = str(value)
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == (
+        "source_table_grid_month_contract_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_rejects_coerced_calendar_aliases() -> None:
+    for field, invalid_value in (
+        ("year", 2022.5),
+        ("year", "2022"),
+        ("year", True),
+        ("month", 6.0),
+        ("month", "6"),
+        ("month", True),
+    ):
+        context = SimpleNamespace(_personal_detail_extraction_issues=[])
+        accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+        repayments[0][field] = invalid_value
+
+        linked = link_candidate_b_repayments(
+            repayments,
+            accounts,
+            grids,
+            issue_context=context,
+        )
+
+        assert linked == []
+        assert _monthly_owner_issue_basis(context) == (
+            "source_table_grid_month_contract_unresolved"
+        )
+
+
+def test_monthly_source_table_owner_rejects_unordered_month_x_bands() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    month_bands = grids[0]["col_bands"]
+    month_bands[5]["bbox"], month_bands[6]["bbox"] = (
+        month_bands[6]["bbox"],
+        month_bands[5]["bbox"],
+    )
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == (
+        "source_table_grid_month_geometry_unresolved"
+    )
+
+
+def test_monthly_source_table_owner_rejects_reversed_cell_x_bands() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    for repayment in repayments:
+        if repayment["month"] not in {6, 7}:
+            continue
+        x0 = 350.0 if repayment["month"] == 6 else 80.0
+        for source_ref in repayment["source_cell_refs"]:
+            source_ref["bbox"][0] = x0
+            source_ref["bbox"][2] = x0 + 26.5
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_grid_geometry_conflict"
+
+
+def test_monthly_source_table_owner_rejects_cell_outside_grid_bbox() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    accounts[0]["source_refs"][0]["bbox"] = [40.0, 40.0, 410.0, 300.0]
+    repayments[0]["source_cell_refs"][0]["bbox"][1:] = [251.5, 239.0, 263.5]
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_grid_geometry_conflict"
+
+
+def test_monthly_source_table_owner_rejects_nonfinite_cell_bbox() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["source_cell_refs"][0]["bbox"][2] = float("inf")
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    assert _monthly_owner_issue_basis(context) == "source_table_exact_provenance_unresolved"
+
+
+def test_monthly_source_table_owner_fails_closed_for_grid_table_mismatch() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    grids[0]["audit"]["visual_month_geometry_by_page"]["12"]["table_id"] = "pt_12_1"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "source_table_grid_provenance_conflict"
+    )
+
+
+def test_monthly_source_table_owner_fails_closed_for_identifier_mismatch() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts, repayments, grids = _exact_source_table_monthly_link_fixture()
+    repayments[0]["account_identifier"] = "B10611000H0001811132137961001"
+
+    linked = link_candidate_b_repayments(
+        repayments,
+        accounts,
+        grids,
+        issue_context=context,
+    )
+
+    assert linked == []
+    owner_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    )
+    assert owner_issue["observed_value"]["linkage_basis"] == (
+        "account_identifier_source_table_conflict"
+    )
+
+
 def test_monthly_equivalent_duplicate_replays_merge_without_false_review() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     accounts = [{"account_id": "account:1", "page": 4, "bbox": [10, 20, 100, 100], "sequence": 1}]
@@ -2720,7 +3521,7 @@ def test_monthly_unresolved_status_survives_linking_for_final_correction() -> No
     )
 
 
-def test_inquiry_schema_joins_geometry_tokens_and_reports_inferred_sequence() -> None:
+def test_inquiry_schema_withholds_boundary_row_without_unique_sequence() -> None:
     context = SimpleNamespace(
         corrected_evidence_pages=lambda: [
             {
@@ -2739,15 +3540,27 @@ def test_inquiry_schema_joins_geometry_tokens_and_reports_inferred_sequence() ->
 
     rows = native_extraction._canonical_inquiry_line_rows(context)
 
-    assert [row["sequence"] for row in rows] == [1, 2]
-    assert rows[1]["inquiry_date"] == "2024-01-01"
-    assert rows[1]["institution"] == "银行乙"
-    assert "extraction_status" not in rows[1]
-    assert context._personal_detail_extraction_issues[0]["issue_code"] == (
-        "candidate_b_inquiry_sequence_inferred_from_row_order"
-    )
-    assert context._personal_detail_extraction_issues[0]["target_record_id"] == rows[1]["inquiry_id"]
-    assert context._personal_detail_extraction_issues[0]["field_name"] == "sequence"
+    assert [row["sequence"] for row in rows] == [1]
+    unresolved = context._personal_detail_extraction_issues[0]
+    assert unresolved["issue_code"] == "candidate_b_inquiry_boundary_sequence_unresolved"
+    assert unresolved["field_name"] == "sequence"
+    assert unresolved["observed_value"] == {
+        "inquiry_type": "institution",
+        "missing_ocr_sequence": True,
+        "boundary": "trailing",
+    }
+    assert unresolved["source_refs"] == [
+        {
+            "source": "candidate_b_canonical_inquiry_line",
+            "logical_page": 8,
+            "source_page": 4,
+            "bbox": [110.0, 29.0, 390.0, 39.0],
+            "geometry_scope": "row",
+            "evidence_ids": [],
+        }
+    ]
+    assert "ordinal_missing_at_population_boundary" in unresolved["reason_codes"]
+    assert "record_not_emitted" in unresolved["reason_codes"]
 
 
 def test_account_schema_reports_non_dense_family_ordinals_without_inventing_rows(monkeypatch) -> None:
