@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import replace
+from datetime import datetime
 from typing import Any
 
 from docmirror.plugins._base.standardizer import normalize_amount, normalize_timestamp
@@ -126,6 +127,60 @@ def _explicit_source_column_value(raw_txn: dict[str, str], aliases: tuple[str, .
     return ""
 
 
+_DATE_COLUMN_ALIASES = ("交易日期", "记账日", "记账日期", "日期", "Date")
+_TIME_COLUMN_ALIASES = ("交易时间", "时间", "Time")
+
+
+def _header_matches_aliases(header: str, aliases: tuple[str, ...]) -> bool:
+    def compact(value: Any) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).lower()
+
+    compact_aliases = {compact(alias) for alias in aliases}
+    compact_header = compact(header)
+    header_parts = {compact(part) for part in str(header or "").splitlines() if compact(part)}
+    return compact_header in compact_aliases or bool(compact_aliases.intersection(header_parts))
+
+
+def _combine_separate_date_time(raw_txn: dict[str, str]) -> str:
+    """Combine explicit bank date and time columns without guessing six-digit semantics."""
+    date_value = _explicit_source_column_value(raw_txn, _DATE_COLUMN_ALIASES)
+    time_value = _explicit_source_column_value(raw_txn, _TIME_COLUMN_ALIASES)
+    if not date_value or not time_value:
+        return ""
+
+    normalized_date = normalize_timestamp(date_value)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}", normalized_date):
+        return ""
+    date_part = normalized_date[:10]
+    compact_time = re.sub(r"\s+", "", unicodedata.normalize("NFKC", time_value))
+    time_formats = (
+        (r"\d{6}", "%H%M%S"),
+        (r"\d{1,2}:\d{2}:\d{2}", "%H:%M:%S"),
+        (r"\d{1,2}:\d{2}", "%H:%M"),
+    )
+    for pattern, time_format in time_formats:
+        if not re.fullmatch(pattern, compact_time):
+            continue
+        try:
+            parsed_time = datetime.strptime(compact_time, time_format).time()
+            return datetime.combine(datetime.fromisoformat(date_part).date(), parsed_time).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _normalize_with_temporal_context(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
+    combined_timestamp = _combine_separate_date_time(raw_txn)
+    if not combined_timestamp:
+        return plugin._normalize(raw_txn)
+
+    prepared: dict[str, str] = {"交易时间": combined_timestamp}
+    prepared.update(
+        (key, value) for key, value in raw_txn.items() if not _header_matches_aliases(key, _TIME_COLUMN_ALIASES)
+    )
+    return plugin._normalize(prepared)
+
+
 def _normalize_source_counterparty_columns(
     raw_txn: dict[str, str],
     normalized: dict[str, Any],
@@ -200,7 +255,7 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
     if income_present and expense_present and income == 0 and expense == 0:
         return None
 
-    normalized = plugin._normalize(raw_txn)
+    normalized = _normalize_with_temporal_context(raw_txn, plugin)
     _normalize_source_counterparty_columns(raw_txn, normalized)
     if normalized.get("counter_party"):
         normalized["counter_party"] = _clean_wrapped_text(str(normalized.get("counter_party") or ""))
@@ -246,7 +301,7 @@ def _normalize_direction_amount(raw_txn: dict[str, str], plugin: Any) -> dict[st
     if direction not in ("income", "expense"):
         return None
 
-    normalized = plugin._normalize(raw_txn)
+    normalized = _normalize_with_temporal_context(raw_txn, plugin)
     _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = abs(float(amount))
     normalized["amount_cny"] = abs(float(amount))
@@ -281,7 +336,7 @@ def _normalize_embedded_direction_amount(raw_txn: dict[str, str], plugin: Any) -
     else:
         return None
 
-    normalized = plugin._normalize(raw_txn)
+    normalized = _normalize_with_temporal_context(raw_txn, plugin)
     _normalize_source_counterparty_columns(raw_txn, normalized)
     normalized["amount"] = float(amount)
     normalized["amount_cny"] = float(amount)
@@ -1255,14 +1310,14 @@ def normalize_record(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any]:
         if any(n in normalized_key for n in ("金额", "发生", "Amount")) and str(value).strip().startswith(("+", "-")):
             amount, direction = parse_signed_amount(str(value))
             if amount is not None:
-                normalized = plugin._normalize(raw_txn)
+                normalized = _normalize_with_temporal_context(raw_txn, plugin)
                 _normalize_source_counterparty_columns(raw_txn, normalized)
                 normalized["amount"] = amount
                 normalized["amount_cny"] = amount
                 normalized["direction"] = direction
                 return _normalize_wrapped_temporal_fields(normalized, raw_txn)
 
-    normalized = plugin._normalize(raw_txn)
+    normalized = _normalize_with_temporal_context(raw_txn, plugin)
     _normalize_source_counterparty_columns(raw_txn, normalized)
     return _normalize_wrapped_temporal_fields(normalized, raw_txn)
 

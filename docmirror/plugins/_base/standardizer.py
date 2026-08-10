@@ -92,12 +92,19 @@ def normalize_timestamp(raw: str) -> str:
         if 1 <= mo <= 12 and 1 <= da <= 31:
             year = 2000 + yy if yy <= 69 else 1900 + yy
             if 2010 <= year <= 2035:
-                return datetime(year, mo, da).date().isoformat()
+                try:
+                    return datetime(year, mo, da).date().isoformat()
+                except ValueError:
+                    pass
 
     # Compact format: 20220928 103039
-    m = re.match(r"(\d{4})(\d{2})(\d{2})\s*(\d{2})(\d{2})(\d{2})", cleaned)
+    m = re.fullmatch(r"(\d{4})(\d{2})(\d{2})\s*(\d{2})(\d{2})(\d{2})", cleaned)
     if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}T{m.group(4)}:{m.group(5)}:{m.group(6)}"
+        compact = "".join(m.groups())
+        try:
+            return datetime.strptime(compact, "%Y%m%d%H%M%S").isoformat()
+        except ValueError:
+            pass
 
     return raw  # 无法标准化，保留原始值
 

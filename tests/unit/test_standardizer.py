@@ -24,6 +24,9 @@ class TestNormalizeTimestamp:
             ("2022/09/28 10:30:39", "2022-09-28T10:30:39"),
             ("20220928 103039", "2022-09-28T10:30:39"),
             ("2022-09-28T10:30:39", "2022-09-28T10:30:39"),
+            ("220401", "2022-04-01"),
+            ("140229", "140229"),
+            ("140631", "140631"),
             ("", ""),
         ],
     )
@@ -32,6 +35,9 @@ class TestNormalizeTimestamp:
 
     def test_unparseable_passthrough(self):
         assert normalize_timestamp("not-a-date") == "not-a-date"
+
+    def test_invalid_compact_datetime_passthrough(self):
+        assert normalize_timestamp("20240230256100") == "20240230256100"
 
 
 class TestNormalizeAmount:
