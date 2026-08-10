@@ -9,6 +9,7 @@ dist/
 build/
 .eggs/
 
+
 ## index
 AGENTS.md
 CLAUDE.md
@@ -48,6 +49,7 @@ htmlcov/
 .coverage.*
 coverage.xml
 /tmp/
+.tmp/
 
 ## Parse output
 /output/
