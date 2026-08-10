@@ -32,7 +32,8 @@ ComponentKind = Literal[
 ConnectionKind = Literal["continues", "contains", "next"]
 
 PERSONAL_BRIEF_IR_SCHEMA_ID = "canonical_personal_brief_document"
-PERSONAL_BRIEF_IR_SCHEMA_VERSION = "1.0.0"
+PERSONAL_BRIEF_IR_SCHEMA_VERSION = "1.1.0"
+_GLOBAL_ORDER_STRIDE = 1000
 
 CANONICAL_PERSONAL_BRIEF_SECTIONS: tuple[tuple[str, str], ...] = (
     ("report_header", "报告信息"),
@@ -1114,6 +1115,839 @@ def _inquiry_candidates(
     return tuple(selected)
 
 
+_NUMBERED_ORDINAL_RE = re.compile(r"^\s*(?P<sequence>\d{1,4})[.、]\s*$")
+_LIABILITY_RECORD_START_RE = re.compile(
+    r"(?<!\d)20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[，,]?\s*为"
+)
+_LIABILITY_RECORD_BOUNDARY_RE = re.compile(
+    r"(?:(?<!\d)(?P<sequence>\d{1,4})[.、]\s*)?"
+    r"(?P<record>(?<!\d)20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[，,]?\s*为)"
+)
+
+
+@dataclass(frozen=True)
+class _EvidenceLine:
+    text: str
+    source_page: int
+    bbox: tuple[float, float, float, float] | None
+    evidence_ids: tuple[str, ...]
+    unit_id: str
+    source_ref: PersonalBriefSourceRef
+    source_order: int
+    line_id: str
+    confidence: float = 1.0
+
+
+@dataclass(frozen=True)
+class _NumberedNarrativeReconstruction:
+    components: tuple[CanonicalPersonalBriefComponent, ...]
+    consumed_unit_ids: tuple[str, ...]
+    expected_fragment_ids: tuple[str, ...]
+    continuation_decisions: tuple[PersonalBriefContinuationDecision, ...]
+    first_source_index: int
+
+
+def _section_by_unit(units: Iterable[CreditReportUnit]) -> dict[str, str]:
+    """Assign sections before replacing unreliable parser block boundaries."""
+    materialized = tuple(units)
+    current = "report_header"
+    assignments: dict[str, str] = {}
+    for unit in materialized:
+        current = _section_for_heading(unit.text, current, unit.kind)
+        assignments[unit.unit_id] = current
+        if unit.kind != "table":
+            current = _section_after_trailing_headings(unit.text, current)
+
+    # Coarse native blocks often contain many records and a trailing heading,
+    # while the visual ordinal column remains split into later parser units.
+    # Recover each ordinal's section from the date-bearing block at the same
+    # vertical band instead of inheriting the trailing heading's new section.
+    for unit in materialized:
+        ordinal_lines = tuple(
+            line.strip() for line in str(unit.text or "").splitlines() if line.strip()
+        )
+        if (
+            not ordinal_lines
+            or not all(_NUMBERED_ORDINAL_RE.fullmatch(line) for line in ordinal_lines)
+            or unit.bbox is None
+        ):
+            continue
+        center_y = (unit.bbox[1] + unit.bbox[3]) / 2.0
+        aligned = [
+            candidate
+            for candidate in materialized
+            if candidate.unit_id != unit.unit_id
+            and candidate.page == unit.page
+            and candidate.bbox is not None
+            and candidate.bbox[1] - 2.0 <= center_y <= candidate.bbox[3] + 2.0
+            and _DATE_RE.search(candidate.text)
+        ]
+        if aligned:
+            body = min(aligned, key=lambda item: item.bbox[3] - item.bbox[1])
+            assignments[unit.unit_id] = assignments[body.unit_id]
+    return assignments
+
+
+def _evidence_text_atoms(parse_result: Any) -> dict[str, Any]:
+    plane = getattr(parse_result, "evidence_plane", None)
+    store = getattr(plane, "evidence", None)
+    atoms = getattr(store, "text_atoms", None)
+    if atoms is None and isinstance(store, dict):
+        atoms = store.get("text_atoms")
+    out: dict[str, Any] = {}
+    for atom in atoms or ():
+        evidence_id = str(
+            atom.get("id", "") if isinstance(atom, dict) else getattr(atom, "id", "")
+        )
+        if evidence_id:
+            out[evidence_id] = atom
+    return out
+
+
+def _atom_value(atom: Any, field_name: str, default: Any = None) -> Any:
+    if isinstance(atom, dict):
+        return atom.get(field_name, default)
+    return getattr(atom, field_name, default)
+
+
+def _interpolated_bbox(
+    bbox: tuple[float, float, float, float] | None,
+    index: int,
+    count: int,
+) -> tuple[float, float, float, float] | None:
+    if bbox is None or count <= 1:
+        return bbox
+    line_height = (bbox[3] - bbox[1]) / count
+    top = bbox[1] + line_height * index
+    return (bbox[0], top, bbox[2], top + line_height)
+
+
+def _evidence_lines_for_unit(
+    unit: CreditReportUnit,
+    ref: PersonalBriefSourceRef,
+    atoms_by_id: dict[str, Any],
+) -> tuple[_EvidenceLine, ...]:
+    resolved_atoms = [atoms_by_id.get(evidence_id) for evidence_id in ref.evidence_ids]
+    use_evidence = bool(ref.evidence_ids) and all(atom is not None for atom in resolved_atoms)
+    if use_evidence:
+        atom_text = "".join(
+            str(_atom_value(atom, "text", "") or "") for atom in resolved_atoms
+        )
+        use_evidence = _compact(atom_text) == _compact(unit.text)
+
+    lines: list[_EvidenceLine] = []
+    if use_evidence:
+        atom_entries = [
+            {
+                "evidence_id": evidence_id,
+                "text": str(_atom_value(atom, "text", "") or ""),
+                "bbox": _bbox(atom),
+                "confidence": float(_atom_value(atom, "confidence", 1.0) or 0.0),
+                "index": atom_index,
+            }
+            for atom_index, (evidence_id, atom) in enumerate(
+                zip(ref.evidence_ids, resolved_atoms, strict=True)
+            )
+            if str(_atom_value(atom, "text", "") or "").strip()
+        ]
+        use_evidence = bool(atom_entries) and all(
+            entry["bbox"] is not None for entry in atom_entries
+        )
+
+    if use_evidence:
+        visual_lines: list[list[dict[str, Any]]] = []
+        for entry in sorted(
+            atom_entries,
+            key=lambda item: (
+                item["bbox"][1],
+                item["bbox"][0],
+                item["index"],
+            ),
+        ):
+            box = entry["bbox"]
+            matching_group: list[dict[str, Any]] | None = None
+            for group in reversed(visual_lines):
+                group_boxes = [item["bbox"] for item in group]
+                group_top = min(item[1] for item in group_boxes)
+                group_bottom = max(item[3] for item in group_boxes)
+                overlap = min(group_bottom, box[3]) - max(group_top, box[1])
+                minimum_height = min(group_bottom - group_top, box[3] - box[1])
+                group_center = (group_top + group_bottom) / 2.0
+                box_center = (box[1] + box[3]) / 2.0
+                if overlap >= minimum_height * 0.45 or abs(group_center - box_center) <= 2.0:
+                    matching_group = group
+                    break
+                if box[1] > group_bottom + 2.0:
+                    break
+            if matching_group is None:
+                visual_lines.append([entry])
+            else:
+                matching_group.append(entry)
+
+        for visual_index, group in enumerate(visual_lines):
+            ordered = sorted(group, key=lambda item: (item["bbox"][0], item["index"]))
+            raw_text = "".join(str(item["text"]).strip() for item in ordered)
+            atom_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+            if not atom_lines and raw_text.strip():
+                atom_lines = [raw_text.strip()]
+            boxes = [item["bbox"] for item in group]
+            visual_bbox = (
+                min(box[0] for box in boxes),
+                min(box[1] for box in boxes),
+                max(box[2] for box in boxes),
+                max(box[3] for box in boxes),
+            )
+            evidence_ids = tuple(str(item["evidence_id"]) for item in ordered)
+            source_order = min(int(item["index"]) for item in group)
+            confidence = min(float(item["confidence"]) for item in group)
+            for line_index, text in enumerate(atom_lines):
+                lines.append(
+                    _EvidenceLine(
+                        text=text,
+                        source_page=ref.source_page,
+                        bbox=_interpolated_bbox(visual_bbox, line_index, len(atom_lines)),
+                        evidence_ids=evidence_ids,
+                        unit_id=unit.unit_id,
+                        source_ref=ref,
+                        source_order=(
+                            ref.source_order * _GLOBAL_ORDER_STRIDE
+                            + source_order * 100
+                            + line_index
+                        ),
+                        line_id=f"{unit.unit_id}:visual-line:{visual_index}:{line_index}",
+                        confidence=confidence,
+                    )
+                )
+        return tuple(lines)
+
+    raw_lines = [line.strip() for line in str(unit.text or "").splitlines() if line.strip()]
+    if not raw_lines and unit.text.strip():
+        raw_lines = [unit.text.strip()]
+    return tuple(
+        _EvidenceLine(
+            text=text,
+            source_page=ref.source_page,
+            bbox=_interpolated_bbox(ref.bbox, index, len(raw_lines)),
+            evidence_ids=(),
+            unit_id=unit.unit_id,
+            source_ref=ref,
+            source_order=ref.source_order * _GLOBAL_ORDER_STRIDE + index,
+            line_id=f"{unit.unit_id}:line:{index}",
+        )
+        for index, text in enumerate(raw_lines)
+    )
+
+
+def _line_sort_key(line: _EvidenceLine) -> tuple[int, float, float, int]:
+    if line.bbox is None:
+        return (line.source_page, float(line.source_order), 0.0, line.source_order)
+    return (line.source_page, line.bbox[1], line.bbox[0], line.source_order)
+
+
+def _ref_for_lines(lines: Iterable[_EvidenceLine]) -> tuple[PersonalBriefSourceRef, ...]:
+    grouped: dict[str, list[_EvidenceLine]] = {}
+    for line in lines:
+        grouped.setdefault(line.unit_id, []).append(line)
+    refs: list[PersonalBriefSourceRef] = []
+    for unit_id, unit_lines in grouped.items():
+        base = unit_lines[0].source_ref
+        boxes = [line.bbox for line in unit_lines if line.bbox is not None]
+        bbox = (
+            (
+                min(box[0] for box in boxes),
+                min(box[1] for box in boxes),
+                max(box[2] for box in boxes),
+                max(box[3] for box in boxes),
+            )
+            if boxes
+            else base.bbox
+        )
+        evidence_ids = tuple(
+            dict.fromkeys(
+                evidence_id
+                for line in unit_lines
+                for evidence_id in line.evidence_ids
+                if evidence_id
+            )
+        )
+        refs.append(
+            PersonalBriefSourceRef(
+                **{
+                    **asdict(base),
+                    "bbox": bbox,
+                    "unit_id": unit_id,
+                    "evidence_ids": evidence_ids or base.evidence_ids,
+                }
+            )
+        )
+    return tuple(refs)
+
+
+def _aligned_ordinal(
+    line: _EvidenceLine,
+    ordinals: Iterable[tuple[int, _EvidenceLine]],
+) -> tuple[int, _EvidenceLine] | None:
+    if line.bbox is None:
+        return None
+    candidates = [
+        (sequence, ordinal)
+        for sequence, ordinal in ordinals
+        if ordinal.source_page == line.source_page
+        and ordinal.bbox is not None
+        and abs(ordinal.bbox[1] - line.bbox[1]) <= 5.0
+    ]
+    return min(candidates, key=lambda item: abs(item[1].bbox[1] - line.bbox[1])) if candidates else None
+
+
+def _liability_record_is_open(text: str) -> bool:
+    compact = _compact(text)
+    return bool(
+        compact.endswith(("保证合同编号：", "保证合同编号:"))
+        or compact.count("（") > compact.count("）")
+        or "截至" not in compact
+        or "余额" not in compact
+    )
+
+
+def _score_liability_continuation(
+    previous_text: str,
+    incoming_text: str,
+    *,
+    previous_page: int,
+    incoming: _EvidenceLine,
+    page_heights: dict[int, float],
+    bounded_by_next_record: bool = False,
+) -> tuple[float, float, tuple[str, ...]]:
+    compact_previous = _compact(previous_text)
+    compact_incoming = _compact(incoming_text)
+    signals: list[str] = []
+    score = 0.0
+    if incoming.source_page == previous_page + 1:
+        score += 0.18
+        signals.append("adjacent_page")
+    page_height = page_heights.get(incoming.source_page, 0.0)
+    if incoming.bbox is not None and page_height > 0 and incoming.bbox[1] / page_height <= 0.12:
+        score += 0.16
+        signals.append("page_top")
+    if _liability_record_is_open(previous_text):
+        score += 0.24
+        signals.append("open_liability_record")
+    if compact_previous.endswith(("保证合同编号：", "保证合同编号:")):
+        score += 0.24
+        signals.append("open_contract_number")
+    if re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]{5,}）", compact_incoming):
+        score += 0.13
+        signals.append("contract_number_completion")
+    if re.match(r"^截至20\d{2}年\d{1,2}月(?:\d{1,2}日)?[，,]", compact_incoming):
+        score += 0.18
+        signals.append("snapshot_tail")
+    if "余额" in compact_incoming:
+        score += 0.12
+        signals.append("balance_tail")
+    if compact_previous.count("（") > compact_previous.count("）") and "）" in compact_incoming:
+        score += 0.12
+        signals.append("delimiter_completion")
+    if any(
+        marker in compact_incoming
+        for marker in ("责任人类型为", "相关还款责任金额", "保证合同编号", "截至")
+    ):
+        score += 0.08
+        signals.append("canonical_field_tail")
+    if bounded_by_next_record:
+        score += 0.08
+        signals.append("bounded_by_next_record")
+    if not _LIABILITY_RECORD_START_RE.search(incoming_text):
+        score += 0.05
+        signals.append("no_new_record_anchor")
+    unresolved_score = 0.45
+    if incoming.source_page != previous_page + 1:
+        unresolved_score = 0.85
+    elif not _liability_record_is_open(previous_text):
+        unresolved_score = 0.75
+    return (
+        round(min(score, 1.0), 6),
+        round(unresolved_score, 6),
+        tuple(signals),
+    )
+
+
+def _exact_heading_target(text: str) -> str | None:
+    label = _compact(text).strip(":：")
+    if label in _SECTION_HEADING_TARGETS:
+        return _SECTION_HEADING_TARGETS[label]
+    if label == "信贷记录":
+        return "credit_records_container"
+    if label == "查询记录":
+        return "inquiries_container"
+    return None
+
+
+def _reconstruct_repayment_liability_records(
+    parse_result: Any,
+    context: CreditReportEntityContext,
+    refs: dict[str, PersonalBriefSourceRef],
+) -> _NumberedNarrativeReconstruction | None:
+    """Replace coarse liability blocks with canonical, evidence-backed records."""
+    assignments = _section_by_unit(context.units)
+    units = tuple(
+        unit
+        for unit in context.units
+        if assignments.get(unit.unit_id) == "repayment_liability"
+        and unit.kind != "table"
+        and _compact(unit.text).strip(":：") != "相关还款责任信息"
+    )
+    if not units:
+        return None
+
+    atoms_by_id = _evidence_text_atoms(parse_result)
+    lines = sorted(
+        (
+            line
+            for unit in units
+            for line in _evidence_lines_for_unit(unit, refs[unit.unit_id], atoms_by_id)
+        ),
+        key=_line_sort_key,
+    )
+    ordinals: list[tuple[int, _EvidenceLine, str]] = []
+    narrative: list[tuple[_EvidenceLine, str]] = []
+    for line in lines:
+        ordinal = _NUMBERED_ORDINAL_RE.fullmatch(line.text)
+        if ordinal:
+            ordinals.append(
+                (
+                    int(ordinal.group("sequence")),
+                    line,
+                    f"fragment:{line.line_id}:slice:0",
+                )
+            )
+            continue
+        narrative.append((line, line.text))
+
+    builders: list[dict[str, Any]] = []
+    residuals: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    continuation_decisions: list[PersonalBriefContinuationDecision] = []
+    fragment_counts: dict[str, int] = {}
+    fragment_source_text = {
+        fragment_id: line.text for _sequence, line, fragment_id in ordinals
+    }
+    fragment_line_ids = {
+        fragment_id: line.line_id for _sequence, line, fragment_id in ordinals
+    }
+    used_ordinal_fragments: set[str] = set()
+    active_section = "repayment_liability"
+    page_heights = {
+        int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or index):
+        float(getattr(page, "height", 0.0) or 0.0)
+        for index, page in enumerate(getattr(parse_result, "pages", None) or (), start=1)
+    }
+
+    def next_fragment_id(line: _EvidenceLine, source_text: str) -> str:
+        slice_index = fragment_counts.get(line.line_id, 0)
+        fragment_counts[line.line_id] = slice_index + 1
+        fragment_id = f"fragment:{line.line_id}:slice:{slice_index}"
+        fragment_source_text[fragment_id] = source_text
+        fragment_line_ids[fragment_id] = line.line_id
+        return fragment_id
+
+    def fragment_sort_key(
+        line: _EvidenceLine,
+        fragment_id: str,
+    ) -> tuple[int, float, float, int, int]:
+        slice_index = int(fragment_id.rsplit(":slice:", 1)[-1])
+        return (*_line_sort_key(line), slice_index)
+
+    def finish_current() -> None:
+        nonlocal current
+        if current is not None:
+            builders.append(current)
+            current = None
+
+    def add_residual(
+        line: _EvidenceLine,
+        text: str,
+        *,
+        section_key: str,
+        semantic_role: str,
+        status: str,
+        fragment_id: str | None = None,
+    ) -> None:
+        if not text.strip():
+            return
+        owned_fragment_id = fragment_id or next_fragment_id(line, text)
+        residuals.append(
+            {
+                "line": line,
+                "text": text.strip(),
+                "section_key": section_key,
+                "semantic_role": semantic_role,
+                "status": status,
+                "fragment_id": owned_fragment_id,
+                "sort_key": fragment_sort_key(line, owned_fragment_id),
+            }
+        )
+
+    def append_span(
+        span: list[tuple[_EvidenceLine, str, str]],
+        *,
+        bounded_by_next_record: bool = False,
+    ) -> bool:
+        nonlocal current
+        materialized = [item for item in span if item[1].strip()]
+        if not materialized:
+            return False
+        line, _first_text, _first_fragment_id = materialized[0]
+        combined_text = "\n".join(text.strip() for _line, text, _fragment_id in materialized)
+        if current is None:
+            for fragment_line, fragment_text, fragment_id in materialized:
+                add_residual(
+                    fragment_line,
+                    fragment_text,
+                    section_key="repayment_liability",
+                    semantic_role="unresolved_liability_fragment",
+                    status="unresolved",
+                    fragment_id=fragment_id,
+                )
+            return False
+        previous_page = int(current["last_page"])
+        if line.source_page != previous_page:
+            score, runner_up, signals = _score_liability_continuation(
+                "\n".join(current["parts"]),
+                combined_text,
+                previous_page=previous_page,
+                incoming=line,
+                page_heights=page_heights,
+                bounded_by_next_record=bounded_by_next_record,
+            )
+            eligible_tail = bool(
+                "snapshot_tail" in signals
+                or (
+                    "open_contract_number" in signals
+                    and "contract_number_completion" in signals
+                )
+                or "delimiter_completion" in signals
+                or "canonical_field_tail" in signals
+            )
+            if not eligible_tail or score < 0.70 or score - runner_up < 0.10:
+                if _liability_record_is_open("\n".join(current["parts"])):
+                    current["status"] = "unresolved"
+                for fragment_line, fragment_text, fragment_id in materialized:
+                    add_residual(
+                        fragment_line,
+                        fragment_text,
+                        section_key="repayment_liability",
+                        semantic_role="unresolved_liability_fragment",
+                        status="unresolved",
+                        fragment_id=fragment_id,
+                    )
+                return False
+            left_line = current["lines"][-1]
+            continuation_decisions.append(
+                PersonalBriefContinuationDecision(
+                    left_unit_id=left_line.unit_id,
+                    right_unit_id=line.unit_id,
+                    selected="continue_numbered_record",
+                    best_score=score,
+                    runner_up_score=runner_up,
+                    margin=round(max(0.0, score - runner_up), 6),
+                    signals=signals,
+                    from_page=previous_page,
+                    to_page=line.source_page,
+                )
+            )
+            current["continuation_scores"].append(score)
+        for fragment_line, fragment_text, fragment_id in materialized:
+            current["parts"].append(fragment_text.strip())
+            current["lines"].append(fragment_line)
+            current["fragment_ids"].append(fragment_id)
+            current["last_page"] = fragment_line.source_page
+        return True
+
+    def append_fragment(
+        line: _EvidenceLine,
+        text: str,
+        *,
+        bounded_by_next_record: bool = False,
+        fragment_id: str | None = None,
+    ) -> bool:
+        return append_span(
+            [(line, text, fragment_id or next_fragment_id(line, text))],
+            bounded_by_next_record=bounded_by_next_record,
+        )
+
+    narrative_index = 0
+    while narrative_index < len(narrative):
+        line, text = narrative[narrative_index]
+        heading_target = _exact_heading_target(text)
+        if heading_target is not None:
+            if heading_target != "repayment_liability":
+                finish_current()
+            add_residual(
+                line,
+                text,
+                section_key=heading_target,
+                semantic_role="section_heading",
+                status="reported",
+            )
+            active_section = heading_target
+            narrative_index += 1
+            continue
+        if active_section != "repayment_liability":
+            add_residual(
+                line,
+                text,
+                section_key=active_section,
+                semantic_role="reconstructed_source_fragment",
+                status="reported",
+            )
+            narrative_index += 1
+            continue
+
+        starts = list(_LIABILITY_RECORD_BOUNDARY_RE.finditer(text))
+        if not starts:
+            if current is not None and line.source_page != int(current["last_page"]):
+                page_prefix: list[tuple[_EvidenceLine, str, str]] = []
+                scan_index = narrative_index
+                while scan_index < len(narrative):
+                    prefix_line, prefix_text = narrative[scan_index]
+                    if prefix_line.source_page != line.source_page:
+                        break
+                    if _exact_heading_target(prefix_text) is not None:
+                        break
+                    if _LIABILITY_RECORD_BOUNDARY_RE.search(prefix_text):
+                        break
+                    page_prefix.append(
+                        (
+                            prefix_line,
+                            prefix_text,
+                            next_fragment_id(prefix_line, prefix_text),
+                        )
+                    )
+                    scan_index += 1
+                bounded = bool(
+                    scan_index < len(narrative)
+                    and narrative[scan_index][0].source_page == line.source_page
+                    and _LIABILITY_RECORD_BOUNDARY_RE.search(narrative[scan_index][1])
+                )
+                append_span(page_prefix, bounded_by_next_record=bounded)
+                narrative_index = scan_index
+                continue
+            append_fragment(line, text)
+            narrative_index += 1
+            continue
+        prefix = text[: starts[0].start()].strip()
+        if prefix:
+            append_fragment(line, prefix, bounded_by_next_record=True)
+        for index, start in enumerate(starts):
+            finish_current()
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+            aligned = (
+                _aligned_ordinal(
+                    line,
+                    ((sequence, ordinal) for sequence, ordinal, _fragment_id in ordinals),
+                )
+                if index == 0
+                else None
+            )
+            inline_sequence = start.group("sequence")
+            sequence = (
+                int(inline_sequence)
+                if inline_sequence is not None
+                else aligned[0]
+                if index == 0 and aligned is not None
+                else int(builders[-1]["sequence"]) + 1
+                if builders
+                else 1
+            )
+            ordinal_fragment_id = next(
+                (
+                    fragment_id
+                    for ordinal_sequence, ordinal_line, fragment_id in ordinals
+                    if aligned is not None
+                    and ordinal_sequence == aligned[0]
+                    and ordinal_line == aligned[1]
+                ),
+                None,
+            )
+            if ordinal_fragment_id is not None:
+                used_ordinal_fragments.add(ordinal_fragment_id)
+            body = text[start.start("record") : end].strip()
+            body_fragment_id = next_fragment_id(line, text[start.start() : end])
+            current = {
+                "sequence": sequence,
+                "parts": [body],
+                "lines": [line],
+                "fragment_ids": [body_fragment_id],
+                "ordinal": aligned[1] if aligned is not None else None,
+                "ordinal_fragment_id": ordinal_fragment_id,
+                "last_page": line.source_page,
+                "status": "reported",
+                "continuation_scores": [],
+                "sort_key": fragment_sort_key(line, body_fragment_id),
+            }
+        narrative_index += 1
+    finish_current()
+    if not builders:
+        return None
+
+    for sequence, ordinal_line, fragment_id in ordinals:
+        if fragment_id in used_ordinal_fragments:
+            continue
+        residuals.append(
+            {
+                "line": ordinal_line,
+                "text": "",
+                "section_key": "repayment_liability",
+                "semantic_role": "record_ordinal",
+                "status": "structural",
+                "fragment_id": fragment_id,
+                "sort_key": fragment_sort_key(ordinal_line, fragment_id),
+                "sequence": sequence,
+            }
+        )
+
+    unit_index = {unit.unit_id: index for index, unit in enumerate(context.units, start=1)}
+    consumed = tuple(dict.fromkeys(line.unit_id for line in lines))
+    first_source_index = min((unit_index[unit_id] for unit_id in consumed), default=1)
+    ordered_components: list[
+        tuple[tuple[int, float, float, int, int], CanonicalPersonalBriefComponent]
+    ] = []
+    for record_index, builder in enumerate(builders, start=1):
+        text = "\n".join(builder["parts"]).strip()
+        narrative_refs = _ref_for_lines(builder["lines"])
+        ordinal = builder.get("ordinal")
+        component_refs = tuple(
+            dict.fromkeys(
+                (
+                    *narrative_refs,
+                    *(_ref_for_lines((ordinal,)) if ordinal is not None else ()),
+                )
+            )
+        )
+        complete = bool(
+            "承担相关还款责任" in _compact(text)
+            and "余额" in _compact(text)
+            and not _liability_record_is_open(text)
+        )
+        status = "reported" if complete and builder["status"] == "reported" else "unresolved"
+        observed_confidence = min(
+            (
+                *(line.confidence for line in builder["lines"]),
+                *builder["continuation_scores"],
+            ),
+            default=1.0,
+        )
+        confidence = min(0.99, observed_confidence) if status == "reported" else min(0.58, observed_confidence)
+        sequence = int(builder["sequence"])
+        source_fragment_ids = tuple(
+            dict.fromkeys(
+                (
+                    *builder["fragment_ids"],
+                    *((builder["ordinal_fragment_id"],) if builder.get("ordinal_fragment_id") else ()),
+                )
+            )
+        )
+        ordered_components.append(
+            (
+                builder["sort_key"],
+            CanonicalPersonalBriefComponent(
+                component_id=f"personal_brief:numbered_record:repayment_liability:{record_index:04d}",
+                kind="numbered_record",
+                section_key="repayment_liability",
+                global_order=0,
+                text=f"{sequence}. {text}",
+                rows=(
+                    CanonicalPersonalBriefRow(
+                        values=(str(sequence), text),
+                        source_refs=narrative_refs,
+                        status=status,
+                    ),
+                ),
+                source_refs=component_refs,
+                source_unit_ids=source_fragment_ids,
+                confidence=confidence,
+                semantic_role="repayment_liability_record",
+            ),
+            )
+        )
+    for residual_index, residual in enumerate(residuals, start=1):
+        line = residual["line"]
+        semantic_role = str(residual["semantic_role"])
+        text = str(residual["text"])
+        rows = (
+            (
+                CanonicalPersonalBriefRow(
+                    values=(f"{int(residual['sequence'])}.",),
+                    source_refs=_ref_for_lines((line,)),
+                    status="structural",
+                ),
+            )
+            if semantic_role == "record_ordinal"
+            else ()
+        )
+        ordered_components.append(
+            (
+                residual["sort_key"],
+                CanonicalPersonalBriefComponent(
+                    component_id=f"personal_brief:reconstructed_fragment:{residual_index:04d}",
+                    kind=(
+                        "heading"
+                        if semantic_role == "section_heading"
+                        else "numbered_record"
+                        if semantic_role == "record_ordinal"
+                        else "paragraph"
+                    ),
+                    section_key=str(residual["section_key"]),
+                    global_order=0,
+                    text=text,
+                    rows=rows,
+                    source_refs=_ref_for_lines((line,)),
+                    source_unit_ids=(str(residual["fragment_id"]),),
+                    confidence=line.confidence if residual["status"] == "reported" else min(0.45, line.confidence),
+                    semantic_role=semantic_role,
+                ),
+            )
+        )
+    ordered_components.sort(key=lambda item: item[0])
+    components = tuple(
+        CanonicalPersonalBriefComponent(
+            **{
+                **asdict(component),
+                "global_order": first_source_index * _GLOBAL_ORDER_STRIDE + index,
+                "rows": component.rows,
+                "source_refs": component.source_refs,
+                "source_unit_ids": component.source_unit_ids,
+            }
+        )
+        for index, (_source_order, component) in enumerate(ordered_components, start=1)
+    )
+    uncovered_fragment_ids: list[str] = []
+    for line in lines:
+        line_fragment_ids = sorted(
+            (
+                fragment_id
+                for fragment_id, line_id in fragment_line_ids.items()
+                if line_id == line.line_id
+            ),
+            key=lambda fragment_id: int(fragment_id.rsplit(":slice:", 1)[-1]),
+        )
+        reconstructed_text = "".join(
+            fragment_source_text[fragment_id] for fragment_id in line_fragment_ids
+        )
+        if _compact(reconstructed_text) != _compact(line.text):
+            uncovered_fragment_ids.append(f"uncovered:{line.line_id}")
+
+    return _NumberedNarrativeReconstruction(
+        components=components,
+        consumed_unit_ids=consumed,
+        expected_fragment_ids=tuple(
+            dict.fromkeys((*fragment_source_text, *uncovered_fragment_ids))
+        ),
+        continuation_decisions=tuple(continuation_decisions),
+        first_source_index=first_source_index,
+    )
+
+
 def _component_kind(unit: CreditReportUnit) -> ComponentKind:
     if unit.kind == "heading":
         return "heading"
@@ -1124,9 +1958,16 @@ def _component_kind(unit: CreditReportUnit) -> ComponentKind:
     return "paragraph"
 
 
-def _decision_payload(context: CreditReportEntityContext) -> tuple[PersonalBriefContinuationDecision, ...]:
+def _decision_payload(
+    context: CreditReportEntityContext,
+    *,
+    excluded_unit_ids: Iterable[str] = (),
+) -> tuple[PersonalBriefContinuationDecision, ...]:
+    excluded = set(excluded_unit_ids)
     decisions: list[PersonalBriefContinuationDecision] = []
     for decision in context.decisions:
+        if decision.left_unit_id in excluded or decision.right_unit_id in excluded:
+            continue
         hypotheses = sorted(decision.hypotheses, key=lambda item: item.score, reverse=True)
         best = hypotheses[0] if hypotheses else None
         runner_up = hypotheses[1] if len(hypotheses) > 1 else None
@@ -1159,6 +2000,16 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
     context = decode_credit_report_entities(parse_result, report_family="personal_brief", beam_width=7)
     refs, furniture = _unit_source_refs(parse_result, context)
     inquiry_tables = _inquiry_candidates(parse_result, context, refs)
+    liability_reconstruction = _reconstruct_repayment_liability_records(
+        parse_result,
+        context,
+        refs,
+    )
+    liability_consumed = set(
+        liability_reconstruction.consumed_unit_ids
+        if liability_reconstruction is not None
+        else ()
+    )
     global_index_by_unit = {
         unit.unit_id: index for index, unit in enumerate(context.units, start=1)
     }
@@ -1181,9 +2032,16 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
 
     components: list[CanonicalPersonalBriefComponent] = []
     unit_to_component: dict[str, str] = {}
-    current_section = "report_header"
+    unit_sections = _section_by_unit(context.units)
     for global_index, unit in enumerate(context.units, start=1):
-        current_section = _section_for_heading(unit.text, current_section, unit.kind)
+        current_section = unit_sections[unit.unit_id]
+        if (
+            liability_reconstruction is not None
+            and global_index == liability_reconstruction.first_source_index
+        ):
+            components.extend(liability_reconstruction.components)
+        if unit.unit_id in liability_consumed:
+            continue
         inquiry = first_consumed.get(global_index)
         if inquiry is not None:
             role = f"{inquiry.inquiry_type}_inquiries"
@@ -1199,7 +2057,7 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
                 component_id=component_id,
                 kind="logical_table",
                 section_key=role,
-                global_order=global_index * 10,
+                global_order=global_index * _GLOBAL_ORDER_STRIDE,
                 text="\n".join(" | ".join(row.values) for row in inquiry.rows),
                 rows=inquiry.rows,
                 source_refs=source_refs,
@@ -1267,7 +2125,7 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
                 component_id=component_id,
                 kind="logical_table",
                 section_key=current_section,
-                global_order=global_index * 10,
+                global_order=global_index * _GLOBAL_ORDER_STRIDE,
                 text="\n".join(candidate.text for candidate in table_units),
                 rows=tuple(rows),
                 source_refs=source_refs,
@@ -1303,7 +2161,7 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
             component_id=component_id,
             kind=_component_kind(unit),
             section_key=current_section,
-            global_order=global_index * 10,
+            global_order=global_index * _GLOBAL_ORDER_STRIDE,
             text=unit.text,
             rows=rows,
             source_refs=(ref,),
@@ -1315,8 +2173,6 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
         )
         components.append(component)
         unit_to_component[unit.unit_id] = component_id
-        if unit.kind != "table":
-            current_section = _section_after_trailing_headings(unit.text, current_section)
 
     components.sort(key=lambda item: (item.global_order, item.component_id))
     connections: list[PersonalBriefConnection] = []
@@ -1339,11 +2195,20 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
             )
 
     owned = [unit_id for component in components for unit_id in component.source_unit_ids]
+    expected_unit_ids = [
+        unit.unit_id for unit in context.units if unit.unit_id not in liability_consumed
+    ]
+    if liability_reconstruction is not None:
+        expected_unit_ids.extend(liability_reconstruction.expected_fragment_ids)
     unassigned = tuple(
         unit_id
         for unit_id in (
-            *context.unassigned_unit_ids,
-            *(unit.unit_id for unit in context.units if owned.count(unit.unit_id) != 1),
+            *(
+                unit_id
+                for unit_id in context.unassigned_unit_ids
+                if unit_id not in liability_consumed
+            ),
+            *(unit_id for unit_id in expected_unit_ids if owned.count(unit_id) != 1),
         )
         if unit_id
     )
@@ -1364,19 +2229,24 @@ def build_canonical_personal_brief_document(parse_result: Any) -> CanonicalPerso
         )
         for index, page in enumerate(pages, start=1)
     )
-    decision_confidences = [decision.best_score for decision in _decision_payload(context)]
+    decisions = list(
+        _decision_payload(context, excluded_unit_ids=liability_consumed)
+    )
+    if liability_reconstruction is not None:
+        decisions.extend(liability_reconstruction.continuation_decisions)
+    decision_confidences = [decision.best_score for decision in decisions]
     confidence = min(decision_confidences, default=1.0)
     return CanonicalPersonalBriefDocumentIR(
         schema_id=PERSONAL_BRIEF_IR_SCHEMA_ID,
         schema_version=PERSONAL_BRIEF_IR_SCHEMA_VERSION,
         components=tuple(components),
         connections=tuple(connections),
-        continuation_decisions=_decision_payload(context),
+        continuation_decisions=tuple(decisions),
         section_presence=section_presence,
         furniture_source_refs=furniture,
         unassigned_source_unit_ids=tuple(dict.fromkeys(unassigned)),
         source_page_count=len(pages),
-        source_unit_count=len(context.units),
+        source_unit_count=len(expected_unit_ids),
         confidence=max(0.0, min(1.0, confidence)),
         _page_dimensions=dimensions,
     )

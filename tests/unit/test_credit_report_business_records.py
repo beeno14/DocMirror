@@ -8,6 +8,7 @@ import pytest
 from docmirror.models.entities.parse_result import CellValue, PageContent, TableBlock, TableRow, TextBlock
 from docmirror.plugins.credit_report.business_assembly import _build_audit
 from docmirror.plugins.credit_report.business_records import (
+    _overdue_from_personal_brief_accounts,
     derive_overdue_records,
     extract_native_credit_business,
 )
@@ -729,6 +730,32 @@ def test_personal_brief_preserves_complete_overdue_business_facts() -> None:
     assert overdue["over_90_days"] is True
     assert overdue["current_overdue"] is True
     assert overdue["current_overdue_status"] == "overdue"
+
+
+def test_personal_brief_does_not_convert_unreported_overdue_months_to_zero() -> None:
+    rows = _overdue_from_personal_brief_accounts(
+        [
+            {
+                "account_id": "account:unknown-months",
+                "ever_overdue": True,
+                "account_type": "credit_card",
+            },
+            {
+                "account_id": "account:reported-months",
+                "ever_overdue": True,
+                "account_type": "credit_card",
+                "overdue_months_last_5y": 1,
+            },
+            {
+                "account_id": "account:never-overdue",
+                "ever_overdue": False,
+                "overdue_months_last_5y": 0,
+            },
+        ]
+    )
+
+    assert [row["overdue_months"] for row in rows] == [None, 1]
+    assert all(row["account_id"] != "account:never-overdue" for row in rows)
 
 
 def test_personal_brief_normalizes_global_currency_names_without_false_cny() -> None:

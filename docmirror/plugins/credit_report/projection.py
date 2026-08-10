@@ -90,7 +90,14 @@ _PUBLIC_SOURCE_PRIVATE_KEYS = frozenset(
         "source_refs",
     }
 )
-_SOURCE_PAGE_KEYS = frozenset({"page", "page_id", "page_number", "source_page"})
+_SOURCE_PAGE_KEY_PRIORITY = (
+    "logical_page",
+    "page",
+    "page_id",
+    "page_number",
+    "source_page",
+)
+_SOURCE_PAGE_KEYS = frozenset(_SOURCE_PAGE_KEY_PRIORITY)
 
 
 def _page_number(value: Any) -> int | None:
@@ -118,36 +125,53 @@ def _source_page_range(record: dict[str, Any]) -> list[int]:
 
     def collect(value: Any) -> None:
         if isinstance(value, dict):
-            for key, item in value.items():
-                normalized_key = str(key).casefold()
-                if normalized_key == "page_range" and isinstance(item, (list, tuple)):
-                    pages.extend(page for candidate in item if (page := _page_number(candidate)) is not None)
-                elif normalized_key in _SOURCE_PAGE_KEYS:
-                    page = _page_number(item)
-                    if page is not None:
-                        pages.append(page)
-                elif isinstance(item, (dict, list, tuple)):
+            normalized_items = {
+                str(key).casefold(): item for key, item in value.items()
+            }
+            selected_page = next(
+                (
+                    page
+                    for key in _SOURCE_PAGE_KEY_PRIORITY
+                    if (page := _page_number(normalized_items.get(key))) is not None
+                ),
+                None,
+            )
+            if selected_page is not None:
+                pages.append(selected_page)
+            else:
+                page_range = normalized_items.get("page_range")
+                if isinstance(page_range, (list, tuple)):
+                    pages.extend(
+                        page
+                        for candidate in page_range
+                        if (page := _page_number(candidate)) is not None
+                    )
+
+            for key, item in normalized_items.items():
+                if key not in _SOURCE_PAGE_KEYS and key != "page_range" and isinstance(
+                    item, (dict, list, tuple)
+                ):
                     collect(item)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if isinstance(item, (dict, list, tuple)):
                     collect(item)
 
-    for key in (
+    provenance_keys = (
         "source",
         "source_refs",
         "source_cell_refs",
         "source_anchor",
         "page_range",
+        "logical_page",
         "page",
         "page_id",
         "page_number",
         "source_page",
         "source_page_end",
         "normalized",
-    ):
-        if key in record:
-            collect({key: record[key]})
+    )
+    collect({key: record[key] for key in provenance_keys if key in record})
     return [min(pages), max(pages)] if pages else []
 
 
@@ -422,7 +446,6 @@ def derive_credit_report_projection(plugin: Any, parse_result: Any, full_text: s
         entity_fields["marital_status"] = domain_facts["marital_status"]
     variant.refine_entity_fields(entity_fields)
     assembled_accounts = list(assembled.get("credit_accounts") or [])
-    assembled_summary = dict(assembled.get("credit_summary") or {})
     warnings = tuple(
         dict.fromkeys(
             (

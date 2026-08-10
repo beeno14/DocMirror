@@ -126,6 +126,59 @@ def test_account_table_issues_remap_to_final_printed_account_identity(monkeypatc
     assert "table_observation" not in due_date_issue["target_record_id"]
 
 
+def test_r2_exact_anchor_resolves_shared_native_revolving_table_signature(monkeypatch) -> None:
+    identifier = "D10053310H00012022052901021012089466554314"
+    base = _table(
+        "r2-account-base",
+        370.0,
+        [
+            ["管理机构", "账户标识", "开立日期", "到期日期", "账户授信额度", "账户币种"],
+            ["浙江网商银行股份有限公司", identifier, "2022.05.29", "长期", "10,000", "人民币元"],
+            ["业务种类", "担保方式", "还款期数", "还款频率", "还款方式", "共同借款标志"],
+            ["个人经营性贷款", "信用/免担保", "--", "月", "不区分还款方式", "无"],
+        ],
+    )
+    context = SimpleNamespace(pages=[_page(12, [base])])
+    monkeypatch.setattr(
+        native_extraction,
+        "_account_anchor_skeletons",
+        lambda _context: [
+            {
+                "account_id": "credit_account_provisional:r2",
+                "account_type": "revolving_loan_account",
+                "account_family_quality": "exact",
+                "_printed_ordinal_status": "printed_unreadable",
+                "account_identifier": identifier,
+                "page": 12,
+                "source_page": 12,
+                "bbox": [10.0, 360.0, 300.0, 369.0],
+                "_canonical_segment": {
+                    "pages": [{"logical_page": 12, "min_y": 360.0, "max_y": None}]
+                },
+                "source_refs": [
+                    {
+                        "source": "candidate_b_account_anchor",
+                        "logical_page": 12,
+                        "source_page": 12,
+                        "bbox": [10.0, 360.0, 300.0, 369.0],
+                    }
+                ],
+            }
+        ],
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:1"
+    assert accounts[0]["account_type"] == "revolving_loan_account"
+    assert accounts[0]["account_identifier"] == identifier
+    assert {ref.get("source") for ref in accounts[0]["source_refs"]} == {
+        "candidate_b_account_anchor",
+        "native_detail_table",
+    }
+
+
 def test_closed_collapsed_account_clusters_recover_only_shape_unique_fields() -> None:
     page = _page(16, [])
     loan_table = _table(
@@ -180,6 +233,74 @@ def test_closed_collapsed_account_clusters_recover_only_shape_unique_fields() ->
     assert card["last_repayment_date"] == "2022-12-03"
     assert card["scheduled_payment"] == card["actual_payment"] == 2186
     assert card["current_overdue_periods"] == card["current_overdue_amount"] == 0
+
+
+def test_watermarked_canonical_terminal_subtable_recovers_settled_state_and_close_date() -> None:
+    page = _page(8, [])
+    table = _table(
+        "pt_8_2",
+        300.0,
+        [
+            ["物 账户状态 爱", "? 账户关闭日期"],
+            ["家 结清", "Q 2020.02.21"],
+        ],
+    )
+    account = {
+        "account_id": "credit_account:non_revolving_loan:12",
+        "canonical_raw": {},
+    }
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    native_extraction._apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert account["account_status"] == "settled"
+    assert account["account_lifecycle_state"] == "settled"
+    assert account["current_overdue"] is False
+    assert account["close_date"] == "2020-02-21"
+    assert account["source_refs_by_field"]["account_lifecycle_state"][0][
+        "binding_quality"
+    ] == "canonical_account_terminal_subtable"
+    assert account["source_refs_by_field"]["close_date"][0]["binding_quality"] == (
+        "canonical_account_terminal_subtable"
+    )
+    assert not any(
+        issue.get("status") not in {"resolved", "informational"}
+        and issue.get("field_name") in {"account_lifecycle_state", "close_date"}
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_terminal_subtable_rejects_multiple_candidate_blocks() -> None:
+    page = _page(8, [])
+    table = _table(
+        "ambiguous-terminal-block",
+        300.0,
+        [
+            ["物 账户状态 爱", "? 账户关闭日期"],
+            ["家 结清", "Q 2020.02.21"],
+            ["账户状态 X", "账户关闭日期 ?"],
+            ["结清 Y", "2020.02.22 Q"],
+        ],
+    )
+    account = {"account_id": "account:ambiguous", "canonical_raw": {}}
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    native_extraction._apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert "account_lifecycle_state" not in account
+    assert "close_date" not in account
 
 
 def test_printed_heading_business_identifier_overrides_nearby_table_guess(monkeypatch) -> None:

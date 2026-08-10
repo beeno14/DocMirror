@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
+from docmirror.plugins.credit_report.personal_detail_scanned import candidate_b, native_extraction
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import CandidateBPipeline
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
     PersonalDetailExtractionContext,
@@ -21,6 +21,202 @@ from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
 )
+
+
+def _account_issue_ref(*, row: int, column: int, field_name: str) -> dict[str, object]:
+    return {
+        "source": "native_detail_table",
+        "logical_page": 4,
+        "source_page": 2,
+        "table_id": "bad-table",
+        "row": row,
+        "column": column,
+        "field_name": field_name,
+        "binding_quality": "closed_canonical_account_cell_cluster",
+    }
+
+
+def _exact_account_field_ref(*, bbox_top: float, field_name: str) -> dict[str, object]:
+    return {
+        "source": "candidate_b_account_anchor_interval",
+        "logical_page": 4,
+        "source_page": 2,
+        "bbox": [10.0, bbox_top, 500.0, bbox_top + 20.0],
+        "field_name": field_name,
+        "binding_quality": "canonical_account_header_geometry",
+    }
+
+
+def _active_account_issue(
+    *, record_id: str, field_name: str, issue_code: str, source_ref: dict[str, object]
+) -> dict[str, object]:
+    return {
+        "target_dataset": "credit_accounts",
+        "target_record_id": record_id,
+        "field_name": field_name,
+        "issue_code": issue_code,
+        "status": "requires_review",
+        "source_refs": [source_ref],
+    }
+
+
+def test_final_account_issue_reconciliation_closes_only_independently_exact_bad_alternates() -> None:
+    cases = (
+        (
+            "currency",
+            "account_currency",
+            "CNY",
+            "candidate_b_account_cluster_residue_unresolved",
+        ),
+        (
+            "business",
+            "business_type",
+            "其他个人消费贷款",
+            "candidate_b_account_cluster_field_unresolved",
+        ),
+        (
+            "guarantee",
+            "guarantee_type",
+            "信用/免担保",
+            "candidate_b_exact_slot_value_invalid",
+        ),
+        (
+            "identifier",
+            "account_identifier",
+            "B11614560H0001310333515600026815",
+            "candidate_b_account_cluster_field_unresolved",
+        ),
+        (
+            "institution-prefix",
+            "management_institution",
+            "重庆市蚂蚁商诚小额贷款有限公司",
+            "candidate_b_institution_leading_boundary_ambiguous",
+        ),
+        (
+            "institution-branch",
+            "management_institution",
+            "中国建设银行股份有限公司福建自贸试验区福州片区分行",
+            "candidate_b_institution_branch_without_legal_root",
+        ),
+    )
+    records = []
+    issues = []
+    for index, (suffix, field_name, value, issue_code) in enumerate(cases, start=1):
+        record_id = f"credit_account:test:{suffix}"
+        ref_field = "currency" if field_name == "account_currency" else field_name
+        record = {
+            "account_id": record_id,
+            field_name: value,
+            "source_refs_by_field": {
+                ref_field: [
+                    _exact_account_field_ref(
+                        bbox_top=100.0 + index * 30.0,
+                        field_name=ref_field,
+                    )
+                ]
+            },
+            "_unresolved_fields": [field_name],
+            "_invalid_observation_fields": [field_name],
+        }
+        records.append(record)
+        issues.append(
+            _active_account_issue(
+                record_id=record_id,
+                field_name=field_name,
+                issue_code=issue_code,
+                source_ref=_account_issue_ref(
+                    row=index,
+                    column=0,
+                    field_name=field_name,
+                ),
+            )
+        )
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+
+    candidate_b._reconcile_final_account_field_issues(context, records)
+
+    assert context._personal_detail_extraction_issues == []
+    assert all("_unresolved_fields" not in record for record in records)
+    assert all("_invalid_observation_fields" not in record for record in records)
+
+
+def test_final_account_issue_reconciliation_preserves_same_source_invalid_and_conflict_cases() -> None:
+    same_ref = _account_issue_ref(row=1, column=0, field_name="business_type")
+    same_source = {
+        "account_id": "credit_account:test:same-source",
+        "business_type": "其他个人消费贷款",
+        "source_refs_by_field": {"business_type": [same_ref]},
+        "_unresolved_fields": ["business_type"],
+    }
+    invalid = {
+        "account_id": "credit_account:test:invalid",
+        "business_type": "货记卡",
+        "source_refs_by_field": {
+            "business_type": [
+                _exact_account_field_ref(bbox_top=200.0, field_name="business_type")
+            ]
+        },
+        "_unresolved_fields": ["business_type"],
+    }
+    conflict = {
+        "account_id": "credit_account:test:conflict",
+        "account_currency": "CNY",
+        "source_refs_by_field": {
+            "currency": [_exact_account_field_ref(bbox_top=240.0, field_name="currency")]
+        },
+        "_reported_field_conflicts": ["account_currency"],
+        "_unresolved_fields": ["account_currency"],
+    }
+    absent = {
+        "account_id": "credit_account:test:absent",
+        "guarantee_type": "信用/免担保",
+        "source_refs_by_field": {
+            "guarantee_type": [
+                _exact_account_field_ref(bbox_top=280.0, field_name="guarantee_type")
+            ]
+        },
+        "_source_absent_fields": ["guarantee_type"],
+        "_unresolved_fields": ["guarantee_type"],
+    }
+    records = [same_source, invalid, conflict, absent]
+    issues = [
+        _active_account_issue(
+            record_id="credit_account:test:same-source",
+            field_name="business_type",
+            issue_code="candidate_b_account_cluster_field_unresolved",
+            source_ref=same_ref,
+        ),
+        _active_account_issue(
+            record_id="credit_account:test:invalid",
+            field_name="business_type",
+            issue_code="candidate_b_account_cluster_field_unresolved",
+            source_ref=_account_issue_ref(row=2, column=0, field_name="business_type"),
+        ),
+        _active_account_issue(
+            record_id="credit_account:test:conflict",
+            field_name="account_currency",
+            issue_code="candidate_b_account_cluster_residue_unresolved",
+            source_ref=_account_issue_ref(row=3, column=0, field_name="account_currency"),
+        ),
+        _active_account_issue(
+            record_id="credit_account:test:conflict",
+            field_name="account_currency",
+            issue_code="candidate_b_exact_slot_value_conflict",
+            source_ref=_account_issue_ref(row=4, column=0, field_name="account_currency"),
+        ),
+        _active_account_issue(
+            record_id="credit_account:test:absent",
+            field_name="guarantee_type",
+            issue_code="candidate_b_exact_slot_value_invalid",
+            source_ref=_account_issue_ref(row=5, column=0, field_name="guarantee_type"),
+        ),
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+
+    candidate_b._reconcile_final_account_field_issues(context, records)
+
+    assert context._personal_detail_extraction_issues == issues
+    assert all(record.get("_unresolved_fields") for record in records)
 
 
 def test_candidate_b_branch_has_no_shared_extraction_or_assembly_imports() -> None:
@@ -1089,10 +1285,104 @@ def test_account_schema_keeps_unanchored_table_only_as_reported_partial(monkeypa
     assert "encounter_order_not_used" in issue["reason_codes"]
 
 
-def test_account_schema_joins_misclassified_table_by_canonical_stream_position(monkeypatch) -> None:
+def test_account_schema_resolves_shared_revolving_table_signature_from_exact_owned_anchor(
+    monkeypatch,
+) -> None:
+    identifier = "D10053310H00012022052901021012089466554314"
+    table_id = "credit_account_table_observation:r2_shared_signature"
+    table = {
+        "account_id": table_id,
+        "_table_observation_id": table_id,
+        "account_type": "revolving_loan_subaccount",
+        "_table_account_family_basis": "shared_revolving_credit_limit_signature",
+        "source": "native_detail_account_table",
+        "account_identifier": identifier,
+        "balance": "8667",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "logical_page": 12,
+                "source_page": 6,
+                "table_id": "pt_12_2",
+                "bbox": [52, 370, 402, 551],
+            }
+        ],
+    }
+    anchor_id = "credit_account_provisional:r2_anchor"
+    anchor = {
+        "account_id": anchor_id,
+        "account_type": "revolving_loan_account",
+        "account_family_quality": "exact",
+        "_printed_ordinal_status": "printed_unreadable",
+        "account_identifier": identifier,
+        "page": 12,
+        "source_page": 6,
+        "bbox": [55, 361, 262, 370],
+        "_canonical_segment": {
+            "pages": [{"logical_page": 12, "min_y": 361, "max_y": None}]
+        },
+        "source_refs": [
+            {
+                "source": "candidate_b_account_anchor",
+                "logical_page": 12,
+                "source_page": 6,
+                "bbox": [55, 361, 262, 370],
+            }
+        ],
+    }
+    repayment = {
+        "account_id": table_id,
+        "year": 2022,
+        "month": 12,
+        "status": "N",
+    }
+    context = SimpleNamespace()
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([table], [repayment], []),
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_account_anchor_skeletons",
+        lambda _context: [anchor],
+    )
+
+    accounts, repayments, events = native_extraction._extract_accounts(context)
+
+    assert events == []
+    assert len(accounts) == 1
+    assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:1"
+    assert accounts[0]["account_type"] == "revolving_loan_account"
+    assert accounts[0]["category_sequence"] == 1
+    assert accounts[0]["account_identifier"] == identifier
+    assert accounts[0]["balance"] == "8667"
+    assert {ref.get("source") for ref in accounts[0]["source_refs"]} == {
+        "candidate_b_account_anchor",
+        "native_detail_table",
+    }
+    assert repayments[0]["account_id"] == accounts[0]["account_id"]
+    issue_codes = {
+        issue.get("issue_code")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    }
+    assert not issue_codes.intersection(
+        {
+            "candidate_b_account_table_missing",
+            "candidate_b_account_category_anchor_missing",
+            "candidate_b_account_sequence_gap",
+            "monthly_population_incomplete_from_account_gap",
+        }
+    )
+
+
+def test_account_schema_does_not_join_misclassified_table_by_stream_position(monkeypatch) -> None:
     table = {
         "account_id": "credit_account:revolving_loan_subaccount:1",
+        "_table_observation_id": "credit_account:revolving_loan_subaccount:1",
         "account_type": "revolving_loan_subaccount",
+        "_table_account_family_basis": "shared_revolving_credit_limit_signature",
+        "source": "native_detail_account_table",
         "category_sequence": 1,
         "account_identifier": "D0206000CA202506XZ20011136047",
         "source_refs": [{"logical_page": 4, "bbox": [10, 220, 500, 280]}],
@@ -1100,7 +1390,9 @@ def test_account_schema_joins_misclassified_table_by_canonical_stream_position(m
     anchor = {
         "account_id": "credit_account:revolving_loan_account:2",
         "account_type": "revolving_loan_account",
+        "account_family_quality": "exact",
         "category_sequence": 2,
+        "account_identifier": "D0206000CA202506XZ20011136048",
         "page": 4,
         "bbox": [10, 200, 300, 210],
         "source_refs": [{"logical_page": 4, "bbox": [10, 200, 300, 210]}],
@@ -1117,21 +1409,41 @@ def test_account_schema_joins_misclassified_table_by_canonical_stream_position(m
 
     accounts, repayments, _events = native_extraction._extract_accounts(context)
 
-    assert len(accounts) == 1
+    assert len(accounts) == 2
     assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:2"
     assert accounts[0]["account_type"] == "revolving_loan_account"
-    assert accounts[0]["account_identifier"] == "D0206000CA202506XZ20011136047"
-    assert repayments[0]["account_id"] == "credit_account:revolving_loan_account:2"
+    assert accounts[0]["account_identifier"] == "D0206000CA202506XZ20011136048"
+    assert accounts[1]["account_type"] == "revolving_loan_subaccount"
+    assert accounts[1]["account_identifier"] == "D0206000CA202506XZ20011136047"
+    assert repayments[0]["account_id"] == "credit_account:revolving_loan_subaccount:1"
 
 
 def test_account_stream_match_never_spills_replay_into_older_unmatched_anchor() -> None:
     anchors = [
-        {"account_id": "account:1", "page": 1, "bbox": [0, 100, 100, 110]},
-        {"account_id": "account:2", "page": 2, "bbox": [0, 100, 100, 110]},
+        {
+            "account_id": "account:1",
+            "account_type": "credit_card",
+            "page": 1,
+            "bbox": [0, 100, 100, 110],
+        },
+        {
+            "account_id": "account:2",
+            "account_type": "credit_card",
+            "page": 2,
+            "bbox": [0, 100, 100, 110],
+        },
     ]
     tables = [
-        {"account_id": "table:1", "source_refs": [{"logical_page": 2, "bbox": [0, 120, 100, 180]}]},
-        {"account_id": "table:replay", "source_refs": [{"logical_page": 3, "bbox": [0, 20, 100, 80]}]},
+        {
+            "account_id": "table:1",
+            "account_type": "credit_card",
+            "source_refs": [{"logical_page": 2, "bbox": [0, 120, 100, 180]}],
+        },
+        {
+            "account_id": "table:replay",
+            "account_type": "credit_card",
+            "source_refs": [{"logical_page": 3, "bbox": [0, 20, 100, 80]}],
+        },
     ]
 
     matches = native_extraction._match_account_table_observations(anchors, tables)
@@ -1163,6 +1475,7 @@ def test_account_table_match_does_not_use_category_or_encounter_order_without_ge
 def test_account_table_match_requires_verified_segment_for_later_page() -> None:
     anchor = {
         "account_id": "account:1",
+        "account_type": "credit_card",
         "page": 1,
         "bbox": [0, 100, 100, 110],
         "_canonical_segment": {
@@ -1171,6 +1484,7 @@ def test_account_table_match_requires_verified_segment_for_later_page() -> None:
     }
     table = {
         "account_id": "table:1",
+        "account_type": "credit_card",
         "source_refs": [{"logical_page": 2, "bbox": [0, 20, 100, 80]}],
     }
 
@@ -1825,6 +2139,13 @@ def test_credit_agreement_dash_glyphs_are_explicit_absence_not_failures(monkeypa
         "limit_identifier",
         "due_date",
     } <= set(rows[0]["_source_absent_fields"])
+    assert rows[0]["canonical_raw"] == {
+        "total_limit": "－",
+        "credit_limit": "——",
+        "used_limit": "--",
+        "limit_identifier": "--",
+        "due_date": "—",
+    }
     assert not any(
         issue.get("field_name")
         in {"total_limit", "credit_limit", "used_limit", "limit_identifier", "due_date"}

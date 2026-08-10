@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -361,3 +362,327 @@ def test_cross_plane_institution_alias_disagreement_is_withheld_without_guessing
     assert context._personal_detail_extraction_issues[0]["issue_code"] == (
         "candidate_b_independent_plane_field_conflict"
     )
+
+
+def test_cross_plane_repayment_status_conflict_is_withheld_by_exact_id() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    native = {
+        "repayment_records": [
+            {
+                "repayment_id": "grid:1:2020-02",
+                "grid_id": "grid:1",
+                "year": 2020,
+                "month": 2,
+                "status": "C",
+                "overdue_amount": "0",
+                "canonical_raw": {"status": "C"},
+                "source_cell_refs": [
+                    {
+                        "page": 1,
+                        "logical_page": 1,
+                        "grid_id": "grid:1",
+                        "row": 9,
+                        "col": 2,
+                        "field_name": "status",
+                        "geometry_scope": "cell",
+                        "bbox": [10.0, 10.0, 20.0, 20.0],
+                    }
+                ],
+            }
+        ]
+    }
+    corrected_row = {
+        "repayment_id": "grid:1:2020-02",
+        "grid_id": "grid:1",
+        "year": 2020,
+        "month": 2,
+        "status": "N",
+        "overdue_amount": "0",
+        "canonical_raw": {"status": "N"},
+        "source_cell_refs": [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "grid_id": "grid:1",
+                "row": 2,
+                "col": 2,
+                "field_name": "status",
+                "geometry_scope": "cell",
+                "bbox": [10.0, 30.0, 20.0, 40.0],
+            }
+        ],
+    }
+
+    _withhold_independent_plane_conflicts(
+        context,
+        native,
+        {"repayment_records": [corrected_row]},
+    )
+
+    assert "status" not in corrected_row
+    assert corrected_row["overdue_amount"] == "0"
+    assert corrected_row["canonical_raw"]["status"] == ["C", "N"]
+    issue = context._personal_detail_extraction_issues[0]
+    assert issue["issue_code"] == (
+        "candidate_b_independent_plane_repayment_status_conflict"
+    )
+    assert issue["target_record_id"] == "grid:1:2020-02"
+    assert issue["field_name"] == "status_code"
+    assert issue["observed_value"] == {
+        "native_static": "C",
+        "corrected_page": "N",
+    }
+    assert {ref["evidence_plane"] for ref in issue["source_refs"]} == {
+        "native_static",
+        "corrected_page",
+    }
+
+
+def test_cross_plane_repayment_status_uses_only_unique_exact_grid_month_fallback() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    native = {
+        "repayment_records": [
+            {
+                "grid_id": "grid:1",
+                "year": 2020,
+                "month": 2,
+                "status": "C",
+                "source_cell_refs": [
+                    {
+                        "page": 1,
+                        "logical_page": 1,
+                        "grid_id": "grid:1",
+                        "row": 9,
+                        "col": 2,
+                        "field_name": "status",
+                        "geometry_scope": "cell",
+                        "bbox": [10.0, 10.0, 20.0, 20.0],
+                    }
+                ],
+            },
+        ]
+    }
+    corrected_row = {
+        "grid_id": "grid:1",
+        "performance_month": "2020-02",
+        "status": "N",
+        "overdue_amount": "0",
+        "source_cell_refs": [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "grid_id": "grid:1",
+                "row": 2,
+                "col": 2,
+                "field_name": "status",
+                "geometry_scope": "cell",
+                "bbox": [10.0, 30.0, 20.0, 40.0],
+            }
+        ],
+    }
+
+    _withhold_independent_plane_conflicts(
+        context,
+        native,
+        {"repayment_records": [corrected_row]},
+    )
+
+    assert "status" not in corrected_row
+    assert corrected_row["overdue_amount"] == "0"
+    assert context._personal_detail_extraction_issues[0]["target_record_id"] == (
+        "grid:1:2020-02"
+    )
+
+    ambiguous_context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    ambiguous_corrected = {
+        "grid_id": "grid:1",
+        "year": 2020,
+        "month": 2,
+        "status": "N",
+    }
+    _withhold_independent_plane_conflicts(
+        ambiguous_context,
+        {
+            "repayment_records": [
+                {"grid_id": "grid:1", "year": 2020, "month": 2, "status": "C"},
+                {"grid_id": "grid:1", "year": 2020, "month": 2, "status": "N"},
+            ]
+        },
+        {"repayment_records": [ambiguous_corrected]},
+    )
+    assert ambiguous_corrected["status"] == "N"
+    assert ambiguous_context._personal_detail_extraction_issues == []
+
+    drift_context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    drift_corrected = {
+        "repayment_id": "grid:drift:stable-id",
+        "grid_id": "grid:drift",
+        "year": 2020,
+        "month": 2,
+        "status": "N",
+    }
+    _withhold_independent_plane_conflicts(
+        drift_context,
+        {
+            "repayment_records": [
+                {
+                    "repayment_id": "grid:drift:stable-id",
+                    "grid_id": "grid:drift",
+                    "year": 2020,
+                    "month": 1,
+                    "status": "C",
+                }
+            ]
+        },
+        {"repayment_records": [drift_corrected]},
+    )
+    assert drift_corrected["status"] == "N"
+    assert drift_context._personal_detail_extraction_issues == []
+
+
+@pytest.mark.parametrize("inexact_plane", ["native", "corrected"])
+def test_cross_plane_repayment_status_requires_two_exact_status_cells(
+    inexact_plane: str,
+) -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    def row(status: str, *, exact: bool) -> dict[str, Any]:
+        ref: dict[str, Any] = {
+            "page": 4,
+            "logical_page": 4,
+            "grid_id": "grid:exact",
+            "row": 2,
+            "col": 6,
+            "field_name": "status",
+            "geometry_scope": "cell" if exact else "logical_page",
+        }
+        if exact:
+            ref["bbox"] = [10.0, 10.0, 20.0, 20.0]
+        else:
+            ref["geometry_status"] = "unresolved"
+        return {
+            "repayment_id": "grid:exact:2022-06",
+            "grid_id": "grid:exact",
+            "year": 2022,
+            "month": 6,
+            "status": status,
+            "canonical_raw": {"status": status},
+            "overdue_amount": "0",
+            "source_cell_refs": [ref],
+        }
+
+    native = row("C", exact=inexact_plane != "native")
+    corrected = row("N", exact=inexact_plane != "corrected")
+
+    _withhold_independent_plane_conflicts(
+        context,
+        {"repayment_records": [native]},
+        {"repayment_records": [corrected]},
+    )
+
+    assert corrected["status"] == "N"
+    assert corrected["overdue_amount"] == "0"
+    assert context._personal_detail_extraction_issues == []
+
+
+def test_cross_plane_repayment_status_requires_substantive_canonical_raw() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    exact_ref = {
+        "page": 4,
+        "logical_page": 4,
+        "grid_id": "grid:raw",
+        "row": 2,
+        "col": 6,
+        "field_name": "status",
+        "geometry_scope": "cell",
+        "bbox": [10.0, 10.0, 20.0, 20.0],
+    }
+    native = {
+        "repayment_id": "grid:raw:2022-06",
+        "grid_id": "grid:raw",
+        "year": 2022,
+        "month": 6,
+        "status": "C",
+        "canonical_raw": {"status": "unknown"},
+        "source_cell_refs": [exact_ref],
+    }
+    corrected = {
+        **native,
+        "status": "N",
+        "canonical_raw": {"status": "N"},
+    }
+
+    _withhold_independent_plane_conflicts(
+        context,
+        {"repayment_records": [native]},
+        {"repayment_records": [corrected]},
+    )
+
+    assert corrected["status"] == "N"
+    assert context._personal_detail_extraction_issues == []
+
+
+def test_cross_plane_matching_statuses_pass_silently_and_preserve_amount() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    corrected_row = {
+        "repayment_id": "grid:1:2020-02",
+        "grid_id": "grid:1",
+        "year": 2020,
+        "month": 2,
+        "status": "C",
+        "overdue_amount": "37",
+    }
+
+    _withhold_independent_plane_conflicts(
+        context,
+        {
+            "repayment_records": [
+                {
+                    "repayment_id": "grid:1:2020-02",
+                    "grid_id": "grid:1",
+                    "year": 2020,
+                    "month": 2,
+                    "status": " C ",
+                    "overdue_amount": "0",
+                }
+            ]
+        },
+        {"repayment_records": [corrected_row]},
+    )
+
+    assert corrected_row["status"] == "C"
+    assert corrected_row["overdue_amount"] == "37"
+    assert context._personal_detail_extraction_issues == []
+
+
+def test_cross_plane_unknown_status_is_not_a_substantive_conflict() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    corrected_row = {
+        "repayment_id": "grid:1:2020-02",
+        "grid_id": "grid:1",
+        "year": 2020,
+        "month": 2,
+        "status": "N",
+        "overdue_amount": "0",
+    }
+
+    _withhold_independent_plane_conflicts(
+        context,
+        {
+            "repayment_records": [
+                {
+                    "repayment_id": "grid:1:2020-02",
+                    "grid_id": "grid:1",
+                    "year": 2020,
+                    "month": 2,
+                    "status": "unknown",
+                    "raw_status": "",
+                }
+            ]
+        },
+        {"repayment_records": [corrected_row]},
+    )
+
+    assert corrected_row["status"] == "N"
+    assert corrected_row["overdue_amount"] == "0"
+    assert context._personal_detail_extraction_issues == []

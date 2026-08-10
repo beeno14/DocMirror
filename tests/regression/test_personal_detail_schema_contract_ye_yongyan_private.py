@@ -141,15 +141,16 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
     ]
     if account_count != 42:
         assert account_count < 42
-        account_gap = next(
-            issue
+        account_gap_ids = {
+            issue["extraction_issue_id"]
             for issue in extraction_issues
             if issue.get("issue_code") == "candidate_b_account_sequence_gap"
-        )
+        }
+        assert account_gap_ids
         missing_sequences = [
             row
             for row in issue_evidence
-            if row.get("extraction_issue_id") == account_gap["extraction_issue_id"]
+            if row.get("extraction_issue_id") in account_gap_ids
             and row.get("evidence_kind") == "candidate"
             and str(row.get("evidence_path") or "").startswith("missing_category_sequences[")
         ]

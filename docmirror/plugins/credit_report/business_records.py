@@ -888,6 +888,7 @@ def _overdue_from_personal_brief_accounts(
             continue
         account_id = str(account.get("account_id") or "")
         current_overdue = account.get("current_overdue")
+        reported_overdue_months = account.get("overdue_months_last_5y")
         out.append(
             {
                 "overdue_id": _stable_id("credit_overdue", account_id, "last_5_years"),
@@ -900,7 +901,11 @@ def _overdue_from_personal_brief_accounts(
                 "open_date": account.get("open_date"),
                 "currency": account.get("currency"),
                 "period_scope": "last_5_years",
-                "overdue_months": int(account.get("overdue_months_last_5y") or 0),
+                "overdue_months": (
+                    int(reported_overdue_months)
+                    if reported_overdue_months is not None
+                    else None
+                ),
                 "over_90_days_months": account.get("over_90_days_months"),
                 "over_90_days": account.get("over_90_days"),
                 "current_overdue": current_overdue,

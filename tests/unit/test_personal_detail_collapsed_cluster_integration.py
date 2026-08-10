@@ -145,6 +145,33 @@ def test_collapsed_account_terms_bind_typed_fields_without_column_order_guessing
     assert result._personal_detail_extraction_issues == []
 
 
+def test_collapsed_loan_classification_keeps_unique_guarantee_and_business_type() -> None:
+    table = _table(
+        "account-classification-collapsed",
+        ["业务种类 担保方式 还款期数"],
+        ["个人消费贷款抵押36"],
+    )
+    page = _page(table)
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {"account_id": "credit_account:non_revolving_loan:13", "canonical_raw": {}}
+
+    _apply_account_facts(
+        result,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert account["business_type"] == "个人消费贷款"
+    assert account["guarantee_type"] == "抵押"
+    assert account["repayment_periods"] == 36
+    assert not any(
+        issue.get("field_name") in {"business_type", "guarantee_type"}
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
 def test_collapsed_account_terms_withhold_only_ambiguous_date() -> None:
     table = _table(
         "account-terms-ambiguous",

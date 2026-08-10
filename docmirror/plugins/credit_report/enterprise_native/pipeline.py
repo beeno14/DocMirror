@@ -37,6 +37,7 @@ from docmirror.plugins.credit_report.enterprise_native.extraction import (
     extract_enterprise_profile_datasets,
     extract_enterprise_public_records_from_tables,
     extract_enterprise_repayment_liability_records,
+    extract_enterprise_report_default_amount_unit,
     extract_enterprise_report_identity_records,
     extract_enterprise_report_metadata_records,
     extract_enterprise_report_notes,
@@ -752,6 +753,7 @@ def extract_enterprise_semantic_document(
     public_view = subset.view("public_records")
     statement_view = subset.view("statements_and_disputes")
     attachment_view = subset.view("attachment")
+    default_amount_unit = extract_enterprise_report_default_amount_unit(document)
 
     attachment_datasets = extract_enterprise_attachment_datasets(attachment_view)
     facility_summary = extract_enterprise_facility_summary(overview_view)
@@ -771,9 +773,18 @@ def extract_enterprise_semantic_document(
     credit_lines = extract_enterprise_credit_lines_from_tables(credit_view, accounts)
     liabilities = extract_enterprise_repayment_liability_records(credit_view)
     public_records = [
-        *extract_enterprise_public_records_from_tables(non_credit_view),
-        *extract_enterprise_public_records_from_tables(public_view),
-        *extract_enterprise_public_records_from_tables(statement_view),
+        *extract_enterprise_public_records_from_tables(
+            non_credit_view,
+            default_amount_unit=default_amount_unit,
+        ),
+        *extract_enterprise_public_records_from_tables(
+            public_view,
+            default_amount_unit=default_amount_unit,
+        ),
+        *extract_enterprise_public_records_from_tables(
+            statement_view,
+            default_amount_unit=default_amount_unit,
+        ),
     ]
 
     summary = {**overview, **reported}
@@ -842,7 +853,12 @@ def extract_enterprise_semantic_document(
         ]
     datasets["enterprise_interest_arrears"] = extract_enterprise_interest_arrears(credit_view)
     datasets.update(attachment_datasets)
-    datasets.update(extract_enterprise_non_credit_history_datasets(attachment_view))
+    datasets.update(
+        extract_enterprise_non_credit_history_datasets(
+            attachment_view,
+            default_amount_unit=default_amount_unit,
+        )
+    )
     datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(profile_view)
     datasets["enterprise_facility_summary"] = facility_summary
     datasets["report_notes"] = extract_enterprise_report_notes(notes_view)

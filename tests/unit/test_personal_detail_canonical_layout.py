@@ -463,3 +463,72 @@ def test_canonical_inquiry_line_uses_longest_reason_suffix_and_final_boundary() 
     assert line_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"
     assert final_rows[0]["institution"] == "深圳前海微众银行股份有限公司"
     assert final_rows[0]["reason"] == "法人代表、负责人、高管等资信审查"
+
+
+def test_inquiry_sequence_prefix_suppression_preserves_valid_101() -> None:
+    table = SimpleNamespace(
+        table_id="inquiries",
+        bbox=[10, 5, 590, 80],
+        metadata={
+            "raw_rows": [
+                ["编号", "查询日期", "查询机构", "查询原因"],
+                ["1", "2024.01.01", "机构甲银行股份有限公司", "贷款审批"],
+                ["101", "2024.01.01", "机构乙银行股份有限公司", "融资审批"],
+            ]
+        },
+        confidence=0.99,
+    )
+    page = _page(28, source=14, tables=[table])
+    page.canonical_template_id = "annotations_and_inquiries"
+    context = SimpleNamespace(pages=[page])
+
+    rows = _extract_inquiries(context)
+
+    assert [row["sequence"] for row in rows] == [1, 101]
+    assert not any(
+        issue.get("issue_code") == "candidate_b_inquiry_sequence_prefix_suppressed"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_inquiry_sequence_prefix_repair_requires_exact_row_neighbors() -> None:
+    def extract(sequences: list[int]) -> tuple[list[dict[str, object]], SimpleNamespace]:
+        table = SimpleNamespace(
+            table_id="inquiries",
+            bbox=[10, 5, 590, 100],
+            metadata={
+                "raw_rows": [
+                    ["编号", "查询日期", "查询机构", "查询原因"],
+                    *[
+                        [str(sequence), "2024.01.01", "机构甲银行股份有限公司", "贷款审批"]
+                        for sequence in sequences
+                    ],
+                ]
+            },
+            confidence=0.99,
+        )
+        page = _page(28, source=14, tables=[table])
+        page.canonical_template_id = "annotations_and_inquiries"
+        context = SimpleNamespace(pages=[page])
+        return _extract_inquiries(context), context
+
+    repaired_rows, repaired_context = extract([88, 789, 90])
+    isolated_rows, isolated_context = extract([89, 789])
+    genuine_rows, genuine_context = extract([788, 789, 790])
+
+    assert [row["sequence"] for row in repaired_rows] == [88, 89, 90]
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_inquiry_sequence_prefix_noise_corrected"
+        and issue.get("observed_value", {}).get("raw_sequence") == 789
+        and issue.get("candidate_value") == {"normalized_sequence": 89}
+        for issue in repaired_context._personal_detail_extraction_issues
+    )
+    assert [row["sequence"] for row in isolated_rows] == [89, 789]
+    assert [row["sequence"] for row in genuine_rows] == [788, 789, 790]
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_inquiry_sequence_prefix_noise_corrected"
+        for context in (isolated_context, genuine_context)
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )

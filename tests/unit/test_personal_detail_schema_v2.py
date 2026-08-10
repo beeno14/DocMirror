@@ -42,6 +42,27 @@ from docmirror.plugins.credit_report.personal_detail_scanned.source_projection i
 from docmirror.plugins.credit_report.projection import _records
 
 
+def test_monthly_status_contract_allows_field_local_null_with_required_identity() -> None:
+    schema = json.loads(
+        get_projection_schema("personal_credit_report_detailed").path.read_text(
+            encoding="utf-8"
+        )
+    )
+    dataset_rules = schema["$defs"]["canonicalDataset"]["allOf"]
+    monthly_rule = next(
+        rule
+        for rule in dataset_rules
+        if rule.get("if", {}).get("properties", {}).get("name", {}).get("const")
+        == "credit_account_monthly_performance"
+    )
+    normalized_contract = monthly_rule["then"]["properties"]["rows"]["items"][
+        "properties"
+    ]["normalized"]
+
+    assert "status_code" in normalized_contract["required"]
+    assert None in normalized_contract["properties"]["status_code"]["enum"]
+
+
 def _record(record_id: str, **values: Any) -> dict[str, Any]:
     return {"record_id": record_id, **values}
 
@@ -116,7 +137,7 @@ def test_repayment_responsibility_status_alternatives_reject_loss_or_collision()
     )
 
 
-def test_monthly_repayment_enum_is_identical_in_runtime_dictionary_and_json() -> None:
+def test_monthly_repayment_business_enum_matches_non_null_json_values() -> None:
     expected = set(_CANONICAL_MONTHLY_STATUS_CODES) | {"unknown"}
     dictionary_codes = set(
         personal_detail_data_dictionary()["enums"]["repayment_status_code"]
@@ -144,7 +165,8 @@ def test_monthly_repayment_enum_is_identical_in_runtime_dictionary_and_json() ->
     )
 
     assert dictionary_codes == expected
-    assert schema_codes == expected
+    assert schema_codes - {None} == expected
+    assert None in schema_codes
 
 
 def test_v2_business_rows_quarantine_internal_ocr_metadata() -> None:
@@ -208,7 +230,7 @@ def test_v2_business_rows_quarantine_internal_ocr_metadata() -> None:
     assert "source_refs_by_field" not in row
 
 
-def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_issue() -> None:
+def test_v2_monthly_gate_keeps_exact_status_issues_and_aggregates_grid() -> None:
     projected = project_personal_detail_datasets(
         {
             "repayment_records": [
@@ -274,6 +296,18 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
                     field_name="status",
                     observed_value="?",
                 ),
+                _record(
+                    "issue:jan:canonical-alias-duplicate",
+                    extraction_issue_id="issue:jan:canonical-alias-duplicate",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="repayment_records",
+                    target_record_id="grid:1:2024-01",
+                    field_name="status_code",
+                    observed_value="unknown",
+                ),
             ],
         }
     )
@@ -289,11 +323,43 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
     assert issues[0]["target_dataset"] == "credit_account_monthly_performance"
     assert issues[0]["field_name"] == "status_code"
     assert "target_record_id" not in issues[0]
-    assert not any(
-        row.get("issue_code") == "pboc_cell_contract_unresolved"
-        and row.get("field_name") in {"status", "status_code"}
+    local_status_issues = [
+        row
         for row in projected["extraction_issues"]
-    )
+        if row.get("issue_code") == "pboc_cell_contract_unresolved"
+    ]
+    assert len(local_status_issues) == 2
+    assert {
+        (
+            row.get("target_record_id"),
+            row.get("field_name"),
+            row.get("status"),
+        )
+        for row in local_status_issues
+    } == {
+        ("grid:1:2024-01", "status_code", "requires_review"),
+        ("grid:1:2024-02", "status_code", "requires_review"),
+    }
+    assert {
+        (
+            row.get("business_record_id"),
+            row.get("field_name"),
+            row.get("reason"),
+        )
+        for row in projected["field_observations"]
+        if row.get("reason") == "pboc_cell_contract_unresolved"
+    } == {
+        (
+            "grid:1:2024-01",
+            "status_code",
+            "pboc_cell_contract_unresolved",
+        ),
+        (
+            "grid:1:2024-02",
+            "status_code",
+            "pboc_cell_contract_unresolved",
+        ),
+    }
     observed = {
         row["evidence_path"]: row.get("integer_value") or row.get("string_value")
         for row in projected["extraction_issue_evidence"]
@@ -315,6 +381,134 @@ def test_v2_monthly_gate_withholds_only_final_unresolved_rows_and_aggregates_iss
     assert status_row["presence_status"] == "partial"
     assert status_row["observed_row_count"] == 1
     assert status_row["expected_row_count"] == 3
+
+
+def test_v2_monthly_gate_prunes_stale_exact_status_issue_after_resolution() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                {
+                    # Real Candidate-B rows carry no outer ``record_id`` and
+                    # place the relationship ``grid_id`` before their row ID.
+                    "repayment_id": "monthly:resolved",
+                    "grid_id": "grid:resolved",
+                    "account_id": "account:1",
+                    "year": 2024,
+                    "month": 1,
+                    "status": "N",
+                    "overdue_amount": 0,
+                },
+                {
+                    "repayment_id": "monthly:orphan-resolved",
+                    "grid_id": "grid:orphan-resolved",
+                    "year": 2024,
+                    "month": 2,
+                    "status": "N",
+                    "overdue_amount": 0,
+                },
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:stale-status",
+                    extraction_issue_id="issue:stale-status",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="repayment_records",
+                    target_record_id="monthly:resolved",
+                    field_name="status",
+                    observed_value="unknown",
+                ),
+                _record(
+                    "issue:stale-orphan-status",
+                    extraction_issue_id="issue:stale-orphan-status",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="repayment_records",
+                    target_record_id="monthly:orphan-resolved",
+                    field_name="status",
+                    observed_value="unknown",
+                ),
+            ],
+        }
+    )
+
+    [row] = projected["credit_account_monthly_performance"]
+    assert row["status_code"] == "N"
+    assert row["monthly_performance_id"] == "monthly:resolved"
+    assert not any(
+        issue.get("issue_code") == "pboc_cell_contract_unresolved"
+        and issue.get("target_record_id")
+        in {"monthly:resolved", "monthly:orphan-resolved"}
+        for issue in projected.get("extraction_issues", [])
+    )
+    assert not any(
+        observation.get("reason") == "pboc_cell_contract_unresolved"
+        and observation.get("business_record_id")
+        in {"monthly:resolved", "monthly:orphan-resolved"}
+        for observation in projected.get("field_observations", [])
+    )
+    aggregate = next(
+        issue
+        for issue in projected["extraction_issues"]
+        if issue.get("issue_code")
+        == "candidate_b_monthly_status_grid_unresolved"
+    )
+    assert "target_record_id" not in aggregate
+
+
+def test_v2_monthly_gate_keeps_exact_status_issue_for_noncanonical_orphan() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                {
+                    "repayment_id": "monthly:orphan-unknown",
+                    "grid_id": "grid:orphan-unknown",
+                    "year": 2024,
+                    "month": 1,
+                    "status": "unknown",
+                    "overdue_amount": None,
+                }
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:orphan-unknown-status",
+                    extraction_issue_id="issue:orphan-unknown-status",
+                    category="ocr_cell_level_error",
+                    issue_code="pboc_cell_contract_unresolved",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="repayment_records",
+                    target_record_id="monthly:orphan-unknown",
+                    field_name="status",
+                    observed_value="unknown",
+                )
+            ],
+        }
+    )
+
+    assert "credit_account_monthly_performance" not in projected
+    local_issue = next(
+        issue
+        for issue in projected["extraction_issues"]
+        if issue.get("issue_code") == "pboc_cell_contract_unresolved"
+    )
+    assert local_issue["target_record_id"] == "monthly:orphan-unknown"
+    assert local_issue["field_name"] == "status_code"
+    assert local_issue["status"] == "requires_review"
+    assert any(
+        observation.get("business_record_id") == "monthly:orphan-unknown"
+        and observation.get("field_name") == "status_code"
+        and observation.get("reason") == "pboc_cell_contract_unresolved"
+        for observation in projected["field_observations"]
+    )
+    assert sum(
+        issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
+        for issue in projected["extraction_issues"]
+    ) == 1
 
 
 def test_v2_successful_monthly_row_drops_diagnostics_without_review() -> None:
@@ -443,6 +637,7 @@ def test_v2_preserves_canonical_slash_monthly_status_silently() -> None:
                     year=2025,
                     month=1,
                     status="/",
+                    overdue_amount=0,
                 )
             ]
         }
@@ -531,6 +726,7 @@ def test_v2_corrected_monthly_row_drops_stale_source_review() -> None:
                     "year": 2025,
                     "month": 2,
                     "status": "N",
+                    "overdue_amount": 0,
                     "extraction_status": "review",
                     "canonical_raw": {"status": "N", "extraction_status": "review"},
                 }
@@ -589,6 +785,7 @@ def test_v2_hash_monthly_marker_is_a_canonical_business_status() -> None:
                     year=2025,
                     month=2,
                     status="#",
+                    overdue_amount=0,
                     extraction_status="review",
                 )
             ],
@@ -709,6 +906,181 @@ def test_v2_successful_business_row_drops_redundant_evidence_snapshots() -> None
     }
     assert "canonical_raw" not in row
     assert "raw" not in row
+
+
+def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
+    def inquiry(
+        sequence: int,
+        inquiry_date: str,
+        institution: str,
+        reason: str,
+        *,
+        channel: str = "institution",
+        suffix: str = "",
+    ) -> dict[str, Any]:
+        inquiry_id = f"inquiry:{sequence}{suffix}"
+        return _record(
+            inquiry_id,
+            inquiry_id=inquiry_id,
+            sequence=sequence,
+            inquiry_date=inquiry_date,
+            institution=institution,
+            reason=reason,
+            query_channel=channel,
+            inquiry_type=channel,
+        )
+
+    def unresolved(
+        issue_id: str,
+        sequence: int,
+        row: list[str],
+    ) -> dict[str, Any]:
+        return _record(
+            issue_id,
+            extraction_issue_id=issue_id,
+            issue_code="candidate_b_inquiry_row_cells_unresolved",
+            category="ocr_structure_correction",
+            status="requires_review",
+            severity="warning",
+            parser_stage="candidate_b_inquiry_schema",
+            target_dataset="inquiry_records",
+            target_record_id=None,
+            field_name="inquiry_date",
+            observed_value={"sequence": sequence, "row": row},
+            candidate_value={"missing_fields": ["inquiry_date"]},
+        )
+
+    projected = project_personal_detail_datasets(
+        {
+            "inquiry_records": [
+                inquiry(3, "2023-01-03", "广发银行股份有限公司", "贷后管理"),
+                inquiry(82, "2021-04-25", "中国光大银行股份有限公司", "贷后管理"),
+                inquiry(90, "2021-01-01", "中信银行股份有限公司", "贷后管理"),
+                inquiry(
+                    90,
+                    "2021-01-01",
+                    "中信银行股份有限公司",
+                    "贷后管理",
+                    suffix=":duplicate",
+                ),
+                inquiry(
+                    91,
+                    "2021-01-02",
+                    "本人",
+                    "本人查询",
+                    channel="personal",
+                ),
+            ],
+            "personal_detail_extraction_issues": [
+                unresolved(
+                    "issue:matched-date-noise",
+                    3,
+                    ["3", "2023.01.03 20", "广发银行股份有限公司", "贷后管理"],
+                ),
+                unresolved(
+                    "issue:matched-edge-noise",
+                    82,
+                    [
+                        "82",
+                        "202104.25",
+                        "多 中国光大银行股份有限公司",
+                        "贷后管理 司 %5",
+                    ],
+                ),
+                unresolved(
+                    "issue:missing-sequence",
+                    23,
+                    ["23", "2022.08:25", "平安银行股份有限公司", "贷后管理"],
+                ),
+                unresolved(
+                    "issue:mismatched-reason",
+                    3,
+                    ["3", "2023.01.03", "广发银行股份有限公司", "贷款审批"],
+                ),
+                unresolved(
+                    "issue:duplicate-sequence",
+                    90,
+                    ["90", "2021.01.01", "中信银行股份有限公司", "贷后管理"],
+                ),
+                unresolved(
+                    "issue:personal-channel",
+                    91,
+                    ["91", "2021.01.02", "本人", "本人查询"],
+                ),
+                unresolved(
+                    "issue:incomplete-fingerprint",
+                    3,
+                    ["3", "2023.01.03", "广发银行股份有限公司"],
+                ),
+            ],
+        }
+    )
+
+    issue_ids = {
+        row.get("extraction_issue_id")
+        for row in projected.get("extraction_issues", [])
+    }
+    assert "issue:matched-date-noise" not in issue_ids
+    assert "issue:matched-edge-noise" not in issue_ids
+    assert {
+        "issue:missing-sequence",
+        "issue:mismatched-reason",
+        "issue:duplicate-sequence",
+        "issue:personal-channel",
+        "issue:incomplete-fingerprint",
+    } <= issue_ids
+
+
+def test_v2_summary_issue_targets_follow_metric_types_when_values_are_withheld() -> None:
+    metrics = [
+        _record(
+            f"metric:{metric_code}",
+            credit_summary_metric_id=f"metric:{metric_code}",
+            summary_record_id="summary:1",
+            row_index=index,
+            column_index=1,
+            metric_code=metric_code,
+            mapping_status="mapped",
+            value_type="unknown",
+        )
+        for index, metric_code in enumerate(
+            ("account_count", "business_type", "first_business_issue_month"),
+            start=1,
+        )
+    ]
+    issues = [
+        _record(
+            f"issue:{metric['metric_code']}",
+            extraction_issue_id=f"issue:{metric['metric_code']}",
+            issue_code="candidate_b_summary_scalar_unresolved",
+            category="schema_incompleteness",
+            status="requires_review",
+            severity="warning",
+            parser_stage="candidate_b_summary_schema",
+            target_dataset="credit_business_overview",
+            target_record_id=metric["credit_summary_metric_id"],
+            field_name="value",
+        )
+        for metric in metrics
+    ]
+
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_credit_summary_metrics": metrics,
+            "personal_detail_extraction_issues": issues,
+        }
+    )
+    fields = {
+        row["extraction_issue_id"].removeprefix("issue:"): row["field_name"]
+        for row in projected["extraction_issues"]
+        if row.get("issue_code") == "candidate_b_summary_scalar_unresolved"
+    }
+
+    assert fields == {
+        "account_count": "numeric_value",
+        "business_type": "text_value",
+        "first_business_issue_month": "date_value",
+    }
 
 
 def test_v2_source_sentinel_is_silent_absence_but_monthly_dash_is_reported() -> None:
@@ -954,7 +1326,7 @@ def test_v2_projection_corrects_business_semantics_and_reports_unmapped_values()
     assert "pboc_extension_fields" not in projected
     assert any(
         row["issue_code"] == "canonical_summary_cell_unmapped"
-        and row["target_record_id"] == "cell:2"
+        and row.get("target_record_id") is None
         for row in projected["extraction_issues"]
     )
 
@@ -1116,6 +1488,112 @@ def test_v2_does_not_treat_wrapper_record_id_as_emitted_account_foreign_key() ->
     assert issue["target_record_id"] == "event:1"
 
 
+def _assert_linked_issue_targets_and_fields_are_addressable(
+    projected: dict[str, list[dict[str, Any]]],
+) -> None:
+    records_by_dataset: dict[str, dict[str, dict[str, Any]]] = {}
+    for dataset_name, records in projected.items():
+        if not isinstance(records, list):
+            continue
+        record_index: dict[str, dict[str, Any]] = {}
+        for record in records:
+            values = (
+                record["normalized"]
+                if isinstance(record.get("normalized"), dict)
+                else record
+            )
+            identities = {str(record.get("record_id") or "")}
+            identities.update(
+                str(value)
+                for key, value in values.items()
+                if key.endswith("_id") and value not in (None, "")
+            )
+            for identity in identities - {""}:
+                record_index[identity] = values
+        records_by_dataset[dataset_name] = record_index
+
+    for issue in projected.get("extraction_issues") or []:
+        values = (
+            issue["normalized"]
+            if isinstance(issue.get("normalized"), dict)
+            else issue
+        )
+        target_record_id = str(values.get("target_record_id") or "")
+        if not target_record_id:
+            continue
+        target_dataset = str(values.get("target_dataset") or "")
+        assert target_record_id in records_by_dataset.get(target_dataset, {})
+        field_name = str(values.get("field_name") or "")
+        if field_name:
+            assert field_name in records_by_dataset[target_dataset][target_record_id]
+
+
+def test_v2_account_event_identifier_linkage_is_silent_or_localized_to_account_id() -> None:
+    parent_identifier = "B10211000H0001350220190204838"
+    conflicting_identifier = "D10053310H00012022052901021012089466554314"
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:1",
+                    account_id="account:1",
+                    sequence=1,
+                    account_type="credit_card",
+                    account_identifier=parent_identifier,
+                )
+            ],
+            "personal_detail_account_events": [
+                _record(
+                    "event:matching",
+                    account_event_id="event:matching",
+                    event_type="large_installment",
+                    account_id="account:1",
+                    account_identifier=parent_identifier,
+                ),
+                _record(
+                    "event:conflicting",
+                    account_event_id="event:conflicting",
+                    event_type="large_installment",
+                    account_id="account:1",
+                    account_identifier=conflicting_identifier,
+                ),
+            ],
+        }
+    )
+
+    events = {
+        row["record_id"]: row
+        for row in projected["credit_card_large_installments"]
+    }
+    matching = events["event:matching"]
+    conflicting = events["event:conflicting"]
+    issues = [
+        row.get("normalized", row) for row in projected["extraction_issues"]
+    ]
+
+    assert matching["account_id"] == "account:1"
+    assert "account_identifier" not in matching
+    assert "account_identifier" not in matching.get("normalized", {})
+    assert not any(
+        issue.get("target_record_id") == "event:matching" for issue in issues
+    )
+    assert conflicting["account_id"] is None
+    assert "account_identifier" not in conflicting
+    assert "account_identifier" not in conflicting.get("normalized", {})
+    conflict_issue = next(
+        issue
+        for issue in issues
+        if issue.get("target_record_id") == "event:conflicting"
+    )
+    assert conflict_issue["issue_code"] == "account_event_parent_identifier_conflict"
+    assert conflict_issue["target_dataset"] == "credit_card_large_installments"
+    assert conflict_issue["field_name"] == "account_id"
+    assert not any(
+        issue.get("field_name") == "account_identifier" for issue in issues
+    )
+    _assert_linked_issue_targets_and_fields_are_addressable(projected)
+
+
 def test_v2_preserves_invalid_month_source_without_emitting_invalid_month() -> None:
     projected = project_personal_detail_datasets(
         {
@@ -1211,6 +1689,44 @@ def test_v2_dictionary_covers_pboc_catalog_and_logical_types() -> None:
     assert dictionary["datasets"]["housing_fund_records"]["columns"][
         "personal_contribution_ratio_percent"
     ]["logical_type"] == "Short"
+
+
+def test_v2_projects_credit_line_validity_under_public_field_name() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:perpetual",
+                    account_id="account:perpetual",
+                    account_type="revolving_loan_account",
+                    validity_type="perpetual",
+                    canonical_raw={"due_date": "长期"},
+                )
+            ],
+            "personal_detail_field_observations": [
+                _record(
+                    "field:validity",
+                    field_observation_id="field:validity",
+                    dataset_name="credit_accounts",
+                    business_record_id="account:perpetual",
+                    field_name="validity_type",
+                    observation_status="ambiguous",
+                    raw_value="长期",
+                )
+            ],
+        }
+    )
+
+    account = projected["credit_accounts"][0]
+    assert account["credit_line_validity_type"] == "perpetual"
+    assert "validity_type" not in account
+    observation = projected["field_observations"][0]
+    assert observation["field_name"] == "credit_line_validity_type"
+    columns = personal_detail_data_dictionary()["datasets"]["credit_accounts"][
+        "columns"
+    ]
+    assert "credit_line_validity_type" in columns
+    assert "validity_type" not in columns
 
 
 def _canonical_dataset(name: str, row: dict[str, Any]) -> dict[str, Any]:
@@ -1958,6 +2474,7 @@ def test_v2_normalizes_valid_currency_and_suppresses_false_issue() -> None:
                     year=2025,
                     month=1,
                     status="N",
+                    overdue_amount=0,
                     reporting_amount_currency="人民币元",
                 )
             ],
@@ -2318,7 +2835,7 @@ def test_failed_summary_scalar_is_issue_only_not_generic_extension() -> None:
         if row.get("issue_code") == "canonical_summary_cell_unmapped"
     )
     assert issue["target_dataset"] == "credit_business_overview"
-    assert issue["target_record_id"] == "cell:bad"
+    assert issue.get("target_record_id") is None
 
 
 def test_source_endpoint_does_not_report_missing_population_when_row_count_is_met() -> None:

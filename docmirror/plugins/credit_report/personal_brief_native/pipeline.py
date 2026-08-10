@@ -550,13 +550,20 @@ def _extract_account_section(
     return _reconcile_numbered_accounts(document, section_key, records)
 
 
-def _liability_fallback(
+def _repayment_liabilities_from_canonical_records(
     document: CanonicalPersonalBriefDocumentIR,
 ) -> list[dict[str, Any]]:
     from docmirror.plugins.credit_report.business_records import _iso_date, _iso_month
     from docmirror.plugins.credit_report.value_utils import parse_number, stable_record_id
 
-    chunks = _numbered_chunks(document, "repayment_liability")
+    chunks: list[tuple[int, str, list[CanonicalPersonalBriefComponent]]] = []
+    for component in document.components_for("repayment_liability"):
+        if component.semantic_role != "repayment_liability_record" or not component.rows:
+            continue
+        row = component.rows[0]
+        if len(row.values) < 2 or not str(row.values[0]).isdigit():
+            continue
+        chunks.append((int(row.values[0]), str(row.values[1]), [component]))
     records: list[dict[str, Any]] = []
     for source_sequence, text, components in chunks:
         compact = re.sub(r"\s+", "", text)
@@ -578,6 +585,24 @@ def _liability_fallback(
         balance_match = re.search(r"余额(?:为)?([\d,.]+)", compact)
         amount_text = core.group(8)
         refs = _component_refs(components, "canonical_repayment_liability_record")
+        if (
+            len(components) == 1
+            and components[0].semantic_role == "repayment_liability_record"
+            and components[0].rows
+        ):
+            refs = [
+                _source_ref(
+                    ref,
+                    "canonical_repayment_liability_record",
+                    component_id=components[0].component_id,
+                )
+                for ref in components[0].rows[0].source_refs
+            ]
+        extraction_status = (
+            components[0].rows[0].status
+            if len(components) == 1 and components[0].rows
+            else "unresolved"
+        )
         records.append(
             {
                 "liability_id": stable_record_id(
@@ -602,8 +627,11 @@ def _liability_fallback(
                 "responsibility_type": core.group(7),
                 "responsibility_amount": parse_number(amount_text),
                 "responsibility_amount_reported": amount_text != "--",
-                "contract_number": contract_match.group(1) if contract_match else None,
-                "contract_number_status": "reported" if contract_match else "not_reported",
+                **(
+                    {"contract_number": contract_match.group(1)}
+                    if contract_match
+                    else {}
+                ),
                 "snapshot_date": (
                     _iso_date(snapshot_match.group(1)) or _iso_month(snapshot_match.group(1))
                     if snapshot_match
@@ -616,7 +644,11 @@ def _liability_fallback(
                 "reporting_amount_unit": "yuan",
                 "source": "canonical_repayment_liability_record",
                 "source_refs": refs,
-                "confidence": 0.96,
+                "extraction_status": extraction_status,
+                "confidence": min(
+                    0.96,
+                    float(components[0].confidence) if len(components) == 1 else 0.55,
+                ),
             }
         )
     return records
@@ -1402,7 +1434,6 @@ def extract_personal_brief_semantic_document(
         _overdue_from_personal_brief_accounts,
         _page_texts,
         _personal_brief_credit_lines,
-        _personal_brief_repayment_liabilities,
         _personal_brief_summary_from_canonical_tables,
     )
     from docmirror.plugins.credit_report.personal_brief_native.extraction import (
@@ -1430,10 +1461,7 @@ def extract_personal_brief_semantic_document(
     accounts: list[dict[str, Any]] = []
     for section_key in ("credit_cards", "loans", "other_business"):
         accounts.extend(_extract_account_section(document, section_key, page_texts))
-    liabilities = _personal_brief_repayment_liabilities(text, page_texts)
-    fallback_liabilities = _liability_fallback(document)
-    if len(fallback_liabilities) > len(liabilities):
-        liabilities = fallback_liabilities
+    liabilities = _repayment_liabilities_from_canonical_records(document)
     inquiries = _inquiry_records(document)
     overdue = _overdue_from_personal_brief_accounts(accounts)
     credit_lines = _personal_brief_credit_lines(accounts)
