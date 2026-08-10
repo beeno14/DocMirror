@@ -57,6 +57,7 @@ _FOOTER_MARKERS = (
     "总收入笔数",
     "总收入金额",
     "总支出笔数",
+    "总支出入笔数",
     "总支出金额",
     "出单截至日期",
     "以下此页无正文",
@@ -84,11 +85,11 @@ _SPLIT_COUNT_PATTERNS = (
     re.compile(r"收入总笔数[:：]\s*(?P<credit>\d+).*?支出总笔数[:：]\s*(?P<debit>\d+)", re.S),
     re.compile(
         r"总收入笔数\s*[:：]?\s*(?P<credit>\d+).*?"
-        r"总支出笔数\s*[:：]?\s*(?P<debit>\d+)",
+        r"总支出(?:入)?笔数\s*[:：]?\s*(?P<debit>\d+)",
         re.S,
     ),
     re.compile(
-        r"总支出笔数\s*[:：]?\s*(?P<debit>\d+).*?"
+        r"总支出(?:入)?笔数\s*[:：]?\s*(?P<debit>\d+).*?"
         r"总收入笔数\s*[:：]?\s*(?P<credit>\d+)",
         re.S,
     ),
@@ -374,7 +375,8 @@ def _annotate_native_grid_matrix(
     date_column = _source_date_column(headers)
     balance_column = _source_balance_column(headers)
     signed_amount_column = _combined_signed_amount_column(headers)
-    if date_column < 0 or balance_column < 0 or signed_amount_column < 0:
+    amount_columns = _source_amount_columns(headers)
+    if date_column < 0 or balance_column < 0 or not amount_columns:
         return matrix
 
     source_headers = [*headers, "_source_page", "_source_bbox", "_source_table_id", "_source_row_index"]
@@ -383,27 +385,28 @@ def _annotate_native_grid_matrix(
     table_id = f"native:p{page_number}:t{table_index}"
     for row_index, source_row in enumerate(matrix[header_index + 1 :], start=header_index + 1):
         row = list(source_row)
-        key = _native_row_datetime_key(row, date_column)
-        if key is None or not hint_queues.get(key):
-            row_time = _native_row_time(row, date_column)
-            matching_keys = [
-                candidate for candidate, values in hint_queues.items() if values and candidate[1] == row_time
-            ]
-            if len(matching_keys) == 1:
-                key = matching_keys[0]
-        queue = hint_queues.get(key) if key is not None else None
-        if queue:
-            amount, balance = queue.pop(0)
-            row[date_column] = f"{key[0]} {key[1]}"
-            row[signed_amount_column] = amount
-            row[balance_column] = balance
-        else:
-            cleaned_amount = _extract_native_signed_money(row[signed_amount_column])
-            cleaned_balance = _extract_native_balance(row[balance_column])
-            if cleaned_amount:
-                row[signed_amount_column] = cleaned_amount
-            if cleaned_balance:
-                row[balance_column] = cleaned_balance
+        if signed_amount_column >= 0:
+            key = _native_row_datetime_key(row, date_column)
+            if key is None or not hint_queues.get(key):
+                row_time = _native_row_time(row, date_column)
+                matching_keys = [
+                    candidate for candidate, values in hint_queues.items() if values and candidate[1] == row_time
+                ]
+                if len(matching_keys) == 1:
+                    key = matching_keys[0]
+            queue = hint_queues.get(key) if key is not None else None
+            if queue:
+                amount, balance = queue.pop(0)
+                row[date_column] = f"{key[0]} {key[1]}"
+                row[signed_amount_column] = amount
+                row[balance_column] = balance
+            else:
+                cleaned_amount = _extract_native_signed_money(row[signed_amount_column])
+                cleaned_balance = _extract_native_balance(row[balance_column])
+                if cleaned_amount:
+                    row[signed_amount_column] = cleaned_amount
+                if cleaned_balance:
+                    row[balance_column] = cleaned_balance
         bbox = row_bboxes[row_index] if row_bboxes and row_index < len(row_bboxes) else (0.0, 0.0, 0.0, 0.0)
         out.append(
             [
@@ -482,22 +485,48 @@ def _native_table_row_bbox(row: Any) -> tuple[float, float, float, float]:
 def _count_borderless_transaction_anchors(text: str) -> int:
     """Count validated source rows from a page-local borderless ledger."""
     lines = [str(line or "").strip() for line in str(text or "").splitlines()]
-    inline_count = sum(1 for line in lines if _BORDERLESS_ROW_RE.search(line))
+    header_index = next((index for index, line in enumerate(lines) if _looks_like_borderless_header_text(line)), -1)
+    if header_index < 0:
+        return 0
+    transaction_lines: list[str] = []
+    for line in lines[header_index + 1 :]:
+        compact = re.sub(r"\s+", "", normalize_header_cell(line))
+        if _is_transaction_count_footer(compact):
+            break
+        transaction_lines.append(line)
+
+    inline_count = sum(1 for line in transaction_lines if _BORDERLESS_ROW_RE.search(line))
     stacked_count = 0
-    for index, line in enumerate(lines):
+    for index, line in enumerate(transaction_lines):
         if not _BORDERLESS_DATE_RE.fullmatch(line):
             continue
-        lookahead = lines[index + 1 : index + 5]
+        lookahead = transaction_lines[index + 1 : index + 5]
         money_values = [value for value in lookahead if _BORDERLESS_BALANCE_RE.fullmatch(re.sub(r"\s+", "", value))]
         compact_date = re.sub(r"\s+", "", line)
         inline_duplicate = any(
             compact_date in re.sub(r"\s+", "", candidate)
             and all(re.sub(r"\s+", "", value) in re.sub(r"\s+", "", candidate) for value in money_values[:2])
-            for candidate in lines[index + 1 :]
+            for candidate in transaction_lines[index + 1 :]
         )
         if len(money_values) >= 2 and not inline_duplicate:
             stacked_count += 1
     return inline_count + stacked_count
+
+
+def _is_transaction_count_footer(compact: str) -> bool:
+    """Return whether a page-local line starts the bank transaction footer."""
+    markers = (
+        "总收入笔数",
+        "总支出笔数",
+        "总支出入笔数",
+        "收入总笔数",
+        "支出总笔数",
+        "借方合计笔数",
+        "贷方合计笔数",
+        "本页交易笔数",
+        "本页合计",
+    )
+    return any(marker in compact for marker in markers)
 
 
 def _has_borderless_source_header(text: str) -> bool:
@@ -688,6 +717,9 @@ def _source_date_column(headers: list[str]) -> int:
     for index, header in enumerate(headers):
         compact = normalize_header_cell(header)
         if any(marker in compact for marker in ("交易日期", "记账日期", "会计日期")):
+            return index
+    for index, header in enumerate(headers):
+        if "交易时间" in normalize_header_cell(header):
             return index
     for index, header in enumerate(headers):
         if "日期" in normalize_header_cell(header):

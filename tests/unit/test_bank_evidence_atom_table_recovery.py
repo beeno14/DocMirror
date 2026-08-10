@@ -82,6 +82,7 @@ def _candidate(
     source_column_width: float = 0.0,
     extraction_confidence: float = 0.0,
     sequence_continuity: float = 0.0,
+    native_cell_coverage: float = 0.0,
 ) -> BankTableCandidate:
     return BankTableCandidate(
         candidate_id=candidate_id,
@@ -99,6 +100,7 @@ def _candidate(
         source_column_width=source_column_width,
         extraction_confidence=extraction_confidence,
         sequence_continuity=sequence_continuity,
+        native_cell_coverage=native_cell_coverage,
     )
 
 
@@ -292,6 +294,33 @@ def test_candidate_selection_preserves_richer_equal_quality_source_columns():
     assert selected is not None
     assert selected.candidate_id == "legacy_primary"
     assert diagnostics["selected_candidate"] == "legacy_primary"
+
+
+def test_candidate_selection_prefers_equal_quality_native_physical_cells() -> None:
+    evidence = RowCountEvidence(count=497, source="header_total", confidence=0.94)
+    selected, diagnostics = _select_candidate(
+        [
+            _candidate(
+                "evidence_atom",
+                rows=497,
+                expected_rows=evidence,
+                extraction_confidence=0.90,
+                source_column_width=8.0,
+            ),
+            _candidate(
+                "native_wide_table",
+                rows=497,
+                expected_rows=evidence,
+                extraction_confidence=0.85,
+                source_column_width=8.0,
+                native_cell_coverage=1.0,
+            ),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "native_wide_table"
+    assert diagnostics["selected_candidate"] == "native_wide_table"
 
 
 def test_candidate_derived_count_cannot_replace_full_native_candidate():
