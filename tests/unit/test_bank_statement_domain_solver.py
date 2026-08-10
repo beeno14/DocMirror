@@ -258,6 +258,17 @@ def test_ccb_header_totals_and_query_period_are_supported() -> None:
     assert identity["query_period"] == "2023-10-01 ~ 2023-12-31"
 
 
+def test_split_footer_accepts_total_expense_count_label_with_extra_character() -> None:
+    text = "总收入笔数 222 总收入金额 1770369.54 总支出入笔数 275 总支出金额 1768504.94"
+
+    evidence = resolve_row_count_evidence("", page_texts=[(26, text)])
+
+    assert evidence.count == 497
+    assert evidence.source == "split_footer"
+    assert evidence.confidence == 0.98
+    assert evidence.page == 26
+
+
 def test_bank_header_total_record_count_is_an_independent_expected_count() -> None:
     text = "打印日期：2026-02-24 交易时段：2025-01-01 至 2025-12-31 总条数：38"
 
@@ -359,6 +370,29 @@ def test_page_local_borderless_count_accepts_stacked_first_row_cells() -> None:
             ),
         ],
     )
+
+    assert evidence.count == 2
+    assert evidence.source == "page_transaction_anchors"
+
+
+def test_borderless_anchor_count_excludes_query_period_dates_before_table_header() -> None:
+    header = "交易日期 交易时间 交易摘要 交易金额 本次余额 对手信息"
+    page_text = "\n".join(
+        [
+            "起止日期",
+            "2022-07-01",
+            "0",
+            "0",
+            "2023-04-15",
+            "0",
+            "0",
+            header,
+            "2023-04-14 120000 转存 +1134.30 1168.10 应付商户延迟清算款",
+            "2023-04-15 120000 转存 +696.50 1864.60 应付商户延迟清算款",
+        ]
+    )
+
+    evidence = resolve_row_count_evidence("", page_texts=[(1, page_text)])
 
     assert evidence.count == 2
     assert evidence.source == "page_transaction_anchors"

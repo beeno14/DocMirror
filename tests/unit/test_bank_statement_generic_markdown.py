@@ -5,13 +5,36 @@
 
 from __future__ import annotations
 
+from docmirror.models.entities.parse_result import DocumentEntities, ParseResult
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
+    BANK_DATA_DICTIONARY,
     _raw_statement_after_table_lines,
     _raw_statement_header_lines,
     _render_bank_statement_content_markdown,
     _sanitize_bank_records,
+    plugin,
 )
+
+
+def test_bank_statement_projection_publishes_chinese_reading_labels() -> None:
+    projection = plugin.derive(
+        ParseResult(entities=DocumentEntities(document_type="bank_statement")),
+        "",
+    )
+
+    dictionary = projection.domain_facts["data_dictionary"]
+
+    assert dictionary == BANK_DATA_DICTIONARY
+    assert dictionary["fields"]["period_start"]["label"] == "账期开始"
+    assert dictionary["fields"]["extract_status"]["label"] == "提取状态"
+    assert dictionary["fields"]["document_scene_refined"]["label"] == "修正文档场景"
+    assert dictionary["fields"]["layout_profile_id_refined"]["label"] == "修正版式配置"
+    assert dictionary["record_columns"]["amount"]["label"] == "交易金额"
+    assert dictionary["record_columns"]["counter_account"]["label"] == "对方账号"
+    assert dictionary["record_columns"]["timestamp"]["label"] == "交易时间"
+    assert dictionary["enums"]["direction"] == {"income": "收入", "expense": "支出"}
+    assert dictionary["enums"]["layout_profile_id_refined"]["borderless_ledger_bank"] == "无框银行流水版式"
 
 
 def test_bank_statement_dedupe_keeps_repeated_page_sequences() -> None:

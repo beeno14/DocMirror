@@ -280,6 +280,30 @@ def test_borderless_source_fields_normalize_without_losing_raw_columns() -> None
     assert raw["_source"]["source_refs"][0]["bbox"] == raw["_source"]["bbox"]
 
 
+def test_separate_compact_transaction_times_use_date_column_context() -> None:
+    plugin = BankStatementCommunityPlugin()
+    cases = (
+        ("20240208", "140229", "2024-02-08T14:02:29"),
+        ("20240223", "140631", "2024-02-23T14:06:31"),
+        ("20240208", "120101", "2024-02-08T12:01:01"),
+    )
+
+    for date_value, time_value, expected in cases:
+        raw = {
+            "交易日期": date_value,
+            "交易时间": time_value,
+            "交易金额": "-1.00",
+            "余额": "99.00",
+        }
+
+        normalized = grid_standard.normalize_record(raw, plugin)
+
+        assert normalized["date"] == expected[:10]
+        assert normalized["timestamp"] == expected
+        assert raw["交易日期"] == date_value
+        assert raw["交易时间"] == time_value
+
+
 def test_repeated_cross_page_headers_preserve_source_page_order() -> None:
     header = [
         "交易日期",

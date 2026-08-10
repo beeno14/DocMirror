@@ -74,6 +74,19 @@ _COVERAGE_THRESHOLD = 0.80
 _INDEPENDENT_ROW_COUNT_SOURCES = frozenset(
     {"split_footer", "header_total", "page_footer", "page_transaction_anchors", "physical_rows"}
 )
+_SOURCE_DATE_RE = re.compile(r"20\d{2}(?:[-/.]?\d{1,2}){2}")
+_SOURCE_DATE_HEADERS = frozenset(
+    {
+        "date",
+        "datetime",
+        "timestamp",
+        "日期",
+        "交易日期",
+        "交易时间",
+        "记账日期",
+        "记账时间",
+    }
+)
 
 
 def _field_completeness(records: list[dict[str, Any]], sample: int = 8) -> float:
@@ -296,6 +309,7 @@ class BankTableCandidate:
     extraction_confidence: float = 0.0
     source_column_width: float = 0.0
     sequence_continuity: float = 0.0
+    native_cell_coverage: float = 0.0
 
 
 def _candidate_expected_rows(
@@ -389,6 +403,28 @@ def _candidate_source_page_coverage(transactions: list[dict[str, Any]]) -> float
     return sourced / len(transactions)
 
 
+def _candidate_native_cell_coverage(transactions: list[dict[str, Any]]) -> float:
+    """Return coverage by native PDF grid rows with explicit physical cell bounds."""
+    if not transactions:
+        return 0.0
+    sourced = 0
+    for transaction in transactions:
+        source = transaction.get("_source")
+        if not isinstance(source, dict):
+            continue
+        table_id = str(source.get("table_id") or source.get("source_table_id") or "")
+        bbox = source.get("bbox")
+        if not table_id.startswith("native:") or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(value) for value in bbox)
+        except (TypeError, ValueError):
+            continue
+        if x1 > x0 and y1 > y0:
+            sourced += 1
+    return sourced / len(transactions)
+
+
 def _candidate_from_batch(
     *,
     candidate_id: str,
@@ -411,7 +447,7 @@ def _candidate_from_batch(
         normalized_rows.append(normalized)
         if normalized.get("direction") in {"income", "expense"}:
             directional_rows += 1
-        if is_canonical_row(normalized):
+        if is_canonical_row(normalized) and not _source_row_contains_multiple_transaction_dates(transaction):
             canonical_rows += 1
     expected_count = int(expected_rows.count or 0) if expected_rows is not None else 0
     if expected_count > 0 and (expected_rows is not None and expected_rows.confidence >= 0.85):
@@ -421,6 +457,7 @@ def _candidate_from_batch(
     field_completeness = _batch_field_completeness(transactions, normalize_fn, plugin)
     source_column_width = _batch_raw_width(transactions)
     source_page_coverage = _candidate_source_page_coverage(transactions)
+    native_cell_coverage = _candidate_native_cell_coverage(transactions)
     balance_chain_score = _candidate_balance_chain_score(normalized_rows)
     sequence_continuity = _candidate_sequence_continuity(normalized_rows)
     score = (
@@ -447,7 +484,27 @@ def _candidate_from_batch(
         extraction_confidence=extraction_confidence,
         source_column_width=source_column_width,
         sequence_continuity=sequence_continuity,
+        native_cell_coverage=native_cell_coverage,
     )
+
+
+def _source_row_contains_multiple_transaction_dates(transaction: dict[str, Any]) -> bool:
+    """Reject a column-aggregated page masquerading as one transaction row.
+
+    A genuine transaction may expose both a date and a timestamp column, so
+    occurrences are checked per source cell. Two complete dates inside one
+    date-like cell prove that physical row boundaries were lost.
+    """
+    for raw_header, value in transaction.items():
+        if str(raw_header).startswith("_"):
+            continue
+        header = re.sub(r"\s+", "", str(raw_header or "")).lower()
+        normalized_header = re.sub(r"\s+", "", grid_standard.normalize_header_cell(str(raw_header or ""))).lower()
+        if header not in _SOURCE_DATE_HEADERS and normalized_header not in _SOURCE_DATE_HEADERS:
+            continue
+        if len(_SOURCE_DATE_RE.findall(str(value or ""))) > 1:
+            return True
+    return False
 
 
 def _candidate_reliable_count_coverage(candidate: BankTableCandidate) -> float | None:
@@ -513,6 +570,34 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
                 candidate.candidate_id == "legacy_primary",
                 selection_key(candidate),
             ),
+        )
+    native_grid_candidates = [
+        candidate
+        for candidate in viable
+        if candidate.candidate_id == "native_wide_table"
+        and candidate.native_cell_coverage >= 0.99
+        and len(candidate.records) >= len(selected.records)
+        and candidate.canonical_rows >= selected.canonical_rows
+        and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
+        and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
+        and candidate.field_completeness >= selected.field_completeness - 0.01
+        and candidate.balance_chain_score >= selected.balance_chain_score - 0.01
+        and candidate.source_column_width >= selected.source_column_width - 0.25
+        and (
+            _candidate_reliable_count_coverage(selected) is None
+            or (
+                _candidate_reliable_count_coverage(candidate) is not None
+                and _candidate_reliable_count_coverage(candidate)
+                >= (_candidate_reliable_count_coverage(selected) or 0.0) - 0.01
+            )
+        )
+    ]
+    if native_grid_candidates:
+        # When every semantic gate is equal, explicit native cell boundaries are
+        # stronger evidence than a text reconstruction that may shift wrapped
+        # fragments into the following transaction.
+        selected = max(
+            native_grid_candidates, key=lambda candidate: (candidate.native_cell_coverage, selection_key(candidate))
         )
     legacy = next((candidate for candidate in viable if candidate.candidate_id == "legacy_primary"), None)
     if (
