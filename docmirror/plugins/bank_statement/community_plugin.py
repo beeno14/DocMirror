@@ -28,7 +28,7 @@ from typing import Any
 from docmirror.plugins._base.base_table_parser import BaseTableParser
 from docmirror.plugins._base.column_registry import ColumnMapping
 from docmirror.plugins._base.projector import ProjectionData
-from docmirror.plugins.bank_statement.canonical_quality import audit_row_accounting
+from docmirror.plugins.bank_statement.canonical_quality import audit_amount_consistency, audit_row_accounting
 from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text
 from docmirror.plugins.bank_statement.wide_table_recovery import (
@@ -582,11 +582,13 @@ class BankStatementCommunityPlugin(BaseTableParser):
             canonical_rows=result.canonical_rows,
             emitted_rows=result.emitted_rows,
         )
-        if accounting_warnings:
+        amount_warnings = audit_amount_consistency(records)
+        if accounting_warnings or amount_warnings:
             result.style_meta.extract_status = "degraded"
         projection_warnings = [
             *result.warnings,
             *accounting_warnings,
+            *amount_warnings,
         ]
         summary = self._build_summary(records)
         # Transaction bounds remain useful summary analytics, but they are not
@@ -801,9 +803,6 @@ def _repair_split_amount_canonical_raw(record: dict) -> None:
     normalized = record.get("normalized")
     if not isinstance(canonical_raw, dict) or not isinstance(raw, dict) or not isinstance(normalized, dict):
         return
-    if canonical_raw.get("amount") not in (None, ""):
-        return
-
     direction = str(normalized.get("direction") or "")
     if direction not in {"income", "expense"}:
         return
@@ -814,11 +813,19 @@ def _repair_split_amount_canonical_raw(record: dict) -> None:
     )
     for value in _raw_values_matching_headers(raw, keys):
         cleaned = _clean_money_text(value)
-        if cleaned:
-            canonical_raw["amount"] = cleaned
-            if "amount_cny" in canonical_raw:
-                canonical_raw["amount_cny"] = cleaned
-            return
+        if not cleaned:
+            continue
+        try:
+            source_amount = abs(float(cleaned.replace(",", "")))
+            normalized_amount = abs(float(normalized.get("amount")))
+        except (TypeError, ValueError):
+            continue
+        if abs(source_amount - normalized_amount) > 0.000001:
+            continue
+        canonical_raw["amount"] = cleaned
+        if "amount_cny" in canonical_raw:
+            canonical_raw["amount_cny"] = cleaned
+        return
 
 
 def _raw_values_matching_headers(raw: dict, aliases: tuple[str, ...]) -> list[str]:

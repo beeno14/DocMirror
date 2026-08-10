@@ -43,8 +43,8 @@ from docmirror.plugins.bank_statement.wide_table_recovery import is_footer_or_to
 PARSER_ID = "grid_standard"
 STYLE_ID = "grid_standard"
 
-_SPLIT_DEBIT_KEYS = ("支出", "支出金额", "借方发生额", "借方")
-_SPLIT_CREDIT_KEYS = ("收入", "收入金额", "贷方发生额", "贷方")
+_SPLIT_DEBIT_KEYS = ("支出", "支出金额", "借方发生额", "借方", "转出金额")
+_SPLIT_CREDIT_KEYS = ("收入", "收入金额", "贷方发生额", "贷方", "转入金额")
 _DIRECTION_KEYS = (
     "收/支",
     "收支",
@@ -181,6 +181,16 @@ def _normalize_with_temporal_context(raw_txn: dict[str, str], plugin: Any) -> di
     return plugin._normalize(prepared)
 
 
+def _explicit_amount_column(raw_txn: dict[str, str], aliases: tuple[str, ...]) -> tuple[bool, str, float | None]:
+    """Return source-column presence, raw text, and parsed amount without defaulting blanks to zero."""
+    for header, value in raw_txn.items():
+        if not _header_matches_aliases(header, aliases):
+            continue
+        raw_value = str(value or "").strip()
+        return True, raw_value, _normalize_monetary_cell(raw_value) if raw_value else None
+    return False, "", None
+
+
 def _normalize_source_counterparty_columns(
     raw_txn: dict[str, str],
     normalized: dict[str, Any],
@@ -234,26 +244,13 @@ def _normalize_source_counterparty_columns(
 
 def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[str, Any] | None:
     """Parse separate debit/credit columns into amount + direction."""
-    directed = _normalize_direction_amount(raw_txn, plugin)
-    if directed is not None:
-        return directed
-    embedded = _normalize_embedded_direction_amount(raw_txn, plugin)
-    if embedded is not None:
-        return embedded
-
-    income_raw = _cell_value(raw_txn, *_SPLIT_CREDIT_KEYS)
-    expense_raw = _cell_value(raw_txn, *_SPLIT_DEBIT_KEYS)
-    income = _normalize_monetary_cell(income_raw)
-    expense = _normalize_monetary_cell(expense_raw)
-    if income is None and expense is None:
-        return None
-
-    income_present = bool(income_raw.strip()) and income is not None
-    expense_present = bool(expense_raw.strip()) and expense is not None
-    income = float(income or 0)
-    expense = float(expense or 0)
-    if income_present and expense_present and income == 0 and expense == 0:
-        return None
+    income_column, _income_raw, income = _explicit_amount_column(raw_txn, _SPLIT_CREDIT_KEYS)
+    expense_column, _expense_raw, expense = _explicit_amount_column(raw_txn, _SPLIT_DEBIT_KEYS)
+    if not income_column and not expense_column:
+        directed = _normalize_direction_amount(raw_txn, plugin)
+        if directed is not None:
+            return directed
+        return _normalize_embedded_direction_amount(raw_txn, plugin)
 
     normalized = _normalize_with_temporal_context(raw_txn, plugin)
     _normalize_source_counterparty_columns(raw_txn, normalized)
@@ -279,16 +276,47 @@ def normalize_split_debit_credit(raw_txn: dict[str, str], plugin: Any) -> dict[s
         if cp:
             normalized["counter_party"] = _clean_wrapped_text(cp)
 
-    if income_present and (income > 0 or not expense_present):
-        normalized["amount"] = income
-        normalized["amount_cny"] = income
+    explicit_direction = _normalize_direction_text(_explicit_source_column_value(raw_txn, _DIRECTION_KEYS))
+    income_nonzero = income is not None and income != 0
+    expense_nonzero = expense is not None and expense != 0
+    if income_nonzero and expense_nonzero:
+        if explicit_direction == "income":
+            selected_amount = abs(float(income))
+        elif explicit_direction == "expense":
+            selected_amount = abs(float(expense))
+        else:
+            normalized["amount"] = None
+            normalized["amount_cny"] = None
+            normalized["direction"] = ""
+            return normalized
+        normalized["amount"] = selected_amount
+        normalized["amount_cny"] = selected_amount
+        normalized["direction"] = explicit_direction
+    elif income_nonzero:
+        selected_amount = abs(float(income))
+        normalized["amount"] = selected_amount
+        normalized["amount_cny"] = selected_amount
         normalized["direction"] = "income"
-    elif expense_present:
-        normalized["amount"] = expense
-        normalized["amount_cny"] = expense
+    elif expense_nonzero:
+        selected_amount = abs(float(expense))
+        normalized["amount"] = selected_amount
+        normalized["amount_cny"] = selected_amount
         normalized["direction"] = "expense"
+    elif income is not None or expense is not None:
+        normalized["amount"] = 0.0
+        normalized["amount_cny"] = 0.0
+        if explicit_direction in {"income", "expense"}:
+            normalized["direction"] = explicit_direction
+        elif income is not None and expense is None:
+            normalized["direction"] = "income"
+        elif expense is not None and income is None:
+            normalized["direction"] = "expense"
+        else:
+            normalized["direction"] = ""
     else:
-        return None
+        normalized["amount"] = None
+        normalized["amount_cny"] = None
+        normalized["direction"] = explicit_direction if explicit_direction in {"income", "expense"} else ""
     return normalized
 
 

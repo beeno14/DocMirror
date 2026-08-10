@@ -20,6 +20,8 @@ from typing import Any
 _DATE_CELL_RE = re.compile(r"^(?:19|20)\d{2}(?:[-/.年]?\d{1,2})(?:[-/.月]?\d{1,2})(?:日)?(?:\d{2}:\d{2}:\d{2})?$")
 _MONEY_CELL_RE = re.compile(r"^[+-]?(?:[¥￥$])?\d[\d,]*\.\d{1,2}$")
 _NON_TRANSACTION_MARKERS = ("合计", "小计", "总计", "本页", "期初", "期末")
+_SPLIT_INCOME_HEADERS = ("收入", "收入金额", "贷方发生额", "贷方", "转入金额")
+_SPLIT_EXPENSE_HEADERS = ("支出", "支出金额", "借方发生额", "借方", "转出金额")
 
 
 def is_canonical_row(norm: dict[str, Any]) -> bool:
@@ -39,6 +41,70 @@ def is_canonical_row(norm: dict[str, Any]) -> bool:
     except (TypeError, ValueError):
         return False
     return isfinite(numeric_amount) and numeric_amount >= 0.0
+
+
+def audit_amount_consistency(records: list[dict[str, Any]]) -> list[str]:
+    """Compare explicit split source amounts with normalized facts without dropping zero-value rows."""
+    warnings: list[str] = []
+    for row_index, record in enumerate(records, start=1):
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        income_values = _source_amount_values(raw, _SPLIT_INCOME_HEADERS)
+        expense_values = _source_amount_values(raw, _SPLIT_EXPENSE_HEADERS)
+        source_values = [*income_values, *expense_values]
+        if not source_values:
+            continue
+
+        record_id = str(record.get("record_id") or f"row:{row_index}")
+        parsed_values = [value for _raw_value, value in source_values if value is not None]
+        nonzero_values = [value for value in parsed_values if value != 0]
+        normalized_amount = _normalized_amount(normalized.get("amount"))
+        if source_values and all(not raw_value for raw_value, _value in source_values) and normalized_amount == 0.0:
+            warnings.append(f"BANK_AMOUNT_DEFAULTED_TO_ZERO:row={row_index}:record_id={record_id}")
+        if nonzero_values and normalized_amount in (None, 0.0):
+            warnings.append(
+                f"BANK_NONZERO_AMOUNT_LOST:row={row_index}:record_id={record_id}:"
+                f"source_nonzero={','.join(str(value) for value in nonzero_values)}:normalized={normalized_amount}"
+            )
+
+        source_is_explicit_zero = bool(parsed_values) and not nonzero_values
+        direction = str(normalized.get("direction") or "")
+        if source_is_explicit_zero and normalized_amount == 0.0 and direction not in {"income", "expense"}:
+            warnings.append(f"BANK_ZERO_AMOUNT_DIRECTION_UNKNOWN:row={row_index}:record_id={record_id}")
+
+        income_nonzero = any(value not in (None, 0.0) for _raw_value, value in income_values)
+        expense_nonzero = any(value not in (None, 0.0) for _raw_value, value in expense_values)
+        if income_nonzero and expense_nonzero:
+            warnings.append(f"BANK_SPLIT_AMOUNT_CONFLICT:row={row_index}:record_id={record_id}")
+    return warnings
+
+
+def _source_amount_values(raw: dict[str, Any], aliases: tuple[str, ...]) -> list[tuple[str, float | None]]:
+    compact_aliases = {_compact_header(alias) for alias in aliases}
+    values: list[tuple[str, float | None]] = []
+    for header, raw_value in raw.items():
+        header_text = str(header or "")
+        compact_header = _compact_header(header_text)
+        header_parts = {_compact_header(part) for part in header_text.splitlines() if part.strip()}
+        if compact_header not in compact_aliases and not compact_aliases.intersection(header_parts):
+            continue
+        text = str(raw_value or "").strip()
+        values.append((text, _money_value(text) if text else None))
+    return values
+
+
+def _compact_header(value: str) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).lower()
+
+
+def _normalized_amount(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        amount = abs(float(value))
+    except (TypeError, ValueError):
+        return None
+    return amount if isfinite(amount) else None
 
 
 def canonical_expected_from_parse_result(parse_result: Any) -> int:
@@ -209,6 +275,7 @@ def audit_row_accounting(*, parsed_rows: int, canonical_rows: int, emitted_rows:
 
 __all__ = [
     "CQFResult",
+    "audit_amount_consistency",
     "audit_cqf",
     "audit_row_accounting",
     "canonical_expected_from_parse_result",

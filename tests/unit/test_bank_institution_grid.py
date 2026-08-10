@@ -175,6 +175,61 @@ def test_normalize_split_debit_credit_direct():
     assert norm["direction"] == "expense"
 
 
+def test_explicit_split_expense_wins_over_zero_income_and_summary_suffix() -> None:
+    plugin = BankStatementCommunityPlugin()
+
+    norm = normalize_split_debit_credit(
+        {
+            "交易时间": "20220929",
+            "收入金额": "0",
+            "支出金额": "2.25",
+            "账户余额": "1507.17",
+            "摘要": "费用外收",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["amount"] == 2.25
+    assert norm["amount_cny"] == 2.25
+    assert norm["direction"] == "expense"
+
+
+def test_explicit_zero_split_transaction_is_preserved_without_invented_direction() -> None:
+    plugin = BankStatementCommunityPlugin()
+
+    norm = normalize_split_debit_credit(
+        {
+            "交易时间": "20220929",
+            "收入金额": "0",
+            "支出金额": "0.00",
+            "账户余额": "1507.17",
+            "摘要": "零金额业务",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["amount"] == 0.0
+    assert norm["amount_cny"] == 0.0
+    assert norm["direction"] == ""
+
+
+def test_split_amount_canonical_raw_is_repaired_when_wrong_zero_is_present() -> None:
+    records = _sanitize_bank_records(
+        [
+            {
+                "raw": {"收入金额": "0", "支出金额": "2.25"},
+                "normalized": {"amount": 2.25, "amount_cny": 2.25, "direction": "expense"},
+                "canonical_raw": {"amount": "0", "amount_cny": "0"},
+            }
+        ]
+    )
+
+    assert records[0]["canonical_raw"]["amount"] == "2.25"
+    assert records[0]["canonical_raw"]["amount_cny"] == "2.25"
+
+
 def test_normalize_transaction_location_as_channel_alias():
     plugin = BankStatementCommunityPlugin()
     norm = normalize_split_debit_credit(
