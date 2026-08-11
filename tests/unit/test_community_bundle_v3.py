@@ -225,6 +225,30 @@ def test_dataset_document_order_is_applied_only_when_configured() -> None:
     ]
 
 
+def test_projection_can_publish_a_source_proven_empty_dataset_envelope() -> None:
+    candidate = _candidate()
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    projection = _PROJECTIONS[id(result)]
+    projection["datasets"]["repayment_records"] = []
+    policy = load_projection_policy("docmirror.plugins.credit_report")
+    policy["publish_empty_datasets"] = ["repayment_records"]
+    payload = _project_community_bundle(
+        seal_parse_result(result),
+        projection_data=projection,
+        projection_policy=policy,
+    ).json_payload()
+
+    dataset = next(
+        item for item in payload["datasets"] if item["name"] == "repayment_records"
+    )
+    assert dataset["row_count"] == 0
+    assert dataset["rows"] == []
+    assert [column["key"] for column in dataset["columns"]] == ["month", "status"]
+
+
 def test_enhanced_markdown_omits_sections_without_renderable_content() -> None:
     payload = {
         "schema": {"name": "docmirror.community"},

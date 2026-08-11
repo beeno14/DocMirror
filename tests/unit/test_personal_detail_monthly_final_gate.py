@@ -450,3 +450,72 @@ def test_monthly_expected_count_does_not_double_count_materialized_withheld_rows
     assert monthly_status["observed_row_count"] == 1
     assert monthly_status["expected_row_count"] == 3
     assert monthly_status["expected_row_count"] - monthly_status["observed_row_count"] == 2
+
+
+def test_monthly_dataset_status_uses_canonical_population_from_account_gap() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:1:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="monthly_population_incomplete_from_account_gap",
+                    message="The canonical grid plane contains three source positions.",
+                    parser_stage="candidate_b_account_monthly_population",
+                    target_dataset="repayment_records",
+                    observed_value={"canonical_grid_row_count": 3},
+                    candidate_value={
+                        "missing_account_category_sequences": {"credit_card": [2]}
+                    },
+                    reason_codes=("dataset_incomplete",),
+                )
+            ],
+        }
+    )
+
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 3
+
+
+def test_source_proven_empty_monthly_dataset_remains_publicly_reportable() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_dataset_status": [
+                {
+                    "record_id": "dataset_status:repayment_records",
+                    "dataset_name": "repayment_records",
+                    "applicability": "applicable",
+                    "presence_status": "partial",
+                    "observed_row_count": 0,
+                    "expected_row_count": 176,
+                }
+            ]
+        }
+    )
+
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 176

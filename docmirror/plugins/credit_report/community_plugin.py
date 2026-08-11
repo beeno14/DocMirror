@@ -691,7 +691,11 @@ class CreditReportPlugin(CommunityProjector):
             for key, values in overrides.items():
                 if isinstance(values, dict):
                     policy[key] = {**dict(policy.get(key) or {}), **values}
-                elif key in {"internal_fields", "internal_facts"} and isinstance(
+                elif key in {
+                    "internal_fields",
+                    "internal_facts",
+                    "publish_empty_datasets",
+                } and isinstance(
                     values, (list, tuple)
                 ):
                     policy[key] = list(

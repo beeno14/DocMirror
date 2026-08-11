@@ -7684,6 +7684,132 @@ def _bounded_carried_revolving_prefix_table(
     return owning_table_count == 1
 
 
+def _bounded_credit_card_prefix_carry_on_mixed_page(
+    parse_result: Any,
+    *,
+    page: Mapping[str, Any],
+    active_family: str,
+    active_family_quality: str,
+    active_family_logical_page: int,
+    active_family_last_ordinal: int,
+    local_table_family: tuple[str, str] | None,
+    cross_page_order_resolved: bool,
+) -> bool:
+    """Keep a dense credit-card prefix before the quasi-card heading.
+
+    A canonical page can contain the tail of the credit-card section followed
+    by the quasi-credit-card section.  Whole-page table morphology is mixed in
+    that case and intentionally returns no local family.  Preserve the prior
+    credit-card family only when the page itself proves a closed partition:
+    dense next ordinals, one credit-card base table inside each anchor interval,
+    and an exact later quasi-card heading.  A competing base table, malformed
+    ordinal, or missing geometric partition fails closed.
+    """
+
+    logical_page = int(page.get("page") or 0)
+    if (
+        active_family != "credit_card"
+        or active_family_quality != "exact"
+        or active_family_last_ordinal <= 0
+        or local_table_family is not None
+        or not cross_page_order_resolved
+        or not _registered_account_pages_are_adjacent(
+            parse_result,
+            active_family_logical_page,
+            logical_page,
+        )
+    ):
+        return False
+
+    anchors: list[tuple[int, float]] = []
+    partition_top: float | None = None
+    for line in page.get("lines") or ():
+        if not isinstance(line, Mapping):
+            continue
+        raw_text = str(line.get("text") or line.get("content") or "")
+        compact = _compact(raw_text)
+        if any(marker in compact for marker in _ACCOUNT_SECTION_END):
+            return False
+        heading = _account_family_from_heading(compact)
+        if heading is not None:
+            if heading != ("quasi_credit_card", "exact"):
+                return False
+            bbox = _account_evidence_bbox(line)
+            if bbox is None:
+                return False
+            partition_top = bbox[1]
+            break
+        anchor = _ACCOUNT_ANCHOR_RE.search(raw_text)
+        if anchor is None:
+            continue
+        if not anchor.group(1):
+            return False
+        bbox = _account_evidence_bbox(line)
+        if bbox is None:
+            return False
+        anchors.append((int(anchor.group(1)), bbox[1]))
+
+    expected_ordinals = list(
+        range(
+            active_family_last_ordinal + 1,
+            active_family_last_ordinal + 1 + len(anchors),
+        )
+    )
+    if (
+        partition_top is None
+        or not anchors
+        or [ordinal for ordinal, _top in anchors] != expected_ordinals
+        or any(
+            anchors[index][1] + 1.0 >= anchors[index + 1][1]
+            for index in range(len(anchors) - 1)
+        )
+        or anchors[-1][1] + 1.0 >= partition_top
+    ):
+        return False
+
+    native_pages = [
+        native_page
+        for native_page in getattr(parse_result, "pages", None) or ()
+        if int(getattr(native_page, "page_number", 0) or 0) == logical_page
+    ]
+    if len(native_pages) != 1:
+        return False
+
+    first_anchor_top = anchors[0][1]
+    prefix_table_tops: list[float] = []
+    for table in getattr(native_pages[0], "tables", None) or ():
+        rows = _table_rows(table)
+        table_top = _table_top_value(table)
+        if not rows or table_top is None:
+            return False
+        if table_top < first_anchor_top:
+            if _account_base(rows) or not _account_continuation_fragment(rows):
+                return False
+            continue
+        if table_top >= partition_top:
+            continue
+        if _other_entity_table(rows) or not _account_base(rows):
+            return False
+        compact = _compact(" ".join(cell for row in rows[:6] for cell in row))
+        if not all(
+            marker in compact
+            for marker in ("发卡机构", "账户标识", "业务种类", "贷记卡")
+        ) or "准贷记卡" in compact:
+            return False
+        prefix_table_tops.append(table_top)
+
+    if len(prefix_table_tops) != len(anchors):
+        return False
+    prefix_table_tops.sort()
+    for index, ((_ordinal, anchor_top), table_top) in enumerate(
+        zip(anchors, prefix_table_tops, strict=True)
+    ):
+        upper = anchors[index + 1][1] if index + 1 < len(anchors) else partition_top
+        if table_top + 1.0 < anchor_top or table_top >= upper:
+            return False
+    return True
+
+
 def _bounded_revolving_family_carry_over_generic_table(
     parse_result: Any,
     *,
@@ -8268,9 +8394,20 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             local_table_family=local_table_family,
             cross_page_order_resolved=cross_page_order_resolved,
         )
+        preserve_credit_card_prefix = _bounded_credit_card_prefix_carry_on_mixed_page(
+            parse_result,
+            page=page,
+            active_family=active_type,
+            active_family_quality=active_family_quality,
+            active_family_logical_page=active_family_logical_page,
+            active_family_last_ordinal=active_family_last_ordinal,
+            local_table_family=local_table_family,
+            cross_page_order_resolved=cross_page_order_resolved,
+        )
         anchor_only_family_carry = bool(
             local_table_family is None
             and not preserve_revolving_family
+            and not preserve_credit_card_prefix
             and not shared_revolving_carry
             and _bounded_anchor_only_family_carry(
                 parse_result,
@@ -8285,6 +8422,7 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
         verified_detail_family_carry = bool(
             local_table_family is None
             and not preserve_revolving_family
+            and not preserve_credit_card_prefix
             and not shared_revolving_carry
             and not anchor_only_family_carry
             and _bounded_verified_detail_family_carry(
@@ -8302,11 +8440,15 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
                 cross_page_order_resolved=cross_page_order_resolved,
             )
         )
-        if local_table_family is not None and not preserve_revolving_family:
+        if (
+            local_table_family is not None
+            and not preserve_revolving_family
+            and not preserve_credit_card_prefix
+        ):
             active_type, active_family_quality = local_table_family
             active_family_logical_page = logical_page
             active_family_last_ordinal = 0
-        elif preserve_revolving_family:
+        elif preserve_revolving_family or preserve_credit_card_prefix:
             active_family_logical_page = logical_page
         elif active_type in {
             "revolving_loan_subaccount",
@@ -8317,7 +8459,11 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             active_family_logical_page = logical_page
         elif verified_detail_family_carry:
             active_family_logical_page = logical_page
-        elif local_table_family is None and not preserve_revolving_family:
+        elif (
+            local_table_family is None
+            and not preserve_revolving_family
+            and not preserve_credit_card_prefix
+        ):
             # Ambiguous, conflicting, or absent page-local account evidence
             # cannot silently inherit a printed family merely because the page
             # edge is adjacent.  A later exact heading on this page can still
@@ -12387,6 +12533,158 @@ def _bounded_collapsed_inquiry_header_slots(
     }
 
 
+def _split_personal_inquiry_header_geometry_exact(table: Any) -> bool:
+    """Prove the two-row header lattice used by a small personal-query table."""
+
+    geometry = _native_table_geometry(table)
+    if geometry is None:
+        return False
+    row_bands = _indexed_geometry_bands(
+        geometry,
+        "row_bands",
+        lower_key="y0",
+        upper_key="y1",
+    )
+    column_bands = _indexed_geometry_bands(
+        geometry,
+        "col_bands",
+        lower_key="x0",
+        upper_key="x1",
+    )
+    if (
+        row_bands is None
+        or not {0, 1} <= set(row_bands)
+        or column_bands is None
+        or set(column_bands) != {0, 1, 2, 3}
+    ):
+        return False
+    cell_bboxes = geometry.get("cell_bboxes")
+    cell_status = geometry.get("cell_geometry_status")
+    cell_evidence_ids = geometry.get("cell_evidence_ids")
+    if not all(
+        isinstance(grid, list)
+        and len(grid) >= 2
+        and all(isinstance(grid[row], list) and len(grid[row]) == 4 for row in (0, 1))
+        for grid in (cell_bboxes, cell_status, cell_evidence_ids)
+    ):
+        return False
+    spans = [
+        span
+        for span in geometry.get("cell_spans") or ()
+        if isinstance(span, Mapping) and int(span.get("row") or 0) <= 1
+    ]
+    if not (
+        len(spans) == 1
+        and spans[0].get("row") == 0
+        and spans[0].get("col") == 0
+        and spans[0].get("row_span") == 2
+        and spans[0].get("col_span") == 1
+    ):
+        return False
+    if [str(value or "") for value in cell_status[0]] != ["exact"] * 4:
+        return False
+    if [str(value or "") for value in cell_status[1]] != [
+        "derived",
+        "exact",
+        "exact",
+        "exact",
+    ]:
+        return False
+    if not (
+        isinstance(cell_evidence_ids[0][0], list)
+        and any(str(value or "") for value in cell_evidence_ids[0][0])
+        and all(value in ([], None) for value in cell_evidence_ids[0][1:])
+        and cell_evidence_ids[1][0] in ([], None)
+        and all(
+            isinstance(cell_evidence_ids[1][column], list)
+            and any(str(value or "") for value in cell_evidence_ids[1][column])
+            for column in (1, 2, 3)
+        )
+    ):
+        return False
+
+    expected_sequence_bbox = (
+        column_bands[0][0],
+        row_bands[0][0],
+        column_bands[0][1],
+        row_bands[1][1],
+    )
+    sequence_bbox = _exact_geometry_bbox(cell_bboxes[0][0])
+    if sequence_bbox is None or any(
+        abs(left - right) > 1.0
+        for left, right in zip(sequence_bbox, expected_sequence_bbox, strict=True)
+    ):
+        return False
+    if cell_bboxes[1][0] is not None:
+        return False
+    for column in (1, 2, 3):
+        expected = (
+            column_bands[column][0],
+            row_bands[1][0],
+            column_bands[column][1],
+            row_bands[1][1],
+        )
+        bbox = _exact_geometry_bbox(cell_bboxes[1][column])
+        if bbox is None or any(
+            abs(left - right) > 1.0
+            for left, right in zip(bbox, expected, strict=True)
+        ):
+            return False
+    declared_bbox = _exact_geometry_bbox(spans[0].get("bbox"))
+    return bool(
+        declared_bbox is None
+        or all(
+            abs(left - right) <= 1.0
+            for left, right in zip(
+                declared_bbox,
+                expected_sequence_bbox,
+                strict=True,
+            )
+        )
+    )
+
+
+def _bounded_split_personal_inquiry_header_slots(
+    rows: list[list[str]],
+    *,
+    table: Any,
+) -> dict[str, int] | None:
+    """Recover only the exact two-row, two-record personal-query table."""
+
+    if (
+        len(rows) < 4
+        or any(len(rows[index]) != 4 for index in (0, 1))
+        or _compact(rows[0][0]) not in {"编号", "序号"}
+        or any(_compact(value) for value in rows[0][1:])
+        or _compact(rows[1][0])
+        or tuple(_compact(value) for value in rows[1][1:])
+        != ("查询日期", "查询机构", "查询原因")
+        or not _split_personal_inquiry_header_geometry_exact(table)
+    ):
+        return None
+    body = [row for row in rows[2:] if _nonempty(row)]
+    if len(body) != 2 or any(len(row) != 4 for row in body):
+        return None
+    if [_inquiry_sequence_token(row[0]) for row in body] != [1, 2]:
+        return None
+    for row in body:
+        institution = _compact(_normalized_inquiry_field("institution", row[2]))
+        reason = _normalized_inquiry_field("reason", row[3])
+        if (
+            _bounded_inquiry_date(row[1]) is None
+            or institution != "本人"
+            or reason not in _INQUIRY_REASONS
+            or not reason.startswith("本人查询")
+        ):
+            return None
+    return {
+        "sequence": 0,
+        "inquiry_date": 1,
+        "institution": 2,
+        "reason": 3,
+    }
+
+
 def _record_inquiry_ordinal_repair(
     parse_result: Any,
     *,
@@ -13117,8 +13415,15 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 else None
             )
             has_repaired_header = repaired_header_slots is not None
+            split_header_slots = (
+                _bounded_split_personal_inquiry_header_slots(rows, table=table)
+                if not has_header
+                else None
+            )
+            has_split_header = split_header_slots is not None
             looks_like_continuation = (
                 not has_header
+                and not has_split_header
                 and page_is_canonical_inquiry
                 and active_canonical_table
                 and set(active_slots) == set(inquiry_aliases)
@@ -13169,7 +13474,12 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 active_slots = {}
                 active_schema_page = None
                 continue
-            if not has_exact_header and not has_repaired_header and not is_continuation:
+            if (
+                not has_exact_header
+                and not has_repaired_header
+                and not has_split_header
+                and not is_continuation
+            ):
                 continue
             page_had_inquiry_table = True
             active_canonical_table = True
@@ -13179,10 +13489,19 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             elif has_repaired_header:
                 active_slots = dict(repaired_header_slots)
                 active_schema_page = page_number
+            elif has_split_header:
+                active_slots = dict(split_header_slots)
+                active_schema_page = page_number
             elif is_continuation:
                 active_schema_page = page_number
             slots = dict(active_slots)
-            start = 1 if has_exact_header or has_repaired_header else 0
+            start = (
+                2
+                if has_split_header
+                else 1
+                if has_exact_header or has_repaired_header
+                else 0
+            )
             table_rows = [
                 (row_index, tuple(str(value or "").strip() for value in row))
                 for row_index, row in enumerate(rows[start:], start=start)
@@ -16914,9 +17233,16 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 if has_header and not has_exact_header
                 else None
             )
+            split_header_slots = (
+                _bounded_split_personal_inquiry_header_slots(rows, table=table)
+                if not has_header
+                else None
+            )
+            has_split_header = split_header_slots is not None
             first_value = _clean(rows[0][0] if rows[0] else "")
             looks_like_continuation = bool(
                 not has_header
+                and not has_split_header
                 and canonical_page
                 and active_group is not None
                 and "sequence" in active_slots
@@ -16955,6 +17281,17 @@ def _inquiry_source_coverage(parse_result: Any) -> dict[str, Any]:
                 groups.append(active_group)
                 active_group_page = page_number
                 start = 1
+            elif has_split_header:
+                active_slots = dict(split_header_slots)
+                active_group = {
+                    "logical_page": page_number,
+                    "last_logical_page": page_number,
+                    "observations": [],
+                    "source_refs": [],
+                }
+                groups.append(active_group)
+                active_group_page = page_number
+                start = 2
             elif is_continuation:
                 active_group_page = page_number
                 active_group["last_logical_page"] = page_number

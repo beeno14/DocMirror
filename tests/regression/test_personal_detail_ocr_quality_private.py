@@ -191,6 +191,59 @@ def _dataset_map(payload: dict) -> dict[str, dict]:
     }
 
 
+def _assert_five_report_population_reporting(payload: dict, fixture: Path) -> None:
+    """Require every source-audited population to be reported without denominator loss."""
+
+    expected_account_months = _EXPECTED_SCHEMA_INPUT_COUNTS.get(fixture.name)
+    expected_agreements = _EXPECTED_AGREEMENT_COUNTS.get(fixture.name)
+    expected_inquiries = _EXPECTED_INQUIRY_COUNTS.get(fixture.name)
+    if (
+        expected_account_months is None
+        or expected_agreements is None
+        or expected_inquiries is None
+    ):
+        return
+
+    expected_accounts, expected_months = expected_account_months
+    expected_by_dataset = {
+        "credit_accounts": expected_accounts,
+        "credit_account_monthly_performance": expected_months,
+        "credit_agreements": expected_agreements,
+        "inquiries": expected_inquiries,
+    }
+    datasets = _dataset_map(payload)
+    defects: list[str] = []
+    for dataset_name, expected_count in expected_by_dataset.items():
+        dataset = datasets.get(dataset_name)
+        if dataset is None:
+            defects.append(
+                f"{dataset_name}: missing public dataset; expected {expected_count} source rows"
+            )
+            continue
+        emitted = int(dataset.get("row_count") or len(dataset.get("rows") or ()))
+        completeness = dataset.get("completeness") or {}
+        reported_expected = completeness.get("expected_row_count")
+        reported_emitted = completeness.get("emitted_row_count")
+        reported_omitted = completeness.get("omitted_row_count")
+        if reported_expected != expected_count:
+            defects.append(
+                f"{dataset_name}: expected-row report {reported_expected!r}, source {expected_count}"
+            )
+        if reported_emitted != emitted:
+            defects.append(
+                f"{dataset_name}: emitted-row report {reported_emitted!r}, public rows {emitted}"
+            )
+        if reported_omitted != expected_count - emitted:
+            defects.append(
+                f"{dataset_name}: omitted-row report {reported_omitted!r}, source gap "
+                f"{expected_count - emitted}"
+            )
+    if defects:
+        raise AssertionError(
+            f"{fixture.name} population-reporting failures:\n- " + "\n- ".join(defects)
+        )
+
+
 def _compact_source_table(table: dict) -> str:
     return re.sub(
         r"\s+",
@@ -1330,6 +1383,8 @@ def test_personal_detail_ocr_correction_invariants(
             json.dumps(semantic, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    _assert_five_report_population_reporting(payload, fixture)
 
     assert raw_bundles == raw_snapshot
     assert topology_audit["valid"] is True

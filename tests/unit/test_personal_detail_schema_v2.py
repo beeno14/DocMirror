@@ -490,7 +490,14 @@ def test_v2_monthly_gate_keeps_exact_status_issue_for_noncanonical_orphan() -> N
         }
     )
 
-    assert "credit_account_monthly_performance" not in projected
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 1
     local_issue = next(
         issue
         for issue in projected["extraction_issues"]
@@ -760,7 +767,14 @@ def test_v2_monthly_null_overlay_is_withheld_with_explicit_grid_issue() -> None:
         }
     )
 
-    assert "credit_account_monthly_performance" not in projected
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 1
     issue = next(
         row
         for row in projected["extraction_issues"]
@@ -1119,7 +1133,14 @@ def test_v2_source_sentinel_is_silent_absence_but_monthly_dash_is_reported() -> 
     spouse = projected["subject_spouse"][0]
     assert spouse["name"] is None
     assert spouse.get("canonical_raw", {}).get("name") is None
-    assert "credit_account_monthly_performance" not in projected
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 1
     assert not any(
         row.get("target_record_id") in {"residence:sentinel", "spouse:sentinel"}
         and row.get("field_name") in {"residential_phone", "name"}

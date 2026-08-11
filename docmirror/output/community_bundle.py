@@ -2752,16 +2752,19 @@ def project_community_bundle(
 
     dataset_candidates: list[tuple[str, list[Any]]] = []
     internal_facts = {str(key) for key in (projection.get("internal_facts") or ())}
+    publish_empty_datasets = {
+        str(key) for key in (projection.get("publish_empty_datasets") or ()) if str(key)
+    }
     for key, value in data.items():
         if (
             key.startswith("_")
             or key in _NON_DATASET_KEYS
             or key in internal_facts
             or not isinstance(value, list)
-            or not value
+            or (not value and key not in publish_empty_datasets)
         ):
             continue
-        if all(isinstance(item, dict) for item in value):
+        if not value or all(isinstance(item, dict) for item in value):
             dataset_candidates.append((str(key), value))
     configured_dataset_order = semantic_extensions.get("dataset_document_order")
     if isinstance(configured_dataset_order, list):

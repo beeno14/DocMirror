@@ -3143,10 +3143,22 @@ def _canonical_quality_gate(
             structural_expected_counts: list[int] = []
             for issue in unique_issues.values():
                 issue_values = _normalized(issue)
-                if (
-                    str(issue_values.get("issue_code") or "")
-                    != "canonical_monthly_reconstruction_incomplete"
-                ):
+                issue_code = str(issue_values.get("issue_code") or "")
+                if issue_code == "monthly_population_incomplete_from_account_gap":
+                    observed = issue_values.get("observed_value")
+                    canonical_grid_count = (
+                        observed.get("canonical_grid_row_count")
+                        if isinstance(observed, Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(canonical_grid_count, int)
+                        and not isinstance(canonical_grid_count, bool)
+                        and canonical_grid_count >= 0
+                    ):
+                        structural_expected_counts.append(canonical_grid_count)
+                    continue
+                if issue_code != "canonical_monthly_reconstruction_incomplete":
                     continue
                 candidate = issue_values.get("candidate_value")
                 observed = issue_values.get("observed_value")
@@ -3756,10 +3768,23 @@ def project_personal_detail_datasets(
                 )
             ):
                 record["normalized"] = _normalized(record)
+    reportable_empty_datasets = {
+        str(values.get("dataset_name") or "")
+        for record in projected.get("dataset_status") or ()
+        if isinstance(record, dict)
+        and (values := _normalized(record))
+        and str(values.get("applicability") or "") == "applicable"
+        and str(values.get("presence_status") or "")
+        in {"partial", "extraction_failed", "unknown"}
+        and isinstance(values.get("expected_row_count"), int)
+        and not isinstance(values.get("expected_row_count"), bool)
+        and int(values["expected_row_count"]) > 0
+        and int(values.get("observed_row_count") or 0) == 0
+    }
     return {
-        name: projected[name]
+        name: projected.get(name, [])
         for name in PBOC_DATASET_ORDER
-        if name in projected and projected[name]
+        if (name in projected and projected[name]) or name in reportable_empty_datasets
     }
 
 
@@ -4256,6 +4281,10 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             name: f"one row per {_PBOC_DATASET_LABELS[name]}"
             for name in PBOC_DATASET_ORDER
         },
+        # Only source-proven empty collections survive v2 projection.  Publish
+        # those zero-row envelopes so their independently known omitted count
+        # is visible instead of disappearing with the business rows.
+        "publish_empty_datasets": list(PBOC_DATASET_ORDER),
         # Community's generic warning is only a projection-conservation check.
         # Source-document completeness is represented explicitly by dataset_status.
         "completeness": {
