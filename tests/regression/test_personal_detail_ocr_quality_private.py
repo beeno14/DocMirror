@@ -39,7 +39,11 @@ _FIXTURE_DIR = Path(
 )
 _FIXTURES = sorted(_FIXTURE_DIR.glob("*.pdf"))
 _EXPECTED_SCHEMA_INPUT_COUNTS = {
-    "余泽熙7.15征信.pdf": (27, 641),
+    # A page-by-page source audit proves 15 real repayment grids.  Their
+    # inclusive printed ranges contribute 746 month positions: 615 currently
+    # owner-bound plus 131 real positions on three owner-unresolved grids.
+    # The former 641 figure was not a source-conserving grid/date oracle.
+    "余泽熙7.15征信.pdf": (27, 746),
     "杨松林个人征信24.7.29.pdf": (38, 615),
     # Source-structure audit proves 40 printed repayment grids: 39 exact
     # physical-table date ranges contribute 942 months and the separate
