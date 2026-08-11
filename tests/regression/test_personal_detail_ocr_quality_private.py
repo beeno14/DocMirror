@@ -108,8 +108,16 @@ _YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS = {
     "credit_account:revolving_loan_subaccount:5": (
         "D10123970H0001HTM93505010211211293881001"
     ),
-    "credit_account:revolving_loan_subaccount:6": "B10611000H0001811132137961001",
 }
+_YE_R1_6_ACCOUNT_ID = "credit_account:revolving_loan_subaccount:6"
+_YE_R1_6_MERGED_SOURCE_TEXT = (
+    "中信银行股份有限 B10611000H0001 2022.06.22 "
+    "公司福州分行 811132137961001"
+)
+_YE_INQUIRY_69_CONFLICTING_INSTITUTIONS = (
+    "守 中信银行股份有限公司个人信贷部",
+    "中信银行股份有限公司个人信贷部",
+)
 _YE_CARD6_EXPECTED_FIELDS = {
     "account_identifier": "D10123910H000115604050032149",
     "credit_agreement_identifier": "D10123910H00010405000000032149",
@@ -139,6 +147,10 @@ _YE_CARD8_EXPECTED_FIELDS = {
     "scheduled_payment": "639",
     "actual_payment": "12780",
     "last_repayment_date": "2024-02-02",
+}
+_YE_CARD9_EXPECTED_FIELDS = {
+    "account_identifier": "B11911000H000115661000042356833",
+    "snapshot_date": "2024-02-15",
 }
 _YE_EXPECTED_MG_P12_MONTHS = (
     *(f"2022-{month:02d}" for month in range(6, 13)),
@@ -2182,11 +2194,13 @@ def test_personal_detail_ocr_correction_invariants(
         }
         assert set(recovered_card_types) == _YE_RECOVERED_CARD_IDS
         assert set(recovered_card_types.values()) == {"credit_card"}
-        ye_account_failures: list[str] = []
-        _append_ye_account_identity_oracle_failures(v2_datasets, ye_account_failures)
-        _append_ye_mg_p12_owner_oracle_failures(v2_datasets, ye_account_failures)
-        assert not ye_account_failures, "Live Ye account oracle failures:\n- " + "\n- ".join(
-            ye_account_failures
+        ye_oracle_failures: list[str] = []
+        _append_ye_account_identity_oracle_failures(v2_datasets, ye_oracle_failures)
+        _append_ye_card9_binding_oracle_failures(semantic, ye_oracle_failures)
+        _append_ye_mg_p12_owner_oracle_failures(v2_datasets, ye_oracle_failures)
+        _append_ye_inquiry_conflict_oracle_failures(v2_datasets, ye_oracle_failures)
+        assert not ye_oracle_failures, "Live Ye oracle failures:\n- " + "\n- ".join(
+            ye_oracle_failures
         )
         assert account_completeness["expected_row_count"] == 42
         assert account_completeness["emitted_row_count"] == len(account_rows)
@@ -2238,7 +2252,7 @@ def test_personal_detail_ocr_correction_invariants(
             institutional_by_sequence[69]["reason"],
         ) == (
             "2022-10-11",
-            "中信银行股份有限公司个人信贷部",
+            None,
             "贷后管理",
         )
         assert audit["applied_count"] >= 70
@@ -2301,7 +2315,7 @@ def _append_ye_account_identity_oracle_failures(
             (wrapper, account)
         )
 
-    expected_r1_ids = set(_YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS)
+    expected_r1_ids = {*_YE_EXPECTED_R1_ACCOUNT_IDENTIFIERS, _YE_R1_6_ACCOUNT_ID}
     observed_r1_ids = {
         str(account.get("account_id") or "")
         for _, account in account_pairs
@@ -2344,6 +2358,107 @@ def _append_ye_account_identity_oracle_failures(
                 f"expected={expected_identifier!r}"
             )
 
+    r1_6_matches = accounts_by_id.get(_YE_R1_6_ACCOUNT_ID, [])
+    if len(r1_6_matches) == 1:
+        r1_6_wrapper, r1_6 = r1_6_matches[0]
+        r1_6_review = r1_6_wrapper.get("review") or {}
+        if (
+            r1_6_review.get("status") != "requires_review"
+            or r1_6_review.get("extraction_status") != "review"
+        ):
+            failures.append(
+                f"{_YE_R1_6_ACCOUNT_ID}: review={r1_6_review!r}, expected active review"
+            )
+        for field_name in ("management_institution", "account_identifier"):
+            if r1_6.get(field_name) is not None:
+                failures.append(
+                    f"{_YE_R1_6_ACCOUNT_ID}: {field_name}={r1_6.get(field_name)!r}, "
+                    "expected withheld under unresolved merged-cell token roles"
+                )
+
+        issue_rows = [
+            wrapper.get("normalized") or {}
+            for wrapper in datasets["extraction_issues"].get("rows") or []
+        ]
+        evidence_rows = [
+            wrapper.get("normalized") or {}
+            for wrapper in datasets["extraction_issue_evidence"].get("rows") or []
+        ]
+        for field_name in ("management_institution", "account_identifier"):
+            active_field_issues = [
+                issue
+                for issue in issue_rows
+                if issue.get("target_dataset") == "credit_accounts"
+                and issue.get("target_record_id") == _YE_R1_6_ACCOUNT_ID
+                and issue.get("field_name") == field_name
+                and str(issue.get("status") or "requires_review")
+                not in {"resolved", "suppressed_redundant", "informational"}
+            ]
+            expected_signature = {
+                (
+                    "candidate_b_account_cluster_field_unresolved",
+                    "candidate_b_account_closed_cell_cluster",
+                    "ocr_structure_correction",
+                    "warning",
+                    "requires_review",
+                )
+            }
+            observed_signatures = {
+                (
+                    str(issue.get("issue_code") or ""),
+                    str(issue.get("parser_stage") or ""),
+                    str(issue.get("category") or ""),
+                    str(issue.get("severity") or ""),
+                    str(issue.get("status") or "requires_review"),
+                )
+                for issue in active_field_issues
+            }
+            if len(active_field_issues) != 1 or observed_signatures != expected_signature:
+                failures.append(
+                    f"{_YE_R1_6_ACCOUNT_ID}: {field_name} active unresolved issues="
+                    f"{sorted(observed_signatures)!r}, expected exactly "
+                    f"{sorted(expected_signature)!r}"
+                )
+                continue
+
+            issue_id = str(active_field_issues[0].get("extraction_issue_id") or "")
+            issue_evidence = [
+                evidence
+                for evidence in evidence_rows
+                if str(evidence.get("extraction_issue_id") or "") == issue_id
+            ]
+            observed_values = {
+                (
+                    str(evidence.get("evidence_path") or ""),
+                    str(evidence.get("string_value") or ""),
+                )
+                for evidence in issue_evidence
+                if evidence.get("evidence_kind") == "observed"
+            }
+            reason_codes = {
+                (
+                    str(evidence.get("evidence_path") or ""),
+                    str(evidence.get("string_value") or ""),
+                )
+                for evidence in issue_evidence
+                if evidence.get("evidence_kind") == "reason"
+            }
+            expected_reason_codes = {
+                ("reason_codes[0]", "closed_canonical_header_label_set"),
+                ("reason_codes[1]", "field_not_uniquely_typed"),
+                ("reason_codes[2]", "normalized_value_withheld"),
+            }
+            if observed_values != {("[0]", _YE_R1_6_MERGED_SOURCE_TEXT)}:
+                failures.append(
+                    f"{_YE_R1_6_ACCOUNT_ID}: {field_name} unresolved observed values="
+                    f"{sorted(observed_values)!r}"
+                )
+            if reason_codes != expected_reason_codes:
+                failures.append(
+                    f"{_YE_R1_6_ACCOUNT_ID}: {field_name} unresolved reason codes="
+                    f"{sorted(reason_codes)!r}, expected={sorted(expected_reason_codes)!r}"
+                )
+
     def _check_card(
         account_id: str,
         expected_fields: dict[str, object],
@@ -2377,12 +2492,13 @@ def _append_ye_account_identity_oracle_failures(
         return wrapper, account
 
     card6_pair = _check_card(
-        "credit_account:credit_card:6", _YE_CARD6_EXPECTED_FIELDS, [18, 18]
+        "credit_account:credit_card:6", _YE_CARD6_EXPECTED_FIELDS, [18, 23]
     )
     card7_pair = _check_card(
         "credit_account:credit_card:7", _YE_CARD7_EXPECTED_FIELDS, [23, 23]
     )
     _check_card("credit_account:credit_card:8", _YE_CARD8_EXPECTED_FIELDS, [23, 24])
+    _check_card("credit_account:credit_card:9", _YE_CARD9_EXPECTED_FIELDS, [21, 24])
 
     if card6_pair is not None:
         _, card6 = card6_pair
@@ -2429,6 +2545,155 @@ def _append_ye_account_identity_oracle_failures(
         }
         if contaminated:
             failures.append(f"card7 absorbed card8-only detail values={contaminated!r}")
+
+
+def _append_ye_card9_binding_oracle_failures(
+    semantic: dict, failures: list[str]
+) -> None:
+    record_id = "credit_account:credit_card:9"
+    bindings = [
+        binding
+        for binding in semantic.get("bindings") or []
+        if isinstance(binding, dict) and binding.get("record_id") == record_id
+    ]
+    if len(bindings) != 1:
+        failures.append(f"{record_id}: semantic binding count={len(bindings)}, expected 1")
+        return
+    binding = bindings[0]
+    observed_tables = set(binding.get("source_table_refs") or [])
+    expected_tables = {"pt_24_1", "pt_21_0"}
+    if observed_tables != expected_tables:
+        failures.append(
+            f"{record_id}: source tables={sorted(observed_tables)!r}, "
+            f"expected={sorted(expected_tables)!r}"
+        )
+    if "pt_24_0" in observed_tables:
+        failures.append(f"{record_id}: incorrectly owns card8 source table pt_24_0")
+    if binding.get("page_range") != [21, 24]:
+        failures.append(
+            f"{record_id}: binding page_range={binding.get('page_range')!r}, "
+            "expected=[21, 24]"
+        )
+
+
+def _append_ye_inquiry_conflict_oracle_failures(
+    datasets: dict[str, dict], failures: list[str]
+) -> None:
+    """Require inquiry 69's exact same-row conflict to remain active and lossless."""
+
+    inquiry_wrappers = [
+        wrapper
+        for wrapper in datasets["inquiries"].get("rows") or []
+        if isinstance(wrapper, dict)
+        and (wrapper.get("normalized") or {}).get("query_channel") == "institution"
+        and (wrapper.get("normalized") or {}).get("sequence") == 69
+    ]
+    if len(inquiry_wrappers) != 1:
+        failures.append(
+            f"institution inquiry 69 emitted row count={len(inquiry_wrappers)}, expected 1"
+        )
+        return
+
+    inquiry_wrapper = inquiry_wrappers[0]
+    inquiry = inquiry_wrapper.get("normalized") or {}
+    if inquiry.get("institution") is not None:
+        failures.append(
+            "institution inquiry 69 promoted one side of an equal-provenance conflict: "
+            f"{inquiry.get('institution')!r}"
+        )
+    inquiry_review = inquiry_wrapper.get("review") or {}
+    if (
+        inquiry_review.get("status") != "requires_review"
+        or inquiry_review.get("extraction_status") != "review"
+    ):
+        failures.append(
+            f"institution inquiry 69 review={inquiry_review!r}, expected active review"
+        )
+
+    record_id = str(inquiry_wrapper.get("record_id") or "")
+    issue_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issues"].get("rows") or []
+    ]
+    active_conflicts = [
+        issue
+        for issue in issue_rows
+        if issue.get("target_dataset") == "inquiries"
+        and issue.get("target_record_id") == record_id
+        and issue.get("field_name") == "institution"
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    expected_signature = {
+        (
+            "candidate_b_inquiry_field_conflict",
+            "candidate_b_inquiry_schema",
+            "ocr_structure_correction",
+            "warning",
+            "requires_review",
+        )
+    }
+    observed_signatures = {
+        (
+            str(issue.get("issue_code") or ""),
+            str(issue.get("parser_stage") or ""),
+            str(issue.get("category") or ""),
+            str(issue.get("severity") or ""),
+            str(issue.get("status") or "requires_review"),
+        )
+        for issue in active_conflicts
+    }
+    if len(active_conflicts) != 1 or observed_signatures != expected_signature:
+        failures.append(
+            "institution inquiry 69 active institution issues="
+            f"{sorted(observed_signatures)!r}, expected exactly "
+            f"{sorted(expected_signature)!r}"
+        )
+        return
+
+    conflict_issue_id = str(active_conflicts[0].get("extraction_issue_id") or "")
+    conflict_evidence = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issue_evidence"].get("rows") or []
+        if str((wrapper.get("normalized") or {}).get("extraction_issue_id") or "")
+        == conflict_issue_id
+    ]
+    observed_candidates = {
+        (
+            str(evidence.get("evidence_path") or ""),
+            str(evidence.get("string_value") or ""),
+        )
+        for evidence in conflict_evidence
+        if evidence.get("evidence_kind") == "observed"
+    }
+    expected_candidates = {
+        (f"[{index}]", value)
+        for index, value in enumerate(_YE_INQUIRY_69_CONFLICTING_INSTITUTIONS)
+    }
+    if observed_candidates != expected_candidates:
+        failures.append(
+            "institution inquiry 69 conflict candidates="
+            f"{sorted(observed_candidates)!r}, expected noisy+clean "
+            f"{sorted(expected_candidates)!r}"
+        )
+    reason_codes = {
+        (
+            str(evidence.get("evidence_path") or ""),
+            str(evidence.get("string_value") or ""),
+        )
+        for evidence in conflict_evidence
+        if evidence.get("evidence_kind") == "reason"
+    }
+    expected_reason_codes = {
+        ("reason_codes[0]", "same_printed_inquiry_row"),
+        ("reason_codes[1]", "equal_field_provenance"),
+        ("reason_codes[2]", "conflicting_values_withheld"),
+    }
+    if reason_codes != expected_reason_codes:
+        failures.append(
+            "institution inquiry 69 conflict reason codes="
+            f"{sorted(reason_codes)!r}, expected={sorted(expected_reason_codes)!r}"
+        )
 
 
 def _append_ye_mg_p12_owner_oracle_failures(
@@ -2582,7 +2847,9 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
     if set(recovered_card_types.values()) - {"credit_card"}:
         failures.append(f"recovered cards have wrong families={recovered_card_types!r}")
     _append_ye_account_identity_oracle_failures(datasets, failures)
+    _append_ye_card9_binding_oracle_failures(semantic, failures)
     _append_ye_mg_p12_owner_oracle_failures(datasets, failures)
+    _append_ye_inquiry_conflict_oracle_failures(datasets, failures)
 
     inquiry_dataset = datasets["inquiries"]
     inquiry_completeness = inquiry_dataset["completeness"]
@@ -2622,7 +2889,7 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
     expected_institutional_rows = {
         5: ("2024-02-07", "兴业银行股份有限公司", "贷后管理"),
         27: ("2023-09-09", "兴业银行股份有限公司", "贷后管理"),
-        69: ("2022-10-11", "中信银行股份有限公司个人信贷部", "贷后管理"),
+        69: ("2022-10-11", None, "贷后管理"),
     }
     institutional_rows_by_sequence: dict[int, list[dict]] = {}
     for row in inquiry_rows:
