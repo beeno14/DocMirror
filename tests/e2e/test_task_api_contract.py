@@ -170,6 +170,11 @@ def test_task_api_accepts_background_work_and_persists_terminal_status(tmp_path:
 
         assert status["status"] == "success"
         assert status["progress"]["percent"] == 100.0
+        assert status["progress"]["pipeline_percent"] == 100.0
+        assert status["progress"]["phase"] == "completed"
+        assert status["progress"]["phase_percent"] == 100.0
+        assert status["progress"]["message"]
+        assert status["progress"]["updated_at"].endswith("Z")
         assert "mirror" not in status["artifacts"]
         assert client.get(f"/v1/tasks/{task_id}/artifacts/not_declared").status_code == 404
 
