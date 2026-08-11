@@ -979,6 +979,54 @@ def _target_matches_year_row_pair(target: BBox, row_pair_year_box: BBox) -> bool
     )
 
 
+def _target_straddles_exact_year_singletons(
+    target: BBox,
+    *,
+    status_cell: BBox,
+    amount_cell: BBox,
+    row_pair_year_box: BBox,
+) -> bool:
+    """Bind a compact year glyph crossing two exact singleton row cells.
+
+    This is deliberately narrower than pair-height ownership.  The target must
+    be substantially contained by the exact row-pair union, cover enough of
+    that union to exclude a tiny boundary speck, and cross the shared rule with
+    material support on each side.  Source cell values are never consulted.
+    """
+
+    target_coverage, pair_coverage, _iou = _intersection_ratio(
+        target,
+        row_pair_year_box,
+    )
+    target_height = target[3] - target[1]
+    target_width = target[2] - target[0]
+    pair_width = row_pair_year_box[2] - row_pair_year_box[0]
+    shared_boundary = (status_cell[3] + amount_cell[1]) / 2.0
+    status_overlap = max(
+        0.0,
+        min(target[3], status_cell[3]) - max(target[1], status_cell[1]),
+    )
+    amount_overlap = max(
+        0.0,
+        min(target[3], amount_cell[3]) - max(target[1], amount_cell[1]),
+    )
+    center_x = (target[0] + target[2]) / 2.0
+    return (
+        abs(status_cell[3] - amount_cell[1]) <= 0.25
+        and row_pair_year_box[0] - 1.0
+        <= center_x
+        <= row_pair_year_box[2] + 1.0
+        and target_coverage >= 0.90
+        and 0.15 <= pair_coverage < 0.35
+        and target_width / max(pair_width, 1e-6) >= 0.35
+        and target[1] < shared_boundary < target[3]
+        and status_overlap / max(target_height, 1e-6) >= 0.20
+        and amount_overlap / max(target_height, 1e-6) >= 0.20
+        and (status_overlap + amount_overlap) / max(target_height, 1e-6)
+        >= 0.90
+    )
+
+
 def _year_anchor_for_pair(
     table: Mapping[str, Any],
     *,
@@ -1091,6 +1139,7 @@ def _year_anchor_for_pair(
     # column zero; the caller still has to prove the global row/column rules
     # and one unique status/amount lattice before this candidate is returned.
     singleton_support = 0
+    strict_exact_singletons: dict[int, BBox] = {}
     for anchor_row in (status_row, amount_row):
         row_span, col_span = _anchor_span(table, anchor_row, 0)
         box = _cell_bbox(table, anchor_row, 0)
@@ -1121,6 +1170,17 @@ def _year_anchor_for_pair(
             and _same_cell(box, declared_box)
         ):
             singleton_support += 1
+            if all(
+                abs(float(observed) - float(declared)) <= 0.25
+                for observed, declared in zip(box, declared_box, strict=True)
+            ) and not _has_competing_exact_cell(
+                table,
+                row=anchor_row,
+                col=0,
+                target=box,
+                allowed_span_anchor=(anchor_row, 0),
+            ):
+                strict_exact_singletons[anchor_row] = box
     if singleton_support and _target_matches_year_row_pair(
         year_bbox,
         row_pair_year_box,
@@ -1130,6 +1190,18 @@ def _year_anchor_for_pair(
             row_pair_year_box,
             2,
             "row_pair_year_column",
+        )
+    if len(strict_exact_singletons) == 2 and _target_straddles_exact_year_singletons(
+        year_bbox,
+        status_cell=strict_exact_singletons[status_row],
+        amount_cell=strict_exact_singletons[amount_row],
+        row_pair_year_box=row_pair_year_box,
+    ):
+        return (
+            status_row,
+            row_pair_year_box,
+            2,
+            "boundary_straddling_singleton_year_cells",
         )
     return None
 

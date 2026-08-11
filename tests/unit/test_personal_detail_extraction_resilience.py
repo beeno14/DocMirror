@@ -338,6 +338,137 @@ def test_huaneng_complementary_liability_observations_merge_by_account_identity(
     assert rows[0]["related_party_category"] == "organization"
 
 
+def test_cross_plane_liability_complements_merge_only_inside_native_card_geometry() -> None:
+    shared = {
+        "business_type": "个人经营性贷款",
+        "open_date": "2023-12-04",
+        "due_date": "2024-10-04",
+        "responsibility_type": "保证人",
+        "responsibility_amount": 3500000,
+        "currency": "CNY",
+        "_party_category": "person",
+        "confidence": 0.98,
+    }
+    native = {
+        **shared,
+        "institution": "云南芒市农村商业银行股份有限公司",
+        "contract_number": "G10117300H03991101011630211202230000011",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 9,
+                "table_id": "pt_18_2",
+                "bbox": [20, 100, 400, 300],
+            }
+        ],
+    }
+    corrected = {
+        **shared,
+        "related_party_name": "杨天云",
+        "snapshot_date": "2024-07-21",
+        "balance": 2000000,
+        "repayment_status_code": "N",
+        "source_refs": [
+            {
+                "source": "personal_detail_corrected_page_cell",
+                "source_page": 9,
+                "bbox": [120, 160, 220, 190],
+            }
+        ],
+    }
+
+    rows = reconcile_candidate_b_liabilities(SimpleNamespace(), [native, corrected])
+
+    assert len(rows) == 1
+    assert rows[0]["contract_number"] == native["contract_number"]
+    assert rows[0]["institution"] == native["institution"]
+    assert rows[0]["snapshot_date"] == "2024-07-21"
+    assert rows[0]["balance"] == 2000000
+
+
+def test_cross_plane_liability_complement_does_not_bridge_distinct_card_geometry() -> None:
+    shared = {
+        "business_type": "企业经营贷款",
+        "open_date": "2021-06-30",
+        "due_date": "2026-06-30",
+        "responsibility_type": "保证人",
+        "responsibility_amount": 5500000,
+        "currency": "CNY",
+        "_party_category": "organization",
+        "confidence": 0.98,
+    }
+    native_a = {
+        **shared,
+        "institution": "中国银行股份有限公司大理州分行",
+        "contract_number": "CONTRACT-A",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 10,
+                "table_id": "pt_19_3",
+                "bbox": [20, 100, 400, 220],
+            }
+        ],
+    }
+    native_b = {
+        **shared,
+        "institution": "中国银行股份有限公司大理州分行",
+        "contract_number": "CONTRACT-B",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 10,
+                "table_id": "pt_19_4",
+                "bbox": [20, 260, 400, 380],
+            }
+        ],
+    }
+    corrected = {
+        **shared,
+        "related_party_name": "大理某企业有限公司",
+        "balance": 5500000,
+        "overdue_months": 0,
+        "source_refs": [
+            {
+                "source": "personal_detail_corrected_page_cell",
+                "source_page": 10,
+                "bbox": [100, 145, 220, 175],
+            }
+        ],
+    }
+
+    rows = reconcile_candidate_b_liabilities(
+        SimpleNamespace(), [native_b, native_a, corrected]
+    )
+
+    assert len(rows) == 2
+    assert {row.get("contract_number") for row in rows} == {
+        "CONTRACT-A",
+        "CONTRACT-B",
+    }
+    completed = next(row for row in rows if row.get("contract_number") == "CONTRACT-A")
+    assert completed["balance"] == 5500000
+
+
+def test_same_liability_ordinal_never_overrides_distinct_contracts() -> None:
+    common = {
+        "_printed_sequence": 1,
+        "_party_category": "organization",
+        "source_refs": [],
+        "confidence": 0.98,
+    }
+
+    rows = reconcile_candidate_b_liabilities(
+        SimpleNamespace(),
+        [
+            {**common, "contract_number": "CONTRACT-ONE"},
+            {**common, "contract_number": "CONTRACT-TWO"},
+        ],
+    )
+
+    assert len(rows) == 2
+
+
 def _lin_liability_candidate(
     sequence: int,
     *,

@@ -500,18 +500,24 @@ def _printed_reading_order_resolution(
     A page-only ``第 N 页`` marker is accepted only after other complete
     footers establish one coherent document total. Its other spread half may
     then be inferred from frozen topology. Every observed logical page must
-    ultimately own one unique, in-range printed number. Failure returns sealed
-    identity order together with explicit unresolved provenance so downstream
-    ownership code cannot mistake the fallback for an authoritative mapping.
+    ultimately own one unique, in-range printed number. A trailing scan half
+    with no sealed text or table content may follow that complete permutation;
+    it is retained after the report pages but never assigned a manufactured
+    printed number. Failure returns sealed identity order together with explicit
+    unresolved provenance so downstream ownership code cannot mistake the
+    fallback for an authoritative mapping.
     """
     text_evidence_by_page: dict[int, list[tuple[str, Any]]] = {}
     page_heights_by_logical: dict[int, list[float]] = {}
     observed_pages: set[int] = set()
     source_by_logical: dict[int, int] = {}
+    native_pages_by_logical: dict[int, list[Any]] = {}
+    evidence_bundles_by_logical: dict[int, list[Mapping[str, Any]]] = {}
 
     for page_index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1):
         logical = int(getattr(page, "page_number", 0) or page_index)
         observed_pages.add(logical)
+        native_pages_by_logical.setdefault(logical, []).append(page)
         transform = dict(getattr(page, "coordinate_transform", None) or {})
         source_by_logical[logical] = int(
             transform.get("source_page_number") or getattr(page, "source_page_number", 0) or logical
@@ -528,9 +534,15 @@ def _printed_reading_order_resolution(
         if not isinstance(bundle, dict):
             continue
         local = bundle.get("local_structure_evidence")
+        logical = int(
+            bundle.get("page")
+            or (local.get("page") if isinstance(local, Mapping) else 0)
+            or 0
+        )
+        if logical > 0:
+            evidence_bundles_by_logical.setdefault(logical, []).append(bundle)
         if not isinstance(local, dict):
             continue
-        logical = int(bundle.get("page") or local.get("page") or 0)
         if logical <= 0:
             continue
         observed_pages.add(logical)
@@ -554,6 +566,148 @@ def _printed_reading_order_resolution(
 
     identity = {page: page for page in sorted(observed_pages)}
 
+    def table_source_content_present(table: Any) -> bool:
+        """Check every sealed table representation, not only its preferred rows."""
+
+        def member(owner: Any, name: str, default: Any = None) -> Any:
+            return (
+                owner.get(name, default)
+                if isinstance(owner, Mapping)
+                else getattr(owner, name, default)
+            )
+
+        def scalar_present(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(_compact(value))
+            return True
+
+        metadata = member(table, "metadata")
+        raw_row_representations = [member(table, "raw_rows")]
+        if isinstance(metadata, Mapping):
+            raw_row_representations.append(metadata.get("raw_rows"))
+        for raw_rows in raw_row_representations:
+            if raw_rows in (None, [], ()):
+                continue
+            if not isinstance(raw_rows, (list, tuple)):
+                return True
+            for raw_row in raw_rows:
+                if not isinstance(raw_row, (list, tuple)):
+                    return True
+                if any(scalar_present(cell) for cell in raw_row):
+                    return True
+
+        if any(scalar_present(header) for header in member(table, "headers", ()) or ()):
+            return True
+        if scalar_present(member(table, "caption")):
+            return True
+        for row_collection_name in ("rows", "row_models", "logical_rows"):
+            rows = member(table, row_collection_name)
+            if rows in (None, [], ()):
+                continue
+            if not isinstance(rows, (list, tuple)):
+                return True
+            for row in rows:
+                cells = member(row, "cells")
+                if cells is None and isinstance(row, (list, tuple)):
+                    cells = row
+                if cells is None or not isinstance(cells, (list, tuple)):
+                    return True
+                for cell in cells:
+                    if isinstance(cell, Mapping):
+                        values = (
+                            cell.get("text"),
+                            cell.get("cleaned"),
+                            cell.get("numeric"),
+                            cell.get("value"),
+                            cell.get("content"),
+                        )
+                    elif isinstance(cell, (str, int, float, bool)) or cell is None:
+                        values = (cell,)
+                    else:
+                        values = (
+                            getattr(cell, "text", None),
+                            getattr(cell, "cleaned", None),
+                            getattr(cell, "numeric", None),
+                        )
+                    if any(scalar_present(value) for value in values):
+                        return True
+        return False
+
+    def source_evidence_empty(logical: int) -> bool:
+        """Prove that one registered logical page has no sealed source content."""
+
+        native_pages = native_pages_by_logical.get(logical) or []
+        if len(native_pages) != 1:
+            return False
+        if any(_compact(text) for text, _evidence in text_evidence_by_page.get(logical, ())):
+            return False
+        page = native_pages[0]
+        if any(
+            _compact(
+                pair.get("key")
+                if isinstance(pair, Mapping)
+                else getattr(pair, "key", "")
+            )
+            or _compact(
+                pair.get("value")
+                if isinstance(pair, Mapping)
+                else getattr(pair, "value", "")
+            )
+            for pair in getattr(page, "key_values", None) or []
+        ):
+            return False
+        if any(
+            _compact(
+                (line.get("content") or line.get("text"))
+                if isinstance(line, Mapping)
+                else getattr(line, "content", getattr(line, "text", ""))
+            )
+            for line in getattr(page, "lines", None) or []
+        ):
+            return False
+        if any(
+            table_source_content_present(table)
+            for table in getattr(page, "tables", None) or []
+        ):
+            return False
+        sealed_bundle_content_keys = (
+            "lines",
+            "tokens",
+            "candidates",
+            "structures",
+            "micro_grid_structures",
+            "source_table_geometry",
+            "tables",
+            "table_rows",
+            "rows",
+            "cells",
+        )
+        for bundle in evidence_bundles_by_logical.get(logical, ()):
+            owners = (
+                bundle,
+                bundle.get("local_structure_evidence"),
+                bundle.get("micro_grid_evidence"),
+            )
+            if any(
+                isinstance(owner, Mapping) and any(owner.get(key) for key in sealed_bundle_content_keys)
+                for owner in owners
+            ):
+                return False
+            region_detect = bundle.get("region_detect")
+            if isinstance(region_detect, Mapping) and region_detect.get(
+                "region_detect_candidates"
+            ):
+                return False
+            morphology_summary = bundle.get("morphology_summary")
+            if isinstance(morphology_summary, Mapping) and any(
+                value not in (None, "", 0, 0.0, False)
+                for value in morphology_summary.values()
+            ):
+                return False
+        return True
+
     def unresolved(
         reason: str,
         *,
@@ -562,6 +716,7 @@ def _printed_reading_order_resolution(
         full_footer_pages: Iterable[int] = (),
         page_only_footer_pages: Iterable[int] = (),
         paired_inferred_pages: Iterable[int] = (),
+        blank_logical_pages: Iterable[int] = (),
     ) -> tuple[dict[int, int], dict[str, Any]]:
         observed = sorted(observed_pages)
         printed = {
@@ -586,6 +741,7 @@ def _printed_reading_order_resolution(
             "full_footer_logical_pages": sorted(set(full_footer_pages)),
             "page_only_footer_logical_pages": sorted(set(page_only_footer_pages)),
             "paired_inferred_logical_pages": sorted(set(paired_inferred_pages)),
+            "blank_logical_pages": sorted(set(blank_logical_pages)),
             **({"printed_total": expected_total} if expected_total is not None else {}),
         }
 
@@ -603,6 +759,7 @@ def _printed_reading_order_resolution(
             "full_footer_logical_pages": [],
             "page_only_footer_logical_pages": [],
             "paired_inferred_logical_pages": [],
+            "blank_logical_pages": [],
         }
 
     printed_by_logical: dict[int, int] = {}
@@ -634,10 +791,7 @@ def _printed_reading_order_resolution(
         )
 
     observed_totals = set(totals)
-    if (
-        len(observed_totals) != 1
-        or next(iter(observed_totals), 0) < len(observed_pages)
-    ):
+    if len(observed_totals) != 1 or next(iter(observed_totals), 0) <= 0:
         return unresolved(
             "printed_total_missing_or_conflicting",
             printed_by_logical=printed_by_logical,
@@ -671,12 +825,31 @@ def _printed_reading_order_resolution(
             page_only_footer_pages=page_only_footer_pages,
         )
 
+    # A sparse sealed excerpt (printed total larger than its observed page
+    # population) cannot prove an extra scan half. Its empty synthetic/partial
+    # siblings remain eligible for bounded footer inference. Blank-tail
+    # certification is available only when the observed population could
+    # already contain the whole numbered document.
+    blank_logical_pages = (
+        {
+            logical
+            for logical in observed_pages - set(printed_by_logical)
+            if source_evidence_empty(logical)
+        }
+        if expected_total <= len(observed_pages)
+        else set()
+    )
     paired_inferred_pages = _infer_paired_printed_pages(
         printed_by_logical,
         source_by_logical,
         topology=topology,
+        expected_total=expected_total,
+        excluded_logical_pages=blank_logical_pages,
     )
-    if len(printed_by_logical) != len(observed_pages):
+    unprinted_nonblank_pages = (
+        observed_pages - set(printed_by_logical) - blank_logical_pages
+    )
+    if unprinted_nonblank_pages:
         return unresolved(
             "logical_page_footer_unresolved",
             printed_by_logical=printed_by_logical,
@@ -684,8 +857,9 @@ def _printed_reading_order_resolution(
             full_footer_pages=full_footer_pages,
             page_only_footer_pages=page_only_footer_pages,
             paired_inferred_pages=paired_inferred_pages,
+            blank_logical_pages=blank_logical_pages,
         )
-    if len(set(printed_by_logical.values())) != len(observed_pages):
+    if len(set(printed_by_logical.values())) != len(printed_by_logical):
         return unresolved(
             "printed_page_nonunique",
             printed_by_logical=printed_by_logical,
@@ -693,6 +867,7 @@ def _printed_reading_order_resolution(
             full_footer_pages=full_footer_pages,
             page_only_footer_pages=page_only_footer_pages,
             paired_inferred_pages=paired_inferred_pages,
+            blank_logical_pages=blank_logical_pages,
         )
 
     printed_pages = set(printed_by_logical.values())
@@ -704,20 +879,47 @@ def _printed_reading_order_resolution(
             full_footer_pages=full_footer_pages,
             page_only_footer_pages=page_only_footer_pages,
             paired_inferred_pages=paired_inferred_pages,
+            blank_logical_pages=blank_logical_pages,
         )
 
+    # Partial sealed contexts may legitimately contain a sparse, uniquely
+    # numbered report excerpt.  Once an unnumbered empty scan half is accepted,
+    # however, require the numbered side to be the complete 1..M document so a
+    # missing business page can never be disguised as that blank tail.
+    if blank_logical_pages and printed_pages != set(range(1, expected_total + 1)):
+        return unresolved(
+            "printed_page_permutation_incomplete",
+            printed_by_logical=printed_by_logical,
+            expected_total=expected_total,
+            full_footer_pages=full_footer_pages,
+            page_only_footer_pages=page_only_footer_pages,
+            paired_inferred_pages=paired_inferred_pages,
+            blank_logical_pages=blank_logical_pages,
+        )
+
+    ordered_report_pages = sorted(
+        printed_by_logical,
+        key=lambda page: (printed_by_logical[page], page),
+    )
+    ordered_logical_pages = ordered_report_pages + sorted(blank_logical_pages)
     order = {
         logical: index
-        for index, logical in enumerate(
-            sorted(observed_pages, key=lambda page: (printed_by_logical[page], page)),
-            start=1,
-        )
+        for index, logical in enumerate(ordered_logical_pages, start=1)
     }
+    has_blank_tail = bool(blank_logical_pages)
     return order, {
         "resolved": True,
         "authoritative": True,
-        "basis": "complete_unique_printed_page_permutation",
-        "reason": "full_page_total_and_bounded_pair_resolution",
+        "basis": (
+            "complete_unique_printed_page_permutation_with_blank_tail"
+            if has_blank_tail
+            else "complete_unique_printed_page_permutation"
+        ),
+        "reason": (
+            "full_page_total_bounded_pair_resolution_and_source_empty_tail"
+            if has_blank_tail
+            else "full_page_total_and_bounded_pair_resolution"
+        ),
         "observed_logical_pages": sorted(observed_pages),
         "identity_fallback": False,
         "printed_page_by_logical": dict(sorted(printed_by_logical.items())),
@@ -726,6 +928,7 @@ def _printed_reading_order_resolution(
         "full_footer_logical_pages": sorted(full_footer_pages),
         "page_only_footer_logical_pages": sorted(page_only_footer_pages),
         "paired_inferred_logical_pages": sorted(paired_inferred_pages),
+        "blank_logical_pages": sorted(blank_logical_pages),
         "printed_total": expected_total,
     }
 
@@ -744,9 +947,12 @@ def _infer_paired_printed_pages(
     source_by_logical: dict[int, int],
     *,
     topology: PersonalDetailPageTopology | None = None,
+    expected_total: int | None = None,
+    excluded_logical_pages: Iterable[int] = (),
 ) -> set[int]:
     """Infer one unread footer from a geometry-confirmed adjacent half."""
     inferred: set[int] = set()
+    excluded = {int(value) for value in excluded_logical_pages}
     logicals_by_source: dict[int, list[int]] = {}
     for logical, source in source_by_logical.items():
         logicals_by_source.setdefault(source, []).append(logical)
@@ -755,12 +961,18 @@ def _infer_paired_printed_pages(
         if ordered is None:
             continue
         left, right = ordered
+        if left in excluded or right in excluded:
+            continue
         if left in printed_by_logical and right not in printed_by_logical:
-            printed_by_logical[right] = printed_by_logical[left] + 1
-            inferred.add(right)
+            candidate = printed_by_logical[left] + 1
+            if expected_total is None or 1 <= candidate <= expected_total:
+                printed_by_logical[right] = candidate
+                inferred.add(right)
         elif right in printed_by_logical and left not in printed_by_logical:
-            printed_by_logical[left] = printed_by_logical[right] - 1
-            inferred.add(left)
+            candidate = printed_by_logical[right] - 1
+            if expected_total is None or 1 <= candidate <= expected_total:
+                printed_by_logical[left] = candidate
+                inferred.add(left)
     return inferred
 
 

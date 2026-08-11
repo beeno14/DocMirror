@@ -3061,6 +3061,59 @@ def test_candidate_b_headerless_continuation_uses_exact_source_table_geometry() 
     assert audit["amount_row_index"] == 1
 
 
+def test_candidate_b_continuation_uses_boundary_straddling_year_singletons() -> None:
+    geometry = _continuation_source_table_geometry(
+        year_anchor_row=0,
+        year_row_span=1,
+    )
+    geometry["cell_bboxes"][1][0] = [20.0, 27.0, 40.0, 45.0]
+    geometry["cell_geometry_status"][1][0] = "exact"
+    geometry["cell_spans"].append(
+        {
+            "row": 1,
+            "col": 0,
+            "row_span": 1,
+            "col_span": 1,
+            "bbox": geometry["cell_bboxes"][1][0],
+        }
+    )
+    lines = [dict(line) for line in _source_owned_continuation_lines()]
+    continuation_year = next(
+        line
+        for line in lines
+        if line.get("source_logical_page") == 2 and line.get("content") == "2019"
+    )
+    # In local continuation coordinates this is y=23..32, crossing the exact
+    # singleton boundary at y=27 with material glyph support on both sides.
+    continuation_year["bbox"] = [20.0, 123.0, 38.0, 132.0]
+
+    extracted = _extract_source_owned_continuation(
+        lines=lines,
+        geometry=geometry,
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    continuation = {row["month"]: row for row in rows if row["year"] == 2019}
+
+    assert set(continuation) == set(range(1, 13))
+    assert all(row["status"] == "N" for row in continuation.values())
+    assert all(row["overdue_amount"] == "0" for row in continuation.values())
+    for month, row in continuation.items():
+        refs = {ref["field_name"]: ref for ref in row["source_cell_refs"]}
+        assert refs["status"]["logical_page"] == 2
+        assert refs["status"]["geometry_scope"] == "cell"
+        assert refs["status"]["col"] == month
+        assert refs["overdue_amount"]["col"] == month
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"]
+    assert audit["year_anchor_mode"] == (
+        "boundary_straddling_singleton_year_cells"
+    )
+    assert audit["table_id"] == "pt_2_0"
+    assert audit["value_inputs_used"] is False
+
+
 def test_candidate_b_three_row_continuation_binds_only_active_status_pair() -> None:
     geometry = _continuation_source_table_geometry(
         row_edges=(0.0, 12.0, 30.0, 45.0),

@@ -120,6 +120,9 @@ def test_printed_page_inference_uses_geometry_instead_of_logical_ids() -> None:
         ],
         entities=SimpleNamespace(domain_specific={}),
     )
+    result.pages[1].texts = [
+        SimpleNamespace(content="账户 1", bbox=[20.0, 100.0, 100.0, 120.0])
+    ]
     topology = PersonalDetailPageTopology(result)
 
     assert _printed_reading_order(result, topology) == {20: 1, 10: 2}
@@ -186,6 +189,222 @@ def test_printed_page_order_accepts_bottom_full_and_page_only_footers() -> None:
     assert resolution["resolved"] is True
     assert resolution["authoritative"] is True
     assert resolution["page_only_footer_logical_pages"] == [10]
+
+
+def test_printed_page_order_accepts_only_a_source_empty_extra_scan_half() -> None:
+    blank = _page(30, source=3, segment=0, crop=[0, 0, 300, 800])
+    blank.tables = []
+    result = SimpleNamespace(
+        pages=[
+            _page(
+                20,
+                source=1,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 1 页，共 2 页",
+            ),
+            _page(
+                10,
+                source=2,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 2 页，共 2 页",
+            ),
+            blank,
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {20: 1, 10: 2, 30: 3}
+    assert resolution["resolved"] is True
+    assert resolution["authoritative"] is True
+    assert resolution["basis"] == "complete_unique_printed_page_permutation_with_blank_tail"
+    assert resolution["printed_page_by_logical"] == {10: 2, 20: 1}
+    assert resolution["blank_logical_pages"] == [30]
+
+
+@pytest.mark.parametrize(
+    "extra_kind",
+    (
+        "text",
+        "table",
+        "typed_table_shadowed_by_empty_raw_rows",
+        "mapping_row_models_shadowed_by_empty_raw_rows",
+        "mapping_top_level_raw_rows",
+        "key_value",
+        "bundle_structure",
+        "region_candidate",
+    ),
+)
+def test_printed_page_order_rejects_nonempty_unprinted_scan_half(
+    extra_kind: str,
+) -> None:
+    extra = _page(3, source=3, segment=0, crop=[0, 0, 300, 800])
+    extra.tables = []
+    if extra_kind == "text":
+        extra.texts = [SimpleNamespace(content="查询记录", bbox=[20, 100, 120, 120])]
+    elif extra_kind == "table":
+        extra.tables = [
+            SimpleNamespace(
+                metadata={"raw_rows": [["查询日期"], ["2024-01-01"]]},
+                headers=[],
+                rows=[],
+            )
+        ]
+    elif extra_kind == "typed_table_shadowed_by_empty_raw_rows":
+        extra.tables = [
+            SimpleNamespace(
+                metadata={"raw_rows": [[""]]},
+                headers=[],
+                rows=[
+                    SimpleNamespace(
+                        cells=[SimpleNamespace(text="查询记录")],
+                    )
+                ],
+            )
+        ]
+    elif extra_kind == "mapping_row_models_shadowed_by_empty_raw_rows":
+        extra.tables = [
+            {
+                "metadata": {"raw_rows": [[""]]},
+                "headers": [],
+                "row_models": [
+                    {
+                        "cells": [
+                            {
+                                "text": "",
+                                "cleaned": "",
+                                "numeric": 0,
+                            }
+                        ]
+                    }
+                ],
+            }
+        ]
+    elif extra_kind == "mapping_top_level_raw_rows":
+        extra.tables = [
+            {
+                "metadata": {},
+                "raw_rows": [["查询记录"]],
+                "headers": [],
+                "rows": [],
+            }
+        ]
+    elif extra_kind == "key_value":
+        extra.key_values = [SimpleNamespace(key=" ", value="张三")]
+    domain_specific = {}
+    if extra_kind == "bundle_structure":
+        domain_specific = {
+            "_page_evidence_bundles": [
+                {
+                    "page": 3,
+                    "source_page_number": 3,
+                    "tokens": [{"text": "还款记录"}],
+                }
+            ]
+        }
+    elif extra_kind == "region_candidate":
+        domain_specific = {
+            "_page_evidence_bundles": [
+                {
+                    "page": 3,
+                    "region_detect": {
+                        "region_detect_candidates": [
+                            {"kind": "micro_grid", "score": 0.91}
+                        ]
+                    },
+                }
+            ]
+        }
+    result = SimpleNamespace(
+        pages=[
+            _page(
+                1,
+                source=1,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 1 页，共 2 页",
+            ),
+            _page(
+                2,
+                source=2,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 2 页，共 2 页",
+            ),
+            extra,
+        ],
+        entities=SimpleNamespace(domain_specific=domain_specific),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {1: 1, 2: 2, 3: 3}
+    assert resolution["resolved"] is False
+    assert resolution["reason"] == "logical_page_footer_unresolved"
+    assert resolution["blank_logical_pages"] == []
+
+
+def test_empty_spread_sibling_cannot_fill_a_missing_printed_page() -> None:
+    result = SimpleNamespace(
+        pages=[
+            _page(
+                20,
+                source=1,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 1 页，共 3 页",
+            ),
+            _page(10, source=1, segment=1, crop=[300, 0, 600, 800]),
+            _page(
+                30,
+                source=2,
+                segment=0,
+                crop=[0, 0, 300, 800],
+                footer="第 3 页，共 3 页",
+            ),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+    topology = PersonalDetailPageTopology(result)
+
+    order, resolution = _printed_reading_order_resolution(result, topology)
+
+    assert order == {10: 10, 20: 20, 30: 30}
+    assert resolution["resolved"] is False
+    assert resolution["reason"] == "printed_page_permutation_incomplete"
+    assert resolution["paired_inferred_logical_pages"] == []
+    assert resolution["blank_logical_pages"] == [10]
+
+
+@pytest.mark.parametrize(
+    ("footers", "reason"),
+    (
+        (("第 1 页，共 3 页", "第 3 页，共 3 页"), "printed_page_permutation_incomplete"),
+        (("第 1 页，共 2 页", "第 1 页，共 2 页"), "printed_page_nonunique"),
+    ),
+)
+def test_blank_scan_half_does_not_hide_an_invalid_printed_permutation(
+    footers: tuple[str, str],
+    reason: str,
+) -> None:
+    result = SimpleNamespace(
+        pages=[
+            _page(1, source=1, segment=0, crop=[0, 0, 300, 800], footer=footers[0]),
+            _page(2, source=2, segment=0, crop=[0, 0, 300, 800], footer=footers[1]),
+            _page(3, source=3, segment=0, crop=[0, 0, 300, 800]),
+        ],
+        entities=SimpleNamespace(domain_specific={}),
+    )
+
+    order, resolution = _printed_reading_order_resolution(result)
+
+    assert order == {1: 1, 2: 2, 3: 3}
+    assert resolution["resolved"] is False
+    assert resolution["reason"] == reason
+    assert resolution["blank_logical_pages"] == [3]
 
 
 def test_printed_page_order_rejects_conflicting_bottom_markers() -> None:

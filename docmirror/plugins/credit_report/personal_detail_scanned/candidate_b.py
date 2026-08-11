@@ -898,15 +898,6 @@ class CandidateBPipeline:
                 **source_datasets,
             }
         )
-        native_status_conflict_audit = apply_candidate_b_native_status_conflict_guard(
-            self.context,
-            [
-                row
-                for row in corrected_payload.get("repayment_records") or ()
-                if isinstance(row, dict)
-            ],
-            enabled=True,
-        )
         _enforce_employment_record_contracts(
             self.context,
             [
@@ -960,6 +951,18 @@ class CandidateBPipeline:
                 for row in source_datasets.get("repayment_records") or ()
                 if isinstance(row, Mapping)
             ),
+        )
+        # Run the sealed-source check after every consistency and glyph stage;
+        # no later operation may change a monthly status.  This keeps the value
+        # audited here identical to the one handed to the final projection.
+        native_status_conflict_audit = apply_candidate_b_native_status_conflict_guard(
+            self.context,
+            [
+                row
+                for row in corrected_payload.get("repayment_records") or ()
+                if isinstance(row, dict)
+            ],
+            enabled=True,
         )
         all_datasets: dict[str, list[dict[str, Any]]] = {
             name: list(corrected_payload.get(name) or ())

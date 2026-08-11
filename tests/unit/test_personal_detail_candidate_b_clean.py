@@ -1154,8 +1154,10 @@ def test_account_schema_suppresses_unmatched_table_in_anchored_category(monkeypa
     accounts, _repayments, _events = native_extraction._extract_accounts(context)
 
     assert accounts == [anchor]
-    assert context._personal_detail_extraction_issues[1]["issue_code"] == (
-        "candidate_b_unmatched_account_table_suppressed"
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_unmatched_account_table_suppressed"
+        for issue in context._personal_detail_extraction_issues
     )
 
 

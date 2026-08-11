@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_parser impor
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     _CANONICAL_MONTHLY_STATUS_CODES,
     PBOC_DATASET_ORDER,
+    _canonical_field_name,
     personal_detail_data_dictionary,
     personal_detail_semantic_extensions,
     project_personal_detail_datasets,
@@ -838,6 +840,83 @@ def test_v2_repayment_responsibility_removes_combined_field_from_all_pools() -> 
         "overdue_months_or_repayment_status" not in row.get(pool_name, {})
         for pool_name in ("normalized", "canonical_raw", "raw")
     )
+
+
+def test_v2_repayment_responsibility_types_normalized_overdue_months_only() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_liability_records": [
+                {
+                    "record_id": "responsibility:typed-overdue",
+                    "normalized": {
+                        "liability_id": "responsibility:typed-overdue",
+                        "related_party_id_type": "统一社会信用代码",
+                        "related_party_id_number": "91110000123456789X",
+                        "overdue_months": "0",
+                    },
+                    "canonical_raw": {"overdue_months": "0"},
+                    "raw": {"overdue_months": "0"},
+                }
+            ]
+        }
+    )
+
+    row = projected["repayment_responsibilities"][0]
+    assert row["normalized"]["overdue_months"] == 0
+    assert type(row["normalized"]["overdue_months"]) is int
+    assert row["canonical_raw"]["overdue_months"] == "0"
+    assert row["raw"]["overdue_months"] == "0"
+
+
+def test_control_field_names_use_only_canonical_dataset_fields() -> None:
+    assert (
+        _canonical_field_name("credit_account_monthly_performance", "status")
+        == "status_code"
+    )
+    assert _canonical_field_name("subject_employment", "employment_components") is None
+    assert _canonical_field_name("subject_profile", "mobile_phone") is None
+    assert (
+        _canonical_field_name("credit_business_overview", "最近2年内的查询次数")
+        == "numeric_value"
+    )
+
+
+def test_multifield_control_alias_stays_explicit_without_fake_field_observation() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_field_observations": [
+                _record(
+                    "observation:employment-components",
+                    field_observation_id="observation:employment-components",
+                    dataset_name="subject_employment",
+                    business_record_id="employment:1",
+                    field_name="employment_components",
+                    observation_status="unreadable",
+                    raw_value="工作单位=示例公司;职业=职员",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    "issue:employment-components",
+                    extraction_issue_id="issue:employment-components",
+                    category="schema_incompleteness",
+                    issue_code="unstructured_multifield_blob",
+                    severity="warning",
+                    status="requires_review",
+                    target_dataset="employment_records",
+                    target_record_id="employment:1",
+                    field_name="employment_components",
+                    observed_value="工作单位=示例公司;职业=职员",
+                )
+            ],
+        }
+    )
+
+    assert projected.get("field_observations", []) == []
+    [issue] = projected["extraction_issues"]
+    assert issue["target_dataset"] == "subject_employment"
+    assert "field_name" not in issue
+    assert issue["observed_value"] == "工作单位=示例公司;职业=职员"
 
 
 def test_unlabeled_legacy_liability_status_is_not_guessed_from_party_category() -> None:
@@ -1712,6 +1791,36 @@ def test_v2_dictionary_covers_pboc_catalog_and_logical_types() -> None:
     ]["logical_type"] == "Short"
 
 
+def test_canonical_sample_business_field_catalog_is_frozen() -> None:
+    """Keep broader official-spec additions outside the sample-vetted API."""
+
+    controls = {
+        "field_observations",
+        "extraction_issues",
+        "extraction_issue_evidence",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
+    catalog = personal_detail_data_dictionary()["datasets"]
+    sample_business_fields = {
+        dataset_name: sorted(catalog[dataset_name]["columns"])
+        for dataset_name in PBOC_DATASET_ORDER
+        if dataset_name not in controls
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            sample_business_fields,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert len(sample_business_fields) == 47
+    assert sum(map(len, sample_business_fields.values())) == 441
+    assert digest == "65cd98fd649baade7bef99d8c51215e687bd2f919614295079f0dd7c400fa0d7"
+
+
 def test_v2_projects_credit_line_validity_under_public_field_name() -> None:
     projected = project_personal_detail_datasets(
         {
@@ -2530,6 +2639,70 @@ def test_v2_normalizes_extended_currency_alias_and_declares_iso_codes() -> None:
     assert row["reporting_amount_currency"] == "AUD"
     currency_codes = personal_detail_data_dictionary()["enums"]["currency_code"]
     assert {"AUD", "CAD", "CHF", "SGD", "MOP"}.issubset(currency_codes)
+
+
+def test_v2_types_account_repayment_periods_without_losing_source_absence() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                _record(
+                    "account:dash-periods",
+                    normalized={
+                        "account_id": "account:dash-periods",
+                        "account_type": "non_revolving_loan",
+                        "repayment_periods": "--",
+                    },
+                    repayment_periods="--",
+                    canonical_raw={"repayment_periods": "--"},
+                    raw={"repayment_periods": "--"},
+                ),
+                _record(
+                    "account:numeric-periods",
+                    account_id="account:numeric-periods",
+                    account_type="non_revolving_loan",
+                    repayment_periods="36",
+                    canonical_raw={"repayment_periods": "36"},
+                    raw={"repayment_periods": "36"},
+                ),
+                _record(
+                    "account:invalid-periods",
+                    account_id="account:invalid-periods",
+                    account_type="non_revolving_loan",
+                    repayment_periods="36?",
+                    canonical_raw={"repayment_periods": "36?"},
+                    raw={"repayment_periods": "36?"},
+                ),
+            ]
+        }
+    )
+
+    rows = {
+        (row.get("normalized") or row)["account_id"]: row
+        for row in projected["credit_accounts"]
+    }
+    dash = rows["account:dash-periods"]
+    assert dash["normalized"]["repayment_periods"] is None
+    assert "repayment_periods" not in dash
+    assert dash["canonical_raw"]["repayment_periods"] == "--"
+    assert dash["raw"]["repayment_periods"] == "--"
+    numeric = rows["account:numeric-periods"]
+    assert numeric["repayment_periods"] == 36
+    assert type(numeric["repayment_periods"]) is int
+    assert numeric["canonical_raw"]["repayment_periods"] == "36"
+    assert numeric["raw"]["repayment_periods"] == "36"
+    invalid = rows["account:invalid-periods"]
+    assert invalid["repayment_periods"] is None
+    assert invalid["canonical_raw"]["repayment_periods"] == "36?"
+    assert invalid["raw"]["repayment_periods"] == "36?"
+    invalid_issues = [
+        issue
+        for issue in projected["extraction_issues"]
+        if issue.get("target_record_id") == "account:invalid-periods"
+        and issue.get("field_name") == "repayment_periods"
+    ]
+    assert len(invalid_issues) == 1
+    assert invalid_issues[0]["issue_code"] == "canonical_field_contract_failed"
+    assert invalid_issues[0]["observed_value"] == "36?"
 
 
 def test_v2_withholds_yuan_units_for_non_cny_currency_with_exact_issues() -> None:

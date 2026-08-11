@@ -268,6 +268,42 @@ def test_numeric_zero_forms_preserve_native_conflict_detection(zero: Any) -> Non
     assert audit["conflicts_withheld"] == 1
 
 
+def test_native_digit_with_zero_amount_cannot_override_symbolic_final_status() -> None:
+    context, records = _case(final_status="*")
+    context.parse_result.pages[0].tables[0].rows[1].cells[8].text = "3"
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "*"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["unique_native_witnesses"] == 1
+    assert audit["native_numeric_witnesses_rejected_for_nonpositive_amount"] == 1
+    assert audit["conflicts_withheld"] == 0
+
+
+def test_native_digit_with_positive_amount_remains_a_conflicting_witness() -> None:
+    context, records = _case(final_status="*")
+    table = context.parse_result.pages[0].tables[0]
+    table.rows[1].cells[8].text = "3"
+    table.rows[2].cells[8].text = "1"
+    records[0]["overdue_amount"] = "1"
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in records[0]
+    assert records[0]["canonical_raw"]["status"] == ["*", "3"]
+    assert audit["native_numeric_witnesses_rejected_for_nonpositive_amount"] == 0
+    assert audit["conflicts_withheld"] == 1
+
+
 def test_boolean_amount_is_not_coerced_to_numeric_zero() -> None:
     context, records = _case()
     records[0]["overdue_amount"] = False

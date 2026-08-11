@@ -495,6 +495,243 @@ def test_monthly_dataset_status_uses_canonical_population_from_account_gap() -> 
     assert monthly_status["expected_row_count"] == 3
 
 
+def test_monthly_expected_count_includes_unique_owner_unresolved_grids() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:owned:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_status_grid_unresolved",
+                    message="Two owned monthly positions were withheld.",
+                    parser_stage="candidate_b_monthly_status_grid",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:owned",
+                        "withheld_month_count": 2,
+                    },
+                    candidate_value={"emitted_month_count_for_grid": 1},
+                    reason_codes=("dataset_incomplete",),
+                ),
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="Three exact grid/month positions have no account owner.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 3,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                ),
+            ],
+        }
+    )
+
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 6
+
+
+def test_zero_row_monthly_dataset_is_published_from_status_and_owner_issues() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_status_grid_unresolved",
+                    message="Two owned monthly positions were withheld.",
+                    parser_stage="candidate_b_monthly_status_grid",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:owned",
+                        "withheld_month_count": 2,
+                    },
+                    reason_codes=("dataset_incomplete",),
+                ),
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="Three exact grid/month positions have no account owner.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 3,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                ),
+            ]
+        }
+    )
+
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 5
+
+
+def test_monthly_owner_unresolved_grid_count_is_deduplicated_and_not_conflict_summed() -> None:
+    def owner_issue(count: int, *, message: str) -> dict:
+        return make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_monthly_grid_owner_unresolved",
+            message=message,
+            parser_stage="candidate_b_monthly_linkage",
+            target_dataset="repayment_records",
+            observed_value={
+                "grid_id": "grid:unowned",
+                "observed_candidate_count": count,
+            },
+            candidate_value={"expected_month_count": count},
+            reason_codes=("relation_withheld",),
+        )
+
+    duplicate = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                owner_issue(3, message="First exact owner failure."),
+                owner_issue(3, message="Duplicate exact owner failure."),
+            ]
+        }
+    )
+    duplicate_status = next(
+        row
+        for row in duplicate["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert duplicate_status["expected_row_count"] == 3
+
+    conflicting = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                owner_issue(3, message="First conflicting owner failure."),
+                owner_issue(4, message="Second conflicting owner failure."),
+            ]
+        }
+    )
+    conflicting_status = next(
+        row
+        for row in conflicting["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert conflicting_status.get("expected_row_count", 0) == 0
+
+
+def test_monthly_owner_unresolved_count_is_not_added_without_observed_agreement() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:owned:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="The candidate and observed grid populations disagree.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 2,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                )
+            ]
+        }
+    )
+    assert len(projected["credit_account_monthly_performance"]) == 1
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status.get("expected_row_count", 0) == 0
+
+
+def test_monthly_status_grid_count_is_deduplicated_and_not_conflict_summed() -> None:
+    def status_issue(count: int, *, message: str) -> dict:
+        return make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_monthly_status_grid_unresolved",
+            message=message,
+            parser_stage="candidate_b_monthly_status_grid",
+            target_dataset="repayment_records",
+            observed_value={
+                "grid_id": "grid:status-unresolved",
+                "withheld_month_count": count,
+            },
+            reason_codes=("dataset_incomplete",),
+        )
+
+    duplicate = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                status_issue(3, message="First exact status-grid failure."),
+                status_issue(3, message="Duplicate exact status-grid failure."),
+            ]
+        }
+    )
+    duplicate_status = next(
+        row
+        for row in duplicate["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert duplicate_status["expected_row_count"] == 3
+
+    conflicting = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                status_issue(3, message="First conflicting status-grid failure."),
+                status_issue(4, message="Second conflicting status-grid failure."),
+            ]
+        }
+    )
+    conflicting_status = next(
+        row
+        for row in conflicting["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert conflicting_status.get("expected_row_count", 0) == 0
+
+
 def test_source_proven_empty_monthly_dataset_remains_publicly_reportable() -> None:
     projected = project_personal_detail_datasets(
         {

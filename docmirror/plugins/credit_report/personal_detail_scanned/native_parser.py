@@ -12,6 +12,7 @@ OCR-confusion aliases may authorize a business field binding.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -584,7 +585,21 @@ class PBOCPersonalDetailNativeParser:
         table_box = getattr(table, "bbox", None)
         if not isinstance(table_box, (list, tuple)) or len(table_box) != 4:
             return "", None
-        table_top = float(table_box[1])
+        try:
+            table_left, table_top, table_right, table_bottom = (
+                float(value) for value in table_box
+            )
+        except (TypeError, ValueError):
+            return "", None
+        if not (
+            all(
+                math.isfinite(value)
+                for value in (table_left, table_top, table_right, table_bottom)
+            )
+            and table_right > table_left
+            and table_bottom > table_top
+        ):
+            return "", None
         candidates: list[tuple[float, str, dict[str, Any]]] = []
         pattern = (
             re.compile(r"授信协议\s*(\d{1,3})")
@@ -596,8 +611,26 @@ class PBOCPersonalDetailNativeParser:
             text_box = getattr(text_item, "bbox", None)
             if match is None or not isinstance(text_box, (list, tuple)) or len(text_box) != 4:
                 continue
-            bottom = float(text_box[3])
-            if bottom <= table_top + 8.0:
+            try:
+                text_left, text_top, text_right, bottom = (
+                    float(value) for value in text_box
+                )
+            except (TypeError, ValueError):
+                continue
+            if not (
+                all(
+                    math.isfinite(value)
+                    for value in (text_left, text_top, text_right, bottom)
+                )
+                and text_right > text_left
+                and bottom > text_top
+            ):
+                continue
+            horizontal_overlap = min(table_right, text_right) - max(
+                table_left,
+                text_left,
+            )
+            if horizontal_overlap > 0.0 and table_top - 24.0 <= bottom <= table_top + 8.0:
                 candidates.append(
                     (
                         bottom,
@@ -621,6 +654,125 @@ class PBOCPersonalDetailNativeParser:
             return "", None
         _bottom, sequence, ref = max(candidates, key=lambda item: item[0])
         return sequence, ref
+
+    @staticmethod
+    def _liability_record_identity_supported(
+        fields: Mapping[str, Any],
+        refs_by_field: Mapping[str, tuple[dict[str, Any], ...]],
+        bindings_by_field: Mapping[str, str],
+        *,
+        page: Any | None = None,
+        table: Any | None = None,
+    ) -> bool:
+        """Require a contract, amount, or one geometry-bound printed card."""
+
+        if fields.get("保证合同编号") or fields.get("还款责任金额"):
+            return True
+        printed_sequence = str(fields.get("__printed_sequence") or "")
+        if (
+            not printed_sequence.isdigit()
+            or bindings_by_field.get("__printed_sequence") != "canonical_card_anchor"
+        ):
+            return False
+        refs = tuple(refs_by_field.get("__printed_sequence") or ())
+        if len(refs) != 1:
+            return False
+        ref = refs[0]
+        anchor_box = ref.get("bbox") if isinstance(ref, Mapping) else None
+        if not (
+            isinstance(ref, Mapping)
+            and ref.get("binding") == "canonical_card_anchor"
+            and isinstance(anchor_box, (list, tuple))
+            and len(anchor_box) == 4
+        ):
+            return False
+        if page is None or table is None:
+            if ref.get("source") != "personal_detail_corrected_page_cell":
+                return False
+            logical_page = int(ref.get("logical_page") or 0)
+            source_page = int(ref.get("source_page") or 0)
+            anchor_geometry = tuple(float(value) for value in anchor_box)
+            if not (
+                logical_page > 0
+                and source_page > 0
+                and all(math.isfinite(value) for value in anchor_geometry)
+                and anchor_geometry[2] > anchor_geometry[0]
+                and anchor_geometry[3] > anchor_geometry[1]
+            ):
+                return False
+            # The complete-page decoder already bounds rows from this printed
+            # anchor to the next card/section boundary.  Still require one
+            # independently labelled business cell on the same registered
+            # page and below the anchor before the ordinal can retain a partial
+            # corrected observation.
+            for field_name, field_refs in refs_by_field.items():
+                if field_name.startswith("__") or not bindings_by_field.get(field_name):
+                    continue
+                for field_ref in field_refs or ():
+                    field_box = (
+                        field_ref.get("bbox")
+                        if isinstance(field_ref, Mapping)
+                        else None
+                    )
+                    if not (
+                        isinstance(field_ref, Mapping)
+                        and field_ref.get("source")
+                        == "personal_detail_corrected_page_cell"
+                        and int(field_ref.get("logical_page") or 0) == logical_page
+                        and int(field_ref.get("source_page") or 0) == source_page
+                        and isinstance(field_box, (list, tuple))
+                        and len(field_box) == 4
+                    ):
+                        continue
+                    try:
+                        field_geometry = tuple(float(value) for value in field_box)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        all(math.isfinite(value) for value in field_geometry)
+                        and field_geometry[2] > field_geometry[0]
+                        and field_geometry[3] > field_geometry[1]
+                        and field_geometry[1] + 1.0 >= anchor_geometry[1]
+                    ):
+                        return True
+            return False
+
+        if ref.get("source") != "native_detail_canonical_anchor_text":
+            return False
+        table_box = getattr(table, "bbox", None)
+        if not isinstance(table_box, (list, tuple)) or len(table_box) != 4:
+            return False
+        logical_page = int(getattr(page, "page_number", 0) or 0)
+        source_page = int(
+            getattr(page, "source_page_number", 0) or logical_page or 0
+        )
+        if (
+            int(ref.get("logical_page") or 0) != logical_page
+            or int(ref.get("source_page") or 0) != source_page
+        ):
+            return False
+        try:
+            table_left, table_top, table_right, _table_bottom = (
+                float(value) for value in table_box
+            )
+            anchor_left, _anchor_top, anchor_right, anchor_bottom = (
+                float(value) for value in anchor_box
+            )
+        except (TypeError, ValueError):
+            return False
+        coordinates = (
+            table_left,
+            table_top,
+            table_right,
+            anchor_left,
+            anchor_right,
+            anchor_bottom,
+        )
+        return bool(
+            all(math.isfinite(value) for value in coordinates)
+            and min(table_right, anchor_right) - max(table_left, anchor_left) > 0.0
+            and table_top - 24.0 <= anchor_bottom <= table_top + 8.0
+        )
 
     @staticmethod
     def _record_group_top(table: Any, row_offset: int, row_count: int) -> float | None:
@@ -1684,8 +1836,15 @@ class PBOCPersonalDetailNativeParser:
                     # not publish a transient missing-field issue here.
                     if dataset_name == "credit_lines" and not fields.get("授信协议标识"):
                         continue
-                    if dataset_name == "repayment_liability_records" and not (
-                        fields.get("保证合同编号") or fields.get("还款责任金额")
+                    if (
+                        dataset_name == "repayment_liability_records"
+                        and not self._liability_record_identity_supported(
+                            fields,
+                            refs_by_field,
+                            bindings_by_field,
+                            page=_page,
+                            table=_table,
+                        )
                     ):
                         continue
                 result.append(
@@ -1811,8 +1970,13 @@ class PBOCPersonalDetailNativeParser:
                     )
                 if dataset_name == "credit_lines" and not fields.get("授信协议标识"):
                     continue
-                if dataset_name == "repayment_liability_records" and not (
-                    fields.get("保证合同编号") or fields.get("还款责任金额")
+                if (
+                    dataset_name == "repayment_liability_records"
+                    and not self._liability_record_identity_supported(
+                        fields,
+                        refs_by_field,
+                        bindings_by_field,
+                    )
                 ):
                     continue
             identity = self._record_identity(dataset_name, fields)

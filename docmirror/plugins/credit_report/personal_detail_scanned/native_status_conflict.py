@@ -540,12 +540,206 @@ def _source_geometry_row_binding(
     return table_id, status_row, amount_row
 
 
+def _base_source_geometry_row_binding(
+    final_ref: Mapping[str, Any],
+    final_amount_ref: Mapping[str, Any],
+    *,
+    logical_page: int,
+) -> tuple[str, int, int, int] | None:
+    """Read one exact, value-free base-page source-table row binding."""
+
+    status_geometry = final_ref.get("geometry_provenance")
+    amount_geometry = final_amount_ref.get("geometry_provenance")
+    if not isinstance(status_geometry, Mapping) or not isinstance(amount_geometry, Mapping):
+        return None
+    required_pairs = {
+        "selection_basis": "source_table_year_plus_twelve_ownership",
+        "source": "source_table_geometry",
+        "coordinate_system": _TOP_LEFT_PDF_COORDINATES,
+        "column_count": 13,
+        "month_column_count": 12,
+    }
+    if any(
+        status_geometry.get(key) != expected or amount_geometry.get(key) != expected
+        for key, expected in required_pairs.items()
+    ):
+        return None
+    if status_geometry.get("value_inputs_used") is not False or amount_geometry.get("value_inputs_used") is not False:
+        return None
+    # This path is deliberately disjoint from headerless continuation binding.
+    # Even a null continuation marker is not accepted as base-page provenance.
+    if any("continuation_logical_page" in geometry for geometry in (status_geometry, amount_geometry)):
+        return None
+    table_id = str(status_geometry.get("table_id") or "").strip()
+    amount_table_id = str(amount_geometry.get("table_id") or "").strip()
+    status_row = _integer(status_geometry.get("status_row_index"))
+    amount_row = _integer(status_geometry.get("amount_row_index"))
+    if not (
+        table_id
+        and amount_table_id == table_id
+        and status_row is not None
+        and status_row >= 1
+        and amount_row == status_row + 1
+        and _integer(amount_geometry.get("status_row_index")) == status_row
+        and _integer(amount_geometry.get("amount_row_index")) == amount_row
+    ):
+        return None
+    for geometry in (status_geometry, amount_geometry):
+        rule_count = _integer(geometry.get("vertical_rule_count") or geometry.get("rule_count"))
+        if not (
+            _integer(geometry.get("logical_page")) == logical_page
+            and rule_count == 14
+            and _integer(geometry.get("year_anchor_row_index")) == status_row
+            and str(geometry.get("year_anchor_mode") or "") == "spanning_year_cell"
+            and _integer(geometry.get("year_row_span")) == 2
+            and geometry.get("active_cell_geometry_exact") is True
+            and _integer(geometry.get("active_cell_rule_derived_count")) == 0
+        ):
+            return None
+    return table_id, status_row - 1, status_row, amount_row
+
+
 def _declares_source_table_geometry(ref: Mapping[str, Any]) -> bool:
     geometry = ref.get("geometry_provenance")
     return bool(
         isinstance(geometry, Mapping)
         and str(geometry.get("selection_basis") or "")
         == "source_table_year_plus_twelve_ownership"
+    )
+
+
+def _base_provenance_bound_native_candidate(
+    *,
+    page: Any,
+    table: Any,
+    geometry_tables: list[Mapping[str, Any]],
+    table_geometry: Mapping[str, Any],
+    final_box: tuple[float, float, float, float],
+    final_amount_box: tuple[float, float, float, float],
+    logical_page: int,
+    expected_year: int,
+    expected_month: int,
+    expected_amount: Decimal,
+    header_row: int,
+    status_row: int,
+    amount_row: int,
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    """Bind raw cells through a source-owned base-page header and row pair."""
+
+    from docmirror.plugins.credit_report.source_table_month_lattice import (
+        resolve_unique_source_table_year_plus_twelve_ownership,
+    )
+
+    rows = _rows(table)
+    if not (
+        0 <= header_row < len(rows)
+        and 0 <= status_row < len(rows)
+        and 0 <= amount_row < len(rows)
+        and header_row + 1 == status_row
+        and status_row + 1 == amount_row
+    ):
+        return None
+    header_cells = _row_cell_map(rows[header_row])
+    status_cells = _row_cell_map(rows[status_row])
+    amount_cells = _row_cell_map(rows[amount_row])
+    if not (
+        header_cells
+        and status_cells
+        and amount_cells
+        and set(status_cells) == set(range(13))
+        and expected_month in amount_cells
+        and _header_proves_month_ordinals(header_cells)
+        and _year_cell_proves_row(status_cells[0], expected_year)
+    ):
+        return None
+    # The bound base-page path accepts damaged header text, but never inferred
+    # header geometry or a header cell owned by a different physical row/col.
+    if any(
+        not (
+            _exact_cell(header_cells[month])
+            and _integer(_get(header_cells[month], "row_index")) == header_row
+            and _integer(_get(header_cells[month], "col_index")) == month
+        )
+        for month in range(1, 13)
+    ):
+        return None
+    year_cell = status_cells[0]
+    if not (
+        _integer(_get(year_cell, "row_index")) == status_row
+        and _integer(_get(year_cell, "col_index")) == 0
+    ):
+        return None
+    logical_year_box = _bbox(_matrix_get(table_geometry.get("cell_bboxes"), status_row, 0))
+    raw_year_box = _bbox(_get(year_cell, "bbox"))
+    if not (
+        logical_year_box is not None
+        and raw_year_box is not None
+        and _overlap_is_same_cell(raw_year_box, logical_year_box)
+    ):
+        return None
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        geometry_tables,
+        logical_page=logical_page,
+        expected_year=expected_year,
+        active_months=(expected_month,),
+        year_bbox=logical_year_box,
+        status_bbox=final_box,
+    )
+    table_id = str(_get(table, "table_id") or _get(table, "id") or "")
+    if not (
+        lattice is not None
+        and lattice.table_id == table_id
+        and lattice.year_anchor_row_index == status_row
+        and lattice.header_row_index == header_row
+        and lattice.status_row_index == status_row
+        and lattice.amount_row_index == amount_row
+    ):
+        return None
+    status_cell = status_cells[expected_month]
+    amount_cell = amount_cells[expected_month]
+    token = _canonical_status(_get(status_cell, "text"))
+    native_amount = _decimal(_get(amount_cell, "text"))
+    native_box = lattice.month_bboxes[expected_month - 1]
+    native_amount_box = lattice.amount_bboxes[expected_month - 1]
+    raw_status_box = _bbox(_get(status_cell, "bbox"))
+    raw_amount_box = _bbox(_get(amount_cell, "bbox"))
+    if not (
+        token is not None
+        and _exact_cell(status_cell, require_single_token=True)
+        and _exact_cell(amount_cell, require_single_token=True)
+        and native_amount == expected_amount
+        and raw_status_box is not None
+        and raw_amount_box is not None
+        and _overlap_is_same_cell(raw_status_box, native_box)
+        and _overlap_is_same_cell(raw_amount_box, native_amount_box)
+        and _overlap_is_same_cell(native_box, final_box)
+        and _amount_overlap_is_same_cell(native_amount_box, final_amount_box)
+        and _integer(_get(status_cell, "row_index")) == status_row
+        and _integer(_get(status_cell, "col_index")) == expected_month
+        and _integer(_get(amount_cell, "row_index")) == amount_row
+        and _integer(_get(amount_cell, "col_index")) == expected_month
+    ):
+        return None
+    return (
+        token,
+        _native_source_ref(
+            page=page,
+            table=table,
+            row_index=status_row,
+            column=expected_month,
+            cell=status_cell,
+            logical_bbox=native_box,
+            field_name="status",
+        ),
+        _native_source_ref(
+            page=page,
+            table=table,
+            row_index=amount_row,
+            column=expected_month,
+            cell=amount_cell,
+            logical_bbox=native_amount_box,
+            field_name="overdue_amount",
+        ),
     )
 
 
@@ -689,13 +883,17 @@ def _native_candidates(
         final_amount_ref,
         logical_page=logical_page,
     )
+    base_source_binding = _base_source_geometry_row_binding(
+        final_ref,
+        final_amount_ref,
+        logical_page=logical_page,
+    )
     if (
         _declares_source_table_geometry(final_ref)
         or _declares_source_table_geometry(final_amount_ref)
-    ) and source_binding is None:
-        # A source-table-owned continuation must carry one complete, mutually
-        # agreeing value-free binding.  Falling back to a nearby header table
-        # would silently detach the final cell from its declared ownership.
+    ) and (source_binding is None) == (base_source_binding is None):
+        # A source-owned ref must carry exactly one complete, mutually agreeing
+        # continuation or base-page binding.  Never fall back to a nearby row.
         return []
     candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for page in _candidate_pages(context, final_ref):
@@ -734,6 +932,30 @@ def _native_candidates(
                 # A complete source-lattice binding is the only admissible
                 # ownership proof for this continuation ref.  Never fall back
                 # to a nearby header/table when its bound raw cell is unusable.
+                continue
+            if base_source_binding is not None:
+                bound_table_id, header_row, status_row, amount_row = base_source_binding
+                if table_id != bound_table_id:
+                    continue
+                candidate = _base_provenance_bound_native_candidate(
+                    page=page,
+                    table=table,
+                    geometry_tables=geometry_tables,
+                    table_geometry=table_geometry[0],
+                    final_box=final_box,
+                    final_amount_box=final_amount_box,
+                    logical_page=logical_page,
+                    expected_year=expected_year,
+                    expected_month=expected_month,
+                    expected_amount=expected_amount,
+                    header_row=header_row,
+                    status_row=status_row,
+                    amount_row=amount_row,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
+                # Base-page source ownership is equally binding: malformed or
+                # ambiguous raw evidence may not trigger the generic scan.
                 continue
             rows = _rows(table)
             for row_position in range(1, len(rows) - 1):
@@ -890,6 +1112,7 @@ def apply_candidate_b_native_status_conflict_guard(
         "enabled": bool(enabled),
         "records_checked": 0,
         "unique_native_witnesses": 0,
+        "native_numeric_witnesses_rejected_for_nonpositive_amount": 0,
         "agreements": 0,
         "conflicts_withheld": 0,
     }
@@ -937,6 +1160,15 @@ def apply_candidate_b_native_status_conflict_guard(
             continue
         audit["unique_native_witnesses"] += 1
         native_token, native_ref, native_amount_ref = native[0]
+        if native_token in {"1", "2", "3", "4", "5", "6", "7"} and amount <= 0:
+            # A digit status denotes positive delinquency aging.  The monthly
+            # grid contract already rejects a digit paired with a zero or
+            # negative amount, so such a native OCR token cannot serve as a
+            # competing witness against a valid symbolic final status.
+            audit[
+                "native_numeric_witnesses_rejected_for_nonpositive_amount"
+            ] += 1
+            continue
         if native_token == final_token:
             audit["agreements"] += 1
             continue

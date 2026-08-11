@@ -781,7 +781,11 @@ def _subject_profile(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _credit_account(values: dict[str, Any]) -> dict[str, Any]:
+def _credit_account(
+    values: dict[str, Any],
+    *,
+    coerce_typed_values: bool = True,
+) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "validity_type", "credit_line_validity_type")
     if values.get("sequence") in (None, "") and values.get("category_sequence") not in (
@@ -802,6 +806,16 @@ def _credit_account(values: dict[str, Any]) -> dict[str, Any]:
         "activation_state"
     ) not in (None, ""):
         values["card_activation_state"] = values["activation_state"]
+    if coerce_typed_values and values.get("repayment_periods") not in (None, ""):
+        raw_repayment_periods = values["repayment_periods"]
+        repayment_periods = _integer(raw_repayment_periods)
+        if repayment_periods is not None and repayment_periods >= 0:
+            values["repayment_periods"] = repayment_periods
+        elif is_explicit_source_absence(raw_repayment_periods):
+            # ``--`` is a printed non-applicable value, not a business string.
+            # Keep the exact sentinel in the source snapshots while exposing
+            # JSON null in the typed Community relation.
+            values["repayment_periods"] = None
 
     status_alias = values.get("account_status")
     if status_alias in (None, ""):
@@ -859,10 +873,19 @@ def _project_credit_accounts(records: list[dict[str, Any]]) -> list[dict[str, An
     """Apply the public account aliases consistently to values and evidence."""
     projected = _project_records(records, _credit_account)
     for record in projected:
+        if isinstance(record.get("normalized"), dict):
+            # Live Candidate-B envelopes can retain a flat compatibility copy
+            # beside the authoritative normalized pool. Do not let a stale
+            # source sentinel or untyped value overwrite the coerced relation
+            # during downstream Community serialization.
+            record.pop("repayment_periods", None)
         for snapshot_name in ("canonical_raw", "raw"):
             snapshot = record.get(snapshot_name)
             if isinstance(snapshot, dict):
-                record[snapshot_name] = _credit_account(snapshot)
+                record[snapshot_name] = _credit_account(
+                    snapshot,
+                    coerce_typed_values=False,
+                )
     return projected
 
 
@@ -943,7 +966,11 @@ def _responsible_party_category(values: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _repayment_responsibility(values: dict[str, Any]) -> dict[str, Any]:
+def _repayment_responsibility(
+    values: dict[str, Any],
+    *,
+    coerce_typed_values: bool = True,
+) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "liability_id", "repayment_responsibility_id")
     id_type = str(values.get("related_party_id_type") or "").strip()
@@ -959,6 +986,15 @@ def _repayment_responsibility(values: dict[str, Any]) -> dict[str, Any]:
         values.setdefault("extraction_status", "review")
     category = _responsible_party_category(values)
     values["related_party_category"] = category
+    if coerce_typed_values and values.get("overdue_months") not in (None, ""):
+        raw_overdue_months = values.get("overdue_months")
+        overdue_months = _integer(raw_overdue_months)
+        if overdue_months is None or overdue_months < 0:
+            values.pop("overdue_months", None)
+            values.setdefault("source_status_value", raw_overdue_months)
+            values.setdefault("extraction_status", "review")
+        else:
+            values["overdue_months"] = overdue_months
     combined = values.pop("overdue_months_or_repayment_status", None)
     if combined not in (None, ""):
         values["source_status_value"] = combined
@@ -1006,7 +1042,10 @@ def _project_repayment_responsibilities(
         for snapshot_name in ("canonical_raw", "raw"):
             snapshot = record.get(snapshot_name)
             if isinstance(snapshot, dict):
-                record[snapshot_name] = _repayment_responsibility(snapshot)
+                record[snapshot_name] = _repayment_responsibility(
+                    snapshot,
+                    coerce_typed_values=False,
+                )
     return projected
 
 
@@ -1358,12 +1397,15 @@ def _canonical_dataset_name(source_name: Any) -> str:
     return name
 
 
-def _canonical_field_name(dataset_name: str, field_name: Any) -> str:
+def _canonical_field_name(dataset_name: str, field_name: Any) -> str | None:
     """Return the final-v2 field that owns one source/compatibility value."""
 
     name = str(field_name or "")
     aliases = {
-        "subject_profile": {"personal_profile_id": "subject_profile_id"},
+        "subject_profile": {
+            "personal_profile_id": "subject_profile_id",
+            "mobile_phone": None,
+        },
         "credit_accounts": {
             "category_sequence": "sequence",
             "institution": "management_institution",
@@ -1379,6 +1421,37 @@ def _canonical_field_name(dataset_name: str, field_name: Any) -> str:
         },
         "credit_account_monthly_performance": {
             "overdue_amount": "status_amount",
+            "status": "status_code",
+        },
+        # These source names describe multi-field blobs or values that moved to
+        # their own canonical dataset.  Keeping them as ``field_name`` would
+        # falsely claim a field that does not exist in the closed-world API;
+        # the issue/observation evidence still preserves the source label.
+        "subject_employment": {
+            "employment_components": None,
+            "values": None,
+        },
+        # Summary-table source labels identify the metric row.  The unresolved
+        # cell itself projects to the canonical numeric value field.
+        "credit_business_overview": {
+            "value": "numeric_value",
+            "账户数": "numeric_value",
+            "授信总额": "numeric_value",
+            "余额": "numeric_value",
+            "最近6个月平均应还款": "numeric_value",
+            "担保责任": "numeric_value",
+            "其他相关还款责任": "numeric_value",
+            "为企业/担保责任": "numeric_value",
+            "为企业/其他相关还款责任": "numeric_value",
+            "最近1个月内的查询机构数": "numeric_value",
+            "最近1个月内的查询次数": "numeric_value",
+            "最近2年内的查询次数": "numeric_value",
+            "本人查询": "numeric_value",
+            "贷后管理": "numeric_value",
+            "贷款审批": "numeric_value",
+            "担保资格 审查": "numeric_value",
+            "特约商户 实名审查": "numeric_value",
+            "信用卡审批": "numeric_value",
         },
     }
     return aliases.get(dataset_name, {}).get(name, name)
@@ -1398,9 +1471,13 @@ def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
     if canonical_name in PBOC_DATASET_ORDER and canonical_name not in _CONTROL_DATASETS:
         values["dataset_name"] = canonical_name
         if values.get("field_name"):
-            values["field_name"] = _canonical_field_name(
+            canonical_field = _canonical_field_name(
                 canonical_name, values["field_name"]
             )
+            if canonical_field is None:
+                values.pop("field_name", None)
+            else:
+                values["field_name"] = canonical_field
     else:
         values["dataset_name"] = "unknown"
         if source_name:
@@ -1535,10 +1612,24 @@ def _extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
         values["target_dataset"] = _canonical_dataset_name(values["target_dataset"])
     else:
         values.pop("target_dataset", None)
-    if values.get("field_name") and values.get("target_dataset"):
-        values["field_name"] = _canonical_field_name(
+    if (
+        values.get("issue_code")
+        == "candidate_b_native_source_cell_repayment_status_conflict"
+        and values.get("target_dataset") == "credit_account_monthly_performance"
+        and values.get("field_name") == "status"
+    ):
+        # This geometry-bound conflict contract is deliberately stricter than
+        # generic legacy monthly diagnostics: only its native ``status_code``
+        # target proves that a withheld row may survive the final gate.
+        values.pop("field_name", None)
+    elif values.get("field_name") and values.get("target_dataset"):
+        canonical_field = _canonical_field_name(
             str(values["target_dataset"]), values["field_name"]
         )
+        if canonical_field is None:
+            values.pop("field_name", None)
+        else:
+            values["field_name"] = canonical_field
     return values
 
 
@@ -2890,6 +2981,14 @@ def _canonical_quality_gate(
                     continue
                 elif isinstance(value, (Mapping, list, tuple, set)):
                     invalid.append((field_name, value, "canonical_unstructured_value_withheld"))
+                elif (
+                    dataset_name == "credit_accounts"
+                    and field_name == "repayment_periods"
+                    and (type(value) is not int or value < 0)
+                ):
+                    invalid.append(
+                        (field_name, value, "canonical_field_contract_failed")
+                    )
                 elif field_name.endswith("_date") or field_name in {"birth_date", "inquiry_date"}:
                     if not valid_iso_date(value):
                         invalid.append((field_name, value, "canonical_date_invalid"))
@@ -3061,6 +3160,12 @@ def _canonical_quality_gate(
     unique_observations: dict[str, dict[str, Any]] = {}
     for record in observations:
         values = _field_observation(_normalized(record))
+        # Multi-field/source-collection aliases do not identify one canonical
+        # business field. Their extraction issue remains visible with typed
+        # evidence, but publishing a field observation without ``field_name``
+        # would violate the v2 control contract and falsely imply a field.
+        if not values.get("field_name"):
+            continue
         observation_target = (
             str(values.get("dataset_name") or ""),
             str(values.get("business_record_id") or ""),
@@ -3128,22 +3233,77 @@ def _canonical_quality_gate(
             "reason": str(existing_values.get("reason") or "unresolved_extraction_issue"),
         }
         if target == "credit_account_monthly_performance":
-            withheld_count = sum(
-                int(observed.get("withheld_month_count") or 0)
-                for issue in unique_issues.values()
-                if str(_normalized(issue).get("issue_code") or "")
-                == "candidate_b_monthly_status_grid_unresolved"
-                and isinstance(
-                    observed := _normalized(issue).get("observed_value"), Mapping
-                )
-                and isinstance(observed.get("withheld_month_count"), int)
-                and not isinstance(observed.get("withheld_month_count"), bool)
-            )
+            withheld_by_grid: dict[str, int] = {}
+            conflicting_status_grids: set[str] = set()
+            for issue in unique_issues.values():
+                issue_values = _normalized(issue)
+                if (
+                    str(issue_values.get("issue_code") or "")
+                    != "candidate_b_monthly_status_grid_unresolved"
+                ):
+                    continue
+                observed = issue_values.get("observed_value")
+                if not isinstance(observed, Mapping):
+                    continue
+                grid_id = str(observed.get("grid_id") or "").strip() or "__unkeyed__"
+                withheld_month_count = observed.get("withheld_month_count")
+                if (
+                    not isinstance(withheld_month_count, int)
+                    or isinstance(withheld_month_count, bool)
+                    or withheld_month_count <= 0
+                ):
+                    continue
+                prior_count = withheld_by_grid.get(grid_id)
+                if prior_count is not None and prior_count != withheld_month_count:
+                    conflicting_status_grids.add(grid_id)
+                    withheld_by_grid.pop(grid_id, None)
+                    continue
+                if grid_id not in conflicting_status_grids:
+                    withheld_by_grid[grid_id] = withheld_month_count
+            withheld_count = sum(withheld_by_grid.values())
             materialized_population = normalized["observed_row_count"] + withheld_count
             structural_expected_counts: list[int] = []
+            owner_unresolved_by_grid: dict[str, int] = {}
+            conflicting_owner_grids: set[str] = set()
             for issue in unique_issues.values():
                 issue_values = _normalized(issue)
                 issue_code = str(issue_values.get("issue_code") or "")
+                if issue_code == "candidate_b_monthly_grid_owner_unresolved":
+                    observed = issue_values.get("observed_value")
+                    candidate = issue_values.get("candidate_value")
+                    grid_id = (
+                        str(observed.get("grid_id") or "").strip()
+                        if isinstance(observed, Mapping)
+                        else ""
+                    )
+                    expected_month_count = (
+                        candidate.get("expected_month_count")
+                        if isinstance(candidate, Mapping)
+                        else None
+                    )
+                    observed_candidate_count = (
+                        observed.get("observed_candidate_count")
+                        if isinstance(observed, Mapping)
+                        else None
+                    )
+                    if (
+                        not grid_id
+                        or not isinstance(expected_month_count, int)
+                        or isinstance(expected_month_count, bool)
+                        or expected_month_count <= 0
+                        or not isinstance(observed_candidate_count, int)
+                        or isinstance(observed_candidate_count, bool)
+                        or observed_candidate_count != expected_month_count
+                    ):
+                        continue
+                    prior_count = owner_unresolved_by_grid.get(grid_id)
+                    if prior_count is not None and prior_count != expected_month_count:
+                        conflicting_owner_grids.add(grid_id)
+                        owner_unresolved_by_grid.pop(grid_id, None)
+                        continue
+                    if grid_id not in conflicting_owner_grids:
+                        owner_unresolved_by_grid[grid_id] = expected_month_count
+                    continue
                 if issue_code == "monthly_population_incomplete_from_account_gap":
                     observed = issue_values.get("observed_value")
                     canonical_grid_count = (
@@ -3192,6 +3352,11 @@ def _canonical_quality_gate(
                         else materialized_population
                     )
                     + missing
+                )
+            owner_unresolved_count = sum(owner_unresolved_by_grid.values())
+            if owner_unresolved_count:
+                structural_expected_counts.append(
+                    materialized_population + owner_unresolved_count
                 )
             if withheld_count or structural_expected_counts:
                 source_expected = existing_values.get("expected_row_count")

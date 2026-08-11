@@ -609,5 +609,9 @@ log "Active release: $RELEASE_DIR"
 log "Version: $CANDIDATE_VERSION"
 log "Health response: $HEALTH_FILE"
 log "Shared runtime snapshot: $RELEASE_DIR/shared-runtime-freeze.txt"
-log "Archive retained: $ARCHIVE"
+if rm -f -- "$ARCHIVE" "$ARCHIVE.sha256"; then
+    log "Uploaded archive and checksum deleted"
+else
+    warn "Deployment succeeded, but archive cleanup failed: $ARCHIVE"
+fi
 log "Previous releases were retained for rollback"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
 )
@@ -55,6 +56,144 @@ def _line(text: str, y: float, *, evidence_id: str) -> dict[str, object]:
         "confidence": 0.97,
         "evidence_ids": [evidence_id],
     }
+
+
+def _adjacent_liability_anchor_context(
+    *,
+    anchor_bbox: list[float] | None = None,
+) -> SimpleNamespace:
+    headers = [
+        "管理机构",
+        "业务种类",
+        "开立日期",
+        "到期日期",
+        "责任人类型",
+        "还款责任金额",
+        "币种",
+        "保证合同编号",
+    ]
+    values = [
+        "中国农业银行股份有限公司大理分行",
+        "贷款",
+        "2023.09.18",
+        "2024.09.13",
+        "共同借款人",
+        "",
+        "人民币元",
+        "",
+    ]
+    column_width = 44.0
+    source_cell_bboxes = [
+        [
+            [
+                47.0 + column * column_width,
+                339.5 if row == 0 else 352.5,
+                47.0 + (column + 1) * column_width,
+                352.5 if row == 0 else 378.0,
+            ]
+            for column in range(8)
+        ]
+        for row in range(2)
+    ]
+    table = SimpleNamespace(
+        table_id="pt_19_2",
+        metadata={
+            "raw_rows": [headers, values],
+            "source_cell_bboxes": source_cell_bboxes,
+            "cell_evidence_ids": [
+                [
+                    [f"pt19:{row}:{column}"]
+                    if [headers, values][row][column]
+                    else []
+                    for column in range(8)
+                ]
+                for row in range(2)
+            ],
+        },
+        headers=[],
+        rows=[],
+        bbox=[47.0, 339.5, 399.0, 444.0],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        canonical_template_id="repayment_liability",
+        texts=[
+            SimpleNamespace(
+                content="账户4",
+                bbox=anchor_bbox or [49.5, 329.0, 70.0, 340.5],
+            )
+        ],
+        tables=[table],
+    )
+    return SimpleNamespace(
+        pages=[page],
+        reading_order_by_logical={19: 19},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        tables_continue=lambda _left, _right: None,
+        corrected_evidence_pages=lambda: [],
+        _personal_detail_extraction_issues=[],
+    )
+
+
+def test_native_liability_card_can_use_one_adjacent_printed_ordinal() -> None:
+    context = _adjacent_liability_anchor_context()
+
+    records = PBOCPersonalDetailNativeParser(context).records(
+        "repayment_liability_records"
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.fields["__printed_sequence"] == "4"
+    assert record.fields["管理机构"] == "中国农业银行股份有限公司大理分行"
+    assert record.fields["开立日期"] == "2023.09.18"
+    assert record.binding_quality_by_field["__printed_sequence"] == (
+        "canonical_card_anchor"
+    )
+    sequence_ref = record.source_refs_by_field["__printed_sequence"][0]
+    assert sequence_ref["source"] == "native_detail_canonical_anchor_text"
+    assert sequence_ref["logical_page"] == 19
+    assert sequence_ref["source_page"] == 10
+    assert sequence_ref["bbox"] == [49.5, 329.0, 70.0, 340.5]
+    assert "还款责任金额" not in record.fields
+    assert "保证合同编号" not in record.fields
+    assert {"还款责任金额", "保证合同编号"} <= record.unresolved_labels
+
+
+def test_native_liability_card_rejects_distant_printed_ordinal() -> None:
+    context = _adjacent_liability_anchor_context(
+        anchor_bbox=[49.5, 280.0, 70.0, 300.0]
+    )
+
+    records = PBOCPersonalDetailNativeParser(context).records(
+        "repayment_liability_records"
+    )
+
+    assert records == []
+
+
+def test_liability_extraction_retains_ordinal_card_and_reports_blank_slots() -> None:
+    context = _adjacent_liability_anchor_context()
+
+    records = native_extraction._extract_liabilities(context)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["_printed_sequence"] == 4
+    assert record["institution"] == "中国农业银行股份有限公司大理分行"
+    assert record["open_date"] == "2023-09-18"
+    assert record.get("responsibility_amount") is None
+    assert record.get("contract_number") is None
+    assert record.get("responsibility_amount") != 700210
+    unresolved_issues = {
+        str(issue.get("field_name") or "")
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code")
+        == "candidate_b_repayment_responsibility_required_field_unresolved"
+        and issue.get("target_record_id") == record["liability_id"]
+    }
+    assert {"responsibility_amount", "contract_number"} <= unresolved_issues
 
 
 def test_native_parser_decodes_packed_liability_with_exact_cell_provenance() -> None:

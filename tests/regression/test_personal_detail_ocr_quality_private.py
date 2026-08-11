@@ -27,6 +27,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     PBOC_DATASET_ORDER,
+    personal_detail_data_dictionary,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
@@ -87,6 +88,7 @@ _LIN_EXPECTED_SOURCE_VETTED_ACCOUNT_TYPES = {
 _LIN_EXPECTED_MONTH_POSITIONS = 944
 _LIN_EXPECTED_INQUIRIES = 90
 _LIN_EXPECTED_LIABILITIES = 3
+_YANG_EXPECTED_LIABILITIES = 6
 _YE_EXPECTED_MONTH_POSITIONS = 951
 _YE_EXPECTED_STATUS_WITHHELD = 121
 _YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS = 42
@@ -187,6 +189,39 @@ _LIN_MONTH_GEOMETRY_GUARDS = {
 }
 
 
+def _inclusive_month_keys(start: str, end: str) -> tuple[str, ...]:
+    start_year, start_month = (int(part) for part in start.split("-"))
+    end_year, end_month = (int(part) for part in end.split("-"))
+    result: list[str] = []
+    year, month = start_year, start_month
+    while (year, month) <= (end_year, end_month):
+        result.append(f"{year:04d}-{month:02d}")
+        month += 1
+        if month == 13:
+            year += 1
+            month = 1
+    return tuple(result)
+
+
+_YU_EXPECTED_MONTHS_BY_GRID = {
+    "mg_p4_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p7_repayment_0": _inclusive_month_keys("2017-08", "2018-08"),
+    "mg_p7_repayment_1": _inclusive_month_keys("2018-03", "2019-03"),
+    "mg_p8_repayment_0": _inclusive_month_keys("2017-08", "2022-07"),
+    "mg_p8_repayment_1": _inclusive_month_keys("2017-08", "2022-07"),
+    "mg_p9_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p9_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p10_repayment_0": _inclusive_month_keys("2017-08", "2022-07"),
+    "mg_p11_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p11_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p12_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p12_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
+    "mg_p13_repayment_0": _inclusive_month_keys("2017-08", "2022-02"),
+    "mg_p14_repayment_0": _inclusive_month_keys("2017-08", "2018-07"),
+    "mg_p14_repayment_1": _inclusive_month_keys("2017-08", "2022-07"),
+}
+
+
 def _dataset_map(payload: dict) -> dict[str, dict]:
     return {
         str(dataset.get("name") or ""): dataset
@@ -246,6 +281,301 @@ def _assert_five_report_population_reporting(payload: dict, fixture: Path) -> No
         raise AssertionError(
             f"{fixture.name} population-reporting failures:\n- " + "\n- ".join(defects)
         )
+
+
+def _assert_yang_liability_dataset_oracle(payload: dict) -> None:
+    """Require all six source cards and the explicitly unresolved dash slots."""
+
+    datasets = _dataset_map(payload)
+    liability_dataset = datasets["repayment_responsibilities"]
+    wrappers = liability_dataset.get("rows") or []
+    completeness = liability_dataset.get("completeness") or {}
+    assert liability_dataset.get("row_count") == _YANG_EXPECTED_LIABILITIES
+    assert completeness.get("expected_row_count") == _YANG_EXPECTED_LIABILITIES
+    assert completeness.get("emitted_row_count") == _YANG_EXPECTED_LIABILITIES
+    assert completeness.get("omitted_row_count") == 0
+
+    rows = [wrapper.get("normalized") or {} for wrapper in wrappers]
+    assert all(
+        row.get("overdue_months") is None
+        or (
+            type(row.get("overdue_months")) is int
+            and row["overdue_months"] >= 0
+        )
+        for row in rows
+    )
+    missing_dash_rows = [
+        (wrapper, wrapper.get("normalized") or {})
+        for wrapper in wrappers
+        if (wrapper.get("normalized") or {}).get("related_party_id_number")
+        == "5329010002043257"
+    ]
+    assert len(missing_dash_rows) == 1
+    wrapper, row = missing_dash_rows[0]
+    assert row.get("institution") == "中国农业银行股份有限公司大理分行"
+    assert row.get("business_type") == "贷款"
+    assert row.get("open_date") == "2023-09-18"
+    assert row.get("due_date") == "2024-09-13"
+    assert row.get("responsibility_type") == "共同借款人"
+    assert row.get("snapshot_date") == "2024-05-28"
+    assert row.get("balance") == "3500000"
+    assert row.get("currency") == "CNY"
+    assert row.get("five_tier_class") == "正常"
+    assert row.get("overdue_months") == 0
+    assert row.get("responsibility_amount") is None
+    assert row.get("contract_number") is None
+    assert "700210" not in {str(value) for value in row.values() if value is not None}
+
+    record_id = str(wrapper.get("record_id") or row.get("repayment_responsibility_id") or "")
+    assert record_id
+    issues = [
+        issue_wrapper.get("normalized") or {}
+        for issue_wrapper in datasets["extraction_issues"].get("rows") or []
+    ]
+    active_fields = {
+        str(issue.get("field_name") or "")
+        for issue in issues
+        if issue.get("target_dataset") == "repayment_responsibilities"
+        and str(issue.get("target_record_id") or "") == record_id
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    }
+    assert {"responsibility_amount", "contract_number"} <= active_fields
+
+
+def _assert_yang_monthly_native_conflict_oracle(payload: dict) -> None:
+    """Require the source-valid symbolic zero and the one irreducible conflict."""
+
+    datasets = _dataset_map(payload)
+    wrappers = {
+        str(
+            wrapper.get("record_id")
+            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+            or ""
+        ): wrapper
+        for wrapper in datasets["credit_account_monthly_performance"].get("rows")
+        or []
+    }
+    digit_false_conflict_id = "mg_p13_repayment_1:2023-05"
+    assert digit_false_conflict_id in wrappers
+    corrected = wrappers[digit_false_conflict_id].get("normalized") or {}
+    assert corrected.get("status_code") == "*"
+    assert _decimal_amount(corrected.get("status_amount")) == Decimal(0)
+    assert not _active_monthly_field_issues(
+        payload,
+        digit_false_conflict_id,
+        "status_code",
+    )
+
+    _assert_exact_native_status_conflict(
+        payload,
+        "mg_p13_repayment_1:2019-08",
+        corrected_status="*",
+        native_status="#",
+        logical_page=14,
+    )
+
+
+def _assert_community_closed_world_dataset_catalog(payload: dict) -> None:
+    """Audit business rows and control references against the canonical catalog."""
+
+    datasets = payload.get("datasets") or []
+    dataset_names = [str(dataset.get("name") or "") for dataset in datasets]
+    assert all(dataset_names)
+    assert len(dataset_names) == len(set(dataset_names))
+    assert dataset_names == [
+        name for name in PBOC_DATASET_ORDER if name in set(dataset_names)
+    ]
+    catalog = personal_detail_data_dictionary()["datasets"]
+    assert set(dataset_names) <= set(PBOC_DATASET_ORDER)
+    dataset_map = _dataset_map(payload)
+    for dataset in datasets:
+        dataset_name = str(dataset["name"])
+        declared_fields = set(catalog[dataset_name]["columns"])
+        column_keys = {
+            str(column.get("key") or "")
+            for column in dataset.get("columns") or []
+            if isinstance(column, dict)
+        }
+        assert "" not in column_keys
+        assert column_keys <= declared_fields
+        assert all(
+            set(wrapper.get(pool_name) or {}) <= declared_fields
+            and set(wrapper.get(pool_name) or {}) <= column_keys
+            for wrapper in dataset.get("rows") or []
+            for pool_name in ("normalized", "canonical_raw", "raw")
+        )
+
+    control_datasets = {
+        "field_observations",
+        "extraction_issues",
+        "extraction_issue_evidence",
+        "pboc_extension_fields",
+        "dataset_status",
+    }
+    business_datasets = set(PBOC_DATASET_ORDER) - control_datasets
+    observation_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in dataset_map.get("field_observations", {}).get("rows") or []
+    ]
+    for observation in observation_rows:
+        dataset_name = str(observation.get("dataset_name") or "")
+        field_name = str(observation.get("field_name") or "")
+        assert dataset_name in business_datasets
+        assert field_name in catalog[dataset_name]["columns"]
+    issue_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in dataset_map.get("extraction_issues", {}).get("rows") or []
+    ]
+    for issue in issue_rows:
+        target_dataset = str(issue.get("target_dataset") or "")
+        field_name = str(issue.get("field_name") or "")
+        if not target_dataset:
+            assert not field_name
+            continue
+        assert target_dataset in business_datasets
+        if field_name:
+            assert field_name in catalog[target_dataset]["columns"]
+    for wrapper in dataset_map.get("dataset_status", {}).get("rows") or []:
+        status = wrapper.get("normalized") or {}
+        assert str(status.get("dataset_name") or "") in business_datasets
+
+    sample_excluded_datasets = {
+        "fraud_warnings",
+        "credit_scores",
+        "credit_score_reasons",
+        "social_assistance_records",
+    }
+    assert all(
+        str(observation.get("dataset_name") or "") not in sample_excluded_datasets
+        for observation in observation_rows
+    )
+    assert all(
+        not issue.get("field_name")
+        or str(issue.get("target_dataset") or "") not in sample_excluded_datasets
+        for issue in issue_rows
+    )
+    for sample_excluded_dataset in sample_excluded_datasets:
+        assert dataset_map.get(sample_excluded_dataset, {}).get("row_count", 0) == 0
+    assert dataset_map.get("pboc_extension_fields", {}).get("row_count", 0) == 0
+
+
+def _assert_exact_month_grid_partition(
+    payload: dict,
+    *,
+    expected_months_by_grid: dict[str, tuple[str, ...]],
+) -> None:
+    """Require every source-audited grid/month key to be emitted or localized once."""
+
+    datasets = _dataset_map(payload)
+    monthly = datasets["credit_account_monthly_performance"]
+    expected_ids = {
+        f"{grid_id}:{month}"
+        for grid_id, months in expected_months_by_grid.items()
+        for month in months
+    }
+    emitted_ids = {
+        str(
+            wrapper.get("record_id")
+            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+            or ""
+        )
+        for wrapper in monthly.get("rows") or ()
+    }
+    assert "" not in emitted_ids
+    assert len(emitted_ids) == int(monthly.get("row_count") or 0)
+
+    issue_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issues"].get("rows") or ()
+    ]
+    evidence_rows = [
+        wrapper.get("normalized") or {}
+        for wrapper in datasets["extraction_issue_evidence"].get("rows") or ()
+    ]
+    evidence_by_issue: dict[str, list[dict]] = {}
+    for evidence in evidence_rows:
+        evidence_by_issue.setdefault(
+            str(evidence.get("extraction_issue_id") or ""), []
+        ).append(evidence)
+
+    localized_ids: set[str] = set()
+    for issue in issue_rows:
+        if (
+            issue.get("target_dataset") != "credit_account_monthly_performance"
+            or str(issue.get("status") or "requires_review")
+            in {"resolved", "suppressed_redundant", "informational"}
+        ):
+            continue
+        issue_code = str(issue.get("issue_code") or "")
+        if issue_code not in {
+            "candidate_b_monthly_status_grid_unresolved",
+            "candidate_b_monthly_grid_owner_unresolved",
+        }:
+            continue
+        issue_id = str(issue.get("extraction_issue_id") or "")
+        evidence = evidence_by_issue.get(issue_id, [])
+        grid_ids = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "grid_id"
+        }
+        assert len(grid_ids) == 1, issue_id
+        grid_id = next(iter(grid_ids))
+        if issue_code == "candidate_b_monthly_status_grid_unresolved":
+            months = {
+                str(row.get("string_value") or "")
+                for row in evidence
+                if row.get("evidence_kind") == "observed"
+                and re.fullmatch(
+                    r"withheld_months\[\d+\]",
+                    str(row.get("evidence_path") or ""),
+                )
+            }
+            counts = [
+                int(row.get("integer_value") or 0)
+                for row in evidence
+                if row.get("evidence_kind") == "observed"
+                and row.get("evidence_path") == "withheld_month_count"
+            ]
+        else:
+            months = {
+                str(row.get("string_value") or "")
+                for row in evidence
+                if row.get("evidence_kind") == "candidate"
+                and re.fullmatch(
+                    r"expected_months\[\d+\]",
+                    str(row.get("evidence_path") or ""),
+                )
+            }
+            observed_months = {
+                str(row.get("string_value") or "")
+                for row in evidence
+                if row.get("evidence_kind") == "observed"
+                and re.fullmatch(
+                    r"observed_candidate_months\[\d+\]",
+                    str(row.get("evidence_path") or ""),
+                )
+            }
+            assert observed_months == months, issue_id
+            counts = [
+                int(row.get("integer_value") or 0)
+                for row in evidence
+                if row.get("evidence_kind") == "candidate"
+                and row.get("evidence_path") == "expected_month_count"
+            ]
+        assert counts == [len(months)], issue_id
+        record_ids = {f"{grid_id}:{month}" for month in months}
+        assert localized_ids.isdisjoint(record_ids), issue_id
+        localized_ids.update(record_ids)
+
+    assert emitted_ids.isdisjoint(localized_ids)
+    assert emitted_ids | localized_ids == expected_ids
+    completeness = monthly.get("completeness") or {}
+    assert completeness.get("expected_row_count") == len(expected_ids)
+    assert completeness.get("emitted_row_count") == len(emitted_ids)
+    assert completeness.get("omitted_row_count") == len(localized_ids)
 
 
 def _compact_source_table(table: dict) -> str:
@@ -925,6 +1255,17 @@ def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
     assert monthly_dataset.get("row_count") == len(rows) == emitted
     assert expected == emitted + omitted == _LIN_EXPECTED_MONTH_POSITIONS
 
+    emitted_ids = {
+        str(
+            wrapper.get("record_id")
+            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+            or ""
+        )
+        for wrapper in rows
+    }
+    assert "" not in emitted_ids
+    assert len(emitted_ids) == emitted
+
     issue_rows = [
         wrapper.get("normalized") or {}
         for wrapper in datasets["extraction_issues"].get("rows") or []
@@ -939,14 +1280,98 @@ def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
         wrapper.get("normalized") or {}
         for wrapper in datasets["extraction_issue_evidence"].get("rows") or []
     ]
-    reported_withheld = sum(
-        int(evidence.get("integer_value") or 0)
-        for evidence in evidence_rows
-        if str(evidence.get("extraction_issue_id") or "") in status_grid_issue_ids
-        and evidence.get("evidence_kind") == "observed"
-        and evidence.get("evidence_path") == "withheld_month_count"
-    )
-    assert reported_withheld == omitted
+    evidence_by_issue: dict[str, list[dict]] = {}
+    for evidence in evidence_rows:
+        evidence_by_issue.setdefault(
+            str(evidence.get("extraction_issue_id") or ""), []
+        ).append(evidence)
+
+    status_withheld_ids: set[str] = set()
+    for issue_id in status_grid_issue_ids:
+        evidence = evidence_by_issue.get(issue_id, [])
+        grid_ids = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "grid_id"
+        }
+        months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and re.fullmatch(
+                r"withheld_months\[\d+\]", str(row.get("evidence_path") or "")
+            )
+        }
+        counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "withheld_month_count"
+        ]
+        assert len(grid_ids) == len(counts) == 1, issue_id
+        assert counts[0] == len(months), issue_id
+        grid_id = next(iter(grid_ids))
+        record_ids = {f"{grid_id}:{month}" for month in months}
+        assert status_withheld_ids.isdisjoint(record_ids), issue_id
+        status_withheld_ids.update(record_ids)
+
+    owner_issue_ids = {
+        str(issue.get("extraction_issue_id") or "")
+        for issue in issue_rows
+        if issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        and issue.get("target_dataset") == "credit_account_monthly_performance"
+    }
+    owner_withheld_ids: set[str] = set()
+    for issue_id in owner_issue_ids:
+        evidence = evidence_by_issue.get(issue_id, [])
+        grid_ids = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "grid_id"
+        }
+        expected_months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "candidate"
+            and re.fullmatch(
+                r"expected_months\[\d+\]", str(row.get("evidence_path") or "")
+            )
+        }
+        observed_months = {
+            str(row.get("string_value") or "")
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and re.fullmatch(
+                r"observed_candidate_months\[\d+\]",
+                str(row.get("evidence_path") or ""),
+            )
+        }
+        expected_counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "candidate"
+            and row.get("evidence_path") == "expected_month_count"
+        ]
+        observed_counts = [
+            int(row.get("integer_value") or 0)
+            for row in evidence
+            if row.get("evidence_kind") == "observed"
+            and row.get("evidence_path") == "observed_candidate_count"
+        ]
+        assert len(grid_ids) == len(expected_counts) == len(observed_counts) == 1, issue_id
+        assert expected_counts[0] == observed_counts[0] == len(expected_months), issue_id
+        assert observed_months == expected_months, issue_id
+        grid_id = next(iter(grid_ids))
+        record_ids = {f"{grid_id}:{month}" for month in expected_months}
+        assert owner_withheld_ids.isdisjoint(record_ids), issue_id
+        owner_withheld_ids.update(record_ids)
+
+    assert emitted_ids.isdisjoint(status_withheld_ids | owner_withheld_ids)
+    assert status_withheld_ids.isdisjoint(owner_withheld_ids)
+    assert omitted == len(status_withheld_ids) + len(owner_withheld_ids)
+    assert expected == len(emitted_ids | status_withheld_ids | owner_withheld_ids)
 
 
 def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
@@ -1389,6 +1814,15 @@ def test_personal_detail_ocr_correction_invariants(
         )
 
     _assert_five_report_population_reporting(payload, fixture)
+    _assert_community_closed_world_dataset_catalog(payload)
+    if fixture.name == "杨松林个人征信24.7.29.pdf":
+        _assert_yang_liability_dataset_oracle(payload)
+        _assert_yang_monthly_native_conflict_oracle(payload)
+    if fixture.name == "余泽熙7.15征信.pdf":
+        _assert_exact_month_grid_partition(
+            payload,
+            expected_months_by_grid=_YU_EXPECTED_MONTHS_BY_GRID,
+        )
 
     assert raw_bundles == raw_snapshot
     assert topology_audit["valid"] is True
@@ -1489,31 +1923,42 @@ def test_personal_detail_ocr_correction_invariants(
         # canonical schema/source structure independently demonstrates a gap.
         canonical_gaps = [
             issue
-            for issue in collect_extraction_issues(context)
+            for issue in source_issues
             if issue.get("issue_code") == "canonical_monthly_reconstruction_incomplete"
         ]
         population_gaps = [
             issue
-            for issue in collect_extraction_issues(context)
+            for issue in source_issues
             if issue.get("issue_code") == "monthly_population_incomplete_from_account_gap"
         ]
         linkage_gaps = [
             issue
-            for issue in collect_extraction_issues(context)
+            for issue in source_issues
             if issue.get("issue_code") == "monthly_linkage_collision_from_account_gap"
         ]
         status_gaps = [
             issue
-            for issue in collect_extraction_issues(context)
+            for issue in source_issues
             if issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
         ]
+        owner_gaps = [
+            issue
+            for issue in source_issues
+            if issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        ]
         if len(linked_repayments) < int(expected_repayments * 0.90):
-            assert canonical_gaps or population_gaps or linkage_gaps or status_gaps
+            assert (
+                canonical_gaps
+                or population_gaps
+                or linkage_gaps
+                or status_gaps
+                or owner_gaps
+            )
         for canonical_gap in canonical_gaps:
             canonical_count = canonical_gap["observed_value"]["canonical_row_count"]
             assert canonical_count >= len(linked_repayments)
             if canonical_count > len(linked_repayments):
-                assert population_gaps or linkage_gaps or status_gaps
+                assert population_gaps or linkage_gaps or status_gaps or owner_gaps
             assert canonical_gap["candidate_value"]["structural_expected_row_count"] > len(linked_repayments)
             assert canonical_gap["candidate_value"]["missing_month_count"] > 0
         for population_gap in population_gaps:
@@ -1652,6 +2097,13 @@ def test_personal_detail_ocr_correction_invariants(
         assert monthly_id in active_native_status_conflict_ids, (
             f"{monthly_id}: null monthly status lacks an exact active native-source-cell conflict"
         )
+        assert row.get("account_id") and row.get("grid_id")
+        assert re.fullmatch(
+            r"\d{4}-(?:0[1-9]|1[0-2])",
+            str(row.get("performance_month") or ""),
+        )
+        assert _decimal_amount(row.get("status_amount")) is not None
+        assert (wrapper.get("review") or {}).get("status") == "requires_review"
     field_observation_rows = [
         row["normalized"]
         for row in v2_datasets.get("field_observations", {}).get("rows", [])
@@ -1766,7 +2218,11 @@ def test_personal_detail_ocr_correction_invariants(
         if row.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
         and row.get("target_dataset") == "credit_account_monthly_performance"
     ]
-    if unresolved_source_months:
+    unresolved_unemitted_source_months = (
+        unresolved_source_months - len(active_native_status_conflict_ids)
+    )
+    assert unresolved_unemitted_source_months >= 0
+    if unresolved_unemitted_source_months:
         assert final_status_grid_issues
         assert v2_statuses["credit_account_monthly_performance"]["presence_status"] == "partial"
     monthly_status_contract_issues = [
@@ -1870,7 +2326,9 @@ def test_personal_detail_ocr_correction_invariants(
         for wrapper in monthly_record_rows
     }
     assert "" not in emitted_monthly_ids
-    assert emitted_monthly_ids <= typed_linked_id_set
+    reported_linked_id_set = typed_linked_id_set | active_native_status_conflict_ids
+    assert emitted_monthly_ids <= reported_linked_id_set
+    assert active_native_status_conflict_ids <= emitted_monthly_ids
     _assert_zero_overdue_status_amount_oracle(payload)
 
     monthly_wrapper_by_id = {
@@ -1967,7 +2425,8 @@ def test_personal_detail_ocr_correction_invariants(
 
     assert (
         emitted_monthly_ids
-        == typed_linked_id_set - actionable_status_withheld_ids
+        == (typed_linked_id_set - actionable_status_withheld_ids)
+        | active_native_status_conflict_ids
     )
     assert (
         v2_datasets["credit_account_monthly_performance"]["row_count"]
@@ -1985,7 +2444,9 @@ def test_personal_detail_ocr_correction_invariants(
         and row.get("evidence_path") == "withheld_month_count"
     )
     assert reported_withheld_months == (
-        unresolved_source_months + len(actionable_status_withheld_ids)
+        unresolved_source_months
+        + len(actionable_status_withheld_ids)
+        - len(active_native_status_conflict_ids)
     )
     monthly_completeness = v2_datasets["credit_account_monthly_performance"][
         "completeness"
@@ -2320,6 +2781,34 @@ def test_personal_detail_ocr_correction_invariants(
 def _project_personal_detail_bundle(sealed, fixture: Path):
     """Project this plugin while an unrelated enterprise-only semantic contract is global."""
     return CreditReportPlugin().project_bundle(sealed, file_path=str(fixture))
+
+
+def test_saved_five_community_dataset_catalog() -> None:
+    """Reload and audit every persisted Community datasets section."""
+
+    audit_dir = os.environ.get("DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
+    if not audit_dir:
+        pytest.skip("set DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
+    directory = Path(audit_dir)
+    community_paths = sorted(directory.glob("*.community.json"))
+    expected_by_stem = {fixture.stem: fixture for fixture in _FIXTURES}
+    assert {path.name.removesuffix(".community.json") for path in community_paths} == set(
+        expected_by_stem
+    )
+
+    for community_path in community_paths:
+        payload = json.loads(community_path.read_text(encoding="utf-8"))
+        assert validate_projection_payload("community", payload).valid, community_path
+        detailed_validation = validate_projection_payload(
+            "personal_credit_report_detailed", payload
+        )
+        assert detailed_validation.valid, (community_path, detailed_validation.errors)
+        _assert_community_closed_world_dataset_catalog(payload)
+        fixture = expected_by_stem[community_path.name.removesuffix(".community.json")]
+        _assert_five_report_population_reporting(payload, fixture)
+        if fixture.name == "杨松林个人征信24.7.29.pdf":
+            _assert_yang_liability_dataset_oracle(payload)
+            _assert_yang_monthly_native_conflict_oracle(payload)
 
 
 def test_saved_lin_semantic_account_fragment_oracle() -> None:
