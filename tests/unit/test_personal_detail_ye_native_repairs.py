@@ -2684,6 +2684,211 @@ def test_anchor_and_ledger_family_state_accept_immediate_authoritative_edge() ->
     assert ledger["credit_accounts"] == 2
 
 
+@pytest.mark.parametrize(
+    ("edge_mode", "next_ordinal", "expected_sequences"),
+    [
+        ("last_prior_true", 2, [1, 2]),
+        ("false", 2, [1]),
+        ("none", 2, [1]),
+        ("multiple_prior_true", 2, [1]),
+        ("wrong_prior_true", 2, [1]),
+        ("last_prior_true", 3, [1]),
+    ],
+)
+def test_anchor_only_family_carry_requires_dense_ordinal_and_unique_graph_edge(
+    edge_mode: str,
+    next_ordinal: int,
+    expected_sequences: list[int],
+) -> None:
+    context = _family_state_context(gap=False)
+    context.corrected_evidence_pages()[1]["lines"][0]["text"] = (
+        f"账户 {next_ordinal}："
+    )
+    context.pages[0].tables = [
+        _table("account-1-base", _GEOMETRIC_LOAN_BASE_ROWS, top=10.0)
+    ]
+    if edge_mode in {"multiple_prior_true", "wrong_prior_true"}:
+        context.pages[0].tables.append(
+            _table("account-1-later", _GEOMETRIC_LOAN_BASE_ROWS, top=20.0)
+        )
+    context.pages[1].tables = [
+        _table(
+            "account-1-continuation",
+            [["还款记录"], ["2023", "N"]],
+            top=10.0,
+        )
+    ]
+
+    def tables_continue(left_table_id: str, right_table_id: str) -> bool | None:
+        if right_table_id != "account-1-continuation":
+            return False
+        if edge_mode == "last_prior_true":
+            return left_table_id in {"account-1-base", "account-1-later"}
+        if edge_mode == "multiple_prior_true":
+            return left_table_id in {"account-1-base", "account-1-later"}
+        if edge_mode == "wrong_prior_true":
+            return left_table_id == "account-1-base"
+        if edge_mode == "none":
+            return None
+        return False
+
+    context.tables_continue = tables_continue
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == expected_sequences
+    assert ledger["account_family_endpoints"] == {
+        "non_revolving_loan": max(expected_sequences)
+    }
+    assert ledger["credit_accounts"] == max(expected_sequences)
+
+
+@pytest.mark.parametrize(
+    "edge_mode",
+    ["false", "none", "wrong_prior_true", "multiple_prior_true"],
+)
+def test_verified_detail_carry_cannot_bypass_rejected_anchor_table_edge(
+    edge_mode: str,
+) -> None:
+    context = _family_state_context(gap=False)
+    context.corrected_evidence_pages()[1]["lines"].insert(
+        0,
+        {
+            "text": "\u8fd8\u6b3e\u8bb0\u5f55",
+            "bbox": [10, 10, 120, 25],
+        },
+    )
+    context.pages[0].tables = [
+        _table("account-1-base", _GEOMETRIC_LOAN_BASE_ROWS, top=10.0)
+    ]
+    if edge_mode in {"wrong_prior_true", "multiple_prior_true"}:
+        context.pages[0].tables.append(
+            _table("account-1-later", _GEOMETRIC_LOAN_BASE_ROWS, top=20.0)
+        )
+    context.pages[1].tables = [
+        _table(
+            "account-1-continuation",
+            [["\u8fd8\u6b3e\u8bb0\u5f55"], ["2023", "N"]],
+            top=20.0,
+        )
+    ]
+    context.allows_scanned_line_transition = lambda *_args: True
+
+    def tables_continue(left_table_id: str, right_table_id: str) -> bool | None:
+        if right_table_id != "account-1-continuation":
+            return False
+        if edge_mode == "wrong_prior_true":
+            return left_table_id == "account-1-base"
+        if edge_mode == "multiple_prior_true":
+            return left_table_id in {"account-1-base", "account-1-later"}
+        if edge_mode == "none":
+            return None
+        return False
+
+    context.tables_continue = tables_continue
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == [1]
+    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 1}
+    assert ledger["credit_accounts"] == 1
+
+
+@pytest.mark.parametrize(
+    ("entity_mode", "expected_sequences"),
+    [
+        ("missing_units", [1]),
+        ("different_entities", [1]),
+        ("same_entity", [1, 2]),
+    ],
+)
+def test_verified_detail_family_bridge_requires_exact_entity_units(
+    entity_mode: str,
+    expected_sequences: list[int],
+) -> None:
+    evidence = [
+        {
+            "page": 1,
+            "source_page": 1,
+            "lines": [
+                {
+                    "text": "\uff08\u4e00\uff09\u975e\u5faa\u73af\u8d37\u8d26\u6237",
+                    "bbox": [10, 10, 220, 25],
+                    "evidence_ids": ["family-heading"],
+                },
+                {
+                    "text": "\u8d26\u6237 1\uff1a",
+                    "bbox": [10, 760, 120, 775],
+                    "evidence_ids": ["anchor-1"],
+                },
+            ],
+        },
+        {
+            "page": 2,
+            "source_page": 2,
+            "lines": [
+                {
+                    "text": "\u8fd8\u6b3e\u8bb0\u5f55",
+                    "bbox": [10, 10, 120, 25],
+                    "evidence_ids": ["detail-2"],
+                }
+            ],
+        },
+        {
+            "page": 3,
+            "source_page": 3,
+            "lines": [
+                {
+                    "text": "\u8d26\u6237 2\uff1a",
+                    "bbox": [10, 40, 120, 55],
+                    "evidence_ids": ["anchor-2"],
+                }
+            ],
+        },
+    ]
+    entities = {
+        "unit-anchor-1": SimpleNamespace(entity_id="entity-1"),
+        "unit-detail-2": SimpleNamespace(
+            entity_id=("entity-1" if entity_mode == "same_entity" else "entity-2")
+        ),
+    }
+    evidence_unit_ids = (
+        {}
+        if entity_mode == "missing_units"
+        else {
+            "evidence:anchor-1": "unit-anchor-1",
+            "evidence:detail-2": "unit-detail-2",
+        }
+    )
+    context = SimpleNamespace(
+        pages=[
+            _page(
+                1,
+                [_table("account-1-base", _GEOMETRIC_LOAN_BASE_ROWS, top=10.0)],
+            ),
+            _page(2, []),
+            _page(3, []),
+        ],
+        reading_order_by_logical={1: 1, 2: 2, 3: 3},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: True,
+        evidence_unit_ids=evidence_unit_ids,
+        entity_context=SimpleNamespace(
+            entity_for_unit=lambda unit_id: entities.get(unit_id)
+        ),
+    )
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert [row["category_sequence"] for row in skeletons] == expected_sequences
+    assert ledger["account_family_endpoints"] == {
+        "non_revolving_loan": max(expected_sequences)
+    }
+    assert ledger["credit_accounts"] == max(expected_sequences)
+
+
 def test_page_local_account_table_family_uses_canonical_closed_signatures() -> None:
     card = _table(
         "canonical-card",
@@ -3230,6 +3435,216 @@ def _ye_family_population_context(*, insert_gap: bool = False) -> SimpleNamespac
     )
 
 
+def _mixed_r2_six_prefix_context(*, defect: str = "") -> SimpleNamespace:
+    """Model Ye's page-19 R2:6 prefix before the exact card heading."""
+
+    def identifier(sequence: int) -> str:
+        return f"D10053310H00012022052901021012089466554{sequence:03d}"
+
+    def revolving_rows(sequence: int) -> list[list[str]]:
+        return [
+            list(_REVOLVING_PHASE_HEADER),
+            [
+                f"\u793a\u4f8b\u94f6\u884c{sequence}",
+                identifier(sequence),
+                "2021.01.02",
+                "100000",
+                "\u4eba\u6c11\u5e01\u5143",
+                "\u4e2a\u4eba\u6d88\u8d39\u8d37\u6b3e",
+                "\u4fe1\u7528",
+            ],
+        ]
+
+    page16 = _page(
+        16,
+        [
+            _table(
+                f"r2-{sequence}",
+                revolving_rows(sequence),
+                top=45.0 + (sequence - 1) * 150.0,
+            )
+            for sequence in range(1, 6)
+        ],
+    )
+    prefix_rows = revolving_rows(6)
+    prefix = _table("pt_19_0", prefix_rows, top=91.0)
+    card = _table(
+        "pt_19_1",
+        [
+            _CARD_HEADER,
+            _card_values("B11911000H00016100000000042356833"),
+        ],
+        top=320.0,
+    )
+    page19 = _page(19, [prefix, card])
+    evidence: list[dict[str, object]] = [
+        {
+            "page": 16,
+            "source_page": 9,
+            "lines": [
+                {
+                    "text": "\uff08\u4e09\uff09\u5faa\u73af\u8d37\u8d26\u6237\u4e8c",
+                    "bbox": [44.5, 10.0, 180.0, 22.0],
+                    "evidence_ids": ["r2-heading"],
+                },
+                *[
+                    {
+                        "text": f"\u8d26\u6237 {sequence}\uff1a",
+                        "bbox": [44.5, 30.0 + (sequence - 1) * 150.0, 90.0, 42.0 + (sequence - 1) * 150.0],
+                        "evidence_ids": [f"r2-anchor-{sequence}"],
+                    }
+                    for sequence in range(1, 6)
+                ],
+            ],
+        },
+        {
+            "page": 19,
+            "source_page": 10,
+            "lines": [
+                {
+                    "text": "\u8d26\u6237 6\uff1a",
+                    "bbox": [44.5, 83.0, 90.0, 95.0],
+                    "evidence_ids": ["r2-anchor-6"],
+                },
+                {
+                    "text": "\uff08\u56db\uff09\u8d37\u8bb0\u5361\u8d26\u6237",
+                    "bbox": [44.5, 288.0, 180.0, 300.0],
+                    "evidence_ids": ["card-heading"],
+                },
+                {
+                    "text": "\u8d26\u6237 1\uff1a",
+                    "bbox": [44.5, 301.5, 90.0, 313.5],
+                    "evidence_ids": ["card-anchor-1"],
+                },
+            ],
+        },
+    ]
+    reading_order = {16: 1, 19: 2}
+    resolution = {"resolved": True, "authoritative": True}
+    pages = [page16, page19]
+
+    if defect == "missing_identity":
+        prefix_rows[1][1] = "SHORT"
+    elif defect == "multiple_identities":
+        prefix_rows[1][-1] = identifier(106)
+    elif defect == "same_identity_twice":
+        prefix_rows[1][-1] = identifier(6)
+    elif defect == "replayed_prior_identity":
+        prefix_rows[1][1] = identifier(5)
+    elif defect == "two_prefix_tables":
+        duplicate = deepcopy(prefix)
+        duplicate.table_id = "pt_19_duplicate"
+        duplicate.bbox[1:4:2] = [180.0, 275.0]
+        page19.tables.insert(1, duplicate)
+    elif defect == "table_before_anchor":
+        prefix.bbox[1:4:2] = [50.0, 78.0]
+    elif defect == "missing_partition_heading":
+        evidence[1]["lines"].pop(1)
+    elif defect == "card_signature_before_heading":
+        prefix.metadata["raw_rows"] = [
+            _CARD_HEADER,
+            _card_values(identifier(6)),
+        ]
+    elif defect == "ordinal_gap":
+        evidence[1]["lines"][0]["text"] = "\u8d26\u6237 7\uff1a"
+    elif defect == "unresolved_reading_order":
+        resolution = {"resolved": False, "authoritative": False}
+    elif defect == "registered_gap":
+        gap = _page(18, [])
+        page19_index = evidence.index(
+            next(page for page in evidence if page["page"] == 19)
+        )
+        evidence.insert(
+            page19_index,
+            {"page": 18, "source_page": 10, "lines": []},
+        )
+        reading_order = {16: 1, 18: 2, 19: 3}
+        pages = [page16, gap, page19]
+
+    return SimpleNamespace(
+        pages=pages,
+        reading_order_by_logical=reading_order,
+        reading_order_resolution=resolution,
+        corrected_evidence_pages=lambda: evidence,
+        allows_scanned_line_transition=lambda *_args: False,
+    )
+
+
+def test_exact_r2_prefix_owner_restores_sixth_endpoint_and_emitted_family() -> None:
+    context = _mixed_r2_six_prefix_context()
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    r2_accounts = [
+        account
+        for account in accounts
+        if account.get("account_type") == "revolving_loan_account"
+    ]
+
+    assert [
+        row["category_sequence"]
+        for row in skeletons
+        if row.get("account_type") == "revolving_loan_account"
+    ] == [1, 2, 3, 4, 5, 6]
+    assert ledger["account_family_endpoints"]["revolving_loan_account"] == 6
+    assert [account["category_sequence"] for account in r2_accounts] == [1, 2, 3, 4, 5, 6]
+    sixth = r2_accounts[-1]
+    assert any(
+        ref.get("table_id") == "pt_19_0" for ref in sixth.get("source_refs") or ()
+    )
+    assert sixth.get("_table_account_type_candidate") == "revolving_loan_subaccount"
+    assert sixth.get("_table_account_family_resolution") == (
+        "exact_printed_anchor_unique_native_signature_interval"
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_identity",
+        "multiple_identities",
+        "same_identity_twice",
+        "replayed_prior_identity",
+        "two_prefix_tables",
+        "table_before_anchor",
+        "missing_partition_heading",
+        "card_signature_before_heading",
+        "ordinal_gap",
+        "unresolved_reading_order",
+        "registered_gap",
+    ],
+)
+def test_exact_r2_prefix_owner_rejects_ambiguous_or_unbounded_evidence(
+    defect: str,
+) -> None:
+    context = _mixed_r2_six_prefix_context(defect=defect)
+
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+
+    assert [
+        row["category_sequence"]
+        for row in skeletons
+        if row.get("account_type") == "revolving_loan_account"
+    ] == [1, 2, 3, 4, 5]
+    assert ledger["account_family_endpoints"]["revolving_loan_account"] == 5
+    assert not any(
+        account.get("account_id") == "credit_account:revolving_loan_account:6"
+        for account in accounts
+    )
+    assert not any(
+        account.get("_table_account_family_resolution")
+        == "exact_printed_anchor_unique_native_signature_interval"
+        and any(
+            ref.get("table_id") == "pt_19_0"
+            for ref in account.get("source_refs") or ()
+        )
+        for account in accounts
+    )
+
+
 def test_generic_loan_morphology_preserves_exact_ye_family_populations() -> None:
     context = _ye_family_population_context()
 
@@ -3253,6 +3668,189 @@ def test_generic_loan_morphology_preserves_exact_ye_family_populations() -> None
         "credit_card": 12,
     }
     assert ledger["credit_accounts"] == 42
+
+
+def test_source_ledger_unions_pre_repair_exact_anchor_inventory_after_line_dropout() -> None:
+    context = _ye_family_population_context()
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    assert [
+        row.get("category_sequence")
+        for row in skeletons
+        if row.get("account_type") == "revolving_loan_subaccount"
+    ] == [1, 2, 3, 4, 5, 6]
+
+    evidence13 = next(
+        page for page in context.corrected_evidence_pages() if page["page"] == 13
+    )
+    evidence13["lines"].pop(1)
+
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert ledger["account_family_anchor_inventory_sequences"][
+        "revolving_loan_subaccount"
+    ] == [1, 2, 3, 4, 5, 6]
+    assert ledger["account_family_endpoints"]["revolving_loan_subaccount"] == 6
+    assert ledger["credit_accounts"] == 42
+
+
+def test_source_ledger_does_not_infer_missing_anchor_without_exact_inventory() -> None:
+    context = _ye_family_population_context()
+    evidence13 = next(
+        page for page in context.corrected_evidence_pages() if page["page"] == 13
+    )
+    evidence13["lines"].pop(1)
+
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert ledger["account_family_anchor_inventory_sequences"][
+        "revolving_loan_subaccount"
+    ] == [1, 2, 3]
+    assert ledger["account_family_endpoints"]["revolving_loan_subaccount"] == 3
+    assert ledger["credit_accounts"] == 39
+
+
+def test_source_ledger_accepts_only_unique_exact_anchor_inventory_ordinals() -> None:
+    context = _ye_family_population_context()
+    skeletons = native_extraction._account_anchor_skeletons(context)
+    seed = next(
+        row
+        for row in skeletons
+        if row.get("account_id") == "credit_account:revolving_loan_subaccount:6"
+    )
+    cached = context._candidate_b_account_anchor_skeleton_cache
+
+    sparse = deepcopy(seed)
+    sparse["category_sequence"] = 115
+    sparse["account_id"] = "credit_account:revolving_loan_subaccount:115"
+    cached.append(sparse)
+
+    for ordinal in (114, 114):
+        duplicate = deepcopy(seed)
+        duplicate["category_sequence"] = ordinal
+        duplicate["account_id"] = (
+            f"credit_account:revolving_loan_subaccount:{ordinal}"
+        )
+        cached.append(duplicate)
+
+    ambiguous = deepcopy(seed)
+    ambiguous["category_sequence"] = 113
+    ambiguous["account_id"] = "credit_account:revolving_loan_subaccount:113"
+    ambiguous["account_family_quality"] = "ambiguous_missing_variant"
+    cached.append(ambiguous)
+
+    provisional = deepcopy(seed)
+    provisional["category_sequence"] = 112
+    provisional["account_id"] = "credit_account:revolving_loan_subaccount:112"
+    provisional["_printed_ordinal_status"] = "printed_duplicate"
+    cached.append(provisional)
+
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert ledger["account_family_anchor_inventory_sequences"][
+        "revolving_loan_subaccount"
+    ] == [1, 2, 3, 4, 5, 6, 115]
+    assert ledger["account_family_endpoints"]["revolving_loan_subaccount"] == 6
+    assert ledger["account_family_sequence_outliers"][
+        "revolving_loan_subaccount"
+    ] == [115]
+    assert ledger["credit_accounts"] == 42
+
+
+@pytest.mark.parametrize(
+    ("edge_mode", "expected_r1_endpoint"),
+    [
+        ("last_prior_true", 6),
+        ("false", 3),
+        ("none", 3),
+        ("multiple_prior_true", 3),
+        ("wrong_prior_true", 3),
+    ],
+)
+def test_generic_loan_family_carry_requires_unique_leading_continuation_edge(
+    edge_mode: str,
+    expected_r1_endpoint: int,
+) -> None:
+    context = _ye_family_population_context()
+    page13 = next(page for page in context.pages if page.page_number == 13)
+    page13.tables.insert(
+        0,
+        _table(
+            "r1-3-continuation",
+            [["还款记录"], ["2023", "N"]],
+            top=10.0,
+        ),
+    )
+
+    def tables_continue(left_table_id: str, right_table_id: str) -> bool | None:
+        if right_table_id != "r1-3-continuation":
+            return False
+        if edge_mode == "last_prior_true":
+            return left_table_id == "r1-3"
+        if edge_mode == "multiple_prior_true":
+            return left_table_id in {"r1-2", "r1-3"}
+        if edge_mode == "wrong_prior_true":
+            return left_table_id == "r1-2"
+        if edge_mode == "none":
+            return None
+        return False
+
+    context.tables_continue = tables_continue
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert ledger["account_family_endpoints"]["revolving_loan_subaccount"] == (
+        expected_r1_endpoint
+    )
+    assert ledger["credit_accounts"] == 36 + expected_r1_endpoint
+
+
+@pytest.mark.parametrize(
+    (
+        "continuation_decision",
+        "remove_next_heading",
+        "expected_r1_endpoint",
+        "expected_credit_accounts",
+    ),
+    [
+        (True, False, 6, 42),
+        (False, False, 5, 41),
+        (None, False, 5, 41),
+        (True, True, 5, 35),
+    ],
+)
+def test_mixed_family_page_requires_leading_graph_edge_and_exact_partition_heading(
+    continuation_decision: bool | None,
+    remove_next_heading: bool,
+    expected_r1_endpoint: int,
+    expected_credit_accounts: int,
+) -> None:
+    context = _ye_family_population_context()
+    page14 = next(page for page in context.pages if page.page_number == 14)
+    page14.tables.insert(
+        0,
+        _table(
+            "r1-5-continuation",
+            [["还款记录"], ["2023", "N"]],
+            top=20.0,
+        ),
+    )
+    if remove_next_heading:
+        evidence14 = next(
+            page for page in context.corrected_evidence_pages() if page["page"] == 14
+        )
+        evidence14["lines"].pop(1)
+
+    def tables_continue(left_table_id: str, right_table_id: str) -> bool | None:
+        if left_table_id == "r1-5" and right_table_id == "r1-5-continuation":
+            return continuation_decision
+        return False
+
+    context.tables_continue = tables_continue
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    assert ledger["account_family_endpoints"]["revolving_loan_subaccount"] == (
+        expected_r1_endpoint
+    )
+    assert ledger["credit_accounts"] == expected_credit_accounts
 
 
 def test_generic_loan_family_carry_stops_at_registered_blank_gap() -> None:
@@ -3653,6 +4251,42 @@ def _owns_real_card8_table(context: SimpleNamespace) -> bool:
     )
 
 
+def test_real_anchor_header_lattice_rejects_nonblank_shared_limit_without_evidence() -> None:
+    context = _real_headerless_card8_context()
+    candidate = context.pages[1].tables[0]
+    candidate.metadata["raw_rows"][0][7] = "9999"
+    candidate.metadata["geometry"]["cell_evidence_ids"][0][7] = []
+
+    table_accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+
+    assert not any(
+        any(
+            ref.get("table_id") == "pt_24_0"
+            for ref in account.get("source_refs") or ()
+        )
+        for account in table_accounts
+    )
+    assert not any(
+        account.get("shared_credit_limit") == 9999 for account in table_accounts
+    )
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    assert not any(account.get("shared_credit_limit") == 9999 for account in accounts)
+    assert any(
+        issue.get("issue_code")
+        in {
+            "candidate_b_headerless_account_owner_unresolved",
+            "candidate_b_headerless_account_value_contract_unresolved",
+        }
+        and any(
+            ref.get("table_id") == "pt_24_0"
+            for ref in issue.get("source_refs") or ()
+        )
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
 @pytest.mark.parametrize(
     "defect",
     [
@@ -3795,6 +4429,214 @@ def test_real_anchor_header_lattice_rejects_unowned_or_malformed_planes(
         )
         for issue in getattr(context, "_personal_detail_extraction_issues", ())
     )
+
+
+def _sealed_native_text_card8_context(*, defect: str = "") -> SimpleNamespace:
+    context = _real_headerless_card8_context(continuation_decision=True)
+    page23, page24 = context.pages
+    page23.source_page_number = 12
+    page24.source_page_number = 12
+
+    columns = [0, 2, 4, 5, 7, 8, 10, 12]
+    native_blocks = []
+    for index, (label, column) in enumerate(
+        zip(_CARD_HEADER, columns, strict=True)
+    ):
+        left = 42.5 + 27.0 * column + 2.0
+        native_blocks.append(
+            SimpleNamespace(
+                content=label,
+                bbox=[
+                    left,
+                    546.0 + (index % 2),
+                    left + 20.0,
+                    558.0 + (index % 2),
+                ],
+                evidence_ids=[f"card8:native-header:{index}"],
+            )
+        )
+    page23.texts = native_blocks
+    page24.texts = []
+
+    evidence = context.corrected_evidence_pages()
+    evidence[0]["lines"] = [
+        *evidence[0]["lines"][:3],
+        {
+            "text": " ".join(_CARD_HEADER),
+            "bbox": [44.5, 546.0, 390.0, 559.0],
+            "evidence_ids": [
+                f"card8:merged-header:{index}" for index in range(8)
+            ],
+        },
+    ]
+    context.corrected_evidence_pages = lambda: evidence
+
+    if defect == "missing_role":
+        page23.texts.pop(3)
+    elif defect == "duplicate_role":
+        duplicate = deepcopy(page23.texts[0])
+        duplicate.evidence_ids = ["card8:native-header:duplicate"]
+        page23.texts.append(duplicate)
+    elif defect == "missing_evidence":
+        page23.texts[3].evidence_ids = []
+    elif defect == "reused_evidence":
+        page23.texts[3].evidence_ids = list(page23.texts[2].evidence_ids)
+    elif defect == "transposed_roles":
+        page23.texts[5].bbox, page23.texts[6].bbox = (
+            page23.texts[6].bbox,
+            page23.texts[5].bbox,
+        )
+    elif defect == "outside_anchor_window":
+        page23.texts[3].bbox[1:4:2] = [590.0, 602.0]
+    elif defect == "duplicate_registered_page":
+        duplicate_page = deepcopy(page23)
+        duplicate_page.tables = []
+        context.pages.insert(1, duplicate_page)
+    elif defect == "source_page_mismatch":
+        page23.source_page_number = 13
+    elif defect == "partial_raw_role":
+        evidence[0]["lines"].append(
+            {
+                "text": _CARD_HEADER[0],
+                "bbox": list(page23.texts[0].bbox),
+                "evidence_ids": ["card8:raw-partial-role"],
+            }
+        )
+    elif defect == "split_across_logical_pages":
+        page24.texts = page23.texts[4:]
+        page23.texts = page23.texts[:4]
+    return context
+
+
+def test_sealed_native_text_blocks_resolve_real_merged_card8_header() -> None:
+    context = _sealed_native_text_card8_context()
+    card8_skeleton = next(
+        skeleton
+        for skeleton in native_extraction._account_anchor_skeletons(context)
+        if skeleton.get("account_id") == "credit_account:credit_card:8"
+    )
+    assert not native_extraction._skeleton_has_exact_card_header_role(
+        card8_skeleton
+    )
+
+    table_accounts, _repayments, _events = native_extraction._extract_table_accounts(
+        context
+    )
+    card8 = next(
+        account
+        for account in table_accounts
+        if account.get("_pending_anchor_account_id")
+        == "credit_account:credit_card:8"
+    )
+
+    assert card8["account_identifier"] == "B10611000H00016226880219191368607"
+    assert any(
+        ref.get("table_id") == "pt_24_0" for ref in card8.get("source_refs") or ()
+    )
+    resolved_issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code") == "candidate_b_headerless_account_owner_resolved"
+        and issue.get("target_record_id") == "credit_account:credit_card:8"
+    )
+    native_header_refs = [
+        ref
+        for ref in resolved_issue.get("source_refs") or ()
+        if ref.get("binding")
+        == "sealed_native_text_block_exact_card_header_lattice"
+    ]
+    assert len(native_header_refs) == 8
+    assert len(
+        {
+            evidence_id
+            for ref in native_header_refs
+            for evidence_id in ref.get("evidence_ids") or ()
+        }
+    ) == 8
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "missing_role",
+        "duplicate_role",
+        "missing_evidence",
+        "reused_evidence",
+        "transposed_roles",
+        "outside_anchor_window",
+        "duplicate_registered_page",
+        "source_page_mismatch",
+        "partial_raw_role",
+        "split_across_logical_pages",
+    ],
+)
+def test_sealed_native_text_card_header_fails_closed(defect: str) -> None:
+    context = _sealed_native_text_card8_context(defect=defect)
+
+    assert not _owns_real_card8_table(context)
+
+
+def _wrapped_sealed_native_text_card8_context(
+    *,
+    sealed_defect: str = "",
+) -> SimpleNamespace:
+    source = _sealed_native_text_card8_context()
+    canonical_pages = deepcopy(source.pages)
+    sealed_pages = deepcopy(source.pages)
+    if not sealed_defect:
+        for page in canonical_pages:
+            page.texts = []
+    elif sealed_defect == "duplicate_prior_page":
+        sealed_pages.insert(1, deepcopy(sealed_pages[0]))
+    elif sealed_defect == "source_page_mismatch":
+        sealed_pages[0].source_page_number = 13
+    elif sealed_defect == "missing_texts":
+        sealed_pages[0].texts = []
+    wrapper = SimpleNamespace(
+        pages=canonical_pages,
+        parse_result=SimpleNamespace(pages=sealed_pages),
+        reading_order_by_logical=deepcopy(source.reading_order_by_logical),
+        reading_order_resolution=deepcopy(source.reading_order_resolution),
+        corrected_evidence_pages=source.corrected_evidence_pages,
+        tables_continue=source.tables_continue,
+        allows_scanned_line_transition=source.allows_scanned_line_transition,
+    )
+    if sealed_defect == "null_sealed_owner":
+        wrapper.parse_result = None
+    elif sealed_defect == "self_sealed_owner":
+        wrapper.parse_result = wrapper
+    return wrapper
+
+
+def test_wrapped_context_uses_only_sealed_native_text_blocks_for_card8() -> None:
+    context = _wrapped_sealed_native_text_card8_context()
+
+    assert not context.pages[0].texts
+    assert len(context.parse_result.pages[0].texts) == 8
+    assert _owns_real_card8_table(context)
+
+
+@pytest.mark.parametrize(
+    "sealed_defect",
+    [
+        "duplicate_prior_page",
+        "source_page_mismatch",
+        "missing_texts",
+        "null_sealed_owner",
+        "self_sealed_owner",
+    ],
+)
+def test_wrapped_context_never_falls_back_to_canonical_text_blocks(
+    sealed_defect: str,
+) -> None:
+    context = _wrapped_sealed_native_text_card8_context(
+        sealed_defect=sealed_defect
+    )
+
+    assert len(context.pages[0].texts) == 8
+    assert not _owns_real_card8_table(context)
+
+
 def _inquiry_value_row(sequence: int, raw_sequence: str) -> list[str]:
     return [
         raw_sequence,

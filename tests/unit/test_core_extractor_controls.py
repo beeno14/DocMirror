@@ -90,6 +90,35 @@ def test_vnext_extractor_respects_page_selection_and_auto_ocr(monkeypatch):
     assert result.parser_info.options["ocr_mode"] == "auto"
 
 
+def test_vnext_extractor_reports_selected_page_completion(monkeypatch):
+    import docmirror.evidence.plane as evidence_plane_module
+
+    class FakeEvidencePlaneBuilder:
+        def build(self, _path):
+            return _fake_plane()
+
+    monkeypatch.setattr(evidence_plane_module, "EvidencePlaneBuilder", FakeEvidencePlaneBuilder)
+    events: list[tuple[str, float, str]] = []
+    policy = normalize_parse_policy(pages="2-3", ocr="off")
+
+    asyncio.run(
+        CoreExtractor().extract_parse_result(
+            Path("sample.pdf"),
+            options={
+                "parse_policy": policy,
+                "on_progress": lambda phase, pct, message: events.append((phase, pct, message)),
+            },
+        )
+    )
+
+    page_events = [event for event in events if event[0] == "page_extraction"]
+    assert page_events == [
+        ("page_extraction", 0.0, "Extracting 0/2 pages..."),
+        ("page_extraction", 50.0, "Extracted page 1/2"),
+        ("page_extraction", 100.0, "Extracted page 2/2"),
+    ]
+
+
 def test_vnext_extractor_force_ocr_runs_even_with_native_text(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 

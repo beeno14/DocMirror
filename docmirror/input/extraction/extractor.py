@@ -1036,8 +1036,20 @@ class CoreExtractor:
         correction_locale = getattr(parse_policy, "ocr_locale", None)
         correction_pack_ids = tuple(getattr(parse_policy, "ocr_correction_packs", ()) or ())
         correction_domain = str(getattr(getattr(parse_policy, "doc_type_hint", None), "value", "") or "") or None
+        on_progress = options.get("on_progress")
+        if on_progress:
+            on_progress("load_document", 0.0, "Loading document evidence...")
         plane = await asyncio.to_thread(EvidencePlaneBuilder().build, str(file_path))
         selected_indices = _selected_page_indices(plane, parse_policy)
+        selected_pages = [page for page in plane.pages if page.page_index in selected_indices]
+        selected_page_count = len(selected_pages)
+        if on_progress:
+            on_progress("load_document", 100.0, f"Loaded {len(plane.pages)} document pages")
+            on_progress(
+                "page_extraction",
+                0.0,
+                f"Extracting 0/{selected_page_count} pages...",
+            )
         page_split_mode = getattr(parse_policy, "page_split", "auto")
         if ocr_mode == "off":
             page_split_mode = "off"
@@ -1068,6 +1080,19 @@ class CoreExtractor:
         document_native_text_suspicious = _has_suspicious_native_glyph_mapping(selected_native_atoms)
         native_text_ocr_fallback_pages: list[int] = []
         native_text_ocr_failed_pages: list[int] = []
+        completed_page_count = 0
+
+        def report_page_complete() -> None:
+            nonlocal completed_page_count
+            completed_page_count += 1
+            if on_progress:
+                pct = completed_page_count / max(selected_page_count, 1) * 100.0
+                on_progress(
+                    "page_extraction",
+                    pct,
+                    f"Extracted page {completed_page_count}/{selected_page_count}",
+                )
+
         for page in plane.pages:
             if page.page_index not in selected_indices:
                 continue
@@ -1161,6 +1186,7 @@ class CoreExtractor:
                         )
                     if page_native_text_suspicious:
                         native_text_ocr_fallback_pages.append(source_page_number)
+                    report_page_complete()
                     continue
                 if page_native_text_suspicious:
                     native_text_ocr_failed_pages.append(source_page_number)
@@ -1190,6 +1216,9 @@ class CoreExtractor:
                     page_image=None,
                 )
             )
+            report_page_complete()
+        if on_progress and selected_page_count == 0:
+            on_progress("page_extraction", 100.0, "No pages selected for extraction")
         table_count = sum(1 for page in pages for block in page.blocks if block.block_type == "table")
         confidence_values: list[tuple[float, int]] = []
         for logical_page in pages:

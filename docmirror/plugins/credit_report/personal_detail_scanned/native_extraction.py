@@ -4627,6 +4627,130 @@ def _unique_strict_card_table_on_page(
     ):
         return None
     return target_lattice
+
+
+def _skeleton_has_exact_card_header_role(
+    skeleton: Mapping[str, Any],
+) -> bool:
+    """Return whether the corrected-evidence plane contains any exact role."""
+
+    for raw_line in skeleton.get("raw_detail_lines") or ():
+        if not isinstance(raw_line, Mapping):
+            continue
+        role = _ACCOUNT_BASIC_HEADER_ROLES.get(
+            _compact(raw_line.get("text") or "")
+        )
+        if role in _ACCOUNT_BASIC_CARD_TEMPLATE:
+            return True
+    return False
+
+
+def _sealed_native_text_block_card_header_lines(
+    parse_result: Any,
+    *,
+    skeleton: Mapping[str, Any],
+    prior_logical_page: int,
+) -> list[dict[str, Any]] | None:
+    """Return one complete card header from one sealed native TextBlock plane.
+
+    This is a bounded fallback for scans whose corrected-evidence segment has
+    merged the eight independently sealed TextBlocks into non-role lines.  It
+    never combines the two planes: callers may use it only when the skeleton
+    contains zero exact card-header roles, and every returned role comes from
+    the single registered prior-page object.
+    """
+
+    missing_sealed_owner = object()
+    sealed_owner = getattr(parse_result, "parse_result", missing_sealed_owner)
+    if sealed_owner is missing_sealed_owner:
+        page_owner = parse_result
+    elif sealed_owner is None or sealed_owner is parse_result:
+        return None
+    else:
+        page_owner = sealed_owner
+    pages = [
+        page
+        for page in getattr(page_owner, "pages", None) or ()
+        if int(getattr(page, "page_number", 0) or 0)
+        == int(prior_logical_page or 0)
+    ]
+    if len(pages) != 1:
+        return None
+    page = pages[0]
+    source_page = getattr(page, "source_page_number", None)
+    skeleton_source_page = skeleton.get("source_page")
+    if (
+        not isinstance(source_page, int)
+        or isinstance(source_page, bool)
+        or source_page <= 0
+        or not isinstance(skeleton_source_page, int)
+        or isinstance(skeleton_source_page, bool)
+        or skeleton_source_page != source_page
+    ):
+        return None
+    anchor_bbox = _exact_geometry_bbox(skeleton.get("bbox"))
+    if anchor_bbox is None:
+        return None
+
+    candidates: list[dict[str, Any]] = []
+    for block in getattr(page, "texts", None) or ():
+        if isinstance(block, Mapping):
+            text = str(block.get("content") or block.get("text") or "")
+            raw_bbox = block.get("bbox")
+            raw_evidence_ids = block.get("evidence_ids")
+        else:
+            text = str(
+                getattr(block, "content", "") or getattr(block, "text", "") or ""
+            )
+            raw_bbox = getattr(block, "bbox", None)
+            raw_evidence_ids = getattr(block, "evidence_ids", None)
+        role = _ACCOUNT_BASIC_HEADER_ROLES.get(_compact(text))
+        if role not in _ACCOUNT_BASIC_CARD_TEMPLATE:
+            continue
+        bbox = _exact_geometry_bbox(raw_bbox)
+        if (
+            bbox is None
+            or bbox[1] + 1.0 < anchor_bbox[3]
+            or bbox[1] > anchor_bbox[3] + 36.0
+        ):
+            continue
+        if not isinstance(raw_evidence_ids, (list, tuple)):
+            return None
+        evidence_ids = tuple(
+            dict.fromkeys(
+                str(value) for value in raw_evidence_ids if str(value or "")
+            )
+        )
+        if not evidence_ids:
+            return None
+        candidates.append(
+            {
+                "logical_page": int(prior_logical_page or 0),
+                "source_page": source_page,
+                "text": text,
+                "bbox": list(bbox),
+                "evidence_ids": list(evidence_ids),
+                "_role": str(role),
+            }
+        )
+
+    roles = [candidate["_role"] for candidate in candidates]
+    if (
+        len(candidates) != len(_ACCOUNT_BASIC_CARD_TEMPLATE)
+        or tuple(sorted(roles)) != tuple(sorted(_ACCOUNT_BASIC_CARD_TEMPLATE))
+        or any(roles.count(role) != 1 for role in _ACCOUNT_BASIC_CARD_TEMPLATE)
+    ):
+        return None
+    seen_evidence: set[str] = set()
+    for candidate in candidates:
+        evidence_ids = set(candidate["evidence_ids"])
+        if seen_evidence.intersection(evidence_ids):
+            return None
+        seen_evidence.update(evidence_ids)
+        candidate.pop("_role", None)
+    return candidates
+
+
 def _exact_anchor_evidence_card_header(
     skeleton: Mapping[str, Any],
     *,
@@ -4732,7 +4856,14 @@ def _exact_anchor_evidence_card_header(
                 candidate_lattice,
                 row=0,
                 column=column,
-                evidence_required=role != "shared_credit_limit",
+                # Ye's projected shared-limit cell is physically exact but
+                # legitimately empty.  Missing evidence is therefore allowed
+                # only for that empty primitive; a populated value must carry
+                # the same exact evidence proof as every other projected field.
+                evidence_required=(
+                    role != "shared_credit_limit"
+                    or bool(str(rows[0][column] or "").strip())
+                ),
             )
             is None
         ):
@@ -4897,9 +5028,38 @@ def _bounded_headerless_card_owner(
                 rows=rows,
                 prior_logical_page=prior_logical_page,
             )
+            native_text_projection = False
+            if projected is None and not _skeleton_has_exact_card_header_role(
+                skeleton
+            ):
+                native_header_lines = _sealed_native_text_block_card_header_lines(
+                    parse_result,
+                    skeleton=skeleton,
+                    prior_logical_page=prior_logical_page,
+                )
+                if native_header_lines is not None:
+                    projected = _exact_anchor_evidence_card_header(
+                        {**skeleton, "raw_detail_lines": native_header_lines},
+                        prior_lattice=projected_lattices[0],
+                        candidate_lattice=projected_lattices[1],
+                        rows=rows,
+                        prior_logical_page=prior_logical_page,
+                    )
+                    native_text_projection = projected is not None
             if projected is None:
                 continue
             header_labels, header_refs = projected
+            if native_text_projection:
+                header_refs = [
+                    {
+                        **ref,
+                        "source": "candidate_b_account_anchor_header_native_text",
+                        "binding": (
+                            "sealed_native_text_block_exact_card_header_lattice"
+                        ),
+                    }
+                    for ref in header_refs
+                ]
             ownership_basis = "printed_anchor_header_lattice"
         ownership_candidates.append(
             {
@@ -7477,6 +7637,53 @@ def _account_page_table_evidence(
     return None, shared_revolving_carry
 
 
+def _bounded_carried_revolving_prefix_table(
+    parse_result: Any,
+    rows: list[list[str]],
+) -> bool:
+    """Accept one prefix table whose exact anchor can resolve R1 versus R2.
+
+    A generic loan base is already an admissible positional alias.  The
+    canonical R1/R2 credit-limit base is also admissible when it contains
+    exactly one strong account-identifier occurrence and that identifier is
+    unique to one registered account-base table.  This morphology proves the
+    shared revolving superfamily, while the exact printed prefix anchor
+    supplies the family variant.  Card morphology, duplicate identity, and
+    replayed identity remain competing evidence and fail closed.
+    """
+
+    compact = _compact(" ".join(cell for row in rows[:6] for cell in row))
+    if "发卡机构" in compact:
+        return False
+    if "账户授信额度" not in compact:
+        return True
+    identifiers = [
+        identifier
+        for row in rows
+        for cell in row
+        if (identifier := _canonical_pboc_account_identifier(cell))
+    ]
+    if len(identifiers) != 1:
+        return False
+
+    target_identifier = identifiers[0]
+    owning_table_count = 0
+    for page in getattr(parse_result, "pages", None) or ():
+        for table in getattr(page, "tables", None) or ():
+            candidate_rows = _table_rows(table)
+            if not candidate_rows or not _account_base(candidate_rows):
+                continue
+            candidate_identifiers = {
+                identifier
+                for candidate_row in candidate_rows
+                for cell in candidate_row
+                if (identifier := _canonical_pboc_account_identifier(cell))
+            }
+            if target_identifier in candidate_identifiers:
+                owning_table_count += 1
+    return owning_table_count == 1
+
+
 def _bounded_revolving_family_carry_over_generic_table(
     parse_result: Any,
     *,
@@ -7488,15 +7695,15 @@ def _bounded_revolving_family_carry_over_generic_table(
     local_table_family: tuple[str, str] | None,
     cross_page_order_resolved: bool,
 ) -> bool:
-    """Keep an exact printed R1/R2 family across one generic loan page.
+    """Keep an exact printed R1/R2 family across one owned prefix page.
 
     The six-column management-institution/identifier/date/amount morphology is
     shared by non-revolving loans and Ye's later R1 rows.  It therefore cannot
     override an already exact printed revolving family on its own.  The carry
     remains deliberately narrow: the registered page edge must be adjacent,
     the account anchors before the next family heading must be the dense next
-    ordinals, and exactly the same number of generic account-base tables must
-    occur before that heading.
+    ordinals, and exactly the same number of admissible account-base tables
+    must occur before that heading.
     """
 
     logical_page = int(page.get("page") or 0)
@@ -7632,7 +7839,7 @@ def _bounded_revolving_family_carry_over_generic_table(
         if affirmative_prior_ids != [prior_bases[-1][1]]:
             return False
 
-    generic_table_tops: list[float] = []
+    prefix_table_tops: list[float] = []
     for table in native_tables:
         rows = _table_rows(table)
         if not rows or _other_entity_table(rows) or not _account_base(rows):
@@ -7643,18 +7850,14 @@ def _bounded_revolving_family_carry_over_generic_table(
         if next_heading_top is not None:
             if table_top >= next_heading_top:
                 continue
-        compact_table = _compact(" ".join(cell for row in rows[:6] for cell in row))
-        # Only the generic loan morphology is compatible with carried R1 or
-        # R2.  Card and shared-credit-limit signatures inside the prefix
-        # interval are competing account families and fail closed.
-        if "发卡机构" in compact_table or "账户授信额度" in compact_table:
+        if not _bounded_carried_revolving_prefix_table(parse_result, rows):
             return False
-        generic_table_tops.append(table_top)
-    if len(generic_table_tops) != len(prefix_anchors):
+        prefix_table_tops.append(table_top)
+    if len(prefix_table_tops) != len(prefix_anchors):
         return False
-    generic_table_tops.sort()
+    prefix_table_tops.sort()
     for index, ((_ordinal, anchor_top), table_top) in enumerate(
-        zip(prefix_anchors, generic_table_tops, strict=True)
+        zip(prefix_anchors, prefix_table_tops, strict=True)
     ):
         upper = (
             prefix_anchors[index + 1][1]
@@ -7664,6 +7867,304 @@ def _bounded_revolving_family_carry_over_generic_table(
         if table_top + 1.0 < anchor_top or (upper is not None and table_top >= upper):
             return False
     return True
+
+
+def _bounded_anchor_only_family_carry(
+    parse_result: Any,
+    *,
+    page: Mapping[str, Any],
+    active_family: str,
+    active_family_quality: str,
+    active_family_logical_page: int,
+    active_family_last_ordinal: int,
+    cross_page_order_resolved: bool,
+) -> bool:
+    """Carry an exact family only to a dense adjacent anchor-only page.
+
+    Some printed accounts begin with their next ``账户 N`` anchor while the
+    physical base row is absent or starts on the following page.  This is not
+    a blank-page carry: the next ordinal must be exact and dense, the page may
+    contain no competing account-base table, and any table before the anchor
+    must be the one graph-owned continuation of the prior page's last table.
+    """
+
+    logical_page = int(page.get("page") or 0)
+    if (
+        active_family
+        not in {
+            "non_revolving_loan",
+            "revolving_loan_subaccount",
+            "revolving_loan_account",
+            "credit_card",
+            "quasi_credit_card",
+        }
+        or active_family_quality != "exact"
+        or active_family_last_ordinal <= 0
+        or not cross_page_order_resolved
+        or not _registered_account_pages_are_adjacent(
+            parse_result,
+            active_family_logical_page,
+            logical_page,
+        )
+    ):
+        return False
+
+    anchors: list[tuple[int, float]] = []
+    for line in page.get("lines") or ():
+        if not isinstance(line, Mapping):
+            continue
+        raw_text = str(line.get("text") or line.get("content") or "")
+        compact = _compact(raw_text)
+        if any(marker in compact for marker in _ACCOUNT_SECTION_END):
+            break
+        if _account_family_from_heading(compact) is not None:
+            if not anchors:
+                return False
+            break
+        match = _ACCOUNT_ANCHOR_RE.search(raw_text)
+        if match is None:
+            continue
+        if not match.group(1):
+            return False
+        bbox = _account_evidence_bbox(line)
+        if bbox is None:
+            return False
+        anchors.append((int(match.group(1)), bbox[1]))
+    expected = list(
+        range(
+            active_family_last_ordinal + 1,
+            active_family_last_ordinal + 1 + len(anchors),
+        )
+    )
+    if (
+        not anchors
+        or [ordinal for ordinal, _top in anchors] != expected
+        or any(
+            anchors[index][1] + 1.0 >= anchors[index + 1][1]
+            for index in range(len(anchors) - 1)
+        )
+    ):
+        return False
+
+    native_pages = [
+        native_page
+        for native_page in getattr(parse_result, "pages", None) or ()
+        if int(getattr(native_page, "page_number", 0) or 0) == logical_page
+    ]
+    if len(native_pages) != 1:
+        return False
+    native_tables = list(getattr(native_pages[0], "tables", None) or ())
+    if any(
+        _account_base(rows)
+        for table in native_tables
+        if (rows := _table_rows(table)) and not _other_entity_table(rows)
+    ):
+        return False
+
+    leading_tables: list[Any] = []
+    first_anchor_top = anchors[0][1]
+    for table in native_tables:
+        table_top = _table_top_value(table)
+        if table_top is None:
+            return False
+        if table_top < first_anchor_top:
+            leading_tables.append(table)
+    if not leading_tables:
+        return True
+    if len(leading_tables) != 1:
+        return False
+
+    continuation_check = getattr(parse_result, "tables_continue", None)
+    current_table_id = str(getattr(leading_tables[0], "table_id", "") or "")
+    prior_pages = [
+        native_page
+        for native_page in getattr(parse_result, "pages", None) or ()
+        if int(getattr(native_page, "page_number", 0) or 0)
+        == active_family_logical_page
+    ]
+    if (
+        not current_table_id
+        or not callable(continuation_check)
+        or len(prior_pages) != 1
+    ):
+        return False
+    prior_tables: list[tuple[float, str]] = []
+    for prior_table in getattr(prior_pages[0], "tables", None) or ():
+        prior_top = _table_top_value(prior_table)
+        prior_table_id = str(getattr(prior_table, "table_id", "") or "")
+        if prior_top is None or not prior_table_id:
+            return False
+        prior_tables.append((prior_top, prior_table_id))
+    prior_tables.sort()
+    if not prior_tables or (
+        len(prior_tables) > 1 and prior_tables[-2][0] == prior_tables[-1][0]
+    ):
+        return False
+    affirmative_prior_ids = [
+        prior_table_id
+        for _prior_top, prior_table_id in prior_tables
+        if continuation_check(prior_table_id, current_table_id) is True
+    ]
+    return affirmative_prior_ids == [prior_tables[-1][1]]
+
+
+def _bounded_verified_detail_family_carry(
+    parse_result: Any,
+    *,
+    previous_page: Mapping[str, Any] | None,
+    page: Mapping[str, Any],
+    active_family: str,
+    active_family_quality: str,
+    active_family_logical_page: int,
+    active_family_last_ordinal: int,
+    cross_page_order_resolved: bool,
+) -> bool:
+    """Keep family state for one affirmatively joined detail-only page."""
+
+    logical_page = int(page.get("page") or 0)
+    if (
+        previous_page is None
+        or active_family
+        not in {
+            "non_revolving_loan",
+            "revolving_loan_subaccount",
+            "revolving_loan_account",
+            "credit_card",
+            "quasi_credit_card",
+        }
+        or active_family_quality != "exact"
+        or active_family_last_ordinal <= 0
+        or not cross_page_order_resolved
+        or int(previous_page.get("page") or 0) != active_family_logical_page
+        or not _registered_account_pages_are_adjacent(
+            parse_result,
+            active_family_logical_page,
+            logical_page,
+        )
+    ):
+        return False
+    previous_lines = [
+        line
+        for line in previous_page.get("lines") or ()
+        if isinstance(line, Mapping)
+    ]
+    current_lines = [
+        line for line in page.get("lines") or () if isinstance(line, Mapping)
+    ]
+    if not previous_lines or not current_lines:
+        return False
+    registered_pages = list(getattr(parse_result, "pages", None) or ())
+    later_anchors: list[tuple[int, int, float]] = []
+    for line_index, line in enumerate(current_lines):
+        raw_text = str(line.get("text") or line.get("content") or "")
+        compact = _compact(raw_text)
+        # This proof is exclusively for a continuation-detail prefix.  A
+        # printed account anchor belongs to the stricter anchor-only proof in
+        # a registered context; accepting it here would bypass a negative or
+        # ambiguous table edge.  Pre-graph sealed contexts have no native-table
+        # plane to bypass, so retain their bounded dense-anchor continuation.
+        anchor = _ACCOUNT_ANCHOR_RE.search(raw_text)
+        if anchor is not None:
+            if registered_pages or not anchor.group(1):
+                return False
+            bbox = _account_evidence_bbox(line)
+            if bbox is None:
+                return False
+            later_anchors.append((line_index, int(anchor.group(1)), bbox[1]))
+            continue
+        if any(marker in compact for marker in _ACCOUNT_SECTION_END):
+            break
+        if _account_family_from_heading(compact) is not None:
+            if line_index == 0:
+                return False
+            break
+
+    if later_anchors:
+        expected = list(
+            range(
+                active_family_last_ordinal + 1,
+                active_family_last_ordinal + 1 + len(later_anchors),
+            )
+        )
+        if (
+            [ordinal for _index, ordinal, _top in later_anchors] != expected
+            or any(
+                later_anchors[index][2] + 1.0 >= later_anchors[index + 1][2]
+                for index in range(len(later_anchors) - 1)
+            )
+        ):
+            return False
+
+    if registered_pages:
+        matching_pages = [
+            native_page
+            for native_page in registered_pages
+            if int(getattr(native_page, "page_number", 0) or 0) == logical_page
+        ]
+        if len(matching_pages) != 1:
+            return False
+        if any(
+            _account_base(rows)
+            for table in getattr(matching_pages[0], "tables", None) or ()
+            if (rows := _table_rows(table)) and not _other_entity_table(rows)
+        ):
+            return False
+
+    previous_logical_page = int(previous_page.get("page") or 0)
+    has_evidence_units = hasattr(parse_result, "evidence_unit_ids")
+    has_entity_context = hasattr(parse_result, "entity_context")
+    if has_evidence_units or has_entity_context:
+        # The real extraction context exposes both structures.  Resolve its
+        # exact evidence keys directly so the geometry-only fallback in
+        # ``allows_scanned_line_transition`` cannot advance family state.
+        evidence_unit_ids = getattr(parse_result, "evidence_unit_ids", None)
+        entity_context = getattr(parse_result, "entity_context", None)
+        entity_for_unit = getattr(entity_context, "entity_for_unit", None)
+        if not isinstance(evidence_unit_ids, Mapping) or not callable(entity_for_unit):
+            return False
+        from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+            _evidence_key,
+        )
+
+        left_unit_id = evidence_unit_ids.get(
+            _evidence_key(
+                previous_logical_page,
+                previous_lines[-1],
+                len(previous_lines) - 1,
+            )
+        )
+        right_unit_id = evidence_unit_ids.get(
+            _evidence_key(logical_page, current_lines[0], 0)
+        )
+        if not left_unit_id or not right_unit_id:
+            return False
+        left_entity = entity_for_unit(left_unit_id)
+        right_entity = entity_for_unit(right_unit_id)
+        left_entity_id = getattr(left_entity, "entity_id", None)
+        right_entity_id = getattr(right_entity, "entity_id", None)
+        return bool(
+            left_entity_id
+            and right_entity_id
+            and left_entity_id == right_entity_id
+        )
+
+    # Small legacy test doubles predate the entity graph.  Preserve their
+    # explicit affirmative callback, but never use it when either graph
+    # structure is present yet incomplete.
+    transition_check = getattr(parse_result, "allows_scanned_line_transition", None)
+    if not callable(transition_check):
+        return False
+    return (
+        transition_check(
+            previous_logical_page,
+            previous_lines[-1],
+            len(previous_lines) - 1,
+            logical_page,
+            current_lines[0],
+            0,
+        )
+        is True
+    )
 
 
 def _account_segment_has_exact_two_cell_card_table(
@@ -7730,9 +8231,8 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
     cross_page_order_resolved = _account_reading_order_resolution(
         parse_result, evidence_pages
     )[-1]
-    for page_offset, page in enumerate(
-        _account_ordered_pages(parse_result, evidence_pages)
-    ):
+    ordered_evidence_pages = _account_ordered_pages(parse_result, evidence_pages)
+    for page_offset, page in enumerate(ordered_evidence_pages):
         logical_page = int(page.get("page") or 0)
         local_table_family, shared_revolving_carry = _account_page_table_evidence(
             parse_result,
@@ -7768,6 +8268,40 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             local_table_family=local_table_family,
             cross_page_order_resolved=cross_page_order_resolved,
         )
+        anchor_only_family_carry = bool(
+            local_table_family is None
+            and not preserve_revolving_family
+            and not shared_revolving_carry
+            and _bounded_anchor_only_family_carry(
+                parse_result,
+                page=page,
+                active_family=active_type,
+                active_family_quality=active_family_quality,
+                active_family_logical_page=active_family_logical_page,
+                active_family_last_ordinal=active_family_last_ordinal,
+                cross_page_order_resolved=cross_page_order_resolved,
+            )
+        )
+        verified_detail_family_carry = bool(
+            local_table_family is None
+            and not preserve_revolving_family
+            and not shared_revolving_carry
+            and not anchor_only_family_carry
+            and _bounded_verified_detail_family_carry(
+                parse_result,
+                previous_page=(
+                    ordered_evidence_pages[page_offset - 1]
+                    if page_offset > 0
+                    else None
+                ),
+                page=page,
+                active_family=active_type,
+                active_family_quality=active_family_quality,
+                active_family_logical_page=active_family_logical_page,
+                active_family_last_ordinal=active_family_last_ordinal,
+                cross_page_order_resolved=cross_page_order_resolved,
+            )
+        )
         if local_table_family is not None and not preserve_revolving_family:
             active_type, active_family_quality = local_table_family
             active_family_logical_page = logical_page
@@ -7778,6 +8312,10 @@ def _account_anchor_skeletons(parse_result: Any) -> list[dict[str, Any]]:
             "revolving_loan_subaccount",
             "revolving_loan_account",
         } and shared_revolving_carry:
+            active_family_logical_page = logical_page
+        elif anchor_only_family_carry:
+            active_family_logical_page = logical_page
+        elif verified_detail_family_carry:
             active_family_logical_page = logical_page
         elif local_table_family is None and not preserve_revolving_family:
             # Ambiguous, conflicting, or absent page-local account evidence
@@ -16712,6 +17250,36 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
             local_table_family=local_table_family,
             cross_page_order_resolved=cross_page_order_resolved,
         )
+        anchor_only_family_carry = bool(
+            local_table_family is None
+            and not preserve_revolving_family
+            and not shared_revolving_carry
+            and _bounded_anchor_only_family_carry(
+                parse_result,
+                page=page,
+                active_family=family,
+                active_family_quality=family_quality,
+                active_family_logical_page=family_logical_page,
+                active_family_last_ordinal=family_last_ordinal,
+                cross_page_order_resolved=cross_page_order_resolved,
+            )
+        )
+        verified_detail_family_carry = bool(
+            local_table_family is None
+            and not preserve_revolving_family
+            and not shared_revolving_carry
+            and not anchor_only_family_carry
+            and _bounded_verified_detail_family_carry(
+                parse_result,
+                previous_page=pages[page_offset - 1] if page_offset > 0 else None,
+                page=page,
+                active_family=family,
+                active_family_quality=family_quality,
+                active_family_logical_page=family_logical_page,
+                active_family_last_ordinal=family_last_ordinal,
+                cross_page_order_resolved=cross_page_order_resolved,
+            )
+        )
         if local_table_family is not None and not preserve_revolving_family:
             family, family_quality = local_table_family
             family_logical_page = logical_page
@@ -16722,6 +17290,10 @@ def _source_completeness_ledger(parse_result: Any) -> dict[str, Any]:
             "revolving_loan_subaccount",
             "revolving_loan_account",
         } and shared_revolving_carry:
+            family_logical_page = logical_page
+        elif anchor_only_family_carry:
+            family_logical_page = logical_page
+        elif verified_detail_family_carry:
             family_logical_page = logical_page
         elif local_table_family is None and not preserve_revolving_family:
             family = ""
