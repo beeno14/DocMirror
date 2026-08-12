@@ -36,7 +36,9 @@ from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.styles.grid_standard import normalize_record, normalize_split_debit_credit
 from docmirror.plugins.bank_statement.wide_table_recovery import (
+    _annotate_native_grid_matrix,
     _normalize_native_grid_table,
+    _normalize_table,
     _select_wide_bank_table,
     is_wide_bank_header,
 )
@@ -173,6 +175,61 @@ def test_normalize_split_debit_credit_direct():
     assert norm is not None
     assert norm["amount"] == 200.0
     assert norm["direction"] == "expense"
+
+
+def test_explicit_split_expense_wins_over_zero_income_and_summary_suffix() -> None:
+    plugin = BankStatementCommunityPlugin()
+
+    norm = normalize_split_debit_credit(
+        {
+            "交易时间": "20220929",
+            "收入金额": "0",
+            "支出金额": "2.25",
+            "账户余额": "1507.17",
+            "摘要": "费用外收",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["amount"] == 2.25
+    assert norm["amount_cny"] == 2.25
+    assert norm["direction"] == "expense"
+
+
+def test_explicit_zero_split_transaction_is_preserved_without_invented_direction() -> None:
+    plugin = BankStatementCommunityPlugin()
+
+    norm = normalize_split_debit_credit(
+        {
+            "交易时间": "20220929",
+            "收入金额": "0",
+            "支出金额": "0.00",
+            "账户余额": "1507.17",
+            "摘要": "零金额业务",
+        },
+        plugin,
+    )
+
+    assert norm is not None
+    assert norm["amount"] == 0.0
+    assert norm["amount_cny"] == 0.0
+    assert norm["direction"] == ""
+
+
+def test_split_amount_canonical_raw_is_repaired_when_wrong_zero_is_present() -> None:
+    records = _sanitize_bank_records(
+        [
+            {
+                "raw": {"收入金额": "0", "支出金额": "2.25"},
+                "normalized": {"amount": 2.25, "amount_cny": 2.25, "direction": "expense"},
+                "canonical_raw": {"amount": "0", "amount_cny": "0"},
+            }
+        ]
+    )
+
+    assert records[0]["canonical_raw"]["amount"] == "2.25"
+    assert records[0]["canonical_raw"]["amount_cny"] == "2.25"
 
 
 def test_normalize_transaction_location_as_channel_alias():
@@ -373,6 +430,54 @@ def test_canonical_logical_grid_preserves_generic_row_provenance_and_raw_columns
     assert [record["source"]["table_id"] for record in records] == ["pt_1_0", "pt_2_0"]
     assert all(record["source"]["source_cell_refs"] for record in records)
     assert all(record["source"]["evidence_ids"] for record in records)
+
+
+def test_native_split_grid_keeps_wrapped_cells_in_their_physical_rows() -> None:
+    matrix = _normalize_table(
+        [
+            ["交易时间", "收入金额", "支出金额", "账户余额", "对方账号", "对方户名", "对方开户行", "摘要"],
+            [
+                "20221102",
+                "5647.20",
+                "0",
+                "5729.46",
+                "121940438010301",
+                "上海赫程国际旅行社有限公司南通分\n公司",
+                "中国农业银行股份\n有限公司镇江京口\n支行",
+                "转存",
+            ],
+            ["20221102", "0", "5000.00", "729.46", "6212261104003648184", "徐双根", "", "转取"],
+        ]
+    )
+
+    annotated = _annotate_native_grid_matrix(
+        matrix,
+        page_number=6,
+        table_index=0,
+        money_hints={},
+        row_bboxes=[
+            (0.0, 0.0, 100.0, 10.0),
+            (0.0, 10.0, 100.0, 20.0),
+            (0.0, 20.0, 100.0, 30.0),
+        ],
+    )
+
+    assert annotated[0][-4:] == ["_source_page", "_source_bbox", "_source_table_id", "_source_row_index"]
+    assert annotated[1][-4:] == ["6", "0.000,10.000,100.000,20.000", "native:p6:t0", "1"]
+    assert annotated[2][-4:] == ["6", "0.000,20.000,100.000,30.000", "native:p6:t0", "2"]
+
+    first_raw = dict(zip(annotated[0], annotated[1]))
+    second_raw = dict(zip(annotated[0], annotated[2]))
+    plugin = BankStatementCommunityPlugin()
+    first = normalize_split_debit_credit(first_raw, plugin)
+    second = normalize_split_debit_credit(second_raw, plugin)
+
+    assert first is not None
+    assert second is not None
+    assert first["counter_party"] == "上海赫程国际旅行社有限公司南通分公司"
+    assert first["counter_bank_name"] == "中国农业银行股份有限公司镇江京口支行"
+    assert second["counter_party"] == "徐双根"
+    assert second.get("counter_bank_name", "") == ""
 
 
 def test_canonical_split_unit_grid_preserves_wrapped_counter_accounts() -> None:

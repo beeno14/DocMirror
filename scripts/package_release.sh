@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Create the complete DocMirror source archive used by the testing server.
+# Create the core DocMirror source archive used by the deployment scripts.
 
 set -Eeuo pipefail
 umask 022
@@ -20,7 +20,7 @@ done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
-OUTPUT_INPUT="${1:-$REPO_ROOT/dist/docmirror-complete.tar.gz}"
+OUTPUT_INPUT="${1:-$REPO_ROOT/docmirror-complete.tar.gz}"
 
 if [[ "$OUTPUT_INPUT" = /* ]]; then
     OUTPUT="$OUTPUT_INPUT"
@@ -41,25 +41,15 @@ CHECKSUM="$OUTPUT.sha256"
 # to be named "docmirror".
 required_entries=(
     pyproject.toml
+    requirements.txt
     README.md
     LICENSE
     Dockerfile
     docker-compose.yml
     docmirror
-    docmirror_enterprise
-    docmirror_finance
 )
 
-optional_entries=(
-    .dockerignore
-    .env.example
-    AUTHORS.md
-    CHANGELOG.md
-    README_zh-CN.md
-    SECURITY.md
-    docs
-    scripts
-)
+optional_entries=()
 
 for entry in "${required_entries[@]}"; do
     [[ -e "$REPO_ROOT/$entry" ]] || fail "Required release entry is missing: $entry"
@@ -170,12 +160,18 @@ tar -tzf "$ARCHIVE_TMP" >/dev/null \
 archive_listing="$(tar -tzf "$ARCHIVE_TMP")"
 for required_member in \
     docmirror/pyproject.toml \
-    docmirror/docmirror/server/api.py \
-    docmirror/docmirror_enterprise/ \
-    docmirror/docmirror_finance/; do
+    docmirror/requirements.txt \
+    docmirror/Dockerfile \
+    docmirror/docker-compose.yml \
+    docmirror/docmirror/server/api.py; do
     grep -Fqx "$required_member" <<<"$archive_listing" \
         || fail "Created archive is missing: $required_member"
 done
+
+if grep -Eq '^docmirror/(docmirror_enterprise|docmirror_finance)(/|$)' \
+    <<<"$archive_listing"; then
+    fail "Created core archive unexpectedly contains a commercial package"
+fi
 
 chmod 0644 "$ARCHIVE_TMP"
 mv -f -- "$ARCHIVE_TMP" "$OUTPUT"

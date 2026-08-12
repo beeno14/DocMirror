@@ -130,19 +130,31 @@ class RapidOCREngine:
                 logger.debug(f"cpu_count detection: suppressed {exc}")
                 intra_threads = 4
 
-            onnxruntime = require_optional_module(
-                "onnxruntime",
-                feature="RapidOCR GPU execution",
-                extra="ocr",
-            )
-            cudnn_spec = find_spec("nvidia.cudnn")
-            if os.name == "nt" and cudnn_spec and cudnn_spec.submodule_search_locations:
-                cudnn_bin = os.path.join(next(iter(cudnn_spec.submodule_search_locations)), "bin")
-                os.environ["PATH"] = f"{cudnn_bin}{os.pathsep}{os.environ.get('PATH', '')}"
-            if preload_dlls := getattr(onnxruntime, "preload_dlls", None):
-                preload_dlls(directory="")
+            use_cuda = False
+            try:
+                onnxruntime = require_optional_module(
+                    "onnxruntime",
+                    feature="RapidOCR execution provider detection",
+                    extra="ocr",
+                )
+                cudnn_spec = find_spec("nvidia.cudnn")
+                if os.name == "nt" and cudnn_spec and cudnn_spec.submodule_search_locations:
+                    cudnn_bin = os.path.join(next(iter(cudnn_spec.submodule_search_locations)), "bin")
+                    os.environ["PATH"] = f"{cudnn_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+                if preload_dlls := getattr(onnxruntime, "preload_dlls", None):
+                    preload_dlls(directory="")
+                providers = onnxruntime.get_available_providers()
+                if "CUDAExecutionProvider" in providers:
+                    use_cuda = True
+                    logger.info("GPU (CUDA) detected, enabling GPU acceleration for OCR")
+                elif "CoreMLExecutionProvider" in providers:
+                    logger.info(
+                        "Mac CoreML detected. Continuing with CPUExecutionProvider + Multi-threading (ONNX CoreML often underperforms on simple CV models)."
+                    )
+            except Exception as exc:
+                logger.debug(f"operation: suppressed {exc}")
 
-            logger.info(f"Initializing RapidOCR ONNX model on GPU (Threads={intra_threads})...")
+            logger.info(f"Initializing RapidOCR ONNX model (GPU={use_cuda}, Threads={intra_threads})...")
 
             # Phase 6 Part 1: Hardware-Aware Engine Initialization
             # The underlying ONNX Runtime models (DET, REC, CLS) run completely sequentially in pure CPU loops.
@@ -155,13 +167,11 @@ class RapidOCREngine:
                 "cls_batch_num": 32,  # Batch size for text classifier
             }
 
-            self._engine = RapidOCR(
-                det_use_cuda=True,
-                cls_use_cuda=True,
-                rec_use_cuda=True,
-                **tuning_kwargs,
-            )
-            logger.info("RapidOCR model loaded with CUDA acceleration.")
+            if use_cuda:
+                self._engine = RapidOCR(det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True, **tuning_kwargs)
+            else:
+                self._engine = RapidOCR(**tuning_kwargs)
+            logger.info("RapidOCR model loaded with Extreme CPU Tuning.")
 
     def _detect_only(self, img: Any) -> Any | None:
         """Runs only the Detection (DET) model on an image and returns un-scaled bounding boxes."""

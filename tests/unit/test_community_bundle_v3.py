@@ -26,6 +26,7 @@ from docmirror.output.community_bundle import (
     project_community_bundle as _project_community_bundle,
 )
 from docmirror.plugins._base.projector import load_projection_policy
+from docmirror.plugins.bank_statement.community_plugin import BANK_DATA_DICTIONARY
 
 _PROJECTIONS: dict[int, dict] = {}
 
@@ -1358,6 +1359,70 @@ def test_payment_records_use_transaction_business_name() -> None:
     assert bundle.datasets[0].public["name"] == "transactions"
     assert bundle.datasets[0].public["type"] == "transaction"
     assert bundle.datasets[0].public["csv"] == "001_datasets/transactions.csv"
+
+
+def test_bank_statement_enhanced_markdown_uses_chinese_labels_without_changing_keys() -> None:
+    candidate = _candidate(
+        [
+            {
+                "normalized": {
+                    "amount": "10.00",
+                    "amount_cny": "10.00",
+                    "balance": "90.00",
+                    "channel": "网银",
+                    "counter_account": "001234",
+                    "counter_bank_code": "102",
+                    "counter_bank_name": "示例银行",
+                    "counter_party": "示例公司",
+                    "counterparty_status": "present",
+                    "date": "2025-07-01",
+                    "direction": "expense",
+                    "purpose": "货款",
+                    "sequence_no": "0001",
+                    "summary": "转账",
+                    "timestamp": "2025-07-01 09:00:00",
+                },
+                "raw": {},
+            }
+        ]
+    )
+    candidate["data"]["records"] = candidate["data"].pop("repayment_records")
+    candidate["data"]["data_dictionary"] = BANK_DATA_DICTIONARY
+    candidate["data"]["fields"].update(
+        {
+            "document_scene_refined": "bank_statement",
+            "layout_profile_id_refined": "borderless_ledger_bank",
+            "layout_profile_refine_confidence": 0.9997,
+        }
+    )
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="bank_statement")),
+        candidate,
+    )
+
+    bundle = project_community_bundle(result, document_id="doc_bank_chinese_reading")
+    enhanced = bundle.render_enhanced_markdown()
+    transaction_header = next(
+        line for line in enhanced.splitlines() if line.startswith("| ") and "交易金额" in line
+    )
+
+    assert "**文档类型:** 银行流水" in enhanced
+    assert "**页数:** 0" in enhanced
+    assert "**修正文档场景:** 银行流水" in enhanced
+    assert "**修正版式配置:** 无框银行流水版式" in enhanced
+    assert "**版式修正置信度:** 0.9997" in enhanced
+    assert "document scene refined" not in enhanced
+    assert "layout profile id refined" not in enhanced
+    assert "交易金额" in transaction_header
+    assert "折合人民币金额" in transaction_header
+    assert "账户余额" in transaction_header
+    assert "对方账号" in transaction_header
+    assert "对方银行名称" in transaction_header
+    assert "收支方向" in transaction_header
+    assert "交易时间" in transaction_header
+    assert " amount " not in transaction_header
+    assert " counter account " not in transaction_header
+    assert bundle.datasets[0].public["columns"][0]["key"] == "amount"
 
 
 def test_markdown_escapes_table_delimiters_but_preserves_content() -> None:

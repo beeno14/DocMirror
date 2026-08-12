@@ -58,7 +58,9 @@ coverage.xml
 ## Distribution
 *.whl
 *.tar.gz
-*.sha256
+
+*.tar.gz.sha256
+
 
 ## Cache
 .mypy_cache/
