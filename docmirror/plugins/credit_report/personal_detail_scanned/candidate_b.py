@@ -66,9 +66,18 @@ _ACCOUNT_ISSUES_SUPERSEDED_BY_EXACT_FINAL = frozenset(
     {
         "candidate_b_account_cluster_field_unresolved",
         "candidate_b_account_cluster_residue_unresolved",
+        "candidate_b_account_required_field_unresolved",
         "candidate_b_exact_slot_value_invalid",
+        "candidate_b_exact_slot_value_row_missing",
+        "candidate_b_exact_slot_value_unreadable",
         "candidate_b_institution_leading_boundary_ambiguous",
         "candidate_b_institution_branch_without_legal_root",
+    }
+)
+_CURRENCY_ISSUES_REQUIRING_CORRECTED_CELL_EVIDENCE = frozenset(
+    {
+        "candidate_b_account_required_field_unresolved",
+        "candidate_b_exact_slot_value_unreadable",
     }
 )
 _INACTIVE_ISSUE_STATUSES = frozenset(
@@ -604,6 +613,34 @@ def _account_ref_is_exact_for_field(ref: Mapping[str, Any], field_name: str) -> 
     return not ref_field or ref_field == field_name
 
 
+def _account_ref_is_corrected_currency_cell(
+    ref: Mapping[str, Any], field_name: str
+) -> bool:
+    """Require value-associated corrected-cell proof for a blank currency slot."""
+
+    if field_name != "account_currency":
+        return False
+    if str(ref.get("source") or "") != "personal_detail_corrected_page_cell":
+        return False
+    if str(ref.get("geometry_scope") or "") != "cell":
+        return False
+    binding = str(ref.get("binding_quality") or ref.get("binding") or "")
+    if binding != "canonical_field_slot":
+        return False
+    if _canonical_account_issue_field(ref.get("field_name")) != field_name:
+        return False
+    if not any(str(value or "").strip() for value in ref.get("evidence_ids") or ()):
+        return False
+    bbox = ref.get("bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return False
+    try:
+        finite_bbox = tuple(float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return False
+    return all(isfinite(value) for value in finite_bbox)
+
+
 def _clear_resolved_account_field_markers(
     record: dict[str, Any], field_name: str
 ) -> None:
@@ -611,7 +648,11 @@ def _clear_resolved_account_field_markers(
     for owner in (_account_record_values(record), record):
         if not isinstance(owner, dict):
             continue
-        for marker_name in ("_unresolved_fields", "_invalid_observation_fields"):
+        for marker_name in (
+            "_unresolved_fields",
+            "_invalid_observation_fields",
+            "_reported_invalid_fields",
+        ):
             retained = [
                 value
                 for value in owner.get(marker_name) or ()
@@ -638,6 +679,24 @@ def _reconcile_final_account_field_issues(
     issues = getattr(context, "_personal_detail_extraction_issues", None)
     if not isinstance(issues, list):
         return
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        _resolve_issue_target,
+    )
+
+    target_remaps = getattr(context, "_personal_detail_issue_target_remaps", None)
+
+    def issue_pair(issue: Mapping[str, Any]) -> tuple[str, str] | None:
+        field_name = _canonical_account_issue_field(issue.get("field_name"))
+        if field_name not in _FINAL_ACCOUNT_FIELD_ALIASES:
+            return None
+        record_id = str(issue.get("target_record_id") or "")
+        if record_id and isinstance(target_remaps, Mapping):
+            remapped_id, ambiguous = _resolve_issue_target(target_remaps, record_id)
+            if ambiguous:
+                return None
+            record_id = remapped_id or record_id
+        return record_id, field_name
+
     records_by_id = {
         str(_account_record_values(record).get("account_id") or record.get("account_id") or ""): record
         for record in records or ()
@@ -651,10 +710,9 @@ def _reconcile_final_account_field_issues(
             continue
         if str(issue.get("status") or "requires_review") in _INACTIVE_ISSUE_STATUSES:
             continue
-        field_name = _canonical_account_issue_field(issue.get("field_name"))
-        if field_name not in _FINAL_ACCOUNT_FIELD_ALIASES:
+        pair = issue_pair(issue)
+        if pair is None:
             continue
-        pair = (str(issue.get("target_record_id") or ""), field_name)
         active_by_pair.setdefault(pair, []).append(issue)
 
     resolved_pairs: set[tuple[str, str]] = set()
@@ -692,10 +750,27 @@ def _reconcile_final_account_field_issues(
         if not issue_sources_complete:
             continue
 
-        exact_final_locators = {
-            locator
+        final_refs = [
+            ref
             for ref in _account_field_refs(record, field_name)
             if _account_ref_is_exact_for_field(ref, field_name)
+        ]
+        if (
+            field_name == "account_currency"
+            and any(
+                str(issue.get("issue_code") or "")
+                in _CURRENCY_ISSUES_REQUIRING_CORRECTED_CELL_EVIDENCE
+                for issue in pair_issues
+            )
+        ):
+            final_refs = [
+                ref
+                for ref in final_refs
+                if _account_ref_is_corrected_currency_cell(ref, field_name)
+            ]
+        exact_final_locators = {
+            locator
+            for ref in final_refs
             if (locator := _source_ref_locator(ref)) is not None
         }
         if not exact_final_locators.difference(issue_locators):
@@ -704,21 +779,19 @@ def _reconcile_final_account_field_issues(
 
     if not resolved_pairs:
         return
-    context._personal_detail_extraction_issues = [
-        issue
-        for issue in issues
-        if not (
+    retained_issues: list[Any] = []
+    for issue in issues:
+        pair = issue_pair(issue) if isinstance(issue, Mapping) else None
+        if (
             isinstance(issue, Mapping)
             and str(issue.get("target_dataset") or "") == "credit_accounts"
             and str(issue.get("issue_code") or "")
             in _ACCOUNT_ISSUES_SUPERSEDED_BY_EXACT_FINAL
-            and (
-                str(issue.get("target_record_id") or ""),
-                _canonical_account_issue_field(issue.get("field_name")),
-            )
-            in resolved_pairs
-        )
-    ]
+            and pair in resolved_pairs
+        ):
+            continue
+        retained_issues.append(issue)
+    context._personal_detail_extraction_issues = retained_issues
     for record_id, field_name in resolved_pairs:
         _clear_resolved_account_field_markers(records_by_id[record_id], field_name)
 

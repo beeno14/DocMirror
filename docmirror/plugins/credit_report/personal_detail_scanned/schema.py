@@ -13,6 +13,7 @@ import json
 import re
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any, Callable, Mapping
 
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
@@ -423,6 +424,225 @@ def _without_internal_projection_metadata(values: Mapping[str, Any]) -> dict[str
         for key, value in values.items()
         if key not in _INTERNAL_PROJECTION_METADATA_FIELDS and not str(key).startswith("_")
     }
+
+
+_ACCOUNT_CURRENCY_SOURCE_FIELDS = {
+    "currency": "account_currency",
+    "account_currency": "account_currency",
+    "reporting_amount_currency": "reporting_amount_currency",
+}
+_PAGE_REOCR_EVIDENCE_PREFIX = "personal_detail_page_reocr:"
+
+
+def _positive_page_number(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _nonnegative_cell_index(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _finite_cell_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        bbox = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(isfinite(item) for item in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+    ):
+        return None
+    return bbox
+
+
+def _valid_page_reocr_evidence_ids(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    return all(
+        isinstance(evidence_id, str)
+        and evidence_id == evidence_id.strip()
+        and evidence_id.startswith(_PAGE_REOCR_EVIDENCE_PREFIX)
+        and len(evidence_id) > len(_PAGE_REOCR_EVIDENCE_PREFIX)
+        for evidence_id in value
+    )
+
+
+def _corrected_bbox_is_bound_to_native_slot(
+    native_bbox: tuple[float, float, float, float],
+    corrected_bbox: tuple[float, float, float, float],
+) -> bool:
+    nx0, ny0, nx1, ny1 = native_bbox
+    cx0, cy0, cx1, cy1 = corrected_bbox
+    center_x = (cx0 + cx1) / 2.0
+    center_y = (cy0 + cy1) / 2.0
+    if not (nx0 <= center_x <= nx1 and ny0 <= center_y <= ny1):
+        return False
+    intersection_width = max(0.0, min(nx1, cx1) - max(nx0, cx0))
+    intersection_height = max(0.0, min(ny1, cy1) - max(ny0, cy0))
+    corrected_area = (cx1 - cx0) * (cy1 - cy0)
+    return intersection_width * intersection_height / corrected_area >= 0.5
+
+
+def _native_account_currency_value_slot(
+    refs_by_field: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the one exact native blank slot which authorized currency repair."""
+
+    slots: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for source_field in _ACCOUNT_CURRENCY_SOURCE_FIELDS:
+        for raw_ref in refs_by_field.get(source_field) or ():
+            if not isinstance(raw_ref, Mapping):
+                continue
+            ref = dict(raw_ref)
+            canonical_field = _ACCOUNT_CURRENCY_SOURCE_FIELDS.get(
+                str(ref.get("field_name") or source_field)
+            )
+            logical_page = _positive_page_number(ref.get("logical_page"))
+            source_page = _positive_page_number(ref.get("source_page"))
+            bbox = _finite_cell_bbox(ref.get("bbox"))
+            row = _nonnegative_cell_index(ref.get("row"))
+            column = _nonnegative_cell_index(ref.get("column"))
+            canonical_row = _nonnegative_cell_index(ref.get("canonical_row"))
+            canonical_column = _nonnegative_cell_index(ref.get("canonical_column"))
+            label_row = _nonnegative_cell_index(ref.get("canonical_label_row"))
+            value_row = _nonnegative_cell_index(ref.get("canonical_value_row"))
+            coordinate_system = str(ref.get("coordinate_system") or "").strip()
+            table_id = str(ref.get("table_id") or "").strip()
+            evidence_ids = ref.get("evidence_ids")
+            if (
+                canonical_field != "account_currency"
+                or str(ref.get("source") or "") != "native_detail_table_cell"
+                or str(ref.get("geometry_scope") or "") != "cell"
+                or str(ref.get("binding") or "") != "canonical_field_slot"
+                or str(ref.get("binding_quality") or "")
+                != "canonical_header_column"
+                or str(ref.get("field_slot_role") or "") != "value"
+                or logical_page is None
+                or source_page is None
+                or bbox is None
+                or row is None
+                or column is None
+                or canonical_row != row
+                or canonical_column != column
+                or label_row is None
+                or value_row is None
+                or row != value_row
+                or label_row >= value_row
+                or not coordinate_system
+                or not table_id
+                or not isinstance(evidence_ids, (list, tuple))
+                or any(str(value or "").strip() for value in evidence_ids)
+            ):
+                continue
+            ref["logical_page"] = logical_page
+            ref["source_page"] = source_page
+            ref["bbox"] = list(bbox)
+            marker = (
+                logical_page,
+                source_page,
+                table_id,
+                row,
+                column,
+                bbox,
+                coordinate_system,
+            )
+            slots.setdefault(marker, ref)
+    return next(iter(slots.values())) if len(slots) == 1 else None
+
+
+def _corrected_currency_ref_matches_native_slot(
+    ref: Mapping[str, Any],
+    *,
+    source_field: str,
+    canonical_field: str,
+    native_slot: Mapping[str, Any],
+) -> bool:
+    ref_field = _ACCOUNT_CURRENCY_SOURCE_FIELDS.get(
+        str(ref.get("field_name") or source_field)
+    )
+    logical_page = _positive_page_number(ref.get("logical_page"))
+    source_page = _positive_page_number(ref.get("source_page"))
+    corrected_bbox = _finite_cell_bbox(ref.get("bbox"))
+    native_bbox = _finite_cell_bbox(native_slot.get("bbox"))
+    return bool(
+        ref_field == canonical_field
+        and str(ref.get("source") or "")
+        == "personal_detail_corrected_page_cell"
+        and str(ref.get("geometry_scope") or "") == "cell"
+        and str(ref.get("binding") or "") == "canonical_field_slot"
+        and str(ref.get("binding_quality") or "") == "canonical_field_slot"
+        and str(ref.get("field_slot_role") or "") == "value"
+        and str(ref.get("evidence_plane") or "") == "business_repair"
+        and _valid_page_reocr_evidence_ids(ref.get("evidence_ids"))
+        and logical_page == native_slot.get("logical_page")
+        and source_page == native_slot.get("source_page")
+        and corrected_bbox is not None
+        and native_bbox is not None
+        and str(ref.get("coordinate_system") or "").strip()
+        == str(native_slot.get("coordinate_system") or "").strip()
+        and _corrected_bbox_is_bound_to_native_slot(native_bbox, corrected_bbox)
+    )
+
+
+def _promote_corrected_account_currency_refs(
+    record: dict[str, Any],
+    *,
+    dataset_name: str,
+) -> None:
+    """Retain only corrected currency evidence bound to this row's native slot."""
+
+    if dataset_name != "credit_accounts":
+        return
+    source_refs = []
+    for raw_ref in record.get("source_refs") or ():
+        if not isinstance(raw_ref, Mapping):
+            continue
+        ref = dict(raw_ref)
+        if (
+            str(ref.get("source") or "")
+            == "personal_detail_corrected_page_cell"
+            and str(ref.get("field_name") or "")
+            in _ACCOUNT_CURRENCY_SOURCE_FIELDS
+        ):
+            continue
+        source_refs.append(ref)
+    record["source_refs"] = source_refs
+    refs_by_field = record.get("source_refs_by_field")
+    if not isinstance(refs_by_field, Mapping):
+        return
+    native_slot = _native_account_currency_value_slot(refs_by_field)
+    if native_slot is None:
+        return
+    promoted: list[dict[str, Any]] = []
+    for source_field, canonical_field in _ACCOUNT_CURRENCY_SOURCE_FIELDS.items():
+        for raw_ref in refs_by_field.get(source_field) or ():
+            if not isinstance(
+                raw_ref, Mapping
+            ) or not _corrected_currency_ref_matches_native_slot(
+                raw_ref,
+                source_field=source_field,
+                canonical_field=canonical_field,
+                native_slot=native_slot,
+            ):
+                continue
+            ref = dict(raw_ref)
+            ref["field_name"] = canonical_field
+            ref["evidence_ids"] = list(ref["evidence_ids"])
+            if ref not in promoted:
+                promoted.append(ref)
+    if not promoted:
+        return
+    for ref in promoted:
+        if ref not in source_refs:
+            source_refs.append(ref)
+    record["source_refs"] = source_refs
 
 
 def _snapshot_evidence(
@@ -871,7 +1091,14 @@ def _credit_agreement(values: dict[str, Any]) -> dict[str, Any]:
 
 def _project_credit_accounts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Apply the public account aliases consistently to values and evidence."""
-    projected = _project_records(records, _credit_account)
+    prepared = deepcopy(records)
+    for record in prepared:
+        if isinstance(record, dict):
+            _promote_corrected_account_currency_refs(
+                record,
+                dataset_name="credit_accounts",
+            )
+    projected = _project_records(prepared, _credit_account)
     for record in projected:
         if isinstance(record.get("normalized"), dict):
             # Live Candidate-B envelopes can retain a flat compatibility copy

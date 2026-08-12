@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2469,6 +2470,438 @@ def test_success_row_drops_nonrequired_review_metadata() -> None:
     assert "review" not in row
 
 
+def _lin_card_20_native_currency_slot_ref() -> dict[str, Any]:
+    return {
+        "source": "native_detail_table_cell",
+        "logical_page": 23,
+        "source_page": 12,
+        "table_id": "pt_23_1",
+        "coordinate_system": "pdf_points_top_left",
+        "row": 1,
+        "column": 5,
+        "geometry_scope": "cell",
+        "evidence_ids": [],
+        "binding": "canonical_field_slot",
+        "binding_quality": "canonical_header_column",
+        "canonical_row": 1,
+        "canonical_column": 5,
+        "bbox": [263.5, 113.0, 307.5, 144.0],
+        "field_slot_role": "value",
+        "canonical_label_row": 0,
+        "canonical_value_row": 1,
+        "field_name": "currency",
+    }
+
+
+def _lin_card_20_corrected_currency_ref(
+    field_name: str = "currency",
+) -> dict[str, Any]:
+    return {
+        "source": "personal_detail_corrected_page_cell",
+        "logical_page": 23,
+        "source_page": 12,
+        "bbox": [
+            273.203125,
+            124.56275727087709,
+            300.2232201057983,
+            133.86744477087709,
+        ],
+        "geometry_scope": "cell",
+        "evidence_ids": [
+            "personal_detail_page_reocr:source:12:crop:0.0000:0.0000:"
+            "403.5000:595.5000:rotation:0:w44"
+        ],
+        "binding": "canonical_field_slot",
+        "binding_quality": "canonical_field_slot",
+        "field_slot_role": "value",
+        "evidence_plane": "business_repair",
+        "coordinate_system": "pdf_points_top_left",
+        "field_name": field_name,
+    }
+
+
+def _project_lin_card_20_currency_record() -> dict[str, Any]:
+    record_id = "credit_account:credit_card:20"
+    return project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": record_id,
+                    "account_id": record_id,
+                    "sequence": 43,
+                    "account_type": "credit_card",
+                    "currency": "CNY",
+                    "account_currency": "CNY",
+                    "reporting_amount_currency": "CNY",
+                    "canonical_raw": {
+                        "currency": "人民币元",
+                        "account_currency": "人民币元",
+                        "reporting_amount_currency": "人民币元",
+                    },
+                    "source_refs": [
+                        {
+                            "source": "native_detail_table",
+                            "logical_page": 22,
+                            "source_page": 11,
+                            "table_id": "pt_22_9",
+                        },
+                        {
+                            "source": "candidate_b_account_anchor",
+                            "logical_page": 23,
+                            "source_page": 12,
+                            "evidence_ids": ["native:account:20"],
+                        },
+                    ],
+                    "source_refs_by_field": {
+                        "currency": [
+                            _lin_card_20_native_currency_slot_ref(),
+                            _lin_card_20_corrected_currency_ref("currency"),
+                        ],
+                        "account_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "account_currency"
+                            )
+                        ],
+                        "reporting_amount_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "reporting_amount_currency"
+                            )
+                        ],
+                    },
+                }
+            ]
+        }
+    )["credit_accounts"][0]
+
+
+def _compact_single_currency_source_row(
+    source_row: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "datasets": [
+            {
+                "name": "credit_accounts",
+                "rows": [
+                    {
+                        "record_id": source_row["record_id"],
+                        "normalized": dict(source_row["normalized"]),
+                        "canonical_raw": {},
+                        "raw": {},
+                        "source": {"page_range": [22, 23]},
+                    }
+                ],
+                "columns": [
+                    {"key": "account_currency", "raw_available": False},
+                    {
+                        "key": "reporting_amount_currency",
+                        "raw_available": False,
+                    },
+                ],
+            }
+        ]
+    }
+    _compact_personal_detail_public_projection(
+        payload,
+        source_datasets=[
+            SimpleNamespace(
+                public={"name": "credit_accounts"},
+                rows=[source_row],
+            )
+        ],
+    )
+    return payload["datasets"][0]
+
+
+def test_account_currency_ref_promotion_accepts_wrapped_live_envelope() -> None:
+    record_id = "credit_account:credit_card:20"
+    source_row = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": record_id,
+                    "normalized": {
+                        "account_id": record_id,
+                        "account_type": "credit_card",
+                        "account_currency": "CNY",
+                        "reporting_amount_currency": "CNY",
+                    },
+                    "canonical_raw": {
+                        "account_currency": "人民币元",
+                        "reporting_amount_currency": "人民币元",
+                    },
+                    "source_refs_by_field": {
+                        "currency": [
+                            _lin_card_20_native_currency_slot_ref(),
+                            _lin_card_20_corrected_currency_ref("currency"),
+                        ],
+                        "account_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "account_currency"
+                            )
+                        ],
+                        "reporting_amount_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "reporting_amount_currency"
+                            )
+                        ],
+                    },
+                }
+            ]
+        }
+    )["credit_accounts"][0]
+
+    assert "source_refs_by_field" not in source_row
+    assert {
+        ref["field_name"]
+        for ref in source_row["source_refs"]
+        if ref.get("source") == "personal_detail_corrected_page_cell"
+    } == {"account_currency", "reporting_amount_currency"}
+
+
+def test_account_currency_raw_alias_survives_schema_and_community_compaction(
+    tmp_path: Path,
+) -> None:
+    record_id = "credit_account:credit_card:20"
+    source_row = _project_lin_card_20_currency_record()
+    projected = {"credit_accounts": [source_row]}
+    assert "source_refs_by_field" not in source_row
+    assert {
+        ref["field_name"]
+        for ref in source_row["source_refs"]
+        if ref.get("source") == "personal_detail_corrected_page_cell"
+    } == {"account_currency", "reporting_amount_currency"}
+
+    semantic = personal_detail_semantic_extensions()
+    projection = {
+        "projector_id": "credit_report",
+        "document_type": "personal_credit_report_detailed",
+        "domain_facts": {
+            "document_label": "个人信用报告",
+            "report_subtype": "personal_detail",
+            "content_mode": "scanned_ocr",
+            "data_dictionary": personal_detail_data_dictionary(),
+            **{
+                f"personal_detail_v2_expected_{name}_count": len(rows)
+                for name, rows in projected.items()
+            },
+        },
+        "semantic": semantic,
+        "datasets": projected,
+        "sections": [],
+    }
+    parse_result = ParseResult(
+        entities=DocumentEntities(document_type="personal_credit_report_detailed"),
+        pages=[PageContent(page_number=1)],
+    )
+    source_pdf = tmp_path / "currency-raw-envelope.pdf"
+    source_pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    projected_bundle = project_community_bundle(
+        seal_parse_result(parse_result),
+        file_path=str(source_pdf),
+        projection_data=projection,
+        projection_policy=dict(semantic["community_projection_overrides"]),
+    )
+    payload = _CreditReportCommunityBundle(
+        schema=projected_bundle.schema,
+        document=projected_bundle.document,
+        sections=projected_bundle.sections,
+        datasets=projected_bundle.datasets,
+        files=projected_bundle.files,
+        warnings=projected_bundle.warnings,
+        result=projected_bundle.result,
+        source_fingerprint=projected_bundle.source_fingerprint,
+        parse_result_schema=projected_bundle.parse_result_schema,
+        classification=projected_bundle.classification,
+        domain=projected_bundle.domain,
+        diagnostics=projected_bundle.diagnostics,
+        content_markdown_override=projected_bundle.content_markdown_override,
+    ).json_payload()
+
+    assert validate_projection_payload("community", payload).valid
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    dataset = datasets["credit_accounts"]
+    row = dataset["rows"][0]
+    assert row["normalized"]["account_currency"] == "CNY"
+    assert row["normalized"]["reporting_amount_currency"] == "CNY"
+    assert row["canonical_raw"]["account_currency"] == "人民币元"
+    assert row["canonical_raw"]["reporting_amount_currency"] == "人民币元"
+    assert row["raw"]["account_currency"] == "人民币元"
+    assert row["raw"]["reporting_amount_currency"] == "人民币元"
+    source_refs = row["source"]["source_refs"]
+    assert {ref["field_name"] for ref in source_refs} == {
+        "account_currency",
+        "reporting_amount_currency",
+    }
+    assert all(
+        ref["source"] == "personal_detail_corrected_page_cell"
+        and ref["evidence_ids"]
+        == _lin_card_20_corrected_currency_ref()["evidence_ids"]
+        for ref in source_refs
+    )
+    assert row["source"]["page_range"] == [22, 23]
+    columns = {str(column["key"]): column for column in dataset["columns"]}
+    assert columns["account_currency"]["raw_available"] is True
+    assert columns["reporting_amount_currency"]["raw_available"] is True
+    active_currency_issues = [
+        issue
+        for issue_dataset in payload["datasets"]
+        if issue_dataset.get("name") == "extraction_issues"
+        for issue in issue_dataset.get("rows") or ()
+        if str((issue.get("normalized") or {}).get("target_record_id") or "")
+        == record_id
+        and str((issue.get("normalized") or {}).get("field_name") or "")
+        in {"currency", "account_currency", "reporting_amount_currency"}
+        and str((issue.get("normalized") or {}).get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    ]
+    assert active_currency_issues == []
+
+
+def test_account_currency_canonical_alias_overrides_stale_raw_compatibility() -> None:
+    for case, stale_raw in (
+        ("conflicting_alias", "美元"),
+        ("null", None),
+        ("normalized_code", "CNY"),
+        ("missing_pool", ...),
+    ):
+        source_row = deepcopy(_project_lin_card_20_currency_record())
+        if stale_raw is ...:
+            source_row.pop("raw", None)
+        else:
+            source_row["raw"] = {
+                "account_currency": stale_raw,
+                "reporting_amount_currency": stale_raw,
+            }
+
+        dataset = _compact_single_currency_source_row(source_row)
+        row = dataset["rows"][0]
+        assert row["canonical_raw"] == {
+            "account_currency": "人民币元",
+            "reporting_amount_currency": "人民币元",
+        }, case
+        assert row["raw"] == row["canonical_raw"], case
+        assert {
+            ref["field_name"] for ref in row["source"]["source_refs"]
+        } == {"account_currency", "reporting_amount_currency"}, case
+
+
+def test_account_currency_trust_requires_canonical_source_alias() -> None:
+    for case, canonical_raw in (
+        ("missing", {}),
+        (
+            "conflicting",
+            {
+                "account_currency": "美元",
+                "reporting_amount_currency": "美元",
+            },
+        ),
+        (
+            "normalized_not_printed_alias",
+            {
+                "account_currency": "CNY",
+                "reporting_amount_currency": "CNY",
+            },
+        ),
+    ):
+        source_row = deepcopy(_project_lin_card_20_currency_record())
+        source_row["canonical_raw"] = canonical_raw
+        source_row["raw"] = {
+            "account_currency": "人民币元",
+            "reporting_amount_currency": "人民币元",
+        }
+
+        dataset = _compact_single_currency_source_row(source_row)
+        row = dataset["rows"][0]
+        assert row["canonical_raw"] == {}, case
+        assert row["raw"] == {}, case
+        assert row["source"] == {}, case
+        assert not any(column["raw_available"] for column in dataset["columns"]), case
+
+
+def test_account_currency_raw_alias_requires_exact_corrected_value_ref() -> None:
+    record_id = "credit_account:credit_card:20"
+    native_ref = _lin_card_20_native_currency_slot_ref()
+    base_ref = _lin_card_20_corrected_currency_ref("account_currency")
+    variants = {
+        "missing_native_slot": base_ref,
+        "injected_top_level": base_ref,
+        "malformed_logical_page": {**base_ref, "logical_page": "not-a-page"},
+        "boolean_logical_page": {**base_ref, "logical_page": True},
+        "boolean_source_page": {**base_ref, "source_page": True},
+        "foreign_logical_page": {**base_ref, "logical_page": 24},
+        "foreign_source_page": {**base_ref, "source_page": 13},
+        "foreign_account_cell": {
+            **base_ref,
+            "bbox": [90.0, 124.5, 120.0, 133.8],
+        },
+        "string_evidence_ids": {
+            **base_ref,
+            "evidence_ids": "personal_detail_page_reocr:source:12:w44",
+        },
+        "invalid_evidence_id": {
+            **base_ref,
+            "evidence_ids": ["ocr:sp0012:lp0023:0044"],
+        },
+        "not_a_value_slot": {**base_ref, "field_slot_role": "label"},
+        "not_business_repair_evidence": {
+            **base_ref,
+            "evidence_plane": "native_static",
+        },
+        "wrong_binding": {**base_ref, "binding": "canonical_header_column"},
+        "wrong_binding_quality": {
+            **base_ref,
+            "binding_quality": "canonical_header_column",
+        },
+        "wrong_coordinate_system": {
+            **base_ref,
+            "coordinate_system": "image_pixels_top_left",
+        },
+    }
+
+    for case, corrected_ref in variants.items():
+        native_refs = [] if case == "missing_native_slot" else [native_ref]
+        top_level_refs = [corrected_ref] if case == "injected_top_level" else []
+        refs_by_field = (
+            {}
+            if case == "injected_top_level"
+            else {
+                "currency": native_refs,
+                "account_currency": [corrected_ref],
+            }
+        )
+        projected = project_personal_detail_datasets(
+            {
+                "credit_accounts": [
+                    {
+                        "record_id": record_id,
+                        "account_id": record_id,
+                        "account_type": "credit_card",
+                        "account_currency": "CNY",
+                        "reporting_amount_currency": "CNY",
+                        "canonical_raw": {
+                            "account_currency": "人民币元",
+                            "reporting_amount_currency": "人民币元",
+                        },
+                        "source_refs": top_level_refs,
+                        "source_refs_by_field": refs_by_field,
+                    }
+                ]
+            }
+        )
+        source_row = projected["credit_accounts"][0]
+        assert not any(
+            ref.get("source") == "personal_detail_corrected_page_cell"
+            for ref in source_row.get("source_refs") or ()
+        ), case
+
+        dataset = _compact_single_currency_source_row(source_row)
+        row = dataset["rows"][0]
+        assert row["canonical_raw"] == {}, case
+        assert row["raw"] == {}, case
+        assert row["source"] == {}, case
+        assert not any(column["raw_available"] for column in dataset["columns"]), case
+
+
 def test_dataset_status_expected_less_than_emitted_is_an_explicit_population_conflict() -> None:
     payload = {
         "datasets": [
@@ -2685,6 +3118,11 @@ def test_v2_types_account_repayment_periods_without_losing_source_absence() -> N
     assert "repayment_periods" not in dash
     assert dash["canonical_raw"]["repayment_periods"] == "--"
     assert dash["raw"]["repayment_periods"] == "--"
+    assert not any(
+        issue.get("target_record_id") == "account:dash-periods"
+        and issue.get("field_name") == "repayment_periods"
+        for issue in projected.get("extraction_issues") or ()
+    )
     numeric = rows["account:numeric-periods"]
     assert numeric["repayment_periods"] == 36
     assert type(numeric["repayment_periods"]) is int
@@ -2703,6 +3141,143 @@ def test_v2_types_account_repayment_periods_without_losing_source_absence() -> N
     assert len(invalid_issues) == 1
     assert invalid_issues[0]["issue_code"] == "canonical_field_contract_failed"
     assert invalid_issues[0]["observed_value"] == "36?"
+
+
+def test_yang_saved_community_datasets_keep_typed_repayment_absence() -> None:
+    record_id = "credit_account:non_revolving_loan:7"
+    source_row = {
+        "record_id": record_id,
+        "normalized": {
+            "account_id": record_id,
+            "account_type": "non_revolving_loan",
+            "repayment_periods": "--",
+        },
+        "repayment_periods": "--",
+        "canonical_raw": {"repayment_periods": "--"},
+        "raw": {"repayment_periods": "--"},
+    }
+    payload = {
+        "datasets": [
+            {
+                "name": "credit_accounts",
+                "rows": [
+                    {
+                        "record_id": record_id,
+                        "normalized": dict(source_row["normalized"]),
+                        "repayment_periods": "--",
+                        "canonical_raw": {},
+                        "raw": {},
+                        "source": {"page_range": [6, 6]},
+                        "review": {
+                            "status": "requires_review",
+                            "extraction_status": "review",
+                        },
+                    }
+                ],
+                "columns": [
+                    {"key": "repayment_periods", "raw_available": False}
+                ],
+            },
+            {
+                "name": "extraction_issues",
+                "rows": [
+                    {
+                        "record_id": "issue:yang-account-identifier",
+                        "normalized": {
+                            "extraction_issue_id": "issue:yang-account-identifier",
+                            "status": "requires_review",
+                            "target_dataset": "credit_accounts",
+                            "target_record_id": record_id,
+                            "field_name": "account_identifier",
+                        },
+                    }
+                ],
+                "columns": [],
+            },
+        ]
+    }
+
+    _compact_personal_detail_public_projection(
+        payload,
+        source_datasets=[
+            SimpleNamespace(
+                public={"name": "credit_accounts"},
+                rows=[source_row],
+            )
+        ],
+    )
+
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    account = datasets["credit_accounts"]["rows"][0]
+    assert account["normalized"]["repayment_periods"] is None
+    assert "repayment_periods" not in account
+    assert account["canonical_raw"]["repayment_periods"] == "--"
+    assert account["raw"]["repayment_periods"] == "--"
+    assert datasets["credit_accounts"]["columns"][0]["raw_available"] is True
+    assert not any(
+        str((issue.get("normalized") or {}).get("target_record_id") or "")
+        == record_id
+        and str((issue.get("normalized") or {}).get("field_name") or "")
+        == "repayment_periods"
+        and str((issue.get("normalized") or {}).get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+        for issue in datasets["extraction_issues"]["rows"]
+    )
+
+
+def test_community_repayment_absence_requires_canonical_source_evidence() -> None:
+    for case, normalized_value, canonical_raw in (
+        ("conflicting_canonical", 36, {"repayment_periods": "36"}),
+        ("missing_canonical", "--", {}),
+    ):
+        record_id = f"account:{case}"
+        source_row = {
+            "record_id": record_id,
+            "normalized": {
+                "account_id": record_id,
+                "account_type": "non_revolving_loan",
+                "repayment_periods": normalized_value,
+            },
+            "canonical_raw": canonical_raw,
+            "raw": {"repayment_periods": "--"},
+        }
+        payload = {
+            "datasets": [
+                {
+                    "name": "credit_accounts",
+                    "rows": [
+                        {
+                            "record_id": record_id,
+                            "normalized": dict(source_row["normalized"]),
+                            "canonical_raw": {},
+                            "raw": {},
+                            "source": {"page_range": [6, 6]},
+                        }
+                    ],
+                    "columns": [
+                        {"key": "repayment_periods", "raw_available": False}
+                    ],
+                }
+            ]
+        }
+
+        _compact_personal_detail_public_projection(
+            payload,
+            source_datasets=[
+                SimpleNamespace(
+                    public={"name": "credit_accounts"},
+                    rows=[source_row],
+                )
+            ],
+        )
+
+        dataset = payload["datasets"][0]
+        row = dataset["rows"][0]
+        expected = 36 if case == "conflicting_canonical" else None
+        assert row["normalized"]["repayment_periods"] == expected, case
+        assert row["canonical_raw"] == {}, case
+        assert row["raw"] == {}, case
+        assert dataset["columns"][0]["raw_available"] is False, case
 
 
 def test_v2_withholds_yuan_units_for_non_cny_currency_with_exact_issues() -> None:

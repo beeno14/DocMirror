@@ -618,6 +618,33 @@ def _prune_stale_resolved_field_issues(
     ]
 
 
+def _has_active_withheld_field_issue(
+    context: Any,
+    *,
+    dataset: str,
+    record_id: str,
+    field_name: str,
+    issue_codes: frozenset[str] | None = None,
+) -> bool:
+    """Avoid two active reports for the same already-withheld scalar."""
+
+    aliases = _DATASET_TARGET_ALIASES.get(dataset, frozenset({dataset}))
+    return any(
+        isinstance(issue, Mapping)
+        and str(issue.get("target_dataset") or "") in aliases
+        and str(issue.get("target_record_id") or "") == record_id
+        and str(issue.get("field_name") or "") == field_name
+        and (
+            issue_codes is None
+            or str(issue.get("issue_code") or "") in issue_codes
+        )
+        and str(issue.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+        and "normalized_value_withheld" in set(issue.get("reason_codes") or ())
+        for issue in getattr(context, "_personal_detail_extraction_issues", ()) or ()
+    )
+
+
 def _institution_observations(
     datasets: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -726,6 +753,29 @@ def _repair_separated_institution_prefixes(
                 }
                 refs = _field_refs(raw_record, field_name)
                 raw = candidates[0][0]
+                if _has_active_withheld_field_issue(
+                    context,
+                    dataset=dataset,
+                    record_id=record_id,
+                    field_name=field_name,
+                    issue_codes=frozenset(
+                        {
+                            "candidate_b_inquiry_institution_leading_boundary_ambiguous"
+                        }
+                    ),
+                ):
+                    # Final inquiry grouping has already compared the exact
+                    # OCR planes and decided that the separated leading glyph
+                    # is not source-resolvable.  Document-local legal-root
+                    # witnesses prove only the institution family, not this
+                    # exact branch boundary, so they must not repopulate the
+                    # field behind the active withholding issue.
+                    values.pop(field_name, None)
+                    _preserve_raw(raw_record, field_name, raw)
+                    _mark_uncertain(raw_record, field_name)
+                    audit["institution_prefix_issue_reused"] += 1
+                    audit["institution_prefix_unresolved"] += 1
+                    continue
                 if root and len(witness_locators) >= 2:
                     values[field_name] = remainder
                     _preserve_raw(raw_record, field_name, raw)
@@ -776,30 +826,38 @@ def _repair_separated_institution_prefixes(
                 values.pop(field_name, None)
                 _preserve_raw(raw_record, field_name, raw)
                 _mark_uncertain(raw_record, field_name)
-                _record_issue(
+                if not _has_active_withheld_field_issue(
                     context,
-                    category="ocr_cell_level_error",
-                    issue_code="candidate_b_document_local_institution_prefix_unresolved",
-                    message=(
-                        "An institution field had a separated leading glyph, but the complete remainder "
-                        "lacked two independent document-local legal-root witnesses."
-                    ),
                     dataset=dataset,
                     record_id=record_id,
                     field_name=field_name,
-                    observed_value={"raw": raw, "separated_glyph": prefix},
-                    candidate_value={
-                        "withheld_remainder": remainder,
-                        "legal_root": root,
-                        "independent_witness_count": len(witness_locators),
-                    },
-                    source_refs=refs,
-                    reason_codes=(
-                        "single_separated_han_glyph_residue",
-                        "document_local_legal_root_not_sufficiently_corroborated",
-                        "normalized_value_withheld",
-                    ),
-                )
+                ):
+                    _record_issue(
+                        context,
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_document_local_institution_prefix_unresolved",
+                        message=(
+                            "An institution field had a separated leading glyph, but the complete remainder "
+                            "lacked two independent document-local legal-root witnesses."
+                        ),
+                        dataset=dataset,
+                        record_id=record_id,
+                        field_name=field_name,
+                        observed_value={"raw": raw, "separated_glyph": prefix},
+                        candidate_value={
+                            "withheld_remainder": remainder,
+                            "legal_root": root,
+                            "independent_witness_count": len(witness_locators),
+                        },
+                        source_refs=refs,
+                        reason_codes=(
+                            "single_separated_han_glyph_residue",
+                            "document_local_legal_root_not_sufficiently_corroborated",
+                            "normalized_value_withheld",
+                        ),
+                    )
+                else:
+                    audit["institution_prefix_issue_reused"] += 1
                 audit["institution_prefix_unresolved"] += 1
 
 

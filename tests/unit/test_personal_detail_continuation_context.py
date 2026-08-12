@@ -1488,7 +1488,7 @@ def test_account_fact_graph_never_shifts_values_across_an_empty_cell() -> None:
     assert accounts[0]["source_refs_by_field"]["loan_amount"][0]["geometry_scope"] == "cell"
     assert any(
         issue["field_name"] == "account_identifier"
-        and issue["issue_code"] == "candidate_b_exact_slot_value_invalid"
+        and issue["issue_code"] == "candidate_b_exact_slot_value_unreadable"
         for issue in result._personal_detail_extraction_issues
     )
 

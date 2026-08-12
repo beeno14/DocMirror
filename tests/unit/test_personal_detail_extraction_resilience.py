@@ -852,6 +852,30 @@ def test_account_exact_finite_currency_token_is_silent() -> None:
         assert collect_extraction_issues(context) == []
 
 
+def test_account_single_han_currency_alias_does_not_match_institution_prose() -> None:
+    context = SimpleNamespace()
+    account = {"account_id": "credit_account:credit_card:20"}
+    raw = "中国工商银行 B10111000H 豫"
+    table = _table("account-currency-embedded-silver", [["账户币种"], [raw]])
+    page = SimpleNamespace(page_number=23, source_page_number=12)
+
+    _apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert "currency" not in account
+    assert "account_currency" not in account
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
+    assert issues[0]["observed_value"] == [raw]
+    assert "normalized_value_withheld" in issues[0]["reason_codes"]
+
+
 def test_account_currency_unknown_or_multiple_tokens_are_withheld_and_reported() -> None:
     for index, raw in enumerate(("ZZZ", "人民币元美元", "澳元美元"), start=1):
         context = SimpleNamespace()

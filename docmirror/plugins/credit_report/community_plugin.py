@@ -21,6 +21,7 @@ Dependencies: ``ProjectionData`` and the credit-report projection orchestrator.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from math import isfinite
 from typing import Any
 
 from docmirror.output.community_bundle import CommunityBundle
@@ -145,6 +146,130 @@ def _review_metadata_requires_attention(review: Any) -> bool:
     )
 
 
+_PAGE_REOCR_EVIDENCE_PREFIX = "personal_detail_page_reocr:"
+
+
+def _positive_page_number(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _valid_page_reocr_evidence_ids(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    return all(
+        isinstance(evidence_id, str)
+        and evidence_id == evidence_id.strip()
+        and evidence_id.startswith(_PAGE_REOCR_EVIDENCE_PREFIX)
+        and len(evidence_id) > len(_PAGE_REOCR_EVIDENCE_PREFIX)
+        for evidence_id in value
+    )
+
+
+def _corrected_account_currency_refs(
+    *,
+    dataset_name: str,
+    source_row: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return evidence-bearing corrected currency refs from the rich row."""
+
+    if dataset_name != "credit_accounts":
+        return {}
+    candidates: list[Any] = list(source_row.get("source_refs") or ())
+    by_field: dict[str, list[dict[str, Any]]] = {}
+    aliases = {
+        "currency": "account_currency",
+        "account_currency": "account_currency",
+        "reporting_amount_currency": "reporting_amount_currency",
+    }
+    for raw_ref in candidates:
+        if not isinstance(raw_ref, Mapping):
+            continue
+        ref = dict(raw_ref)
+        field_name = aliases.get(str(ref.get("field_name") or ""))
+        if field_name is None:
+            continue
+        if (
+            str(ref.get("source") or "")
+            != "personal_detail_corrected_page_cell"
+            or str(ref.get("geometry_scope") or "") != "cell"
+            or str(ref.get("binding") or "") != "canonical_field_slot"
+            or str(ref.get("binding_quality") or "") != "canonical_field_slot"
+            or str(ref.get("field_slot_role") or "") != "value"
+            or str(ref.get("evidence_plane") or "") != "business_repair"
+            or not _valid_page_reocr_evidence_ids(ref.get("evidence_ids"))
+        ):
+            continue
+        bbox = ref.get("bbox")
+        try:
+            finite_bbox = (
+                tuple(float(value) for value in bbox)
+                if isinstance(bbox, (list, tuple)) and len(bbox) == 4
+                else ()
+            )
+        except (TypeError, ValueError):
+            finite_bbox = ()
+        logical_page = _positive_page_number(ref.get("logical_page"))
+        source_page = _positive_page_number(ref.get("source_page"))
+        if (
+            len(finite_bbox) != 4
+            or not all(isfinite(value) for value in finite_bbox)
+            or finite_bbox[2] <= finite_bbox[0]
+            or finite_bbox[3] <= finite_bbox[1]
+            or logical_page is None
+            or source_page is None
+        ):
+            continue
+        ref["logical_page"] = logical_page
+        ref["source_page"] = source_page
+        ref["evidence_ids"] = list(ref["evidence_ids"])
+        ref["field_name"] = field_name
+        field_refs = by_field.setdefault(field_name, [])
+        if ref not in field_refs:
+            field_refs.append(ref)
+    return by_field
+
+
+def _trusted_account_currency_raw_fields(
+    *,
+    dataset_name: str,
+    normalized: Mapping[str, Any],
+    canonical_source: Mapping[str, Any],
+    corrected_refs: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> set[str]:
+    """Trust only a canonical printed alias backed by its corrected cell."""
+
+    if dataset_name != "credit_accounts":
+        return set()
+    from docmirror.plugins.credit_report.currency_codes import (
+        CURRENCY_CODE_BY_ALIAS,
+        ISO_4217_CURRENT_CODES,
+    )
+
+    retained: set[str] = set()
+    for field_name in ("account_currency", "reporting_amount_currency"):
+        if not corrected_refs.get(field_name):
+            continue
+        normalized_value = str(normalized.get(field_name) or "").strip().upper()
+        raw_value = canonical_source.get(field_name)
+        if not normalized_value or not isinstance(raw_value, str):
+            continue
+        compact_raw = "".join(raw_value.split()).strip(
+            "()（）[]【】,，;；:："
+        ).upper()
+        if not compact_raw or compact_raw == normalized_value:
+            continue
+        source_code = (
+            compact_raw
+            if compact_raw in ISO_4217_CURRENT_CODES
+            else CURRENCY_CODE_BY_ALIAS.get(compact_raw)
+        )
+        if source_code == normalized_value:
+            retained.add(field_name)
+    return retained
+
+
 def _compact_personal_detail_public_projection(
     payload: dict[str, Any],
     *,
@@ -154,9 +279,13 @@ def _compact_personal_detail_public_projection(
 
     The rich semantic result keeps correction/provenance state.  The final
     Community JSON exposes only declared normalized fields and raw evidence for
-    fields which still require review; successful normalization stays silent.
+    fields which still require review. Exact non-identical account-currency
+    aliases remain as the source explanation for their trusted ISO value.
     """
 
+    from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+        is_explicit_source_absence,
+    )
     from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
         personal_detail_data_dictionary,
     )
@@ -182,11 +311,16 @@ def _compact_personal_detail_public_projection(
         raw_available: set[str] = set()
 
         for index, row in enumerate(public_rows):
-            normalized = row.get("normalized") if isinstance(row.get("normalized"), Mapping) else {}
-            row["normalized"] = {
-                key: normalized.get(key)
+            source_normalized = (
+                row.get("normalized")
+                if isinstance(row.get("normalized"), Mapping)
+                else {}
+            )
+            normalized = {
+                key: source_normalized.get(key)
                 for key in declared_keys
             }
+            row["normalized"] = normalized
             record_id = str(row.get("record_id") or "")
             source_row = source_by_id.get(record_id)
             if source_row is None and not record_id and index < len(source_rows):
@@ -194,6 +328,12 @@ def _compact_personal_detail_public_projection(
                 if not str(positional_source.get("record_id") or ""):
                     source_row = positional_source
             source_row = source_row if isinstance(source_row, Mapping) else {}
+            public_source = row.get("source")
+            public_page_range = (
+                tuple(public_source.get("page_range") or ())
+                if isinstance(public_source, Mapping)
+                else ()
+            )
             canonical_source = (
                 source_row.get("canonical_raw")
                 if isinstance(source_row.get("canonical_raw"), Mapping)
@@ -204,10 +344,41 @@ def _compact_personal_detail_public_projection(
                 if isinstance(source_row.get("raw"), Mapping)
                 else {}
             )
+            trusted_source_absence: dict[str, Any] = {}
+            if name == "credit_accounts" and "repayment_periods" in allowed:
+                field_name = "repayment_periods"
+                canonical_absence = canonical_source.get(field_name)
+                exact_absence = (
+                    canonical_absence
+                    if is_explicit_source_absence(canonical_absence)
+                    else None
+                )
+                if is_explicit_source_absence(normalized.get(field_name)) or (
+                    exact_absence is not None
+                ):
+                    normalized[field_name] = None
+                    row.pop(field_name, None)
+                if exact_absence is not None:
+                    trusted_source_absence[field_name] = exact_absence
             affected = set(review_fields.get((name, record_id), ()))
             affected &= allowed
             if name in _PERSONAL_DETAIL_CONTROL_DATASETS:
                 affected.clear()
+            corrected_currency_refs = _corrected_account_currency_refs(
+                dataset_name=name,
+                source_row=source_row,
+            )
+            trusted_currency_raw = _trusted_account_currency_raw_fields(
+                dataset_name=name,
+                normalized=normalized,
+                canonical_source=canonical_source,
+                corrected_refs=corrected_currency_refs,
+            )
+            trusted_currency_raw &= allowed
+            trusted_source_absence_fields = set(trusted_source_absence) & allowed
+            retained_raw_fields = (
+                affected | trusted_currency_raw | trusted_source_absence_fields
+            )
             existing_review = row.get("review")
             keep_review_metadata = bool(
                 name in _PERSONAL_DETAIL_CONTROL_DATASETS
@@ -220,7 +391,17 @@ def _compact_personal_detail_public_projection(
             canonical_evidence: dict[str, Any] = {}
             raw_evidence: dict[str, Any] = {}
             for key in declared_keys:
-                if key not in affected:
+                if key not in retained_raw_fields:
+                    continue
+                if key in trusted_source_absence_fields:
+                    exact_absence = trusted_source_absence[key]
+                    canonical_evidence[key] = exact_absence
+                    raw_evidence[key] = exact_absence
+                    continue
+                if key in trusted_currency_raw:
+                    canonical_value = canonical_source[key]
+                    canonical_evidence[key] = canonical_value
+                    raw_evidence[key] = canonical_value
                     continue
                 if key in canonical_source:
                     canonical_evidence[key] = canonical_source[key]
@@ -244,9 +425,35 @@ def _compact_personal_detail_public_projection(
                 row["source"] = {}
                 row.pop("confidence", None)
                 row.pop("review", None)
+            trusted_refs = [
+                ref
+                for field_name in sorted(trusted_currency_raw)
+                for ref in corrected_currency_refs.get(field_name) or ()
+            ]
+            if trusted_refs:
+                source = row.get("source")
+                public_source = dict(source) if isinstance(source, Mapping) else {}
+                public_source["source_refs"] = trusted_refs
+                pages = {
+                    int(page)
+                    for page in public_page_range
+                    if isinstance(page, int)
+                    and not isinstance(page, bool)
+                    and page > 0
+                }
+                pages.update(
+                    int(ref["logical_page"])
+                    for ref in trusted_refs
+                    if isinstance(ref.get("logical_page"), int)
+                    and not isinstance(ref.get("logical_page"), bool)
+                    and int(ref["logical_page"]) > 0
+                )
+                if pages:
+                    public_source["page_range"] = [min(pages), max(pages)]
+                row["source"] = public_source
             raw_available.update(
                 key
-                for key in affected
+                for key in retained_raw_fields
                 if canonical_evidence.get(key) not in (None, "")
                 or raw_evidence.get(key) not in (None, "")
             )

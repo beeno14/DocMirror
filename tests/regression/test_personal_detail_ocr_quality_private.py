@@ -90,8 +90,43 @@ _LIN_EXPECTED_INQUIRIES = 90
 _LIN_EXPECTED_LIABILITIES = 3
 _YANG_EXPECTED_LIABILITIES = 6
 _YE_EXPECTED_MONTH_POSITIONS = 951
-_YE_EXPECTED_STATUS_WITHHELD = 121
+_YE_EXPECTED_STATUS_WITHHELD = 95
 _YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS = 42
+_YE_RECOVERED_N_ZERO_REVIEW_IDS = {
+    "mg_p17_repayment_0:2019-04",
+    "mg_p17_repayment_0:2019-07",
+    "mg_p17_repayment_0:2019-09",
+    "mg_p17_repayment_0:2019-10",
+    "mg_p17_repayment_0:2020-01",
+    "mg_p17_repayment_0:2020-02",
+    "mg_p17_repayment_0:2020-03",
+    "mg_p17_repayment_0:2020-08",
+    "mg_p17_repayment_0:2020-12",
+    "mg_p17_repayment_1:2024-02",
+}
+_YE_RECOVERED_N_ZERO_SILENT_IDS = {
+    "mg_p17_repayment_0:2019-05",
+    "mg_p17_repayment_0:2019-06",
+    "mg_p17_repayment_0:2019-08",
+    "mg_p17_repayment_0:2019-11",
+    "mg_p17_repayment_0:2019-12",
+    "mg_p17_repayment_0:2020-04",
+    "mg_p17_repayment_0:2020-05",
+    "mg_p17_repayment_0:2020-06",
+    "mg_p17_repayment_0:2020-07",
+    "mg_p17_repayment_0:2020-09",
+    "mg_p17_repayment_0:2020-11",
+    "mg_p17_repayment_1:2024-01",
+    "mg_p17_repayment_1:2024-03",
+    "mg_p18_repayment_0:2024-01",
+    "mg_p18_repayment_0:2024-02",
+    "mg_p18_repayment_0:2024-03",
+}
+_YE_RECOVERED_N_ZERO_GRID_BINDINGS = {
+    "mg_p17_repayment_0": ("credit_account:credit_card:3", 17, "pt_17_0"),
+    "mg_p17_repayment_1": ("credit_account:credit_card:4", 17, "pt_17_1"),
+    "mg_p18_repayment_0": ("credit_account:credit_card:5", 18, "pt_18_0"),
+}
 _YE_RECOVERED_CARD_IDS = {
     "B10911000H000115603050013394541",
     "B11313900H000115603090424251222",
@@ -611,6 +646,7 @@ def _assert_lin_semantic_account_oracle(semantic: dict, community: dict) -> None
     community_datasets = _dataset_map(community)
     required_dataset_names = {
         "credit_accounts",
+        "credit_agreements",
         "credit_account_monthly_performance",
         "repayment_responsibilities",
         "inquiries",
@@ -642,10 +678,129 @@ def _assert_lin_semantic_account_oracle(semantic: dict, community: dict) -> None
             f"credit_accounts: expected {_LIN_EXPECTED_ACCOUNTS}, observed {len(accounts)}"
         )
 
+    expected_account_currencies = {
+        "credit_account:credit_card:3": "USD",
+        "credit_account:credit_card:16": "EUR",
+        "credit_account:credit_card:17": "HKD",
+        "credit_account:credit_card:20": "CNY",
+    }
+    for record_id, expected_currency in expected_account_currencies.items():
+        observed_currency = accounts.get(record_id, {}).get("account_currency")
+        if observed_currency != expected_currency:
+            defects.append(
+                f"{record_id}: expected source-vetted account currency "
+                f"{expected_currency}, observed {observed_currency!r}"
+            )
+    card_20 = accounts.get("credit_account:credit_card:20", {})
+    for field_name, expected in (
+        ("reporting_amount_currency", "CNY"),
+        ("amount_unit", "yuan"),
+        ("reporting_amount_unit", "yuan"),
+    ):
+        if card_20.get(field_name) != expected:
+            defects.append(
+                f"credit_account:credit_card:20: expected {field_name}={expected!r}, "
+                f"observed {card_20.get(field_name)!r}"
+            )
+    account_20_wrapper = next(
+        (
+            wrapper
+            for wrapper in account_wrappers
+            if str(wrapper.get("record_id") or "") == "credit_account:credit_card:20"
+        ),
+        {},
+    )
+    for pool_name in ("canonical_raw", "raw"):
+        raw_pool = account_20_wrapper.get(pool_name) or {}
+        for field_name in ("account_currency", "reporting_amount_currency"):
+            if raw_pool.get(field_name) != "人民币元":
+                defects.append(
+                    "credit_account:credit_card:20: expected exact "
+                    f"{pool_name}.{field_name}='人民币元', observed "
+                    f"{raw_pool.get(field_name)!r}"
+                )
+    corrected_currency_refs = [
+        ref
+        for ref in (account_20_wrapper.get("source") or {}).get("source_refs") or ()
+        if isinstance(ref, dict)
+        and ref.get("source") == "personal_detail_corrected_page_cell"
+        and ref.get("field_name")
+        in {"account_currency", "reporting_amount_currency"}
+    ]
+    if {
+        str(ref.get("field_name") or "") for ref in corrected_currency_refs
+    } != {"account_currency", "reporting_amount_currency"} or any(
+        not [value for value in ref.get("evidence_ids") or () if value]
+        for ref in corrected_currency_refs
+    ):
+        defects.append(
+            "credit_account:credit_card:20: exact corrected currency-cell evidence was not preserved"
+        )
+
+    expected_account_institutions = {
+        "credit_account:credit_card:6": (
+            "中国建设银行股份有限公司福建自贸试验区福州片区分行"
+        ),
+        "credit_account:non_revolving_loan:15": "重庆市蚂蚁商诚小额贷款有限公司",
+        "credit_account:non_revolving_loan:18": "重庆市蚂蚁商诚小额贷款有限公司",
+    }
+    for record_id, expected_institution in expected_account_institutions.items():
+        observed_institution = re.sub(
+            r"\s+", "", str(accounts.get(record_id, {}).get("management_institution") or "")
+        )
+        if observed_institution != expected_institution:
+            defects.append(
+                f"{record_id}: expected source-vetted institution {expected_institution!r}, "
+                f"observed {observed_institution!r}"
+            )
+
+    agreement_wrappers = community_datasets["credit_agreements"].get("rows") or []
+    agreements = {
+        str(wrapper.get("record_id") or ""): wrapper.get("normalized") or {}
+        for wrapper in agreement_wrappers
+    }
+    expected_agreement_institutions = {
+        "credit_line:3541f331d5318ead": "中国光大银行股份有限公司",
+        "credit_line:870e1a6ac873c754": (
+            "中国建设银行股份有限公司福建自贸试验区福州片区分行"
+        ),
+    }
+    for record_id, expected_institution in expected_agreement_institutions.items():
+        observed_institution = re.sub(
+            r"\s+", "", str(agreements.get(record_id, {}).get("institution") or "")
+        )
+        if observed_institution != expected_institution:
+            defects.append(
+                f"{record_id}: expected source-vetted institution {expected_institution!r}, "
+                f"observed {observed_institution!r}"
+            )
     issue_rows = [
         wrapper.get("normalized") or {}
         for wrapper in community_datasets["extraction_issues"].get("rows") or []
     ]
+    if any(
+        str(row.get("target_record_id") or "") == "credit_line:870e1a6ac873c754"
+        and row.get("field_name") == "institution"
+        and str(row.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+        for row in issue_rows
+    ):
+        defects.append(
+            "credit_line:870e1a6ac873c754: correct source-bound institution still has an active withheld issue"
+        )
+    if card_20.get("account_currency") not in (None, "") and any(
+        row.get("target_dataset") == "credit_accounts"
+        and str(row.get("target_record_id") or "")
+        == "credit_account:credit_card:20"
+        and str(row.get("field_name") or "") in {"currency", "account_currency"}
+        and bool(row.get("issue_code"))
+        and str(row.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+        for row in issue_rows
+    ):
+        defects.append(
+            "credit_account:credit_card:20: repaired currency still has an active field issue"
+        )
 
     def has_actionable_field_issue(record_id: str, field_names: set[str]) -> bool:
         return any(
@@ -1564,6 +1719,148 @@ def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
 
     assert omitted == len(status_withheld_ids) + unlocalized + len(unowned_ids)
     assert expected == emitted + len(status_withheld_ids) + unlocalized + len(unowned_ids)
+
+
+def _assert_ye_recovered_n_zero_months_oracle(
+    community: dict,
+    semantic: dict,
+) -> None:
+    """Pin the 26 source-vetted N/0 cells recovered by exact p17/p18 geometry."""
+
+    review_ids = _YE_RECOVERED_N_ZERO_REVIEW_IDS
+    silent_ids = _YE_RECOVERED_N_ZERO_SILENT_IDS
+    recovered_ids = review_ids | silent_ids
+    assert review_ids.isdisjoint(silent_ids)
+    assert len(review_ids) == 10
+    assert len(silent_ids) == 16
+    assert len(recovered_ids) == 26
+
+    def wrappers_by_id(payload: dict) -> dict[str, dict]:
+        dataset = _dataset_map(payload)["credit_account_monthly_performance"]
+        return {
+            str(
+                wrapper.get("record_id")
+                or (wrapper.get("normalized") or {}).get("monthly_performance_id")
+                or ""
+            ): wrapper
+            for wrapper in dataset.get("rows") or []
+        }
+
+    community_rows = wrappers_by_id(community)
+    semantic_rows = wrappers_by_id(semantic)
+    assert recovered_ids <= set(community_rows)
+    assert recovered_ids <= set(semantic_rows)
+
+    for record_id in sorted(recovered_ids):
+        grid_id, performance_month = record_id.split(":", 1)
+        expected_account_id, expected_page, expected_table_id = (
+            _YE_RECOVERED_N_ZERO_GRID_BINDINGS[grid_id]
+        )
+        month_number = int(performance_month[-2:])
+
+        community_wrapper = community_rows[record_id]
+        semantic_wrapper = semantic_rows[record_id]
+        for wrapper in (community_wrapper, semantic_wrapper):
+            values = wrapper.get("normalized") or {}
+            assert values.get("monthly_performance_id") == record_id
+            assert values.get("grid_id") == grid_id
+            assert values.get("account_id") == expected_account_id
+            assert values.get("performance_month") == performance_month
+            assert values.get("status_code") == "N"
+            assert Decimal(str(values.get("status_amount"))) == 0
+
+        for pool_name in ("canonical_raw", "raw"):
+            pool = semantic_wrapper.get(pool_name) or {}
+            assert pool.get("status_code") == "N", (record_id, pool_name, pool)
+            assert Decimal(str(pool.get("status_amount"))) == 0, (
+                record_id,
+                pool_name,
+                pool,
+            )
+
+        refs = (semantic_wrapper.get("source") or {}).get("source_cell_refs") or []
+        assert len(refs) == 2, (record_id, refs)
+        refs_by_field = {str(ref.get("field_name") or ""): ref for ref in refs}
+        assert set(refs_by_field) == {"status", "overdue_amount"}, (
+            record_id,
+            refs_by_field,
+        )
+        for ref in refs_by_field.values():
+            assert ref.get("logical_page") == expected_page, (record_id, ref)
+            assert ref.get("geometry_scope") == "cell", (record_id, ref)
+            assert ref.get("grid_id") == grid_id, (record_id, ref)
+            assert ref.get("col") == month_number, (record_id, ref)
+            bbox = ref.get("bbox")
+            assert isinstance(bbox, list) and len(bbox) == 4, (record_id, ref)
+            geometry = ref.get("geometry_provenance") or {}
+            assert geometry.get("selection_basis") == (
+                "source_table_year_plus_twelve_ownership"
+            ), (record_id, geometry)
+            assert geometry.get("source") == "source_table_geometry", (
+                record_id,
+                geometry,
+            )
+            assert geometry.get("reason") == (
+                "exact_source_table_month_lattice_calibration"
+            ), (record_id, geometry)
+            assert geometry.get("table_id") == expected_table_id, (
+                record_id,
+                geometry,
+            )
+            assert geometry.get("logical_page") == expected_page, (
+                record_id,
+                geometry,
+            )
+            assert geometry.get("column_count") == 13, (record_id, geometry)
+            assert geometry.get("month_column_count") == 12, (record_id, geometry)
+            assert geometry.get("year_anchor_mode") == (
+                "boundary_straddling_singleton_year_cells"
+            ), (record_id, geometry)
+            assert (
+                geometry.get("active_cell_geometry_exact"),
+                geometry.get("active_cell_rule_derived_count"),
+            ) in {(True, 0), (False, 2)}, (record_id, geometry)
+            assert geometry.get("value_inputs_used") is False, (
+                record_id,
+                geometry,
+            )
+            assert geometry.get("source_table_comparison") == (
+                "source_over_ambiguous_visual"
+            ), (record_id, geometry)
+
+        review = community_wrapper.get("review")
+        if record_id in review_ids:
+            assert isinstance(review, dict), record_id
+            assert review.get("status") == "requires_review", (record_id, review)
+            assert review.get("extraction_status") == "review", (record_id, review)
+            assert review.get("recognition_source") == (
+                "static_glyph_shape_unresolved"
+            ), (record_id, review)
+            diagnostics = review.get("diagnostics") or {}
+            assert diagnostics.get("reason") == (
+                "zero_status_static_corroboration_unavailable"
+            ), (record_id, diagnostics)
+            assert diagnostics.get("observed_status") == "N", (
+                record_id,
+                diagnostics,
+            )
+            assert diagnostics.get("reported_value_retained") is True, (
+                record_id,
+                diagnostics,
+            )
+        else:
+            assert not review, (record_id, review)
+
+    glyph_bank = (
+        (((semantic.get("domain") or {}).get("facts") or {}).get(
+            "credit_extraction_audit"
+        )
+        or {}).get("document_local_status_glyph_bank")
+        or {}
+    )
+    assert glyph_bank.get("enabled") is False
+    assert glyph_bank.get("promoted_count") == 0
+    assert glyph_bank.get("promotions") == []
 
 
 def _assert_lin_risky_zero_amount_cells_oracle(community: dict) -> None:
@@ -2743,6 +3040,8 @@ def test_personal_detail_ocr_correction_invariants(
                 "Ye physical month-column ownership failures:\n- "
                 + "\n- ".join(geometry_defects)
             )
+        _assert_ye_monthly_position_conservation_oracle(payload)
+        _assert_ye_recovered_n_zero_months_oracle(payload, semantic)
         for record_id in (
             "mg_p10_repayment_0:2022-06",
             "mg_p10_repayment_0:2020-08",
@@ -2809,6 +3108,16 @@ def test_saved_five_community_dataset_catalog() -> None:
         if fixture.name == "杨松林个人征信24.7.29.pdf":
             _assert_yang_liability_dataset_oracle(payload)
             _assert_yang_monthly_native_conflict_oracle(payload)
+        if fixture.name == "叶永燕征信.pdf":
+            ye_inquiry_failures: list[str] = []
+            _append_ye_inquiry_conflict_oracle_failures(
+                _dataset_map(payload),
+                ye_inquiry_failures,
+            )
+            assert not ye_inquiry_failures, (
+                f"{community_path}: saved Ye inquiry conflict failures:\n- "
+                + "\n- ".join(ye_inquiry_failures)
+            )
 
 
 def test_saved_lin_semantic_account_fragment_oracle() -> None:
@@ -3469,6 +3778,10 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
     failures.extend(geometry_defects)
     try:
         _assert_ye_monthly_position_conservation_oracle(community)
+    except AssertionError as exc:
+        failures.append(str(exc))
+    try:
+        _assert_ye_recovered_n_zero_months_oracle(community, semantic)
     except AssertionError as exc:
         failures.append(str(exc))
     for record_id in (

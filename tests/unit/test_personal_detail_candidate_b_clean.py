@@ -219,6 +219,96 @@ def test_final_account_issue_reconciliation_preserves_same_source_invalid_and_co
     assert all(record.get("_unresolved_fields") for record in records)
 
 
+def test_new_currency_issues_require_evidence_bearing_corrected_cell_ref() -> None:
+    record_id = "credit_account:test:currency"
+    geometry_only_ref = _exact_account_field_ref(
+        bbox_top=300.0,
+        field_name="currency",
+    )
+    record = {
+        "account_id": record_id,
+        "account_currency": "CNY",
+        "source_refs_by_field": {"currency": [geometry_only_ref]},
+        "_unresolved_fields": ["currency"],
+        "_invalid_observation_fields": ["currency"],
+        "_reported_invalid_fields": ["currency"],
+    }
+    issue_ref = _account_issue_ref(row=1, column=5, field_name="currency")
+    issues = [
+        _active_account_issue(
+            record_id=record_id,
+            field_name="account_currency",
+            issue_code=issue_code,
+            source_ref=issue_ref,
+        )
+        for issue_code in (
+            "candidate_b_account_required_field_unresolved",
+            "candidate_b_exact_slot_value_unreadable",
+        )
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+
+    candidate_b._reconcile_final_account_field_issues(context, [record])
+
+    assert context._personal_detail_extraction_issues == issues
+    assert record["_unresolved_fields"] == ["currency"]
+    assert record["_invalid_observation_fields"] == ["currency"]
+    assert record["_reported_invalid_fields"] == ["currency"]
+
+
+def test_final_currency_issue_reconciliation_uses_unambiguous_target_remap() -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        register_issue_target_remap,
+    )
+
+    provisional_id = "credit_account_table_observation:pt_23_1"
+    record_id = "credit_account:credit_card:20"
+    issue_ref = _account_issue_ref(row=1, column=5, field_name="currency")
+    corrected_ref = {
+        "source": "personal_detail_corrected_page_cell",
+        "logical_page": 4,
+        "source_page": 2,
+        "bbox": [270.0, 120.0, 300.0, 135.0],
+        "geometry_scope": "cell",
+        "evidence_ids": ["repair:currency:20"],
+        "binding": "canonical_field_slot",
+        "binding_quality": "canonical_field_slot",
+        "field_slot_role": "value",
+        "field_name": "currency",
+    }
+    record = {
+        "account_id": record_id,
+        "account_currency": "CNY",
+        "source_refs_by_field": {"currency": [corrected_ref]},
+        "_unresolved_fields": ["currency"],
+        "_invalid_observation_fields": ["currency"],
+        "_reported_invalid_fields": ["currency"],
+    }
+    issues = [
+        _active_account_issue(
+            record_id=provisional_id,
+            field_name="account_currency",
+            issue_code="candidate_b_exact_slot_value_unreadable",
+            source_ref=issue_ref,
+        ),
+        _active_account_issue(
+            record_id=record_id,
+            field_name="currency",
+            issue_code="candidate_b_account_required_field_unresolved",
+            source_ref=issue_ref,
+        ),
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+    register_issue_target_remap(context, provisional_id, record_id)
+
+    candidate_b._reconcile_final_account_field_issues(context, [record])
+
+    assert context._personal_detail_extraction_issues == []
+    assert "_unresolved_fields" not in record
+    assert "_invalid_observation_fields" not in record
+    assert "_reported_invalid_fields" not in record
+
+
 def test_candidate_b_branch_has_no_shared_extraction_or_assembly_imports() -> None:
     root = Path("docmirror/plugins/credit_report/personal_detail_scanned")
     active = "\n".join(

@@ -307,6 +307,14 @@ def _exact_cell(cell: Any, *, require_single_token: bool = False) -> bool:
     return len(token_ids) == 1 and len(evidence_ids) == 1 and token_ids == evidence_ids
 
 
+def _nonempty_equal_token_evidence(cell: Any) -> bool:
+    token_ids = [str(item) for item in _get(cell, "token_ids", ()) or () if item]
+    evidence_ids = [
+        str(item) for item in _get(cell, "evidence_ids", ()) or () if item
+    ]
+    return bool(token_ids) and token_ids == evidence_ids
+
+
 def _header_proves_month_ordinals(cells: Mapping[int, Any]) -> bool:
     if set(range(1, 13)).difference(cells):
         return False
@@ -585,10 +593,20 @@ def _base_source_geometry_row_binding(
     ):
         return None
     for geometry in (status_geometry, amount_geometry):
-        rule_count = _integer(geometry.get("vertical_rule_count") or geometry.get("rule_count"))
+        vertical_rule_count = _integer(geometry.get("vertical_rule_count"))
+        rule_count = _integer(geometry.get("rule_count"))
+        if (
+            vertical_rule_count is not None
+            and rule_count is not None
+            and vertical_rule_count != rule_count
+        ):
+            return None
+        effective_rule_count = (
+            vertical_rule_count if vertical_rule_count is not None else rule_count
+        )
         if not (
             _integer(geometry.get("logical_page")) == logical_page
-            and rule_count == 14
+            and effective_rule_count == 14
             and _integer(geometry.get("year_anchor_row_index")) == status_row
             and str(geometry.get("year_anchor_mode") or "") == "spanning_year_cell"
             and _integer(geometry.get("year_row_span")) == 2
@@ -654,19 +672,27 @@ def _base_provenance_bound_native_candidate(
         return None
     # The bound base-page path accepts damaged header text, but never inferred
     # header geometry or a header cell owned by a different physical row/col.
-    if any(
-        not (
-            _exact_cell(header_cells[month])
-            and _integer(_get(header_cells[month], "row_index")) == header_row
-            and _integer(_get(header_cells[month], "col_index")) == month
+    for month in range(1, 13):
+        header_cell = header_cells[month]
+        raw_header_box = _bbox(_get(header_cell, "bbox"))
+        logical_header_box = _bbox(
+            _matrix_get(table_geometry.get("cell_bboxes"), header_row, month)
         )
-        for month in range(1, 13)
-    ):
-        return None
+        if not (
+            _exact_cell(header_cell)
+            and _integer(_get(header_cell, "row_index")) == header_row
+            and _integer(_get(header_cell, "col_index")) == month
+            and raw_header_box is not None
+            and logical_header_box is not None
+            and _overlap_is_same_cell(raw_header_box, logical_header_box)
+            and _nonempty_equal_token_evidence(header_cell)
+        ):
+            return None
     year_cell = status_cells[0]
     if not (
         _integer(_get(year_cell, "row_index")) == status_row
         and _integer(_get(year_cell, "col_index")) == 0
+        and _nonempty_equal_token_evidence(year_cell)
     ):
         return None
     logical_year_box = _bbox(_matrix_get(table_geometry.get("cell_bboxes"), status_row, 0))

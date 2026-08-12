@@ -81,6 +81,15 @@ _INQUIRY_REASONS = (
     "异议处理",
     "司法调查",
 )
+_SELF_INQUIRY_REASON_CHANNELS = frozenset(
+    {
+        "本人查询",
+        "本人查询(自助查询机)",
+        "本人查询(商业银行网上银行)",
+        "本人查询(互联网个人信用信息服务平台)",
+        "本人查询(征信中心柜台)",
+    }
+)
 _INQUIRY_REASON_REPAIRS = {
     "货后管理": "贷后管理",
     "贷后智理": "贷后管理",
@@ -439,6 +448,15 @@ def _currency_token(value: Any) -> tuple[str | None, str, str]:
             ):
                 start = index + 1
                 continue
+            if len(token) == 1 and "\u3400" <= token <= "\u9fff" and (
+                (index > 0 and "\u3400" <= raw[index - 1] <= "\u9fff")
+                or (end < len(raw) and "\u3400" <= raw[end] <= "\u9fff")
+            ):
+                # Single-Han currency aliases (for example 银 -> XAG) are
+                # scalar tokens only.  They must not match a glyph embedded
+                # in ordinary institution prose such as 中国工商银行.
+                start = index + 1
+                continue
             matches.append((index, end, code))
             start = index + 1
 
@@ -545,7 +563,16 @@ def _source_ref(
         # Canonical projection keeps both registered-page coordinates and the
         # originating source-page coordinates.  A business-field repair must
         # point at the originating cell, never at the enclosing table.
-        cell_bboxes = metadata.get("source_cell_bboxes") or metadata.get("cell_bboxes")
+        cell_bboxes = (
+            metadata.get("source_cell_bboxes")
+            or metadata.get("cell_bboxes")
+            or (
+                geometry.get("source_cell_bboxes")
+                or geometry.get("cell_bboxes")
+                if isinstance(geometry, Mapping)
+                else None
+            )
+        )
         if (
             isinstance(cell_bboxes, list)
             and 0 <= row < len(cell_bboxes)
@@ -557,7 +584,11 @@ def _source_ref(
                 bbox = candidate
                 ref["source"] = "native_detail_table_cell"
                 ref["geometry_scope"] = "cell"
-        cell_evidence_ids = metadata.get("cell_evidence_ids")
+        cell_evidence_ids = metadata.get("cell_evidence_ids") or (
+            geometry.get("cell_evidence_ids")
+            if isinstance(geometry, Mapping)
+            else None
+        )
         if (
             isinstance(cell_evidence_ids, list)
             and 0 <= row < len(cell_evidence_ids)
@@ -949,6 +980,74 @@ def _reject_exact_observation(
             observed_value=raw_values,
             source_refs=(ref,),
             reason_codes=("canonical_field_slot", "field_contract_failed", "normalized_value_withheld"),
+        ),
+    )
+
+
+def _report_unreadable_exact_slot(
+    parse_result: Any,
+    record: dict[str, Any],
+    *,
+    dataset: str,
+    target_record_id: str,
+    field_name: str,
+    source_ref: Mapping[str, Any],
+    parser_stage: str,
+    issue_code: str = "candidate_b_exact_slot_value_unreadable",
+    slot_state: str = "blank_or_unreadable",
+    message: str = (
+        "The canonical value slot was blank or unreadable; no normalized "
+        "value was published."
+    ),
+) -> None:
+    """Report one canonical slot whose value is unavailable without guessing."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    ref = {**dict(source_ref), "field_name": field_name}
+    refs = record.setdefault("source_refs_by_field", {}).setdefault(field_name, [])
+    if ref not in refs:
+        refs.append(ref)
+    record.pop(field_name, None)
+    _append_internal_field(record, "_unresolved_fields", field_name)
+    _append_internal_field(record, "_invalid_observation_fields", field_name)
+    prior = record.setdefault("canonical_raw", {}).get(field_name)
+    raw_values = (
+        prior
+        if isinstance(prior, list)
+        else ([prior] if prior not in (None, "") else [])
+    )
+    if "" not in raw_values:
+        raw_values.append("")
+    record["canonical_raw"][field_name] = raw_values
+    reported = record.setdefault("_reported_invalid_fields", [])
+    if field_name in reported:
+        return
+    reported.append(field_name)
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code=issue_code,
+            message=message,
+            parser_stage=parser_stage,
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            observed_value={"raw": "", "slot_state": slot_state},
+            source_refs=(ref,),
+            reason_codes=(
+                "canonical_field_slot",
+                (
+                    "exact_value_slot_blank_or_unreadable"
+                    if slot_state == "blank_or_unreadable"
+                    else "canonical_value_row_missing"
+                ),
+                "normalized_value_withheld",
+            ),
         ),
     )
 
@@ -3439,17 +3538,55 @@ def _apply_account_facts(
         target = next((field for field, labels, _converter in mappings if label in labels), None)
         if target is None:
             target = {"账户币种": "currency", "币种": "currency", "账户状态": "account_status", "状态": "account_status"}.get(label)
-        source_row = physical_row(label_row_index)
-        if not target or source_row is None:
+        label_source_row = physical_row(label_row_index)
+        source_row = physical_row(label_row_index + 1)
+        if not target or label_source_row is None:
             continue
-        _reject_exact_observation(
+        if source_row is None:
+            ref = _source_ref(
+                page,
+                table,
+                row=label_source_row,
+                column=column,
+            )
+            ref.update(
+                {
+                    "field_slot_role": "label_without_value_row",
+                    "canonical_label_row": label_source_row,
+                    "canonical_value_row": None,
+                }
+            )
+            _report_unreadable_exact_slot(
+                parse_result,
+                account,
+                dataset=dataset,
+                target_record_id=target_record_id,
+                field_name=target,
+                source_ref=ref,
+                parser_stage=parser_stage,
+                issue_code="candidate_b_exact_slot_value_row_missing",
+                slot_state="value_row_missing",
+                message=(
+                    "The canonical label had no physically owned next value row; "
+                    "no value was guessed or published."
+                ),
+            )
+            continue
+        ref = _source_ref(page, table, row=source_row, column=column)
+        ref.update(
+            {
+                "field_slot_role": "value",
+                "canonical_label_row": label_source_row,
+                "canonical_value_row": source_row,
+            }
+        )
+        _report_unreadable_exact_slot(
             parse_result,
             account,
             dataset=dataset,
             target_record_id=target_record_id,
             field_name=target,
-            raw="",
-            source_ref=_source_ref(page, table, row=source_row, column=column),
+            source_ref=ref,
             parser_stage=parser_stage,
         )
 
@@ -12935,6 +13072,42 @@ def _longest_inquiry_reason_suffix(value: str) -> str:
     return max(matches, key=len, default="")
 
 
+def _bounded_canonical_inquiry_reason(value: Any) -> str | None:
+    """Return one finite reason surrounded only by bounded OCR edge debris.
+
+    The inquiry-reason column has a closed vocabulary.  A canonical token may
+    therefore be retained when it occurs exactly once and the rest of the cell
+    is no more than three compact edge glyphs (at most one Han glyph).  This
+    deliberately rejects a damaged long reason that merely ends in the shorter
+    ``资信审查`` token.
+    """
+
+    text = _compact(_normalize_inquiry_reason(str(value or "")))
+    if not text:
+        return None
+    if re.fullmatch(r"本人查询(?:[（(][^）)]{1,16}[）)])?", text):
+        # The parenthesized self-query channel is part of the canonical source
+        # wording, not OCR edge debris.  Ordinal grouping still uses the closed
+        # semantic reason ``本人查询``.
+        return "本人查询"
+    matches = [reason for reason in _INQUIRY_REASONS if text.count(reason) == 1]
+    if not matches:
+        return None
+    longest = max(len(reason) for reason in matches)
+    canonical = {reason for reason in matches if len(reason) == longest}
+    if len(canonical) != 1:
+        return None
+    selected = next(iter(canonical))
+    prefix, suffix = text.split(selected, 1)
+    residue = re.sub(r"[\W_]+", "", f"{prefix}{suffix}", flags=re.UNICODE)
+    if (
+        len(residue) > 3
+        or len(re.findall(r"[\u3400-\u9fff]", residue)) > 1
+    ):
+        return None
+    return selected
+
+
 def _repair_inquiry_reason_boundary(record: Mapping[str, Any]) -> dict[str, Any]:
     """Move a finite long-reason prefix out of a contaminated institution cell."""
 
@@ -13142,7 +13315,7 @@ def _document_local_inquiry_ordinals(
 
 
 _BOUNDED_INQUIRY_DATE_RE = re.compile(
-    r"(?<!\d)((?:19|20)\d{2})[./:-]?(\d{2})[./:-](\d{2})(?!\d)"
+    r"(?<!\d)((?:19|20)\d{2})[./:-]?(\d{2})[./:-]?(\d{2})(?!\d)"
 )
 
 
@@ -13498,6 +13671,24 @@ def _split_personal_inquiry_header_geometry_exact(
     )
 
 
+def _bounded_split_personal_inquiry_reason(value: Any) -> bool:
+    """Validate one self-query channel wrapped inside an exact split row."""
+
+    raw_reason = _compact(
+        _normalize_inquiry_reason(str(value or ""))
+    ).translate(str.maketrans({"（": "(", "）": ")"}))
+    if raw_reason.count("本人查询") != 1:
+        return False
+    wrapped_prefix, wrapped_suffix = raw_reason.split("本人查询", 1)
+    # Hong's source lattice wraps the parenthesized query channel inside one
+    # physical cell: its trailing fragment precedes ``本人查询`` while its
+    # leading fragment follows it. Reorder only those fragments and require a
+    # complete closed-vocabulary channel. This proof is used only after the
+    # split personal header, body topology, and exact geometry are established.
+    reconstructed = f"本人查询{wrapped_suffix}{wrapped_prefix}"
+    return reconstructed in _SELF_INQUIRY_REASON_CHANNELS
+
+
 def _bounded_split_personal_inquiry_header_slots(
     rows: list[list[str]],
     *,
@@ -13567,15 +13758,12 @@ def _bounded_split_personal_inquiry_header_slots(
                 _slot_value(row, slots, "institution"),
             )
         )
-        reason = _normalized_inquiry_field(
-            "reason",
-            _slot_value(row, slots, "reason"),
-        )
         if (
             _bounded_inquiry_date(_slot_value(row, slots, "inquiry_date")) is None
             or institution != "本人"
-            or reason not in _INQUIRY_REASONS
-            or not reason.startswith("本人查询")
+            or not _bounded_split_personal_inquiry_reason(
+                _slot_value(row, slots, "reason")
+            )
         ):
             return None
     return slots
@@ -13724,10 +13912,9 @@ def _bounded_split_personal_leading_ordinal(
             )
         )
         == "本人"
-        and _normalized_inquiry_field(
-            "reason",
+        and _bounded_split_personal_inquiry_reason(
             _slot_value(row, slots, "reason"),
-        ).startswith("本人查询")
+        )
         for row in cells
     )
 
@@ -14297,12 +14484,12 @@ def _normalized_inquiry_field(field_name: str, value: Any) -> str:
         return normalized
 
     if field_name == "reason":
-        normalized = normalize_role_candidate(value, "inquiry_reason")
-        compact = re.sub(r"\s+", "", normalized)
-        for canonical in sorted(_INQUIRY_REASONS, key=len, reverse=True):
-            if canonical in compact:
-                return canonical
-        return normalized
+        canonical = _bounded_canonical_inquiry_reason(value)
+        return (
+            canonical
+            if canonical is not None
+            else normalize_role_candidate(value, "inquiry_reason")
+        )
 
     role = {
         "inquiry_date": "date",
@@ -14548,6 +14735,319 @@ def _exact_native_inquiry_row_ref(
         "evidence_ids": sorted(evidence_ids),
         "binding": "canonical_header_row",
     }
+
+
+def _exact_native_inquiry_business_row_ref(
+    page: Any,
+    table: Any,
+    *,
+    row_index: int,
+) -> dict[str, Any] | None:
+    """Bind the three exact business cells even when the ordinal is blank."""
+
+    rows = _table_rows(table)
+    geometry = _native_table_geometry(table)
+    if (
+        not (0 <= row_index < len(rows))
+        or len(rows[row_index]) != 4
+        or geometry is None
+    ):
+        return None
+    for key in (
+        "cell_bboxes",
+        "cell_geometry_status",
+        "cell_evidence_ids",
+    ):
+        grid = geometry.get(key)
+        if (
+            not isinstance(grid, list)
+            or not (0 <= row_index < len(grid))
+            or not isinstance(grid[row_index], list)
+            or len(grid[row_index]) != 4
+        ):
+            return None
+    row_geometry = _exact_inquiry_table_row_geometry(
+        table,
+        row_index=row_index,
+        require_all_cells=False,
+    )
+    if row_geometry is None:
+        return None
+    bbox, evidence_ids = row_geometry
+    # Date, institution, and reason are the three business columns.  The
+    # generic row helper already requires three exact cells; make sure they
+    # are precisely these columns rather than an ordinal plus two fields.
+    for column in (1, 2, 3):
+        if _exact_native_table_cell(table, row=row_index, column=column) is None:
+            return None
+    return {
+        **_source_ref(page, table, row=row_index),
+        "bbox": list(bbox),
+        "geometry_scope": "row",
+        "evidence_ids": sorted(evidence_ids),
+        "binding": "canonical_header_business_row",
+    }
+
+
+def _exact_inquiry_row_refs(value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return exact, evidence-bearing row refs from one record or issue."""
+
+    exact: list[dict[str, Any]] = []
+    for ref in value.get("source_refs") or ():
+        if not isinstance(ref, Mapping):
+            continue
+        try:
+            logical_page = int(ref.get("logical_page") or 0)
+            source_page = int(ref.get("source_page") or 0)
+        except (TypeError, ValueError):
+            continue
+        bbox = _exact_geometry_bbox(ref.get("bbox"))
+        evidence_ids = {
+            str(item) for item in ref.get("evidence_ids") or () if str(item or "")
+        }
+        if (
+            bbox is None
+            or not evidence_ids
+            or ref.get("geometry_scope") != "row"
+            or str(ref.get("source") or "")
+            not in {
+                "native_detail_table",
+                "candidate_b_canonical_inquiry_line",
+            }
+            or logical_page <= 0
+            or source_page <= 0
+        ):
+            continue
+        exact.append(dict(ref))
+    return exact
+
+
+def _inquiry_cross_plane_row_match(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    """Require a unique physical-row overlap across the two OCR planes."""
+
+    pairs: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    for left_ref in _exact_inquiry_row_refs(left):
+        left_bbox = _exact_geometry_bbox(left_ref.get("bbox"))
+        if left_bbox is None:
+            continue
+        for right_ref in _exact_inquiry_row_refs(right):
+            if (
+                left_ref.get("source") == right_ref.get("source")
+                or int(left_ref.get("logical_page") or 0)
+                != int(right_ref.get("logical_page") or 0)
+                or int(left_ref.get("source_page") or 0)
+                != int(right_ref.get("source_page") or 0)
+            ):
+                continue
+            right_bbox = _exact_geometry_bbox(right_ref.get("bbox"))
+            if right_bbox is None:
+                continue
+            horizontal_overlap = min(left_bbox[2], right_bbox[2]) - max(
+                left_bbox[0], right_bbox[0]
+            )
+            vertical_overlap = min(left_bbox[3], right_bbox[3]) - max(
+                left_bbox[1], right_bbox[1]
+            )
+            maximum_width = max(
+                left_bbox[2] - left_bbox[0],
+                right_bbox[2] - right_bbox[0],
+            )
+            maximum_height = max(
+                left_bbox[3] - left_bbox[1],
+                right_bbox[3] - right_bbox[1],
+            )
+            if (
+                maximum_width > 0.0
+                and maximum_height > 0.0
+                and horizontal_overlap / maximum_width >= 0.60
+                and vertical_overlap / maximum_height >= 0.60
+            ):
+                pairs.append((left_ref, right_ref))
+    return len(pairs) == 1
+
+
+def _dropped_leading_han_inquiry_conflict_indices(
+    observations: Iterable[Mapping[str, Any]],
+) -> set[int]:
+    """Return same-row observations that disagree by one dropped Han glyph.
+
+    A corrected-line plane may omit the separated leading glyph retained by an
+    exact native institution cell (for example ``守 中信银行...`` versus
+    ``中信银行...``).  The cleaner spelling is not self-authenticating.  Treat
+    both readings as coequal only when their independent row refs prove the
+    same physical inquiry row.
+    """
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+        institution_name_has_separated_leading_han,
+    )
+
+    rows = [
+        observation
+        for observation in observations
+        if isinstance(observation, Mapping)
+    ]
+    conflicts: set[int] = set()
+    for noisy_index, noisy_observation in enumerate(rows):
+        noisy_value = str(noisy_observation.get("institution") or "")
+        if not institution_name_has_separated_leading_han(noisy_value):
+            continue
+        separated = re.match(
+            r"^[\u3400-\u9fff]\s+(.+)$",
+            _clean(noisy_value),
+        )
+        if separated is None:
+            continue
+        full_value = _compact(
+            _normalized_inquiry_field("institution", noisy_value)
+        )
+        dropped_value = _compact(
+            _normalized_inquiry_field("institution", separated.group(1))
+        )
+        if not full_value or not dropped_value or full_value == dropped_value:
+            continue
+        for clean_index, clean_observation in enumerate(rows):
+            if clean_index == noisy_index:
+                continue
+            clean_value = str(clean_observation.get("institution") or "")
+            if (
+                not clean_value
+                or institution_name_has_separated_leading_han(clean_value)
+                or _compact(
+                    _normalized_inquiry_field("institution", clean_value)
+                )
+                != dropped_value
+                or not _inquiry_cross_plane_row_match(
+                    noisy_observation,
+                    clean_observation,
+                )
+            ):
+                continue
+            conflicts.update((noisy_index, clean_index))
+    return conflicts
+
+
+def _unresolved_inquiry_business_row(
+    issue: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    observed = issue.get("observed_value")
+    if not isinstance(observed, Mapping):
+        return None
+    row = observed.get("row")
+    if isinstance(row, Mapping):
+        inquiry_date = _bounded_inquiry_date(row.get("inquiry_date"))
+        institution = row.get("institution")
+        reason = row.get("reason")
+    elif isinstance(row, (list, tuple)) and len(row) == 4:
+        inquiry_date = _bounded_inquiry_date(row[1])
+        institution = row[2]
+        reason = row[3]
+    else:
+        return None
+    inquiry_type = str(observed.get("inquiry_type") or "")
+    if inquiry_date is None or not inquiry_type or not institution or not reason:
+        return None
+    return {
+        "inquiry_type": inquiry_type,
+        "inquiry_date": inquiry_date,
+        "institution": institution,
+        "reason": reason,
+    }
+
+
+def _reconcile_unresolved_inquiry_issues_to_emitted_records(
+    parse_result: Any,
+    records: Iterable[Mapping[str, Any]],
+) -> None:
+    """Close only reciprocal exact-row omission issues after final grouping."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+    )
+
+    issues = getattr(parse_result, "_personal_detail_extraction_issues", None)
+    if not isinstance(issues, list):
+        return
+    final_records = [dict(record) for record in records if isinstance(record, Mapping)]
+    unresolved_codes = {
+        "candidate_b_inquiry_multiple_missing_sequences_unresolved",
+        "candidate_b_inquiry_boundary_sequence_unresolved",
+        "candidate_b_inquiry_sequence_unresolved",
+    }
+    candidates: list[tuple[int, Mapping[str, Any], Mapping[str, Any]]] = []
+    for issue_index, issue in enumerate(issues):
+        if (
+            not isinstance(issue, Mapping)
+            or str(issue.get("issue_code") or "") not in unresolved_codes
+            or str(issue.get("status") or "requires_review")
+            in {"resolved", "suppressed_redundant", "informational"}
+            or "record_not_emitted" not in set(issue.get("reason_codes") or ())
+        ):
+            continue
+        observed = _unresolved_inquiry_business_row(issue)
+        if observed is not None:
+            candidates.append((issue_index, issue, observed))
+
+    edges_by_issue: defaultdict[int, set[int]] = defaultdict(set)
+    edges_by_record: defaultdict[int, set[int]] = defaultdict(set)
+    for issue_index, issue, observed in candidates:
+        for record_index, record in enumerate(final_records):
+            if (
+                str(observed.get("inquiry_type") or "")
+                != str(record.get("inquiry_type") or "")
+                or not _inquiry_business_equivalent(observed, record)
+                or not _inquiry_cross_plane_row_match(issue, record)
+            ):
+                continue
+            edges_by_issue[issue_index].add(record_index)
+            edges_by_record[record_index].add(issue_index)
+
+    for issue_index, record_indices in edges_by_issue.items():
+        if len(record_indices) != 1:
+            continue
+        record_index = next(iter(record_indices))
+        if edges_by_record[record_index] != {issue_index}:
+            continue
+        original = issues[issue_index]
+        record = final_records[record_index]
+        sequence = int(record.get("sequence") or 0)
+        record_id = str(record.get("inquiry_id") or "")
+        if sequence <= 0 or not record_id:
+            continue
+        refs = [
+            dict(ref)
+            for owner in (original, record)
+            for ref in owner.get("source_refs") or ()
+            if isinstance(ref, Mapping)
+        ]
+        issues[issue_index] = make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_inquiry_unresolved_sequence_reconciled_to_emitted_record",
+            message=(
+                "A provisional inquiry non-emission was closed after reciprocal "
+                "exact-row reconciliation proved that the same business row was emitted."
+            ),
+            severity="info",
+            status="resolved",
+            parser_stage="candidate_b_inquiry_schema",
+            target_dataset="inquiry_records",
+            target_record_id=record_id,
+            field_name="sequence",
+            observed_value=original.get("observed_value"),
+            candidate_value={"normalized_sequence": sequence},
+            source_refs=refs,
+            reason_codes=(
+                "distinct_native_and_corrected_line_planes",
+                "same_logical_and_source_page",
+                "strong_row_geometry_overlap",
+                "normalized_business_fields_equal",
+                "reciprocal_unique_cross_plane_match",
+                "record_emitted",
+            ),
+        )
 
 
 def _reconcile_exact_native_inquiry_line_ordinals(
@@ -14982,6 +15482,9 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 )
                 if sequence is None:
                     if repair_kind:
+                        unresolved_date = _slot_value(
+                            cells, slots, "inquiry_date"
+                        )
                         unresolved_institution = _slot_value(
                             cells, slots, "institution"
                         )
@@ -14995,8 +15498,27 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                         _record_inquiry_ordinal_unresolved(
                             parse_result,
                             inquiry_type=unresolved_type,
-                            source_ref=_source_ref(page, table, row=row_index),
-                            observed_row=list(cells),
+                            source_ref=(
+                                _exact_native_inquiry_business_row_ref(
+                                    page,
+                                    table,
+                                    row_index=row_index,
+                                )
+                                or _source_ref(page, table, row=row_index)
+                            ),
+                            observed_row={
+                                "raw_sequence": _slot_value(
+                                    cells,
+                                    slots,
+                                    "sequence",
+                                ),
+                                "raw_inquiry_date": unresolved_date,
+                                "inquiry_date": _bounded_inquiry_date(
+                                    unresolved_date
+                                ),
+                                "institution": unresolved_institution,
+                                "reason": unresolved_reason,
+                            },
                             repair_kind=repair_kind,
                         )
                     continue
@@ -15043,7 +15565,14 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     "personal" if institution == "本人" or source_reason.startswith("本人查询") else "institution"
                 )
                 inquiry_id = stable_record_id("credit_inquiry", inquiry_type, sequence)
-                row_ref = _source_ref(page, table, row=row_index)
+                row_ref = (
+                    _exact_native_inquiry_business_row_ref(
+                        page,
+                        table,
+                        row_index=row_index,
+                    )
+                    or _source_ref(page, table, row=row_index)
+                )
                 refs_by_field = {
                     field_name: [
                         {
@@ -15155,6 +15684,11 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
 
     best: dict[tuple[str, int], dict[str, Any]] = {}
     for key, observations in grouped.items():
+        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+            institution_name_has_separated_leading_han,
+            normalize_institution_name,
+        )
+
         selected = deepcopy(max(observations, key=_inquiry_observation_score))
         selected["inquiry_id"] = stable_record_id("credit_inquiry", key[0], key[1])
         merged_refs: list[dict[str, Any]] = []
@@ -15171,9 +15705,59 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
         selected_refs_by_field: dict[str, list[dict[str, Any]]] = {}
         for field_name in ("inquiry_date", "institution", "reason"):
             candidates: list[tuple[int, float, Any, Mapping[str, Any]]] = []
-            for observation in observations:
+            dropped_leading_conflicts = (
+                _dropped_leading_han_inquiry_conflict_indices(observations)
+                if field_name == "institution"
+                else set()
+            )
+            separated_institutions = [
+                str(observation.get("institution") or "")
+                for observation in observations
+                if field_name == "institution"
+                and institution_name_has_separated_leading_han(
+                    str(observation.get("institution") or "")
+                )
+            ]
+            ambiguous_joined_institutions = {
+                _compact(normalize_institution_name(value))
+                for value in separated_institutions
+                if value
+            }
+            ambiguous_dropped_institutions: set[str] = set()
+            for separated_value in separated_institutions:
+                separated = re.match(
+                    r"^[\u3400-\u9fff]\s+(.+)$",
+                    _clean(separated_value),
+                )
+                if separated is not None:
+                    ambiguous_dropped_institutions.add(
+                        _compact(
+                            _normalized_inquiry_field(
+                                "institution",
+                                separated.group(1),
+                            )
+                        )
+                    )
+            for observation_index, observation in enumerate(observations):
                 value = observation.get(field_name)
                 if value in (None, ""):
+                    continue
+                if (
+                    field_name == "institution"
+                    and observation_index not in dropped_leading_conflicts
+                    and (
+                        institution_name_has_separated_leading_han(str(value))
+                        or _compact(normalize_institution_name(str(value)))
+                        in (
+                            ambiguous_joined_institutions
+                            | ambiguous_dropped_institutions
+                        )
+                    )
+                ):
+                    # One exact plane preserved the visible whitespace while
+                    # another may have compacted it.  Neither spelling proves
+                    # whether the separated Han glyph belongs to the legal
+                    # name, so both are withheld as the same ambiguity.
                     continue
                 refs_by_field = observation.get("source_refs_by_field")
                 refs = refs_by_field.get(field_name) if isinstance(refs_by_field, Mapping) else ()
@@ -15183,9 +15767,73 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     and ref.get("binding") == "canonical_header_column"
                     for ref in refs or ()
                 )
-                candidates.append((2 if exact else 1, float(observation.get("confidence") or 0.0), value, observation))
+                candidates.append(
+                    (
+                        2
+                        if exact or observation_index in dropped_leading_conflicts
+                        else 1,
+                        float(observation.get("confidence") or 0.0),
+                        value,
+                        observation,
+                    )
+                )
             if not candidates:
                 selected[field_name] = None
+                if separated_institutions:
+                    selected["extraction_status"] = "review"
+                    _append_internal_field(
+                        selected,
+                        "_unresolved_fields",
+                        "institution",
+                    )
+                    raw_values = list(dict.fromkeys(separated_institutions))
+                    selected.setdefault("canonical_raw", {})[
+                        "institution"
+                    ] = raw_values
+                    field_refs = [
+                        dict(ref)
+                        for observation in observations
+                        for ref in (
+                            (
+                                observation.get("source_refs_by_field") or {}
+                            ).get("institution")
+                            if isinstance(
+                                observation.get("source_refs_by_field"),
+                                Mapping,
+                            )
+                            else observation.get("source_refs") or ()
+                        )
+                        if isinstance(ref, Mapping)
+                    ]
+                    record_issue(
+                        parse_result,
+                        make_issue(
+                            category="ocr_cell_level_error",
+                            issue_code="candidate_b_inquiry_institution_leading_boundary_ambiguous",
+                            message=(
+                                "A separated leading Han glyph could be either "
+                                "institution text or neighbouring-cell debris; "
+                                "the institution was withheld."
+                            ),
+                            parser_stage="candidate_b_inquiry_schema",
+                            target_dataset="inquiry_records",
+                            target_record_id=selected["inquiry_id"],
+                            field_name="institution",
+                            observed_value={"raw_values": raw_values},
+                            candidate_value={
+                                "compacted_joined_values": sorted(
+                                    ambiguous_joined_institutions
+                                )
+                            },
+                            source_refs=field_refs or merged_refs,
+                            reason_codes=(
+                                "exact_inquiry_institution_slot",
+                                "separated_leading_han_boundary",
+                                "independent_alternate_spelling_missing",
+                                "normalized_value_withheld",
+                            ),
+                        ),
+                    )
                 continue
             top_quality = max(candidate[0] for candidate in candidates)
             top = [candidate for candidate in candidates if candidate[0] == top_quality]
@@ -15216,7 +15864,80 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 )
                 continue
             chosen = max(top, key=lambda candidate: (candidate[1], len(str(candidate[2]))))
-            selected[field_name] = chosen[2]
+            normalized_value = next(iter(normalized))
+            if (
+                field_name == "reason"
+                and key[0] == "institution"
+                and normalized_value not in _INQUIRY_REASONS
+            ):
+                selected[field_name] = None
+                selected["extraction_status"] = "review"
+                _append_internal_field(selected, "_unresolved_fields", "reason")
+                raw_values = list(
+                    dict.fromkeys(str(candidate[2]) for candidate in top)
+                )
+                selected.setdefault("canonical_raw", {})["reason"] = raw_values
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_inquiry_reason_unresolved",
+                        message=(
+                            "The exact inquiry-reason slot did not prove one "
+                            "member of the finite canonical reason vocabulary."
+                        ),
+                        parser_stage="candidate_b_inquiry_schema",
+                        target_dataset="inquiry_records",
+                        target_record_id=selected["inquiry_id"],
+                        field_name="reason",
+                        observed_value={"raw_values": raw_values},
+                        source_refs=merged_refs,
+                        reason_codes=(
+                            "exact_inquiry_reason_slot",
+                            "finite_reason_vocabulary",
+                            "bounded_token_proof_failed",
+                            "normalized_value_withheld",
+                        ),
+                    ),
+                )
+                continue
+            selected[field_name] = (
+                chosen[2]
+                if field_name == "reason" and key[0] == "personal"
+                else normalized_value
+            )
+            if (
+                field_name == "reason"
+                and key[0] == "institution"
+                and _compact(chosen[2]) != _compact(normalized_value)
+            ):
+                selected.setdefault("canonical_raw", {})["reason"] = chosen[2]
+                record_issue(
+                    parse_result,
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code="candidate_b_inquiry_reason_edge_residue_corrected",
+                        message=(
+                            "One exact finite inquiry-reason token was retained "
+                            "after bounded edge OCR residue was removed."
+                        ),
+                        severity="info",
+                        status="resolved",
+                        parser_stage="candidate_b_inquiry_schema",
+                        target_dataset="inquiry_records",
+                        target_record_id=selected["inquiry_id"],
+                        field_name="reason",
+                        observed_value={"raw": chosen[2]},
+                        candidate_value={"normalized_reason": normalized_value},
+                        source_refs=merged_refs,
+                        reason_codes=(
+                            "exact_inquiry_reason_slot",
+                            "unique_finite_reason_token",
+                            "bounded_edge_residue",
+                            "professional_field_correction",
+                        ),
+                    ),
+                )
             for _quality, _confidence, _value, observation in normalized[next(iter(normalized))]:
                 refs_by_field = observation.get("source_refs_by_field")
                 for ref in refs_by_field.get(field_name) or () if isinstance(refs_by_field, Mapping) else ():
@@ -15226,6 +15947,10 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             selected["source_refs_by_field"] = selected_refs_by_field
         best[key] = selected
     ordered = sorted(best.values(), key=lambda row: (str(row.get("inquiry_type") or ""), int(row.get("sequence") or 0)))
+    _reconcile_unresolved_inquiry_issues_to_emitted_records(
+        parse_result,
+        ordered,
+    )
     for inquiry_type in sorted({str(row.get("inquiry_type") or "unknown") for row in ordered}):
         sequences = {
             int(row.get("sequence") or 0)

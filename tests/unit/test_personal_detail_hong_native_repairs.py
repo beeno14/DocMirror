@@ -361,6 +361,10 @@ def _hong_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
             personal_rows[1][2],
             personal_rows[1][1],
         )
+    elif defect == "unknown_wrapped_personal_channel":
+        personal_rows[3][3] = "渠道) 本人查询(未知"
+    elif defect == "competing_personal_reason":
+        personal_rows[2][3] = "本人查询(自助查询机) 贷款审批"
     personal_table = _table(
         "pt_9_1",
         personal_rows,
@@ -449,6 +453,13 @@ def test_hong_mixed_inquiry_regions_emit_17_institution_and_3_personal(
     personal = [row for row in rows if row["inquiry_type"] == "personal"]
     assert [row["sequence"] for row in institutional] == list(range(1, 18))
     assert [row["sequence"] for row in personal] == [1, 2, 3]
+    expected_raw_reasons = [
+        "本人查询(自助查询机)",
+        "银行) 本人查询(商业银行网上",
+        "用信息服务平台) 本人查询(互联网个人信",
+    ]
+    assert [row["reason"] for row in personal] == expected_raw_reasons
+    assert [row["source_reason"] for row in personal] == expected_raw_reasons
     assert coverage["sequence_endpoints"] == {"institution": 17, "personal": 3}
     assert coverage["expected_row_count"] == 20
 
@@ -461,6 +472,8 @@ def test_hong_mixed_inquiry_regions_emit_17_institution_and_3_personal(
         "non_authoritative_order",
         "populated_trailing_column",
         "transposed_personal_header",
+        "unknown_wrapped_personal_channel",
+        "competing_personal_reason",
     ],
 )
 def test_hong_mixed_inquiry_repairs_fail_closed(
@@ -474,7 +487,11 @@ def test_hong_mixed_inquiry_repairs_fail_closed(
     institutional = [row for row in rows if row["inquiry_type"] == "institution"]
     personal = [row for row in rows if row["inquiry_type"] == "personal"]
 
-    if defect == "transposed_personal_header":
+    if defect in {
+        "transposed_personal_header",
+        "unknown_wrapped_personal_channel",
+        "competing_personal_reason",
+    }:
         assert [row["sequence"] for row in institutional] == list(range(1, 18))
         assert personal == []
     elif defect == "non_authoritative_order":

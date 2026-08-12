@@ -986,7 +986,7 @@ def test_trailing_optional_account_fact_labels_are_consumed_or_reported(boundary
     unresolved_fields = {
         issue.get("field_name")
         for issue in result._personal_detail_extraction_issues
-        if issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        if issue.get("issue_code") == "candidate_b_exact_slot_value_row_missing"
         and issue.get("target_record_id") == accounts[0]["account_id"]
     }
     assert {"repayment_frequency", "repayment_method"} <= unresolved_fields

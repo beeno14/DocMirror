@@ -5,9 +5,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.evidence.repair import RepairCandidate
+from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
+    _reconcile_final_account_field_issues,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
     collect_extraction_issues,
+    make_issue,
+    record_issue,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _account_institution,
@@ -301,6 +308,20 @@ def test_institution_legal_name_preserves_sanctioned_internal_dashes() -> None:
     assert not institution_slot_is_unambiguous(debris)
     assert normalize_institution_name(debris) == debris
     assert _account_institution(debris) is None
+
+
+def test_institution_legal_root_is_ranked_after_attaching_its_branch_tail() -> None:
+    expected = "中国建设银行股份有限公司福建自贸试验区福州片区分行"
+    for raw in (
+        expected,
+        "中国建设银行股份有限 公司福建自贸试验区福 州片区分行",
+        "中国建设银行 股份有限公司 福建自贸试验 区福州片区分 行",
+    ):
+        assert normalize_institution_name(raw) == expected
+        assert _account_institution(raw) == expected
+
+    branch_only = "福建自贸试验区福州片区分行"
+    assert normalize_institution_name(branch_only) == branch_only
 
 
 def test_account_institution_requires_independent_source_bound_corroboration() -> None:
@@ -900,6 +921,411 @@ def test_summary_source_ref_prefers_exact_cell_geometry() -> None:
     assert ref["geometry_scope"] == "cell"
     assert ref["source"] == "native_detail_table_cell"
     assert ref["evidence_ids"] == ["ocr:2"]
+
+
+def test_source_ref_reads_cell_provenance_nested_under_geometry() -> None:
+    page = SimpleNamespace(page_number=23, source_page_number=12)
+    table = SimpleNamespace(
+        table_id="pt_23_1",
+        bbox=[0, 0, 400, 200],
+        metadata={
+            "geometry": {
+                "coordinate_system": "pdf_points",
+                "cell_bboxes": [
+                    [[0, 0, 40, 10]],
+                    [[10, 20, 50, 40]],
+                ],
+                "cell_evidence_ids": [
+                    [["native:header"]],
+                    [["native:value"]],
+                ],
+            }
+        },
+    )
+
+    ref = _source_ref(page, table, row=1, column=0)
+
+    assert ref["source"] == "native_detail_table_cell"
+    assert ref["bbox"] == [10, 20, 50, 40]
+    assert ref["evidence_ids"] == ["native:value"]
+    assert ref["coordinate_system"] == "pdf_points"
+
+
+def _blank_account_currency_observation(
+    context: SimpleNamespace,
+    *,
+    with_geometry: bool = True,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {"raw_rows": [["币种"], [""]]}
+    if with_geometry:
+        metadata["geometry"] = {
+            "coordinate_system": "pdf_points",
+            "cell_bboxes": [
+                [[0, 0, 40, 10]],
+                [[10, 20, 50, 40]],
+            ],
+            "cell_evidence_ids": [
+                [["native:currency-header"]],
+                [["native:currency-blank"]],
+            ],
+        }
+    table = SimpleNamespace(
+        table_id="pt_23_1",
+        bbox=[0, 0, 400, 200],
+        metadata=metadata,
+        headers=[],
+        rows=[],
+    )
+    account: dict[str, object] = {
+        "account_id": "credit_account:credit_card:20",
+    }
+    _apply_account_facts(
+        context,
+        account,
+        metadata["raw_rows"],
+        page=SimpleNamespace(page_number=23, source_page_number=12),
+        table=table,
+    )
+    return account
+
+
+def test_blank_account_currency_reports_unreadable_value_cell_not_invalid_value() -> None:
+    context = SimpleNamespace()
+
+    account = _blank_account_currency_observation(context)
+
+    assert "currency" not in account
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    issue = issues[0]
+    assert issue["issue_code"] == "candidate_b_exact_slot_value_unreadable"
+    assert issue["observed_value"] == {
+        "raw": "",
+        "slot_state": "blank_or_unreadable",
+    }
+    assert "blank or unreadable" in issue["message"]
+    assert "field_contract_failed" not in issue["reason_codes"]
+    ref = issue["source_refs"][0]
+    assert ref["row"] == 1
+    assert ref["canonical_label_row"] == 0
+    assert ref["canonical_value_row"] == 1
+    assert ref["field_slot_role"] == "value"
+    assert ref["bbox"] == [10, 20, 50, 40]
+    assert ref["evidence_ids"] == ["native:currency-blank"]
+
+
+def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issue() -> None:
+    context = SimpleNamespace()
+    account = _blank_account_currency_observation(context)
+    native_currency_ref = account["source_refs_by_field"]["currency"][0]
+    record_issue(
+        context,
+        make_issue(
+            category="schema_incompleteness",
+            issue_code="candidate_b_account_required_field_unresolved",
+            message="A required canonical account field remains withheld.",
+            parser_stage="candidate_b_account_canonical_slots",
+            target_dataset="credit_accounts",
+            target_record_id="credit_account:credit_card:20",
+            field_name="currency",
+            source_refs=(native_currency_ref,),
+            reason_codes=(
+                "canonical_account_template",
+                "required_field_missing",
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+    wrapped_account = {
+        "record_id": "credit_account:credit_card:20",
+        "normalized": {
+            "account_id": "credit_account:credit_card:20",
+            "currency": None,
+            "account_currency": None,
+            "reporting_amount_currency": None,
+        },
+        # Model the live compatibility envelope: stale flat aliases must not
+        # override the repaired normalized record downstream.
+        "currency": None,
+        "account_currency": "STALE",
+        "reporting_amount_currency": None,
+        "canonical_raw": account["canonical_raw"],
+        "source_refs_by_field": account["source_refs_by_field"],
+        "_unresolved_fields": account["_unresolved_fields"],
+        "_invalid_observation_fields": account["_invalid_observation_fields"],
+        "_reported_invalid_fields": account["_reported_invalid_fields"],
+    }
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    raw_currency = "\u4eba\u6c11\u5e01\u5143"
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 23,
+                "source_page": 12,
+                "lines": [
+                    {
+                        "text": raw_currency,
+                        "confidence": 0.96,
+                        "bbox": [12, 22, 48, 38],
+                        "evidence_ids": ["repair:currency:20"],
+                    }
+                ],
+            }
+        ],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [wrapped_account]},
+        stage="candidate_b_final_validation",
+    )
+    corrected_account = corrected["credit_accounts"][0]
+    normalized = corrected_account["normalized"]
+
+    assert normalized["currency"] == "CNY"
+    assert normalized["account_currency"] == "CNY"
+    assert normalized["reporting_amount_currency"] == "CNY"
+    assert corrected_account["currency"] == "CNY"
+    assert corrected_account["account_currency"] == "CNY"
+    assert corrected_account["reporting_amount_currency"] == "CNY"
+    assert corrected_account["canonical_raw"]["currency"] == raw_currency
+    assert corrected_account["canonical_raw"]["account_currency"] == raw_currency
+    assert (
+        corrected_account["canonical_raw"]["reporting_amount_currency"]
+        == raw_currency
+    )
+    corrected_refs = [
+        ref
+        for ref in corrected_account["source_refs_by_field"]["account_currency"]
+        if ref.get("source") == "personal_detail_corrected_page_cell"
+    ]
+    assert len(corrected_refs) == 1
+    assert corrected_refs[0]["bbox"] == [12.0, 22.0, 48.0, 38.0]
+    assert corrected_refs[0]["evidence_ids"] == ["repair:currency:20"]
+    assert "table_id" not in corrected_refs[0]
+    assert "row" not in corrected_refs[0]
+    decisions = overlay.audit()["decisions"]
+    assert any(
+        decision["role"] == "currency"
+        and decision["corrected"] == "CNY"
+        and decision["method"]
+        == "schema_bound_missing_account_currency_reparse"
+        for decision in decisions
+    )
+
+    _reconcile_final_account_field_issues(context, [corrected_account])
+
+    assert collect_extraction_issues(context) == []
+    for marker in (
+        "_unresolved_fields",
+        "_invalid_observation_fields",
+        "_reported_invalid_fields",
+    ):
+        assert marker not in corrected_account
+
+
+@pytest.mark.parametrize(
+    ("case", "lines"),
+    (
+        (
+            "missing_bbox",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [12, 22, 48, 38],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "header_ref",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [12, 22, 48, 38],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "low_confidence",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.71,
+                    "bbox": [12, 22, 48, 38],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "multiple_currencies",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.99,
+                    "bbox": [12, 22, 30, 38],
+                    "evidence_ids": ["repair:cny"],
+                },
+                {
+                    "text": "USD",
+                    "confidence": 0.80,
+                    "bbox": [30, 22, 48, 38],
+                    "evidence_ids": ["repair:usd"],
+                },
+            ],
+        ),
+        (
+            "near_tie",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [12, 22, 30, 38],
+                    "evidence_ids": ["repair:cny"],
+                },
+                {
+                    "text": "USD",
+                    "confidence": 0.92,
+                    "bbox": [30, 22, 48, 38],
+                    "evidence_ids": ["repair:usd"],
+                },
+            ],
+        ),
+        (
+            "outside_value_cell",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [200, 200, 240, 220],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "row_spanning_bbox",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [0, 20, 400, 40],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "mostly_outside_bbox",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [-200, 20, 20, 40],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "neighboring_halo_bbox",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [51, 22, 65, 38],
+                    "evidence_ids": ["repair:cny"],
+                }
+            ],
+        ),
+        (
+            "missing_repair_evidence_id",
+            [
+                {
+                    "text": "\u4eba\u6c11\u5e01\u5143",
+                    "confidence": 0.96,
+                    "bbox": [12, 22, 48, 38],
+                }
+            ],
+        ),
+    ),
+)
+def test_missing_account_currency_repair_remains_fail_closed(
+    case: str,
+    lines: list[dict[str, object]],
+) -> None:
+    context = SimpleNamespace()
+    account = _blank_account_currency_observation(
+        context,
+        with_geometry=case != "missing_bbox",
+    )
+    if case == "header_ref":
+        ref = account["source_refs_by_field"]["currency"][0]
+        ref["row"] = 0
+        ref["canonical_value_row"] = 0
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    overlay.install_business_repair_evidence(
+        [{"page": 23, "source_page": 12, "lines": lines}],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [account]},
+        stage="candidate_b_final_validation",
+    )
+    corrected_account = corrected["credit_accounts"][0]
+    _reconcile_final_account_field_issues(context, [corrected_account])
+
+    assert corrected_account.get("currency") is None
+    assert corrected_account.get("account_currency") is None
+    assert corrected_account.get("reporting_amount_currency") is None
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_unreadable"
+    assert issues[0]["status"] == "requires_review"
+
+
+def test_missing_account_currency_repair_never_overwrites_existing_currency() -> None:
+    context = SimpleNamespace()
+    account = _blank_account_currency_observation(context)
+    account.update(
+        {
+            "currency": "USD",
+            "account_currency": "USD",
+            "reporting_amount_currency": "USD",
+        }
+    )
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 23,
+                "source_page": 12,
+                "lines": [
+                    {
+                        "text": "\u4eba\u6c11\u5e01\u5143",
+                        "confidence": 0.99,
+                        "bbox": [12, 22, 48, 38],
+                        "evidence_ids": ["repair:cny"],
+                    }
+                ],
+            }
+        ],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [account]},
+        stage="candidate_b_final_validation",
+    )
+
+    assert corrected["credit_accounts"][0]["currency"] == "USD"
+    assert corrected["credit_accounts"][0]["account_currency"] == "USD"
+    assert corrected["credit_accounts"][0]["reporting_amount_currency"] == "USD"
+    assert not any(
+        decision["method"] == "schema_bound_missing_account_currency_reparse"
+        for decision in overlay.audit()["decisions"]
+    )
 
 
 def test_evidence_overlay_corrects_inquiry_lines_without_mutating_raw_evidence() -> None:
