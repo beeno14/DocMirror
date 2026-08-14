@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -17,8 +18,12 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.sdk.integration.request import InputRef, ParseRequest
+from docmirror.server.parse_process_manager import (
+    ParseCapacityError,
+    bounded_request_payload,
+    get_parse_process_manager,
+)
 from docmirror.server.task_executor import (
-    execute_parse_task,
     initialize_task_manifest,
     read_task_manifest,
     task_directory,
@@ -118,9 +123,12 @@ async def list_task_artifacts(
 ):
     """List stable artifact keys and task-relative paths."""
     _verify_api_key(authorization)
-    manifest = _manifest_or_404(task_id)
-    result = task_result_from_manifest(task_directory(task_id) / "manifest.json")
-    return {"task_id": task_id, "status": manifest.get("status"), "artifacts": result.public_dict()["artifacts"]}
+    _manifest_or_404(task_id)
+    output_root = task_output_root()
+    result = get_parse_process_manager().runtime_result(task_id, output_root=output_root)
+    if result is None:
+        result = task_result_from_manifest(task_directory(task_id, output_root=output_root) / "manifest.json")
+    return {"task_id": task_id, "status": result.status, "artifacts": result.public_dict()["artifacts"]}
 
 
 @router.get("/{task_id}/artifacts/{artifact_key}")
@@ -172,7 +180,11 @@ async def get_task(
     """Return the current durable task manifest."""
     _verify_api_key(authorization)
     _manifest_or_404(task_id)
-    return task_result_from_manifest(task_directory(task_id) / "manifest.json").public_dict()
+    output_root = task_output_root()
+    runtime_result = get_parse_process_manager().runtime_result(task_id, output_root=output_root)
+    if runtime_result is not None:
+        return runtime_result.public_dict()
+    return task_result_from_manifest(task_directory(task_id, output_root=output_root) / "manifest.json").public_dict()
 
 
 async def submit_upload_task(
@@ -207,9 +219,6 @@ async def submit_upload_task(
         ocr_locale=ocr_locale,
         ocr_correction_packs=ocr_correction_packs,
     )
-    from docmirror.configs.runtime.performance import resolve_worker_budget
-
-    budget = resolve_worker_budget(workers, file_count=len(uploads))
     task_id = _new_task_id()
     output_root = task_output_root()
     task_dir = task_directory(task_id, output_root=output_root)
@@ -226,6 +235,10 @@ async def submit_upload_task(
         max_pages=max_pages,
         workers=workers,
     )
+    request.workers = int(bounded_request_payload(request)["workers"])
+    from docmirror.configs.runtime.performance import resolve_worker_budget
+
+    budget = resolve_worker_budget(request.workers, file_count=len(uploads))
     initialize_task_manifest(
         output_root,
         task_id,
@@ -275,14 +288,17 @@ async def _start_or_wait(
     task_id: str,
     wait: bool,
 ):
-    coroutine = execute_parse_task(
-        request,
-        output_root=output_root,
-        task_id=task_id,
-    )
+    try:
+        background = await get_parse_process_manager().start(
+            request,
+            output_root=output_root,
+            task_id=task_id,
+        )
+    except ParseCapacityError as exc:
+        shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
+        raise HTTPException(status_code=503, detail="Document parser capacity is currently exhausted") from exc
     if wait:
-        return (await coroutine).public_dict()
-    background = asyncio.create_task(coroutine, name=f"docmirror-task:{task_id}")
+        return (await background).public_dict()
     _BACKGROUND_TASKS.add(background)
     background.add_done_callback(_BACKGROUND_TASKS.discard)
     result = task_result_from_manifest(task_directory(task_id, output_root=output_root) / "manifest.json")

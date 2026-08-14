@@ -8,11 +8,25 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult, ResultStatus
 from docmirror.models.sealed import seal_parse_result
 from docmirror.server.api import app
+from docmirror.server.parse_process_manager import get_parse_process_manager
+from docmirror.server.task_executor import execute_parse_task
+
+
+@pytest.fixture(autouse=True)
+def _execute_parses_inline(monkeypatch):
+    """Keep contract monkeypatches in-process; process isolation has dedicated tests."""
+    manager = get_parse_process_manager()
+
+    async def start(request, *, output_root, task_id):
+        return asyncio.create_task(execute_parse_task(request, output_root=output_root, task_id=task_id))
+
+    monkeypatch.setattr(manager, "start", start)
 
 
 def _mirror(document_type: str = "business_license") -> ParseResult:
@@ -114,9 +128,7 @@ def test_task_api_has_no_delivery_selection_parameters():
     schema = TestClient(app).get("/openapi.json").json()
     removed = {"formats", "editions", "geometry", "include_geometry", "include_text", "mirror_level"}
     for path in ("/v1/tasks", "/v1/tasks/batch"):
-        parameters = {
-            parameter["name"] for parameter in schema["paths"][path]["post"].get("parameters", [])
-        }
+        parameters = {parameter["name"] for parameter in schema["paths"][path]["post"].get("parameters", [])}
         assert not parameters & removed
 
 
