@@ -16,8 +16,10 @@ services:
       - DOCMIRROR_LOG_LEVEL=info
       # Optional: Control concurrency
       - OMP_NUM_THREADS=4
-      # 0 = unlimited top-level PDF parse processes
-      - DOCMIRROR_MAX_ACTIVE_PARSES=0
+      # Process-local FIFO: 10 active parses plus up to 50 waiting requests
+      - DOCMIRROR_MAX_ACTIVE_PARSES=10
+      - DOCMIRROR_MAX_QUEUED_PARSES=50
+      - DOCMIRROR_QUEUE_WAIT_TIMEOUT_SECONDS=900
       - DOCMIRROR_WORKERS_PER_PARSE=2
       - DOCMIRROR_PARSE_TIMEOUT_SECONDS=1800
       - DOCMIRROR_PARSE_KILL_GRACE_SECONDS=10

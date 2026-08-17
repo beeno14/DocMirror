@@ -17,20 +17,25 @@ from pathlib import Path
 from typing import Any
 
 from docmirror.sdk.integration.request import ParseRequest
+from docmirror.server.parse_admission_queue import (
+    ParseAdmissionQueue,
+    ParseCapacityError,
+    ParseManagerShuttingDownError,
+    ParseQueueFullError,
+    ParseQueueWaitTimeoutError,
+    max_active_parses,
+    max_queued_parses,
+    queue_wait_timeout_seconds,
+)
 from docmirror.server.task_executor import task_directory
 from docmirror.server.task_result import TaskResult, task_result_from_manifest
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_ACTIVE_PARSES = 0
 _DEFAULT_WORKERS_PER_PARSE = 2
 _DEFAULT_PARSE_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_KILL_GRACE_SECONDS = 10.0
 _MAX_RUNTIME_RESULTS = 1000
-
-
-class ParseCapacityError(RuntimeError):
-    """Raised when all configured parse-process slots are occupied."""
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -39,17 +44,6 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
     try:
         return max(1, int(raw))
-    except ValueError:
-        logger.warning("event=parse_config_invalid name=%s value=%r default=%s", name, raw, default)
-        return default
-
-
-def _non_negative_int_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return max(0, int(raw))
     except ValueError:
         logger.warning("event=parse_config_invalid name=%s value=%r default=%s", name, raw, default)
         return default
@@ -64,11 +58,6 @@ def _positive_float_env(name: str, default: float) -> float:
     except ValueError:
         logger.warning("event=parse_config_invalid name=%s value=%r default=%s", name, raw, default)
         return default
-
-
-def max_active_parses() -> int:
-    """Return the parse-process limit, where zero means unlimited."""
-    return _non_negative_int_env("DOCMIRROR_MAX_ACTIVE_PARSES", _DEFAULT_MAX_ACTIVE_PARSES)
 
 
 def workers_per_parse() -> int:
@@ -106,7 +95,7 @@ class ParseProcessManager:
 
     def __init__(self) -> None:
         self._state_lock = asyncio.Lock()
-        self._active_slots = 0
+        self._admission = ParseAdmissionQueue()
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._tasks: set[asyncio.Task[TaskResult]] = set()
         self._runtime_results: OrderedDict[tuple[str, str], TaskResult] = OrderedDict()
@@ -116,6 +105,7 @@ class ParseProcessManager:
         """Allow submissions for a new FastAPI lifespan."""
         async with self._state_lock:
             self._closing = False
+        await self._admission.startup()
 
     async def start(
         self,
@@ -124,20 +114,21 @@ class ParseProcessManager:
         output_root: Path,
         task_id: str,
     ) -> asyncio.Task[TaskResult]:
-        """Reserve capacity and start monitoring one isolated parser process."""
-        async with self._state_lock:
-            limit = max_active_parses()
-            if self._closing:
-                raise RuntimeError("DocMirror parse manager is shutting down")
-            if limit > 0 and self._active_slots >= limit:
-                raise ParseCapacityError(f"all {limit} parser process slot(s) are occupied")
-            self._active_slots += 1
+        """Wait for FIFO admission and start monitoring one isolated parser process."""
+        await self._admission.acquire(task_id=task_id)
 
-        task = asyncio.create_task(
-            self._run_reserved(request, output_root=output_root.resolve(), task_id=task_id),
-            name=f"docmirror-process:{task_id}",
-        )
-        self._tasks.add(task)
+        try:
+            async with self._state_lock:
+                if self._closing:
+                    raise ParseManagerShuttingDownError("DocMirror parse manager is shutting down")
+                task = asyncio.create_task(
+                    self._run_reserved(request, output_root=output_root.resolve(), task_id=task_id),
+                    name=f"docmirror-process:{task_id}",
+                )
+                self._tasks.add(task)
+        except BaseException:
+            await self._admission.release()
+            raise
         task.add_done_callback(self._tasks.discard)
         return task
 
@@ -147,6 +138,7 @@ class ParseProcessManager:
 
     async def shutdown(self) -> None:
         """Terminate active parser process groups and wait for monitors to finish."""
+        await self._admission.shutdown()
         async with self._state_lock:
             self._closing = True
             processes = list(self._processes.items())
@@ -180,7 +172,12 @@ class ParseProcessManager:
                 output_root=output_root,
             )
             async with self._state_lock:
-                self._processes[task_id] = process
+                shutting_down = self._closing
+                if not shutting_down:
+                    self._processes[task_id] = process
+            if shutting_down:
+                await self._terminate_process_group(process, grace_seconds=parse_kill_grace_seconds())
+                raise asyncio.CancelledError
             logger.info(
                 "event=parse_process_started task_id=%s pid=%s timeout_seconds=%s",
                 task_id,
@@ -246,7 +243,7 @@ class ParseProcessManager:
             request_path.unlink(missing_ok=True)
             async with self._state_lock:
                 self._processes.pop(task_id, None)
-                self._active_slots = max(0, self._active_slots - 1)
+            await self._admission.release()
 
     async def _spawn_process(
         self,
@@ -352,11 +349,16 @@ def get_parse_process_manager() -> ParseProcessManager:
 
 __all__ = [
     "ParseCapacityError",
+    "ParseManagerShuttingDownError",
     "ParseProcessManager",
+    "ParseQueueFullError",
+    "ParseQueueWaitTimeoutError",
     "bounded_request_payload",
     "get_parse_process_manager",
     "max_active_parses",
+    "max_queued_parses",
     "parse_kill_grace_seconds",
     "parse_timeout_seconds",
+    "queue_wait_timeout_seconds",
     "workers_per_parse",
 ]

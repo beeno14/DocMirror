@@ -31,7 +31,8 @@ from fastapi.responses import FileResponse
 from docmirror import __version__
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.sdk.integration.request import InputRef, ParseRequest
-from docmirror.server.parse_process_manager import ParseCapacityError, get_parse_process_manager
+from docmirror.server.parse_admission_queue import ParseCapacityError
+from docmirror.server.parse_process_manager import get_parse_process_manager
 from docmirror.server.task_api import router as task_router
 from docmirror.server.task_api import submit_upload_task
 from docmirror.server.task_executor import task_output_root

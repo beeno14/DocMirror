@@ -32,12 +32,17 @@ docker run -d \
 | `DOCMIRROR_API_KEY` | — | API key for request authentication |
 | `DOCMIRROR_LOG_LEVEL` | `info` | Logging level |
 | `DOCMIRROR_MAX_PAGES` | `200` | Maximum pages to process per document |
-| `DOCMIRROR_MAX_ACTIVE_PARSES` | `0` | Maximum isolated parser processes; `0` accepts an unlimited number |
+| `DOCMIRROR_MAX_ACTIVE_PARSES` | `10` | Maximum isolated parser processes; `0` accepts an unlimited number |
+| `DOCMIRROR_MAX_QUEUED_PARSES` | `50` | Maximum requests waiting in the process-local FIFO queue |
+| `DOCMIRROR_QUEUE_WAIT_TIMEOUT_SECONDS` | `900` | Maximum time one request may wait for a parser slot |
 | `DOCMIRROR_WORKERS_PER_PARSE` | `2` | Maximum internal file/page worker budget for one parser process |
 | `DOCMIRROR_PARSE_TIMEOUT_SECONDS` | `1800` | Hard wall-clock timeout for one parser process |
 | `DOCMIRROR_PARSE_KILL_GRACE_SECONDS` | `10` | Grace period between terminate and forced kill |
 | `DOCMIRROR_LICENSE` | — | Optional commercial license key |
 | `OMP_NUM_THREADS` | — | Optional native thread limit for OCR/math libraries |
+
+The FIFO queue is process-local. Run exactly one Uvicorn API worker when the configured active and queued limits must
+apply globally to the whole DocMirror service.
 
 ### Docker Compose
 
@@ -54,7 +59,9 @@ services:
     environment:
       - DOCMIRROR_API_KEY=${DOCMIRROR_API_KEY}
       - DOCMIRROR_LOG_LEVEL=info
-      - DOCMIRROR_MAX_ACTIVE_PARSES=0
+      - DOCMIRROR_MAX_ACTIVE_PARSES=10
+      - DOCMIRROR_MAX_QUEUED_PARSES=50
+      - DOCMIRROR_QUEUE_WAIT_TIMEOUT_SECONDS=900
       - DOCMIRROR_WORKERS_PER_PARSE=2
       - DOCMIRROR_PARSE_TIMEOUT_SECONDS=1800
       - DOCMIRROR_PARSE_KILL_GRACE_SECONDS=10
@@ -82,7 +89,7 @@ server {
     ssl_certificate_key /etc/ssl/private/docmirror.key;
 
     client_max_body_size 100M;
-    proxy_read_timeout 1860s;
+    proxy_read_timeout 3000s;
 
     location / {
         proxy_pass http://127.0.0.1:8000;

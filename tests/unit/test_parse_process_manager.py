@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from docmirror.sdk.integration.request import InputRef, ParseRequest
+from docmirror.server.parse_admission_queue import ParseManagerShuttingDownError
 from docmirror.server.parse_process_manager import (
-    ParseCapacityError,
     ParseProcessManager,
     bounded_request_payload,
 )
@@ -35,6 +35,15 @@ async def _sleeping_process(seconds: float) -> asyncio.subprocess.Process:
     )
 
 
+async def _wait_for_queue_size(manager: ParseProcessManager, expected: int) -> None:
+    deadline = asyncio.get_running_loop().time() + 1.0
+    snapshot = await manager._admission.snapshot()
+    while snapshot.queued != expected and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.005)
+        snapshot = await manager._admission.snapshot()
+    assert snapshot.queued == expected
+
+
 def test_request_round_trip_and_worker_cap(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("DOCMIRROR_WORKERS_PER_PARSE", "2")
     payload = bounded_request_payload(_request(tmp_path, workers=8))
@@ -45,24 +54,68 @@ def test_request_round_trip_and_worker_cap(tmp_path: Path, monkeypatch):
     assert restored.inputs[0].file_name == "input.txt"
 
 
-def test_manager_rejects_when_process_capacity_is_full(tmp_path: Path, monkeypatch):
+def test_manager_runs_queued_requests_in_fifo_order(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("DOCMIRROR_MAX_ACTIVE_PARSES", "1")
+    monkeypatch.setenv("DOCMIRROR_MAX_QUEUED_PARSES", "2")
+    monkeypatch.setenv("DOCMIRROR_QUEUE_WAIT_TIMEOUT_SECONDS", "5")
     monkeypatch.setenv("DOCMIRROR_PARSE_TIMEOUT_SECONDS", "5")
     manager = ParseProcessManager()
+    started: list[str] = []
 
-    async def spawn_process(**_kwargs):
-        return await _sleeping_process(0.1)
+    async def spawn_process(**kwargs):
+        started.append(kwargs["task_id"])
+        return await _sleeping_process(0.08)
 
     monkeypatch.setattr(manager, "_spawn_process", spawn_process)
 
     async def scenario():
         first = await manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_first")
-        with pytest.raises(ParseCapacityError):
-            await manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_second")
-        await first
+        second_start = asyncio.create_task(
+            manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_second")
+        )
+        await _wait_for_queue_size(manager, 1)
+        third_start = asyncio.create_task(
+            manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_third")
+        )
+        await _wait_for_queue_size(manager, 2)
 
-        third = await manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_third")
+        await first
+        second = await second_start
+        await second
+        third = await third_start
         await third
+
+        assert started == ["task_first", "task_second", "task_third"]
+
+    asyncio.run(scenario())
+
+
+def test_manager_rejects_queued_requests_during_shutdown(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("DOCMIRROR_MAX_ACTIVE_PARSES", "1")
+    monkeypatch.setenv("DOCMIRROR_MAX_QUEUED_PARSES", "1")
+    monkeypatch.setenv("DOCMIRROR_QUEUE_WAIT_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("DOCMIRROR_PARSE_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("DOCMIRROR_PARSE_KILL_GRACE_SECONDS", "0.1")
+    manager = ParseProcessManager()
+
+    async def spawn_process(**_kwargs):
+        return await _sleeping_process(5)
+
+    monkeypatch.setattr(manager, "_spawn_process", spawn_process)
+
+    async def scenario():
+        await manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_first")
+        second_start = asyncio.create_task(
+            manager.start(_request(tmp_path), output_root=tmp_path / "tasks", task_id="task_second")
+        )
+        await _wait_for_queue_size(manager, 1)
+
+        await manager.shutdown()
+        with pytest.raises(ParseManagerShuttingDownError):
+            await second_start
+        snapshot = await manager._admission.snapshot()
+        assert snapshot.queued == 0
+        assert snapshot.active == 0
 
     asyncio.run(scenario())
 

@@ -18,8 +18,13 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.sdk.integration.request import InputRef, ParseRequest
-from docmirror.server.parse_process_manager import (
+from docmirror.server.parse_admission_queue import (
     ParseCapacityError,
+    ParseManagerShuttingDownError,
+    ParseQueueFullError,
+    ParseQueueWaitTimeoutError,
+)
+from docmirror.server.parse_process_manager import (
     bounded_request_payload,
     get_parse_process_manager,
 )
@@ -294,6 +299,43 @@ async def _start_or_wait(
             output_root=output_root,
             task_id=task_id,
         )
+    except asyncio.CancelledError:
+        shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
+        raise
+    except ParseQueueFullError as exc:
+        shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DOCMIRROR_QUEUE_FULL",
+                "message": "DocMirror解析队列已满，请稍后重试",
+                "retryable": True,
+                "active": exc.active,
+                "queued": exc.queued,
+                "queue_limit": exc.max_queued,
+            },
+        ) from exc
+    except ParseQueueWaitTimeoutError as exc:
+        shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DOCMIRROR_QUEUE_WAIT_TIMEOUT",
+                "message": "DocMirror排队等待超过15分钟，请稍后重试",
+                "retryable": True,
+                "wait_timeout_seconds": exc.wait_timeout_seconds,
+            },
+        ) from exc
+    except ParseManagerShuttingDownError as exc:
+        shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "DOCMIRROR_SHUTTING_DOWN",
+                "message": "DocMirror服务正在停止，请稍后重试",
+                "retryable": True,
+            },
+        ) from exc
     except ParseCapacityError as exc:
         shutil.rmtree(task_directory(task_id, output_root=output_root), ignore_errors=True)
         raise HTTPException(status_code=503, detail="Document parser capacity is currently exhausted") from exc
