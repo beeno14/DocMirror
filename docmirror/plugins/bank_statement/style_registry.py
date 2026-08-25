@@ -114,7 +114,7 @@ _ROW_PLANE_COUNT_SOURCES = frozenset(
     }
 )
 _SOURCE_DATE_RE = re.compile(r"20\d{2}(?:[-/.]?\d{1,2}){2}")
-_SEALED_TIME_RE = re.compile(r"(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)")
+_SEALED_TIME_RE = re.compile(r"(?<![\d:])\d{1,2}:\d{2}:\d{2}(?![\d:])")
 _SEALED_MONEY_RE = re.compile(r"(?<!\d)[+-]?\d[\d,]*\.\d{2}(?!\d)")
 _SOURCE_DATE_HEADERS = frozenset(
     {
@@ -1543,6 +1543,14 @@ def _has_sealed_transaction_role_fact(values: list[str]) -> bool:
     )
 
 
+def _looks_like_sealed_positioned_record(value: str) -> bool:
+    return (
+        len([line for line in str(value or "").splitlines() if line.strip()]) >= 4
+        and bool(_SOURCE_DATE_RE.search(value))
+        and len(_SEALED_MONEY_RE.findall(value)) >= 2
+    )
+
+
 def _sealed_alternative_planes_match_physical(
     ctx: StyleContext,
     physical_rows_by_position: dict[tuple[int, int], list[list[Any]]],
@@ -1573,6 +1581,42 @@ def _sealed_alternative_planes_match_physical(
         if not atom_id or atom_id in atoms_by_id:
             return False
         atoms_by_id[atom_id] = atom
+
+    positioned_blocks_by_page: dict[str, list[str]] = {}
+    for page in getattr(ctx.parse_result, "pages", None) or []:
+        try:
+            page_number = int(getattr(page, "page_number", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if page_number <= 0:
+            return False
+        page_id = f"page:{page_number:04d}"
+        for block in getattr(page, "texts", None) or []:
+            content = str(getattr(block, "content", "") or "").strip()
+            bbox = getattr(block, "bbox", None)
+            if not content or not isinstance(bbox, list) or len(bbox) < 4:
+                continue
+            evidence_ids = [str(item or "") for item in (getattr(block, "evidence_ids", None) or [])]
+            if not evidence_ids or any(not item or item not in atoms_by_id for item in evidence_ids):
+                return False
+            atom_text = "".join(str(atoms_by_id[item].get("text") or "") for item in evidence_ids)
+            if _compact_source_cell(content) != _compact_source_cell(atom_text):
+                return False
+            positioned_blocks_by_page.setdefault(page_id, []).append(content)
+
+    for block_texts in positioned_blocks_by_page.values():
+        if (
+            _has_sealed_transaction_role_fact(block_texts)
+            or sum(_looks_like_sealed_positioned_record(text) for text in block_texts) >= 2
+        ):
+            return False
+        block_text = "\n".join(block_texts)
+        if (
+            _has_sealed_transaction_headers(block_texts)
+            and len(_SOURCE_DATE_RE.findall(block_text)) >= 2
+            and len(_SEALED_MONEY_RE.findall(block_text)) >= 2
+        ):
+            return False
 
     candidates_by_position: dict[tuple[int, int], dict[str, Any]] = {}
     for indexed_table in indexed_tables:
@@ -1667,7 +1711,10 @@ def _sealed_alternative_planes_match_physical(
     # skip.  Requiring repeated date/time/amount anchors avoids treating ordinary
     # statement identity and totals as a transaction plane.
     for outside_texts in outside_by_page.values():
-        if _has_sealed_transaction_role_fact(outside_texts):
+        if (
+            _has_sealed_transaction_role_fact(outside_texts)
+            or sum(_looks_like_sealed_positioned_record(text) for text in outside_texts) >= 2
+        ):
             return False
         dates = sum(bool(_SOURCE_DATE_RE.search(text)) for text in outside_texts)
         times = sum(bool(_SEALED_TIME_RE.search(text)) for text in outside_texts)
@@ -1685,16 +1732,13 @@ def _sealed_alternative_planes_match_physical(
             non_pipe_lines.append(line)
     non_pipe_text = "\n".join(non_pipe_lines)
     row_like_lines = sum(
-        bool(_SOURCE_DATE_RE.search(line) and _SEALED_MONEY_RE.search(line))
+        bool(_SOURCE_DATE_RE.search(line) and len(_SEALED_MONEY_RE.findall(line)) >= 2)
         for line in non_pipe_lines
     )
-    if (
+    if row_like_lines >= 2 or (
         len(_SOURCE_DATE_RE.findall(non_pipe_text)) >= 2
+        and len(_SEALED_TIME_RE.findall(non_pipe_text)) >= 2
         and len(_SEALED_MONEY_RE.findall(non_pipe_text)) >= 2
-        and (
-            len(_SEALED_TIME_RE.findall(non_pipe_text)) >= 2
-            or (row_like_lines >= 2 and _has_sealed_transaction_headers(non_pipe_lines))
-        )
     ):
         return False
     return True

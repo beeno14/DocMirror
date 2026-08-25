@@ -874,6 +874,108 @@ def test_primary_cannot_hide_outside_band_transaction_role_fact() -> None:
     assert proof.reason == "canonical_source_columns_not_conserved"
 
 
+def test_primary_cannot_hide_richer_positioned_page_text_blocks() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.pages[0].width = 600
+    parse_result.pages[0].height = 850
+    parse_result.pages[0].texts = [
+        SimpleNamespace(
+            content="序号\n摘要\n交易日期\n交易金额\n账户余额\n对方账号与户名",
+            bbox=[20.0, 200.0, 60.0, 215.0],
+            evidence_ids=[],
+        ),
+        SimpleNamespace(
+            content="1\n银联入账\n20250101\n1.00\n1.00\n6222020202020001/甲公司",
+            bbox=[20.0, 220.0, 60.0, 235.0],
+            evidence_ids=[],
+        ),
+        SimpleNamespace(
+            content="2\n转账支取\n20250102\n-2.00\n-1.00\n6222020202020002/乙公司",
+            bbox=[20.0, 240.0, 60.0, 255.0],
+            evidence_ids=[],
+        ),
+    ]
+    recovery = style_registry.recover_positioned_record_block_bank_tables(parse_result)
+    assert recovery.expected_rows == 2
+    assert len(recovery.tables[0][0]) > 4
+
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_bound_positioned_records_without_account_field() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.pages[0].width = 600
+    parse_result.pages[0].height = 850
+    blocks = []
+    for sequence in range(1, 4):
+        content = f"{sequence}\n转账收入\n2025-01-0{sequence}\n1.00\n{sequence}.00"
+        atom_id = f"positioned-record:{sequence}"
+        bbox = [20.0, 200.0 + sequence * 20.0, 60.0, 215.0 + sequence * 20.0]
+        parse_result.evidence_plane.evidence["text_atoms"].append(
+            {
+                "id": atom_id,
+                "page_id": "page:0001",
+                "text": content,
+                "bbox": bbox,
+                "source_kind": "pdf_native",
+            }
+        )
+        blocks.append(SimpleNamespace(content=content, bbox=bbox, evidence_ids=[atom_id]))
+    parse_result.pages[0].texts = blocks
+    recovery = style_registry.recover_positioned_record_block_bank_tables(parse_result)
+    assert recovery.expected_rows == 3
+
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
 def test_primary_cannot_hide_richer_semantic_text_table() -> None:
     candidate = _complete_primary_candidate()
     ctx = StyleContext(
@@ -892,6 +994,86 @@ def test_primary_cannot_hide_richer_semantic_text_table() -> None:
         institution=None,
         page_count=1,
         parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_richer_stacked_semantic_text_table() -> None:
+    headers = ["交易日期", "交易时间", "摘要", "交易金额", "余额", "对方户名"]
+    rows = [
+        ["2025-01-01", "10:00:00", "summary1", "+1.00", "100.00", "Alice"],
+        ["2025-01-02", "11:00:00", "summary2", "+2.00", "102.00", "Bob"],
+    ]
+    records = []
+    for row_index, row in enumerate(rows):
+        records.append(
+            {
+                **dict(zip(headers, row, strict=True)),
+                "_source": {
+                    "source_page": 1,
+                    "page_range": [1, 1],
+                    "table_id": "table:1",
+                    "source_row_index": row_index,
+                    "source_cell_refs": [
+                        {
+                            "page": 1,
+                            "table_id": "table:1",
+                            "row": row_index,
+                            "raw_row": row_index + 1,
+                            "col": col_index,
+                        }
+                        for col_index in range(len(headers))
+                    ],
+                },
+            }
+        )
+    candidate = replace(
+        _complete_primary_candidate(),
+        records=records,
+        source_column_width=float(len(headers)),
+    )
+    full_text = "\n".join(
+        [
+            "交易明细",
+            "对方户名",
+            "备注",
+            "余额",
+            "收入/支出金额",
+            "Alice",
+            "ref-1",
+            "100.00",
+            "/",
+            "2025-01-01",
+            "10:00:00 +1.00 summary1",
+            "Bob",
+            "ref-2",
+            "102.00",
+            "/",
+            "2025-01-02",
+            "11:00:00 +2.00 summary2",
+        ]
+    )
+    semantic = style_registry._semantic_text_table_candidates(full_text)
+    assert len(semantic) == 1
+    assert len(semantic[0][0]) == 7
+    assert [row[-1] for row in semantic[0][1:]] == ["ref-1", "ref-2"]
+
+    ctx = StyleContext(
+        tables=[[headers, *rows]],
+        full_text=full_text,
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(headers=headers, rows=rows),
         reconstruction=ReconstructionMeta(source="canonical_table"),
     )
     detection = StyleDetectionResult(
