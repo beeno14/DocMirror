@@ -17,7 +17,7 @@ Key exports: ``BankExtractResult``, ``run_bank_statement_extract``,
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from docmirror.plugins.bank_statement.blo import BankLedgerOrchestrator
@@ -27,17 +27,26 @@ from docmirror.plugins.bank_statement.canonical_quality import (
     is_canonical_row,
     physical_transaction_row_estimate,
 )
-from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
-from docmirror.plugins.bank_statement.institution_authority import (
-    extract_identity_from_header,
-    resolve_institution_from_context,
+from docmirror.plugins.bank_statement.context import (
+    StyleContext,
+    build_digital_style_context,
+    build_scanned_style_context,
 )
+from docmirror.plugins.bank_statement.extraction_dispatch import (
+    BankExtractionRoute,
+    resolve_bank_extraction_route,
+)
+from docmirror.plugins.bank_statement.institution_authority import (
+    extract_header_institution_fields,
+    extract_identity_from_header,
+)
+from docmirror.plugins.bank_statement.statement_context import page_texts_with_business_headers
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     audit_bank_statement_invariants,
-    count_expected_rows_from_bank_footer,
     page_texts_from_parse_result,
+    resolve_row_count_evidence,
 )
 
 
@@ -53,6 +62,84 @@ class BankExtractResult:
     canonical_rows: int = 0
     emitted_rows: int = 0
     candidate_diagnostics: list[dict[str, Any]] | None = None
+    extraction_route: BankExtractionRoute = BankExtractionRoute.DIGITAL
+
+
+_INFERRED_ISSUER_SOURCES = {
+    "domain_specific.institution",
+    "entities",
+    "entities.organization",
+    "filename.token",
+    "institution_argument",
+    "institution_authority",
+    "institution_keywords.header",
+    "layout_profile.variant",
+    "metadata",
+    "plugin.institutions",
+}
+_DIRECT_ISSUER_SOURCES = {
+    "canonical_evidence_atoms",
+    "header.kv",
+    "page.table_kv",
+    "page_headers",
+    "parse_result_ocr_text",
+}
+_ISSUER_SOURCE_LABELS = {
+    "bankname",
+    "issuerbank",
+    "issuermark",
+    "issuertitleband",
+    "statementtitleissuer",
+    "银行名称",
+}
+
+
+def _compact_identity_label(value: Any) -> str:
+    return re.sub(r"[\s:：/／_\-()（）]+", "", str(value or "")).casefold()
+
+
+def is_source_bound_issuer_detail(detail: Any) -> bool:
+    """Admit an issuer only from an explicit source label with provenance."""
+
+    if not isinstance(detail, dict):
+        return False
+    value = next(
+        (
+            str(detail.get(candidate) or "").strip()
+            for candidate in ("raw_value", "value", "normalized_value")
+            if detail.get(candidate) not in (None, "")
+        ),
+        "",
+    )
+    if not value or not any(marker in value.casefold() for marker in ("银行", "bank", "信用社", "信用联社")):
+        return False
+    if _compact_identity_label(detail.get("raw_name")) not in _ISSUER_SOURCE_LABELS:
+        return False
+
+    source = str(detail.get("source") or "").strip().casefold()
+    if source in _INFERRED_ISSUER_SOURCES:
+        return False
+    refs = [ref for ref in (detail.get("source_refs") or []) if isinstance(ref, dict)]
+    direct_ref = any(
+        (
+            (ref_source := str(ref.get("source") or "").strip().casefold())
+            not in _INFERRED_ISSUER_SOURCES
+            and (
+                ref_source in _DIRECT_ISSUER_SOURCES
+                or ref.get("bbox")
+                or ref.get("page")
+                or ref.get("source_page")
+                or ref.get("page_id")
+            )
+        )
+        for ref in refs
+    )
+    return source in _DIRECT_ISSUER_SOURCES or source.startswith("statement_header") or direct_ref
+
+
+def _drop_unbound_issuer(fields: dict[str, dict]) -> None:
+    if "bank_name" in fields and not is_source_bound_issuer_detail(fields.get("bank_name")):
+        fields.pop("bank_name", None)
 
 
 def enrich_identity_fields(
@@ -64,15 +151,18 @@ def enrich_identity_fields(
     """Merge header KV identity into registry identity fields (EIP)."""
     fields = dict(identity_fields)
     header_identity = extract_identity_from_header(full_text)
+    header_institution_fields = extract_header_institution_fields(full_text)
     for field_name, value in header_identity.items():
         if not value:
             continue
+        raw_name = header_institution_fields.get(field_name, (field_name, value))[0]
         fields[field_name] = {
-            "raw_name": field_name,
+            "raw_name": raw_name,
             "raw_value": value,
             "normalized_value": value,
             "data_type": "string",
             "source": "header.kv",
+            "source_refs": [{"source": "full_text", "scope": "header"}],
         }
     explicit_page_period = _explicit_query_period_from_pages(parse_result)
     if explicit_page_period is not None:
@@ -92,7 +182,6 @@ def enrich_identity_fields(
             for field_name in (
                 "account_holder",
                 "account_number",
-                "bank_name",
                 "query_period",
                 "currency",
             ):
@@ -108,7 +197,7 @@ def enrich_identity_fields(
                         "source": "metadata",
                     }
         if entities is not None:
-            for field_name in ("account_holder", "account_number", "bank_name"):
+            for field_name in ("account_holder", "account_number"):
                 value = getattr(entities, field_name, None)
                 if field_name == "account_number" and full_text.strip() and not header_identity.get("account_number"):
                     continue
@@ -137,24 +226,9 @@ def enrich_identity_fields(
             currency_detail = _currency_from_source_table(parse_result)
             if currency_detail:
                 fields["currency"] = currency_detail
-        if institution and "bank_name" not in fields:
-            fields["bank_name"] = {
-                "raw_name": "bank_name",
-                "raw_value": institution,
-                "normalized_value": institution,
-                "data_type": "string",
-                "source": "institution_argument",
-            }
-        if "bank_name" not in fields:
-            institution, authority = resolve_institution_from_context(parse_result, full_text)
-            if institution:
-                fields["bank_name"] = {
-                    "raw_name": "bank_name",
-                    "raw_value": institution,
-                    "normalized_value": institution,
-                    "data_type": "string",
-                    "source": authority or "institution_authority",
-                }
+    # Institution hints (including ``institution``) are routing metadata.  They
+    # never become issuer business data without an explicit source label.
+    _drop_unbound_issuer(fields)
     return fields
 
 
@@ -163,7 +237,10 @@ def _explicit_query_period_from_pages(parse_result: Any) -> tuple[str, list[dict
     if parse_result is None:
         return None
     periods: list[tuple[str, str, int]] = []
-    for page_number, page_text in page_texts_from_parse_result(parse_result):
+    for page_number, page_text in page_texts_with_business_headers(
+        parse_result,
+        page_texts_from_parse_result(parse_result),
+    ):
         start_match = re.search(r"起始日期\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
         end_match = re.search(r"(?:截止日期|终止日期)\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
         if start_match is None or end_match is None:
@@ -249,9 +326,50 @@ def _currency_from_source_table(parse_result: Any) -> dict[str, Any]:
     return {}
 
 
+_SPE_FULL_TABLE_PIPE_FALLBACK_WARNING = "spe:mirror_table_extraction_full_used_ltro_fallback"
+
+
+def _spe_explicitly_proves_no_table_candidates(structure_spe: dict[str, Any] | None) -> bool:
+    """Return true only when SPE explicitly proves that no table route existed.
+
+    ``table_extraction=full`` describes the requested extraction policy, not proof that
+    Mirror actually produced a usable table.  Keep the ordinary fallback warning unless
+    the structure record is complete enough to establish the stronger, layout-neutral
+    fact that table extraction was inapplicable and every candidate counter was zero.
+    """
+    if not isinstance(structure_spe, dict):
+        return False
+    gate = structure_spe.get("table_reconstruction_gate")
+    if not isinstance(gate, dict):
+        return False
+    return (
+        structure_spe.get("table_extraction_skipped_reason") == "no_tabular_signal"
+        and structure_spe.get("physical_table_count") == 0
+        and structure_spe.get("native_table_candidate_count") == 0
+        and "logical_table_count" in structure_spe
+        and structure_spe.get("logical_table_count") in {None, 0}
+        and gate.get("applicable") is False
+        and gate.get("candidate_count") == 0
+        and gate.get("physical_table_count") == 0
+    )
+
+
+def _bank_spe_ltro_warnings(
+    structure_spe: dict[str, Any] | None,
+    reconstruction_source: str,
+) -> list[str]:
+    """Apply bank-local interpretation without weakening core SPE diagnostics."""
+    from docmirror.evidence.spe_consumer import spe_ltro_warnings
+
+    warnings = spe_ltro_warnings(structure_spe, reconstruction_source)
+    if _spe_explicitly_proves_no_table_candidates(structure_spe):
+        warnings = [warning for warning in warnings if warning != _SPE_FULL_TABLE_PIPE_FALLBACK_WARNING]
+    return warnings
+
+
 def collect_extract_warnings(ctx: StyleContext, style_meta: StyleMeta) -> list[str]:
     """LTRO / coverage warnings shared across editions."""
-    from docmirror.evidence.spe_consumer import read_structure_spe, spe_ltro_warnings
+    from docmirror.evidence.spe_consumer import read_structure_spe
 
     warnings: list[str] = []
     if ctx.reconstruction and ctx.reconstruction.pipe_parse_failed:
@@ -267,42 +385,107 @@ def collect_extract_warnings(ctx: StyleContext, style_meta: StyleMeta) -> list[s
     if ctx.parse_result is not None:
         spe = read_structure_spe(ctx.parse_result)
         source = style_meta.reconstruction_source or (ctx.reconstruction.source if ctx.reconstruction else "")
-        warnings.extend(spe_ltro_warnings(spe, source))
+        warnings.extend(_bank_spe_ltro_warnings(spe, source))
     return warnings
+
+
+ISSUER_ROW_COUNT_EVIDENCE_SOURCES = frozenset(
+    {
+        "split_footer",
+        "header_total",
+        "statement_header_totals",
+        "cumulative_footer_total",
+        "page_footer",
+    }
+)
+_ROW_PLANE_COUNT_SOURCES = frozenset(
+    {
+        "complete_page_local_sequences",
+        "ccb_primary_source_sequence",
+        "cmb_primary_source_rows",
+        "native_page_datetime_census",
+        "native_page_signed_ledger_census",
+        "ocr_page_ordinal_census",
+        "page_transaction_anchors",
+        "physical_rows",
+        "positioned_date_anchors",
+        "positioned_record_blocks",
+    }
+)
+
+
+def is_authoritative_issuer_row_count(evidence: Any) -> bool:
+    """Return whether ``evidence`` is an exact, issuer-owned document count."""
+    if evidence is None or not hasattr(evidence, "source") or not hasattr(evidence, "confidence"):
+        return False
+    try:
+        count = int(getattr(evidence, "count", 0) or 0)
+        confidence = float(getattr(evidence, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    source = str(getattr(evidence, "source", "") or "")
+    return count > 0 and confidence >= 0.85 and source in ISSUER_ROW_COUNT_EVIDENCE_SOURCES
+
+
+def authoritative_issuer_transaction_count_detail(evidence: Any) -> dict[str, Any] | None:
+    """Build the public identity detail for independently issuer-reported evidence."""
+    if not is_authoritative_issuer_row_count(evidence):
+        return None
+    count = int(evidence.count)
+    evidence_source = str(evidence.source)
+    detail: dict[str, Any] = {
+        "raw_name": f"{evidence_source}_transaction_count",
+        "raw_value": str(count),
+        "normalized_value": str(count),
+        "data_type": "integer",
+        "source": f"row_count_evidence.{evidence_source}",
+    }
+    page = getattr(evidence, "page", None)
+    if page is not None:
+        detail["source_refs"] = [
+            {
+                "source": f"row_count_evidence.{evidence_source}",
+                "page_id": f"page:{int(page):04d}",
+            }
+        ]
+    evidence_ids = list(getattr(evidence, "evidence_ids", ()) or ())
+    if evidence_ids:
+        detail["evidence_ids"] = evidence_ids
+    return detail
 
 
 def _apply_source_reported_transaction_count(
     identity_fields: dict[str, dict],
-    source_reported_count: int,
+    source_reported_count: Any,
 ) -> None:
     """Keep the identity aggregate aligned with the independently counted source rows."""
-    if source_reported_count <= 0:
-        return
-    identity_fields["total_transactions"] = {
-        "raw_name": "page_footer_transaction_count",
-        "raw_value": str(source_reported_count),
-        "normalized_value": str(source_reported_count),
-        "data_type": "integer",
-        "source": "page_footer.sum",
-    }
+    detail = authoritative_issuer_transaction_count_detail(source_reported_count)
+    if detail is not None:
+        identity_fields["total_transactions"] = detail
 
 
-def _physical_logical_row_mismatch_warning(physical_expected: int, style_meta: StyleMeta) -> str:
-    """Return a row mismatch warning unless a complete recovery supersedes a sparse table."""
+def _physical_logical_row_mismatch_warning(
+    physical_expected: int,
+    style_meta: StyleMeta,
+    reconstruction: Any,
+) -> str:
+    """Return a mismatch unless independent reconstruction evidence proves completeness."""
     if physical_expected <= 0 or physical_expected == style_meta.canonical_extracted:
         return ""
-    recovery_supersedes_sparse_physical = (
-        style_meta.reconstruction_source
-        in {
-            "canonical_evidence_table",
-            "positioned_record_block",
-            "native_wide_table",
-            "ocr_implicit_table",
-        }
-        and style_meta.canonical_extracted > physical_expected
-        and style_meta.canonical_extracted == style_meta.expected_primary_rows
+
+    evidence_source = str(getattr(reconstruction, "expected_evidence_source", "") or "")
+    evidence_confidence = float(getattr(reconstruction, "expected_evidence_confidence", 0.0) or 0.0)
+    evidence_count = int(getattr(reconstruction, "expected_primary_rows", 0) or 0)
+    authoritative_count = (
+        evidence_source in ISSUER_ROW_COUNT_EVIDENCE_SOURCES and evidence_confidence >= 0.85
     )
-    if recovery_supersedes_sparse_physical:
+    evidence_proves_fuller_result = (
+        authoritative_count
+        and style_meta.canonical_extracted > physical_expected
+        and evidence_count == style_meta.canonical_extracted
+        and style_meta.expected_primary_rows == style_meta.canonical_extracted
+    )
+    if evidence_proves_fuller_result:
         return ""
     return f"BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:physical={physical_expected}:canonical={style_meta.canonical_extracted}"
 
@@ -313,7 +496,13 @@ def run_bank_statement_extract(
     plugin: Any,
 ) -> BankExtractResult:
     """Run the canonical bank-statement extract pipeline."""
-    ctx = build_style_context(parse_result, full_text)
+    extraction_route = resolve_bank_extraction_route(parse_result)
+    context_builder = (
+        build_digital_style_context
+        if extraction_route is BankExtractionRoute.DIGITAL
+        else build_scanned_style_context
+    )
+    ctx = context_builder(parse_result, full_text)
     detection = BankStyleDetector().detect(ctx)
     registry = BankStyleParserRegistry()
     records, identity_fields, blo_meta = BankLedgerOrchestrator(registry).run(
@@ -351,11 +540,24 @@ def run_bank_statement_extract(
                 or (evidence_preferred and current_source in {"header.kv", "bank_statement.default"})
             ):
                 identity_fields[field_name] = detail
-    page_texts = page_texts_from_parse_result(parse_result)
-    source_reported_count = count_expected_rows_from_bank_footer(
+    _drop_unbound_issuer(identity_fields)
+    page_texts = page_texts_with_business_headers(
+        parse_result,
+        page_texts_from_parse_result(parse_result),
+    )
+    source_reported_count = resolve_row_count_evidence(
         ctx.full_text,
         page_texts=page_texts,
     )
+    if source_reported_count.source in _ROW_PLANE_COUNT_SOURCES:
+        source_reported_count = replace(
+            source_reported_count,
+            confidence=min(source_reported_count.confidence, 0.80),
+        )
+    # Generic KV/text/atom identity recovery can observe a count label, but it
+    # cannot prove that the label owns the complete statement. Fail closed and
+    # publish this exact-looking field only from issuer-authoritative evidence.
+    identity_fields.pop("total_transactions", None)
     _apply_source_reported_transaction_count(identity_fields, source_reported_count)
     style_meta = build_style_meta(
         detection,
@@ -367,8 +569,16 @@ def run_bank_statement_extract(
         source_reported_count=source_reported_count,
     )
     warnings = collect_extract_warnings(ctx, style_meta)
-    physical_expected = physical_transaction_row_estimate(parse_result)
-    if mismatch_warning := _physical_logical_row_mismatch_warning(physical_expected, style_meta):
+    physical_expected = (
+        physical_transaction_row_estimate(parse_result)
+        if extraction_route is BankExtractionRoute.DIGITAL
+        else 0
+    )
+    if mismatch_warning := _physical_logical_row_mismatch_warning(
+        physical_expected,
+        style_meta,
+        ctx.reconstruction,
+    ):
         warnings.append(mismatch_warning)
     if style_meta.expected_primary_rows > 0 and style_meta.canonical_extracted < style_meta.expected_primary_rows:
         warnings.append(
@@ -394,6 +604,7 @@ def run_bank_statement_extract(
         records,
         ctx.full_text,
         page_texts=page_texts,
+        row_count_evidence=source_reported_count,
     )
     if invariant_failures:
         if any(warning.startswith("bank_invariant_failed:") for warning in invariant_failures):
@@ -421,6 +632,7 @@ def run_bank_statement_extract(
         canonical_rows=canonical_rows,
         emitted_rows=emitted_rows,
         candidate_diagnostics=list(getattr(blo_meta, "candidate_diagnostics", []) or []),
+        extraction_route=extraction_route,
     )
 
 

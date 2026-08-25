@@ -40,6 +40,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.source_projection i
 from docmirror.plugins.credit_report.personal_detail_scanned.variant import (
     PersonalDetailScannedVariant,
 )
+from docmirror.plugins.credit_report.value_utils import stable_record_id
 
 
 def _table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
@@ -49,6 +50,75 @@ def _table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
         headers=[],
         rows=[],
         bbox=[20, 20, 580, 300],
+    )
+
+
+def _liability_page(
+    *tables: SimpleNamespace,
+    page_number: int = 4,
+    source_page_number: int = 2,
+) -> SimpleNamespace:
+    for table in tables:
+        table.metadata["canonical_template_id"] = "repayment_responsibility"
+    return SimpleNamespace(
+        page_number=page_number,
+        source_page_number=source_page_number,
+        canonical_template_id="repayment_responsibility",
+        tables=list(tables),
+        texts=[],
+    )
+
+
+def _exact_table(
+    table_id: str,
+    rows: list[list[str]],
+    *,
+    derived_cells: set[tuple[int, int]] = frozenset(),
+    canonical_template_id: str = "report_header_and_identity",
+) -> SimpleNamespace:
+    width = max((len(row) for row in rows), default=0)
+    cell_bboxes = [
+        [
+            [20.0 + column * 100.0, 20.0 + row * 20.0, 120.0 + column * 100.0, 40.0 + row * 20.0]
+            for column in range(width)
+        ]
+        for row in range(len(rows))
+    ]
+    statuses = [
+        ["derived" if (row, column) in derived_cells else "exact" for column in range(width)]
+        for row in range(len(rows))
+    ]
+    evidence = [
+        [
+            [] if (row, column) in derived_cells else [f"native:{table_id}:{row}:{column}"]
+            for column in range(width)
+        ]
+        for row in range(len(rows))
+    ]
+    return SimpleNamespace(
+        table_id=table_id,
+        metadata={
+            "raw_rows": rows,
+            "canonical_template_id": canonical_template_id,
+            "geometry": {
+                "coordinate_system": "logical_page_pixels",
+                "row_bands": [
+                    {"index": row, "y0": 20.0 + row * 20.0, "y1": 40.0 + row * 20.0}
+                    for row in range(len(rows))
+                ],
+                "col_bands": [
+                    {"index": column, "x0": 20.0 + column * 100.0, "x1": 120.0 + column * 100.0}
+                    for column in range(width)
+                ],
+                "cell_bboxes": cell_bboxes,
+                "cell_geometry_status": statuses,
+                "cell_evidence_ids": evidence,
+                "cell_spans": [],
+            },
+        },
+        headers=[],
+        rows=[],
+        bbox=[20.0, 20.0, 20.0 + width * 100.0, 20.0 + len(rows) * 20.0],
     )
 
 
@@ -81,6 +151,8 @@ def test_pboc_controlled_vocabulary_is_diagnostic_and_broad() -> None:
     assert validate_pboc_field("贷后管理", "inquiry_reason").valid is True
     assert validate_pboc_field("司法调查", "inquiry_reason").valid is True
     assert validate_pboc_field("保后管理", "inquiry_reason").valid is True
+    assert validate_pboc_field("公积金提取复核", "inquiry_reason").valid is True
+    assert validate_pboc_field("本人查询（临柜）", "inquiry_reason").valid is True
     assert validate_pboc_field("人民币元", "currency").valid is True
     for currency in ("澳元", "加拿大元", "瑞士法郎", "新加坡元", "澳门元"):
         assert validate_pboc_field(currency, "currency").valid is True
@@ -125,7 +197,14 @@ def test_native_liability_extraction_drops_header_only_tables_before_counting() 
         ],
     )
     result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[header_only, substantive])]
+        pages=[
+            _liability_page(
+                header_only,
+                substantive,
+                page_number=1,
+                source_page_number=1,
+            )
+        ]
     )
 
     rows = _extract_liabilities(result)
@@ -171,9 +250,7 @@ def test_liability_dedupe_does_not_merge_transposed_contract_identifiers() -> No
 
 def test_complete_liability_card_preserves_exact_slots_and_snapshot_date() -> None:
     table = _complete_liability_table("liability-complete")
-    result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
-    )
+    result = SimpleNamespace(pages=[_liability_page(table)])
 
     rows = _extract_liabilities(result)
 
@@ -192,9 +269,7 @@ def test_complete_liability_card_preserves_exact_slots_and_snapshot_date() -> No
 def test_liability_overdue_month_label_is_not_reinterpreted_as_status_code() -> None:
     table = _complete_liability_table("liability-overdue-months", status="0")
     table.metadata["raw_rows"][-2][7] = "逾期月数"
-    result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
-    )
+    result = SimpleNamespace(pages=[_liability_page(table)])
 
     row = _extract_liabilities(result)[0]
 
@@ -205,9 +280,7 @@ def test_liability_overdue_month_label_is_not_reinterpreted_as_status_code() -> 
 
 def test_liability_currency_is_unknown_and_reported_instead_of_defaulted() -> None:
     table = _complete_liability_table("liability-bad-currency", currency="人民币无")
-    result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
-    )
+    result = SimpleNamespace(pages=[_liability_page(table)])
 
     rows = _extract_liabilities(result)
 
@@ -227,9 +300,7 @@ def test_liability_extended_exact_currency_is_silent() -> None:
         start=1,
     ):
         table = _complete_liability_table(f"liability-currency-{index}", currency=raw)
-        result = SimpleNamespace(
-            pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
-        )
+        result = SimpleNamespace(pages=[_liability_page(table)])
 
         rows = _extract_liabilities(result)
 
@@ -243,9 +314,7 @@ def test_liability_extended_exact_currency_is_silent() -> None:
 
 def test_explicit_liability_placeholder_is_known_absence_not_failure() -> None:
     table = _complete_liability_table("liability-explicit-absence", currency="--")
-    result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[table], texts=[])]
-    )
+    result = SimpleNamespace(pages=[_liability_page(table)])
 
     rows = _extract_liabilities(result)
 
@@ -259,9 +328,7 @@ def test_explicit_liability_placeholder_is_known_absence_not_failure() -> None:
 def test_equal_provenance_liability_conflict_is_withheld_and_linked() -> None:
     first = _complete_liability_table("liability-conflict-a", responsibility_amount="200,000", top=20)
     second = _complete_liability_table("liability-conflict-b", responsibility_amount="300,000", top=260)
-    result = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=4, source_page_number=2, tables=[first, second], texts=[])]
-    )
+    result = SimpleNamespace(pages=[_liability_page(first, second)])
 
     rows = _extract_liabilities(result)
 
@@ -336,6 +403,137 @@ def test_huaneng_complementary_liability_observations_merge_by_account_identity(
     assert rows[0]["five_tier_class"] == "正常"
     assert rows[0]["overdue_months"] == 0
     assert rows[0]["related_party_category"] == "organization"
+
+
+def test_cross_plane_liability_complements_merge_only_inside_native_card_geometry() -> None:
+    shared = {
+        "business_type": "个人经营性贷款",
+        "open_date": "2023-12-04",
+        "due_date": "2024-10-04",
+        "responsibility_type": "保证人",
+        "responsibility_amount": 3500000,
+        "currency": "CNY",
+        "_party_category": "person",
+        "confidence": 0.98,
+    }
+    native = {
+        **shared,
+        "institution": "云南芒市农村商业银行股份有限公司",
+        "contract_number": "G10117300H03991101011630211202230000011",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 9,
+                "table_id": "pt_18_2",
+                "bbox": [20, 100, 400, 300],
+            }
+        ],
+    }
+    corrected = {
+        **shared,
+        "related_party_name": "杨天云",
+        "snapshot_date": "2024-07-21",
+        "balance": 2000000,
+        "repayment_status_code": "N",
+        "source_refs": [
+            {
+                "source": "personal_detail_corrected_page_cell",
+                "source_page": 9,
+                "bbox": [120, 160, 220, 190],
+            }
+        ],
+    }
+
+    rows = reconcile_candidate_b_liabilities(SimpleNamespace(), [native, corrected])
+
+    assert len(rows) == 1
+    assert rows[0]["contract_number"] == native["contract_number"]
+    assert rows[0]["institution"] == native["institution"]
+    assert rows[0]["snapshot_date"] == "2024-07-21"
+    assert rows[0]["balance"] == 2000000
+
+
+def test_cross_plane_liability_complement_does_not_bridge_distinct_card_geometry() -> None:
+    shared = {
+        "business_type": "企业经营贷款",
+        "open_date": "2021-06-30",
+        "due_date": "2026-06-30",
+        "responsibility_type": "保证人",
+        "responsibility_amount": 5500000,
+        "currency": "CNY",
+        "_party_category": "organization",
+        "confidence": 0.98,
+    }
+    native_a = {
+        **shared,
+        "institution": "中国银行股份有限公司大理州分行",
+        "contract_number": "CONTRACT-A",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 10,
+                "table_id": "pt_19_3",
+                "bbox": [20, 100, 400, 220],
+            }
+        ],
+    }
+    native_b = {
+        **shared,
+        "institution": "中国银行股份有限公司大理州分行",
+        "contract_number": "CONTRACT-B",
+        "source_refs": [
+            {
+                "source": "native_detail_table",
+                "source_page": 10,
+                "table_id": "pt_19_4",
+                "bbox": [20, 260, 400, 380],
+            }
+        ],
+    }
+    corrected = {
+        **shared,
+        "related_party_name": "大理某企业有限公司",
+        "balance": 5500000,
+        "overdue_months": 0,
+        "source_refs": [
+            {
+                "source": "personal_detail_corrected_page_cell",
+                "source_page": 10,
+                "bbox": [100, 145, 220, 175],
+            }
+        ],
+    }
+
+    rows = reconcile_candidate_b_liabilities(
+        SimpleNamespace(), [native_b, native_a, corrected]
+    )
+
+    assert len(rows) == 2
+    assert {row.get("contract_number") for row in rows} == {
+        "CONTRACT-A",
+        "CONTRACT-B",
+    }
+    completed = next(row for row in rows if row.get("contract_number") == "CONTRACT-A")
+    assert completed["balance"] == 5500000
+
+
+def test_same_liability_ordinal_never_overrides_distinct_contracts() -> None:
+    common = {
+        "_printed_sequence": 1,
+        "_party_category": "organization",
+        "source_refs": [],
+        "confidence": 0.98,
+    }
+
+    rows = reconcile_candidate_b_liabilities(
+        SimpleNamespace(),
+        [
+            {**common, "contract_number": "CONTRACT-ONE"},
+            {**common, "contract_number": "CONTRACT-TWO"},
+        ],
+    )
+
+    assert len(rows) == 2
 
 
 def _lin_liability_candidate(
@@ -655,14 +853,126 @@ def test_credit_agreement_does_not_invent_active_status(monkeypatch) -> None:
     assert "status" not in rows[0]
 
 
-def test_account_currency_unique_token_with_residue_is_retained_and_reported() -> None:
-    examples = (
-        ("人民币元 共同借款标志", "CNY", "共同借款标志"),
-        ("美元 江", "USD", "江"),
-        ("福 人民币元 第", "CNY", "福第"),
-        ("福 澳元 第", "AUD", "福第"),
+@pytest.mark.parametrize(
+    ("raw", "expected_status", "expected_lifecycle", "expected_resolution"),
+    (
+        ("正 常", "active", "open", "resolved"),
+        ("结清", "settled", "settled", "resolved"),
+        ("结 请", "settled", "settled", "ocr_noise_normalized"),
+        ("结 消", "settled", "settled", "ocr_noise_normalized"),
+        ("未 激 活", "inactive", "open", "resolved"),
+        ("银行止付", "suspended", None, "resolved"),
+    ),
+)
+def test_account_status_publishes_only_a_complete_registered_cell(
+    raw: str,
+    expected_status: str,
+    expected_lifecycle: str | None,
+    expected_resolution: str,
+) -> None:
+    context = SimpleNamespace()
+    account = {"account_id": f"credit_account:status:{raw}"}
+    table = _table("account-status-exact", [["账户状态"], [raw]])
+
+    _apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=SimpleNamespace(page_number=6, source_page_number=3),
+        table=table,
     )
-    for index, (raw, expected, residue) in enumerate(examples, start=1):
+
+    assert account["account_status"] == expected_status
+    assert account.get("account_lifecycle_state") == expected_lifecycle
+    assert account["account_status_raw"] == raw.replace(" ", "")
+    assert account["account_status_resolution"] == expected_resolution
+    assert collect_extraction_issues(context) == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "非正常",
+        "未销户",
+        "正常1",
+        "正常附",
+        "X正常",
+        "正常。",
+        "结清销户",
+        "R结清",
+    ),
+)
+def test_account_status_negation_or_residue_is_withheld_with_field_issue(raw: str) -> None:
+    context = SimpleNamespace()
+    account = {"account_id": f"credit_account:status-invalid:{raw}"}
+    table = _table("account-status-invalid", [["账户状态"], [raw]])
+
+    _apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=SimpleNamespace(page_number=6, source_page_number=3),
+        table=table,
+    )
+
+    for field_name in (
+        "account_status",
+        "account_status_raw",
+        "account_status_resolution",
+        "account_lifecycle_state",
+        "card_activation_state",
+        "credit_quality_status",
+        "current_overdue",
+        "current_overdue_status",
+    ):
+        assert field_name not in account
+    assert account["canonical_raw"]["account_status"] == [raw]
+    assert "account_status" in account["_unresolved_fields"]
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
+    assert issues[0]["target_record_id"] == account["account_id"]
+    assert issues[0]["field_name"] == "account_status"
+    assert issues[0]["observed_value"] == [raw]
+    assert issues[0]["status"] == "requires_review"
+    assert "normalized_value_withheld" in issues[0]["reason_codes"]
+
+
+def test_account_status_sentence_does_not_bypass_the_whole_cell_contract() -> None:
+    context = SimpleNamespace()
+    account = {"account_id": "credit_account:status-sentence-invalid"}
+    raw = "非正常"
+    table = _table("account-status-sentence-invalid", [[f"截至2024年1月1日，账户状态为“{raw}”"]])
+
+    _apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=SimpleNamespace(page_number=6, source_page_number=3),
+        table=table,
+    )
+
+    assert "account_status" not in account
+    assert "account_lifecycle_state" not in account
+    assert account["canonical_raw"]["account_status"] == [raw]
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
+    assert issues[0]["field_name"] == "account_status"
+    assert issues[0]["source_refs"][0]["binding"] == "canonical_account_status_sentence"
+    assert issues[0]["status"] == "requires_review"
+
+
+def test_account_currency_alias_with_any_substantive_residue_is_withheld_and_active() -> None:
+    examples = (
+        "人民币元 共同借款标志",
+        "美元X",
+        "非人民币",
+        "美元。",
+        "美元1",
+        "福 澳元 第",
+    )
+    for index, raw in enumerate(examples, start=1):
         context = SimpleNamespace()
         account = {"account_id": f"credit_account:loan:{index}"}
         table = _table(f"account-currency-{index}", [["账户币种"], [raw]])
@@ -676,20 +986,27 @@ def test_account_currency_unique_token_with_residue_is_retained_and_reported() -
             table=table,
         )
 
-        assert account["currency"] == expected
-        assert account["account_currency"] == expected
+        assert "currency" not in account
+        assert "account_currency" not in account
+        assert account["canonical_raw"]["currency"] == [raw]
         issues = collect_extraction_issues(context)
         assert len(issues) == 1
-        assert issues[0]["issue_code"] == "candidate_b_currency_token_residue_corrected"
+        assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
         assert issues[0]["target_record_id"] == account["account_id"]
         assert issues[0]["field_name"] == "currency"
-        assert issues[0]["observed_value"] == {"raw": raw, "residue": residue}
-        assert issues[0]["severity"] == "info"
-        assert issues[0]["status"] == "resolved"
+        assert issues[0]["observed_value"] == [raw]
+        assert issues[0]["status"] == "requires_review"
+        assert "normalized_value_withheld" in issues[0]["reason_codes"]
 
 
 def test_account_exact_finite_currency_token_is_silent() -> None:
     examples = (
+        ("人 民 币 元", "CNY"),
+        ("人民币", "CNY"),
+        ("RMB", "CNY"),
+        ("rmb", "CNY"),
+        ("美元", "USD"),
+        ("usd", "USD"),
         ("港元", "HKD"),
         ("澳元", "AUD"),
         ("加拿大元", "CAD"),
@@ -701,6 +1018,7 @@ def test_account_exact_finite_currency_token_is_silent() -> None:
         ("CHF", "CHF"),
         ("SGD", "SGD"),
         ("MOP", "MOP"),
+        ("银", "XAG"),
     )
     for index, (raw, expected) in enumerate(examples, start=1):
         context = SimpleNamespace()
@@ -719,6 +1037,30 @@ def test_account_exact_finite_currency_token_is_silent() -> None:
         assert account["currency"] == expected
         assert account["account_currency"] == expected
         assert collect_extraction_issues(context) == []
+
+
+def test_account_single_han_currency_alias_does_not_match_institution_prose() -> None:
+    context = SimpleNamespace()
+    account = {"account_id": "credit_account:credit_card:20"}
+    raw = "中国工商银行 B10111000H 豫"
+    table = _table("account-currency-embedded-silver", [["账户币种"], [raw]])
+    page = SimpleNamespace(page_number=23, source_page_number=12)
+
+    _apply_account_facts(
+        context,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert "currency" not in account
+    assert "account_currency" not in account
+    issues = collect_extraction_issues(context)
+    assert len(issues) == 1
+    assert issues[0]["issue_code"] == "candidate_b_exact_slot_value_invalid"
+    assert issues[0]["observed_value"] == [raw]
+    assert "normalized_value_withheld" in issues[0]["reason_codes"]
 
 
 def test_account_currency_unknown_or_multiple_tokens_are_withheld_and_reported() -> None:
@@ -744,7 +1086,7 @@ def test_account_currency_unknown_or_multiple_tokens_are_withheld_and_reported()
         assert issues[0]["target_record_id"] == account["account_id"]
 
 
-def test_credit_agreement_currency_residue_is_retained_and_field_reported(monkeypatch) -> None:
+def test_credit_agreement_currency_residue_is_withheld_and_field_reported(monkeypatch) -> None:
     candidate = SimpleNamespace(
         fields={
             "授信协议标识": "T10151210H0001ABC12345",
@@ -775,19 +1117,20 @@ def test_credit_agreement_currency_residue_is_retained_and_field_reported(monkey
     rows = _extract_credit_lines(context)
     rows = reconcile_candidate_b_credit_lines(context, rows)
 
-    assert rows[0]["currency"] == "USD"
-    assert rows[0]["account_currency"] == "USD"
-    assert rows[0]["reporting_amount_currency"] == "USD"
+    assert rows[0]["currency"] is None
+    assert rows[0]["account_currency"] is None
+    assert rows[0]["reporting_amount_currency"] is None
+    assert "currency" in rows[0]["_unresolved_fields"]
     issues = [
         issue
         for issue in collect_extraction_issues(context)
-        if issue["issue_code"] == "candidate_b_currency_token_residue_corrected"
+        if issue["issue_code"] == "candidate_b_credit_agreement_currency_unresolved"
     ]
     assert len(issues) == 1
     assert issues[0]["target_record_id"] == rows[0]["credit_line_id"]
-    assert issues[0]["observed_value"] == {"raw": "美元 江", "residue": "江"}
-    assert issues[0]["severity"] == "info"
-    assert issues[0]["status"] == "resolved"
+    assert issues[0]["observed_value"] == "美元 江"
+    assert issues[0]["status"] == "requires_review"
+    assert "normalized_value_withheld" in issues[0]["reason_codes"]
 
 
 def test_credit_agreement_exact_extended_currency_is_silent_and_final(monkeypatch) -> None:
@@ -822,7 +1165,7 @@ def test_credit_agreement_exact_extended_currency_is_silent_and_final(monkeypatc
 
 
 def test_credit_agreement_multiple_or_arbitrary_currency_codes_are_withheld(monkeypatch) -> None:
-    for raw in ("人民币元美元", "澳元美元", "ZZZ"):
+    for raw in ("人民币元美元", "澳元美元", "非人民币", "美元X", "美元。", "美元1", "ZZZ"):
         candidate = SimpleNamespace(
             fields={
                 "授信协议标识": f"T10151210H0001{raw.encode().hex().upper()}",
@@ -858,6 +1201,7 @@ def test_credit_agreement_multiple_or_arbitrary_currency_codes_are_withheld(monk
         ]
         assert len(issues) == 1
         assert issues[0]["target_record_id"] == rows[0]["credit_line_id"]
+        assert not issues[0].get("source_refs")
 
 
 def test_final_grid_count_repairs_only_zero_expected_count() -> None:
@@ -1045,13 +1389,14 @@ def test_inquiry_endpoint_trusts_sparse_exact_ordinals_but_rejects_proven_prefix
 
 
 def test_inquiry_source_gap_is_repair_eligible_without_orphan_record_target() -> None:
-    table = _table(
+    table = _exact_table(
         "institutional",
         [
             ["编号", "查询日期", "查询机构", "查询原因"],
             ["1", "2024.01.03", "示例银行", "贷款审批"],
             ["3", "", "", ""],
         ],
+        canonical_template_id="annotations_and_inquiries",
     )
     result = SimpleNamespace(
         pages=[
@@ -1137,6 +1482,1094 @@ def test_projection_prefers_independent_inquiry_endpoints_over_emitted_rows() ->
     assert "target_record_id" not in issue
 
 
+def test_source_ledger_projects_exact_missing_account_and_printed_field_issues() -> None:
+    ref = {
+        "source": "candidate_b_account_anchor",
+        "logical_page": 8,
+        "source_page": 4,
+        "geometry_scope": "line",
+        "binding": "printed_account_ordinal",
+        "binding_quality": "printed_account_ordinal",
+        "account_type": "credit_card",
+        "category_sequence": 2,
+        "bbox": [20.0, 40.0, 200.0, 60.0],
+        "evidence_ids": ["account-anchor-2"],
+    }
+    field_ref = {
+        "source": "native_detail_table_cell",
+        "logical_page": 8,
+        "source_page": 4,
+        "table_id": "account-table-2",
+        "row": 1,
+        "column": 1,
+        "geometry_scope": "cell",
+        "binding": "canonical_field_slot",
+        "binding_quality": "canonical_header_column",
+        "field_name": "account_identifier",
+        "bbox": [40.0, 80.0, 220.0, 100.0],
+        "evidence_ids": ["account-identifier-2"],
+    }
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_accounts": 2,
+                    "account_family_endpoints": {"credit_card": 2},
+                    "account_family_ordinal_observations": {
+                        "credit_card": {
+                            "2": {
+                                "account_id": "credit_account:credit_card:2",
+                                "printed_fields": ["account_identifier"],
+                                "field_source_refs": {
+                                    "account_identifier": [field_ref]
+                                },
+                                "source_refs": [ref],
+                            }
+                        }
+                    },
+                }
+            },
+            "datasets": {
+                "credit_accounts": [
+                    {
+                        "account_id": "credit_account:credit_card:1",
+                        "account_type": "credit_card",
+                        "category_sequence": 1,
+                    }
+                ]
+            },
+        },
+        final_dataset_counts={"credit_accounts": 1},
+    )
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    identity_issue = next(
+        issue for issue in issues if issue.get("issue_code") == "source_account_record_omitted"
+    )
+    field_issue = next(
+        issue for issue in issues if issue.get("issue_code") == "source_account_field_omitted"
+    )
+    assert identity_issue["target_record_id"] == "credit_account:credit_card:2"
+    assert identity_issue["field_name"] == "account_id"
+    assert field_issue["target_record_id"] == "credit_account:credit_card:2"
+    assert field_issue["field_name"] == "account_identifier"
+    assert field_issue["source_refs"][0]["logical_page"] == 8
+
+
+def test_source_ledger_rejects_duplicate_or_foreign_account_anchor_omission() -> None:
+    exact = {
+        "source": "candidate_b_account_anchor",
+        "logical_page": 8,
+        "source_page": 4,
+        "geometry_scope": "line",
+        "binding": "printed_account_ordinal",
+        "binding_quality": "printed_account_ordinal",
+        "account_type": "credit_card",
+        "category_sequence": 2,
+        "bbox": [20.0, 40.0, 200.0, 60.0],
+        "evidence_ids": ["account-anchor-2"],
+    }
+    for observation in (
+        {
+            "account_id": "credit_account:credit_card:2",
+            "source_refs": [exact, {**exact, "evidence_ids": ["duplicate-owner"]}],
+        },
+        {
+            "account_id": "credit_account:non_revolving_loan:2",
+            "source_refs": [exact],
+        },
+    ):
+        content = prepare_personal_detail_source_collections(
+            {
+                "facts": {
+                    "personal_detail_source_completeness_ledger": {
+                        "credit_accounts": 2,
+                        "account_family_endpoints": {"credit_card": 2},
+                        "account_family_ordinal_observations": {
+                            "credit_card": {"2": observation}
+                        },
+                    }
+                },
+                "datasets": {
+                    "credit_accounts": [
+                        {
+                            "account_id": "credit_account:credit_card:1",
+                            "account_type": "credit_card",
+                            "category_sequence": 1,
+                        }
+                    ]
+                },
+            },
+            final_dataset_counts={"credit_accounts": 1},
+        )
+
+        issues = content["datasets"]["personal_detail_extraction_issues"]
+        assert not any(
+            issue.get("issue_code") == "source_account_record_omitted"
+            for issue in issues
+        )
+
+
+def test_source_ledger_projects_exact_missing_agreement_issue_with_evidence() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_agreements": 3,
+                    "credit_agreement_sequence_endpoint": 3,
+                    "credit_agreement_observed_sequences": [1, 2, 3],
+                    "credit_agreement_ordinal_observations": {
+                        "3": {
+                            "sequence": 3,
+                            "source_refs": [
+                                {
+                                    "source": "candidate_b_source_coverage_ledger",
+                                    "logical_page": 12,
+                                    "source_page": 6,
+                                    "geometry_scope": "line",
+                                    "binding": "printed_credit_agreement_ordinal",
+                                    "binding_quality": "printed_credit_agreement_ordinal",
+                                    "sequence": 3,
+                                    "bbox": [20.0, 40.0, 120.0, 60.0],
+                                    "evidence_ids": ["ocr:sp0006:lp0012:0003"],
+                                }
+                            ],
+                            "printed_fields": ["institution", "total_limit"],
+                            "field_source_refs": {
+                                "institution": [
+                                    {
+                                        "source": "personal_detail_corrected_page_cell",
+                                        "logical_page": 12,
+                                        "source_page": 6,
+                                        "geometry_scope": "cell",
+                                        "binding": "canonical_label_slot",
+                                        "field_name": "institution",
+                                        "bbox": [20.0, 80.0, 120.0, 96.0],
+                                        "evidence_ids": ["ocr:sp0006:lp0012:institution"],
+                                    }
+                                ],
+                                "total_limit": [
+                                    {
+                                        "source": "personal_detail_corrected_page_cell",
+                                        "logical_page": 12,
+                                        "source_page": 6,
+                                        "geometry_scope": "cell",
+                                        "binding": "canonical_label_slot",
+                                        "field_name": "total_limit",
+                                        "bbox": [140.0, 80.0, 220.0, 96.0],
+                                        "evidence_ids": ["ocr:sp0006:lp0012:total_limit"],
+                                    }
+                                ],
+                            },
+                        }
+                    },
+                }
+            },
+            "datasets": {
+                "credit_lines": [
+                    {
+                        "credit_line_id": "credit_agreement:1",
+                        "_printed_sequence": 1,
+                        "_canonical_card_key": "credit_agreement:1",
+                    },
+                    {
+                        "credit_line_id": "credit_agreement:2",
+                        "_printed_sequence": 2,
+                        "_canonical_card_key": "credit_agreement:2",
+                    },
+                ]
+            },
+        }
+    )
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    issue = next(
+        issue
+        for issue in issues
+        if issue.get("issue_code") == "source_credit_agreement_record_omitted"
+    )
+    assert issue["target_record_id"] == "credit_agreement:3"
+    assert issue["field_name"] == "credit_line_id"
+    assert issue["source_refs"][0]["logical_page"] == 12
+    field_issues = {
+        item["field_name"]: item
+        for item in issues
+        if item.get("issue_code") == "source_credit_agreement_field_omitted"
+    }
+    assert set(field_issues) == {"institution", "total_limit"}
+    assert all(
+        item["source_refs"][0]["field_name"] == field_name
+        for field_name, item in field_issues.items()
+    )
+
+
+def _agreement_lifecycle_content(
+    emitted_rows: list[dict[str, object]],
+) -> dict[str, object]:
+    return prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_agreements": 1,
+                    "credit_agreement_sequence_endpoint": 1,
+                    "credit_agreement_observed_sequences": [1],
+                    "credit_agreement_ordinal_observations": {
+                        "1": {
+                            "sequence": 1,
+                            "source_refs": [
+                                {
+                                    "source": "candidate_b_source_coverage_ledger",
+                                    "logical_page": 12,
+                                    "source_page": 6,
+                                    "geometry_scope": "line",
+                                    "binding": "printed_credit_agreement_ordinal",
+                                    "binding_quality": "printed_credit_agreement_ordinal",
+                                    "sequence": 1,
+                                    "bbox": [20.0, 40.0, 120.0, 60.0],
+                                    "evidence_ids": ["ocr:sp0006:lp0012:agreement-1"],
+                                }
+                            ],
+                        }
+                    },
+                }
+            },
+            "datasets": {"credit_lines": emitted_rows},
+        }
+    )
+
+
+def _hashed_agreement_with_source_identity(
+    record_suffix: str,
+    *,
+    bbox: list[float] | None = None,
+) -> dict[str, object]:
+    return {
+        "credit_line_id": f"credit_line:hashed-{record_suffix}",
+        "sequence": 1,
+        "_source_agreement_identity": {
+            "sequence": 1,
+            "source_refs": [
+                {
+                    "source": "native_detail_canonical_anchor_text",
+                    "logical_page": 12,
+                    "source_page": 6,
+                    "geometry_scope": "text",
+                    "binding": "canonical_card_anchor",
+                    "bbox": bbox or [22.0, 42.0, 118.0, 58.0],
+                }
+            ],
+        },
+    }
+
+
+def test_source_ledger_reconciles_hashed_agreement_with_exact_card_owner() -> None:
+    content = _agreement_lifecycle_content(
+        [_hashed_agreement_with_source_identity("one")]
+    )
+
+    assert not any(
+        issue.get("issue_code")
+        in {
+            "source_credit_agreement_record_omitted",
+            "source_credit_agreement_field_omitted",
+        }
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+    )
+
+
+@pytest.mark.parametrize("owner_defect", ("nonoverlap", "duplicate"))
+def test_source_ledger_does_not_reconcile_ambiguous_hashed_agreement_owner(
+    owner_defect: str,
+) -> None:
+    rows = [_hashed_agreement_with_source_identity("one")]
+    if owner_defect == "nonoverlap":
+        rows[0] = _hashed_agreement_with_source_identity(
+            "one",
+            bbox=[220.0, 240.0, 320.0, 260.0],
+        )
+    else:
+        rows.append(_hashed_agreement_with_source_identity("two"))
+    content = _agreement_lifecycle_content(rows)
+
+    assert any(
+        issue.get("issue_code") == "source_credit_agreement_record_omitted"
+        and issue.get("target_record_id") == "credit_agreement:1"
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing_observation_sequence",
+        "wrong_observation_sequence",
+        "wrong_source",
+        "broad_scope",
+        "wrong_binding",
+        "wrong_binding_quality",
+        "missing_logical_page",
+        "missing_source_page",
+        "wrong_ref_sequence",
+        "missing_bbox",
+        "nonfinite_bbox",
+        "degenerate_bbox",
+        "missing_evidence",
+    ),
+)
+def test_source_ledger_rejects_forged_agreement_omission_refs(
+    mutation: str,
+) -> None:
+    observation = {
+        "sequence": 3,
+        "source_refs": [
+            {
+                "source": "candidate_b_source_coverage_ledger",
+                "logical_page": 12,
+                "source_page": 6,
+                "geometry_scope": "line",
+                "binding": "printed_credit_agreement_ordinal",
+                "binding_quality": "printed_credit_agreement_ordinal",
+                "sequence": 3,
+                "bbox": [20.0, 40.0, 120.0, 60.0],
+                "evidence_ids": ["ocr:sp0006:lp0012:0003"],
+            }
+        ],
+    }
+    ref = observation["source_refs"][0]
+    if mutation == "missing_observation_sequence":
+        observation.pop("sequence")
+    elif mutation == "wrong_observation_sequence":
+        observation["sequence"] = 2
+    elif mutation == "wrong_source":
+        ref["source"] = "native_detail_canonical_anchor_text"
+    elif mutation == "broad_scope":
+        ref["geometry_scope"] = "logical_page"
+    elif mutation == "wrong_binding":
+        ref["binding"] = "canonical_card_anchor"
+    elif mutation == "wrong_binding_quality":
+        ref["binding_quality"] = "canonical_card_anchor"
+    elif mutation == "missing_logical_page":
+        ref.pop("logical_page")
+    elif mutation == "missing_source_page":
+        ref.pop("source_page")
+    elif mutation == "wrong_ref_sequence":
+        ref["sequence"] = 2
+    elif mutation == "missing_bbox":
+        ref.pop("bbox")
+    elif mutation == "nonfinite_bbox":
+        ref["bbox"] = [20.0, 40.0, float("inf"), 60.0]
+    elif mutation == "degenerate_bbox":
+        ref["bbox"] = [20.0, 40.0, 20.0, 60.0]
+    elif mutation == "missing_evidence":
+        ref["evidence_ids"] = []
+
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_agreements": 3,
+                    "credit_agreement_sequence_endpoint": 3,
+                    "credit_agreement_observed_sequences": [1, 2, 3],
+                    "credit_agreement_ordinal_observations": {
+                        "3": observation,
+                    },
+                }
+            },
+            "datasets": {
+                "credit_lines": [
+                    {
+                        "credit_line_id": "credit_agreement:1",
+                        "_printed_sequence": 1,
+                        "_canonical_card_key": "credit_agreement:1",
+                    },
+                    {
+                        "credit_line_id": "credit_agreement:2",
+                        "_printed_sequence": 2,
+                        "_canonical_card_key": "credit_agreement:2",
+                    },
+                ]
+            },
+        }
+    )
+
+    assert not any(
+        issue.get("issue_code") == "source_credit_agreement_record_omitted"
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+    )
+
+
+def test_source_ledger_inquiry_identity_expansion_fails_closed_on_sparse_outlier() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "inquiry_records": 117,
+                    "inquiry_sequence_endpoints": {"institution": 117},
+                    "inquiry_observed_sequences": {"institution": [1, 117]},
+                }
+            },
+            "datasets": {
+                "inquiry_records": [
+                    {
+                        "inquiry_id": "credit_inquiry:institution:1",
+                        "inquiry_type": "institution",
+                        "sequence": 1,
+                    }
+                ]
+            },
+        }
+    )
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    assert any(issue.get("issue_code") == "source_sequence_or_count_gap" for issue in issues)
+    assert not any(issue.get("issue_code") == "source_inquiry_record_omitted" for issue in issues)
+
+
+def test_exact_population_issues_are_idempotent_and_project_structured_evidence() -> None:
+    ref = {"logical_page": 20, "source_page": 10, "geometry_scope": "table"}
+    content = {
+        "facts": {
+            "personal_detail_source_completeness_ledger": {
+                "inquiry_records": 3,
+                "inquiry_sequence_endpoints": {"institution": 3},
+                "inquiry_observed_sequences": {"institution": [1, 2, 3]},
+                "inquiry_ordinal_observations": {
+                    "institution": {"3": {"source_refs": [ref]}}
+                },
+            }
+        },
+        "datasets": {
+            "inquiry_records": [
+                {
+                    "inquiry_id": "credit_inquiry:institution:1",
+                    "inquiry_type": "institution",
+                    "sequence": 1,
+                },
+                {
+                    "inquiry_id": "credit_inquiry:institution:2",
+                    "inquiry_type": "institution",
+                    "sequence": 2,
+                },
+            ]
+        },
+    }
+    prepare_personal_detail_source_collections(content)
+    prepare_personal_detail_source_collections(content)
+
+    source_issues = [
+        issue
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+        if issue.get("issue_code") == "source_inquiry_record_omitted"
+    ]
+    assert len(source_issues) == 1
+    assert source_issues[0]["candidate_value"] == {"source_sequence_endpoint": 3}
+    projected = project_personal_detail_datasets(content["datasets"])
+    public_issue = next(
+        row
+        for row in projected["extraction_issues"]
+        if row.get("issue_code") == "source_inquiry_record_omitted"
+    )
+    assert public_issue["candidate_value_type"] == "object"
+    assert any(
+        evidence.get("extraction_issue_id") == public_issue["extraction_issue_id"]
+        and evidence.get("evidence_kind") == "candidate"
+        and evidence.get("evidence_path") == "source_sequence_endpoint"
+        and evidence.get("integer_value") == 3
+        for evidence in projected["extraction_issue_evidence"]
+    )
+
+
+def test_agreement_text_without_sealed_source_structure_is_not_population() -> None:
+    evidence_pages = [
+        {
+            "page": 12,
+            "source_page": 6,
+            "lines": [
+                {"text": "授信协议信息"},
+                {"text": "授信协议1 授信协议标识A"},
+                {"text": "授信协议2 授信协议标识B"},
+                {"text": "授信协议3 授信协议标识C"},
+            ],
+            "tables": [],
+        }
+    ]
+    result = SimpleNamespace(
+        pages=[],
+        corrected_evidence_pages=lambda: evidence_pages,
+    )
+    ledger = _source_completeness_ledger(result)
+    assert "credit_agreement_sequence_endpoint" not in ledger
+    assert "credit_agreement_ordinal_observations" not in ledger
+
+
+def test_agreement_ledger_uses_frozen_geometry_not_grouped_representative_line() -> None:
+    evidence_pages = [
+        {
+            "page": 20,
+            "source_page": 10,
+            "lines": [
+                {
+                    "text": "授信协议信息",
+                    "bbox": [10.0, 20.0, 120.0, 36.0],
+                    "source_bbox": [10.0, 20.0, 120.0, 36.0],
+                    "source_logical_page": 20,
+                    "source_page": 10,
+                    "evidence_ids": ["ocr:sp0010:lp0020:heading"],
+                },
+                {
+                    "text": "授信协议1",
+                    # Canonical-layout grouping moved the line onto the
+                    # representative page and transformed its working bbox.
+                    "bbox": [210.0, 240.0, 310.0, 260.0],
+                    "page": 20,
+                    "source_bbox": [12.0, 40.0, 112.0, 60.0],
+                    "source_logical_page": 21,
+                    "source_page": 11,
+                    "evidence_ids": ["ocr:sp0011:lp0021:ordinal"],
+                },
+            ],
+            "tables": [],
+        }
+    ]
+    frozen_page = SimpleNamespace(
+        page_number=21,
+        source_page_number=11,
+        tables=[],
+        texts=[
+            SimpleNamespace(
+                content="授信协议信息",
+                bbox=[10.0, 20.0, 120.0, 36.0],
+                evidence_ids=["ocr:sp0011:lp0021:heading"],
+            ),
+            SimpleNamespace(
+                content="授信协议1",
+                bbox=[12.0, 40.0, 112.0, 60.0],
+                evidence_ids=["ocr:sp0011:lp0021:ordinal"],
+            ),
+            SimpleNamespace(
+                content="机构查询记录明细",
+                bbox=[12.0, 70.0, 140.0, 86.0],
+                evidence_ids=["ocr:sp0011:lp0021:boundary"],
+            ),
+        ],
+    )
+    result = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[frozen_page]),
+        _frozen_logical_pages={21: frozen_page},
+        pages=[],
+        corrected_evidence_pages=lambda: evidence_pages,
+        reading_order_by_logical={21: 1},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+    )
+
+    ledger = _source_completeness_ledger(result)
+    ref = ledger["credit_agreement_ordinal_observations"]["1"]["source_refs"][0]
+
+    assert ref["logical_page"] == 21
+    assert ref["source_page"] == 11
+    assert ref["bbox"] == [12.0, 40.0, 112.0, 60.0]
+
+
+def test_exact_population_does_not_localize_dataset_wide_endpoint_refs() -> None:
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    "credit_accounts": 2,
+                    "account_family_endpoints": {"credit_card": 2},
+                    "source_refs": {
+                        "credit_accounts": [
+                            {
+                                "logical_page": 8,
+                                "source_page": 4,
+                                "geometry_scope": "logical_page",
+                            }
+                        ]
+                    },
+                }
+            },
+            "datasets": {
+                "credit_accounts": [
+                    {
+                        "account_id": "credit_account:credit_card:1",
+                        "account_type": "credit_card",
+                        "category_sequence": 1,
+                    }
+                ]
+            },
+        },
+        final_dataset_counts={"credit_accounts": 1},
+    )
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    assert any(issue.get("issue_code") == "source_sequence_or_count_gap" for issue in issues)
+    assert not any(issue.get("issue_code") == "source_account_record_omitted" for issue in issues)
+
+
+def test_exact_residence_and_employment_rows_project_stable_local_issues() -> None:
+    contracts = {
+        "residence_records": (
+            "residence_record_id",
+            "credit_residence",
+            "residence",
+            (
+                "sequence",
+                "address",
+                "residential_phone",
+                "residence_status",
+                "information_updated_date",
+            ),
+        ),
+        "employment_records": (
+            "employment_record_id",
+            "credit_employment",
+            "basic",
+            (
+                "sequence",
+                "employer",
+                "employer_type",
+                "employer_address",
+                "employer_phone",
+            ),
+        ),
+    }
+
+    def exact_ref(
+        dataset: str,
+        component: str,
+        ordinal: int,
+        field_name: str,
+        column: int,
+    ) -> dict[str, object]:
+        sequence_ref = field_name == "sequence"
+        binding = "printed_profile_sequence" if sequence_ref else "printed_profile_field"
+        return {
+            "source": (
+                "candidate_b_raw_profile_sequence_cell"
+                if sequence_ref
+                else "candidate_b_raw_profile_field_cell"
+            ),
+            "logical_page": 37,
+            "source_page": 19,
+            "table_id": f"{dataset}:{component}",
+            "row": ordinal,
+            "column": column,
+            "bbox": [column * 20.0, ordinal * 20.0, column * 20.0 + 10.0, ordinal * 20.0 + 10.0],
+            "geometry_scope": "cell",
+            "evidence_ids": [f"{dataset}:{component}:{ordinal}:{field_name}"],
+            "binding": binding,
+            "binding_quality": binding,
+            "canonical_template_id": "report_header_and_identity",
+            "dataset_name": dataset,
+            "component": component,
+            "sequence": ordinal,
+            "field_name": field_name,
+        }
+
+    ordinal_observations: dict[str, dict[str, object]] = {}
+    for dataset, (id_field, prefix, component, fields) in contracts.items():
+        ordinal_observations[dataset] = {}
+        for ordinal in (1, 2):
+            field_refs = {
+                field_name: [
+                    exact_ref(dataset, component, ordinal, field_name, column)
+                ]
+                for column, field_name in enumerate(fields[1:], 1)
+            }
+            ordinal_observations[dataset][str(ordinal)] = {
+                "sequence": ordinal,
+                id_field: stable_record_id(prefix, ordinal),
+                "canonical_template_id": "report_header_and_identity",
+                "canonical_header_fields_by_component": {
+                    component: list(fields)
+                },
+                "printed_fields": list(fields[1:]),
+                "field_source_refs": field_refs,
+                "source_refs": [
+                    exact_ref(dataset, component, ordinal, "sequence", 0)
+                ],
+            }
+    ledger = {
+        "sequence_endpoints": {
+            "residence_records": 2,
+            "employment_records": 2,
+        },
+        "sequence_observed_sequences": {
+            "residence_records": [1, 2],
+            "employment_records": [1, 2],
+        },
+        "sequence_ordinal_observations": ordinal_observations,
+    }
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {"personal_detail_source_completeness_ledger": ledger},
+            "datasets": {
+                "residence_records": [
+                    {
+                        "record_id": stable_record_id("credit_residence", 1),
+                        "residence_record_id": stable_record_id("credit_residence", 1),
+                        "sequence": 1,
+                    }
+                ],
+                "employment_records": [
+                    {
+                        "record_id": stable_record_id("credit_employment", 1),
+                        "employment_record_id": stable_record_id("credit_employment", 1),
+                        "sequence": 1,
+                    }
+                ],
+            },
+        }
+    )
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    residence_issue = next(
+        issue for issue in issues if issue.get("issue_code") == "source_residence_record_omitted"
+    )
+    employment_issue = next(
+        issue for issue in issues if issue.get("issue_code") == "source_employment_record_omitted"
+    )
+    assert residence_issue["target_record_id"] == stable_record_id("credit_residence", 2)
+    assert residence_issue["observed_value"]["sequence"] == 2
+    assert residence_issue["source_refs"][0]["sequence"] == 2
+    assert employment_issue["target_record_id"] == stable_record_id("credit_employment", 2)
+    assert employment_issue["observed_value"]["sequence"] == 2
+    assert any(
+        issue.get("target_record_id") == stable_record_id("credit_residence", 2)
+        and issue.get("field_name") == "address"
+        for issue in issues
+    )
+    assert any(
+        issue.get("target_record_id") == stable_record_id("credit_employment", 2)
+        and issue.get("field_name") == "employer"
+        for issue in issues
+    )
+    assert len(content["datasets"]["residence_records"]) == 1
+    assert len(content["datasets"]["employment_records"]) == 1
+    projected = project_personal_detail_datasets(content["datasets"])
+    projected_ids = {
+        row["target_record_id"]
+        for row in projected["extraction_issues"]
+        if row.get("target_record_id")
+    }
+    assert stable_record_id("credit_residence", 2) in projected_ids
+    assert stable_record_id("credit_employment", 2) in projected_ids
+
+
+def test_duplicate_exact_sequence_rows_fail_closed_for_local_omission() -> None:
+    residence = _exact_table(
+        "residence-duplicate",
+        [
+            ["编号", "居住地址", "住宅电话", "居住状况", "信息更新日期"],
+            ["1", "北京市一号", "01012345678", "自置", "2024.01.01"],
+            ["2", "北京市二号", "01087654321", "租房", "2024.02.01"],
+            ["2", "北京市三号", "01011112222", "租房", "2024.03.01"],
+        ],
+    )
+    ledger = _source_completeness_ledger(
+        SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=2,
+                    source_page_number=1,
+                    tables=[residence],
+                )
+            ],
+            corrected_evidence_pages=lambda: [],
+        )
+    )
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {"personal_detail_source_completeness_ledger": ledger},
+            "datasets": {
+                "residence_records": [
+                    {
+                        "record_id": stable_record_id("credit_residence", 1),
+                        "residence_record_id": stable_record_id("credit_residence", 1),
+                        "sequence": 1,
+                    }
+                ]
+            },
+        }
+    )
+
+    assert "2" not in ledger.get("sequence_ordinal_observations", {}).get(
+        "residence_records", {}
+    )
+    assert not any(
+        issue.get("issue_code") == "source_residence_record_omitted"
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+    )
+
+
+def test_sequence_ledger_keeps_mixed_table_components_in_header_bounded_regions() -> None:
+    mixed = _exact_table(
+        "mixed-residence-employment",
+        [
+            ["\u7f16\u53f7", "\u5c45\u4f4f\u5730\u5740", "\u4f4f\u5b85\u7535\u8bdd", "\u5c45\u4f4f\u72b6\u51b5", "\u4fe1\u606f\u66f4\u65b0\u65e5\u671f"],
+            ["1", "RESIDENCE ONE", "01012345678", "STATUS ONE", "2024.01.01"],
+            ["\u7f16\u53f7", "\u5de5\u4f5c\u5355\u4f4d", "\u5355\u4f4d\u6027\u8d28", "\u5355\u4f4d\u5730\u5740", "\u5355\u4f4d\u7535\u8bdd"],
+            ["2", "EMPLOYER TWO", "TYPE TWO", "ADDRESS TWO", "01087654321"],
+        ],
+    )
+    ledger = _source_completeness_ledger(
+        SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=2,
+                    source_page_number=1,
+                    tables=[mixed],
+                )
+            ],
+            corrected_evidence_pages=lambda: [],
+        )
+    )
+
+    assert ledger["sequence_endpoints"] == {
+        "residence_records": 1,
+        "employment_records": 2,
+    }
+    observations = ledger["sequence_ordinal_observations"]
+    assert set(observations["residence_records"]) == {"1"}
+    assert set(observations["employment_records"]) == {"2"}
+
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {"personal_detail_source_completeness_ledger": ledger},
+            "datasets": {
+                "residence_records": [
+                    {
+                        "record_id": stable_record_id("credit_residence", 1),
+                        "residence_record_id": stable_record_id("credit_residence", 1),
+                        "sequence": 1,
+                    }
+                ],
+                "employment_records": [
+                    {
+                        "record_id": stable_record_id("credit_employment", 2),
+                        "employment_record_id": stable_record_id("credit_employment", 2),
+                        "sequence": 2,
+                    }
+                ],
+            },
+        }
+    )
+    exact_issue_codes = {
+        issue.get("issue_code")
+        for issue in content["datasets"]["personal_detail_extraction_issues"]
+        if issue.get("target_record_id")
+    }
+    assert "source_residence_record_omitted" not in exact_issue_codes
+    assert "source_employment_record_omitted" not in exact_issue_codes
+
+
+def test_mobile_source_ledger_requires_exact_unique_four_slot_rows() -> None:
+    mobile = _exact_table(
+        "mobile",
+        [
+            ["编号", "手机号码", "信息更新日期", "数据发生机构名称"],
+            ["1", "13800138000", "2024.01.01", "样例银行"],
+            ["2", "13900139000", "2024.02.01", "另一银行"],
+        ],
+    )
+    ledger = _source_completeness_ledger(
+        SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=1,
+                    source_page_number=1,
+                    tables=[mobile],
+                )
+            ],
+            corrected_evidence_pages=lambda: [],
+        )
+    )
+
+    assert ledger["sequence_endpoints"]["mobile_phone_records"] == 2
+    observation = ledger["sequence_ordinal_observations"]["mobile_phone_records"]["2"]
+    assert observation["sequence"] == 2
+    assert observation["canonical_header_fields"] == [
+        "data_provider",
+        "information_updated_date",
+        "mobile_phone",
+        "sequence",
+    ]
+    assert observation["printed_fields"] == [
+        "data_provider",
+        "information_updated_date",
+        "mobile_phone",
+    ]
+    assert all(ref["sequence"] == 2 for ref in observation["source_refs"])
+
+
+def test_inquiry_source_ledger_accepts_only_exact_dense_headerless_carry() -> None:
+    header = _exact_table(
+        "inquiry-header",
+        [
+            ["编号", "查询日期", "查询机构", "查询原因"],
+            ["1", "2024.01.01", "样例银行", "贷后管理"],
+            ["2", "2024.01.02", "样例银行", "贷后管理"],
+            ["3", "2024.01.03", "样例银行", "贷后管理"],
+        ],
+        canonical_template_id="annotations_and_inquiries",
+    )
+    continuation_rows = [
+        [str(sequence), "2024.01.04", "样例银行", "贷后管理"]
+        for sequence in range(4, 144)
+    ]
+    continuation = _exact_table(
+        "inquiry-continuation",
+        continuation_rows,
+        canonical_template_id="annotations_and_inquiries",
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=33,
+                source_page_number=17,
+                canonical_template_id="annotations_and_inquiries",
+                tables=[header],
+            ),
+            SimpleNamespace(
+                page_number=37,
+                source_page_number=19,
+                canonical_template_id="annotations_and_inquiries",
+                tables=[continuation],
+            ),
+        ],
+        corrected_evidence_pages=lambda: [],
+        reading_order_by_logical={33: 1, 37: 2},
+        reading_order_resolution={
+            "status": "resolved",
+            "resolved": True,
+            "authoritative": True,
+        },
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["inquiry_sequence_endpoints"] == {"institution": 143}
+    assert ledger["inquiry_observed_sequences"]["institution"] == list(range(1, 144))
+    last = ledger["inquiry_ordinal_observations"]["institution"]["143"]
+    assert last["source_refs"][0]["logical_page"] == 37
+    assert last["source_refs"][0]["geometry_scope"] == "row"
+
+
+def test_inquiry_source_ledger_keeps_duplicate_ordinal_owners_aggregate_only() -> None:
+    inquiry_table = _exact_table(
+        "inquiry-duplicate-ordinal",
+        [
+            ["编号", "查询日期", "查询机构", "查询原因"],
+            ["1", "2024.01.01", "样例银行", "贷后管理"],
+            ["2", "2024.01.02", "样例银行", "贷后管理"],
+            ["2", "2024.01.02", "样例银行", "贷后管理"],
+            ["3", "2024.01.03", "样例银行", "贷后管理"],
+        ],
+        canonical_template_id="annotations_and_inquiries",
+    )
+    ledger = _source_completeness_ledger(
+        SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=20,
+                    source_page_number=10,
+                    canonical_template_id="annotations_and_inquiries",
+                    tables=[inquiry_table],
+                )
+            ],
+            corrected_evidence_pages=lambda: [],
+        )
+    )
+
+    assert ledger["inquiry_sequence_endpoints"] == {"institution": 3}
+    observations = ledger["inquiry_ordinal_observations"]["institution"]
+    assert set(observations) == {"1", "3"}
+
+    content = {
+        "facts": {"personal_detail_source_completeness_ledger": ledger},
+        "datasets": {
+            "inquiry_records": [
+                {
+                    "inquiry_id": "credit_inquiry:institution:1",
+                    "inquiry_type": "institution",
+                    "sequence": 1,
+                },
+                {
+                    "inquiry_id": "credit_inquiry:institution:3",
+                    "inquiry_type": "institution",
+                    "sequence": 3,
+                },
+            ]
+        },
+    }
+    prepare_personal_detail_source_collections(content)
+
+    issues = content["datasets"]["personal_detail_extraction_issues"]
+    assert any(
+        issue.get("issue_code") == "source_sequence_or_count_gap"
+        and issue.get("target_dataset") == "inquiry_records"
+        for issue in issues
+    )
+    assert not any(
+        issue.get("issue_code") in {
+            "source_inquiry_record_omitted",
+            "source_inquiry_field_omitted",
+        }
+        and issue.get("target_record_id") == "credit_inquiry:institution:2"
+        for issue in issues
+    )
+
+
+@pytest.mark.parametrize("defect", ["wrong_page", "competing_group", "derived_geometry"])
+def test_inquiry_source_ledger_rejects_unbounded_headerless_carry(defect: str) -> None:
+    header = _exact_table(
+        "inquiry-negative-header",
+        [
+            ["编号", "查询日期", "查询机构", "查询原因"],
+            ["1", "2024.01.01", "样例银行", "贷后管理"],
+            ["2", "2024.01.02", "样例银行", "贷后管理"],
+            ["3", "2024.01.03", "样例银行", "贷后管理"],
+        ],
+        canonical_template_id="annotations_and_inquiries",
+    )
+    rows = [["4", "2024.01.04", "样例银行", "贷后管理"]]
+    if defect == "competing_group":
+        rows[0][2:] = ["本人", "本人查询"]
+    continuation = _exact_table(
+        "inquiry-negative-continuation",
+        rows,
+        derived_cells={(0, 2)} if defect == "derived_geometry" else frozenset(),
+        canonical_template_id="annotations_and_inquiries",
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=33,
+                source_page_number=17,
+                canonical_template_id="annotations_and_inquiries",
+                tables=[header],
+            ),
+            SimpleNamespace(
+                page_number=37,
+                source_page_number=19,
+                canonical_template_id=(
+                    "public_records" if defect == "wrong_page" else "annotations_and_inquiries"
+                ),
+                tables=[continuation],
+            ),
+        ],
+        corrected_evidence_pages=lambda: [],
+        reading_order_resolution={"status": "ambiguous"},
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["inquiry_sequence_endpoints"] == {"institution": 3}
+    assert "4" not in ledger.get("inquiry_ordinal_observations", {}).get(
+        "institution", {}
+    )
+
+
 def test_source_ledger_rejects_isolated_account_sequence_outlier() -> None:
     endpoint, outliers = _credible_sequence_endpoint(set(range(1, 28)) | {115})
 
@@ -1144,7 +2577,7 @@ def test_source_ledger_rejects_isolated_account_sequence_outlier() -> None:
     assert outliers == [115]
 
 
-def test_account_source_ledger_counts_lin_numbered_and_unnumbered_families() -> None:
+def test_unsealed_sample_account_lines_cannot_establish_population() -> None:
     lines = [
         {"text": "（一）非循环贷账户"},
         *({"text": f"账户{sequence}"} for sequence in range(1, 23)),
@@ -1168,22 +2601,12 @@ def test_account_source_ledger_counts_lin_numbered_and_unnumbered_families() -> 
 
     ledger = _source_completeness_ledger(result)
 
-    assert ledger["credit_accounts"] == 45
-    assert ledger["account_family_endpoints"] == {
-        "non_revolving_loan": 22,
-        "credit_card": 22,
-    }
-    assert ledger["account_family_source_populations"] == {
-        "credit_card": 22,
-        "non_revolving_loan": 22,
-        "revolving_loan_account": 1,
-    }
-    assert ledger["account_family_unnumbered_anchor_counts"] == {
-        "revolving_loan_account": 1
-    }
+    assert "credit_accounts" not in ledger
+    assert "account_family_endpoints" not in ledger
+    assert "account_family_source_populations" not in ledger
 
 
-def test_account_source_ledger_is_conservative_for_sparse_and_weak_anchors() -> None:
+def test_unsealed_sparse_and_weak_account_lines_cannot_establish_population() -> None:
     result = SimpleNamespace(
         pages=[],
         corrected_evidence_pages=lambda: [
@@ -1214,19 +2637,12 @@ def test_account_source_ledger_is_conservative_for_sparse_and_weak_anchors() -> 
 
     ledger = _source_completeness_ledger(result)
 
-    assert ledger["credit_accounts"] == 5
-    assert ledger["account_family_endpoints"] == {"non_revolving_loan": 3}
-    assert ledger["account_family_sequence_outliers"] == {
-        "non_revolving_loan": [115]
-    }
-    assert ledger["account_family_source_populations"] == {
-        "non_revolving_loan": 3,
-        "revolving_loan_account": 2,
-    }
-    assert "credit_card" not in ledger["account_family_source_populations"]
+    assert "credit_accounts" not in ledger
+    assert "account_family_endpoints" not in ledger
+    assert "account_family_source_populations" not in ledger
 
 
-def test_exact_single_weak_account_anchor_is_a_bounded_source_witness() -> None:
+def test_unregistered_single_weak_account_anchor_is_not_a_source_witness() -> None:
     result = SimpleNamespace(
         pages=[],
         corrected_evidence_pages=lambda: [
@@ -1247,13 +2663,9 @@ def test_exact_single_weak_account_anchor_is_a_bounded_source_witness() -> None:
 
     ledger = _source_completeness_ledger(result)
 
-    assert ledger["credit_accounts"] == 1
-    assert ledger["account_family_source_populations"] == {
-        "revolving_loan_account": 1
-    }
-    assert ledger["account_family_unnumbered_anchor_counts"] == {
-        "revolving_loan_account": 1
-    }
+    assert "credit_accounts" not in ledger
+    assert "account_family_source_populations" not in ledger
+    assert "account_family_unnumbered_anchor_counts" not in ledger
 
 
 def test_account_source_ledger_does_not_mutate_final_business_rows() -> None:
@@ -1287,30 +2699,42 @@ def test_account_source_ledger_does_not_mutate_final_business_rows() -> None:
 
 
 def test_agreement_ledger_does_not_count_account_heading_identifiers() -> None:
+    raw_pages = [
+        SimpleNamespace(
+            page_number=1,
+            source_page_number=1,
+            tables=[],
+            texts=[
+                SimpleNamespace(
+                    content="账户1（授信协议标识：ACCOUNT0001）",
+                    bbox=[10.0, 20.0, 200.0, 30.0],
+                    evidence_ids=["account-heading"],
+                )
+            ],
+        ),
+        SimpleNamespace(
+            page_number=2,
+            source_page_number=2,
+            tables=[],
+            texts=[
+                SimpleNamespace(
+                    content=text,
+                    bbox=[10.0, 20.0 + index * 20.0, 180.0, 30.0 + index * 20.0],
+                    evidence_ids=[f"agreement-structure:{index}"],
+                )
+                for index, text in enumerate(
+                    ("（五）授信协议信息", "授信协议1", "授信协议2", "公共信息明细")
+                )
+            ],
+        ),
+    ]
     result = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=raw_pages),
+        _frozen_logical_pages={page.page_number: page for page in raw_pages},
         pages=[],
-        corrected_evidence_pages=lambda: [
-            {
-                "page": 1,
-                "source_page": 1,
-                "lines": [
-                    {"text": "账户1（授信协议标识：ACCOUNT0001）"},
-                    {"text": "授信协议标识"},
-                ],
-            },
-            {
-                "page": 2,
-                "source_page": 2,
-                "lines": [
-                    {"text": "（五）授信协议信息"},
-                    {"text": "授信协议1"},
-                    {"text": "授信协议标识"},
-                    {"text": "授信协议2"},
-                    {"text": "授信协议标识"},
-                    {"text": "公共信息明细"},
-                ],
-            },
-        ],
+        corrected_evidence_pages=lambda: [],
+        reading_order_by_logical={1: 1, 2: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
     )
 
     ledger = _source_completeness_ledger(result)
@@ -1319,23 +2743,36 @@ def test_agreement_ledger_does_not_count_account_heading_identifiers() -> None:
 
 
 def test_agreement_ledger_prefers_printed_endpoint_over_duplicate_primary_labels() -> None:
-    result = SimpleNamespace(
-        pages=[],
-        corrected_evidence_pages=lambda: [
-            {
-                "page": 24,
-                "source_page": 12,
-                "lines": [
-                    {"text": "（五）授信协议信息"},
-                    {"text": "授信协议1"},
-                    {"text": "授信协议标识"},
-                    {"text": "授信协议标识"},
-                    {"text": "授信协议2"},
-                    {"text": "授信协议标识"},
-                    {"text": "公共信息明细"},
-                ],
-            }
+    raw_page = SimpleNamespace(
+        page_number=24,
+        source_page_number=12,
+        tables=[],
+        texts=[
+            SimpleNamespace(
+                content=text,
+                bbox=[10.0, 20.0 + index * 20.0, 180.0, 30.0 + index * 20.0],
+                evidence_ids=[f"agreement-structure:{index}"],
+            )
+            for index, text in enumerate(
+                (
+                    "（五）授信协议信息",
+                    "授信协议1",
+                    "授信协议标识",
+                    "授信协议标识",
+                    "授信协议2",
+                    "授信协议标识",
+                    "公共信息明细",
+                )
+            )
         ],
+    )
+    result = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[raw_page]),
+        _frozen_logical_pages={24: raw_page},
+        pages=[],
+        corrected_evidence_pages=lambda: [],
+        reading_order_by_logical={24: 1},
+        reading_order_resolution={"resolved": True, "authoritative": True},
     )
 
     ledger = _source_completeness_ledger(result)
@@ -1499,7 +2936,17 @@ def test_header_consensus_reports_missing_fields_for_coordinated_page_repair(mon
     assert metadata["report_time"] is None
     assert len(result._personal_detail_extraction_issues) == 7
     assert all(
-        issue["source_refs"][0]["logical_page"] == 1
+        issue["source_refs"][0].get("source")
+        == "candidate_b_report_header_business_fields"
+        for issue in result._personal_detail_extraction_issues
+    )
+    assert all(
+        issue["source_refs"][0].get("canonical_template_id")
+        == "report_header_and_identity"
+        for issue in result._personal_detail_extraction_issues
+    )
+    assert all(
+        "logical_page" not in issue["source_refs"][0]
         for issue in result._personal_detail_extraction_issues
     )
     targets = {
@@ -1531,6 +2978,147 @@ def test_header_consensus_reports_missing_fields_for_coordinated_page_repair(mon
     assert all(
         issue["record_id"] == issue["extraction_issue_id"]
         for issue in result._personal_detail_extraction_issues
+    )
+
+
+def _exact_header_token_context(
+    *,
+    value_tokens: tuple[tuple[str, tuple[float, float, float, float], str], ...],
+    raw_name: str,
+) -> SimpleNamespace:
+    rows = [
+        ["被查询者姓名", "被查询者证件类型", "被查询者证件号码", "查询机构 查询原因"],
+        [raw_name, "身份证", "350121199101285219", "本人 本人查询(自助查询机)"],
+    ]
+    cell_bboxes = [
+        [[0, 0, 60, 10], [60, 0, 120, 10], [120, 0, 220, 10], [220, 0, 360, 10]],
+        [[0, 10, 60, 30], [60, 10, 120, 30], [120, 10, 220, 30], [220, 10, 360, 30]],
+    ]
+    header_ids = ["header-name", "header-type", "header-number", "header-query"]
+    value_ids = [token[2] for token in value_tokens]
+    table = SimpleNamespace(
+        table_id="header-token-residue",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": rows,
+            "geometry": {
+                "cell_bboxes": cell_bboxes,
+                "cell_geometry_status": [["exact"] * 4, ["exact"] * 4],
+                "row_bands": [
+                    {"index": 0, "y0": 0, "y1": 10},
+                    {"index": 1, "y0": 10, "y1": 30},
+                ],
+                "col_bands": [
+                    {"index": 0, "x0": 0, "x1": 60},
+                    {"index": 1, "x0": 60, "x1": 120},
+                    {"index": 2, "x0": 120, "x1": 220},
+                    {"index": 3, "x0": 220, "x1": 360},
+                ],
+                "cell_spans": [],
+                "cell_evidence_ids": [
+                    [[header_ids[column]] for column in range(4)],
+                    [value_ids, ["value-type"], ["value-number"], ["value-query"]],
+                ],
+                "cell_token_ids": [
+                    [[header_ids[column]] for column in range(4)],
+                    [value_ids, ["value-type"], ["value-number"], ["value-query"]],
+                ],
+            },
+        },
+        headers=[],
+        rows=[],
+        bbox=[0, 0, 360, 30],
+        confidence=0.99,
+    )
+    atoms = [
+        {"id": "header-name", "text": "被查询者姓名", "bbox": [0, 0, 60, 10]},
+        {"id": "header-type", "text": "被查询者证件类型", "bbox": [60, 0, 120, 10]},
+        {"id": "header-number", "text": "被查询者证件号码", "bbox": [120, 0, 220, 10]},
+        {"id": "header-query", "text": "查询机构 查询原因", "bbox": [220, 0, 360, 10]},
+        *[
+            {"id": token_id, "text": text, "bbox": list(bbox)}
+            for text, bbox, token_id in value_tokens
+        ],
+        {"id": "value-type", "text": "身份证", "bbox": [60, 10, 120, 30]},
+        {"id": "value-number", "text": "350121199101285219", "bbox": [120, 10, 220, 30]},
+        {"id": "value-query", "text": "本人 本人查询(自助查询机)", "bbox": [220, 10, 360, 30]},
+    ]
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    return SimpleNamespace(
+        pages=[page],
+        evidence_plane=SimpleNamespace(evidence=SimpleNamespace(text_atoms=atoms)),
+        _personal_detail_extraction_issues=[],
+    )
+
+
+def test_header_exact_tokens_remove_one_tiny_watermark_without_editing_name(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
+    context = _exact_header_token_context(
+        raw_name="P 黄圣辉",
+        value_tokens=(
+            ("P", (2.0, 15.0, 5.0, 23.0), "name-watermark"),
+            ("黄圣辉", (10.0, 14.0, 42.0, 24.0), "name-value"),
+        ),
+    )
+
+    datasets = _extract_header_datasets(context, "报告编号:2025080514473622586957 报告时间:2025.08.05 14:47:36")
+
+    assert datasets["personal_report_metadata"][0]["subject_name"] == "黄圣辉"
+    assert not any(
+        issue.get("field_name") == "subject_name"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_name", "value_tokens"),
+    [
+        (
+            "P 黄圣辉 王",
+            (
+                ("P", (2.0, 15.0, 5.0, 23.0), "name-watermark"),
+                ("黄圣辉", (10.0, 14.0, 42.0, 24.0), "name-value"),
+                ("王", (45.0, 14.0, 55.0, 24.0), "second-name"),
+            ),
+        ),
+        (
+            "黄圣辉 王小明",
+            (
+                ("黄圣辉", (2.0, 14.0, 28.0, 24.0), "name-value"),
+                ("王小明", (30.0, 14.0, 55.0, 24.0), "second-name"),
+            ),
+        ),
+        (
+            "银行 黄圣辉",
+            (
+                ("银行", (2.0, 14.0, 18.0, 24.0), "wide-residue"),
+                ("黄圣辉", (22.0, 14.0, 48.0, 24.0), "name-value"),
+            ),
+        ),
+    ],
+)
+def test_header_subject_name_token_recovery_fails_closed_for_competing_text(
+    monkeypatch,
+    raw_name,
+    value_tokens,
+) -> None:
+    monkeypatch.setattr(PBOCPersonalDetailNativeParser, "records", lambda self, name: [])
+    context = _exact_header_token_context(raw_name=raw_name, value_tokens=value_tokens)
+
+    datasets = _extract_header_datasets(context, "报告编号:2025080514473622586957 报告时间:2025.08.05 14:47:36")
+
+    assert datasets["personal_report_metadata"][0]["subject_name"] is None
+    assert any(
+        issue.get("field_name") == "subject_name"
+        and issue.get("issue_code") == "page_one_consensus_unresolved"
+        for issue in context._personal_detail_extraction_issues
     )
 
 
@@ -1619,7 +3207,15 @@ def test_native_parser_rejects_similarity_only_label_damage() -> None:
             ["AGREEMENT0001", "循环额度", "示例银行股份有限公司"],
         ],
     )
-    page = SimpleNamespace(page_number=1, source_page_number=1, tables=[table])
+    table.bbox = [20, 100, 580, 300]
+    table.metadata["canonical_template_id"] = "credit_agreement"
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="credit_agreement",
+        tables=[table],
+        texts=[SimpleNamespace(content="授信协议1", bbox=[20, 78, 120, 98])],
+    )
     context = SimpleNamespace(
         pages=[page],
         reading_order_by_logical={1: 1},
@@ -2095,7 +3691,15 @@ def test_native_parser_accepts_only_declared_ocr_label_aliases() -> None:
             ["AGREEMENT0001", "循环额度", "示例银行股份有限公司"],
         ],
     )
-    page = SimpleNamespace(page_number=1, source_page_number=1, tables=[table])
+    table.bbox = [20, 100, 580, 300]
+    table.metadata["canonical_template_id"] = "credit_agreement"
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="credit_agreement",
+        tables=[table],
+        texts=[SimpleNamespace(content="授信协议1", bbox=[20, 78, 120, 98])],
+    )
     context = SimpleNamespace(
         pages=[page],
         reading_order_by_logical={1: 1},

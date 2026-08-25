@@ -5,24 +5,319 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
+import docmirror.plugins.bank_statement.style_registry as style_registry
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.mirror_projector import project_mirror
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
-from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
-from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
-from docmirror.plugins.bank_statement.wide_table_recovery import _recover_cross_page_wide_tables
+from docmirror.plugins.bank_statement.extraction_dispatch import (
+    BankExtractionPolicy,
+    BankExtractionRoute,
+)
+from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
+from docmirror.plugins.bank_statement.style_registry import (
+    BankStyleParserRegistry,
+    BankTableCandidate,
+    _candidate_expected_rows,
+    _candidate_sequence_continuity,
+    _select_candidate,
+)
+from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence, _recover_cross_page_wide_tables
+
+
+def _candidate_for_authority_test(
+    candidate_id: str,
+    rows: int,
+    evidence: RowCountEvidence,
+) -> BankTableCandidate:
+    records = [{"normalized": {"date": "2025-01-01", "amount": 1.0, "direction": "income"}}] * rows
+    return BankTableCandidate(
+        candidate_id=candidate_id,
+        records=records,
+        source="native_wide_table",
+        canonical_rows=rows,
+        directional_rows=rows,
+        source_page_rows=rows,
+        expected_rows=evidence,
+        balance_chain_score=0.5,
+        field_completeness=1.0,
+        score=1.0,
+        canonical_coverage=1.0,
+        source_page_coverage=1.0,
+        extraction_confidence=0.9,
+        source_column_width=5.0,
+        sequence_continuity=1.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "complete_page_local_sequences",
+        "ccb_primary_source_sequence",
+        "cmb_primary_source_rows",
+        "native_page_datetime_census",
+        "native_page_signed_ledger_census",
+        "ocr_page_ordinal_census",
+    ],
+)
+def test_short_row_plane_signal_cannot_beat_fuller_candidate(source: str) -> None:
+    short = _candidate_for_authority_test("recovery:short", 4, RowCountEvidence(4, source, 0.99))
+    fuller = _candidate_for_authority_test("parser:full", 5, RowCountEvidence(5, "candidate_rows", 0.55))
+
+    selected, _diagnostics = _select_candidate([short, fuller])
+
+    assert selected is fuller
+
+
+@pytest.mark.parametrize("fuller_route", ["ocr_implicit_table", "positioned_record_block"])
+def test_fuller_candidate_guard_is_route_agnostic(fuller_route: str) -> None:
+    short = replace(
+        _candidate_for_authority_test(
+            "evidence_atom",
+            2,
+            RowCountEvidence(2, "positioned_date_anchors", 0.80),
+        ),
+        sequence_continuity=1.0,
+    )
+    fuller = replace(
+        _candidate_for_authority_test(
+            fuller_route,
+            3,
+            RowCountEvidence(3, "candidate_rows", 0.55),
+        ),
+        sequence_continuity=0.95,
+    )
+
+    selected, _diagnostics = _select_candidate([short, fuller])
+
+    assert selected is fuller
+
+
+def test_fuller_candidate_guard_preserves_materially_richer_shorter_candidate() -> None:
+    short = replace(
+        _candidate_for_authority_test(
+            "evidence_atom",
+            2,
+            RowCountEvidence(2, "positioned_date_anchors", 0.80),
+        ),
+        sequence_continuity=1.0,
+        source_column_width=8.0,
+    )
+    fuller = replace(
+        _candidate_for_authority_test(
+            "ocr_implicit_table",
+            3,
+            RowCountEvidence(3, "candidate_rows", 0.55),
+        ),
+        field_completeness=0.70,
+        sequence_continuity=0.95,
+        source_column_width=6.0,
+    )
+
+    selected, _diagnostics = _select_candidate([short, fuller])
+
+    assert selected is short
+
+
+def _candidate_records_on_pages(rows: int, pages: list[int]) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    for index in range(rows):
+        page = pages[index % len(pages)]
+        records.append(
+            {
+                "normalized": {"date": "2025-01-01", "amount": 1.0, "direction": "income"},
+                "_source": {
+                    "source_page": page,
+                    "page_range": [page, page],
+                    "bbox": [10.0, float(index * 10), 100.0, float(index * 10 + 8)],
+                },
+            }
+        )
+    return records
+
+
+def test_fuller_candidate_can_use_strict_source_page_superset_over_local_balance_score() -> None:
+    short = replace(
+        _candidate_for_authority_test(
+            "native_wide_table:0",
+            4,
+            RowCountEvidence(4, "native_wide_rows", 0.70),
+        ),
+        records=_candidate_records_on_pages(4, [2, 3]),
+        balance_chain_score=0.98,
+        sequence_continuity=1.0,
+        score=0.98,
+    )
+    fuller = replace(
+        _candidate_for_authority_test(
+            "evidence_atom",
+            10,
+            RowCountEvidence(10, "positioned_date_anchors", 0.80),
+        ),
+        records=_candidate_records_on_pages(10, [1, 2, 3, 4, 5]),
+        balance_chain_score=0.50,
+        sequence_continuity=0.0,
+        score=0.88,
+    )
+
+    selected, _diagnostics = _select_candidate([short, fuller])
+
+    assert selected is fuller
+
+
+def test_fuller_candidate_with_same_source_pages_still_needs_semantic_parity() -> None:
+    short = replace(
+        _candidate_for_authority_test(
+            "native_wide_table:0",
+            4,
+            RowCountEvidence(4, "native_wide_rows", 0.70),
+        ),
+        records=_candidate_records_on_pages(4, [1, 2]),
+        balance_chain_score=0.98,
+        sequence_continuity=1.0,
+        score=0.98,
+    )
+    noisier = replace(
+        _candidate_for_authority_test(
+            "evidence_atom",
+            8,
+            RowCountEvidence(8, "positioned_date_anchors", 0.80),
+        ),
+        records=_candidate_records_on_pages(8, [1, 2]),
+        balance_chain_score=0.50,
+        sequence_continuity=0.0,
+        score=0.88,
+    )
+
+    selected, _diagnostics = _select_candidate([short, noisier])
+
+    assert selected is short
+
+
+def _sequenced_source_row(sequence: int, page: int, y: float) -> tuple[dict[str, str], dict[str, object]]:
+    return (
+        {"sequence_no": str(sequence)},
+        {
+            "_source": {
+                "source_page": page,
+                "page_range": [page, page],
+                "bbox": [10.0, y, 100.0, y + 8.0],
+            }
+        },
+    )
+
+
+def test_sequence_continuity_accepts_only_forward_source_order_resets() -> None:
+    rows = [
+        _sequenced_source_row(1, 1, 100.0),
+        _sequenced_source_row(2, 1, 120.0),
+        _sequenced_source_row(1, 2, 80.0),
+        _sequenced_source_row(2, 2, 100.0),
+        _sequenced_source_row(3, 2, 120.0),
+    ]
+
+    assert _candidate_sequence_continuity(
+        [normalized for normalized, _transaction in rows],
+        [transaction for _normalized, transaction in rows],
+    ) == 1.0
+
+
+def test_sequence_continuity_rejects_a_duplicate_plane_page_rewind() -> None:
+    rows = [
+        _sequenced_source_row(1, 1, 100.0),
+        _sequenced_source_row(2, 2, 100.0),
+        _sequenced_source_row(1, 1, 101.0),
+        _sequenced_source_row(2, 2, 101.0),
+    ]
+
+    score = _candidate_sequence_continuity(
+        [normalized for normalized, _transaction in rows],
+        [transaction for _normalized, transaction in rows],
+    )
+
+    assert score == pytest.approx(2 / 3)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "complete_page_local_sequences",
+        "ccb_primary_source_sequence",
+        "cmb_primary_source_rows",
+        "native_page_datetime_census",
+        "native_page_signed_ledger_census",
+        "ocr_page_ordinal_census",
+    ],
+)
+def test_row_plane_signal_is_clamped_below_public_count_authority(source: str) -> None:
+    evidence = _candidate_expected_rows(RowCountEvidence(4, source, 0.99))
+
+    assert evidence == RowCountEvidence(4, source, 0.80)
+
+
+def test_candidate_count_is_not_replaced_by_separate_row_plane_signal() -> None:
+    evidence = _candidate_expected_rows(
+        RowCountEvidence(4, "native_page_datetime_census", 0.99),
+        count=5,
+        source="native_wide_rows",
+        confidence=0.70,
+    )
+
+    assert evidence == RowCountEvidence(5, "native_wide_rows", 0.70)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "positioned_record_blocks",
+        "physical_rows",
+        "positioned_date_anchors",
+        "page_transaction_anchors",
+    ],
+)
+def test_candidate_fallback_row_plane_source_is_clamped_below_authority(source: str) -> None:
+    evidence = _candidate_expected_rows(
+        RowCountEvidence(0, "candidate_rows", 0.55),
+        count=7,
+        source=source,
+        confidence=0.99,
+    )
+
+    assert evidence == RowCountEvidence(7, source, 0.80)
+
+
+@pytest.mark.parametrize(
+    "source,confidence",
+    [
+        ("split_footer", 0.98),
+        ("header_total", 0.94),
+        ("cumulative_footer_total", 0.99),
+        ("page_footer", 0.90),
+    ],
+)
+def test_issuer_count_remains_authoritative_for_candidate_selection(source: str, confidence: float) -> None:
+    complete = _candidate_for_authority_test("recovery:complete", 4, RowCountEvidence(4, source, confidence))
+    extra = _candidate_for_authority_test("parser:extra", 5, RowCountEvidence(4, source, confidence))
+
+    selected, _diagnostics = _select_candidate([complete, extra])
+
+    assert selected is complete
 
 
 def test_builtin_templates_registered():
-    pytest.importorskip("docmirror_enterprise", reason="enterprise package is not available in OSS CI")
-    from docmirror_enterprise.plugins.bank_statement.configs.registry import ensure_builtin_templates, reset_registry
+    registry_module = pytest.importorskip(
+        "docmirror_enterprise.plugins.bank_statement.configs.registry",
+        reason="enterprise bank-statement templates are not available in OSS CI",
+    )
 
-    reset_registry()
-    reg = ensure_builtin_templates()
+    registry_module.reset_registry()
+    reg = registry_module.ensure_builtin_templates()
     ids = {t["template_id"] for t in reg.list_templates()}
     assert "generic" in ids
     assert "icbc_personal_v2022" in ids
@@ -48,6 +343,184 @@ def test_style_registry_extracts_three_transactions_from_clean_table():
     plugin = BankStatementCommunityPlugin()
     records, _ = BankStyleParserRegistry().run(detection, ctx, plugin)
     assert len(records) >= 3
+
+
+def test_preferred_context_tables_exclude_document_acquisition_planes(monkeypatch: pytest.MonkeyPatch) -> None:
+    ctx = StyleContext(
+        tables=[
+            [
+                ["交易日期", "摘要", "收入", "支出", "余额"],
+                ["2024-01-02", "continued", "", "2.00", "7.00"],
+                ["2024-01-03", "continued", "3.00", "", "10.00"],
+            ]
+        ],
+        full_text="document-wide text must stay outside this local continuation batch",
+        institution=None,
+        page_count=14,
+        prefer_context_tables=True,
+    )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("document-wide acquisition ran inside a context-tables-only batch")
+
+    for name in (
+        "recovered_native_datetime_row_evidence",
+        "recover_evidence_atom_bank_tables",
+        "_semantic_text_table_candidates",
+        "collect_physical_tables_from_parse_result",
+        "recover_positioned_record_block_bank_tables",
+        "recover_wide_bank_tables",
+        "recover_ocr_implicit_ledger_tables",
+    ):
+        monkeypatch.setattr(style_registry, name, forbidden)
+
+    candidates = style_registry._collect_table_candidates(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert candidates
+    assert all(candidate.candidate_id.startswith("parser:") for candidate in candidates)
+    assert max(len(candidate.records) for candidate in candidates) == 2
+
+
+def _physical_candidate_parse_result(*, blank_body_geometry: bool = False) -> SimpleNamespace:
+    headers = ["交易日期", "摘要", "收入", "支出", "余额"]
+    values = ["2024-01-02", "工资", "100.00", "", "100.00"]
+    header_boxes = [[float(index * 60), 1.0, float((index + 1) * 60), 10.0] for index in range(5)]
+    body_boxes = (
+        [None] * 5
+        if blank_body_geometry
+        else [
+            [10.0, 20.0, 55.0, 32.0],
+            [55.0, 20.0, 115.0, 32.0],
+            [115.0, 20.0, 175.0, 32.0],
+            [175.0, 20.0, 235.0, 32.0],
+            [235.0, 20.0, 300.0, 32.0],
+        ]
+    )
+    body_evidence = [[], [], [], [], []] if blank_body_geometry else [
+        ["ev:body:date"],
+        ["ev:body:summary"],
+        ["ev:body:income"],
+        [],
+        ["ev:body:balance"],
+    ]
+    cells = [
+        SimpleNamespace(
+            text=value,
+            cleaned=None,
+            bbox=None,
+            evidence_ids=[],
+            source_cell_refs=[],
+        )
+        for value in values
+    ]
+    row = SimpleNamespace(
+        cells=cells,
+        source_page=3,
+        source_physical_id="pt_3_7",
+        source_row_index=4,
+        source_cell_refs=[],
+    )
+    table = SimpleNamespace(
+        headers=headers,
+        rows=[row],
+        table_id="pt_3_7",
+        bbox=[0.0, 0.0, 999.0, 999.0],
+        metadata={
+            "raw_rows": [headers, values],
+            "geometry": {
+                "cell_bboxes": [header_boxes, body_boxes],
+                "cell_evidence_ids": [
+                    [[f"ev:header:{index}"] for index in range(5)],
+                    body_evidence,
+                ],
+            },
+        },
+    )
+    page = SimpleNamespace(page_number=3, source_page_number=3, tables=[table], texts=[])
+    return SimpleNamespace(pages=[page], logical_tables=[], full_text="")
+
+
+def _physical_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    blank_body_geometry: bool = False,
+) -> style_registry.BankTableCandidate:
+    parse_result = _physical_candidate_parse_result(blank_body_geometry=blank_body_geometry)
+    policy = BankExtractionPolicy(
+        route=BankExtractionRoute.DIGITAL,
+        allowed_parser_ids=frozenset(),
+        allow_physical_tables=True,
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+    monkeypatch.setattr(
+        style_registry,
+        "recovered_native_datetime_row_evidence",
+        lambda *_args, **_kwargs: (0, "", 0.0),
+    )
+    monkeypatch.setattr(style_registry, "physical_transaction_row_estimate", lambda _result: 1)
+
+    candidates = style_registry._collect_table_candidates(
+        StyleDetectionResult(primary_style="grid_standard", parser_chain=[]),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    return next(candidate for candidate in candidates if candidate.candidate_id == "physical_table")
+
+
+def test_physical_candidate_attaches_exact_body_row_geometry_and_never_header_geometry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _physical_candidate(monkeypatch)
+
+    assert len(candidate.records) == 1
+    source = candidate.records[0]["_source"]
+    assert source["source"] == "canonical_physical_table"
+    assert source["source_page"] == 3
+    assert source["page_range"] == [3, 3]
+    assert source["table_id"] == "pt_3_7"
+    assert source["source_row_index"] == 4
+    assert source["bbox"] == [10.0, 20.0, 300.0, 32.0]
+    assert source["evidence_ids"] == [
+        "ev:body:date",
+        "ev:body:summary",
+        "ev:body:income",
+        "ev:body:balance",
+    ]
+    assert len(source["source_cell_refs"]) == 5
+    assert {ref["raw_row"] for ref in source["source_cell_refs"]} == {1}
+    assert {ref["row"] for ref in source["source_cell_refs"]} == {4}
+    assert not any(value.startswith("ev:header:") for value in source["evidence_ids"])
+    assert source["bbox"] != [0.0, 0.0, 999.0, 999.0]
+
+
+def test_physical_candidate_blank_row_geometry_keeps_identity_without_borrowing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _physical_candidate(monkeypatch, blank_body_geometry=True)
+
+    assert len(candidate.records) == 1
+    source = candidate.records[0]["_source"]
+    assert source["source"] == "canonical_physical_table"
+    assert source["source_page"] == 3
+    assert source["page_range"] == [3, 3]
+    assert source["table_id"] == "pt_3_7"
+    assert source["source_row_index"] == 4
+    assert "bbox" not in source
+    assert "evidence_ids" not in source
+    assert "source_cell_refs" not in source
 
 
 def test_style_registry_extracts_wide_debit_credit_table_and_skips_footer():

@@ -3,8 +3,13 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
     BusinessUncertaintyRepairCoordinator,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+    PersonalDetailExtractionContext,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
     PersonalDetailOCRCorrectionOverlay,
@@ -18,15 +23,18 @@ def _bad_count(record_id: str, bbox: list[float]) -> dict[str, object]:
         "value": "无法识别",
         "source_refs": [
             {
+                "source": "native_detail_table_cell",
                 "logical_page": 1,
+                "source_page": 1,
                 "bbox": bbox,
+                "evidence_ids": [f"native:{record_id}"],
                 "geometry_scope": "cell",
             }
         ],
     }
 
 
-def test_business_uncertainty_reuses_complete_page_evidence_without_ocr() -> None:
+def test_existing_complete_page_evidence_cannot_materially_correct_its_own_value() -> None:
     coordinator = BusinessUncertaintyRepairCoordinator(SimpleNamespace())
     payload = {"personal_detail_summary_cells": [_bad_count("cell:1", [10, 10, 40, 30])]}
     plan = coordinator.plan(payload, canonical_audit={"unresolved_pages": []})
@@ -42,7 +50,15 @@ def test_business_uncertainty_reuses_complete_page_evidence_without_ocr() -> Non
         source_pages=[
             {
                 "page": 1,
-                "lines": [{"text": "2", "confidence": 0.98, "bbox": [10, 10, 40, 30]}],
+                "source_page": 1,
+                "lines": [
+                    {
+                        "text": "2",
+                        "confidence": 0.98,
+                        "bbox": [10, 10, 40, 30],
+                        "evidence_ids": ["repair:cell:1"],
+                    }
+                ],
             }
         ],
         page_ocr_loader=page_ocr_loader,
@@ -62,7 +78,10 @@ def test_business_uncertainty_reuses_complete_page_evidence_without_ocr() -> Non
     overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
     overlay.install_business_repair_evidence(plan.page_evidence.values(), affected_pages=plan.affected_pages)
     corrected = overlay.correct_business_candidates(payload, stage="candidate_b_final_validation")
-    assert corrected["personal_detail_summary_cells"][0]["value"] == "2"
+    cell = corrected["personal_detail_summary_cells"][0]
+    assert cell["value"] is None
+    assert cell["canonical_raw"]["value"] == "无法识别"
+    assert overlay.audit()["applied_count"] == 0
 
 
 def test_business_uncertainties_are_grouped_into_one_page_ocr_request() -> None:
@@ -152,6 +171,68 @@ def test_structurally_missing_business_record_enters_the_page_repair_plan() -> N
     assert plan.affected_pages == (20,)
     assert plan.uncertainties[0].dataset_name == "credit_accounts"
     assert "candidate_b_unmatched_account_table_suppressed" in plan.uncertainties[0].reason_codes
+
+
+def test_second_source_pass_invalidates_discovery_account_anchor_skeleton(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repaired_page = {
+        "page": 5,
+        "lines": [
+            {
+                "text": "\u8d26\u62376",
+                "bbox": [53.0, 229.0, 73.5, 240.0],
+                "evidence_ids": ["ocr:sp0003:lp0005:0044"],
+            }
+        ],
+    }
+    plan = SimpleNamespace(
+        affected_pages=(5,),
+        page_evidence={5: repaired_page},
+        requires_second_pass=True,
+    )
+
+    class _Coordinator:
+        def __init__(self, _parse_result: object) -> None:
+            pass
+
+        def plan(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
+            return plan
+
+        def resolve_page_evidence(
+            self, candidate: SimpleNamespace, **_kwargs: object
+        ) -> SimpleNamespace:
+            return candidate
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.business_repair."
+        "BusinessUncertaintyRepairCoordinator",
+        _Coordinator,
+    )
+    context = object.__new__(PersonalDetailExtractionContext)
+    context.parse_result = SimpleNamespace()
+    context._personal_detail_extraction_issues = []
+    context._initial_personal_detail_extraction_issues = []
+    context._candidate_b_account_anchor_skeleton_cache = [
+        {"account_id": "credit_account:non_revolving_loan:5"}
+    ]
+    context._cache = {"account_collections": ([{"account_id": "stale"}], [], [])}
+    context._canonical_layout_projection_cache = object()
+    context._pboc_layout_profile_cache = object()
+    context._canonical_entity_context_ready = True
+    context._source_evidence_pages = lambda: []
+    context.full_page_ocr_evidence = lambda *_args, **_kwargs: []
+    context.canonical_layout_audit = lambda: {"unresolved_pages": []}
+
+    assert context.prepare_candidate_b_business_repair({}) is True
+    assert "_candidate_b_account_anchor_skeleton_cache" not in context.__dict__
+    assert context._candidate_b_pre_repair_account_anchor_inventory == (
+        {"account_id": "credit_account:non_revolving_loan:5"},
+    )
+    assert context._cache == {}
+    assert context._canonical_layout_projection_cache is None
+    assert context._pboc_layout_profile_cache is None
+    assert context._business_repair_evidence_by_page == {5: repaired_page}
 
 
 def test_numeric_monthly_status_without_amount_is_withheld_and_explicitly_reported() -> None:

@@ -22,21 +22,32 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from importlib.resources import files
+from math import isfinite
 from typing import Any, Iterable, Mapping
 
 import yaml
 
+from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
+    resolve_exact_page_token_atoms,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+    _canonical_nonmobile_phone,
+)
+
 _DATE_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
 _DATE_LOOSE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[.,/-]?(\d{2})[.,/-](\d{2})(?!\d)")
 _MONTH_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})(?![\d./-])")
-_DATETIME_DIGITS_RE = re.compile(r"(?<!\d)(20\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})\D*(\d{2})(?!\d)")
+_DATETIME_DIGITS_RE = re.compile(
+    r"(20\d{2})[./\-年]?(\d{2})[./\-月]?(\d{2})日?[ T]?(\d{2})[:：]?(\d{2})[:：]?(\d{2})"
+)
+_PAGE_REOCR_EVIDENCE_RE = re.compile(r"^personal_detail_page_reocr:(.+):w\d+$")
 _CN_ID_RE = re.compile(r"^\d{17}[0-9X]$")
 _IDENTITY_NUMBER_TYPE_FIELDS: dict[str, tuple[str, ...]] = {
     "primary_id_number": ("primary_id_type", "id_type", "document_type"),
     "id_number": ("id_type", "primary_id_type", "document_type"),
     "document_number": ("document_type", "primary_id_type", "id_type"),
 }
-_MOBILE_RE = re.compile(r"^1[3-9]\d{9}$")
+_MOBILE_RE = re.compile(r"^1[3-9][0-9]{9}$")
 _ACCOUNT_IDENTIFIER_RE = re.compile(r"^[A-Z0-9-]{8,80}$")
 _AMOUNT_RE = re.compile(r"^-?(?:0|[1-9]\d{0,14})(?:\.\d{1,2})?$")
 _INQUIRY_DATE_LIKE_RE = re.compile(r"20\d{2}(?:[.,/:;-]?\d{1,2}[.,/:;-]\d{1,2}|[.]\d{4})")
@@ -268,6 +279,8 @@ class PersonalDetailCorrectionDecision:
     confidence: float
     source_refs: tuple[dict[str, Any], ...] = ()
     candidates: tuple[str, ...] = ()
+    selected_raw: str = ""
+    selected_acquisition: str = ""
     pack_id: str = "pboc.personal_detail.zh-CN"
     pack_version: int = 1
 
@@ -313,6 +326,21 @@ def _plain_text(value: Any) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).replace("\u200b", "").strip()
 
 
+def _business_glyph_signature(value: Any) -> str:
+    """Return business-bearing glyphs after presentation-only folding.
+
+    Punctuation, whitespace, width, and Latin case are presentation.  Digits,
+    Latin letters, and Han glyphs carry the field value and therefore may not
+    be inserted, deleted, or substituted by a repair candidate normalizer.
+    """
+
+    return "".join(character.upper() for character in _plain_text(value) if character.isalnum())
+
+
+def _normalization_is_presentation_equivalent(original: Any, normalized: Any) -> bool:
+    return _business_glyph_signature(original) == _business_glyph_signature(normalized)
+
+
 def _valid_date(value: str) -> bool:
     try:
         datetime.strptime(value, "%Y-%m-%d")
@@ -346,22 +374,6 @@ def _normalized_date_candidates(value: str) -> list[str]:
     return [candidate for _span, candidate in _normalized_date_candidate_spans(value)]
 
 
-def _short_ascii_date_residue(value: str) -> bool:
-    residue = re.sub(r"\s+", "", value)
-    if not residue:
-        return True
-    return bool(
-        residue.isascii()
-        and len(residue) <= 3
-        and not any(character.isdigit() for character in residue)
-        and sum(character.isalpha() for character in residue) <= 2
-        and all(
-            character.isalpha() or character in r"!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~"
-            for character in residue
-        )
-    )
-
-
 def _one_safe_date_candidate(value: str) -> str | None:
     text = _plain_text(value).replace(",", ".")
     candidates = _normalized_date_candidate_spans(text)
@@ -369,7 +381,7 @@ def _one_safe_date_candidate(value: str) -> str | None:
         return None
     (start, end), candidate = candidates[0]
     residue = text[:start] + text[end:]
-    return candidate if _short_ascii_date_residue(residue) else None
+    return candidate if not residue.strip() else None
 
 
 def _normalize_date(value: str) -> str:
@@ -379,15 +391,10 @@ def _normalize_date(value: str) -> str:
 
 def _normalize_datetime(value: str) -> str:
     text = _plain_text(value).replace(",", ".")
-    match = _DATETIME_DIGITS_RE.search(text)
-    if not match:
-        digits = re.sub(r"\D", "", text)
-        if len(digits) == 14 and digits.startswith("20"):
-            parts = (digits[:4], digits[4:6], digits[6:8], digits[8:10], digits[10:12], digits[12:14])
-        else:
-            return text
-    else:
-        parts = match.groups()
+    match = _DATETIME_DIGITS_RE.fullmatch(text)
+    if match is None:
+        return text
+    parts = match.groups()
     candidate = f"{parts[0]}-{parts[1]}-{parts[2]}T{parts[3]}:{parts[4]}:{parts[5]}+08:00"
     try:
         datetime.fromisoformat(candidate)
@@ -402,7 +409,7 @@ def _normalize_date_or_month(value: str) -> str:
     if len(date_candidates) == 1:
         (start, end), candidate = date_candidates[0]
         residue = text[:start] + text[end:]
-        return candidate if _short_ascii_date_residue(residue) else text
+        return candidate if not residue.strip() else text
     if date_candidates:
         return text
     month_candidates = [
@@ -414,7 +421,7 @@ def _normalize_date_or_month(value: str) -> str:
         return text
     (start, end), candidate = valid_months[0]
     residue = text[:start] + text[end:]
-    return candidate if _short_ascii_date_residue(residue) else text
+    return candidate if not residue.strip() else text
 
 
 def _cn_id_checksum_valid(value: str) -> bool:
@@ -426,47 +433,55 @@ def _cn_id_checksum_valid(value: str) -> bool:
 
 
 def _normalize_identity(value: str) -> str:
-    text = re.sub(r"[\s-]+", "", _plain_text(value)).upper()
-    if _cn_id_checksum_valid(text):
-        return text
-    substitutions = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8"})
-    candidate = text.translate(substitutions)
-    return candidate if _cn_id_checksum_valid(candidate) else text
+    text = _plain_text(value).upper()
+    return text if _cn_id_checksum_valid(text) else _plain_text(value)
 
 
 def _normalize_phone(value: str, *, mobile: bool) -> str:
-    text = _plain_text(value)
-    digits = re.sub(r"\D", "", text)
-    digit_groups = re.findall(r"\d+", text)
-    if len(digit_groups) > 1 and re.search(r"\d\s+\d", text) and len(digits) > 12:
-        # A common table-collapse failure joins a telephone number to a
-        # neighbouring numeric cell.  Flattening that sequence would turn
-        # structure damage into a plausible-looking telephone number.
-        return text
-    if mobile and _MOBILE_RE.fullmatch(digits):
-        return digits
-    if not mobile and 5 <= len(digits) <= 16 and not re.search(r"[A-Za-z\u3400-\u9fff]", text):
-        return digits
-    return text
+    # Phone digits are business data, not a generic Unicode presentation
+    # surface.  In particular, NFKC and zero-width deletion can manufacture a
+    # valid ASCII number from glyphs which were never observed as that number.
+    # Keep the finite phone grammar on the exact source string.
+    text = str(value or "").strip()
+    if mobile:
+        match = re.fullmatch(
+            r"(?:(?:\+?86|0086)[ -]?)?(1[3-9][0-9][ -]?[0-9]{4}[ -]?[0-9]{4})",
+            text,
+        )
+        if match is None:
+            return text
+        return re.sub(r"[ -]", "", match.group(1))
+    canonical = _canonical_nonmobile_phone(value)
+    return (
+        canonical
+        if canonical is not None and re.fullmatch(r"[0-9]{7,16}", canonical)
+        else str(value or "")
+    )
 
 
 def _normalize_identifier(value: str) -> str:
-    text = re.sub(r"[\s:：,，]+", "", _plain_text(value)).upper()
+    text = re.sub(r"\s+", "", _plain_text(value)).upper()
     return text if _ACCOUNT_IDENTIFIER_RE.fullmatch(text) else _plain_text(value)
 
 
 def _normalize_amount(value: str) -> str:
-    text = _plain_text(value).replace("，", ",").replace(",", "")
+    raw = _plain_text(value)
+    text = raw.replace("，", ",").upper()
+    candidate = text
+    if "," in candidate:
+        if not re.fullmatch(
+            r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?",
+            candidate,
+        ):
+            return raw
+        candidate = candidate.replace(",", "")
+    text = candidate
     if re.fullmatch(r"[+-]?0+(?:\.0+)?", text):
         return "0"
     if text.startswith("+"):
         text = text[1:]
     if not _AMOUNT_RE.fullmatch(text):
-        substitutions = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "S": "5", "B": "8"})
-        candidate = text.translate(substitutions)
-        if not _AMOUNT_RE.fullmatch(candidate):
-            return _plain_text(value)
-        text = candidate
+        return raw
     try:
         Decimal(text)
     except InvalidOperation:
@@ -475,18 +490,21 @@ def _normalize_amount(value: str) -> str:
 
 
 def _normalize_nonnegative_integer(value: str, *, allow_placeholder: bool = False) -> str:
-    text = _plain_text(value).replace(",", "").replace("，", "")
+    raw = _plain_text(value)
+    text = raw.replace("，", ",").upper()
     if allow_placeholder and text in _PLACEHOLDERS:
         return text
-    if re.fullmatch(r"\d{1,12}", text):
-        return str(int(text))
+    unit_match = re.fullmatch(r"(.+?)(?:个)?(?:月|期|次|笔|家|户)", text)
+    numeric = unit_match.group(1) if unit_match is not None else text
+    if "," in numeric:
+        if not re.fullmatch(r"\d{1,3}(?:,\d{3})+", numeric):
+            return raw
+        numeric = numeric.replace(",", "")
+    if re.fullmatch(r"\d{1,12}", numeric):
+        return str(int(numeric))
     unit_match = re.fullmatch(r"(\d{1,12})(?:个)?(?:月|期|次|笔|家|户)", text)
     if unit_match:
         return str(int(unit_match.group(1)))
-    substitutions = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "S": "5", "B": "8"})
-    candidate = text.upper().translate(substitutions)
-    if re.fullmatch(r"\d{1,12}", candidate):
-        return str(int(candidate))
     chinese_digits = {
         "〇": "0",
         "零": "0",
@@ -511,11 +529,11 @@ def _normalize_amount_or_placeholder(value: str) -> str:
 
 
 def _normalize_business_enum(value: str, _candidates: Iterable[str]) -> str:
-    return re.sub(r"\s+", "", _plain_text(value)).strip("-_:：,，;；")
+    return re.sub(r"\s+", "", _plain_text(value))
 
 
 def _normalize_summary_business_category(value: str) -> str:
-    text = re.sub(r"\s+", "", _plain_text(value)).strip("-_:：,，;；")
+    text = re.sub(r"\s+", "", _plain_text(value))
     return text
 
 
@@ -582,17 +600,22 @@ def normalize_institution_name(value: str) -> str:
     if matches:
         # OCR debris tends to occur before or after the legal-name span. Prefer
         # the longest suffix-terminated Chinese span and preserve branch names.
-        selected_match = max(matches, key=lambda match: len(match.group(0)))
-        selected = selected_match.group(0)
-        trailing = text[selected_match.end() :]
-        specialized_tail = re.match(
-            r"(?:信用卡中心|个人信贷部|银行卡业务部[（(]牡丹卡中心[）)]|"
-            rf"[A-Za-z0-9\u3400-\u9fff（）()·{re.escape(_INSTITUTION_INTERNAL_DASHES)}]{{1,24}}(?:支行|分行))",
-            trailing,
-        )
-        if specialized_tail:
-            selected += specialized_tail.group(0)
-        text = selected
+        # Expand every legal-root candidate with its immediately following
+        # branch before ranking.  Otherwise a standalone branch span can be
+        # longer than the bank/company root and incorrectly discard that root.
+        expanded: list[str] = []
+        for match in matches:
+            selected = match.group(0)
+            trailing = text[match.end() :]
+            specialized_tail = re.match(
+                r"(?:信用卡中心|个人信贷部|银行卡业务部[（(]牡丹卡中心[）)]|"
+                rf"[A-Za-z0-9\u3400-\u9fff（）()·{re.escape(_INSTITUTION_INTERNAL_DASHES)}]{{1,24}}(?:支行|分行))",
+                trailing,
+            )
+            if specialized_tail:
+                selected += specialized_tail.group(0)
+            expanded.append(selected)
+        text = max(expanded, key=len)
     return text
 
 
@@ -601,17 +624,25 @@ def _normalize_inquiry_line(value: str) -> str:
     text = re.sub(r"(?<=\d)[,:;](?=\d)", ".", text)
     text = re.sub(r"(?<!\d)(20\d{2})[.](\d{2})(\d{2})(?!\d)", r"\1.\2.\3", text)
     text = re.sub(r"(?<!\d)(20\d{2})(\d{2})[.](\d{2})(?!\d)", r"\1.\2.\3", text)
-    for original, corrected in dict(_pack().get("inquiry_reason_substitutions") or {}).items():
-        text = text.replace(str(original), str(corrected))
     return text
+
+
+def _field_local_inquiry_reason_alias(value: str) -> str:
+    """Return only presentation-normalized complete reason-field evidence.
+
+    A finite OCR typo table is still not source authority for a business enum.
+    Material glyph substitutions must remain reviewable unless another
+    immutable acquisition independently observes the canonical value.
+    """
+
+    return _plain_text(value)
 
 
 def _normalize_account_line(value: str) -> str:
-    text = _plain_text(value)
-    for original, corrected in dict(_pack().get("account_label_substitutions") or {}).items():
-        text = text.replace(str(original), str(corrected))
-    text = re.sub(r"^[^\u3400-\u9fff0-9]*[账联][户广尸]\s*(?=\d{1,3}\b)", "账户 ", text)
-    return text
+    # A whole account line contains both labels and individualized values.
+    # Replacing a label-like substring can therefore mutate an institution or
+    # identifier.  Keep only presentation normalization at this boundary.
+    return _plain_text(value)
 
 
 def _is_valid_for_role(value: str, role: str) -> bool:
@@ -619,6 +650,13 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         validate_pboc_field,
     )
 
+    if role in {"institution_name", "employer_name"}:
+        normalized = _normalize_role(value, role)
+        if re.sub(r"\s+", "", normalized) != re.sub(r"\s+", "", _plain_text(value)):
+            # A plausible legal-name substring does not prove that surrounding
+            # source glyphs are debris.  Treat deletion or substitution as an
+            # unresolved observation unless independent page evidence agrees.
+            return False
     contract = validate_pboc_field(value, role)
     if contract.assessed:
         return contract.valid
@@ -668,12 +706,11 @@ def _is_valid_for_role(value: str, role: str) -> bool:
     if role == "mobile_phone":
         return bool(_MOBILE_RE.fullmatch(value))
     if role == "phone":
-        digits = re.sub(r"\D", "", value)
-        if re.search(r"[A-Za-z\u3400-\u9fff]", value):
-            return False
-        if len(re.findall(r"\d+", value)) > 1 and re.search(r"\d\s+\d", value) and len(digits) > 12:
-            return False
-        return 5 <= len(digits) <= 16
+        canonical_phone = _canonical_nonmobile_phone(value)
+        return bool(
+            canonical_phone is not None
+            and re.fullmatch(r"[0-9]{7,16}", canonical_phone)
+        )
     if role == "account_identifier":
         return bool(_ACCOUNT_IDENTIFIER_RE.fullmatch(value))
     if role == "amount":
@@ -791,9 +828,7 @@ def _normalize_role(value: str, role: str) -> str:
     if role == "inquiry_row":
         return _normalize_inquiry_line(value)
     if role == "inquiry_reason":
-        text = _plain_text(value)
-        for original, corrected in dict(_pack().get("inquiry_reason_substitutions") or {}).items():
-            text = text.replace(str(original), str(corrected))
+        text = _field_local_inquiry_reason_alias(value)
         return _normalize_business_enum(text, _VALID_INQUIRY_REASONS)
     if role == "account_line":
         return _normalize_account_line(value)
@@ -815,6 +850,51 @@ def _source_refs(value: Any) -> tuple[dict[str, Any], ...]:
     if not isinstance(value, Iterable) or isinstance(value, (str, bytes, Mapping)):
         return ()
     return tuple(dict(item) for item in value if isinstance(item, dict))
+
+
+def _preserve_canonical_raw(owner: dict[str, Any], field_name: str, raw_value: Any) -> None:
+    """Retain every displaced flat scalar without erasing prior observations."""
+
+    raw_values = owner.setdefault("canonical_raw", {})
+    if not isinstance(raw_values, dict):
+        return
+    if field_name not in raw_values:
+        raw_values[field_name] = raw_value
+        return
+    existing = raw_values[field_name]
+    existing_values = list(existing) if isinstance(existing, (list, tuple)) else [existing]
+    if raw_value in existing_values:
+        return
+    raw_values[field_name] = [*existing_values, raw_value]
+
+
+def _preserve_nested_raw(owner: dict[str, Any], raw_value: Any) -> None:
+    """Retain the immediately displaced nested scalar alongside any prior raw."""
+
+    if "raw" not in owner:
+        owner["raw"] = raw_value
+        return
+    existing = owner.get("raw")
+    existing_values = list(existing) if isinstance(existing, (list, tuple)) else [existing]
+    if raw_value in existing_values:
+        return
+    # ``raw`` is an established scalar in nested value envelopes.  Keep that
+    # compatibility slot intact and place additional displaced observations in
+    # the same append-only canonical-raw plane used by flat records.
+    canonical_raw = owner.get("canonical_raw")
+    if canonical_raw is None or isinstance(canonical_raw, dict):
+        _preserve_canonical_raw(owner, "value", raw_value)
+        return
+    # A malformed pre-existing canonical_raw container must not make an
+    # applied correction erase the current observation.  Preserve both the
+    # malformed audit object and the displaced scalar in a private history.
+    history = owner.get("_ocr_raw_history")
+    history_values = list(history) if isinstance(history, (list, tuple)) else []
+    if history not in (None, []) and not isinstance(history, (list, tuple)):
+        history_values.append(history)
+    if raw_value not in history_values:
+        history_values.append(raw_value)
+    owner["_ocr_raw_history"] = history_values
 
 
 def _summary_cell_role(value: Mapping[str, Any]) -> str | None:
@@ -933,6 +1013,272 @@ def _boxes_associate(
     return tx0 - halo <= center_x <= tx1 + halo and ty0 - halo <= center_y <= ty1 + halo
 
 
+def _candidate_is_contained_by_field_cell(
+    target: tuple[float, float, float, float],
+    candidate: tuple[float, float, float, float],
+) -> bool:
+    """Require candidate-local containment for a missing-field repair.
+
+    The generic page-evidence selector deliberately permits a small OCR halo
+    and row-scale boxes for other repair roles.  A previously blank currency
+    slot needs stronger proof: the selected token's center must be in the
+    canonical value cell and at least half of that token must overlap the cell.
+    """
+
+    tx0, ty0, tx1, ty1 = target
+    cx0, cy0, cx1, cy1 = candidate
+    target_width = tx1 - tx0
+    target_height = ty1 - ty0
+    candidate_width = cx1 - cx0
+    candidate_height = cy1 - cy0
+    if min(target_width, target_height, candidate_width, candidate_height) <= 0.0:
+        return False
+    center_x = (cx0 + cx1) / 2.0
+    center_y = (cy0 + cy1) / 2.0
+    if not (tx0 <= center_x <= tx1 and ty0 <= center_y <= ty1):
+        return False
+    intersection_width = max(0.0, min(tx1, cx1) - max(tx0, cx0))
+    intersection_height = max(0.0, min(ty1, cy1) - max(ty0, cy0))
+    candidate_area = candidate_width * candidate_height
+    return intersection_width * intersection_height / candidate_area >= 0.5
+
+
+def _strict_repair_evidence_ids(value: Any) -> tuple[str, ...] | None:
+    """Return one immutable, non-replayed evidence-ID tuple."""
+
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        for item in value
+    ):
+        return None
+    evidence_ids = tuple(value)
+    return evidence_ids if len(evidence_ids) == len(set(evidence_ids)) else None
+
+
+def _consistent_line_text(value: Mapping[str, Any]) -> tuple[str, bool]:
+    """Return one line value and whether its two textual views conflict."""
+
+    text = str(value.get("text") or "").strip()
+    content = str(value.get("content") or "").strip()
+    if text and content and text != content:
+        return "", False
+    return text or content, True
+
+
+def _page_reocr_acquisition(
+    *,
+    evidence_ids: tuple[str, ...],
+    source: Any,
+    page_key: Any = None,
+    explicit_acquisition: Any = None,
+) -> str | None:
+    """Resolve the existing one-shot page-OCR acquisition identity.
+
+    The page re-OCR lifecycle already emits both the producer source and IDs
+    containing its immutable page key.  Requiring both avoids inventing a
+    caller-controlled trust flag and prevents distinct IDs from one ordinary
+    OCR pass from masquerading as independent evidence.
+    """
+
+    if str(source or "") != "personal_detail_page_reocr_once":
+        return None
+    matches = [_PAGE_REOCR_EVIDENCE_RE.fullmatch(evidence_id) for evidence_id in evidence_ids]
+    if any(match is None for match in matches):
+        return None
+    page_keys = {match.group(1) for match in matches if match is not None}
+    if len(page_keys) != 1:
+        return None
+    observed_page_key = next(iter(page_keys))
+    declared_page_key = str(page_key or "").strip()
+    if declared_page_key and declared_page_key != observed_page_key:
+        return None
+    acquisition = f"personal_detail_page_reocr_once:{observed_page_key}"
+    declared_acquisition = str(explicit_acquisition or "").strip()
+    if declared_acquisition and declared_acquisition != acquisition:
+        return None
+    return acquisition
+
+
+def _target_page_reocr_acquisitions(
+    ref: Mapping[str, Any],
+) -> frozenset[str] | None:
+    """Return one internally consistent target acquisition set.
+
+    ``None`` is a malformed/contradictory contract.  An empty set is a native
+    or sealed target whose acquisition independence must be proved by its
+    immutable store or producer family.
+    """
+
+    evidence_ids = _strict_repair_evidence_ids(ref.get("evidence_ids")) or ()
+    matches = [_PAGE_REOCR_EVIDENCE_RE.fullmatch(evidence_id) for evidence_id in evidence_ids]
+    matched = [match for match in matches if match is not None]
+    explicit = str(ref.get("acquisition_id") or "").strip()
+    source = str(ref.get("source") or "").strip()
+    evidence_plane = str(ref.get("evidence_plane") or "").strip()
+    repair_plane = evidence_plane == "business_repair" or source in {
+        "personal_detail_corrected_page_cell",
+        "personal_detail_installed_page_evidence",
+        "personal_detail_page_reocr_once",
+    }
+    if matched:
+        # A source reference cannot mix ordinary native IDs with re-OCR IDs or
+        # combine observations from distinct page acquisitions.
+        if len(matched) != len(evidence_ids):
+            return None
+        page_keys = {match.group(1) for match in matched}
+        if len(page_keys) != 1 or not repair_plane:
+            return None
+        acquisition = f"personal_detail_page_reocr_once:{next(iter(page_keys))}"
+        if explicit and explicit != acquisition:
+            return None
+        return frozenset({acquisition})
+    if explicit:
+        # An acquisition assertion without IDs from that acquisition is not
+        # source authority, regardless of whether the string looks familiar.
+        return None
+    if repair_plane:
+        # Corrected/re-OCR targets need their original acquisition identity;
+        # sealed containment alone cannot prove that the candidate is distinct.
+        return None
+    return frozenset()
+
+
+def _repair_acquisition_is_independent(
+    ref: Mapping[str, Any],
+    candidate_acquisition: str,
+    *,
+    sealed_target_resolved: bool,
+) -> bool:
+    target_acquisitions = _target_page_reocr_acquisitions(ref)
+    if target_acquisitions is None or not candidate_acquisition:
+        return False
+    if candidate_acquisition in target_acquisitions:
+        return False
+    if target_acquisitions:
+        return True
+    source = str(ref.get("source") or "")
+    evidence_plane = str(ref.get("evidence_plane") or "")
+    if evidence_plane == "business_repair" or source in {
+        "personal_detail_corrected_page_cell",
+        "personal_detail_installed_page_evidence",
+        "personal_detail_page_reocr_once",
+    }:
+        return False
+    if sealed_target_resolved:
+        return True
+    # These producer families are the existing sealed/native acquisition
+    # boundary.  They are source observations, not a caller assertion that a
+    # value should be trusted.
+    return source.startswith(("native_", "sealed_"))
+
+
+def _role_for_field_name(field_name: str) -> str | None:
+    role = _FIELD_ROLES.get(field_name)
+    if role:
+        return role
+    if field_name.endswith("_date") and not field_name.endswith("_date_text"):
+        return "date_or_month"
+    if field_name.endswith("_amount"):
+        return "amount"
+    if field_name.endswith(("_count", "_periods", "_months")):
+        return "nonnegative_integer"
+    return None
+
+
+def _field_name_matches_role(field_name: str, role: str) -> bool:
+    expected = _role_for_field_name(field_name)
+    if expected is None:
+        return True
+    if expected == role:
+        return True
+    return bool(
+        expected == "identity_document_number"
+        and role.startswith("identity_document_number::")
+    )
+
+
+def _sealed_evidence_store_available(owner: Any) -> bool:
+    plane = getattr(owner, "evidence_plane", None)
+    evidence = getattr(plane, "evidence", None)
+    if isinstance(getattr(evidence, "text_atoms", None), list):
+        return True
+    entities = getattr(owner, "entities", None)
+    domain_specific = getattr(entities, "domain_specific", None)
+    return isinstance(domain_specific, Mapping) and isinstance(
+        domain_specific.get("_page_evidence_bundles"),
+        list,
+    )
+
+
+def _exact_repair_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        bbox = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if not all(isfinite(item) for item in bbox):
+        return None
+    return bbox if bbox[2] > bbox[0] and bbox[3] > bbox[1] else None
+
+
+def _exact_repair_target_ref(
+    refs: tuple[dict[str, Any], ...],
+    *,
+    role: str,
+    field_name: str | None,
+) -> dict[str, Any] | None:
+    """Resolve one uniquely owned canonical field cell for page-evidence repair."""
+
+    candidates: list[dict[str, Any]] = []
+    if field_name is not None and not _field_name_matches_role(field_name, role):
+        return None
+    for item in refs:
+        logical_page = item.get("logical_page") or item.get("page")
+        source_page = item.get("source_page")
+        bound_field_name = str(item.get("field_name") or "").strip()
+        bound_roles = tuple(
+            str(item.get(key) or "").strip()
+            for key in ("field_role", "semantic_role", "canonical_role", "role")
+            if str(item.get(key) or "").strip()
+        )
+        if (
+            not isinstance(logical_page, int)
+            or isinstance(logical_page, bool)
+            or logical_page <= 0
+            or not isinstance(source_page, int)
+            or isinstance(source_page, bool)
+            or source_page <= 0
+            or not str(item.get("source") or "").strip()
+            or _exact_repair_bbox(item.get("bbox")) is None
+            or _strict_repair_evidence_ids(item.get("evidence_ids")) is None
+            or _target_page_reocr_acquisitions(item) is None
+            or (
+                bound_field_name
+                and (
+                    (field_name is not None and bound_field_name != field_name)
+                    or (
+                        field_name is None
+                        and not _field_name_matches_role(bound_field_name, role)
+                    )
+                    or not _field_name_matches_role(bound_field_name, role)
+                )
+            )
+            or any(bound_role != role for bound_role in bound_roles)
+            or (
+                item.get("geometry_scope") != "cell"
+                and item.get("binding") != "canonical_field_slot"
+            )
+        ):
+            continue
+        candidates.append(dict(item))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 class PersonalDetailOCRCorrectionOverlay:
     """Schema-aware corrected view over one sealed personal report.
 
@@ -1047,6 +1393,8 @@ class PersonalDetailOCRCorrectionOverlay:
         confidence: float,
         refs: tuple[dict[str, Any], ...],
         candidates: tuple[str, ...] = (),
+        selected_raw: str = "",
+        selected_acquisition: str = "",
         action: str = "applied",
     ) -> PersonalDetailCorrectionDecision:
         marker = (role, original, corrected, repr(refs))
@@ -1062,6 +1410,8 @@ class PersonalDetailOCRCorrectionOverlay:
             confidence=max(0.0, min(1.0, float(confidence))),
             source_refs=refs,
             candidates=candidates,
+            selected_raw=selected_raw,
+            selected_acquisition=selected_acquisition,
             pack_id=str(_pack().get("pack_id") or "pboc.personal_detail.zh-CN"),
             pack_version=int(_pack().get("version") or 1),
         )
@@ -1075,12 +1425,25 @@ class PersonalDetailOCRCorrectionOverlay:
         value: Any,
         *,
         role: str,
+        field_name: str | None = None,
         source_refs: Iterable[dict[str, Any]] = (),
         confidence: float | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision | None]:
         original = str(value or "")
         refs = _source_refs(source_refs)
         corrected = _normalize_role(original, role)
+        destructive_business_normalization = bool(
+            role in {"institution_name", "employer_name"}
+            and re.sub(r"\s+", "", corrected) != re.sub(r"\s+", "", _plain_text(original))
+        )
+        if destructive_business_normalization:
+            repaired = self._repair_from_installed_page_evidence(
+                original,
+                role=role,
+                field_name=field_name,
+                refs=refs,
+            )
+            return repaired if repaired is not None else (original, None)
         if corrected != original and _is_valid_for_role(corrected, role):
             return corrected, self._record(
                 role=role,
@@ -1092,35 +1455,61 @@ class PersonalDetailOCRCorrectionOverlay:
                 refs=refs,
             )
         if not _is_valid_for_role(corrected, role):
-            repaired = self._repair_from_installed_page_evidence(original, role=role, refs=refs)
+            repaired = self._repair_from_installed_page_evidence(
+                original,
+                role=role,
+                field_name=field_name,
+                refs=refs,
+            )
             if repaired is not None:
                 return repaired
         return original, None
+
+    def _sealed_target_resolution(
+        self,
+        ref: Mapping[str, Any],
+        *,
+        logical_page: int,
+    ) -> tuple[bool, bool]:
+        """Return ``(admissible, resolved)`` for one immutable target cell."""
+
+        if not _sealed_evidence_store_available(self.parse_result):
+            return True, False
+        target = _exact_repair_bbox(ref.get("bbox"))
+        resolved = resolve_exact_page_token_atoms(
+            self.parse_result,
+            _strict_repair_evidence_ids(ref.get("evidence_ids")) or (),
+            logical_page=logical_page,
+        )
+        if (
+            target is None
+            or resolved is None
+            or any(
+                not _candidate_is_contained_by_field_cell(target, atom_bbox)
+                for _text, atom_bbox, _token_id in resolved
+            )
+        ):
+            return False, False
+        return True, True
 
     def _repair_from_installed_page_evidence(
         self,
         original: str,
         *,
         role: str,
+        field_name: str | None,
         refs: tuple[dict[str, Any], ...],
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
-        ref = next(
-            (
-                item
-                for item in refs
-                if isinstance(item.get("bbox"), (list, tuple))
-                and len(item["bbox"]) == 4
-                and int(item.get("logical_page") or item.get("page") or 0) > 0
-                and (
-                    item.get("geometry_scope") == "cell"
-                    or item.get("binding") == "canonical_field_slot"
-                )
-            ),
-            None,
-        )
+        ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
         if ref is None:
             return None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
+        target_admissible, sealed_target_resolved = self._sealed_target_resolution(
+            ref,
+            logical_page=logical_page,
+        )
+        if not target_admissible:
+            return None
         evidence = self._repair_evidence_by_page.get(logical_page)
         if evidence is None:
             return None
@@ -1128,9 +1517,11 @@ class PersonalDetailOCRCorrectionOverlay:
         return self._repair_from_page_evidence(
             original,
             role=role,
+            field_name=field_name,
             ref=ref,
             refs=refs,
             page=evidence,
+            sealed_target_resolved=sealed_target_resolved,
         )
 
     def _repair_from_page_evidence(
@@ -1138,52 +1529,277 @@ class PersonalDetailOCRCorrectionOverlay:
         original: str,
         *,
         role: str,
+        field_name: str | None,
         ref: dict[str, Any],
         refs: tuple[dict[str, Any], ...],
         page: Mapping[str, Any],
+        sealed_target_resolved: bool,
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         """Select a typed value from already-acquired complete-page evidence."""
-        target = tuple(float(item) for item in ref.get("bbox") or ())
-        if len(target) != 4:
+        selection = self._select_page_evidence_candidate(
+            role=role,
+            ref=ref,
+            page=page,
+            sealed_target_resolved=sealed_target_resolved,
+        )
+        if selection is None:
             return None
-        candidates: list[tuple[float, str]] = []
-        selected: list[tuple[float, float, str, float]] = []
-        for line in page.get("lines") or ():
-            if not isinstance(line, dict):
-                continue
-            bbox = line.get("bbox")
-            text = str(line.get("text") or line.get("content") or "").strip()
-            if not text or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-                continue
-            candidate_box = tuple(float(item) for item in bbox)
-            if not _boxes_associate(target, candidate_box):
-                continue
-            confidence = float(line.get("confidence") or 0.0)
-            selected.append((candidate_box[1], candidate_box[0], text, confidence))
-            normalized = _normalize_role(text, role)
-            if _is_valid_for_role(normalized, role):
-                candidates.append((confidence, normalized))
-        if selected:
-            joined = " ".join(item[2] for item in sorted(selected))
-            normalized = _normalize_role(joined, role)
-            if _is_valid_for_role(normalized, role):
-                candidates.append((min(item[3] for item in selected), normalized))
-        valid = sorted(candidates, reverse=True)
-        if not valid or valid[0][0] < 0.72:
+        selected = str(selection["normalized"])
+        selected_ref = selection.get("source_ref")
+        if not isinstance(selected_ref, dict):
             return None
-        if len(valid) > 1 and valid[0][1] != valid[1][1] and valid[0][0] - valid[1][0] < 0.08:
-            return None
-        selected = valid[0][1]
+        if field_name is not None:
+            selected_ref = {**selected_ref, "field_name": field_name}
         return selected, self._record(
             role=role,
             original=original,
             corrected=selected,
             method="schema_bound_page_evidence_reparse",
-            reason_codes=("business_uncertainty_trigger", "schema_role_validation", "candidate_margin"),
-            confidence=valid[0][0],
-            refs=refs,
-            candidates=tuple(dict.fromkeys(value for _score, value in valid)),
+            reason_codes=(
+                "business_uncertainty_trigger",
+                "schema_role_validation",
+                "exact_repair_candidate_source_ref",
+                "unique_source_bound_candidate",
+            ),
+            confidence=float(selection["confidence"]),
+            refs=(dict(ref), dict(selected_ref)),
+            candidates=tuple(selection["candidates"]),
+            selected_raw=str(selection["raw"]),
+            selected_acquisition=str(selection["acquisition"]),
         )
+
+    @staticmethod
+    def _select_page_evidence_candidate(
+        *,
+        role: str,
+        ref: Mapping[str, Any],
+        page: Mapping[str, Any],
+        sealed_target_resolved: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return one uniquely source-bound typed candidate and its OCR evidence."""
+
+        target = _exact_repair_bbox(ref.get("bbox"))
+        target_evidence_ids = _strict_repair_evidence_ids(ref.get("evidence_ids"))
+        logical_page = page.get("page")
+        declared_logical_page = page.get("logical_page")
+        source_page = page.get("source_page")
+        page_key = str(page.get("page_key") or "").strip()
+        page_acquisition = str(page.get("acquisition_id") or "").strip()
+        target_coordinate_system = str(ref.get("coordinate_system") or "").strip()
+        page_coordinate_system = str(page.get("coordinate_system") or "").strip()
+        if (
+            target is None
+            or target_evidence_ids is None
+            or not isinstance(logical_page, int)
+            or isinstance(logical_page, bool)
+            or logical_page != int(ref.get("logical_page") or ref.get("page") or 0)
+            or (
+                declared_logical_page is not None
+                and (
+                    not isinstance(declared_logical_page, int)
+                    or isinstance(declared_logical_page, bool)
+                    or declared_logical_page != logical_page
+                )
+            )
+            or not isinstance(source_page, int)
+            or isinstance(source_page, bool)
+            or source_page <= 0
+            or source_page != int(ref.get("source_page") or 0)
+            or (
+                target_coordinate_system
+                and page_coordinate_system
+                and target_coordinate_system != page_coordinate_system
+            )
+        ):
+            return None
+
+        page_lines = page.get("lines")
+        if not isinstance(page_lines, (list, tuple)) or any(
+            not isinstance(line, Mapping) for line in page_lines
+        ):
+            return None
+        raw_lines = [dict(line) for line in page_lines]
+        evidence_counts: Counter[str] = Counter()
+        line_evidence: dict[int, tuple[str, ...]] = {}
+        line_text: dict[int, str] = {}
+        line_acquisitions: dict[int, str] = {}
+        for index, line in enumerate(raw_lines):
+            evidence_ids = _strict_repair_evidence_ids(line.get("evidence_ids"))
+            text, text_is_consistent = _consistent_line_text(line)
+            declared_acquisitions = {
+                value
+                for value in (
+                    page_acquisition,
+                    str(line.get("acquisition_id") or "").strip(),
+                )
+                if value
+            }
+            if evidence_ids is None or not text_is_consistent or len(declared_acquisitions) > 1:
+                return None
+            acquisition = _page_reocr_acquisition(
+                evidence_ids=evidence_ids,
+                source=line.get("source"),
+                page_key=page_key,
+                explicit_acquisition=(
+                    next(iter(declared_acquisitions)) if declared_acquisitions else None
+                ),
+            )
+            if acquisition is None:
+                return None
+            line_evidence[index] = evidence_ids
+            line_text[index] = text
+            line_acquisitions[index] = acquisition
+            evidence_counts.update(evidence_ids)
+        if len(set(line_acquisitions.values())) != 1:
+            return None
+
+        candidates: list[dict[str, Any]] = []
+        associated: list[dict[str, Any]] = []
+        for index, line in enumerate(raw_lines):
+            candidate_box = _exact_repair_bbox(line.get("bbox"))
+            if (
+                candidate_box is None
+                or not _candidate_is_contained_by_field_cell(target, candidate_box)
+            ):
+                continue
+            text = line_text[index]
+            if not text:
+                continue
+            evidence_ids = line_evidence[index]
+            if (
+                any(evidence_counts[evidence_id] != 1 for evidence_id in evidence_ids)
+                or set(evidence_ids) & set(target_evidence_ids)
+            ):
+                return None
+            try:
+                confidence = float(line.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                return None
+            if not isfinite(confidence):
+                return None
+            acquisition = line_acquisitions[index]
+            associated.append(
+                {
+                    "top": candidate_box[1],
+                    "left": candidate_box[0],
+                    "raw": text,
+                    "confidence": confidence,
+                    "bbox": candidate_box,
+                    "evidence_ids": evidence_ids,
+                    "source": str(line.get("source") or ""),
+                    "acquisition": acquisition,
+                }
+            )
+            normalized = _normalize_role(text, role)
+            if (
+                acquisition is not None
+                and _normalization_is_presentation_equivalent(text, normalized)
+                and _is_valid_for_role(normalized, role)
+            ):
+                candidates.append(
+                    {
+                        "confidence": confidence,
+                        "normalized": normalized,
+                        "raw": text,
+                        "bbox": candidate_box,
+                        "evidence_ids": evidence_ids,
+                        "source": str(line.get("source") or ""),
+                        "acquisition": acquisition,
+                    }
+                )
+        if len(associated) > 1:
+            ordered = sorted(
+                associated,
+                key=lambda item: (float(item["top"]), float(item["left"])),
+            )
+            joined = " ".join(str(item["raw"]) for item in ordered)
+            normalized = _normalize_role(joined, role)
+            acquisitions = {
+                str(item["acquisition"])
+                for item in ordered
+                if item.get("acquisition")
+            }
+            if (
+                len(acquisitions) == 1
+                and all(item.get("acquisition") for item in ordered)
+                and _normalization_is_presentation_equivalent(joined, normalized)
+                and _is_valid_for_role(normalized, role)
+            ):
+                boxes = [tuple(item["bbox"]) for item in ordered]
+                joined_bbox = (
+                    min(box[0] for box in boxes),
+                    min(box[1] for box in boxes),
+                    max(box[2] for box in boxes),
+                    max(box[3] for box in boxes),
+                )
+                if not _candidate_is_contained_by_field_cell(target, joined_bbox):
+                    return None
+                candidates.append(
+                    {
+                        "confidence": min(float(item["confidence"]) for item in ordered),
+                        "normalized": normalized,
+                        "raw": joined,
+                        "bbox": joined_bbox,
+                        "evidence_ids": tuple(
+                            dict.fromkeys(
+                                evidence_id
+                                for item in ordered
+                                for evidence_id in item["evidence_ids"]
+                            )
+                        ),
+                        "source": "personal_detail_page_reocr_once",
+                        "acquisition": next(iter(acquisitions)),
+                    }
+                )
+        exact_candidates = {
+            (
+                str(candidate["normalized"]),
+                str(candidate["raw"]),
+                tuple(candidate["bbox"]),
+                tuple(candidate["evidence_ids"]),
+            ): candidate
+            for candidate in candidates
+        }
+        if len(exact_candidates) != 1:
+            return None
+        selected = dict(next(iter(exact_candidates.values())))
+        associated_evidence_ids = {
+            evidence_id
+            for item in associated
+            for evidence_id in item["evidence_ids"]
+        }
+        if set(selected["evidence_ids"]) != associated_evidence_ids:
+            # A valid substring cannot discard another exact observation in
+            # the same canonical field cell as unowned residue.
+            return None
+        if not _repair_acquisition_is_independent(
+            ref,
+            str(selected.get("acquisition") or ""),
+            sealed_target_resolved=sealed_target_resolved,
+        ):
+            return None
+        if float(selected["confidence"]) < 0.72:
+            return None
+        coordinate_system = str(page.get("coordinate_system") or ref.get("coordinate_system") or "").strip()
+        selected_ref: dict[str, Any] = {
+            "source": "personal_detail_installed_page_evidence",
+            "logical_page": logical_page,
+            "source_page": source_page,
+            "bbox": list(selected["bbox"]),
+            "evidence_ids": list(selected["evidence_ids"]),
+            "geometry_scope": "token_band",
+            "geometry_status": "exact",
+            "binding": "canonical_field_slot_repair_candidate",
+            "binding_quality": "exact_source_bound_candidate",
+            "raw_text": str(selected["raw"]),
+            "producer_source": str(selected["source"]),
+            "acquisition_id": str(selected["acquisition"]),
+        }
+        if coordinate_system:
+            selected_ref["coordinate_system"] = coordinate_system
+        selected["source_ref"] = selected_ref
+        selected["candidates"] = (str(selected["normalized"]),)
+        return selected
 
     @staticmethod
     def _line_role(text: str) -> str | None:
@@ -1204,7 +1820,10 @@ class PersonalDetailOCRCorrectionOverlay:
             corrected_lines: list[dict[str, Any]] = []
             for raw_line in page.get("lines") or []:
                 line = dict(raw_line)
-                original = str(line.get("text") or line.get("content") or "")
+                original, text_is_consistent = _consistent_line_text(line)
+                if not text_is_consistent:
+                    corrected_lines.append(line)
+                    continue
                 role = self._line_role(original)
                 if role:
                     corrected, decision = self.correct_text(
@@ -1232,14 +1851,272 @@ class PersonalDetailOCRCorrectionOverlay:
             corrected_pages.append(page)
         return corrected_pages
 
+    @staticmethod
+    def _missing_account_currency_ref(
+        record: Mapping[str, Any],
+        values: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Return one proved blank account-currency value-slot reference."""
+
+        aliases = {"currency", "account_currency", "reporting_amount_currency"}
+        owners = (values, record) if values is not record else (record,)
+        unresolved = {
+            str(field_name)
+            for owner in owners
+            for field_name in owner.get("_unresolved_fields") or ()
+        }
+        invalid = {
+            str(field_name)
+            for owner in owners
+            for field_name in owner.get("_invalid_observation_fields") or ()
+        }
+        conflicts = {
+            str(field_name)
+            for owner in owners
+            for field_name in owner.get("_reported_field_conflicts") or ()
+        }
+        source_absent = {
+            str(field_name)
+            for owner in owners
+            for field_name in owner.get("_source_absent_fields") or ()
+        }
+        if (
+            not aliases.intersection(unresolved)
+            or not aliases.intersection(invalid)
+            or aliases.intersection(conflicts)
+            or aliases.intersection(source_absent)
+        ):
+            return None
+
+        raw_observed = False
+        raw_items: list[Any] = []
+        for owner in owners:
+            canonical_raw = owner.get("canonical_raw")
+            if not isinstance(canonical_raw, Mapping):
+                continue
+            for alias in aliases:
+                if alias not in canonical_raw:
+                    continue
+                raw_observed = True
+                raw = canonical_raw.get(alias)
+                raw_items.extend(raw if isinstance(raw, list) else (raw,))
+        if not raw_observed or any(str(item or "").strip() for item in raw_items):
+            # This recovery is only for a blank/unreadable exact slot.  Invalid
+            # prose and unsupported printed tokens remain explicit failures.
+            return None
+
+        refs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for owner in owners:
+            refs_by_field = owner.get("source_refs_by_field")
+            if not isinstance(refs_by_field, Mapping):
+                continue
+            for alias in aliases:
+                for raw_ref in refs_by_field.get(alias) or ():
+                    if not isinstance(raw_ref, Mapping):
+                        continue
+                    ref = dict(raw_ref)
+                    marker = repr(sorted(ref.items(), key=lambda item: str(item[0])))
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    bbox = ref.get("bbox")
+                    try:
+                        exact_bbox = (
+                            tuple(float(item) for item in bbox)
+                            if isinstance(bbox, (list, tuple)) and len(bbox) == 4
+                            else ()
+                        )
+                    except (TypeError, ValueError):
+                        exact_bbox = ()
+                    row = ref.get("row")
+                    label_row = ref.get("canonical_label_row")
+                    value_row = ref.get("canonical_value_row")
+                    bound_field_name = str(ref.get("field_name") or "").strip()
+                    bound_roles = tuple(
+                        str(ref.get(key) or "").strip()
+                        for key in (
+                            "field_role",
+                            "semantic_role",
+                            "canonical_role",
+                            "role",
+                        )
+                        if str(ref.get(key) or "").strip()
+                    )
+                    if (
+                        str(ref.get("source") or "") != "native_detail_table_cell"
+                        or str(ref.get("binding") or "") != "canonical_field_slot"
+                        or str(ref.get("binding_quality") or "")
+                        != "canonical_header_column"
+                        or str(ref.get("field_slot_role") or "") != "value"
+                        or (bound_field_name and bound_field_name not in aliases)
+                        or any(bound_role != "currency" for bound_role in bound_roles)
+                        or not exact_bbox
+                        or not all(isfinite(item) for item in exact_bbox)
+                        or int(ref.get("logical_page") or 0) <= 0
+                        or not isinstance(row, int)
+                        or not isinstance(label_row, int)
+                        or not isinstance(value_row, int)
+                        or row != value_row
+                        or label_row >= value_row
+                        or _strict_repair_evidence_ids(ref.get("evidence_ids")) is None
+                        or _target_page_reocr_acquisitions(ref) is None
+                    ):
+                        continue
+                    refs.append(ref)
+        return refs[0] if len(refs) == 1 else None
+
+    def _recover_missing_account_currencies(
+        self,
+        payload: dict[str, Any],
+        *,
+        stage: str,
+    ) -> None:
+        """Recover only blank exact account-currency slots from installed evidence."""
+
+        if stage != "candidate_b_final_validation":
+            return
+        accounts = payload.get("credit_accounts")
+        if not isinstance(accounts, list):
+            return
+        for record in accounts:
+            if not isinstance(record, dict):
+                continue
+            normalized = record.get("normalized")
+            values = normalized if isinstance(normalized, dict) else record
+            if any(
+                values.get(field_name) not in (None, "")
+                for field_name in (
+                    "currency",
+                    "account_currency",
+                    "reporting_amount_currency",
+                )
+            ):
+                continue
+            ref = self._missing_account_currency_ref(record, values)
+            if ref is None:
+                continue
+            logical_page = int(ref.get("logical_page") or 0)
+            target_admissible, sealed_target_resolved = self._sealed_target_resolution(
+                ref,
+                logical_page=logical_page,
+            )
+            if not target_admissible:
+                continue
+            page = self._repair_evidence_by_page.get(logical_page)
+            if page is None:
+                continue
+            self._repair_evidence_reparse_attempts += 1
+            selection = self._select_page_evidence_candidate(
+                role="currency",
+                ref=ref,
+                page=page,
+                sealed_target_resolved=sealed_target_resolved,
+            )
+            if (
+                selection is None
+                or not selection.get("evidence_ids")
+            ):
+                continue
+            try:
+                target_bbox = tuple(float(item) for item in ref.get("bbox") or ())
+                candidate_bbox = tuple(float(item) for item in selection.get("bbox") or ())
+            except (TypeError, ValueError):
+                continue
+            if (
+                len(target_bbox) != 4
+                or len(candidate_bbox) != 4
+                or not all(isfinite(item) for item in (*target_bbox, *candidate_bbox))
+                or not _candidate_is_contained_by_field_cell(
+                    target_bbox,
+                    candidate_bbox,
+                )
+            ):
+                continue
+            from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+                _currency_token,
+            )
+
+            currency_codes: set[str] = set()
+            candidates_are_exact = True
+            for candidate in selection.get("candidates") or ():
+                currency_code, residue, resolution = _currency_token(candidate)
+                if currency_code is None or residue or resolution != "exact":
+                    candidates_are_exact = False
+                    break
+                currency_codes.add(currency_code)
+            if not candidates_are_exact or len(currency_codes) != 1:
+                continue
+            currency = next(iter(currency_codes))
+            raw_currency = str(selection["raw"])
+            corrected_ref: dict[str, Any] = {
+                "source": "personal_detail_corrected_page_cell",
+                "logical_page": logical_page,
+                "source_page": int(
+                    page.get("source_page")
+                    or ref.get("source_page")
+                    or logical_page
+                ),
+                "bbox": list(selection["bbox"]),
+                "geometry_scope": "cell",
+                "evidence_ids": list(selection["evidence_ids"]),
+                "binding": "canonical_field_slot",
+                "binding_quality": "canonical_field_slot",
+                "field_slot_role": "value",
+                "evidence_plane": "business_repair",
+                "raw_text": raw_currency,
+                "producer_source": str(selection.get("source") or ""),
+                "acquisition_id": str(selection.get("acquisition") or ""),
+            }
+            coordinate_system = ref.get("coordinate_system")
+            if isinstance(coordinate_system, str) and coordinate_system.strip():
+                corrected_ref["coordinate_system"] = coordinate_system.strip()
+
+            provenance = record if values is not record else values
+            refs_by_field = provenance.setdefault("source_refs_by_field", {})
+            for field_name in (
+                "currency",
+                "account_currency",
+                "reporting_amount_currency",
+            ):
+                values[field_name] = currency
+                if values is not record:
+                    # Candidate wrappers retain flat compatibility slots beside
+                    # ``normalized``.  Keep them synchronized so a stale null
+                    # or pre-repair value cannot override the canonical view in
+                    # a downstream Community projection.
+                    record[field_name] = currency
+                _preserve_canonical_raw(provenance, field_name, raw_currency)
+                field_ref = {**corrected_ref, "field_name": field_name}
+                field_refs = refs_by_field.setdefault(field_name, [])
+                if field_ref not in field_refs:
+                    field_refs.append(field_ref)
+            self._record(
+                role="currency",
+                original="",
+                corrected=currency,
+                method="schema_bound_missing_account_currency_reparse",
+                reason_codes=(
+                    "exact_blank_account_currency_value_slot",
+                    "coordinator_installed_page_evidence",
+                    "unique_finite_currency_candidate",
+                    "candidate_margin",
+                ),
+                confidence=float(selection["confidence"]),
+                refs=(ref, {**corrected_ref, "field_name": "currency"}),
+                candidates=(currency,),
+                selected_raw=raw_currency,
+                selected_acquisition=str(selection.get("acquisition") or ""),
+            )
+
     def correct_business_candidates(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
         corrected = deepcopy(dict(payload))
         # Institution names are individualized values.  Repetition elsewhere
         # in the report is not evidence for this cell; only the same canonical
         # field slot on the one-shot page observation may correct it.
+        self._recover_missing_account_currencies(corrected, stage=stage)
         self._walk(corrected, parent="", refs=(), stage=stage)
         self._enforce_cross_field_contracts(corrected, stage=stage)
-        self._promote_account_identifier_candidates(corrected)
         return corrected
 
     def enforce_cross_field_contracts(self, payload: Mapping[str, Any], *, stage: str) -> dict[str, Any]:
@@ -1567,10 +2444,12 @@ class PersonalDetailOCRCorrectionOverlay:
                 updated, decision = self.correct_text(
                     item,
                     role=role,
+                    field_name=str(key),
                     source_refs=field_refs,
                     confidence=float(confidence or 0.0),
                 )
                 if decision is not None:
+                    _preserve_canonical_raw(value, str(key), item)
                     value[key] = updated
                 final_value = value[key]
                 valid = _is_valid_for_role(str(final_value), role)
@@ -1611,7 +2490,7 @@ class PersonalDetailOCRCorrectionOverlay:
                     and normalize_institution_name(str(item["value"]))
                     == re.sub(r"\s+", "", _plain_text(item["value"])).strip("-_:：,，;；")
                 ):
-                    item.setdefault("raw", item["value"])
+                    _preserve_nested_raw(item, item["value"])
                     final_value = item["value"]
                     item["value"] = None
                     self._audit_cell(
@@ -1635,11 +2514,12 @@ class PersonalDetailOCRCorrectionOverlay:
                 updated, decision = self.correct_text(
                     item["value"],
                     role=role,
+                    field_name=str(key),
                     source_refs=nested_refs,
                     confidence=float(item.get("confidence") or confidence or 0.0),
                 )
                 if decision is not None:
-                    item.setdefault("raw", item["value"])
+                    _preserve_nested_raw(item, item["value"])
                     item["value"] = updated
                 final_value = item["value"]
                 valid = _is_valid_for_role(str(final_value), role)
@@ -1655,7 +2535,7 @@ class PersonalDetailOCRCorrectionOverlay:
                     )
                 )
                 if withhold_invalid:
-                    item.setdefault("raw", final_value)
+                    _preserve_nested_raw(item, final_value)
                     item["value"] = None
                 self._audit_cell(
                     stage=stage,
@@ -1675,39 +2555,6 @@ class PersonalDetailOCRCorrectionOverlay:
                 and not str(key).startswith("_")
             ):
                 self._walk(item, parent=field_path, refs=local_refs, stage=stage)
-
-    def _promote_account_identifier_candidates(self, payload: dict[str, Any]) -> None:
-        accounts = payload.get("credit_accounts")
-        if not isinstance(accounts, list):
-            return
-        for account in accounts:
-            if not isinstance(account, dict) or account.get("account_identifier"):
-                continue
-            raw_candidates = account.get("account_identifier_candidates")
-            if not isinstance(raw_candidates, list):
-                continue
-            candidates = tuple(
-                dict.fromkeys(
-                    normalized
-                    for item in raw_candidates
-                    if (normalized := _normalize_identifier(str(item or "")))
-                    and _is_valid_for_role(normalized, "account_identifier")
-                )
-            )
-            if len(candidates) != 1:
-                continue
-            account["account_identifier"] = candidates[0]
-            self._record(
-                role="account_identifier",
-                original="",
-                corrected=candidates[0],
-                method="unique_typed_candidate",
-                reason_codes=("missing_typed_field", "single_valid_candidate", "identifier_character_set"),
-                confidence=float(account.get("confidence") or 0.9),
-                refs=_source_refs(account.get("source_refs")),
-                candidates=candidates,
-            )
-
 
 __all__ = [
     "PersonalDetailCorrectionDecision",

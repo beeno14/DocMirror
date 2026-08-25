@@ -33,15 +33,14 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
         pytest.skip("叶永燕 personal detailed report fixture is unavailable")
 
     audit_dir = os.environ.get("DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
-    cached_payload = Path(audit_dir or "") / f"{_FIXTURE.stem}.community.json" if audit_dir else None
-    if cached_payload is not None and cached_payload.exists():
+    if audit_dir:
+        audit_directory = Path(audit_dir)
+        cached_payload = audit_directory / f"{_FIXTURE.stem}.community.json"
+        cached_semantic = audit_directory / f"{_FIXTURE.stem}.semantic.json"
+        assert cached_payload.is_file(), cached_payload
+        assert cached_semantic.is_file(), cached_semantic
         payload = json.loads(cached_payload.read_text(encoding="utf-8"))
-        semantic = {
-            "domain": {
-                "data_dictionary": personal_detail_data_dictionary(),
-                "extensions": personal_detail_semantic_extensions(),
-            }
-        }
+        semantic = json.loads(cached_semantic.read_text(encoding="utf-8"))
     else:
         sealed = asyncio.run(
             perceive_document(
@@ -61,6 +60,7 @@ def test_ye_yongyan_personal_detail_schema_contract() -> None:
 
     assert payload["document"]["type"] == "personal_credit_report_detailed"
     assert validate_projection_payload("community", payload).valid
+    assert validate_projection_payload("community_semantic", semantic).valid
     domain_validation = validate_projection_payload("personal_credit_report_detailed", payload)
     status_counts = {
         row["normalized"]["dataset_name"]: row["normalized"]["observed_row_count"]

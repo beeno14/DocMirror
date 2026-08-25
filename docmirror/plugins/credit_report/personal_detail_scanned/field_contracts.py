@@ -16,6 +16,10 @@ from docmirror.plugins.credit_report.currency_codes import (
     CURRENCY_CODE_BY_ALIAS,
     ISO_4217_CURRENT_CODES,
 )
+from docmirror.plugins.credit_report.pboc_vocabularies import (
+    PBOC_INQUIRY_REASON_FORMS,
+    is_pboc_institution_name,
+)
 
 CONTRACT_ID = "pboc.personal_credit_report.instructed_cells"
 CONTRACT_VERSION = "2026-08-08"
@@ -62,16 +66,7 @@ _VOCABULARIES: dict[str, frozenset[str]] = {
             "未知",
         }
     ),
-    "inquiry_reason": frozenset(
-        {
-            "本人查询", "本人查询(自助查询机)", "本人查询（自助查询机）", "贷后管理", "保后管理", "贷款审批", "信用卡审批", "担保资格审查", "融资审批", "保前审查",
-            "本人查询(商业银行网上银行)", "本人查询（商业银行网上银行）",
-            "本人查询(互联网个人信用信息服务平台)", "本人查询（互联网个人信用信息服务平台）",
-            "本人查询(征信中心柜台)", "本人查询（征信中心柜台）",
-            "客户准入资格审查", "资信审查", "法人代表、负责人、高管等资信审查", "异议处理", "司法调查",
-            "公积金提取复核", "特约商户实名审查", "其他",
-        }
-    ),
+    "inquiry_reason": PBOC_INQUIRY_REASON_FORMS,
     "residence_status": frozenset(
         {"自置", "按揭", "亲属楼宇", "集体宿舍", "租房", "共有住宅", "其他", "未知"}
     ),
@@ -248,6 +243,8 @@ def _custom_contract(text: str, role: str) -> FieldContractResult | None:
     compact = re.sub(r"\s+", "", text)
     if role == "person_name":
         valid = bool(re.fullmatch(r"[\u3400-\u9fff·]{2,30}", compact))
+    elif role == "institution_name":
+        valid = is_pboc_institution_name(compact)
     elif role == "address":
         date_prefix = bool(re.match(r"^(?:19|20)\d{2}[./年-]\d{1,2}(?:[./月-]\d{1,2})?", compact))
         phone_fragment = bool(re.search(r"(?<!\d)\d{7,16}(?!\d)", compact))

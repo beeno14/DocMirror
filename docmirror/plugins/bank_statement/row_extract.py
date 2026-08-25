@@ -27,7 +27,10 @@ from docmirror.plugins.bank_statement.header_resolve import HeaderMatch, canonic
 _ISO_DATE_RE = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
 _ISO_DATETIME_RE = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}\s+\d{2}:\d{2}")
 _COMPACT_DATE_RE = re.compile(r"^\d{8}$")
+_COMPACT_DATETIME_RE = re.compile(r"^(?P<date>\d{8})(?P<time>\d{6})$")
+_COMPACT_COLON_DATETIME_RE = re.compile(r"^(?P<date>\d{8})(?P<time>\d{2}:\d{2}(?::\d{2})?)$")
 _SHORT_DATE_RE = re.compile(r"^\d{6}$")
+_MONTH_DAY_RE = re.compile(r"^(?P<month>\d{2})[-/](?P<day>\d{2})$")
 _AMOUNT_RE = re.compile(r"^[+-]?\d[\d,]*\.?\d*$")
 _MONEY_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{1,2}")
 _SUMMARY_MARKERS = ("合计", "小计", "本页", "总计")
@@ -39,6 +42,39 @@ def _looks_like_date(text: str) -> bool:
         return False
     if _ISO_DATE_RE.match(t) or _ISO_DATETIME_RE.match(t):
         return True
+    if match := _COMPACT_DATETIME_RE.match(t):
+        date_token = match.group("date")
+        time_token = match.group("time")
+        try:
+            year, month, day = int(date_token[:4]), int(date_token[4:6]), int(date_token[6:8])
+            hour, minute, second = int(time_token[:2]), int(time_token[2:4]), int(time_token[4:6])
+            return (
+                1900 <= year <= 2100
+                and 1 <= month <= 12
+                and 1 <= day <= 31
+                and 0 <= hour <= 23
+                and 0 <= minute <= 59
+                and 0 <= second <= 59
+            )
+        except ValueError:
+            return False
+    if match := _COMPACT_COLON_DATETIME_RE.match(t):
+        date_token = match.group("date")
+        time_parts = match.group("time").split(":")
+        try:
+            year, month, day = int(date_token[:4]), int(date_token[4:6]), int(date_token[6:8])
+            hour, minute = int(time_parts[0]), int(time_parts[1])
+            second = int(time_parts[2]) if len(time_parts) == 3 else 0
+            return (
+                1900 <= year <= 2100
+                and 1 <= month <= 12
+                and 1 <= day <= 31
+                and 0 <= hour <= 23
+                and 0 <= minute <= 59
+                and 0 <= second <= 59
+            )
+        except ValueError:
+            return False
     if _COMPACT_DATE_RE.match(t):
         try:
             y, m, d = int(t[:4]), int(t[4:6]), int(t[6:8])
@@ -48,6 +84,12 @@ def _looks_like_date(text: str) -> bool:
     if _SHORT_DATE_RE.match(t):
         try:
             m, d = int(t[2:4]), int(t[4:6])
+            return 1 <= m <= 12 and 1 <= d <= 31
+        except ValueError:
+            return False
+    if match := _MONTH_DAY_RE.match(t):
+        try:
+            m, d = int(match.group("month")), int(match.group("day"))
             return 1 <= m <= 12 and 1 <= d <= 31
         except ValueError:
             return False
@@ -194,12 +236,15 @@ def _starts_at_page_top(fragment: dict[str, Any]) -> bool:
     refs = [ref for ref in fragment.get("source_cell_refs") or [] if isinstance(ref, dict)]
     for ref in refs:
         try:
-            if int(ref.get("row", -1)) == 0 or int(ref.get("raw_row", -1)) == 1:
+            # A repeated child-header is commonly retained as source row zero.
+            # Its immediately following narrative continuation is still the
+            # first business fragment on the page.
+            if int(ref.get("row", -1)) in {0, 1} or int(ref.get("raw_row", -1)) in {1, 2}:
                 return True
         except (TypeError, ValueError):
             continue
     try:
-        return int(fragment.get("source_row_index", -1)) == 0
+        return int(fragment.get("source_row_index", -1)) in {0, 1}
     except (TypeError, ValueError):
         return False
 
@@ -294,6 +339,8 @@ def _stitch_cross_page_logical_rows(
             "values": [str(getattr(cell, "text", "") or "").strip() for cell in (getattr(row, "cells", []) or [])],
             "fragments": [_row_source_details(row, row_provenance, row_index)],
         }
+        if _looks_like_repeated_header_fragment(entry["values"], headers):
+            continue
         if stitched and _is_cross_page_continuation(stitched[-1], entry, headers=headers):
             stitched[-1]["values"] = _join_fragment_cells(stitched[-1]["values"], entry["values"])
             stitched[-1]["fragments"].extend(entry["fragments"])
@@ -352,11 +399,15 @@ def extract_all_tables(
 ) -> list[dict[str, str]]:
     """Detect headers per table segment and merge transaction rows."""
     all_txns: list[dict[str, str]] = []
-    seen: set[tuple[tuple[str, str], ...]] = set()
+    seen_tables: set[tuple[tuple[str, ...], ...]] = set()
 
     for tbl_idx, tbl in enumerate(tables):
         if not tbl:
             continue
+        table_signature = tuple(tuple(str(cell or "").strip() for cell in row) for row in tbl)
+        if table_signature in seen_tables:
+            continue
+        seen_tables.add(table_signature)
         header = detect_headers([tbl], registry, prefer_strict=prefer_strict)
         if header is None:
             continue
@@ -368,10 +419,6 @@ def extract_all_tables(
             mode=header.mode,
         )
         for txn in extract_rows_from_header(tables, header, registry, strict_first_col=strict_first_col):
-            key = tuple(sorted(txn.items()))
-            if key in seen:
-                continue
-            seen.add(key)
             all_txns.append(txn)
     return all_txns
 

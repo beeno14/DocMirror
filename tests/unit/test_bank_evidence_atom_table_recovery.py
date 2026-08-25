@@ -14,26 +14,84 @@ from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     _column_aggregate_source_raw,
+    _expand_composite_header_atoms,
+    _geometry_header,
+    _geometry_transaction_anchor_y,
     _infer_positioned_block_directions,
     _is_geometry_footer_text,
     _join_geometry_atoms,
     _positioned_block_counter_account,
+    _repair_geometry_cell_spill,
     _repair_geometry_rows,
     _sort_positioned_block_records,
+    _split_glued_geometry_data_atom,
+    _strip_geometry_page_header_overlay,
     recover_evidence_atom_bank_tables,
     recover_positioned_record_block_bank_tables,
     recovered_evidence_atom_expected_row_count,
     recovered_evidence_atom_expected_row_evidence,
     recovered_evidence_atom_row_sources,
+    recovered_native_datetime_row_evidence,
 )
 from docmirror.plugins.bank_statement.style_registry import (
     BankTableCandidate,
+    _candidate_expected_rows,
     _candidate_from_batch,
+    _candidate_reliable_count_coverage,
+    _candidate_row_count_evidence,
+    _collect_table_candidates,
+    _continuous_source_sequence_evidence,
+    _page_complete_sequence_evidence,
     _select_candidate,
 )
 from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence
 
 pytestmark = pytest.mark.unit
+
+
+def test_continuous_source_sequence_is_candidate_local_quality_evidence() -> None:
+    rows = [{"序号": str(index), "交易日期": "2024-01-01"} for index in range(1, 550)]
+
+    evidence = _continuous_source_sequence_evidence(rows)
+
+    assert evidence == RowCountEvidence(549, "continuous_source_sequence", 0.80)
+    assert _continuous_source_sequence_evidence([{"序号": "1"}, {"序号": "3"}]) is None
+
+
+def test_continuous_source_prefix_is_not_independent_count_coverage() -> None:
+    prefix = _candidate(
+        "truncated_prefix",
+        rows=5,
+        expected_rows=RowCountEvidence(5, "continuous_source_sequence", 0.80),
+    )
+
+    assert _candidate_reliable_count_coverage(prefix) is None
+
+
+def test_bounded_page_sequence_precedes_bare_global_continuity() -> None:
+    rows = [{"序号": str(value), "_source": {"source_page": 1}} for value in range(1, 8)]
+    source_rows = "\n".join(f"| {value} | 250101 | 250101 | business | detail |" for value in range(1, 8))
+    page_text = f"|No. |Bk.D. |Val.D. | Type | Notes |\n{source_rows}\nDebit Total 1.00 Credit Total 2.00\nPage 1 of 1"
+
+    evidence = _candidate_row_count_evidence(
+        rows,
+        None,
+        page_count=1,
+        page_texts=[(1, page_text)],
+    )
+
+    assert evidence == RowCountEvidence(7, "complete_page_local_sequences", 0.80)
+
+
+def test_continuous_sequence_ignores_proven_aggregate_pseudo_row() -> None:
+    aggregate = {"序号": "533\n534", "交易日期": "2024-12-01\n2024-12-02"}
+    rows = [aggregate, *[{"序号": str(index), "交易日期": "2024-01-01"} for index in range(1, 550)]]
+
+    assert _continuous_source_sequence_evidence(rows) == RowCountEvidence(
+        549,
+        "continuous_source_sequence",
+        0.80,
+    )
 
 
 def _atom(atom_id: str, text: str, x0: float, y0: float, x1: float | None = None) -> dict:
@@ -152,6 +210,45 @@ def test_candidate_scoring_rejects_column_aggregated_dates_copied_as_rows() -> N
     assert candidate.canonical_coverage == 0.0
 
 
+def test_native_candidate_drops_page_aggregate_but_keeps_physical_rows() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "amount_cny", "direction", "balance"],
+        _normalize=lambda raw: _normalized_candidate_row(raw),
+    )
+    rows = [
+        {
+            "交易日期": "2025-01-012025-01-022025-01-03",
+            "金额": "1.00",
+            "方向": "收入",
+            "余额": "3.00",
+        },
+        *[
+            {
+                "交易日期": f"2025-01-0{day}",
+                "金额": "1.00",
+                "方向": "收入",
+                "余额": f"{day}.00",
+            }
+            for day in range(1, 4)
+        ],
+    ]
+
+    candidate = _candidate_from_batch(
+        candidate_id="native_wide_table",
+        transactions=rows,
+        normalize_fn=_normalized_candidate_row,
+        plugin=plugin,
+        source="native_wide_table",
+        expected_rows=RowCountEvidence(count=3, source="header_total", confidence=0.95),
+        extraction_confidence=0.85,
+    )
+
+    assert len(candidate.records) == 3
+    assert candidate.canonical_rows == 3
+    assert candidate.semantic_anomaly_rows == 1
+    assert candidate.rejection_reason == ""
+
+
 def test_candidate_scoring_preserves_distinct_rows_with_same_business_values() -> None:
     plugin = SimpleNamespace(
         standard_fields=["date", "amount", "amount_cny", "direction", "balance"],
@@ -174,6 +271,787 @@ def test_candidate_scoring_preserves_distinct_rows_with_same_business_values() -
 
     assert candidate.canonical_rows == 2
     assert candidate.canonical_coverage == 1.0
+
+
+def test_candidate_scoring_excludes_cross_role_echo_row() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance"],
+        _normalize=lambda raw: dict(raw["normalized"]),
+    )
+    echoed = "2023-06-0161"
+    transaction = {
+        "交易日期": "2023-06-01",
+        "交易金额": "2,356,210.84",
+        "normalized": {
+            "date": "2023-06-01",
+            "amount": 2356210.84,
+            "direction": "income",
+            "balance": 2023.0,
+            "timestamp": echoed,
+            "summary": echoed,
+            "purpose": echoed,
+            "sequence_no": echoed,
+            "channel": echoed,
+        },
+    }
+
+    candidate = _candidate_from_batch(
+        candidate_id="positioned_record_block",
+        transactions=[transaction],
+        normalize_fn=lambda raw: dict(raw["normalized"]),
+        plugin=plugin,
+        source="positioned_record_block",
+        expected_rows=None,
+        extraction_confidence=0.95,
+    )
+
+    assert candidate.canonical_rows == 0
+    assert candidate.semantic_anomaly_rows == 1
+
+
+def _native_datetime_atom(
+    atom_id: str,
+    text: str,
+    x0: float,
+    y0: float,
+    x1: float,
+    *,
+    page_id: str,
+) -> dict:
+    return {
+        "id": atom_id,
+        "page_id": page_id,
+        "source_kind": "pdf_native",
+        "text": text,
+        "bbox": [x0, y0, x1, y0 + 10.0],
+    }
+
+
+def _native_datetime_page(
+    page: int,
+    page_count: int,
+    rows: list[tuple[str, str, str, str, str]],
+    *,
+    account: str = "550933090800015",
+) -> list[dict]:
+    page_id = f"page:{page:04d}"
+    atoms = [
+        _native_datetime_atom("title", "台州银行交易明细", 235.0, 43.0, 360.0, page_id=page_id),
+        _native_datetime_atom("account", f"账号:{account}", 67.0, 77.0, 170.0, page_id=page_id),
+        _native_datetime_atom("page", f"第{page}", 355.0, 77.0, 375.0, page_id=page_id),
+        _native_datetime_atom("slash", "/", 389.0, 77.0, 394.0, page_id=page_id),
+        _native_datetime_atom("total", str(page_count), 404.0, 77.0, 409.0, page_id=page_id),
+        _native_datetime_atom("page_label", "页", 414.0, 77.0, 424.0, page_id=page_id),
+    ]
+    for index, (label, x0, x1) in enumerate(
+        zip(
+            ("日期", "支出", "收入", "余额", "对方账户", "对方户名", "摘要/附言"),
+            (38.0, 126.0, 199.0, 278.0, 339.0, 435.0, 514.0),
+            (58.0, 146.0, 219.0, 298.0, 379.0, 475.0, 559.0),
+        )
+    ):
+        atoms.append(_native_datetime_atom(f"header-{index}", label, x0, 156.0, x1, page_id=page_id))
+
+    debit_total = 0.0
+    credit_total = 0.0
+    for index, (row_date, row_time, direction, amount, balance) in enumerate(rows):
+        y = 174.0 + 35.0 * index
+        atoms.extend(
+            [
+                _native_datetime_atom(f"date-{index}", row_date, 23.0, y, 73.0, page_id=page_id),
+                _native_datetime_atom(f"time-{index}", row_time, 28.0, y + 10.0, 68.0, page_id=page_id),
+                _native_datetime_atom(
+                    f"amount-{index}",
+                    amount,
+                    112.0 if direction == "expense" else 185.0,
+                    y,
+                    147.0 if direction == "expense" else 220.0,
+                    page_id=page_id,
+                ),
+                _native_datetime_atom(f"balance-{index}", balance, 263.0, y, 298.0, page_id=page_id),
+            ]
+        )
+        if direction == "expense":
+            debit_total += float(amount)
+        else:
+            credit_total += float(amount)
+
+    atoms.extend(
+        [
+            _native_datetime_atom("footer", "合计:", 29.0, 773.0, 54.0, page_id=page_id),
+            _native_datetime_atom("debit-total", f"{debit_total:.2f}", 104.0, 773.0, 149.0, page_id=page_id),
+            _native_datetime_atom("credit-total", f"{credit_total:.2f}", 180.0, 773.0, 225.0, page_id=page_id),
+            _native_datetime_atom("operator", "打印操作员：1", 105.0, 788.0, 220.0, page_id=page_id),
+            _native_datetime_atom("print-date", "打印日期：2024-03-29", 265.0, 788.0, 365.0, page_id=page_id),
+            _native_datetime_atom("print-time", "打印时间：09:31:18", 405.0, 788.0, 495.0, page_id=page_id),
+        ]
+    )
+    return atoms
+
+
+def _native_datetime_result(atoms: list[dict], page_count: int) -> SimpleNamespace:
+    pages = [SimpleNamespace(page_number=page, width=595, height=842) for page in range(1, page_count + 1)]
+    plane_pages = [
+        SimpleNamespace(page_id=f"page:{page:04d}", page_number=page, content_mode="native_text")
+        for page in range(1, page_count + 1)
+    ]
+    return SimpleNamespace(
+        pages=pages,
+        evidence_plane=SimpleNamespace(
+            pages=plane_pages,
+            evidence={"text_atoms": atoms},
+        ),
+        parser_info=SimpleNamespace(
+            extraction_method="digital",
+            options={
+                "source_page_count": page_count,
+                "selected_source_pages": list(range(1, page_count + 1)),
+            },
+        ),
+    )
+
+
+def _cib_native_page(
+    page: int,
+    page_count: int,
+    rows: list[tuple[str, str, str]],
+    *,
+    account: str = "622908123094910928",
+) -> list[dict]:
+    page_id = f"page:{page:04d}"
+    last_row_y = 212.0 + 34.0 * max(len(rows) - 1, 0)
+    footer_y = last_row_y + 30.0
+    atoms = [
+        _native_datetime_atom("title", "兴业银行交易流水", 250.0, 52.0, 345.0, page_id=page_id),
+        _native_datetime_atom("account", f"号：{account}", 333.0, 81.0, 480.0, page_id=page_id),
+        _native_datetime_atom("header-date", "交易日期", 36.0, 184.0, 72.0, page_id=page_id),
+        _native_datetime_atom("header-posting", "记账日期", 83.0, 184.0, 120.0, page_id=page_id),
+        _native_datetime_atom("header-summary", "摘要", 130.0, 184.0, 149.0, page_id=page_id),
+        _native_datetime_atom("header-money", "支/收交易金额", 196.0, 184.0, 255.0, page_id=page_id),
+        _native_datetime_atom("header-balance", "账户余额", 265.0, 184.0, 301.0, page_id=page_id),
+        _native_datetime_atom("header-location", "交易地点", 311.0, 184.0, 348.0, page_id=page_id),
+        _native_datetime_atom("header-party", "对方户名", 388.0, 184.0, 425.0, page_id=page_id),
+        _native_datetime_atom(
+            "header-counter",
+            "对方账户/对方银行",
+            466.0,
+            184.0,
+            542.0,
+            page_id=page_id,
+        ),
+    ]
+    for index, (row_date, amount, balance) in enumerate(rows):
+        y = 212.0 + 34.0 * index
+        atoms.extend(
+            [
+                _native_datetime_atom(f"date-{index}", row_date, 36.0, y, 82.0, page_id=page_id),
+                _native_datetime_atom(f"posting-{index}", row_date, 84.0, y, 130.0, page_id=page_id),
+                _native_datetime_atom(f"amount-{index}", amount, 220.0, y, 263.0, page_id=page_id),
+                _native_datetime_atom(f"balance-{index}", balance, 268.0, y, 309.0, page_id=page_id),
+            ]
+        )
+    atoms.extend(
+        [
+            _native_datetime_atom(
+                "privacy-footer",
+                "说明：交易明细涉及您的个人隐私，请妥善处理。",
+                36.0,
+                footer_y,
+                440.0,
+                page_id=page_id,
+            ),
+            _native_datetime_atom(
+                "page-marker",
+                f"第{page}页/共{page_count}页",
+                273.0,
+                footer_y + 50.0,
+                323.0,
+                page_id=page_id,
+            ),
+        ]
+    )
+    return atoms
+
+
+def test_native_datetime_census_counts_duplicate_timestamps_as_bbox_multiset() -> None:
+    rows = [
+        ("2024-03-26", "16:09:39", "expense", "1200.00", "395.67"),
+        ("2024-03-26", "16:09:39", "income", "2800.00", "3195.67"),
+    ]
+    result = _native_datetime_result(_native_datetime_page(1, 1, rows), 1)
+
+    assert recovered_native_datetime_row_evidence(result, source_route="digital") == (
+        2,
+        "native_page_datetime_census",
+        0.80,
+    )
+
+
+def test_native_datetime_census_terminal_deletion_remains_low_confidence() -> None:
+    rows = [
+        ("2024-03-26", "16:09:39", "expense", "1200.00", "395.67"),
+        ("2024-03-26", "16:08:39", "expense", "0.00", "395.67"),
+        ("2024-03-26", "16:07:39", "income", "0.00", "395.67"),
+    ]
+    atoms = _native_datetime_page(1, 1, rows)
+    terminal_ids = {"date-2", "time-2", "amount-2", "balance-2"}
+    shortened_atoms = [atom for atom in atoms if atom["id"] not in terminal_ids]
+
+    # The zero-value terminal row can disappear without changing page totals.
+    # The surviving geometry is internally consistent, but cannot certify its
+    # own terminal completeness.
+    assert recovered_native_datetime_row_evidence(
+        _native_datetime_result(shortened_atoms, 1), source_route="digital"
+    ) == (2, "native_page_datetime_census", 0.80)
+
+
+@pytest.mark.parametrize("missing_index", [1, 2])
+def test_native_datetime_census_rejects_erased_zero_value_row_boundary(missing_index: int) -> None:
+    rows = [
+        ("2024-03-26", "16:09:39", "expense", "1200.00", "395.67"),
+        ("2024-03-26", "16:08:39", "expense", "0.00", "395.67"),
+        ("2024-03-26", "16:07:39", "income", "0.00", "395.67"),
+    ]
+    atoms = _native_datetime_page(1, 1, rows)
+    row_pitch = 35.0
+    footer_y = 174.0 + row_pitch * len(rows) + 20.0
+    for atom in atoms:
+        if atom["id"] in {"footer", "debit-total", "credit-total"}:
+            atom["bbox"][1] = footer_y
+            atom["bbox"][3] = footer_y + 10.0
+        elif atom["id"] in {"operator", "print-date", "print-time"}:
+            atom["bbox"][1] = footer_y + 15.0
+            atom["bbox"][3] = footer_y + 25.0
+    erased_ids = {
+        f"date-{missing_index}",
+        f"time-{missing_index}",
+        f"amount-{missing_index}",
+        f"balance-{missing_index}",
+    }
+    atoms = [atom for atom in atoms if atom["id"] not in erased_ids]
+
+    assert recovered_native_datetime_row_evidence(_native_datetime_result(atoms, 1), source_route="digital") == (
+        0,
+        "",
+        0.0,
+    )
+
+
+@pytest.mark.parametrize("orphan_id", ["date-1", "time-1", "amount-1", "balance-1"])
+def test_native_datetime_census_rejects_orphan_row_atom(orphan_id: str) -> None:
+    rows = [
+        ("2024-03-26", "16:09:39", "expense", "1200.00", "395.67"),
+        ("2024-03-26", "16:08:39", "income", "0.00", "395.67"),
+    ]
+    atoms = [atom for atom in _native_datetime_page(1, 1, rows) if atom["id"] != orphan_id]
+
+    assert recovered_native_datetime_row_evidence(_native_datetime_result(atoms, 1), source_route="digital") == (
+        0,
+        "",
+        0.0,
+    )
+
+
+def test_native_datetime_census_rejects_duplicate_row_atom() -> None:
+    atoms = _native_datetime_page(
+        1,
+        1,
+        [
+            ("2024-03-26", "16:09:39", "expense", "1200.00", "395.67"),
+            ("2024-03-26", "16:08:39", "income", "0.00", "395.67"),
+        ],
+    )
+    duplicate = dict(next(atom for atom in atoms if atom["id"] == "date-1"), id="date-duplicate")
+
+    assert recovered_native_datetime_row_evidence(
+        _native_datetime_result([*atoms, duplicate], 1), source_route="digital"
+    ) == (0, "", 0.0)
+
+
+def test_native_datetime_census_does_not_override_candidate_rows_as_authority() -> None:
+    evidence = RowCountEvidence(152, "native_page_datetime_census", 0.80)
+
+    assert _candidate_expected_rows(
+        evidence,
+        count=149,
+        source="candidate_rows",
+        confidence=0.55,
+    ) == RowCountEvidence(149, "candidate_rows", 0.55)
+    assert _candidate_expected_rows(evidence) == evidence
+
+
+def test_native_and_ocr_bounded_census_sources_stay_below_authority_threshold() -> None:
+    for source in (
+        "native_page_datetime_census",
+        "native_page_signed_ledger_census",
+        "ocr_page_ordinal_census",
+    ):
+        evidence = RowCountEvidence(152, source, 0.80)
+
+        assert evidence.confidence < 0.85
+        assert _candidate_expected_rows(
+            evidence,
+            count=149,
+            source="candidate_rows",
+            confidence=0.55,
+        ) == RowCountEvidence(149, "candidate_rows", 0.55)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["title", "header", "header_order", "footer", "account", "balance", "page"],
+)
+def test_native_datetime_census_fails_closed_when_page_proof_is_incomplete(mutation: str) -> None:
+    rows = [("2024-03-26", "16:09:39", "expense", "1200.00", "395.67")]
+    atoms = _native_datetime_page(1, 1, rows)
+    if mutation == "title":
+        next(atom for atom in atoms if atom["id"] == "title")["text"] = "鍏朵粬閾惰娴佹按"
+    elif mutation == "header":
+        atoms = [atom for atom in atoms if atom["id"] != "header-3"]
+    elif mutation == "header_order":
+        left = next(atom for atom in atoms if atom["id"] == "header-1")
+        right = next(atom for atom in atoms if atom["id"] == "header-2")
+        left["bbox"], right["bbox"] = right["bbox"], left["bbox"]
+    elif mutation == "footer":
+        next(atom for atom in atoms if atom["id"] == "debit-total")["text"] = "1199.99"
+    elif mutation == "account":
+        atoms.extend(_native_datetime_page(2, 2, rows, account="999999999999999"))
+        result = _native_datetime_result(atoms, 2)
+        assert recovered_native_datetime_row_evidence(result, source_route="digital") == (0, "", 0.0)
+        return
+    elif mutation == "balance":
+        atoms = [atom for atom in atoms if atom["id"] != "balance-0"]
+    else:
+        result = _native_datetime_result(atoms, 2)
+        assert recovered_native_datetime_row_evidence(result, source_route="digital") == (0, "", 0.0)
+        return
+    result = _native_datetime_result(atoms, 1)
+
+    assert recovered_native_datetime_row_evidence(result, source_route="digital") == (0, "", 0.0)
+
+
+def test_cib_native_census_counts_complete_signed_ledger_across_pages() -> None:
+    atoms = [
+        *_cib_native_page(
+            1,
+            2,
+            [("2022-01-01", "100.00", "100.00"), ("2022-01-02", "-30.00", "70.00")],
+        ),
+        *_cib_native_page(2, 2, [("2022-01-03", "20.00", "90.00")]),
+    ]
+
+    assert recovered_native_datetime_row_evidence(_native_datetime_result(atoms, 2), source_route="digital") == (
+        3,
+        "native_page_signed_ledger_census",
+        0.80,
+    )
+
+
+def test_cib_native_census_terminal_deletion_remains_low_confidence() -> None:
+    atoms = _cib_native_page(
+        1,
+        1,
+        [
+            ("2022-01-01", "100.00", "100.00"),
+            ("2022-01-02", "-30.00", "70.00"),
+            ("2022-01-03", "20.00", "90.00"),
+        ],
+    )
+    terminal_ids = {"date-2", "posting-2", "amount-2", "balance-2"}
+    shortened_atoms = [atom for atom in atoms if atom["id"] not in terminal_ids]
+    for atom in shortened_atoms:
+        if atom["id"] in {"privacy-footer", "page-marker"}:
+            atom["bbox"][1] -= 34.0
+            atom["bbox"][3] -= 34.0
+
+    # Moving the footer with a symmetrically shortened row plane leaves a valid
+    # prefix and a closed balance chain.  It is useful coverage, not authority.
+    assert recovered_native_datetime_row_evidence(
+        _native_datetime_result(shortened_atoms, 1), source_route="digital"
+    ) == (2, "native_page_signed_ledger_census", 0.80)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["title", "header", "header_order", "footer", "page", "posting", "balance_chain", "missing_tail"],
+)
+def test_cib_native_census_fails_closed_when_source_proof_is_incomplete(mutation: str) -> None:
+    atoms = _cib_native_page(
+        1,
+        1,
+        [("2022-01-01", "100.00", "100.00"), ("2022-01-02", "-30.00", "70.00")],
+    )
+    if mutation == "title":
+        next(atom for atom in atoms if atom["id"] == "title")["text"] = "其他银行交易流水"
+    elif mutation == "header":
+        atoms = [atom for atom in atoms if atom["id"] != "header-posting"]
+    elif mutation == "header_order":
+        date_header = next(atom for atom in atoms if atom["id"] == "header-date")
+        posting_header = next(atom for atom in atoms if atom["id"] == "header-posting")
+        date_header["bbox"], posting_header["bbox"] = posting_header["bbox"], date_header["bbox"]
+    elif mutation == "footer":
+        atoms = [atom for atom in atoms if atom["id"] != "privacy-footer"]
+    elif mutation == "page":
+        next(atom for atom in atoms if atom["id"] == "page-marker")["text"] = "第1页/共2页"
+    elif mutation == "posting":
+        atoms = [atom for atom in atoms if atom["id"] != "posting-1"]
+    elif mutation == "balance_chain":
+        next(atom for atom in atoms if atom["id"] == "balance-1")["text"] = "71.00"
+    else:
+        atoms = [
+            atom for atom in atoms if not atom["id"].endswith("-1") or atom["id"] in {"privacy-footer", "page-marker"}
+        ]
+
+    assert recovered_native_datetime_row_evidence(_native_datetime_result(atoms, 1), source_route="digital") == (
+        0,
+        "",
+        0.0,
+    )
+
+
+def test_candidate_scoring_excludes_explicit_header_furniture_row() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance"],
+        _normalize=lambda raw: _normalized_candidate_row(raw),
+    )
+    transaction = {
+        "交易日期": "2025-01-02",
+        "金额": "25.00",
+        "方向": "支出",
+        "余额": "5000888.02",
+        "摘要": "打印时间: 2026/02/24 16:19 记录数: 71",
+        "对方户名": "用户所属公司: 重庆正大华日软件有限公司",
+    }
+
+    candidate = _candidate_from_batch(
+        candidate_id="positioned_record_block",
+        transactions=[transaction],
+        normalize_fn=_normalized_candidate_row,
+        plugin=plugin,
+        source="positioned_record_block",
+        expected_rows=None,
+        extraction_confidence=0.95,
+    )
+
+    assert candidate.canonical_rows == 0
+    assert candidate.semantic_anomaly_rows == 1
+
+
+def test_candidate_rejects_truncated_recognized_delimited_business_cell() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "summary"],
+        _normalize=lambda raw: {
+            **_normalized_candidate_row(raw),
+            "summary": raw.get("摘要/附言", ""),
+        },
+    )
+    shifted = {
+        "序号": "1",
+        "交易日期": "2025-01-02",
+        "交易金额": "25.00",
+        "交易类型": "支出",
+        "币别": "CNY",
+        "账户余额": "100.00",
+        "对方账号": "",
+        "对方户名": "",
+        "金额": "25.00",
+        "方向": "支出",
+        "余额": "100.00",
+        # A shifted cell can retain a complete-looking marker after a fragment
+        # from the neighbouring row.  The marker's position makes the grammar
+        # invalid even though the four delimiters are still present.
+        "摘要/附言": "前行尾部0WL#12345S#WL协议#商户退款",
+    }
+    intact = {
+        **shifted,
+        "摘要/附言": "0WL#12345S#WL协议#商户退款",
+    }
+
+    rejected = _candidate_from_batch(
+        candidate_id="geometry_shifted",
+        transactions=[shifted],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="canonical_evidence_table",
+        expected_rows=None,
+        extraction_confidence=0.9,
+    )
+    accepted = _candidate_from_batch(
+        candidate_id="source_grid",
+        transactions=[intact],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="canonical_physical_tables",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    selected, _diagnostics = _select_candidate([rejected, accepted])
+
+    assert rejected.canonical_rows == 0
+    assert rejected.rejection_reason == "source_role_corruption"
+    assert selected is accepted
+
+
+def test_candidate_does_not_apply_delimited_grammar_to_unknown_business_code() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "summary"],
+        _normalize=lambda raw: {
+            **_normalized_candidate_row(raw),
+            "summary": raw.get("摘要/附言", ""),
+        },
+    )
+    row = {
+        "序号": "1",
+        "交易日期": "2025-01-02",
+        "交易金额": "25.00",
+        "交易类型": "支出",
+        "币别": "CNY",
+        "账户余额": "100.00",
+        "对方账号": "",
+        "对方户名": "",
+        "金额": "25.00",
+        "方向": "支出",
+        "余额": "100.00",
+        "摘要/附言": "CUSTOM#free#form",
+    }
+
+    candidate = _candidate_from_batch(
+        candidate_id="unknown_delimiter",
+        transactions=[row],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="canonical_physical_tables",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    assert candidate.canonical_rows == 1
+    assert candidate.semantic_anomaly_rows == 0
+
+
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("摘要/附言", "业务提示包含0WL但没有结构分隔符"),
+        ("摘要/附言", "A0WL#12345S#WL协议#普通自由文本"),
+        ("普通摘要", "前行尾部0WL#12345S#WL协议#普通自由文本"),
+    ],
+)
+def test_delimited_business_guard_is_bounded_by_marker_and_source_role(
+    header: str,
+    value: str,
+) -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "summary"],
+        _normalize=lambda raw: {
+            **_normalized_candidate_row(raw),
+            "summary": raw.get(header, ""),
+        },
+    )
+    row = {
+        "序号": "1",
+        "交易日期": "2025-01-02",
+        "交易金额": "25.00",
+        "交易类型": "支出",
+        "币别": "CNY",
+        "账户余额": "100.00",
+        "对方账号": "",
+        "对方户名": "",
+        "金额": "25.00",
+        "方向": "支出",
+        "余额": "100.00",
+        "摘要/附言": "" if header != "摘要/附言" else value,
+        header: value,
+    }
+
+    candidate = _candidate_from_batch(
+        candidate_id="bounded_delimiter_guard",
+        transactions=[row],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="canonical_physical_tables",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    assert candidate.canonical_rows == 1
+    assert candidate.semantic_anomaly_rows == 0
+
+
+def test_delimited_business_guard_requires_complete_source_layout() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "summary"],
+        _normalize=lambda raw: {
+            **_normalized_candidate_row(raw),
+            "summary": raw["摘要/附言"],
+        },
+    )
+    row = {
+        "序号": "1",
+        "交易日期": "2025-01-02",
+        "交易金额": "25.00",
+        "交易类型": "支出",
+        # Deliberately no 币别: the full source layout is not proven.
+        "账户余额": "100.00",
+        "对方账号": "",
+        "对方户名": "",
+        "金额": "25.00",
+        "方向": "支出",
+        "余额": "100.00",
+        "摘要/附言": "前缀0WL#12345S#WL协议#文本",
+    }
+
+    candidate = _candidate_from_batch(
+        candidate_id="incomplete_layout_delimiter_guard",
+        transactions=[row],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="canonical_physical_tables",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    assert candidate.canonical_rows == 1
+    assert candidate.semantic_anomaly_rows == 0
+
+
+def test_candidate_selection_rejects_systemic_summary_date_role_swap() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "summary"],
+        _normalize=lambda raw: {
+            **_normalized_candidate_row(raw),
+            "summary": raw.get("摘要", ""),
+        },
+    )
+    bad_rows = [
+        {
+            "交易日期": f"2025-01-{day:02d}",
+            "摘要": f"2025/01/{day:02d}",
+            "金额": "1.00",
+            "方向": "收入",
+            "余额": f"{day}.00",
+        }
+        for day in range(1, 11)
+    ]
+    good_rows = [
+        {
+            "交易日期": f"2025-02-{day:02d}",
+            "摘要": "转账",
+            "金额": "1.00",
+            "方向": "收入",
+            "余额": f"{day}.00",
+        }
+        for day in range(1, 4)
+    ]
+    bad = _candidate_from_batch(
+        candidate_id="positioned_record_block",
+        transactions=bad_rows,
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="positioned_record_block",
+        expected_rows=None,
+        extraction_confidence=0.95,
+    )
+    good = _candidate_from_batch(
+        candidate_id="native_wide_table",
+        transactions=good_rows,
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="native_wide_table",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    selected, _ = _select_candidate([bad, good])
+
+    assert bad.canonical_rows == 0
+    assert bad.source_role_swap_ratio == 1.0
+    assert selected is good
+
+
+def test_candidate_scoring_keeps_sparse_rows_without_optional_fields_or_provenance() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction"],
+        _normalize=lambda raw: {
+            "date": raw["交易日期"],
+            "amount": abs(float(raw["交易金额"])),
+            "direction": "expense" if raw["交易金额"].startswith("-") else "income",
+        },
+    )
+    rows = [{"交易日期": f"2025-03-{day:02d}", "交易金额": "-1.00"} for day in range(1, 4)]
+    candidate = _candidate_from_batch(
+        candidate_id="semantic_text:0",
+        transactions=rows,
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="semantic_text_table",
+        expected_rows=None,
+        extraction_confidence=0.65,
+    )
+
+    selected, _ = _select_candidate([candidate])
+
+    assert candidate.canonical_rows == 3
+    assert selected is candidate
+
+
+def test_candidate_field_completeness_counts_explicit_zero_amount_and_balance() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance"],
+        _normalize=lambda _raw: {
+            "date": "2025-03-01",
+            "amount": 0.0,
+            "direction": "income",
+            "balance": 0.0,
+        },
+    )
+    candidate = _candidate_from_batch(
+        candidate_id="native_wide_table",
+        transactions=[{"交易日期": "2025-03-01", "交易金额": "0.00", "余额": "0.00"}],
+        normalize_fn=plugin._normalize,
+        plugin=plugin,
+        source="native_wide_table",
+        expected_rows=None,
+        extraction_confidence=0.85,
+    )
+
+    assert candidate.field_completeness == 1.0
+
+
+def test_candidate_with_shifted_header_furniture_rejects_whole_alignment() -> None:
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance"],
+        _normalize=lambda raw: _normalized_candidate_row(raw),
+        _canonical_raw_values=lambda raw, _normalized: dict(raw),
+        _extract_identity=lambda _result: {},
+        identity_fields=[],
+    )
+    valid_rows = [
+        {"交易日期": "2025-01-02", "金额": "1.00", "方向": "收入", "余额": "1.00"},
+        {"交易日期": "2025-01-03", "金额": "1.00", "方向": "收入", "余额": "2.00"},
+    ]
+    furniture = {
+        "交易日期": "2025-01-01",
+        "金额": "1.00",
+        "方向": "收入",
+        "余额": "0.00",
+        "摘要": "打印时间: 2026/02/24 16:19 记录数: 71",
+        "对方户名": "用户所属公司: 测试公司",
+    }
+    candidate = _candidate_from_batch(
+        candidate_id="positioned_record_block",
+        transactions=[furniture, *valid_rows],
+        normalize_fn=_normalized_candidate_row,
+        plugin=plugin,
+        source="positioned_record_block",
+        expected_rows=None,
+        extraction_confidence=0.95,
+    )
+
+    assert candidate.canonical_rows == 0
+    assert candidate.rejected_row_indexes == (0,)
+    assert candidate.rejection_reason == "source_role_corruption"
 
 
 def _normalized_candidate_row(raw: dict) -> dict:
@@ -200,6 +1078,29 @@ def test_geometry_direction_repair_uses_summary_and_cross_page_balance() -> None
     assert second_page[0][0] == "支出"
 
 
+def test_geometry_cell_spill_moves_bounded_summary_prefix_out_of_signed_amount() -> None:
+    row = ["2023/04/08", "AppStore_Music", "Apple-19.00", "549.28"]
+
+    _repair_geometry_cell_spill(
+        row,
+        {"date": 0, "summary": 1, "amount": 2, "balance": 3},
+    )
+
+    assert row == ["2023/04/08", "AppStore_MusicApple", "-19.00", "549.28"]
+
+
+def test_geometry_cell_spill_does_not_treat_currency_or_unsigned_text_as_summary() -> None:
+    currency = ["2023/04/08", "purchase", "USD-19.00", "549.28"]
+    unsigned = ["2023/04/08", "purchase", "Apple19.00", "549.28"]
+    columns = {"date": 0, "summary": 1, "amount": 2, "balance": 3}
+
+    _repair_geometry_cell_spill(currency, columns)
+    _repair_geometry_cell_spill(unsigned, columns)
+
+    assert currency[1:3] == ["purchase", "USD-19.00"]
+    assert unsigned[1:3] == ["purchase", "Apple19.00"]
+
+
 def test_geometry_direction_repair_corrects_explicit_direction_when_balance_uniquely_disagrees() -> None:
     columns = {"direction": 0, "amount": 1, "balance": 2, "summary": 3}
     rows = [["收入", "2.00", "3,641.74", "短信收费"]]
@@ -220,6 +1121,523 @@ def test_geometry_atom_join_preserves_visual_account_order_across_font_baselines
 
 def test_geometry_footer_recognizes_issuer_important_notice() -> None:
     assert _is_geometry_footer_text("重要提示：请仔细核对账户余额，客服电话：95588") is True
+    assert _is_geometry_footer_text("说明：交易明细涉及您的个人隐私，请妥善处理") is True
+    assert _is_geometry_footer_text("收入交易笔数：391 收入金额合计：23,790,585.15") is True
+    assert _is_geometry_footer_text("支出交易笔数：1861 支出金额合计：23,791,584.72") is True
+    assert _is_geometry_footer_text("支出交易总额：14,146,954.73") is True
+    assert _is_geometry_footer_text("收入交易总额：14,146,649.53") is True
+    assert _is_geometry_footer_text("合计笔数：1821") is True
+    assert _is_geometry_footer_text("https://secure.example/statement-verification") is True
+
+
+def test_geometry_recovery_splits_source_fragmented_dates_and_glued_business_cells() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("hp", "记账日期", 70.0, 80.0, 110.0),
+        _atom("hs", "摘要", 120.0, 80.0, 150.0),
+        _atom("hdir1", "⽀/", 175.0, 73.0, 190.0),
+        _atom("hdir2", "收", 175.0, 87.0, 190.0),
+        _atom("hm", "交易⾦额账户余额交易地点", 200.0, 80.0, 360.0),
+        _atom("hparty", "对方户名", 400.0, 80.0, 450.0),
+        _atom("haccount", "对方账户/对方银行", 460.0, 80.0, 570.0),
+        _atom("d1a", "2024-01-", 20.0, 110.0, 60.0),
+        _atom("d1b", "02", 20.0, 122.0, 32.0),
+        _atom("p1a", "2024-01-", 70.0, 110.0, 110.0),
+        _atom("p1b", "02", 70.0, 122.0, 82.0),
+        _atom("s1", "跨行代付", 120.0, 116.0, 165.0),
+        _atom("dir1", "收", 175.0, 116.0, 185.0),
+        _atom("money1", "10.0020.00测试支行", 205.0, 116.0, 365.0),
+        _atom("party1", "测试商户", 400.0, 116.0, 445.0),
+        _atom("account1", "123456789", 460.0, 116.0, 520.0),
+        _atom("row2lead", "2024-01-032024-01-03转账支出", 20.0, 150.0, 165.0),
+        _atom("dir2", "支", 175.0, 150.0, 185.0),
+        _atom("money2", "-5.0015.00另一支行", 205.0, 150.0, 365.0),
+        _atom("party2", "另一商户", 400.0, 150.0, 445.0),
+        _atom("account2", "987654321", 460.0, 150.0, 520.0),
+        _atom("footer", "打印完毕", 20.0, 180.0, 100.0),
+    ]
+    # Some PDF-native extractors give a horizontally glued row a tall bbox.
+    # It remains one semantic row, not two vertically stacked date values.
+    next(atom for atom in atoms if atom["id"] == "row2lead")["bbox"][3] = 174.0
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert len(tables) == 1
+    assert tables[0][0][:7] == ["交易日期", "记账日期", "摘要", "支/收", "交易金额", "账户余额", "交易地点"]
+    assert tables[0][1][:7] == ["2024-01-02", "2024-01-02", "跨行代付", "收", "10.00", "20.00", "测试支行"]
+    assert tables[0][2][:7] == [
+        "2024-01-03",
+        "2024-01-03",
+        "转账支出",
+        "支出",
+        "-5.00",
+        "15.00",
+        "另一支行",
+    ]
+
+
+def test_coalesced_fragmented_date_anchor_uses_union_midpoint_only() -> None:
+    coalesced = _atom("coalesced", "2024-01-02", 20.0, 100.0, 60.0)
+    coalesced["bbox"][3] = 128.0
+    coalesced["_coalesced_fragmented_date_anchor"] = True
+    native_tall = {key: value for key, value in coalesced.items() if key != "_coalesced_fragmented_date_anchor"}
+
+    assert _geometry_transaction_anchor_y(coalesced, 8.0) == 114.0
+    assert _geometry_transaction_anchor_y(native_tall, 8.0) == 124.0
+
+
+def test_geometry_exact_boundary_uses_target_account_evidence_without_stealing_prior_tail() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("ha", "交易金额", 120.0, 80.0, 170.0),
+        _atom("hb", "账户余额", 200.0, 80.0, 250.0),
+        _atom("hs", "对方账户/对方银行", 300.0, 80.0, 420.0),
+        _atom("d1", "2024-01-02", 20.0, 116.0, 70.0),
+        _atom("a1", "-1.00", 120.0, 116.0, 165.0),
+        _atom("b1", "9.00", 200.0, 116.0, 245.0),
+        # Native single-line date centers are 120 and 156, so the shared
+        # boundary is exactly 138.  A CJK tail on that boundary completes the
+        # prior bank name, while an account-shaped prefix completes the next
+        # row's otherwise-too-short account fragment.
+        _atom("prior-account", "111111中国测试有限公", 300.0, 116.0, 410.0),
+        _atom("prior-tail", "司", 300.0, 134.0, 310.0),
+        _atom("next-account-prefix", "AW8BAGYFokX0qiBJu7uua7e", 315.0, 134.0, 410.0),
+        _atom("d2", "2024-01-03", 20.0, 152.0, 70.0),
+        _atom("a2", "+2.00", 120.0, 152.0, 165.0),
+        _atom("b2", "11.00", 200.0, 152.0, 245.0),
+        _atom("next-account-body", "GZfG1财付通支付科技有限公司", 300.0, 152.0, 410.0),
+        _atom("footer", "打印完毕", 20.0, 190.0, 100.0),
+    ]
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert len(tables) == 1
+    assert len(tables[0]) == 3
+    assert sources[0]["source_raw"]["对方账户/对方银行"] == "111111中国测试有限公司"
+    assert sources[1]["source_raw"]["对方账户/对方银行"] == "AW8BAGYFokX0qiBJu7uua7eGZfG1财付通支付科技有限公司"
+    assert "prior-tail" in sources[0]["evidence_ids"]
+    assert "prior-tail" not in sources[1]["evidence_ids"]
+    assert "next-account-prefix" not in sources[0]["evidence_ids"]
+    assert "next-account-prefix" in sources[1]["evidence_ids"]
+
+
+def test_noncoalesced_geometry_row_keeps_unproven_account_tail_at_exact_top() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("ha", "交易金额", 120.0, 80.0, 170.0),
+        _atom("hb", "账户余额", 200.0, 80.0, 250.0),
+        _atom("hs", "对方账户/对方银行", 300.0, 80.0, 420.0),
+        _atom("d1", "2024-01-02", 20.0, 116.0, 70.0),
+        _atom("a1", "-1.00", 120.0, 116.0, 165.0),
+        _atom("b1", "9.00", 200.0, 116.0, 245.0),
+        _atom("s1", "111111中国测试商户", 300.0, 116.0, 410.0),
+        # Native date centers are 120 and 156, making the second row's exact
+        # half-open top 138.  This CJK token does not complete an allowed prior
+        # institution suffix, so it retains the existing next-row ownership.
+        _atom("row2-exact-top", "备注", 300.0, 134.0, 325.0),
+        _atom("d2", "2024-01-03", 20.0, 152.0, 70.0),
+        _atom("a2", "+2.00", 120.0, 152.0, 165.0),
+        _atom("b2", "11.00", 200.0, 152.0, 245.0),
+        _atom("s2", "222222中国测试银行", 300.0, 152.0, 410.0),
+        _atom("footer", "打印完毕", 20.0, 190.0, 100.0),
+    ]
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert len(tables) == 1
+    assert len(tables[0]) == 3
+    assert "row2-exact-top" not in sources[0]["evidence_ids"]
+    assert "row2-exact-top" in sources[1]["evidence_ids"]
+
+
+def test_fragmented_date_midpoint_keeps_leading_wrapped_roles_with_next_row() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("hp", "记账日期", 70.0, 80.0, 110.0),
+        _atom("hs", "摘要", 120.0, 80.0, 150.0),
+        _atom("hdir", "支/收", 175.0, 80.0, 195.0),
+        _atom("ha", "交易金额", 210.0, 80.0, 255.0),
+        _atom("hb", "账户余额", 270.0, 80.0, 315.0),
+        _atom("hl", "交易地点", 325.0, 80.0, 375.0),
+        _atom("hparty", "对方户名", 400.0, 80.0, 450.0),
+        _atom("haccount", "对方账户/对方银行", 460.0, 80.0, 570.0),
+        _atom("d1a", "2023-04-", 20.0, 110.0, 60.0),
+        _atom("d1b", "02", 20.0, 122.0, 32.0),
+        _atom("p1a", "2023-04-", 70.0, 110.0, 110.0),
+        _atom("p1b", "02", 70.0, 122.0, 82.0),
+        _atom("s1", "汇款汇入", 120.0, 116.0, 165.0),
+        _atom("dir1", "收", 180.0, 116.0, 190.0),
+        _atom("a1", "30,000.00", 210.0, 116.0, 260.0),
+        _atom("b1", "30,059.12", 270.0, 116.0, 320.0),
+        _atom("l1", "兴业银行漳州高新区支行", 325.0, 116.0, 390.0),
+        _atom("party1", "曾燕雁", 400.0, 116.0, 430.0),
+        _atom("account1", "6228480158325987077", 460.0, 110.0, 570.0),
+        _atom("bank1", "中国农业银行", 460.0, 124.0, 525.0),
+        # These are the first wrapped line of row two.  Their baseline is
+        # above row two's fragmented date, but they must not leak into row one.
+        _atom("party2-prefix", "支付宝(中国)", 400.0, 136.0, 460.0),
+        _atom("account2", "215500690", 460.0, 136.0, 515.0),
+        _atom("d2a", "2023-04-", 20.0, 146.0, 60.0),
+        _atom("d2b", "02", 20.0, 158.0, 32.0),
+        _atom("p2a", "2023-04-", 70.0, 146.0, 110.0),
+        _atom("p2b", "02", 70.0, 158.0, 82.0),
+        _atom("s2", "快捷支付", 120.0, 152.0, 165.0),
+        _atom("dir2", "支", 180.0, 152.0, 190.0),
+        _atom("a2", "-25.00", 210.0, 152.0, 250.0),
+        _atom("b2", "30,034.12", 270.0, 152.0, 320.0),
+        _atom("l2", "兴业银行漳州高新区支行", 325.0, 152.0, 390.0),
+        _atom("party2-body", "网络技术有限公", 400.0, 152.0, 465.0),
+        _atom("bank2-body", "支付宝(中国)网络技", 460.0, 152.0, 565.0),
+        _atom("party2-tail", "司", 400.0, 164.0, 410.0),
+        _atom("bank2-tail", "术有限公司", 460.0, 164.0, 510.0),
+        _atom("footer", "打印完毕", 20.0, 190.0, 100.0),
+    ]
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert len(tables) == 1
+    assert len(tables[0]) == 3
+    assert sources[0]["source_raw"]["对方户名"] == "曾燕雁"
+    assert sources[0]["source_raw"]["对方账户/对方银行"] == "6228480158325987077中国农业银行"
+    assert sources[1]["source_raw"]["对方户名"] == "支付宝(中国)网络技术有限公司"
+    assert sources[1]["source_raw"]["对方账户/对方银行"] == "215500690支付宝(中国)网络技术有限公司"
+    assert {"party2-prefix", "account2"}.isdisjoint(sources[0]["evidence_ids"])
+    assert {"party2-prefix", "account2"}.issubset(sources[1]["evidence_ids"])
+    assert sources[0]["bbox"][3] < sources[1]["bbox"][1]
+
+    plugin = BankStatementCommunityPlugin()
+    first_raw = sources[0]["source_raw"]
+    second_raw = sources[1]["source_raw"]
+    first_canonical = plugin._canonical_raw_values(first_raw, plugin._normalize(first_raw))
+    second_canonical = plugin._canonical_raw_values(second_raw, plugin._normalize(second_raw))
+    assert {
+        key: first_canonical[key] for key in ("counter_party", "counter_account", "counter_bank_name")
+    } == {
+        "counter_party": "曾燕雁",
+        "counter_account": "6228480158325987077",
+        "counter_bank_name": "中国农业银行",
+    }
+    assert {
+        key: second_canonical[key] for key in ("counter_party", "counter_account", "counter_bank_name")
+    } == {
+        "counter_party": "支付宝(中国)网络技术有限公司",
+        "counter_account": "215500690",
+        "counter_bank_name": "支付宝(中国)网络技术有限公司",
+    }
+
+
+def test_geometry_recovery_only_splits_money_atoms_owned_by_balance_band() -> None:
+    atoms = [
+        _atom("hs", "序号", 15.0, 80.0, 45.0),
+        _atom("hd", "交易日期", 75.0, 80.0, 125.0),
+        _atom("ha", "交易金额", 175.0, 80.0, 225.0),
+        _atom("hb", "账户余额", 255.0, 80.0, 305.0),
+        _atom("hl", "交易地点", 355.0, 80.0, 405.0),
+        _atom("hm", "摘要", 485.0, 80.0, 515.0),
+        _atom("s1", "1", 25.0, 110.0, 35.0),
+        _atom("d1", "2025-01-02", 75.0, 110.0, 125.0),
+        _atom("a1", "-10.00", 180.0, 110.0, 220.0),
+        _atom("b1", "90.00", 260.0, 110.0, 300.0),
+        _atom("l1", "手机银行", 355.0, 110.0, 405.0),
+        _atom("m1", "6.17两单6030", 480.0, 110.0, 550.0),
+        _atom("s2", "2", 25.0, 150.0, 35.0),
+        _atom("d2", "2025-01-03", 75.0, 150.0, 125.0),
+        _atom("a2", "-10.00", 180.0, 150.0, 220.0),
+        _atom("b2", "80.00", 260.0, 150.0, 300.0),
+        _atom("l2", "手机银行", 355.0, 150.0, 405.0),
+        _atom("m2a", "6.18订单号", 480.0, 136.0, 535.0),
+        _atom("m2b", "274114825757金额", 480.0, 150.0, 555.0),
+        _atom("m2c", "6030元", 480.0, 162.0, 515.0),
+        _atom("s3", "3", 25.0, 190.0, 35.0),
+        _atom("d3", "2025-01-04", 75.0, 190.0, 125.0),
+        _atom("a3", "-10.00", 180.0, 190.0, 220.0),
+        # The right-aligned balance atom spills eight points left of its
+        # Voronoi band but still spans the immediately adjacent location.
+        _atom("balance-location", "70.00测试支行", 232.0, 190.0, 410.0),
+        _atom("s4", "4", 25.0, 230.0, 35.0),
+        _atom("d4", "2025-01-05", 75.0, 230.0, 125.0),
+        _atom("amount-balance-location", "-5.0065.00另一支行", 180.0, 230.0, 410.0),
+        _atom("s5", "5", 25.0, 270.0, 35.0),
+        _atom("d5", "2025-01-06", 75.0, 270.0, 125.0),
+        _atom("a5", "-5.00", 180.0, 270.0, 220.0),
+        _atom("b5", "60.00", 260.0, 270.0, 300.0),
+        _atom("l5", "手机银行", 355.0, 270.0, 405.0),
+        _atom("m5", "6.12", 480.0, 270.0, 505.0),
+        _atom("footer", "打印完毕", 20.0, 310.0, 100.0),
+    ]
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert tables == [
+        [
+            ["序号", "交易日期", "交易金额", "账户余额", "交易地点", "摘要"],
+            ["1", "2025-01-02", "-10.00", "90.00", "手机银行", "6.17两单6030"],
+            ["2", "2025-01-03", "-10.00", "80.00", "手机银行", "6.18订单号274114825757金额6030元"],
+            ["3", "2025-01-04", "-10.00", "70.00", "测试支行", ""],
+            ["4", "2025-01-05", "-5.00", "65.00", "另一支行", ""],
+            ["5", "2025-01-06", "-5.00", "60.00", "手机银行", "6.12"],
+        ]
+    ]
+    assert sources[0]["source_raw"] == {
+        "序号": "1",
+        "交易日期": "2025-01-02",
+        "交易金额": "-10.00",
+        "账户余额": "90.00",
+        "交易地点": "手机银行",
+        "摘要": "6.17两单6030",
+    }
+    assert sources[1]["source_raw"]["摘要"] == "6.18订单号274114825757金额6030元"
+    assert {"m1", "m2a", "m2b", "m2c"}.issubset(
+        {evidence_id for source in sources[:2] for evidence_id in source["evidence_ids"]}
+    )
+    assert "balance-location" in sources[2]["evidence_ids"]
+    assert "amount-balance-location" in sources[3]["evidence_ids"]
+    assert sources[2]["bbox"] == [25.0, 190.0, 410.0, 198.0]
+    assert sources[3]["bbox"] == [25.0, 230.0, 410.0, 238.0]
+    assert all("reconstruction_repairs" not in source for source in sources)
+
+
+def test_geometry_balance_location_split_requires_adjacent_forward_roles() -> None:
+    nonadjacent = _atom("nonadjacent", "90.00测试支行", 190.0, 110.0, 420.0)
+    nonadjacent_centers = [100.0, 200.0, 300.0, 400.0]
+    nonadjacent_bounds = [float("-inf"), 150.0, 250.0, 350.0, float("inf")]
+
+    reversed_roles = _atom("reversed", "90.00测试支行", 280.0, 110.0, 420.0)
+    reversed_centers = [100.0, 200.0, 300.0]
+    reversed_bounds = [float("-inf"), 150.0, 250.0, float("inf")]
+
+    assert (
+        _split_glued_geometry_data_atom(
+            nonadjacent,
+            nonadjacent_bounds,
+            nonadjacent_centers,
+            {"amount": 0, "balance": 1, "counter_party": 2, "transaction_location": 3},
+        )
+        == []
+    )
+    assert (
+        _split_glued_geometry_data_atom(
+            reversed_roles,
+            reversed_bounds,
+            reversed_centers,
+            {"transaction_location": 0, "amount": 1, "balance": 2},
+        )
+        == []
+    )
+
+
+def test_geometry_two_money_split_requires_adjacent_forward_roles() -> None:
+    cases = [
+        (
+            _atom("nonadjacent-money", "10.0020.00", 90.0, 110.0, 320.0),
+            [100.0, 200.0, 300.0],
+            [float("-inf"), 150.0, 250.0, float("inf")],
+            {"amount": 0, "counter_party": 1, "balance": 2},
+        ),
+        (
+            _atom("reversed-money", "10.0020.00", 190.0, 110.0, 320.0),
+            [100.0, 200.0, 300.0],
+            [float("-inf"), 150.0, 250.0, float("inf")],
+            {"balance": 0, "amount": 1, "transaction_location": 2},
+        ),
+        (
+            _atom("nonadjacent-residue", "10.0020.00测试支行", 90.0, 110.0, 420.0),
+            [100.0, 200.0, 300.0, 400.0],
+            [float("-inf"), 150.0, 250.0, 350.0, float("inf")],
+            {"amount": 0, "balance": 1, "counter_party": 2, "transaction_location": 3},
+        ),
+        (
+            _atom("reversed-residue", "10.0020.00测试支行", 190.0, 110.0, 420.0),
+            [100.0, 200.0, 300.0],
+            [float("-inf"), 150.0, 250.0, float("inf")],
+            {"transaction_location": 0, "amount": 1, "balance": 2},
+        ),
+    ]
+
+    for atom, centers, bounds, col_map in cases:
+        assert _split_glued_geometry_data_atom(atom, bounds, centers, col_map) == []
+
+
+def test_geometry_recovery_splits_fused_counterparty_headers_by_source_position() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 70.0),
+        _atom("hp", "记账日期", 80.0, 80.0, 130.0),
+        _atom("hs", "摘要", 140.0, 80.0, 170.0),
+        _atom("hdir", "支/收", 180.0, 80.0, 210.0),
+        _atom("ha", "交易金额", 220.0, 80.0, 270.0),
+        _atom("hb", "账户余额", 280.0, 80.0, 330.0),
+        _atom("hl", "交易地点", 340.0, 80.0, 390.0),
+        _atom("hcounter", "对方户名对方账户/对方银行", 410.0, 80.0, 570.0),
+        _atom("d", "2025-04-01", 20.0, 110.0, 70.0),
+        _atom("p", "2025-04-01", 80.0, 110.0, 130.0),
+        _atom("s", "汇款汇入", 140.0, 110.0, 175.0),
+        _atom("dir", "收", 190.0, 110.0, 200.0),
+        _atom("a", "300.00", 225.0, 110.0, 265.0),
+        _atom("b", "399.00", 285.0, 110.0, 325.0),
+        _atom("l", "测试支行", 340.0, 110.0, 390.0),
+        _atom("party", "测试商户", 410.0, 110.0, 445.0),
+        _atom("account", "AW8BAGYF12345", 455.0, 105.0, 535.0),
+        _atom("bank", "测试银行", 455.0, 118.0, 515.0),
+        _atom("footer", "打印完毕", 20.0, 150.0, 100.0),
+    ]
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert len(tables) == 1
+    assert tables[0][0][-2:] == ["对方户名", "对方账户/对方银行"]
+    assert tables[0][1][-2:] == ["测试商户", "AW8BAGYF12345测试银行"]
+
+
+def test_geometry_header_rejects_tall_glued_money_row_atom() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("hp", "记账日期", 70.0, 80.0, 110.0),
+        _atom("hs", "摘要", 120.0, 80.0, 150.0),
+        _atom("hm", "支/收交易金额账户余额交易地点", 170.0, 80.0, 360.0),
+        _atom("hparty", "对方户名", 400.0, 80.0, 450.0),
+        _atom("haccount", "对方账户/对方银行", 460.0, 80.0, 570.0),
+        _atom("first-row-money", "-1,000.0046,167.53测试支行", 205.0, 78.0, 365.0),
+    ]
+    next(atom for atom in atoms if atom["id"] == "first-row-money")["bbox"][3] = 118.0
+
+    header = _geometry_header(_expand_composite_header_atoms(atoms))
+
+    assert header is not None
+    assert all(not str(atom.get("text") or "").startswith("-1,000.00") for atom in header[0])
+
+
+def test_geometry_recovery_splits_source_atom_across_summary_direction_boundary() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("hp", "记账日期", 70.0, 80.0, 110.0),
+        _atom("hs", "摘要", 120.0, 80.0, 150.0),
+        _atom("hm", "支/收交易金额账户余额交易地点", 170.0, 80.0, 360.0),
+        _atom("d1", "2024-02-01", 20.0, 110.0, 60.0),
+        _atom("p1", "2024-02-01", 70.0, 110.0, 110.0),
+        _atom("summary-direction", "快捷支付支", 120.0, 110.0, 185.0),
+        _atom("amount", "-3.00", 205.0, 110.0, 240.0),
+        _atom("balance", "15.00", 265.0, 110.0, 300.0),
+        _atom("location", "测试支行", 320.0, 110.0, 365.0),
+        _atom("footer", "打印完毕", 20.0, 140.0, 100.0),
+    ]
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert len(tables) == 1
+    header, row = tables[0]
+    assert row[header.index("摘要")] == "快捷支付"
+    assert row[header.index("支/收")] == "支"
+
+
+def test_geometry_overlay_splitter_keeps_only_row_local_business_values() -> None:
+    row = [
+        "2024-06-19",
+        "户名：测试客户币种：⼈⺠币打印⽇期：2025-02-20记账⽇期2024-06-19",
+        "某银行交易流水2024-01-01-2024-12-31账摘要快捷支付",
+        "16:40:13⽀/收⽀",
+        "交易⾦额账户余额-38.00",
+        "某银行交易流水2024-01-01-2024-12-31账账户余额4,210.68",
+        "账户类型：活期交易地点测试支行",
+        "账号：123456789对⽅户名测试商户",
+        "2025年02月20日对⽅账户/对⽅银⾏99887766测试银行",
+    ]
+    col_map = {
+        "date": 0,
+        "posting_date": 1,
+        "summary": 2,
+        "direction": 3,
+        "amount": 4,
+        "balance": 5,
+        "transaction_location": 6,
+        "counter_party": 7,
+        "counter_account": 8,
+    }
+
+    repairs = _strip_geometry_page_header_overlay(row, col_map)
+
+    assert row == [
+        "2024-06-19",
+        "2024-06-19",
+        "快捷支付",
+        "⽀",
+        "-38.00",
+        "4,210.68",
+        "测试支行",
+        "测试商户",
+        "99887766测试银行",
+    ]
+    assert {repair["field"] for repair in repairs} == {
+        "posting_date",
+        "summary",
+        "direction",
+        "amount",
+        "balance",
+        "transaction_location",
+        "counter_party",
+        "counter_account",
+    }
+
+
+def test_geometry_overlay_splitter_does_not_rewrite_clean_dedicated_values() -> None:
+    row = ["2024-06-19", "借Dr", "退款", "-8.00", "92.00"]
+    original = list(row)
+
+    repairs = _strip_geometry_page_header_overlay(
+        row,
+        {"date": 0, "direction": 1, "summary": 2, "amount": 3, "balance": 4},
+    )
+
+    assert row == original
+    assert repairs == []
+
+
+def test_geometry_header_and_rows_ignore_tall_overlapping_transaction_bboxes() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 20.0, 80.0, 60.0),
+        _atom("hp", "记账日期", 70.0, 80.0, 110.0),
+        _atom("hs", "摘要", 120.0, 80.0, 150.0),
+        _atom("hm", "支/收交易金额账户余额交易地点", 170.0, 80.0, 360.0),
+        _atom("hparty", "对方户名", 400.0, 80.0, 450.0),
+        _atom("haccount", "对方账户/对方银行", 460.0, 80.0, 570.0),
+        _atom("d1", "2024-02-01", 20.0, 78.0, 60.0),
+        _atom("p1", "2024-02-01", 70.0, 78.0, 110.0),
+        _atom("s1", "入账", 120.0, 108.0, 150.0),
+        _atom("dir1", "收", 180.0, 108.0, 190.0),
+        _atom("a1", "8.00", 220.0, 108.0, 250.0),
+        _atom("b1", "18.00", 270.0, 108.0, 305.0),
+        _atom("l1", "测试支行", 320.0, 108.0, 370.0),
+        _atom("party1", "甲公司", 400.0, 108.0, 445.0),
+        _atom("account1", "10001", 460.0, 108.0, 510.0),
+        _atom("d2", "2024-02-02", 20.0, 108.0, 60.0),
+        _atom("p2", "2024-02-02", 70.0, 108.0, 110.0),
+        _atom("s2", "支出", 120.0, 138.0, 150.0),
+        _atom("dir2", "支", 180.0, 138.0, 190.0),
+        _atom("a2", "-3.00", 220.0, 138.0, 250.0),
+        _atom("b2", "15.00", 270.0, 138.0, 305.0),
+        _atom("l2", "另一支行", 320.0, 138.0, 370.0),
+        _atom("party2", "乙公司", 400.0, 138.0, 445.0),
+        _atom("account2", "10002", 460.0, 138.0, 510.0),
+        _atom("footer", "打印完毕", 20.0, 170.0, 100.0),
+    ]
+    for atom_id in ("d1", "p1", "d2", "p2"):
+        atom = next(item for item in atoms if item["id"] == atom_id)
+        atom["bbox"][3] = atom["bbox"][1] + 40.0
+
+    header = _geometry_header(_expand_composite_header_atoms(atoms))
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert header is not None
+    assert all("2024-02" not in str(atom.get("text") or "") for atom in header[0])
+    assert len(tables) == 1
+    assert [row[0] for row in tables[0][1:]] == ["2024-02-01", "2024-02-02"]
 
 
 def test_geometry_recovery_prefers_sequence_spine_and_repairs_glued_cells() -> None:
@@ -256,7 +1674,7 @@ def test_geometry_recovery_prefers_sequence_spine_and_repairs_glued_cells() -> N
     sources = recovered_evidence_atom_row_sources(parse_result)
 
     assert recovered_evidence_atom_expected_row_count(parse_result) == 3
-    assert recovered_evidence_atom_expected_row_evidence(parse_result) == (3, "page_transaction_anchors", 0.97)
+    assert recovered_evidence_atom_expected_row_evidence(parse_result) == (3, "positioned_date_anchors", 0.80)
     assert len(tables) == 1
     assert len(tables[0]) == 4
     assert tables[0][1] == ["1", "2025-01-02", "-10.00", "90.00", "税费社保", "待报解预算收入"]
@@ -264,6 +1682,199 @@ def test_geometry_recovery_prefers_sequence_spine_and_repairs_glued_cells() -> N
     assert tables[0][3] == ["3", "2025-01-04", "-10.00", "75.00", "网银跨行互联", "另一公司"]
     assert all(source["row_anchor_type"] == "sequence" for source in sources)
     assert any(source.get("reconstruction_repairs") for source in sources)
+
+
+def test_geometry_recovery_carries_proven_schema_to_headerless_continuation_page() -> None:
+    def on_page(atom: dict, page: int) -> dict:
+        return {**atom, "page_id": f"page:{page:04d}"}
+
+    page_one = [
+        _atom("hd", "交易时间", 55.0, 80.0, 105.0),
+        _atom("ha", "交易金额", 145.0, 80.0, 200.0),
+        _atom("hb", "账户余额", 225.0, 80.0, 280.0),
+        _atom("ht", "交易类型", 300.0, 80.0, 360.0),
+        _atom("hn", "交易备注", 390.0, 80.0, 470.0),
+        _atom("d1", "2025-01-02 08:10:00", 55.0, 110.0, 120.0),
+        _atom("a1", "+10.00", 160.0, 110.0, 195.0),
+        _atom("b1", "110.00", 235.0, 110.0, 275.0),
+        _atom("t1", "汇入汇款", 310.0, 110.0, 355.0),
+        _atom("n1", "首笔", 400.0, 110.0, 430.0),
+    ]
+    page_two = [
+        on_page(_atom("page", "Page 2 of 2", 390.0, 5.0, 470.0), 2),
+        on_page(_atom("d2", "2025-01-03 09:20:00", 55.0, 58.0, 120.0), 2),
+        on_page(_atom("a2", "-5.00", 160.0, 58.0, 195.0), 2),
+        on_page(_atom("b2", "105.00", 235.0, 58.0, 275.0), 2),
+        on_page(_atom("t2", "协议支付", 310.0, 58.0, 355.0), 2),
+        on_page(_atom("n2", "续页首笔", 400.0, 58.0, 455.0), 2),
+        on_page(_atom("wrap", "补充附言", 400.0, 83.0, 455.0), 2),
+        on_page(_atom("d3", "2025-01-04 10:30:00", 55.0, 92.0, 120.0), 2),
+        on_page(_atom("a3", "+20.00", 160.0, 92.0, 195.0), 2),
+        on_page(_atom("b3", "125.00", 235.0, 92.0, 275.0), 2),
+        on_page(_atom("t3", "转账", 310.0, 92.0, 355.0), 2),
+        on_page(_atom("n3", "续页次笔", 400.0, 92.0, 455.0), 2),
+    ]
+    # These tokens have the right x positions but not one transaction baseline;
+    # carrying the schema must not convert them into a third-page ledger.
+    page_three = [
+        on_page(_atom("prose-date", "截至2025-01-05", 55.0, 70.0, 120.0), 3),
+        on_page(_atom("prose-amount", "说明金额30.00", 160.0, 90.0, 210.0), 3),
+        on_page(_atom("prose-balance", "参考余额155.00", 235.0, 110.0, 300.0), 3),
+    ]
+    parse_result = _result([*page_one, *page_two, *page_three])
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert [len(table) - 1 for table in tables] == [1, 2]
+    assert sum(len(table) - 1 for table in tables) == 3
+    assert [source["source_page"] for source in sources] == [1, 2, 2]
+    assert tables[1][1][-1] == "续页首笔"
+    assert tables[1][2][-1] == "补充附言续页次笔"
+    assert tables[1][2][:3] == ["2025-01-0410:30:00", "+20.00", "125.00"]
+
+
+def test_geometry_frame_rules_do_not_merge_multiple_rows() -> None:
+    atoms = [
+        _atom("hd", "交易日期", 55.0, 80.0, 105.0),
+        _atom("ha", "交易金额", 145.0, 80.0, 200.0),
+        _atom("hb", "账户余额", 225.0, 80.0, 280.0),
+        _atom("d1", "2025-02-01", 55.0, 110.0, 105.0),
+        _atom("a1", "+1.00", 160.0, 110.0, 195.0),
+        _atom("b1", "11.00", 235.0, 110.0, 275.0),
+        _atom("d2", "2025-02-02", 55.0, 130.0, 105.0),
+        _atom("a2", "+2.00", 160.0, 130.0, 195.0),
+        _atom("b2", "13.00", 235.0, 130.0, 275.0),
+    ]
+    frame_rules = [
+        {"id": "top", "page_id": "page:0001", "bbox": [0.0, 100.0, 600.0, 100.0]},
+        {"id": "bottom", "page_id": "page:0001", "bbox": [0.0, 145.0, 600.0, 145.0]},
+    ]
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms, frame_rules))
+
+    assert tables == [
+        [
+            ["交易日期", "交易金额", "账户余额"],
+            ["2025-02-01", "+1.00", "11.00"],
+            ["2025-02-02", "+2.00", "13.00"],
+        ]
+    ]
+
+
+def test_compound_datetime_and_money_header_expands_to_semantic_roles() -> None:
+    atoms = _expand_composite_header_atoms(
+        [
+            _atom("datetime", "日期时间", 20.0, 80.0, 90.0),
+            _atom("money", "支/收交易金额账户余额交易地点", 120.0, 80.0, 400.0),
+            _atom("party", "对方户名", 430.0, 80.0, 500.0),
+        ]
+    )
+
+    header = _geometry_header(atoms)
+
+    assert header is not None
+    assert set(header[1]).issuperset({"timestamp", "direction", "amount", "balance"})
+
+
+def test_compound_direction_amount_header_preserves_dedicated_direction() -> None:
+    atoms = _expand_composite_header_atoms(
+        [
+            _atom("date", "交易日期", 20.0, 80.0, 90.0),
+            _atom("summary", "摘要", 100.0, 80.0, 150.0),
+            _atom("money", "支/收交易金额", 160.0, 80.0, 300.0),
+            _atom("balance", "账户余额", 320.0, 80.0, 390.0),
+        ]
+    )
+
+    header = _geometry_header(atoms)
+    normalized = BankStatementCommunityPlugin()._normalize(
+        {"交易日期": "2025-02-01", "收/支": "收", "交易金额": "12.34", "账户余额": "56.78"}
+    )
+
+    assert header is not None
+    assert set(header[1]).issuperset({"date", "direction", "amount", "balance"})
+    assert normalized["direction"] == "income"
+
+
+def test_geometry_recovery_preserves_second_tier_business_column_per_row() -> None:
+    atoms = [
+        _atom("hd", "日期时间", 20.0, 80.0, 90.0),
+        _atom("hs", "日志号", 130.0, 80.0, 180.0),
+        _atom("hm", "短摘要", 200.0, 80.0, 250.0),
+        _atom("ha", "交易金额", 270.0, 80.0, 320.0),
+        _atom("hb", "本次余额", 360.0, 80.0, 410.0),
+        _atom("aux-header", "对方账号户名/附言", 130.0, 95.0, 250.0),
+        _atom("d1", "20250102081000", 20.0, 120.0, 100.0),
+        _atom("s1", "1001", 140.0, 120.0, 175.0),
+        _atom("m1", "转账", 210.0, 120.0, 240.0),
+        _atom("a1", "+10.00", 280.0, 120.0, 315.0),
+        _atom("b1", "110.00", 370.0, 120.0, 405.0),
+        _atom("aux1a", "622200001", 130.0, 133.0, 180.0),
+        _atom("aux1b", "第一笔附言", 185.0, 133.0, 250.0),
+        _atom("d2", "20250103092000", 20.0, 150.0, 100.0),
+        _atom("s2", "1002", 140.0, 150.0, 175.0),
+        _atom("m2", "支付", 210.0, 150.0, 240.0),
+        _atom("a2", "-5.00", 280.0, 150.0, 315.0),
+        _atom("b2", "105.00", 370.0, 150.0, 405.0),
+        _atom("aux2a", "622200002", 130.0, 163.0, 180.0),
+        _atom("aux2b", "第二笔附言", 185.0, 163.0, 250.0),
+    ]
+
+    tables = recover_evidence_atom_bank_tables(_result(atoms))
+
+    assert tables == [
+        [
+            ["日期时间", "日志号", "短摘要", "交易金额", "本次余额", "对方账号户名/附言"],
+            ["20250102081000", "1001", "转账", "+10.00", "110.00", "622200001第一笔附言"],
+            ["20250103092000", "1002", "支付", "-5.00", "105.00", "622200002第二笔附言"],
+        ]
+    ]
+
+
+def test_icbc_geometry_recovery_preserves_exact_raw_source_headers() -> None:
+    headers = [
+        "交易日期",
+        "账号",
+        "储种",
+        "序号",
+        "币种",
+        "钞汇",
+        "摘要",
+        "地区",
+        "收入/支出金额",
+        "余额",
+        "渠道",
+    ]
+    row = [
+        "2022-09-0410:01:14",
+        "1104060001031076947",
+        "活期",
+        "00000",
+        "人民币",
+        "钞",
+        "消费",
+        "1104",
+        "-23.00",
+        "268.08",
+        "快捷支付",
+    ]
+    centers = [35.0, 105.0, 185.0, 235.0, 285.0, 330.0, 375.0, 420.0, 475.0, 535.0, 580.0]
+    atoms = [
+        _atom(f"h{index}", header, center - 18.0, 80.0, center + 18.0)
+        for index, (header, center) in enumerate(zip(headers, centers))
+    ]
+    atoms.extend(
+        _atom(f"r{index}", value, center - 18.0, 110.0, center + 18.0)
+        for index, (value, center) in enumerate(zip(row, centers))
+    )
+    parse_result = _result(atoms)
+
+    tables = recover_evidence_atom_bank_tables(parse_result)
+    sources = recovered_evidence_atom_row_sources(parse_result)
+
+    assert tables == [[headers, row]]
+    assert sources[0]["source_raw"] == dict(zip(headers, row))
 
 
 def test_candidate_selection_rejects_balance_chain_weaker_near_tie():
@@ -281,7 +1892,7 @@ def test_candidate_selection_rejects_balance_chain_weaker_near_tie():
 def test_candidate_selection_preserves_richer_equal_quality_source_columns():
     selected, diagnostics = _select_candidate(
         [
-            _candidate("legacy_primary", source_column_width=8.0),
+            _candidate("parser:grid_standard", source_column_width=8.0),
             _candidate(
                 "evidence_atom",
                 expected_rows=RowCountEvidence(count=3, source="positioned_date_anchors", confidence=0.95),
@@ -292,8 +1903,8 @@ def test_candidate_selection_preserves_richer_equal_quality_source_columns():
     )
 
     assert selected is not None
-    assert selected.candidate_id == "legacy_primary"
-    assert diagnostics["selected_candidate"] == "legacy_primary"
+    assert selected.candidate_id == "parser:grid_standard"
+    assert diagnostics["selected_candidate"] == "parser:grid_standard"
 
 
 def test_candidate_selection_prefers_equal_quality_native_physical_cells() -> None:
@@ -326,7 +1937,7 @@ def test_candidate_selection_prefers_equal_quality_native_physical_cells() -> No
 def test_candidate_derived_count_cannot_replace_full_native_candidate():
     selected, _diagnostics = _select_candidate(
         [
-            _candidate("legacy_primary", rows=4),
+            _candidate("parser:grid_standard", rows=4),
             _candidate(
                 "evidence_atom",
                 rows=3,
@@ -337,7 +1948,7 @@ def test_candidate_derived_count_cannot_replace_full_native_candidate():
     )
 
     assert selected is not None
-    assert selected.candidate_id == "legacy_primary"
+    assert selected.candidate_id == "parser:grid_standard"
 
 
 def test_candidate_selection_penalizes_rows_above_independent_total():
@@ -351,6 +1962,458 @@ def test_candidate_selection_penalizes_rows_above_independent_total():
 
     assert selected is not None
     assert selected.candidate_id == "exact"
+
+
+def test_source_width_tiebreaker_cannot_override_exact_independent_count() -> None:
+    evidence = RowCountEvidence(count=10, source="header_total", confidence=0.94)
+    selected, _diagnostics = _select_candidate(
+        [
+            _candidate("exact", rows=10, expected_rows=evidence, source_column_width=7.0),
+            _candidate("wider_over", rows=12, expected_rows=evidence, source_column_width=8.0),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "exact"
+
+
+def test_partial_sequence_cannot_override_conflicting_issuer_total() -> None:
+    issuer_total = RowCountEvidence(count=63, source="split_footer", confidence=0.98)
+    partial_sequence = RowCountEvidence(count=27, source="continuous_source_sequence", confidence=0.99)
+
+    selected, _diagnostics = _select_candidate(
+        [
+            _candidate("complete", rows=63, expected_rows=issuer_total),
+            _candidate("truncated_sequence", rows=27, expected_rows=partial_sequence),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "complete"
+
+
+def test_partial_sequence_evidence_is_not_used_against_conflicting_issuer_total() -> None:
+    rows = [{"序号": str(index), "交易日期": "2024-01-01"} for index in range(1, 13)]
+    sequence = _continuous_source_sequence_evidence(rows)
+    issuer_total = RowCountEvidence(count=475, source="split_footer", confidence=0.98)
+
+    if sequence is not None and issuer_total.count != sequence.count:
+        sequence = None
+
+    assert sequence is None
+
+
+def test_page_anchor_conflict_does_not_promote_bare_candidate_sequence() -> None:
+    anchors = RowCountEvidence(count=475, source="page_transaction_anchors", confidence=0.93)
+    rows = [{"序号": str(index), "交易日期": "2024-01-01"} for index in range(1, 550)]
+
+    assert _candidate_row_count_evidence(rows, anchors) == anchors
+
+
+def test_non_one_sequence_span_does_not_self_certify_from_amount_totals() -> None:
+    rows = [{"序号": str(value), "_source": {"source_page": 1 + (value - 571) // 19}} for value in range(571, 656)]
+    page_texts = [(page, "序号 记账日 借方发生额 贷方发生额 余额\n借方合计 1.00 贷方合计 2.00") for page in range(1, 6)]
+    evidence = _page_complete_sequence_evidence(rows, page_count=5, page_texts=page_texts)
+
+    assert evidence is None
+
+
+def test_complete_page_local_sequence_resets_prove_sum() -> None:
+    rows = [
+        {"序号": str(value), "_source": {"source_page": page}}
+        for page, count in enumerate((20, 21, 19, 15), start=1)
+        for value in range(1, count + 1)
+    ]
+
+    counts = (20, 21, 19, 15)
+    page_texts = []
+    for page, count in enumerate(counts, start=1):
+        rows_text = "\n".join(
+            f"| {value} |220401|220401|交易| |REF{value}| | 1.00| 2.00|SERIAL|NOTE|" for value in range(1, count + 1)
+        )
+        page_texts.append(
+            (
+                page,
+                "\n".join(
+                    [
+                        f"Page {page} of 4",
+                        "|No. |Bk.D. |Val.D.| Type |Vou.| Details | Debit Amount | Credit Amount | Balance | Reference No. | Notes |",
+                        rows_text,
+                        "Debit Total Credit Total Current Page Balance",
+                    ]
+                ),
+            )
+        )
+    evidence = _page_complete_sequence_evidence(rows, page_count=4, page_texts=page_texts)
+
+    assert evidence == RowCountEvidence(75, "complete_page_local_sequences", 0.80)
+
+
+def test_page_local_sequence_source_census_rejects_missing_candidate_tail() -> None:
+    candidate_rows = [{"序号": str(value), "_source": {"source_page": 1}} for value in range(1, 6)]
+    source_rows = "\n".join(f"| {value} |220401|220401|交易| |REF| | 1.00| 2.00|SERIAL|NOTE|" for value in range(1, 7))
+    page_text = "\n".join(
+        [
+            "Page 1 of 1",
+            "|No. |Bk.D. |Val.D.| Type |Vou.| Details | Debit Amount | Credit Amount | Balance | Reference No. | Notes |",
+            source_rows,
+            "Debit Total Credit Total Current Page Balance",
+        ]
+    )
+
+    assert (
+        _page_complete_sequence_evidence(
+            candidate_rows,
+            page_count=1,
+            page_texts=[(1, page_text)],
+        )
+        is None
+    )
+
+
+def test_page_complete_sequence_evidence_rejects_gap_reset_and_missing_page() -> None:
+    assert (
+        _page_complete_sequence_evidence(
+            [
+                {"序号": "1", "_source": {"source_page": 1}},
+                {"序号": "3", "_source": {"source_page": 1}},
+            ],
+            page_count=1,
+            page_texts=[(1, "序号 记账日\n借方合计 1.00 贷方合计 2.00")],
+        )
+        is None
+    )
+    assert (
+        _page_complete_sequence_evidence(
+            [
+                {"序号": "1", "_source": {"source_page": 1}},
+                {"序号": "2", "_source": {"source_page": 1}},
+            ],
+            page_count=2,
+            page_texts=[
+                (1, "序号 记账日\n借方合计 1.00 贷方合计 2.00"),
+                (2, "序号 记账日\n借方合计 1.00 贷方合计 2.00"),
+            ],
+        )
+        is None
+    )
+
+
+def test_page_sequence_prefixes_do_not_prove_count_without_source_boundaries() -> None:
+    rows = [{"序号": str(value), "_source": {"source_page": page}} for page in (1, 2) for value in range(1, 6)]
+
+    assert (
+        _page_complete_sequence_evidence(
+            rows,
+            page_count=2,
+            page_texts=[(1, "序号 记账日"), (2, "序号 记账日")],
+        )
+        is None
+    )
+
+
+def test_non_one_span_does_not_prove_omitted_edge_rows_without_source_boundaries() -> None:
+    rows = [{"序号": str(value), "_source": {"source_page": 1 if value <= 20 else 2}} for value in range(11, 31)]
+
+    assert (
+        _page_complete_sequence_evidence(
+            rows,
+            page_count=2,
+            page_texts=[(1, "序号 记账日"), (2, "序号 记账日")],
+        )
+        is None
+    )
+
+
+def test_fuller_candidate_outranks_shorter_heuristic_page_anchors() -> None:
+    selected, _diagnostics = _select_candidate(
+        [
+            _candidate(
+                "evidence_atom",
+                rows=475,
+                expected_rows=RowCountEvidence(
+                    count=475,
+                    source="page_transaction_anchors",
+                    confidence=0.93,
+                ),
+                field_completeness=1.0,
+                sequence_continuity=0.50,
+            ),
+            _candidate(
+                "native_wide_table",
+                rows=549,
+                expected_rows=RowCountEvidence(
+                    count=549,
+                    source="continuous_source_sequence",
+                    confidence=0.80,
+                ),
+                field_completeness=0.989,
+                native_cell_coverage=1.0,
+                sequence_continuity=1.0,
+            ),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "native_wide_table"
+
+
+def test_fuller_candidate_tolerates_tiny_relative_optional_column_sparsity() -> None:
+    selected, _diagnostics = _select_candidate(
+        [
+            _candidate(
+                "native_wide_table:page_prefix",
+                rows=14,
+                score=0.9925,
+                extraction_confidence=0.99,
+                native_cell_coverage=1.0,
+                source_column_width=14.5714,
+            ),
+            _candidate(
+                "parser:grid_standard",
+                rows=70,
+                score=0.9900,
+                extraction_confidence=0.95,
+                source_column_width=14.3143,
+            ),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "parser:grid_standard"
+
+
+def test_full_exact_sequence_outranks_shorter_exact_prefix() -> None:
+    selected, _diagnostics = _select_candidate(
+        [
+            _candidate(
+                "parser:grid_standard",
+                rows=475,
+                expected_rows=RowCountEvidence(
+                    count=475,
+                    source="continuous_source_sequence",
+                    confidence=0.99,
+                ),
+                source_page_coverage=0.95,
+                balance_chain_score=0.97,
+            ),
+            _candidate(
+                "native_wide_table",
+                rows=12,
+                expected_rows=RowCountEvidence(
+                    count=12,
+                    source="continuous_source_sequence",
+                    confidence=0.99,
+                ),
+                source_page_coverage=1.0,
+                balance_chain_score=1.0,
+                native_cell_coverage=1.0,
+            ),
+        ]
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "parser:grid_standard"
+
+
+def test_registry_does_not_reemit_semantically_rejected_candidate_through_fallback(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.style_registry as registry_module
+    from docmirror.plugins.bank_statement.context import StyleContext
+    from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
+    from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
+
+    rejected = BankTableCandidate(
+        candidate_id="parser:grid_standard",
+        records=[{"交易日期": "2025-01-02", "交易金额": "25.00", "收/支": "支出"}],
+        source="parser:grid_standard",
+        canonical_rows=0,
+        directional_rows=1,
+        source_page_rows=0,
+        expected_rows=None,
+        balance_chain_score=0.0,
+        field_completeness=1.0,
+        score=0.0,
+        rejection_reason="source_role_corruption",
+    )
+    monkeypatch.setattr(registry_module, "_collect_table_candidates", lambda *_args, **_kwargs: [rejected])
+
+    def forbidden_fallback(*_args, **_kwargs):
+        raise AssertionError("a semantically rejected candidate must not bypass selection through a fallback parser")
+
+    monkeypatch.setattr(registry_module, "_run_parser", forbidden_fallback)
+    ctx = StyleContext(tables=[], full_text="", institution=None, page_count=1, parse_result=None)
+    detection = StyleDetectionResult(primary_style="grid_standard", parser_chain=["grid_standard"])
+
+    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+
+    assert records == []
+
+
+def test_native_recovery_streams_compete_as_whole_table_alternatives(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.style_registry as registry_module
+    from docmirror.plugins.bank_statement.context import StyleContext
+    from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
+
+    headers = ["序号", "交易日期", "交易金额", "余额"]
+    first = [headers, ["1", "2025-01-01", "+1.00", "1.00"], ["2", "2025-01-02", "+1.00", "2.00"]]
+    second = [headers, ["1", "2025-01-01", "+1.00", "1.00"], ["2", "2025-01-02", "+1.00", "2.00"]]
+    monkeypatch.setattr(registry_module, "recover_wide_bank_tables", lambda *_args: [first, second])
+    monkeypatch.setattr(registry_module, "recover_evidence_atom_bank_tables", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(registry_module, "recover_positioned_record_block_bank_tables", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_module, "_semantic_text_table_candidates", lambda *_args: [])
+    monkeypatch.setattr(
+        registry_module,
+        "_run_parser",
+        lambda _parser, ctx, _plugin: (
+            [
+                {
+                    "序号": row[0],
+                    "交易日期": row[1],
+                    "交易金额": row[2],
+                    "余额": row[3],
+                }
+                for table in ctx.tables
+                for row in table[1:]
+            ],
+            lambda raw: {
+                "sequence_no": raw["序号"],
+                "date": raw["交易日期"],
+                "amount": abs(float(raw["交易金额"])),
+                "direction": "income" if raw["交易金额"].startswith("+") else "expense",
+                "balance": float(raw["余额"]),
+            },
+        ),
+    )
+    plugin = SimpleNamespace(
+        standard_fields=["sequence_no", "date", "amount", "direction", "balance"],
+        _normalize=lambda raw: raw,
+    )
+    ctx = StyleContext(tables=[], full_text="", institution=None, page_count=1, parse_result=None)
+    detection = StyleDetectionResult(primary_style="grid_standard", parser_chain=[])
+
+    candidates = _collect_table_candidates(detection, ctx, plugin)
+    native = [candidate for candidate in candidates if candidate.candidate_id.startswith("native_wide_table")]
+
+    assert [(candidate.candidate_id, len(candidate.records)) for candidate in native] == [
+        ("native_wide_table:0", 2),
+        ("native_wide_table:1", 2),
+    ]
+    selected, _diagnostics = _select_candidate(native)
+    assert selected is not None
+    assert len(selected.records) == 2
+
+
+def test_disjoint_native_streams_combine_when_independent_total_proves_union(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.style_registry as registry_module
+    from docmirror.plugins.bank_statement.context import StyleContext
+    from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
+
+    headers = ["序号", "交易日期", "交易金额", "余额"]
+    first = [headers, ["1", "2025-01-01", "+1.00", "1.00"], ["2", "2025-01-02", "+1.00", "2.00"]]
+    second = [headers, ["3", "2025-01-03", "+1.00", "3.00"], ["4", "2025-01-04", "+1.00", "4.00"]]
+    monkeypatch.setattr(registry_module, "recover_wide_bank_tables", lambda *_args: [first, second])
+    monkeypatch.setattr(registry_module, "recover_evidence_atom_bank_tables", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(registry_module, "recover_positioned_record_block_bank_tables", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_module, "_semantic_text_table_candidates", lambda *_args: [])
+    monkeypatch.setattr(
+        registry_module,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(4, "split_footer", 0.98),
+    )
+    monkeypatch.setattr(
+        registry_module,
+        "_run_parser",
+        lambda _parser, ctx, _plugin: (
+            [
+                {"序号": row[0], "交易日期": row[1], "交易金额": row[2], "余额": row[3]}
+                for table in ctx.tables
+                for row in table[1:]
+            ],
+            lambda raw: {
+                "sequence_no": raw["序号"],
+                "date": raw["交易日期"],
+                "amount": abs(float(raw["交易金额"])),
+                "direction": "income",
+                "balance": float(raw["余额"]),
+            },
+        ),
+    )
+    plugin = SimpleNamespace(
+        standard_fields=["sequence_no", "date", "amount", "direction", "balance"],
+        _normalize=lambda raw: raw,
+    )
+    ctx = StyleContext(tables=[], full_text="", institution=None, page_count=1, parse_result=None)
+    detection = StyleDetectionResult(primary_style="grid_standard", parser_chain=[])
+
+    native = [
+        candidate
+        for candidate in _collect_table_candidates(detection, ctx, plugin)
+        if candidate.candidate_id.startswith("native_wide_table")
+    ]
+    selected, _diagnostics = _select_candidate(native)
+
+    assert selected is not None
+    assert selected.candidate_id == "native_wide_table:combined"
+    assert [record["序号"] for record in selected.records] == ["1", "2", "3", "4"]
+
+
+def test_overlapping_native_streams_do_not_combine_even_when_counts_sum_to_issuer_total(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.style_registry as registry_module
+    from docmirror.plugins.bank_statement.context import StyleContext
+    from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
+
+    headers = ["序号", "交易日期", "交易金额", "余额"]
+    first = [headers, ["1", "2025-01-01", "+1.00", "1.00"], ["2", "2025-01-02", "+1.00", "2.00"]]
+    second = [headers, ["1", "2025-01-01", "+1.00", "1.00"], ["2", "2025-01-02", "+1.00", "2.00"]]
+    monkeypatch.setattr(registry_module, "recover_wide_bank_tables", lambda *_args: [first, second])
+    monkeypatch.setattr(registry_module, "recover_evidence_atom_bank_tables", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(registry_module, "recover_positioned_record_block_bank_tables", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(registry_module, "_semantic_text_table_candidates", lambda *_args: [])
+    monkeypatch.setattr(
+        registry_module,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(4, "split_footer", 0.98),
+    )
+
+    def run_parser(_parser, ctx, _plugin):
+        rows = []
+        for table_index, table in enumerate(ctx.tables):
+            for row_index, row in enumerate(table[1:], start=1):
+                rows.append(
+                    {
+                        "序号": row[0],
+                        "交易日期": row[1],
+                        "交易金额": row[2],
+                        "余额": row[3],
+                        "_source": {
+                            "source_page": 1,
+                            "bbox": [10.0, row_index * 20.0 + table_index, 200.0, row_index * 20.0 + 10.0],
+                        },
+                    }
+                )
+        return rows, lambda raw: {
+            "sequence_no": raw["序号"],
+            "date": raw["交易日期"],
+            "amount": abs(float(raw["交易金额"])),
+            "direction": "income",
+            "balance": float(raw["余额"]),
+        }
+
+    monkeypatch.setattr(registry_module, "_run_parser", run_parser)
+    plugin = SimpleNamespace(
+        standard_fields=["sequence_no", "date", "amount", "direction", "balance"],
+        _normalize=lambda raw: raw,
+    )
+    ctx = StyleContext(tables=[], full_text="", institution=None, page_count=1, parse_result=None)
+    detection = StyleDetectionResult(primary_style="grid_standard", parser_chain=[])
+
+    native = [
+        candidate
+        for candidate in _collect_table_candidates(detection, ctx, plugin)
+        if candidate.candidate_id.startswith("native_wide_table")
+    ]
+
+    assert [candidate.candidate_id for candidate in native] == ["native_wide_table:0", "native_wide_table:1"]
 
 
 def test_recovers_complete_split_debit_credit_rows():
@@ -1045,8 +3108,9 @@ def test_recovers_borderless_embedded_direction_amount_rows():
 
     assert len(tables) == 1
     assert len(tables[0]) == 3
-    assert tables[0][1][2] == "跨行代付收"
-    assert tables[0][1][3] == "23,903.69"
+    assert tables[0][1][2] == "跨行代付"
+    assert tables[0][1][3] == "收"
+    assert tables[0][1][4] == "23,903.69"
 
 
 def test_recovers_staggered_multilingual_borderless_header():
@@ -1208,7 +3272,7 @@ def test_uses_positioned_page_text_when_evidence_atoms_are_not_promoted():
     assert "r2" in sources[0]["evidence_ids"]
 
 
-def test_dedupe_uses_bank_reference_before_lossy_business_fields():
+def test_dedupe_does_not_treat_unproven_repeated_reference_as_row_identity():
     base = {"normalized": {"date": "2026-01-02", "amount": 100.0, "balance": 200.0, "counter_party": "甲"}}
     records = [
         {**base, "raw": {"交易流水号": "REF001"}},
@@ -1218,7 +3282,7 @@ def test_dedupe_uses_bank_reference_before_lossy_business_fields():
 
     deduped = dedupe_transaction_rows(records)
 
-    assert len(deduped) == 2
+    assert len(deduped) == 3
 
 
 def test_dedupe_preserves_distinct_rows_that_share_a_bank_reference():
@@ -1252,7 +3316,7 @@ def test_dedupe_preserves_distinct_rows_that_share_a_bank_reference():
     assert len(deduped) == 2
 
 
-def test_dedupe_keeps_same_business_fields_when_sequence_differs():
+def test_dedupe_does_not_collapse_unproven_repeated_sequence_rows():
     base = {"date": "2026-01-02", "amount": 100.0, "balance": 200.0, "counter_party": "same"}
     records = [
         {"normalized": {**base, "sequence_no": "491"}, "raw": {}},
@@ -1262,7 +3326,7 @@ def test_dedupe_keeps_same_business_fields_when_sequence_differs():
 
     deduped = dedupe_transaction_rows(records)
 
-    assert [record["normalized"]["sequence_no"] for record in deduped] == ["491", "638"]
+    assert [record["normalized"]["sequence_no"] for record in deduped] == ["491", "638", "638"]
 
 
 def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
@@ -1286,7 +3350,21 @@ def test_recovers_bank_header_title_and_total_row_count_from_evidence_atoms():
     assert fields["query_period"]["normalized_value"] == "2026-01-01 至 2026-06-30"
     assert fields["total_transactions"]["normalized_value"] == "38"
     assert fields["account_number"]["normalized_value"] == "1234567890"
-    assert fields["bank_name"]["normalized_value"] == "浦发银行重庆分行营业部"
+    assert fields["branch_name"]["normalized_value"] == "浦发银行重庆分行营业部"
+    assert "bank_name" not in fields
+
+
+def test_evidence_identity_requires_an_explicit_issuer_label_for_bank_name():
+    atoms = [
+        _atom("bank_label", "银行名称", 10.0, 20.0, 70.0),
+        _atom("bank_value", "测试银行", 80.0, 18.0, 150.0),
+    ]
+
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(_result(atoms))
+
+    assert fields["bank_name"]["normalized_value"] == "测试银行"
+    assert fields["bank_name"]["raw_name"] == "银行名称"
+    assert fields["bank_name"]["source_refs"][0]["source"] == "canonical_evidence_atoms"
 
 
 def test_evidence_identity_ignores_native_atoms_rejected_by_ocr_fallback():
@@ -1382,7 +3460,7 @@ def test_evidence_identity_recovers_split_header_values_and_directional_totals()
     assert fields["currency"]["raw_value"] == "人民币"
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["query_period"]["normalized_value"] == "2025-07-01 至 2025-07-31"
-    assert fields["total_transactions"]["normalized_value"] == "11"
+    assert "total_transactions" not in fields
 
 
 def test_evidence_identity_pairs_parallel_label_value_columns_by_geometry():
@@ -1405,7 +3483,8 @@ def test_evidence_identity_pairs_parallel_label_value_columns_by_geometry():
     assert fields["account_holder"]["normalized_value"] == "测试信用管理有限公司"
     assert fields["currency"]["raw_value"] == "人民币"
     assert fields["currency"]["normalized_value"] == "CNY"
-    assert fields["bank_name"]["normalized_value"] == "富滇银行"
+    assert fields["branch_name"]["normalized_value"] == "富滇银行"
+    assert "bank_name" not in fields
 
 
 def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():
@@ -1429,7 +3508,7 @@ def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():
     assert fields["account_holder"]["normalized_value"] == "测试农业科技有限公司"
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["query_period"]["normalized_value"] == "2025-11-01 至 2025-12-31"
-    assert fields["total_transactions"]["normalized_value"] == "4"
+    assert "total_transactions" not in fields
 
 
 def test_evidence_identity_normalizes_compatibility_currency_without_changing_raw_value():

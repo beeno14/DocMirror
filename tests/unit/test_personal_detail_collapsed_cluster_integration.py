@@ -14,7 +14,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
     _apply_account_facts,
     _extract_employment_records,
     _extract_table_accounts,
+    _special_transaction_type,
 )
+from tests.unit.personal_detail_employment_test_support import employment_page
 
 
 def _table(table_id: str, *rows: list[str]) -> SimpleNamespace:
@@ -44,6 +46,96 @@ def _result(*tables: SimpleNamespace) -> SimpleNamespace:
         tables_continue=lambda _left, _right: False,
         _personal_detail_extraction_issues=[],
     )
+
+
+def _lin_account_13_pair_table() -> SimpleNamespace:
+    """Return the exact source lattice surrounding Lin account 13's pair."""
+
+    rows = [
+        ["管理机构", "账户标识 开立日期", "到期日期", "借款金额", "账户币种"],
+        [
+            "重庆市蚂蚁商诚小 额贷款有限公司",
+            "8 蚂蚁借呗合并 20200222J101011 2020.02.22 1033080944075 Y7",
+            "",
+            "10,200",
+            "人民币元",
+        ],
+        ["业务种类", "担保方式 还款期数 心", "还款频率", '还款方式 "', "共同借款标志"],
+        ["其他个人消费贷款", "信用/免担保 12", "月", "", "无"],
+    ]
+    row_edges = (51.0, 66.0, 91.5, 104.0, 117.0)
+    column_edges = (32.0, 92.5, 209.5, 269.0, 327.5, 387.5)
+    cell_bboxes = [
+        [
+            [
+                column_edges[column],
+                row_edges[row],
+                column_edges[column + 1],
+                row_edges[row + 1],
+            ]
+            for column in range(5)
+        ]
+        for row in range(4)
+    ]
+    cell_status = [["exact" for _column in range(5)] for _row in range(4)]
+    cell_evidence_ids = [
+        [[f"ocr:test:{row}:{column}"] for column in range(5)]
+        for row in range(4)
+    ]
+    cell_evidence_ids[2][1] = [
+        "ocr:sp0005:lp0009:0018",
+        "ocr:sp0005:lp0009:0019",
+        "ocr:sp0005:lp0009:0023",
+    ]
+    cell_evidence_ids[3][1] = [
+        "ocr:sp0005:lp0009:0025",
+        "ocr:sp0005:lp0009:0026",
+    ]
+    cell_bboxes[3][3] = None
+    cell_status[3][3] = "derived"
+    cell_evidence_ids[3][3] = []
+    geometry = {
+        "coordinate_system": "pdf_points_top_left",
+        "cell_bboxes": cell_bboxes,
+        "cell_geometry_status": cell_status,
+        "cell_evidence_ids": cell_evidence_ids,
+        "cell_spans": [
+            {
+                "row": 2,
+                "col": 3,
+                "row_span": 2,
+                "col_span": 1,
+                "bbox": [269.0, 91.5, 327.5, 117.0],
+            }
+        ],
+        "row_bands": [
+            {"index": row, "y0": row_edges[row], "y1": row_edges[row + 1]}
+            for row in range(4)
+        ],
+        "col_bands": [
+            {
+                "index": column,
+                "x0": column_edges[column],
+                "x1": column_edges[column + 1],
+            }
+            for column in range(5)
+        ],
+    }
+    return SimpleNamespace(
+        table_id="pt_9_0",
+        metadata={"raw_rows": rows, "geometry": geometry},
+        headers=[],
+        rows=[],
+        bbox=[32.0, 51.0, 387.5, 117.0],
+        confidence=0.99,
+    )
+
+
+def _lin_account_13_page(table: SimpleNamespace) -> SimpleNamespace:
+    page = _page(table)
+    page.page_number = 9
+    page.source_page_number = 5
+    return page
 
 
 def _account_base_rows(*trailing_rows: list[str]) -> list[list[str]]:
@@ -88,12 +180,17 @@ def test_collapsed_employment_rows_bind_only_unique_business_fields() -> None:
         ["编号工作单位单位性质单位地址单位电话"],
         ["1 福建海峡粮油购销有限公司 国有企业 鼓楼区鼓屏路60号13层 059100000000"],
         ["2 北方星河科技有限公司 国有企业 私营企业 海州市新城路8号 01012345678"],
+        ["3 甲私营企业有限公司 福建省福州市星河路8号 01087654321"],
     )
-    result = _result(table)
+    result = SimpleNamespace(
+        pages=[employment_page(table, logical_page=2, source_page=1)],
+        tables_continue=lambda _left, _right: False,
+        _personal_detail_extraction_issues=[],
+    )
 
     records = _extract_employment_records(result)
 
-    assert [record["sequence"] for record in records] == [1, 2]
+    assert [record["sequence"] for record in records] == [1, 2, 3]
     assert {
         field: records[0][field]
         for field in ("employer", "employer_type", "employer_address", "employer_phone")
@@ -117,6 +214,20 @@ def test_collapsed_employment_rows_bind_only_unique_business_fields() -> None:
         and issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
     }
     assert {"employer", "employer_type", "employer_address"} <= unresolved
+
+    nested = records[2]
+    assert nested["employer_phone"] == "01087654321"
+    assert all(
+        field not in nested
+        for field in ("employer", "employer_type", "employer_address")
+    )
+    nested_unresolved = {
+        issue.get("field_name")
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("target_record_id") == nested["employment_record_id"]
+        and issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+    }
+    assert {"employer", "employer_type", "employer_address"} <= nested_unresolved
 
 
 def test_collapsed_account_terms_bind_typed_fields_without_column_order_guessing() -> None:
@@ -168,6 +279,237 @@ def test_collapsed_loan_classification_keeps_unique_guarantee_and_business_type(
     assert account["repayment_periods"] == 36
     assert not any(
         issue.get("field_name") in {"business_type", "guarantee_type"}
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+def test_clean_guarantee_period_pair_is_a_closed_account_cluster() -> None:
+    table = _table(
+        "account-guarantee-periods-clean",
+        ["担保方式 还款期数"],
+        ["信用/免担保 12"],
+    )
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {
+        "account_id": "credit_account:non_revolving_loan:13",
+        "account_type": "non_revolving_loan",
+        "canonical_raw": {},
+    }
+
+    _apply_account_facts(
+        result,
+        account,
+        table.metadata["raw_rows"],
+        page=_page(table),
+        table=table,
+    )
+
+    assert account["guarantee_type"] == "信用/免担保"
+    assert account["repayment_periods"] == 12
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_account_header_han_residue_corrected"
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+def test_lin_account_13_damaged_pair_uses_exact_value_cell_and_reports_header() -> None:
+    table = _lin_account_13_pair_table()
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {
+        "account_id": "credit_account:non_revolving_loan:13",
+        "account_type": "non_revolving_loan",
+        "canonical_raw": {},
+    }
+
+    _apply_account_facts(
+        result,
+        account,
+        table.metadata["raw_rows"],
+        page=_lin_account_13_page(table),
+        table=table,
+    )
+
+    assert account["guarantee_type"] == "信用/免担保"
+    assert account["repayment_periods"] == 12
+    for field_name in ("guarantee_type", "repayment_periods"):
+        refs = account["source_refs_by_field"][field_name]
+        assert len(refs) == 1
+        expected_ref = {
+            "source": "native_detail_table_cell",
+            "logical_page": 9,
+            "source_page": 5,
+            "table_id": "pt_9_0",
+            "row": 3,
+            "column": 1,
+            "geometry_scope": "cell",
+            "bbox": [92.5, 104.0, 209.5, 117.0],
+            "evidence_ids": [
+                "ocr:sp0005:lp0009:0025",
+                "ocr:sp0005:lp0009:0026",
+            ],
+            "binding": "bounded_canonical_account_header_residue_cluster",
+            "binding_quality": "bounded_canonical_account_header_residue_cluster",
+        }
+        assert {key: refs[0].get(key) for key in expected_ref} == expected_ref
+
+    correction = next(
+        issue
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("issue_code")
+        == "candidate_b_account_header_han_residue_corrected"
+    )
+    assert correction["status"] == "resolved"
+    assert correction["severity"] == "info"
+    assert correction["observed_value"] == {
+        "raw_header": "担保方式 还款期数 心",
+        "unassigned_header_residue": "心",
+    }
+    assert correction["target_record_id"] == account["account_id"]
+    assert correction["source_refs"][0]["bbox"] == [92.5, 91.5, 209.5, 104.0]
+    assert correction["source_refs"][0]["evidence_ids"] == [
+        "ocr:sp0005:lp0009:0018",
+        "ocr:sp0005:lp0009:0019",
+        "ocr:sp0005:lp0009:0023",
+    ]
+    assert correction["source_refs"][1]["bbox"] == [92.5, 104.0, 209.5, 117.0]
+    assert not any(
+        issue.get("field_name") in {"guarantee_type", "repayment_periods"}
+        and issue.get("status") != "resolved"
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "two_han_residue",
+        "ascii_residue",
+        "missing_header_evidence",
+        "missing_value_evidence",
+        "shared_evidence",
+        "derived_value_geometry",
+        "shifted_value_bbox",
+        "merged_value_cell",
+        "nonconsecutive_projection",
+        "native_text_mismatch",
+        "card_account_family",
+    ],
+)
+def test_lin_account_13_damaged_pair_fails_closed_without_exact_lattice(
+    defect: str,
+) -> None:
+    table = _lin_account_13_pair_table()
+    rows = table.metadata["raw_rows"]
+    geometry = table.metadata["geometry"]
+    physical_row_indices = None
+    account_type = "non_revolving_loan"
+    if defect == "two_han_residue":
+        rows[2][1] = "担保方式 还款期数 心爱"
+    elif defect == "ascii_residue":
+        rows[2][1] = "担保方式 还款期数 X"
+    elif defect == "missing_header_evidence":
+        geometry["cell_evidence_ids"][2][1] = []
+    elif defect == "missing_value_evidence":
+        geometry["cell_evidence_ids"][3][1] = []
+    elif defect == "shared_evidence":
+        geometry["cell_evidence_ids"][3][1].append(
+            "ocr:sp0005:lp0009:0018"
+        )
+    elif defect == "derived_value_geometry":
+        geometry["cell_geometry_status"][3][1] = "derived"
+    elif defect == "shifted_value_bbox":
+        geometry["cell_bboxes"][3][1] = [93.75, 104.0, 210.75, 117.0]
+    elif defect == "merged_value_cell":
+        geometry["cell_spans"].append(
+            {
+                "row": 3,
+                "col": 1,
+                "row_span": 1,
+                "col_span": 2,
+                "bbox": [92.5, 104.0, 269.0, 117.0],
+            }
+        )
+    elif defect == "nonconsecutive_projection":
+        physical_row_indices = [0, 1, 2, 4]
+    elif defect == "native_text_mismatch":
+        rows = [list(row) for row in rows]
+        table.metadata["raw_rows"][2][1] = "担保方式 还款期数 林"
+    elif defect == "card_account_family":
+        account_type = "credit_card"
+
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {
+        "account_id": "credit_account:non_revolving_loan:13",
+        "account_type": account_type,
+        "canonical_raw": {},
+    }
+    _apply_account_facts(
+        result,
+        account,
+        rows,
+        page=_lin_account_13_page(table),
+        table=table,
+        physical_row_indices=physical_row_indices,
+    )
+
+    assert "guarantee_type" not in account
+    assert "repayment_periods" not in account
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_account_header_han_residue_corrected"
+        for issue in result._personal_detail_extraction_issues
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "retained_field", "unresolved_field"),
+    [
+        ("信用/免担保 12 24", "guarantee_type", "repayment_periods"),
+        ("信用/免担保 抵押 12", "repayment_periods", "guarantee_type"),
+    ],
+)
+def test_lin_account_13_damaged_pair_reports_ambiguous_typed_value(
+    raw_value: str,
+    retained_field: str,
+    unresolved_field: str,
+) -> None:
+    table = _lin_account_13_pair_table()
+    table.metadata["raw_rows"][3][1] = raw_value
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {
+        "account_id": "credit_account:non_revolving_loan:13",
+        "account_type": "non_revolving_loan",
+        "canonical_raw": {},
+    }
+
+    _apply_account_facts(
+        result,
+        account,
+        table.metadata["raw_rows"],
+        page=_lin_account_13_page(table),
+        table=table,
+    )
+
+    assert retained_field in account
+    assert unresolved_field not in account
+    unresolved_issue = next(
+        issue
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("field_name") == unresolved_field
+        and issue.get("issue_code")
+        == "candidate_b_account_cluster_field_unresolved"
+    )
+    assert unresolved_issue["source_refs"][0]["bbox"] == [
+        92.5,
+        104.0,
+        209.5,
+        117.0,
+    ]
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_account_header_han_residue_corrected"
+        and issue.get("status") == "resolved"
         for issue in result._personal_detail_extraction_issues
     )
 
@@ -522,6 +864,97 @@ def test_ambiguous_special_transaction_reports_each_unresolved_slot() -> None:
     assert {"transaction_type", "changed_months", "amount", "details"} <= unresolved
 
 
+def test_exact_invalid_special_transaction_type_is_withheld_and_cell_reported() -> None:
+    table = _table(
+        "special-transaction-invalid-exact-cell",
+        ["特殊交易类型", "发生日期", "变更月数", "发生金额", "明细记录"],
+        ["提前结消", "2023.03.13", "0", "45,247", "提前还款"],
+    )
+    table.metadata.update(
+        {
+            "source_cell_bboxes": [
+                [[10 + 20 * column, 10, 28 + 20 * column, 20] for column in range(5)],
+                [[10 + 20 * column, 20, 28 + 20 * column, 30] for column in range(5)],
+            ],
+            "cell_evidence_ids": [
+                [[f"header-{column}"] for column in range(5)],
+                [[f"value-{column}"] for column in range(5)],
+            ],
+        }
+    )
+    page = _page(table)
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {"account_id": "credit_account:revolving_loan_subaccount:16"}
+
+    events = _account_events(result, account, page, table, table.metadata["raw_rows"])
+
+    assert len(events) == 1
+    event = events[0]
+    assert "transaction_type" not in event
+    assert event["canonical_raw"]["transaction_type"] == ["提前结消"]
+    issue = next(
+        row
+        for row in result._personal_detail_extraction_issues
+        if row.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        and row.get("target_record_id") == event["account_event_id"]
+        and row.get("field_name") == "transaction_type"
+    )
+    assert issue["observed_value"] == ["提前结消"]
+    assert issue["source_refs"] == [
+        {
+            "source": "native_detail_table_cell",
+            "logical_page": 2,
+            "source_page": 1,
+            "table_id": "special-transaction-invalid-exact-cell",
+            "row": 1,
+            "column": 0,
+            "evidence_ids": ["value-0"],
+            "binding_quality": "canonical_header_column",
+            "binding": "canonical_field_slot",
+            "canonical_row": 1,
+            "canonical_column": 0,
+            "geometry_scope": "cell",
+            "bbox": [10, 20, 28, 30],
+            "field_name": "transaction_type",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "提前结清",
+        "提前还款",
+        "提前还款(全部)",
+        "提前还款（部分）",
+        "展期",
+        "展期（延期）",
+        "延期",
+        "担保人代还",
+        "以资抵债",
+        "其他",
+        "提前还款(全部),变更月数-55个月",
+    ],
+)
+def test_special_transaction_type_accepts_only_registered_business_forms(raw: str) -> None:
+    assert _special_transaction_type(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "提前结消",
+        "提前结算",
+        "提前结清备注",
+        "担保人代",
+        "随机交易",
+        "提前还款(全部),变更金额-55元",
+    ],
+)
+def test_special_transaction_type_rejects_unregistered_near_misses(raw: str) -> None:
+    assert _special_transaction_type(raw) is None
+
+
 @pytest.mark.parametrize(
     ("header", "continuation_rows", "event_type", "expected"),
     [
@@ -665,7 +1098,7 @@ def test_trailing_optional_account_fact_labels_are_consumed_or_reported(boundary
     unresolved_fields = {
         issue.get("field_name")
         for issue in result._personal_detail_extraction_issues
-        if issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        if issue.get("issue_code") == "candidate_b_exact_slot_value_row_missing"
         and issue.get("target_record_id") == accounts[0]["account_id"]
     }
     assert {"repayment_frequency", "repayment_method"} <= unresolved_fields

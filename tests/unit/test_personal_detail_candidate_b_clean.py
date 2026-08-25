@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.credit_report.personal_detail_scanned import candidate_b, native_extraction
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import CandidateBPipeline
 from docmirror.plugins.credit_report.personal_detail_scanned.context import (
@@ -219,6 +221,96 @@ def test_final_account_issue_reconciliation_preserves_same_source_invalid_and_co
     assert all(record.get("_unresolved_fields") for record in records)
 
 
+def test_new_currency_issues_require_evidence_bearing_corrected_cell_ref() -> None:
+    record_id = "credit_account:test:currency"
+    geometry_only_ref = _exact_account_field_ref(
+        bbox_top=300.0,
+        field_name="currency",
+    )
+    record = {
+        "account_id": record_id,
+        "account_currency": "CNY",
+        "source_refs_by_field": {"currency": [geometry_only_ref]},
+        "_unresolved_fields": ["currency"],
+        "_invalid_observation_fields": ["currency"],
+        "_reported_invalid_fields": ["currency"],
+    }
+    issue_ref = _account_issue_ref(row=1, column=5, field_name="currency")
+    issues = [
+        _active_account_issue(
+            record_id=record_id,
+            field_name="account_currency",
+            issue_code=issue_code,
+            source_ref=issue_ref,
+        )
+        for issue_code in (
+            "candidate_b_account_required_field_unresolved",
+            "candidate_b_exact_slot_value_unreadable",
+        )
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+
+    candidate_b._reconcile_final_account_field_issues(context, [record])
+
+    assert context._personal_detail_extraction_issues == issues
+    assert record["_unresolved_fields"] == ["currency"]
+    assert record["_invalid_observation_fields"] == ["currency"]
+    assert record["_reported_invalid_fields"] == ["currency"]
+
+
+def test_final_currency_issue_reconciliation_uses_unambiguous_target_remap() -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        register_issue_target_remap,
+    )
+
+    provisional_id = "credit_account_table_observation:pt_23_1"
+    record_id = "credit_account:credit_card:20"
+    issue_ref = _account_issue_ref(row=1, column=5, field_name="currency")
+    corrected_ref = {
+        "source": "personal_detail_corrected_page_cell",
+        "logical_page": 4,
+        "source_page": 2,
+        "bbox": [270.0, 120.0, 300.0, 135.0],
+        "geometry_scope": "cell",
+        "evidence_ids": ["repair:currency:20"],
+        "binding": "canonical_field_slot",
+        "binding_quality": "canonical_field_slot",
+        "field_slot_role": "value",
+        "field_name": "currency",
+    }
+    record = {
+        "account_id": record_id,
+        "account_currency": "CNY",
+        "source_refs_by_field": {"currency": [corrected_ref]},
+        "_unresolved_fields": ["currency"],
+        "_invalid_observation_fields": ["currency"],
+        "_reported_invalid_fields": ["currency"],
+    }
+    issues = [
+        _active_account_issue(
+            record_id=provisional_id,
+            field_name="account_currency",
+            issue_code="candidate_b_exact_slot_value_unreadable",
+            source_ref=issue_ref,
+        ),
+        _active_account_issue(
+            record_id=record_id,
+            field_name="currency",
+            issue_code="candidate_b_account_required_field_unresolved",
+            source_ref=issue_ref,
+        ),
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=issues)
+    register_issue_target_remap(context, provisional_id, record_id)
+
+    candidate_b._reconcile_final_account_field_issues(context, [record])
+
+    assert context._personal_detail_extraction_issues == []
+    assert "_unresolved_fields" not in record
+    assert "_invalid_observation_fields" not in record
+    assert "_reported_invalid_fields" not in record
+
+
 def test_candidate_b_branch_has_no_shared_extraction_or_assembly_imports() -> None:
     root = Path("docmirror/plugins/credit_report/personal_detail_scanned")
     active = "\n".join(
@@ -430,6 +522,125 @@ def test_profile_address_preserves_province_name_inside_community_proper_name() 
     assert not hasattr(context, "_personal_detail_extraction_issues")
 
 
+def _profile_address_token_residue_context(
+    *,
+    raw: str = "2 福建省福州市鼓楼区华林路1号",
+    ordinal_text: str = "2",
+    address_text: str = "福建省福州市鼓楼区华林路1号",
+    ordinal_bbox: tuple[float, float, float, float] = (2.0, 12.0, 5.0, 18.0),
+    address_bbox: tuple[float, float, float, float] = (10.0, 12.0, 90.0, 18.0),
+    cell_span: int = 2,
+    evidence_ids: tuple[str, ...] = ("address-ordinal", "address-value"),
+    token_ids: tuple[str, ...] = ("address-ordinal", "address-value"),
+) -> SimpleNamespace:
+    value_cell = SimpleNamespace(
+        bbox=[0.0, 30.0, 100.0, 40.0],
+        geometry_status="exact",
+        evidence_ids=list(evidence_ids),
+        token_ids=list(token_ids),
+        row_span=1,
+        col_span=cell_span,
+    )
+    table = SimpleNamespace(
+        table_id="profile-address-token-residue",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "source_logical_page": 1,
+            "source_page": 1,
+            "raw_rows": [
+                ["性别", "", "", ""],
+                ["男", "", "", ""],
+                ["通讯地址", "", "户籍地址", ""],
+                [raw, "", "--", ""],
+            ],
+            "source_cell_bboxes": [
+                [[0, 0, 25, 10], None, None, None],
+                [[0, 10, 25, 20], None, None, None],
+                [[0, 20, 100, 30], None, [100, 20, 200, 30], None],
+                [[0, 30, 100, 40], None, [100, 30, 200, 40], None],
+            ],
+            "cell_evidence_ids": [
+                [["gender-header"], [], [], []],
+                [["gender-value"], [], [], []],
+                [["address-header"], [], ["household-header"], []],
+                [list(evidence_ids), [], ["household-value"], []],
+            ],
+            "cell_geometry_status": [
+                ["exact", "derived", "derived", "derived"],
+                ["exact", "derived", "derived", "derived"],
+                ["exact", "derived", "exact", "derived"],
+                ["exact", "derived", "exact", "derived"],
+            ],
+        },
+        rows=[],
+        source_cell_objects=[
+            [None, None, None, None],
+            [None, None, None, None],
+            [None, None, None, None],
+            [value_cell, None, None, None],
+        ],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    atoms = [
+        {
+            "id": "address-ordinal",
+            "text": ordinal_text,
+            "bbox": [ordinal_bbox[0], ordinal_bbox[1] + 20, ordinal_bbox[2], ordinal_bbox[3] + 20],
+        },
+        {
+            "id": "address-value",
+            "text": address_text,
+            "bbox": [address_bbox[0], address_bbox[1] + 20, address_bbox[2], address_bbox[3] + 20],
+        },
+    ]
+    return SimpleNamespace(
+        pages=[page],
+        evidence_plane=SimpleNamespace(evidence=SimpleNamespace(text_atoms=atoms)),
+    )
+
+
+def test_profile_address_removes_independently_owned_sequence_residue() -> None:
+    context = _profile_address_token_residue_context()
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["mailing_address"]["normalized_value"] == "福建省福州市鼓楼区华林路1号"
+    assert profile["mailing_address"]["raw"] == "2 福建省福州市鼓楼区华林路1号"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_raw"),
+    [
+        ({"ordinal_text": "20A"}, "2 福建省福州市鼓楼区华林路1号"),
+        ({"address_text": "示例路1号"}, "2 福建省福州市鼓楼区华林路1号"),
+        ({"ordinal_bbox": (2.0, 12.0, 20.0, 18.0)}, "2 福建省福州市鼓楼区华林路1号"),
+        ({"address_bbox": (4.0, 12.0, 90.0, 18.0)}, "2 福建省福州市鼓楼区华林路1号"),
+        ({"cell_span": 1}, "2 福建省福州市鼓楼区华林路1号"),
+        (
+            {"evidence_ids": ("address-ordinal",), "token_ids": ("address-ordinal",)},
+            "2 福建省福州市鼓楼区华林路1号",
+        ),
+        ({"raw": "3 福建省福州市鼓楼区华林路1号"}, "3 福建省福州市鼓楼区华林路1号"),
+    ],
+)
+def test_profile_address_sequence_residue_fails_closed(
+    overrides: dict[str, object],
+    expected_raw: str,
+) -> None:
+    context = _profile_address_token_residue_context(**overrides)
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["mailing_address"]["normalized_value"] == expected_raw
+    assert profile["mailing_address"]["normalized_value"] != "福建省福州市鼓楼区华林路1号"
+
+
 def test_profile_address_rejects_structural_region_and_provider_concatenation() -> None:
     contaminated = (
         "福建省福州市鼓楼区华林路1号 福建省厦门市思明区湖滨路2号",
@@ -503,7 +714,7 @@ def test_profile_address_with_multiple_provider_markers_is_withheld_and_reported
     }
 
 
-def test_profile_schema_decodes_collapsed_canonical_identity_cells() -> None:
+def test_profile_schema_withholds_collapsed_scalars_without_exact_token_owners() -> None:
     table = SimpleNamespace(
         table_id="identity-profile-collapsed",
         metadata={
@@ -536,21 +747,418 @@ def test_profile_schema_decodes_collapsed_canonical_identity_cells() -> None:
         for field, entry in profile.items()
         if entry["normalized_value"] is not None
     } == {
-        "gender": "男",
-        "birth_date": "2002-08-03",
-        "marital_status": "未婚",
-        "employment_status": "职员",
-        "education_level": "大专",
-        "nationality": "中国（含港澳台）",
         "email": "1838961623@qq.com",
     }
-    assert profile["degree"]["normalized_value"] is None
-    assert profile["degree"]["raw"] == ["光 大专"]
+    assert "nationality" not in profile
+    assert not any(
+        issue.get("field_name") == "nationality"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+    assert "marital_status" not in profile
+    assert not any(
+        issue.get("field_name") == "marital_status"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+    for field in (
+        "gender",
+        "birth_date",
+        "employment_status",
+        "education_level",
+        "degree",
+    ):
+        assert profile[field]["normalized_value"] is None
+        assert any(
+            issue.get("issue_code") == "candidate_b_profile_contract_unresolved"
+            and issue.get("field_name") == field
+            for issue in context._personal_detail_extraction_issues
+        )
+
+
+@pytest.mark.parametrize(
+    "provider",
+    (
+        "导某银行股份有限公司",
+        "S 某银行股份有限公司",
+        "某银行股份有限公司 Ss",
+    ),
+)
+def test_profile_address_provider_never_deletes_unowned_source_glyphs(
+    provider: str,
+) -> None:
+    address = "福建省福州市鼓楼区华林路1号"
+    raw = f"{address} 数据发生机构名称 {provider}"
+
+    profile, context = _profile_with_mailing_address(raw)
+    entry = profile["mailing_address"]
+
+    assert entry["normalized_value"] == address
+    assert entry["raw"] == raw
+    assert entry["provider_evidence"]["normalized_value"] is None
+    assert entry["provider_evidence"]["observation_status"] == "unreadable"
     assert any(
-        issue.get("issue_code") == "candidate_b_profile_contract_unresolved"
-        and issue.get("field_name") == "degree"
+        issue.get("issue_code") == "candidate_b_profile_provider_contract_unresolved"
+        and issue.get("field_name") == "mailing_address.data_provider"
+        and issue.get("observed_value") == provider
         for issue in context._personal_detail_extraction_issues
     )
+
+
+def test_candidate_b_publishes_owner_census_before_projection_only(
+    monkeypatch,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+    )
+    from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+        prepare_personal_detail_source_collections as real_prepare,
+    )
+
+    captured_facts: dict[str, object] = {}
+    metadata_id = "personal_report_metadata:production-owner"
+    canonical_audit = {
+        "registrations": [
+            {
+                "logical_page": 1,
+                "source_page": 1,
+                "template_id": "report_header_and_identity",
+                "status": "registered",
+            },
+            {
+                "logical_page": 3,
+                "source_page": 3,
+                "template_id": "report_header_and_identity",
+                "status": "registered",
+            }
+        ],
+        "fragment_groups": [
+            {
+                "template_id": "report_header_and_identity",
+                "fragment_logical_pages": [1],
+                "source_pages": [1],
+            },
+            {
+                "template_id": "report_header_and_identity",
+                "fragment_logical_pages": [3],
+                "source_pages": [3],
+            }
+        ],
+    }
+    context = SimpleNamespace(
+        pages=[],
+        reading_order_by_logical={},
+        account_collections=lambda: ([], [], []),
+        corrected_repayment_records=lambda: [],
+        corrected_repayment_micro_grids=lambda: [],
+        prepare_candidate_b_business_repair=lambda _payload: False,
+        correct_candidate_b_datasets=lambda payload: payload,
+        ocr_correction_audit=lambda: {"business_repair": {}},
+        canonical_layout_audit=lambda: canonical_audit,
+        page_topology_audit=lambda: {},
+        _personal_detail_extraction_issues=[
+            make_issue(
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_exact_slot_value_unreadable",
+                message="Exact report-header subject name was unreadable.",
+                parser_stage="candidate_b_report_header_exact_slot",
+                target_dataset="personal_report_metadata",
+                target_record_id=metadata_id,
+                field_name="subject_name",
+                observed_value={"raw": "", "slot_state": "blank_or_unreadable"},
+                source_refs=(
+                    {
+                        "source": "native_detail_table_cell",
+                        "logical_page": 3,
+                        "source_page": 3,
+                        "table_id": "report-header-page-three",
+                        "row": 1,
+                        "column": 0,
+                        "bbox": [20.0, 40.0, 120.0, 60.0],
+                        "geometry_scope": "cell",
+                        "evidence_ids": ["native:report-header-page-three:1:0"],
+                        "binding": "canonical_field_slot",
+                        "binding_quality": "canonical_header_column",
+                        "field_name": "subject_name",
+                    },
+                ),
+                reason_codes=(
+                    "canonical_field_slot",
+                    "normalized_value_withheld",
+                ),
+            )
+        ],
+    )
+
+    def empty(_context):
+        return []
+
+    for name in (
+        "_extract_credit_lines",
+        "_extract_employment_records",
+        "_extract_inquiries",
+        "_extract_liabilities",
+        "_extract_postpaid_payment_history",
+        "_extract_postpaid_records",
+        "_extract_public_records",
+        "_extract_recovery_records",
+        "_extract_residence_records",
+        "_extract_source_rows",
+    ):
+        monkeypatch.setattr(native_extraction, name, empty)
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_header_datasets",
+        lambda _context, _text: {
+            "personal_report_metadata": [
+                {
+                    "record_id": metadata_id,
+                    "personal_report_metadata_id": metadata_id,
+                    "subject_name": None,
+                    "primary_id_type": None,
+                    "primary_id_number": None,
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        native_extraction, "_extract_personal_notes", lambda _context: ([], [])
+    )
+    monkeypatch.setattr(
+        native_extraction, "_extract_profile_detail_records", lambda _context: {}
+    )
+    monkeypatch.setattr(
+        native_extraction, "_extract_summary_datasets", lambda _context: ([], [])
+    )
+    monkeypatch.setattr(
+        native_extraction, "_record_pre_repair_source_gaps", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        native_extraction, "_source_completeness_ledger", lambda _context: {}
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "reconcile_candidate_b_credit_lines",
+        lambda _context, rows: rows,
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.profile_extraction.extract_candidate_b_profile",
+        lambda _context: {},
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.relations.link_candidate_b_repayments",
+        lambda rows, *_args, **_kwargs: rows,
+    )
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.relations.derive_candidate_b_overdue_records",
+        lambda *_args: [],
+    )
+
+    def capture_projection(payload, _business, **_kwargs):
+        captured_facts.update(payload["facts"])
+        return real_prepare(payload, _business, **_kwargs)
+
+    monkeypatch.setattr(
+        "docmirror.plugins.credit_report.personal_detail_scanned.source_projection.prepare_personal_detail_source_collections",
+        capture_projection,
+    )
+
+    result = CandidateBPipeline(context, "").run()
+
+    assert captured_facts["_personal_detail_canonical_layout_owner_census"] == canonical_audit
+    assert "_personal_detail_canonical_layout_owner_census" not in result.section_content["facts"]
+    assert result.audit["canonical_layout"] == canonical_audit
+    assert result.audit["canonical_layout"] is not canonical_audit
+    mirror = [
+        issue
+        for issue in result.section_content["datasets"][
+            "personal_detail_extraction_issues"
+        ]
+        if issue.get("issue_code") == "source_bound_profile_field_omitted"
+    ]
+    assert len(mirror) == 1
+    assert mirror[0]["target_dataset"] == "personal_profile"
+    assert mirror[0]["target_record_id"] == "personal_profile:1"
+    assert mirror[0]["field_name"] == "subject_name"
+
+
+def test_profile_schema_recovers_clipped_nationality_header_only_from_exact_four_column_signature() -> None:
+    header_atom = SimpleNamespace(id="h2", text="国", bbox=[55.0, 1.0, 65.0, 9.0])
+    value_atom = SimpleNamespace(
+        id="v2",
+        text="中国(含港澳台)",
+        bbox=[52.0, 11.0, 73.0, 19.0],
+    )
+    header_cell = SimpleNamespace(
+        text="国",
+        geometry_status="exact",
+        evidence_ids=["h2"],
+        token_ids=["h2"],
+        bbox=[50.0, 0.0, 75.0, 10.0],
+    )
+    value_cell = SimpleNamespace(
+        text="中国(含港澳台)",
+        geometry_status="exact",
+        evidence_ids=["v2"],
+        token_ids=["v2"],
+        bbox=[50.0, 10.0, 75.0, 20.0],
+    )
+    table = SimpleNamespace(
+        table_id="identity-profile-clipped-nationality",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [
+                ["学历", "学位", "国", "电子邮箱"],
+                ["大专", "--", "中国(含港澳台)", "user@example.com"],
+            ],
+            "source_cell_bboxes": [
+                [[0, 0, 25, 10], [25, 0, 50, 10], [50, 0, 75, 10], [75, 0, 100, 10]],
+                [[0, 10, 25, 20], [25, 10, 50, 20], [50, 10, 75, 20], [75, 10, 100, 20]],
+            ],
+            "cell_evidence_ids": [
+                [["h0"], ["h1"], ["h2"], ["h3"]],
+                [["v0"], ["v1"], ["v2"], ["v3"]],
+            ],
+            "cell_geometry_status": [["exact"] * 4, ["exact"] * 4],
+        },
+        rows=[],
+        source_cell_objects=[
+            [None, None, header_cell, None],
+            [None, None, value_cell, None],
+        ],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+
+    profile = extract_candidate_b_profile(
+        SimpleNamespace(
+            pages=[page],
+            evidence_plane=SimpleNamespace(
+                evidence=SimpleNamespace(text_atoms=[header_atom, value_atom])
+            ),
+        )
+    )
+
+    assert profile["nationality"]["normalized_value"] == "中国(含港澳台)"
+    ref = profile["nationality"]["source_refs"][0]
+    assert ref["bbox"] == [50, 10, 75, 20]
+    assert ref["evidence_ids"] == ["v2"]
+    assert ref["geometry_status"] == "exact"
+
+
+def test_profile_schema_does_not_infer_clipped_nationality_without_complete_signature() -> None:
+    table = SimpleNamespace(
+        table_id="identity-profile-clipped-nationality-incomplete",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "raw_rows": [
+                ["学历", "学位", "国", ""],
+                ["大专", "--", "中国(含港澳台)", ""],
+            ],
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+
+    profile = extract_candidate_b_profile(SimpleNamespace(pages=[page]))
+
+    assert "nationality" not in profile
+
+
+def _visual_profile_degree_context(*, dash_only: bool) -> SimpleNamespace:
+    import cv2
+    import numpy as np
+
+    image = np.full((100, 200, 3), 255, dtype=np.uint8)
+    if dash_only:
+        cv2.line(image, (82, 40), (90, 40), (0, 0, 0), 2)
+        cv2.line(image, (98, 40), (106, 40), (0, 0, 0), 2)
+    else:
+        cv2.rectangle(image, (84, 31), (102, 49), (0, 0, 0), -1)
+    value_cell = SimpleNamespace(
+        bbox=[20.0, 20.0, 180.0, 60.0],
+        geometry_status="exact",
+        evidence_ids=["degree-value"],
+    )
+    table = SimpleNamespace(
+        table_id="identity-profile-visual-degree",
+        metadata={
+            "canonical_template_id": "report_header_and_identity",
+            "source_logical_page": 1,
+            "source_page": 1,
+            "raw_rows": [["学位"], ["中"]],
+            "source_cell_bboxes": [[[20, 5, 180, 20]], [[20, 20, 180, 60]]],
+            "cell_evidence_ids": [[[
+                "degree-header"
+            ]], [["degree-value"]]],
+            "cell_geometry_status": [["exact"], ["exact"]],
+        },
+        rows=[],
+        source_cell_objects=[[None], [value_cell]],
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        canonical_template_id="report_header_and_identity",
+        tables=[table],
+    )
+    return SimpleNamespace(
+        pages=[page],
+        _page_image_resolver=lambda _page: {
+            "image": image,
+            "page_width": 200.0,
+            "page_height": 100.0,
+        },
+    )
+
+
+def test_profile_schema_visual_dash_shape_recovers_exact_source_absence() -> None:
+    context = _visual_profile_degree_context(dash_only=True)
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["degree"]["normalized_value"] is None
+    assert profile["degree"]["observation_status"] == "source_absent"
+    assert profile["degree"]["raw"] == ["--"]
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+def test_profile_schema_visual_dash_shape_rejects_non_dash_foreground() -> None:
+    context = _visual_profile_degree_context(dash_only=False)
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["degree"]["normalized_value"] is None
+    assert profile["degree"]["observation_status"] == "unreadable"
+    assert profile["degree"]["raw"] == ["中"]
+    assert context._personal_detail_extraction_issues[0]["field_name"] == "degree"
+
+
+def test_profile_schema_visual_dash_shape_ignores_pale_watermark_and_specks() -> None:
+    import cv2
+    import numpy as np
+
+    context = _visual_profile_degree_context(dash_only=False)
+    image = context._page_image_resolver(1)["image"]
+    image[:] = 255
+    cv2.line(image, (94, 40), (99, 40), (65, 65, 65), 1)
+    cv2.line(image, (102, 40), (107, 40), (65, 65, 65), 1)
+    cv2.circle(image, (155, 35), 11, (190, 190, 190), 2)
+    image[35, 55] = np.asarray((100, 100, 100), dtype=np.uint8)
+
+    profile = extract_candidate_b_profile(context)
+
+    assert profile["degree"]["normalized_value"] is None
+    assert profile["degree"]["observation_status"] == "source_absent"
+    assert profile["degree"]["raw"] == ["--"]
+    assert not hasattr(context, "_personal_detail_extraction_issues")
 
 
 def test_profile_schema_does_not_mine_provider_suffix_for_identity_value() -> None:
@@ -603,7 +1211,7 @@ def test_profile_schema_keeps_printed_placeholder_as_source_absent() -> None:
     assert not hasattr(context, "_personal_detail_extraction_issues")
 
 
-def test_profile_schema_exposes_damaged_household_address_slot_for_review() -> None:
+def test_profile_schema_does_not_infer_household_address_from_damaged_label() -> None:
     table = SimpleNamespace(
         table_id="identity-profile-address-slots",
         metadata={
@@ -628,11 +1236,8 @@ def test_profile_schema_exposes_damaged_household_address_slot_for_review() -> N
     profile = extract_candidate_b_profile(context)
 
     assert profile["mailing_address"]["normalized_value"] == "福建省泉州市示例路1号"
-    assert profile["household_address"]["normalized_value"] is None
-    assert profile["household_address"]["observation_status"] == "unreadable"
-    issue = context._personal_detail_extraction_issues[0]
-    assert issue["field_name"] == "household_address"
-    assert issue["source_refs"][0]["logical_page"] == 1
+    assert "household_address" not in profile
+    assert not hasattr(context, "_personal_detail_extraction_issues")
 
 
 def test_profile_schema_ignores_residence_and_employment_contact_tables() -> None:
@@ -1154,8 +1759,10 @@ def test_account_schema_suppresses_unmatched_table_in_anchored_category(monkeypa
     accounts, _repayments, _events = native_extraction._extract_accounts(context)
 
     assert accounts == [anchor]
-    assert context._personal_detail_extraction_issues[1]["issue_code"] == (
-        "candidate_b_unmatched_account_table_suppressed"
+    assert any(
+        issue.get("issue_code")
+        == "candidate_b_unmatched_account_table_suppressed"
+        for issue in context._personal_detail_extraction_issues
     )
 
 
@@ -1259,7 +1866,7 @@ def test_unmatched_account_report_identifies_exact_suppressed_child_population(m
     assert "related_child_observations_suppressed" in issue["reason_codes"]
 
 
-def test_account_schema_keeps_unanchored_table_only_as_reported_partial(monkeypatch) -> None:
+def test_account_schema_withholds_unanchored_table_as_reported_observation(monkeypatch) -> None:
     table = {
         "account_id": "credit_account_table_observation:abc",
         "account_type": "credit_card",
@@ -1275,14 +1882,12 @@ def test_account_schema_keeps_unanchored_table_only_as_reported_partial(monkeypa
 
     assert repayments == []
     assert events == []
-    assert len(accounts) == 1
-    assert accounts[0]["management_institution"] == "样例银行"
-    assert "category_sequence" not in accounts[0]
-    assert accounts[0]["extraction_status"] == "review"
+    assert accounts == []
     issue = context._personal_detail_extraction_issues[0]
     assert issue["issue_code"] == "candidate_b_account_anchor_population_missing"
-    assert issue["target_record_id"] == accounts[0]["account_id"]
+    assert issue["target_record_id"] == table["account_id"]
     assert "encounter_order_not_used" in issue["reason_codes"]
+    assert "record_not_emitted_due_to_unresolved_account_ownership" in issue["reason_codes"]
 
 
 def test_account_schema_resolves_shared_revolving_table_signature_from_exact_owned_anchor(
@@ -1298,6 +1903,24 @@ def test_account_schema_resolves_shared_revolving_table_signature_from_exact_own
         "source": "native_detail_account_table",
         "account_identifier": identifier,
         "balance": "8667",
+        "source_refs_by_field": {
+            "account_identifier": [
+                {
+                    "source": "native_detail_table_cell",
+                    "geometry_scope": "cell",
+                    "logical_page": 12,
+                    "source_page": 6,
+                    "table_id": "pt_12_2",
+                    "row": 1,
+                    "column": 1,
+                    "bbox": [120, 401, 250, 421],
+                    "evidence_ids": ["pt_12_2:r1:c1"],
+                    "binding": "canonical_field_slot",
+                    "binding_quality": "canonical_header_column",
+                    "field_name": "account_identifier",
+                }
+            ]
+        },
         "source_refs": [
             {
                 "source": "native_detail_table",
@@ -1409,13 +2032,18 @@ def test_account_schema_does_not_join_misclassified_table_by_stream_position(mon
 
     accounts, repayments, _events = native_extraction._extract_accounts(context)
 
-    assert len(accounts) == 2
+    assert len(accounts) == 1
     assert accounts[0]["account_id"] == "credit_account:revolving_loan_account:2"
     assert accounts[0]["account_type"] == "revolving_loan_account"
     assert accounts[0]["account_identifier"] == "D0206000CA202506XZ20011136048"
-    assert accounts[1]["account_type"] == "revolving_loan_subaccount"
-    assert accounts[1]["account_identifier"] == "D0206000CA202506XZ20011136047"
-    assert repayments[0]["account_id"] == "credit_account:revolving_loan_subaccount:1"
+    assert repayments == []
+    issue = next(
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_account_category_anchor_missing"
+    )
+    assert issue["target_record_id"] == table["account_id"]
+    assert "record_not_emitted_due_to_unresolved_account_ownership" in issue["reason_codes"]
 
 
 def test_account_stream_match_never_spills_replay_into_older_unmatched_anchor() -> None:
@@ -1563,11 +2191,20 @@ def test_credit_agreement_does_not_merge_damaged_identifier_from_business_simila
         "T10151210H0001ABC12345",
         None,
     }
-    assert any(
-        issue.get("issue_code") == "candidate_b_credit_agreement_identity_ambiguous"
-        and "fuzzy_identifier_merge_forbidden" in issue.get("reason_codes", ())
+    invalid = next(row for row in reconciled if row.get("account_identifier") is None)
+    assert invalid["canonical_raw"]["account_identifier"] == "T10151210H0001ABC1234?"
+    assert "account_identifier" in invalid["_unresolved_fields"]
+    issues = [
+        issue
         for issue in context._personal_detail_extraction_issues
-    )
+        if issue.get("issue_code") == "candidate_b_credit_agreement_identifier_invalid"
+    ]
+    assert len(issues) == 1
+    assert issues[0]["status"] == "requires_review"
+    assert issues[0]["target_record_id"] == invalid["credit_line_id"]
+    assert issues[0]["field_name"] == "account_identifier"
+    assert issues[0]["observed_value"] == "T10151210H0001ABC1234?"
+    assert "fuzzy_identifier_repair_forbidden" in issues[0]["reason_codes"]
 
 
 def test_credit_agreement_same_page_without_shared_card_geometry_is_not_merge_authority() -> None:
@@ -1750,7 +2387,7 @@ def test_credit_agreement_same_physical_page_and_containment_do_not_prove_identi
     )
 
 
-def test_credit_agreement_exact_leading_insertion_can_reconcile_same_card() -> None:
+def test_credit_agreement_leading_suffix_shape_does_not_prove_same_card() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     shared = {
         "_printed_sequence": 7,
@@ -1774,17 +2411,20 @@ def test_credit_agreement_exact_leading_insertion_can_reconcile_same_card() -> N
         [damaged, canonical],
     )
 
-    assert len(reconciled) == 1
-    assert reconciled[0]["account_identifier"] == canonical["account_identifier"]
-    assert reconciled[0]["sequence"] == 7
+    assert len(reconciled) == 2
+    assert {row["account_identifier"] for row in reconciled} == {
+        damaged["account_identifier"],
+        canonical["account_identifier"],
+    }
+    assert all(row.get("sequence") is None for row in reconciled)
     assert any(
-        issue.get("issue_code") == "candidate_b_credit_agreement_identifier_variant"
-        and "exact_leading_ocr_insertion_corrected" in issue.get("reason_codes", ())
+        issue.get("issue_code") == "candidate_b_credit_agreement_identity_ambiguous"
+        and "fuzzy_identifier_merge_forbidden" in issue.get("reason_codes", ())
         for issue in context._personal_detail_extraction_issues
     )
 
 
-def test_credit_agreement_exact_ordinal_and_verified_continuation_can_reconcile_observations() -> None:
+def test_credit_agreement_exact_ordinal_and_verified_continuation_cannot_choose_an_identifier() -> None:
     context = SimpleNamespace(
         _personal_detail_extraction_issues=[],
         tables_continue=lambda left, right: (left, right) == ("agreement:left", "agreement:right"),
@@ -1804,14 +2444,25 @@ def test_credit_agreement_exact_ordinal_and_verified_continuation_can_reconcile_
     strong = {
         "account_identifier": "T10151210H0001ABC12345",
         "_printed_sequence": 4,
-        "source_refs": [{"logical_page": 8, "table_id": "agreement:right"}],
+        "source_refs": [
+            {
+                "logical_page": 8,
+                "source_page": 8,
+                "table_id": "agreement:right",
+            }
+        ],
         "source_refs_by_field": {
             "account_identifier": [
                 {
+                    "source": "personal_detail_corrected_page_cell",
                     "logical_page": 8,
+                    "source_page": 8,
                     "table_id": "agreement:right",
+                    "bbox": [20.0, 100.0, 220.0, 120.0],
                     "geometry_scope": "cell",
                     "binding": "canonical_label_slot",
+                    "field_name": "account_identifier",
+                    "evidence_ids": ["agreement:right:identifier"],
                 }
             ]
         },
@@ -1821,17 +2472,20 @@ def test_credit_agreement_exact_ordinal_and_verified_continuation_can_reconcile_
 
     reconciled = native_extraction.reconcile_candidate_b_credit_lines(context, [weak, strong])
 
-    assert len(reconciled) == 1
-    assert reconciled[0]["account_identifier"] == strong["account_identifier"]
-    assert reconciled[0]["sequence"] == 4
+    assert len(reconciled) == 2
+    assert {row["account_identifier"] for row in reconciled} == {
+        weak["account_identifier"],
+        strong["account_identifier"],
+    }
+    assert all(row.get("sequence") is None for row in reconciled)
     assert any(
-        issue.get("issue_code") == "candidate_b_credit_agreement_identifier_variant"
-        and "higher_provenance_value_retained_for_review" in issue.get("reason_codes", ())
+        issue.get("issue_code") == "candidate_b_credit_agreement_identity_ambiguous"
+        and "fuzzy_identifier_merge_forbidden" in issue.get("reason_codes", ())
         for issue in context._personal_detail_extraction_issues
     )
 
 
-def test_credit_agreement_exact_cross_plane_card_anchor_reconciles_ocr_observations() -> None:
+def test_credit_agreement_exact_cross_plane_card_anchor_rejects_distinct_identifiers() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     shared = {
         "_printed_sequence": 2,
@@ -1847,14 +2501,33 @@ def test_credit_agreement_exact_cross_plane_card_anchor_reconciles_ocr_observati
                 "source": "native_detail_canonical_anchor_text",
                 "binding": "canonical_card_anchor",
                 "logical_page": 15,
+                "source_page": 15,
+                "bbox": [20.0, 80.0, 220.0, 95.0],
+                "evidence_ids": ["native:anchor"],
+            }
+        ],
+        "source_refs": [
+            {
+                "source": "native_detail_tolerant_table",
+                "logical_page": 15,
+                "source_page": 15,
+                "table_id": "agreement:native",
             }
         ],
         "source_refs_by_field": {
             "account_identifier": [
                 {
                     "source": "native_detail_tolerant_table_cell",
+                    "logical_page": 15,
+                    "source_page": 15,
+                    "table_id": "agreement:native",
+                    "row": 1,
+                    "column": 1,
+                    "bbox": [20.0, 100.0, 220.0, 120.0],
                     "geometry_scope": "cell",
                     "binding": "label_column",
+                    "field_name": "account_identifier",
+                    "evidence_ids": ["native:identifier"],
                 }
             ]
         },
@@ -1872,14 +2545,29 @@ def test_credit_agreement_exact_cross_plane_card_anchor_reconciles_ocr_observati
                 "source": "personal_detail_corrected_page_cell",
                 "binding": "canonical_card_anchor",
                 "logical_page": 15,
+                "source_page": 15,
+                "bbox": [20.0, 80.0, 220.0, 95.0],
+                "evidence_ids": ["corrected:anchor"],
+            }
+        ],
+        "source_refs": [
+            {
+                "source": "personal_detail_corrected_page",
+                "logical_page": 15,
+                "source_page": 15,
             }
         ],
         "source_refs_by_field": {
             "account_identifier": [
                 {
                     "source": "personal_detail_corrected_page_cell",
+                    "logical_page": 15,
+                    "source_page": 15,
+                    "bbox": [20.0, 100.0, 220.0, 120.0],
                     "geometry_scope": "cell",
                     "binding": "canonical_label_slot",
+                    "field_name": "account_identifier",
+                    "evidence_ids": ["corrected:identifier"],
                 }
             ]
         },
@@ -1892,23 +2580,15 @@ def test_credit_agreement_exact_cross_plane_card_anchor_reconciles_ocr_observati
         [native, corrected],
     )
 
-    assert len(reconciled) == 1
-    assert reconciled[0]["sequence"] == 2
-    assert reconciled[0]["account_identifier"] == corrected["account_identifier"]
-    assert "_canonical_card_key" not in reconciled[0]
-    assert "_canonical_card_anchor_refs" not in reconciled[0]
+    assert len(reconciled) == 2
+    assert {row["account_identifier"] for row in reconciled} == {
+        native["account_identifier"],
+        corrected["account_identifier"],
+    }
+    assert all(row.get("sequence") is None for row in reconciled)
     assert any(
-        issue.get("issue_code") == "candidate_b_credit_agreement_identifier_variant"
-        and "exact_canonical_card_anchor_cross_plane" in issue.get("reason_codes", ())
-        and "canonical_anchor_provenance_selection" in issue.get("reason_codes", ())
-        for issue in context._personal_detail_extraction_issues
-    )
-    assert not any(
-        issue.get("issue_code")
-        in {
-            "candidate_b_credit_agreement_identity_ambiguous",
-            "candidate_b_credit_agreement_sequence_unresolved",
-        }
+        issue.get("issue_code") == "candidate_b_credit_agreement_identity_ambiguous"
+        and "canonical_card_anchor_not_cross_plane_unique" in issue.get("reason_codes", ())
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -1934,7 +2614,7 @@ def test_credit_agreement_cross_plane_anchor_does_not_override_business_conflict
         **shared,
     }
     corrected = {
-        "account_identifier": "B10711000H0001100000111111112446567900000",
+        "account_identifier": native["account_identifier"],
         "used_limit": "999",
         "_canonical_card_anchor_refs": [
             {
@@ -1950,11 +2630,12 @@ def test_credit_agreement_cross_plane_anchor_does_not_override_business_conflict
         [native, corrected],
     )
 
-    assert len(reconciled) == 2
-    assert all(row.get("sequence") is None for row in reconciled)
+    assert len(reconciled) == 1
+    assert reconciled[0]["sequence"] == 2
+    assert reconciled[0]["used_limit"] is None
     assert any(
-        issue.get("issue_code") == "candidate_b_credit_agreement_identity_ambiguous"
-        and "canonical_card_anchor_business_conflict" in issue.get("reason_codes", ())
+        issue.get("issue_code") == "candidate_b_credit_agreement_observation_conflict"
+        and "used_limit" in issue.get("observed_value", {}).get("conflicting_fields", ())
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -1996,6 +2677,31 @@ def test_credit_agreement_business_similarity_alone_does_not_raise_identity_issu
 
 def test_credit_agreement_reports_required_fields_missing_after_final_merge() -> None:
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    missing_fields = {
+        "institution",
+        "facility_type",
+        "due_date",
+        "total_limit",
+        "credit_limit",
+        "used_limit",
+        "limit_identifier",
+        "currency",
+    }
+    exact_field_refs = {
+        field_name: [
+            {
+                "source": "personal_detail_corrected_page_cell",
+                "logical_page": 8,
+                "source_page": 4,
+                "bbox": [1.0, 2.0, 30.0, 40.0],
+                "geometry_scope": "cell",
+                "field_name": field_name,
+                "binding": "canonical_label_slot",
+                "evidence_ids": [f"ocr:agreement:{field_name}"],
+            }
+        ]
+        for field_name in missing_fields
+    }
     rows = native_extraction.reconcile_candidate_b_credit_lines(
         context,
         [
@@ -2007,6 +2713,7 @@ def test_credit_agreement_reports_required_fields_missing_after_final_merge() ->
                 "effective_date": "2020-03-29",
                 "_printed_sequence": 1,
                 "source_refs": [{"logical_page": 8, "bbox": [1, 2, 30, 40]}],
+                "source_refs_by_field": exact_field_refs,
             }
         ],
     )
@@ -2018,18 +2725,10 @@ def test_credit_agreement_reports_required_fields_missing_after_final_merge() ->
         for issue in context._personal_detail_extraction_issues
         if issue.get("issue_code") == "candidate_b_credit_agreement_required_field_unresolved"
     ]
-    assert {issue["field_name"] for issue in issues} == {
-        "institution",
-        "facility_type",
-        "due_date",
-        "total_limit",
-        "credit_limit",
-        "used_limit",
-        "limit_identifier",
-        "currency",
-    }
+    assert {issue["field_name"] for issue in issues} == missing_fields
     assert {issue["target_record_id"] for issue in issues} == {final_id}
     assert all(issue["source_refs"][0]["logical_page"] == 8 for issue in issues)
+    assert all(issue["source_refs"][0]["field_name"] == issue["field_name"] for issue in issues)
     assert all(
         issue["reason_codes"]
         == [
@@ -2093,6 +2792,7 @@ def test_credit_agreement_withholds_concatenated_limit_identifiers(monkeypatch) 
     assert context._personal_detail_extraction_issues[0]["issue_code"] == (
         "candidate_b_credit_limit_identifier_unresolved"
     )
+    assert not context._personal_detail_extraction_issues[0].get("source_refs")
 
 
 def test_credit_agreement_dash_glyphs_are_explicit_absence_not_failures(monkeypatch) -> None:
@@ -2100,6 +2800,13 @@ def test_credit_agreement_dash_glyphs_are_explicit_absence_not_failures(monkeypa
         PBOCPersonalDetailNativeParser,
     )
 
+    dash_fields = {
+        "授信额度": "total_limit",
+        "授信限额": "credit_limit",
+        "已用额度": "used_limit",
+        "授信限额编号": "limit_identifier",
+        "到期日期": "due_date",
+    }
     candidate = SimpleNamespace(
         fields={
             "授信协议标识": "T10151210H0001ABC12345",
@@ -2110,7 +2817,21 @@ def test_credit_agreement_dash_glyphs_are_explicit_absence_not_failures(monkeypa
             "到期日期": "—",
         },
         source_refs=[],
-        source_refs_by_field={},
+        source_refs_by_field={
+            label: [
+                {
+                    "source": "personal_detail_corrected_page_cell",
+                    "logical_page": 8,
+                    "source_page": 4,
+                    "bbox": [10.0, 20.0, 80.0, 36.0],
+                    "geometry_scope": "cell",
+                    "field_name": field_name,
+                    "binding": "canonical_label_slot",
+                    "evidence_ids": [f"ocr:agreement:{field_name}:dash"],
+                }
+            ]
+            for label, field_name in dash_fields.items()
+        },
         binding_quality_by_field={},
         unresolved_labels=frozenset(),
         observed_labels=frozenset(),
@@ -2158,7 +2879,7 @@ def test_inquiry_boundary_and_normalization_differences_require_exact_institutio
         {"inquiry_date": "2024.01.02", "institution": " 示例银行股份有限公司 ", "reason": "货款审批"},
         {"inquiry_date": "2024-01-02", "institution": "示例银行股份有限公司", "reason": "贷款审批"},
     )
-    assert native_extraction._inquiry_business_equivalent(
+    assert not native_extraction._inquiry_business_equivalent(
         {"inquiry_date": "2024-01-02", "institution": "安 本人", "reason": "本人查询"},
         {
             "inquiry_date": "2024-01-02",
@@ -2170,7 +2891,7 @@ def test_inquiry_boundary_and_normalization_differences_require_exact_institutio
         {"inquiry_date": "2024-01-02", "institution": "美 兴业银行股份有限公司 你", "reason": "贷后管理"},
         {"inquiry_date": "2024-01-02", "institution": "兴业银行股份有限公司 你 美", "reason": "贷后管理"},
     )
-    assert native_extraction._inquiry_business_equivalent(
+    assert not native_extraction._inquiry_business_equivalent(
         {
             "inquiry_date": "2024-01-02",
             "institution": "深圳前海微众银行股份有限公司 法人代表、负责人、高管等",
@@ -2182,19 +2903,68 @@ def test_inquiry_boundary_and_normalization_differences_require_exact_institutio
             "reason": "法人代表、负责人、高管等资信审查",
         },
     )
+    assert native_extraction._normalize_inquiry_reason("货后管理") == "贷后管理"
+    assert (
+        native_extraction._normalize_inquiry_reason("某货后管理服务有限公司")
+        == "某货后管理服务有限公司"
+    )
+    assert native_extraction._bounded_canonical_inquiry_reason("公积金提取复核") == "公积金提取复核"
+    assert native_extraction._bounded_canonical_inquiry_reason("本人查询（临柜）") == "本人查询"
+    assert native_extraction._bounded_canonical_inquiry_reason("本人查询（未来渠道）") is None
+    assert native_extraction._bounded_canonical_inquiry_reason("未来用途审查") is None
+    assert native_extraction._bounded_canonical_inquiry_reason("其他") == "其他"
+    assert native_extraction._bounded_canonical_inquiry_reason("X贷后管理Y") is None
+    assert native_extraction._bounded_canonical_inquiry_reason("???贷后管理!!!") is None
+    assert native_extraction._longest_inquiry_reason_suffix("示例征信服务其他") == ""
+    assert native_extraction._longest_inquiry_reason_suffix("示例银行 公积金提取复核") == "公积金提取复核"
+
+
+def _sealed_public_table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
+    column_count = max((len(row) for row in rows), default=0)
+    bboxes = [
+        [
+            [column * 100, row_index * 20, (column + 1) * 100, (row_index + 1) * 20]
+            for column in range(len(row))
+        ]
+        for row_index, row in enumerate(rows)
+    ]
+    return SimpleNamespace(
+        table_id=table_id,
+        bbox=[0, 0, max(100, column_count * 100), max(20, len(rows) * 20)],
+        metadata={
+            "raw_rows": rows,
+            "canonical_template_id": "public_information",
+            "geometry": {
+                "row_bands": [
+                    {"index": row, "y0": row * 20, "y1": (row + 1) * 20}
+                    for row in range(len(rows))
+                ],
+                "col_bands": [
+                    {"index": column, "x0": column * 100, "x1": (column + 1) * 100}
+                    for column in range(column_count)
+                ],
+                "cell_bboxes": bboxes,
+                "cell_geometry_status": [["exact"] * len(row) for row in rows],
+                "cell_evidence_ids": [
+                    [
+                        [f"{table_id}:{row_index}:{column}"]
+                        for column in range(len(row))
+                    ]
+                    for row_index, row in enumerate(rows)
+                ],
+            },
+        },
+    )
 
 
 def test_public_record_projection_keeps_canonical_authorities_and_typed_fields() -> None:
     def table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
-        return SimpleNamespace(
-            table_id=table_id,
-            bbox=[0, 0, 600, 200],
-            metadata={"raw_rows": rows},
-        )
+        return _sealed_public_table(table_id, rows)
 
     page = SimpleNamespace(
         page_number=13,
         source_page_number=13,
+        canonical_template_id="public_information",
         tables=[
             table(
                 "tax",
@@ -2249,15 +3019,12 @@ def test_housing_fund_blocks_use_canonical_boundaries_across_pages() -> None:
         return [aliases[role][0] for role in fields]
 
     def table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
-        return SimpleNamespace(
-            table_id=table_id,
-            bbox=[0, 0, 600, 200],
-            metadata={"raw_rows": rows},
-        )
+        return _sealed_public_table(table_id, rows)
 
     page_1 = SimpleNamespace(
         page_number=13,
         source_page_number=13,
+        canonical_template_id="public_information",
         tables=[
             table(
                 "housing-base-1",
@@ -2272,17 +3039,18 @@ def test_housing_fund_blocks_use_canonical_boundaries_across_pages() -> None:
     page_2 = SimpleNamespace(
         page_number=14,
         source_page_number=14,
+        canonical_template_id="public_information",
         tables=[
             table(
                 "housing-continuation-and-second-record",
                 [
                     header(provider),
                     ["", ""],
-                    ["S 示例科技有限公司", "2023.08"],
+                    ["示例科技有限公司", "2023.08"],
                     header(base),
                     ["Xiamen", "2015.06.25", "2015.06", "2018.08", "closed", "1023", "8%", "8%"],
                     header(provider),
-                    ["限 示例服务有限公司", "2023.08"],
+                    ["示例服务有限公司", "2023.08"],
                 ],
             )
         ],
@@ -2313,11 +3081,11 @@ def test_housing_fund_continuation_without_start_is_reported_and_not_invented() 
     page = SimpleNamespace(
         page_number=14,
         source_page_number=14,
+        canonical_template_id="public_information",
         tables=[
-            SimpleNamespace(
-                table_id="orphan-housing-provider",
-                bbox=[0, 0, 600, 100],
-                metadata={"raw_rows": [header, ["Employer A", "2023.08"]]},
+            _sealed_public_table(
+                "orphan-housing-provider",
+                [header, ["Employer A", "2023.08"]],
             )
         ],
     )
@@ -2345,12 +3113,9 @@ def test_housing_fund_nonadjacent_continuation_is_not_attached() -> None:
         return SimpleNamespace(
             page_number=number,
             source_page_number=number,
+            canonical_template_id="public_information",
             tables=[
-                SimpleNamespace(
-                    table_id=table_id,
-                    bbox=[0, 0, 600, 100],
-                    metadata={"raw_rows": rows},
-                )
+                _sealed_public_table(table_id, rows)
             ],
         )
 
@@ -3866,6 +4631,315 @@ def test_monthly_grid_reports_missing_printed_month_without_inventing_it() -> No
     assert "target_record_id" not in issue
 
 
+def test_monthly_grid_reports_each_missing_month_field_with_exact_identity() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [
+        {
+            "account_id": "account:1",
+            "page": 4,
+            "bbox": [10, 20, 100, 100],
+            "sequence": 1,
+        }
+    ]
+    grid = {
+        "grid_id": "grid:range",
+        "page": 4,
+        "bbox": [10, 120, 220, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 2,
+            }
+        },
+    }
+
+    linked = link_candidate_b_repayments(
+        [
+            {
+                "grid_id": "grid:range",
+                "year": 2024,
+                "month": 1,
+                "status": "N",
+                "source_cell_refs": [
+                    {
+                        "logical_page": 4,
+                        "grid_id": "grid:range",
+                        "field_name": "status",
+                        "bbox": [20, 140, 30, 150],
+                        "geometry_scope": "cell",
+                    }
+                ],
+            }
+        ],
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(linked) == 1
+    field_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_contract_missing_field"
+    ]
+    assert {
+        (issue["target_record_id"], issue["field_name"]) for issue in field_issues
+    } == {
+        ("grid:range:2024-02", "performance_month"),
+        ("grid:range:2024-02", "status_code"),
+    }
+    assert all(issue["source_refs"] for issue in field_issues)
+    assert all(
+        ref["geometry_scope"] == "grid"
+        for issue in field_issues
+        for ref in issue["source_refs"]
+    )
+    assert all(
+        ref["grid_id"] == "grid:range"
+        and ref["performance_month"] == "2024-02"
+        and ref["field_name"] == issue["field_name"]
+        for issue in field_issues
+        for ref in issue["source_refs"]
+    )
+    assert not any(issue["field_name"] == "status_amount" for issue in field_issues)
+
+
+def test_credit_agreement_missing_fields_never_inherit_record_geometry() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        [
+            {
+                "account_identifier": "B10512900H00010010011135264974289",
+                "_printed_sequence": 1,
+                "source_refs": [
+                    {
+                        "logical_page": 8,
+                        "source_page": 4,
+                        "bbox": [1.0, 2.0, 300.0, 400.0],
+                        "geometry_scope": "table",
+                    }
+                ],
+            }
+        ],
+    )
+
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_credit_agreement_required_field_unresolved"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_monthly_owner_withholding_is_field_local_without_inventing_values() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    row = {
+        "grid_id": "grid:unowned",
+        "performance_month": "2024-01",
+        "year": 2024,
+        "month": 1,
+        "status": "N",
+        "overdue_amount": "88",
+        "source_cell_refs": [
+            {
+                "logical_page": 6,
+                "grid_id": "grid:unowned",
+                "col": 1,
+                "field_name": "status",
+                "bbox": [20, 140, 30, 150],
+                "geometry_scope": "cell",
+            },
+            {
+                "logical_page": 6,
+                "grid_id": "grid:unowned",
+                "col": 1,
+                "field_name": "overdue_amount",
+                "bbox": [20, 160, 30, 170],
+                "geometry_scope": "cell",
+            },
+        ],
+    }
+    grid = {
+        "grid_id": "grid:unowned",
+        "page": 6,
+        "bbox": [10, 120, 220, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 1,
+            }
+        },
+    }
+
+    assert link_candidate_b_repayments(
+        [row],
+        [],
+        [grid],
+        issue_context=context,
+    ) == []
+
+    aggregate = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+    ]
+    field_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved_field"
+    ]
+    assert len(aggregate) == 1
+    assert "target_record_id" not in aggregate[0]
+    assert {
+        (issue["target_record_id"], issue["field_name"]) for issue in field_issues
+    } == {
+        ("grid:unowned:2024-01", "performance_month"),
+        ("grid:unowned:2024-01", "status_code"),
+        ("grid:unowned:2024-01", "status_amount"),
+    }
+    assert next(
+        issue for issue in field_issues if issue["field_name"] == "status_code"
+    )["observed_value"]["source_observations"] == ["N"]
+    assert next(
+        issue for issue in field_issues if issue["field_name"] == "status_amount"
+    )["observed_value"]["source_observations"] == ["88"]
+    assert all(issue["source_refs"] for issue in field_issues)
+    assert len(
+        {
+            (issue["target_record_id"], issue["field_name"])
+            for issue in field_issues
+        }
+    ) == len(field_issues)
+
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [],
+            "personal_detail_extraction_issues": context._personal_detail_extraction_issues,
+        }
+    )
+    public_issues = [
+        issue
+        for issue in projected["extraction_issues"]
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved_field"
+    ]
+    assert {
+        (issue["target_record_id"], issue["field_name"])
+        for issue in public_issues
+    } == {
+        ("grid:unowned:2024-01", "performance_month"),
+        ("grid:unowned:2024-01", "status_code"),
+        ("grid:unowned:2024-01", "status_amount"),
+    }
+    issue_ids = {issue["extraction_issue_id"] for issue in public_issues}
+    evidence_by_issue = {
+        issue_id: [
+            evidence
+            for evidence in projected["extraction_issue_evidence"]
+            if evidence["extraction_issue_id"] == issue_id
+        ]
+        for issue_id in issue_ids
+    }
+    assert all(evidence_by_issue.values())
+    assert all(
+        any(
+            evidence["evidence_kind"] == "reason"
+            and evidence.get("string_value") == "normalized_value_withheld"
+            for evidence in evidence_by_issue[issue_id]
+        )
+        for issue_id in issue_ids
+    )
+
+
+def test_monthly_owner_withholding_keeps_ambiguous_month_identity_aggregate_only() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    grid = {"grid_id": "grid:ambiguous", "page": 6, "bbox": [10, 120, 220, 220]}
+
+    assert link_candidate_b_repayments(
+        [
+            {
+                "grid_id": "grid:ambiguous",
+                "performance_month": "2024-13",
+                "status": "N",
+                "source_cell_refs": [
+                    {
+                        "logical_page": 6,
+                        "grid_id": "grid:ambiguous",
+                        "field_name": "status",
+                        "bbox": [20, 140, 30, 150],
+                        "geometry_scope": "cell",
+                    }
+                ],
+            }
+        ],
+        [],
+        [grid],
+        issue_context=context,
+    ) == []
+
+    assert any(
+        issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert not any(
+        issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved_field"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_monthly_owner_withholding_does_not_report_unobserved_default_amount() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    grid = {
+        "grid_id": "grid:no-amount-cell",
+        "page": 6,
+        "bbox": [10, 120, 220, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 1,
+            }
+        },
+    }
+    row = {
+        "grid_id": "grid:no-amount-cell",
+        "performance_month": "2024-01",
+        "year": 2024,
+        "month": 1,
+        "status": "N",
+        # A compatibility/default value is not proof that an amount cell was visible.
+        "overdue_amount": "0",
+        "source_cell_refs": [
+            {
+                "logical_page": 6,
+                "grid_id": "grid:no-amount-cell",
+                "col": 1,
+                "field_name": "status",
+                "bbox": [20, 140, 30, 150],
+                "geometry_scope": "cell",
+            }
+        ],
+    }
+
+    assert link_candidate_b_repayments(
+        [row], [], [grid], issue_context=context
+    ) == []
+    field_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_grid_owner_unresolved_field"
+    ]
+    assert {issue["field_name"] for issue in field_issues} == {
+        "performance_month",
+        "status_code",
+    }
+
+
 def test_monthly_anchor_ledger_is_independent_and_account_bound() -> None:
     accounts = [
         {
@@ -3959,6 +5033,9 @@ def test_monthly_visible_anchor_reconciles_to_materialized_grid() -> None:
         {
             "account_id": "account:1",
             "_canonical_segment": {
+                "ownership_basis": "printed_anchor_to_next_anchor",
+                "anchor_logical_page": 4,
+                "anchor_bbox": [10, 20, 90, 30],
                 "pages": [{"logical_page": 4, "min_y": 20, "max_y": 300}]
             },
         }
@@ -4004,5 +5081,661 @@ def test_monthly_visible_anchor_reconciles_to_materialized_grid() -> None:
     assert linked[0]["account_id"] == "account:1"
     assert not any(
         issue["issue_code"] == "candidate_b_monthly_anchor_grid_missing"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def _monthly_anchor_evidence(
+    text: str,
+    *,
+    page: int = 4,
+    source_page: int = 2,
+    evidence_ids: list[str] | None = None,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "page": page,
+            "source_page": source_page,
+            "lines": [
+                {
+                    "text": text,
+                    "bbox": [100, 120, 400, 140],
+                    "evidence_ids": evidence_ids or ["ocr:monthly-range:1"],
+                    "line_id": "ocr:monthly-range:line:1",
+                }
+            ],
+        }
+    ]
+
+
+def _monthly_anchor_account(
+    *,
+    account_id: str = "account:1",
+    page: int = 4,
+    minimum: float = 20,
+    maximum: float = 300,
+) -> dict[str, object]:
+    return {
+        "account_id": account_id,
+        "_canonical_segment": {
+            "ownership_basis": "printed_anchor_to_next_anchor",
+            "anchor_logical_page": page,
+            "anchor_bbox": [10, minimum, 90, minimum + 10],
+            "pages": [
+                {
+                    "logical_page": page,
+                    "min_y": minimum,
+                    "max_y": maximum,
+                }
+            ],
+        },
+    }
+
+
+def test_monthly_account_range_reports_every_missing_month_without_status_value() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [_monthly_anchor_account()]
+    ledger = candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence("2023年11月一2024年02月的还款记录"),
+        accounts,
+    )
+
+    assert ledger[0]["date_range"] == {
+        "start_year": 2023,
+        "start_month": 11,
+        "end_year": 2024,
+        "end_month": 2,
+    }
+    assert ledger[0]["source_refs"][0]["evidence_ids"] == [
+        "ocr:monthly-range:1"
+    ]
+
+    assert link_candidate_b_repayments(
+        [], accounts, [], issue_context=context, repayment_anchors=ledger
+    ) == []
+    field_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"]
+        in {
+            "candidate_b_monthly_account_range_missing_month",
+            "candidate_b_monthly_account_range_status_grid_unavailable",
+        }
+    ]
+    assert len(field_issues) == 8
+    assert {
+        issue["observed_value"]["performance_month"] for issue in field_issues
+    } == {"2023-11", "2023-12", "2024-01", "2024-02"}
+    assert {issue["field_name"] for issue in field_issues} == {
+        "performance_month",
+        "status_code",
+    }
+    assert all(
+        issue["observed_value"]["account_id"] == "account:1"
+        and issue["target_record_id"].startswith("source_account_month:")
+        and issue["source_refs"][0]["evidence_ids"] == ["ocr:monthly-range:1"]
+        and issue["source_refs"][0]["logical_page"] == 4
+        and issue["source_refs"][0]["source_page"] == 2
+        for issue in field_issues
+    )
+    status_issues = [
+        issue for issue in field_issues if issue["field_name"] == "status_code"
+    ]
+    assert all(
+        issue["source_refs"][0]["binding"] == "source_account_month_identity"
+        and "source_observations" not in issue["observed_value"]
+        and "status_source_grid_unavailable" in issue["reason_codes"]
+        for issue in status_issues
+    )
+
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [],
+            "personal_detail_extraction_issues": (
+                context._personal_detail_extraction_issues
+            ),
+        }
+    )
+    public_issues = [
+        issue
+        for issue in projected["extraction_issues"]
+        if issue["issue_code"].startswith("candidate_b_monthly_account_range_")
+    ]
+    assert len(public_issues) == 8
+    assert {
+        (issue["target_record_id"], issue["field_name"])
+        for issue in public_issues
+    } == {
+        (issue["target_record_id"], issue["field_name"])
+        for issue in field_issues
+    }
+    assert all(
+        issue["target_dataset"] == "credit_account_monthly_performance"
+        and issue["source_refs"][0]["geometry_scope"] == "line"
+        and issue["source_refs"][0]["evidence_ids"] == ["ocr:monthly-range:1"]
+        for issue in public_issues
+    )
+    assert all(
+        issue["source_refs"][0]["binding"]
+        not in {"grid_month_cell", "monthly_grid_cell", "source_monthly_field_cell"}
+        for issue in public_issues
+        if issue["field_name"] == "status_code"
+    )
+
+
+def test_monthly_account_range_overlap_reports_only_unrepresented_months() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [_monthly_anchor_account()]
+    ledger = candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence("2024年01月—2024年03月的还款记录"),
+        accounts,
+    )
+    grid = {
+        "grid_id": "grid:overlap",
+        "account_id": "account:1",
+        "page": 4,
+        "bbox": [100, 140, 400, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 2,
+            }
+        },
+    }
+    rows = [
+        {
+            "grid_id": "grid:overlap",
+            "account_id": "account:1",
+            "performance_month": f"2024-0{month}",
+            "year": 2024,
+            "month": month,
+            "status": "N",
+        }
+        for month in (1, 2)
+    ]
+
+    linked = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+        repayment_anchors=ledger,
+    )
+
+    assert len(linked) == 2
+    range_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"].startswith("candidate_b_monthly_account_range_")
+    ]
+    assert {
+        (issue["observed_value"]["performance_month"], issue["field_name"])
+        for issue in range_issues
+    } == {("2024-03", "performance_month"), ("2024-03", "status_code")}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2024年01月附近2024年02月的还款记录",
+        "2024年01月—2024年02月—2024年03月的还款记录",
+        "2024年01月—2024年13月的还款记录",
+        "2024年02月—2024年01月的还款记录",
+        "2024年01月—2024年02月的查询记录",
+    ],
+)
+def test_monthly_account_range_rejects_malformed_near_misses(text: str) -> None:
+    ledger = candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence(text), [_monthly_anchor_account()]
+    )
+
+    assert not ledger or ledger[0]["date_range"] is None
+
+
+def test_monthly_account_range_rejects_ambiguous_duplicate_owner() -> None:
+    accounts = [
+        _monthly_anchor_account(account_id="account:1"),
+        _monthly_anchor_account(account_id="account:2"),
+    ]
+
+    assert candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence("2024年01月—2024年02月的还款记录"), accounts
+    ) == []
+
+
+def test_monthly_account_range_rejects_cross_page_segment_mismatch() -> None:
+    account = _monthly_anchor_account(page=5)
+
+    assert candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence(
+            "2024年01月—2024年02月的还款记录", page=4, source_page=2
+        ),
+        [account],
+    ) == []
+
+
+def test_monthly_account_range_missing_evidence_stays_aggregate_only() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    accounts = [_monthly_anchor_account()]
+    evidence = _monthly_anchor_evidence("2024年01月—2024年02月的还款记录")
+    evidence[0]["lines"][0].pop("evidence_ids")
+    ledger = candidate_b_repayment_anchor_ledger(evidence, accounts)
+
+    link_candidate_b_repayments(
+        [], accounts, [], issue_context=context, repayment_anchors=ledger
+    )
+
+    assert any(
+        issue["issue_code"] == "candidate_b_monthly_anchor_grid_missing"
+        for issue in context._personal_detail_extraction_issues
+    )
+    assert not any(
+        issue["issue_code"].startswith("candidate_b_monthly_account_range_")
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_account_month_closure_spans_variable_ranges_and_cross_page_grids() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = _monthly_anchor_account(maximum=300)
+    account["_canonical_segment"]["pages"].append(
+        {"logical_page": 5, "min_y": 0, "max_y": 700}
+    )
+    ledger = candidate_b_repayment_anchor_ledger(
+        _monthly_anchor_evidence(
+            "2023年11月—2024年02月的还款记录",
+            page=4,
+        ),
+        [account],
+    )
+    grids = [
+        {
+            "grid_id": "grid:later-scaled",
+            "page": 5,
+            "bbox": [40, 80, 560, 260],
+            "audit": {
+                "date_range": {
+                    "start_year": 2024,
+                    "start_month": 1,
+                    "end_year": 2024,
+                    "end_month": 2,
+                }
+            },
+        },
+        {
+            "grid_id": "grid:earlier",
+            "page": 4,
+            "bbox": [100, 140, 400, 220],
+            "audit": {
+                "date_range": {
+                    "start_year": 2023,
+                    "start_month": 11,
+                    "end_year": 2023,
+                    "end_month": 12,
+                }
+            },
+        },
+    ]
+    rows = [
+        {
+            "grid_id": grid_id,
+            "year": year,
+            "month": month,
+            "status": "N",
+        }
+        for grid_id, year, month in (
+            ("grid:later-scaled", 2024, 2),
+            ("grid:earlier", 2023, 12),
+            ("grid:later-scaled", 2024, 1),
+            ("grid:earlier", 2023, 11),
+        )
+    ]
+
+    linked = link_candidate_b_repayments(
+        rows,
+        [account],
+        grids,
+        issue_context=context,
+        repayment_anchors=ledger,
+    )
+
+    assert {
+        (row["account_id"], row["year"], row["month"]) for row in linked
+    } == {
+        ("account:1", 2023, 11),
+        ("account:1", 2023, 12),
+        ("account:1", 2024, 1),
+        ("account:1", 2024, 2),
+    }
+    assert all(
+        row["_account_month_identity_proof"]["unique_owner"] is True
+        for row in linked
+    )
+    assert not any(
+        issue["issue_code"] == "candidate_b_monthly_anchor_grid_missing"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_account_month_closure_deduplicates_reordered_grid_aliases() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = _monthly_anchor_account()
+    grids = [
+        {
+            "grid_id": grid_id,
+            "page": 4,
+            "bbox": bbox,
+            "audit": {
+                "date_range": {
+                    "start_year": 2024,
+                    "start_month": 1,
+                    "end_year": 2024,
+                    "end_month": 2,
+                }
+            },
+        }
+        for grid_id, bbox in (
+            ("grid:alias-b", [60, 150, 500, 250]),
+            ("grid:alias-a", [100, 140, 400, 220]),
+        )
+    ]
+    rows = [
+        {"grid_id": grid_id, "year": 2024, "month": month, "status": "N"}
+        for grid_id, month in (
+            ("grid:alias-b", 2),
+            ("grid:alias-a", 1),
+            ("grid:alias-b", 1),
+            ("grid:alias-a", 2),
+        )
+    ]
+
+    linked = link_candidate_b_repayments(
+        rows,
+        [account],
+        grids,
+        issue_context=context,
+    )
+
+    assert {(row["year"], row["month"]) for row in linked} == {
+        (2024, 1),
+        (2024, 2),
+    }
+    assert not any(
+        issue["issue_code"]
+        in {
+            "candidate_b_monthly_grid_contract_missing_field",
+            "candidate_b_monthly_grid_contract_unresolved",
+        }
+        for issue in context._personal_detail_extraction_issues
+    )
+    alias_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"]
+        == "candidate_b_monthly_source_position_alias_reconciled"
+    ]
+    assert len(alias_issues) == 2
+    assert {
+        issue["observed_value"]["performance_month"] for issue in alias_issues
+    } == {"2024-01", "2024-02"}
+    assert all(
+        issue["status"] == "informational"
+        and issue["observed_value"]["source_position_state"]
+        == "owner_bound_alias"
+        and issue["source_refs"]
+        and issue["source_refs"][0]["grid_id"]
+        == issue["observed_value"]["grid_id"]
+        and issue["source_refs"][0]["performance_month"]
+        == issue["observed_value"]["performance_month"]
+        for issue in alias_issues
+    )
+
+
+def test_detached_source_position_promotes_only_with_unique_exact_owner() -> None:
+    source_grid = {
+        "grid_id": "grid:detached",
+        "page": 4,
+        "bbox": [100, 140, 400, 220],
+        "audit": {
+            "date_range": {
+                "start_year": 2024,
+                "start_month": 1,
+                "end_year": 2024,
+                "end_month": 1,
+            }
+        },
+    }
+    source_record = {
+        "grid_id": "grid:detached",
+        "year": 2024,
+        "month": 1,
+        "status": "unknown",
+        "source_cell_refs": [
+            {
+                "source": "sealed_native_physical_table_cell",
+                "logical_page": 4,
+                "source_page": 2,
+                "table_id": "monthly-table:detached",
+                "grid_id": "grid:detached",
+                "row": 2,
+                "col": 1,
+                "field_name": "status",
+                "performance_month": "2024-01",
+                "bbox": [110, 160, 130, 175],
+                "geometry_scope": "cell",
+                "evidence_ids": ["native:monthly-table:detached:2:1"],
+                "binding": "source_monthly_field_cell",
+                "binding_quality": "source_monthly_field_cell",
+            }
+        ],
+    }
+    exact_context = SimpleNamespace(
+        _personal_detail_extraction_issues=[],
+        _candidate_b_monthly_source_structure_grids=[source_grid],
+        _candidate_b_monthly_source_structure_records=[source_record],
+    )
+
+    assert link_candidate_b_repayments(
+        [],
+        [_monthly_anchor_account()],
+        [],
+        issue_context=exact_context,
+    ) == []
+    exact_issues = [
+        issue
+        for issue in exact_context._personal_detail_extraction_issues
+        if issue["issue_code"] == "candidate_b_monthly_owned_grid_missing_field"
+    ]
+    assert {issue["field_name"] for issue in exact_issues} == {"performance_month"}
+    assert all(
+        issue["target_record_id"].startswith("source_account_month:")
+        and issue["observed_value"]
+        == {"account_id": "account:1", "performance_month": "2024-01"}
+        and len(issue["source_refs"]) == 1
+        and issue["source_refs"][0]["source"]
+        == "candidate_b_monthly_owned_grid_cell"
+        and issue["source_refs"][0]["binding"]
+        == "source_account_month_identity"
+        for issue in exact_issues
+    )
+
+    untrusted_record = {
+        **source_record,
+        "source_cell_refs": [
+            {**source_record["source_cell_refs"][0], "source": "unrelated_cell"}
+        ],
+    }
+    untrusted_context = SimpleNamespace(
+        _personal_detail_extraction_issues=[],
+        _candidate_b_monthly_source_structure_grids=[source_grid],
+        _candidate_b_monthly_source_structure_records=[untrusted_record],
+    )
+    link_candidate_b_repayments(
+        [],
+        [_monthly_anchor_account()],
+        [],
+        issue_context=untrusted_context,
+    )
+    assert not any(
+        issue["issue_code"] == "candidate_b_monthly_owned_grid_missing_field"
+        for issue in untrusted_context._personal_detail_extraction_issues
+    )
+
+    competing_cell_record = {
+        **source_record,
+        "source_cell_refs": [
+            source_record["source_cell_refs"][0],
+            {
+                **source_record["source_cell_refs"][0],
+                "column": 2,
+                "col": 2,
+                "bbox": [135, 160, 155, 175],
+                "evidence_ids": ["native:monthly-table:detached:2:2"],
+            },
+        ],
+    }
+    competing_cell_context = SimpleNamespace(
+        _personal_detail_extraction_issues=[],
+        _candidate_b_monthly_source_structure_grids=[source_grid],
+        _candidate_b_monthly_source_structure_records=[competing_cell_record],
+    )
+    link_candidate_b_repayments(
+        [],
+        [_monthly_anchor_account()],
+        [],
+        issue_context=competing_cell_context,
+    )
+    assert not any(
+        issue["issue_code"] == "candidate_b_monthly_owned_grid_missing_field"
+        for issue in competing_cell_context._personal_detail_extraction_issues
+    )
+
+    for malformed_evidence_ids in (
+        ["native:duplicate", "native:duplicate"],
+        ["native:valid", ""],
+        ["native:valid", 7],
+    ):
+        malformed_evidence_context = SimpleNamespace(
+            _personal_detail_extraction_issues=[],
+            _candidate_b_monthly_source_structure_grids=[source_grid],
+            _candidate_b_monthly_source_structure_records=[
+                {
+                    **source_record,
+                    "source_cell_refs": [
+                        {
+                            **source_record["source_cell_refs"][0],
+                            "evidence_ids": malformed_evidence_ids,
+                        }
+                    ],
+                }
+            ],
+        )
+        link_candidate_b_repayments(
+            [],
+            [_monthly_anchor_account()],
+            [],
+            issue_context=malformed_evidence_context,
+        )
+        assert not any(
+            issue["issue_code"]
+            == "candidate_b_monthly_owned_grid_missing_field"
+            for issue in malformed_evidence_context._personal_detail_extraction_issues
+        )
+
+    ambiguous_context = SimpleNamespace(
+        _personal_detail_extraction_issues=[],
+        _candidate_b_monthly_source_structure_grids=[source_grid],
+        _candidate_b_monthly_source_structure_records=[source_record],
+    )
+    link_candidate_b_repayments(
+        [],
+        [
+            _monthly_anchor_account(account_id="account:1"),
+            _monthly_anchor_account(account_id="account:2"),
+        ],
+        [],
+        issue_context=ambiguous_context,
+    )
+    assert not any(
+        issue.get("observed_value", {}).get("account_id")
+        for issue in ambiguous_context._personal_detail_extraction_issues
+    )
+
+
+def test_detached_exact_source_alias_is_preserved_without_double_counting() -> None:
+    date_range = {
+        "start_year": 2024,
+        "start_month": 1,
+        "end_year": 2024,
+        "end_month": 1,
+    }
+    primary_grid = {
+        "grid_id": "grid:primary",
+        "page": 4,
+        "bbox": [100, 140, 400, 220],
+        "audit": {"date_range": date_range},
+    }
+    detached_grid = {
+        **primary_grid,
+        "grid_id": "grid:detached-alias",
+        "bbox": [90, 145, 420, 225],
+    }
+    detached_record = {
+        "grid_id": "grid:detached-alias",
+        "year": 2024,
+        "month": 1,
+        "status": "unknown",
+        "source_cell_refs": [
+            {
+                "logical_page": 4,
+                "grid_id": "grid:detached-alias",
+                "row": 2,
+                "col": 1,
+                "field_name": "status",
+                "bbox": [110, 160, 130, 175],
+                "geometry_scope": "cell",
+            }
+        ],
+    }
+    context = SimpleNamespace(
+        _personal_detail_extraction_issues=[],
+        _candidate_b_monthly_source_structure_grids=[detached_grid],
+        _candidate_b_monthly_source_structure_records=[detached_record],
+    )
+
+    linked = link_candidate_b_repayments(
+        [
+            {
+                "grid_id": "grid:primary",
+                "year": 2024,
+                "month": 1,
+                "status": "N",
+            }
+        ],
+        [_monthly_anchor_account()],
+        [primary_grid],
+        issue_context=context,
+    )
+
+    assert len(linked) == 1
+    alias_issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue["issue_code"]
+        == "candidate_b_monthly_source_position_alias_reconciled"
+    ]
+    assert len(alias_issues) == 1
+    assert alias_issues[0]["observed_value"] == {
+        "account_id": "account:1",
+        "grid_id": "grid:detached-alias",
+        "performance_month": "2024-01",
+        "source_position_state": "owner_bound_alias",
+        "account_month_owner_basis": "canonical_account_segment",
+    }
+    assert alias_issues[0]["source_refs"][0]["geometry_scope"] == "cell"
+    assert not any(
+        issue["issue_code"] == "canonical_monthly_source_structure_missing_field"
         for issue in context._personal_detail_extraction_issues
     )

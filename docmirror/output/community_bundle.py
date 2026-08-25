@@ -375,9 +375,21 @@ def _record_pools(row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
     if normalized or raw:
         keys = list(dict.fromkeys([*normalized.keys(), *raw.keys()]))
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
+        canonical_keys = []
+        for key in keys:
+            detail = field_sources.get(key)
+            explicitly_derived = bool(
+                isinstance(detail, dict)
+                and str(detail.get("source") or "").startswith("derived.")
+                and str(detail.get("derivation") or "").strip()
+            )
+            if key in raw or not explicitly_derived:
+                canonical_keys.append(key)
         return (
             {str(key): normalized.get(key, raw.get(key)) for key in keys},
-            {str(key): raw.get(key, normalized.get(key)) for key in keys},
+            {str(key): raw.get(key, normalized.get(key)) for key in canonical_keys},
         )
     public = {str(key): value for key, value in row.items() if key not in _INTERNAL_RECORD_KEYS}
     return public, public
@@ -662,7 +674,11 @@ def _dataset_completeness(
         for candidate in count_candidates:
             count_key = str(candidate.get("key") or "")
             count_value = data.get(count_key)
-            if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= 0:
+            try:
+                minimum = max(0, int(candidate.get("minimum", 0) or 0))
+            except (TypeError, ValueError):
+                minimum = 0
+            if isinstance(count_value, int) and not isinstance(count_value, bool) and count_value >= minimum:
                 selected_count = (
                     int(count_value),
                     str(candidate.get("public_basis") or policy.get("public_basis") or "domain_fact_count"),
@@ -2759,16 +2775,19 @@ def project_community_bundle(
 
     dataset_candidates: list[tuple[str, list[Any]]] = []
     internal_facts = {str(key) for key in (projection.get("internal_facts") or ())}
+    publish_empty_datasets = {
+        str(key) for key in (projection.get("publish_empty_datasets") or ()) if str(key)
+    }
     for key, value in data.items():
         if (
             key.startswith("_")
             or key in _NON_DATASET_KEYS
             or key in internal_facts
             or not isinstance(value, list)
-            or not value
+            or (not value and key not in publish_empty_datasets)
         ):
             continue
-        if all(isinstance(item, dict) for item in value):
+        if not value or all(isinstance(item, dict) for item in value):
             dataset_candidates.append((str(key), value))
     configured_dataset_order = semantic_extensions.get("dataset_document_order")
     if isinstance(configured_dataset_order, list):

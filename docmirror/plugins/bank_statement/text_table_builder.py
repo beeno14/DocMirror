@@ -174,7 +174,6 @@ def build_tables_from_spaced_ocr_text(text: str) -> list[list[list[str]]]:
 
     headers = ["交易日期", "摘要", "交易金额", "余额"]
     rows: list[list[str]] = [headers]
-    seen: set[tuple[str, str, str]] = set()
 
     for line in text.splitlines():
         line = line.strip()
@@ -188,10 +187,6 @@ def build_tables_from_spaced_ocr_text(text: str) -> list[list[list[str]]]:
         txn = _parse_txn_line(line)
         if txn is None:
             continue
-        key = (txn["交易日期"], txn["交易金额"], txn["余额"])
-        if key in seen:
-            continue
-        seen.add(key)
         rows.append([txn["交易日期"], txn["摘要"], txn["交易金额"], txn["余额"]])
 
     if len(rows) < 2:
@@ -217,7 +212,6 @@ def build_tables_from_stacked_bank_text(text: str) -> list[list[list[str]]]:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     headers = ["交易日期", "交易时间", "摘要", "交易金额", "余额", "对方户名", "备注"]
     rows: list[list[str]] = [headers]
-    seen: set[tuple[str, str, str, str]] = set()
 
     last_boundary = 0
     idx = 0
@@ -282,10 +276,12 @@ def build_tables_from_stacked_bank_text(text: str) -> list[list[list[str]]]:
         if amount and not amount.startswith(("+", "-")):
             amount = f"+{amount}"
         remark = " ".join(remark_parts).strip()
-        key = (date, inline_time, amount, balance)
-        if key not in seen:
-            seen.add(key)
-            rows.append([date, inline_time, summary, amount, balance, party, remark])
+        # Equal business values are common in real ledgers (fees, reversals,
+        # and batch payments).  This flattened source has no row-level
+        # provenance with which to prove identity, so preserve every ordered
+        # occurrence.  Alternative extraction planes are reconciled by the
+        # candidate selector, not by value-only deletion here.
+        rows.append([date, inline_time, summary, amount, balance, party, remark])
 
         last_boundary = amount_idx + 1
         idx = amount_idx + 1

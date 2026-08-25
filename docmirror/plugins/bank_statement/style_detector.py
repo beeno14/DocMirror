@@ -28,6 +28,7 @@ from typing import Any
 import yaml
 
 from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.extraction_dispatch import BankExtractionRoute
 from docmirror.plugins.bank_statement.header_resolve import has_split_debit_credit_headers
 from docmirror.plugins.bank_statement.institution_authority import resolve_institution_hint
 from docmirror.plugins.bank_statement.row_extract import row_has_transaction_data
@@ -86,12 +87,23 @@ class BankStyleDetector:
         scores: list[tuple[str, float, list[str]]] = []
 
         for style_id, spec in styles_cfg.items():
+            if style_id == "borderless_ocr" and ctx.extraction_route is not BankExtractionRoute.SCANNED:
+                continue
+            transaction_parsers = [
+                parser_id
+                for parser_id in (spec.get("parser_chain") or ["grid_standard"])
+                if parser_id != "kv_identity"
+            ]
+            if not any(ctx.extraction_policy.allows_parser(parser_id) for parser_id in transaction_parsers):
+                continue
             score = self._score_style(ctx, style_id, spec)
             secondary = self._secondary_tags(ctx, style_id)
             scores.append((style_id, score, secondary))
 
         scores.sort(key=lambda item: item[1], reverse=True)
         default_style = cfg.get("default_style") or "grid_standard"
+        if not ctx.extraction_policy.allows_parser(default_style):
+            default_style = next(iter(sorted(ctx.extraction_policy.allowed_parser_ids)))
 
         if scores and scores[0][1] >= self.MATCH_THRESHOLD:
             primary, confidence, secondary = scores[0]
@@ -100,6 +112,9 @@ class BankStyleDetector:
 
         spec = styles_cfg.get(primary, {})
         chain = list(spec.get("parser_chain") or ["grid_standard"])
+        chain = [parser_id for parser_id in chain if ctx.extraction_policy.allows_parser(parser_id)]
+        if not any(parser_id != "kv_identity" for parser_id in chain):
+            chain.append(default_style)
 
         return StyleDetectionResult(
             primary_style=primary,

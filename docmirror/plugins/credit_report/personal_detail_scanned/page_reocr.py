@@ -41,7 +41,7 @@ class _PageAttempt:
 class OneShotPageReOCRRegistry:
     """Run one producer at most once for each frozen logical subpage."""
 
-    def __init__(self, *, max_pages: int = 12) -> None:
+    def __init__(self, *, max_pages: int) -> None:
         self.max_pages = max(0, int(max_pages))
         self._attempts: dict[str, _PageAttempt] = {}
 

@@ -9,15 +9,21 @@ them into the only public business model before Community JSON is assembled.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from copy import deepcopy
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from math import isfinite
 from typing import Any, Callable, Mapping
 
 from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
     is_explicit_source_absence,
     validate_pboc_field,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.profile_extraction import (
+    canonical_profile_phone,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.quality import (
     decode_mapping,
@@ -25,6 +31,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.quality import (
     normalize_currency,
     valid_iso_date,
 )
+from docmirror.plugins.credit_report.value_utils import stable_record_id
 
 PBOC_SCHEMA_ID = "personal_credit_report_detailed"
 PBOC_SCHEMA_VERSION = "2.0.0"
@@ -105,6 +112,29 @@ _QUALITY_GATE_EXEMPT_DATASETS = _CONTROL_DATASETS - {"pboc_extension_fields"}
 _CANONICAL_MONTHLY_STATUS_CODES = frozenset(
     {"*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7", "A", "B", "C", "D", "G", "M", "Z"}
 )
+
+# Postpaid history uses a different finite PBOC code list from credit-account
+# repayment history.  Keep the vocabularies separate so a legacy credit status
+# cannot cross the final postpaid boundary merely because it is valid elsewhere.
+_POSTPAID_MONTHLY_STATUS_CODES = frozenset(
+    {"*", "N", "0", "1", "2", "3", "4", "5", "6", "C", "G", "#"}
+)
+_POSTPAID_BUSINESS_TYPES = frozenset(
+    {
+        "固定电话",
+        "固定电话后付费",
+        "移动电话",
+        "移动电话后付费",
+        "有线电视",
+        "有线电视后付费",
+        "电信业务",
+        "水费",
+        "电费",
+        "燃气费",
+        "水电气等公用事业",
+    }
+)
+_POSTPAID_PAYMENT_STATUSES = frozenset({"正常", "欠费"})
 
 _SPARSE_DATASET_STATUS_SEMANTICS = {
     "mode": "potentially_flawed_only",
@@ -189,6 +219,27 @@ _DIRECT_DATASET_RENAMES = {
     "inquiry_records": "inquiries",
 }
 
+_PROFILE_PHONE_RELATIONS = {
+    "mobile_phone": (
+        "mobile_phone_records",
+        "subject_mobile_phones",
+        "mobile_phone",
+        "mobile_phone_record_id",
+    ),
+    "work_phone": (
+        "employment_records",
+        "subject_employment",
+        "employer_phone",
+        "employment_record_id",
+    ),
+    "residence_phone": (
+        "residence_records",
+        "subject_residences",
+        "residential_phone",
+        "residence_record_id",
+    ),
+}
+
 _ACCOUNT_TYPE_CODES = {
     "non_revolving_loan": ("D1", "非循环贷账户"),
     "revolving_loan": ("R1", "循环贷账户（一）"),
@@ -209,6 +260,14 @@ _PUBLIC_RECORD_TARGETS = {
     "professional_qualification": "professional_qualification_records",
     "award": "administrative_award_records",
     "administrative_award": "administrative_award_records",
+}
+
+_PUBLIC_MONEY_FIELDS_BY_DATASET = {
+    "tax_arrears_records": frozenset({"arrears_amount"}),
+    "civil_judgment_records": frozenset({"claim_amount"}),
+    "enforcement_records": frozenset({"executed_amount", "requested_amount"}),
+    "administrative_penalty_records": frozenset({"penalty_amount"}),
+    "housing_fund_records": frozenset({"monthly_contribution"}),
 }
 
 _ACCOUNT_EVENT_TARGETS = {
@@ -423,6 +482,225 @@ def _without_internal_projection_metadata(values: Mapping[str, Any]) -> dict[str
         for key, value in values.items()
         if key not in _INTERNAL_PROJECTION_METADATA_FIELDS and not str(key).startswith("_")
     }
+
+
+_ACCOUNT_CURRENCY_SOURCE_FIELDS = {
+    "currency": "account_currency",
+    "account_currency": "account_currency",
+    "reporting_amount_currency": "reporting_amount_currency",
+}
+_PAGE_REOCR_EVIDENCE_PREFIX = "personal_detail_page_reocr:"
+
+
+def _positive_page_number(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _nonnegative_cell_index(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _finite_cell_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        bbox = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(isfinite(item) for item in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+    ):
+        return None
+    return bbox
+
+
+def _valid_page_reocr_evidence_ids(value: Any) -> bool:
+    if not isinstance(value, (list, tuple)) or not value:
+        return False
+    return all(
+        isinstance(evidence_id, str)
+        and evidence_id == evidence_id.strip()
+        and evidence_id.startswith(_PAGE_REOCR_EVIDENCE_PREFIX)
+        and len(evidence_id) > len(_PAGE_REOCR_EVIDENCE_PREFIX)
+        for evidence_id in value
+    )
+
+
+def _corrected_bbox_is_bound_to_native_slot(
+    native_bbox: tuple[float, float, float, float],
+    corrected_bbox: tuple[float, float, float, float],
+) -> bool:
+    nx0, ny0, nx1, ny1 = native_bbox
+    cx0, cy0, cx1, cy1 = corrected_bbox
+    center_x = (cx0 + cx1) / 2.0
+    center_y = (cy0 + cy1) / 2.0
+    if not (nx0 <= center_x <= nx1 and ny0 <= center_y <= ny1):
+        return False
+    intersection_width = max(0.0, min(nx1, cx1) - max(nx0, cx0))
+    intersection_height = max(0.0, min(ny1, cy1) - max(ny0, cy0))
+    corrected_area = (cx1 - cx0) * (cy1 - cy0)
+    return intersection_width * intersection_height / corrected_area >= 0.5
+
+
+def _native_account_currency_value_slot(
+    refs_by_field: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the one exact native blank slot which authorized currency repair."""
+
+    slots: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for source_field in _ACCOUNT_CURRENCY_SOURCE_FIELDS:
+        for raw_ref in refs_by_field.get(source_field) or ():
+            if not isinstance(raw_ref, Mapping):
+                continue
+            ref = dict(raw_ref)
+            canonical_field = _ACCOUNT_CURRENCY_SOURCE_FIELDS.get(
+                str(ref.get("field_name") or source_field)
+            )
+            logical_page = _positive_page_number(ref.get("logical_page"))
+            source_page = _positive_page_number(ref.get("source_page"))
+            bbox = _finite_cell_bbox(ref.get("bbox"))
+            row = _nonnegative_cell_index(ref.get("row"))
+            column = _nonnegative_cell_index(ref.get("column"))
+            canonical_row = _nonnegative_cell_index(ref.get("canonical_row"))
+            canonical_column = _nonnegative_cell_index(ref.get("canonical_column"))
+            label_row = _nonnegative_cell_index(ref.get("canonical_label_row"))
+            value_row = _nonnegative_cell_index(ref.get("canonical_value_row"))
+            coordinate_system = str(ref.get("coordinate_system") or "").strip()
+            table_id = str(ref.get("table_id") or "").strip()
+            evidence_ids = ref.get("evidence_ids")
+            if (
+                canonical_field != "account_currency"
+                or str(ref.get("source") or "") != "native_detail_table_cell"
+                or str(ref.get("geometry_scope") or "") != "cell"
+                or str(ref.get("binding") or "") != "canonical_field_slot"
+                or str(ref.get("binding_quality") or "")
+                != "canonical_header_column"
+                or str(ref.get("field_slot_role") or "") != "value"
+                or logical_page is None
+                or source_page is None
+                or bbox is None
+                or row is None
+                or column is None
+                or canonical_row != row
+                or canonical_column != column
+                or label_row is None
+                or value_row is None
+                or row != value_row
+                or label_row >= value_row
+                or not coordinate_system
+                or not table_id
+                or not isinstance(evidence_ids, (list, tuple))
+                or any(str(value or "").strip() for value in evidence_ids)
+            ):
+                continue
+            ref["logical_page"] = logical_page
+            ref["source_page"] = source_page
+            ref["bbox"] = list(bbox)
+            marker = (
+                logical_page,
+                source_page,
+                table_id,
+                row,
+                column,
+                bbox,
+                coordinate_system,
+            )
+            slots.setdefault(marker, ref)
+    return next(iter(slots.values())) if len(slots) == 1 else None
+
+
+def _corrected_currency_ref_matches_native_slot(
+    ref: Mapping[str, Any],
+    *,
+    source_field: str,
+    canonical_field: str,
+    native_slot: Mapping[str, Any],
+) -> bool:
+    ref_field = _ACCOUNT_CURRENCY_SOURCE_FIELDS.get(
+        str(ref.get("field_name") or source_field)
+    )
+    logical_page = _positive_page_number(ref.get("logical_page"))
+    source_page = _positive_page_number(ref.get("source_page"))
+    corrected_bbox = _finite_cell_bbox(ref.get("bbox"))
+    native_bbox = _finite_cell_bbox(native_slot.get("bbox"))
+    return bool(
+        ref_field == canonical_field
+        and str(ref.get("source") or "")
+        == "personal_detail_corrected_page_cell"
+        and str(ref.get("geometry_scope") or "") == "cell"
+        and str(ref.get("binding") or "") == "canonical_field_slot"
+        and str(ref.get("binding_quality") or "") == "canonical_field_slot"
+        and str(ref.get("field_slot_role") or "") == "value"
+        and str(ref.get("evidence_plane") or "") == "business_repair"
+        and _valid_page_reocr_evidence_ids(ref.get("evidence_ids"))
+        and logical_page == native_slot.get("logical_page")
+        and source_page == native_slot.get("source_page")
+        and corrected_bbox is not None
+        and native_bbox is not None
+        and str(ref.get("coordinate_system") or "").strip()
+        == str(native_slot.get("coordinate_system") or "").strip()
+        and _corrected_bbox_is_bound_to_native_slot(native_bbox, corrected_bbox)
+    )
+
+
+def _promote_corrected_account_currency_refs(
+    record: dict[str, Any],
+    *,
+    dataset_name: str,
+) -> None:
+    """Retain only corrected currency evidence bound to this row's native slot."""
+
+    if dataset_name != "credit_accounts":
+        return
+    source_refs = []
+    for raw_ref in record.get("source_refs") or ():
+        if not isinstance(raw_ref, Mapping):
+            continue
+        ref = dict(raw_ref)
+        if (
+            str(ref.get("source") or "")
+            == "personal_detail_corrected_page_cell"
+            and str(ref.get("field_name") or "")
+            in _ACCOUNT_CURRENCY_SOURCE_FIELDS
+        ):
+            continue
+        source_refs.append(ref)
+    record["source_refs"] = source_refs
+    refs_by_field = record.get("source_refs_by_field")
+    if not isinstance(refs_by_field, Mapping):
+        return
+    native_slot = _native_account_currency_value_slot(refs_by_field)
+    if native_slot is None:
+        return
+    promoted: list[dict[str, Any]] = []
+    for source_field, canonical_field in _ACCOUNT_CURRENCY_SOURCE_FIELDS.items():
+        for raw_ref in refs_by_field.get(source_field) or ():
+            if not isinstance(
+                raw_ref, Mapping
+            ) or not _corrected_currency_ref_matches_native_slot(
+                raw_ref,
+                source_field=source_field,
+                canonical_field=canonical_field,
+                native_slot=native_slot,
+            ):
+                continue
+            ref = dict(raw_ref)
+            ref["field_name"] = canonical_field
+            ref["evidence_ids"] = list(ref["evidence_ids"])
+            if ref not in promoted:
+                promoted.append(ref)
+    if not promoted:
+        return
+    for ref in promoted:
+        if ref not in source_refs:
+            source_refs.append(ref)
+    record["source_refs"] = source_refs
 
 
 def _snapshot_evidence(
@@ -707,10 +985,24 @@ def _month_value(value: Any) -> str | None:
     return f"{year:04d}-{month:02d}"
 
 
-def _decimal_string(value: Any) -> str | None:
+def _canonical_decimal_text(value: Any) -> str | None:
+    """Return a decimal spelling without deleting malformed separators."""
+
     if isinstance(value, bool) or value in (None, ""):
         return None
-    text = str(value).strip().replace(",", "")
+    text = str(value).strip()
+    if isinstance(value, str):
+        plain = re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text)
+        grouped = re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", text)
+        if plain is None and grouped is None:
+            return None
+    return text.replace(",", "")
+
+
+def _decimal_string(value: Any) -> str | None:
+    text = _canonical_decimal_text(value)
+    if text is None:
+        return None
     try:
         number = Decimal(text)
     except (InvalidOperation, ValueError):
@@ -770,6 +1062,876 @@ def _project_report_queries(
     return records
 
 
+def _dedupe_source_ref_mappings(refs: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Preserve each distinct source reference without weakening its payload."""
+
+    unique: dict[str, dict[str, Any]] = {}
+    for ref in refs:
+        if not isinstance(ref, Mapping):
+            continue
+        copied = deepcopy(dict(ref))
+        marker = json.dumps(copied, ensure_ascii=False, sort_keys=True, default=str)
+        unique.setdefault(marker, copied)
+    return list(unique.values())
+
+
+_PROFILE_PHONE_REF_SOURCES = frozenset(
+    {
+        "candidate_b_canonical_table",
+        "native_detail_table_cell",
+        "personal_detail_corrected_page_cell",
+    }
+)
+
+
+def _strict_profile_phone_ref(
+    ref: Mapping[str, Any],
+    field_name: str,
+) -> dict[str, Any] | None:
+    """Return one immutable exact ref that explicitly owns a profile phone."""
+
+    evidence_ids = ref.get("evidence_ids")
+    if (
+        str(ref.get("field_name") or "") != field_name
+        or str(ref.get("source") or "") not in _PROFILE_PHONE_REF_SOURCES
+        or _positive_page_number(ref.get("logical_page")) is None
+        or _positive_page_number(ref.get("source_page")) is None
+        or not str(ref.get("table_id") or "").strip()
+        or _nonnegative_cell_index(ref.get("row")) is None
+        or _nonnegative_cell_index(ref.get("column")) is None
+        or _finite_cell_bbox(ref.get("bbox")) is None
+        or str(ref.get("coordinate_system") or "") != "pdf_points_top_left"
+        or str(ref.get("geometry_scope") or "") not in {"cell", "token"}
+        or str(ref.get("geometry_status") or "") != "exact"
+        or not str(ref.get("binding") or "").strip()
+        or not str(ref.get("binding_quality") or "").strip()
+        or not isinstance(evidence_ids, (list, tuple))
+        or not evidence_ids
+        or any(
+            not isinstance(evidence_id, str) or not evidence_id.strip()
+            for evidence_id in evidence_ids
+        )
+        or len(evidence_ids) != len(set(evidence_ids))
+    ):
+        return None
+    return deepcopy(dict(ref))
+
+
+def _profile_phone_ref_owner(ref: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Return a physical owner signature independent of the evidence ID."""
+
+    return (
+        str(ref.get("source") or ""),
+        int(ref["logical_page"]),
+        int(ref["source_page"]),
+        str(ref.get("table_id") or ""),
+        int(ref["row"]),
+        int(ref["column"]),
+        str(ref.get("geometry_scope") or ""),
+        tuple(float(value) for value in ref["bbox"]),
+    )
+
+
+def _profile_phone_scalar_values(value: Any) -> list[Any]:
+    if isinstance(value, (list, tuple, set)):
+        return [item for member in value for item in _profile_phone_scalar_values(member)]
+    return [value]
+
+
+def _profile_phone_semantic_key(field_name: str, value: Any) -> str | None:
+    canonical = canonical_profile_phone(field_name, value)
+    if canonical is None:
+        return None
+    digits = re.sub(r"\D", "", canonical)
+    if field_name != "mobile_phone":
+        if digits.startswith("0086") and digits[4:5] == "0":
+            digits = digits[4:]
+        elif digits.startswith("86") and digits[2:3] == "0":
+            digits = digits[2:]
+    return digits or None
+
+
+def _profile_phone_value_contract(
+    field_name: str,
+    normalized_value: Any,
+    observed_value: Any,
+) -> tuple[bool, str]:
+    canonical = canonical_profile_phone(field_name, normalized_value)
+    if canonical is None or canonical != str(normalized_value or "").strip():
+        return False, "profile_phone_normalized_contract_failed"
+    normalized_key = _profile_phone_semantic_key(field_name, canonical)
+    raw_values = [
+        value
+        for value in _profile_phone_scalar_values(observed_value)
+        if value not in (None, "")
+    ]
+    if not raw_values:
+        return False, "profile_phone_raw_evidence_missing"
+    raw_keys = [_profile_phone_semantic_key(field_name, value) for value in raw_values]
+    if any(value is None for value in raw_keys):
+        return False, "profile_phone_raw_contract_failed"
+    if set(raw_keys) != {normalized_key}:
+        return False, "profile_phone_raw_normalized_conflict"
+    return True, "profile_phone_value_contract_exact"
+
+
+def _field_bound_source_refs(record: Mapping[str, Any], field_name: str) -> list[dict[str, Any]]:
+    """Return only refs whose envelope explicitly owns ``field_name``."""
+
+    refs: list[Mapping[str, Any]] = []
+    refs_by_field = record.get("source_refs_by_field")
+    if isinstance(refs_by_field, Mapping):
+        refs.extend(
+            ref
+            for ref in refs_by_field.get(field_name) or ()
+            if isinstance(ref, Mapping)
+        )
+    for pool_name in ("source_cell_refs", "source_refs"):
+        refs.extend(
+            ref
+            for ref in record.get(pool_name) or ()
+            if isinstance(ref, Mapping)
+            and str(ref.get("field_name") or "") == field_name
+        )
+    return _dedupe_source_ref_mappings(refs)
+
+
+def _phone_control_matches(
+    record: Mapping[str, Any],
+    *,
+    profile_id: str,
+    field_name: str,
+    profile_count: int,
+) -> bool:
+    values = _normalized(dict(record))
+    if str(values.get("dataset_name") or values.get("target_dataset") or "") not in {
+        "personal_profile",
+        "subject_profile",
+    }:
+        return False
+    if str(values.get("field_name") or "") != field_name:
+        return False
+    record_profile_id = str(
+        values.get("business_record_id") or values.get("target_record_id") or ""
+    )
+    return bool(
+        (profile_id and record_profile_id == profile_id)
+        or (not record_profile_id and profile_count == 1)
+    )
+
+
+def _profile_phone_evidence(
+    profile: Mapping[str, Any],
+    observations: list[dict[str, Any]],
+    *,
+    field_name: str,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Collect every raw variant and exact field-owned ref for one scalar."""
+
+    raw_values: list[Any] = []
+    refs: list[Mapping[str, Any]] = list(_field_bound_source_refs(profile, field_name))
+    for snapshot_name in ("canonical_raw", "raw"):
+        snapshot = profile.get(snapshot_name)
+        if isinstance(snapshot, Mapping) and snapshot.get(field_name) not in (None, ""):
+            raw_values.append(deepcopy(snapshot[field_name]))
+    for observation in observations:
+        values = _normalized(observation)
+        raw_value = values.get("raw_value")
+        if raw_value not in (None, ""):
+            raw_values.append(deepcopy(raw_value))
+        for pool_name in ("source_cell_refs", "source_refs"):
+            refs.extend(
+                ref
+                for ref in observation.get(pool_name) or ()
+                if isinstance(ref, Mapping)
+            )
+
+    unique_raw: dict[str, Any] = {}
+    for raw_value in raw_values:
+        marker = json.dumps(raw_value, ensure_ascii=False, sort_keys=True, default=str)
+        unique_raw.setdefault(marker, raw_value)
+    preserved_raw = list(unique_raw.values())
+    observed_value: Any = (
+        preserved_raw[0]
+        if len(preserved_raw) == 1
+        else preserved_raw
+        if preserved_raw
+        else None
+    )
+    return observed_value, _dedupe_source_ref_mappings(refs)
+
+
+def _stable_relation_record_identity(
+    record: Mapping[str, Any],
+    id_field: str,
+) -> tuple[str, str]:
+    values = _normalized(dict(record))
+    envelope_id = str(record.get("record_id") or "").strip()
+    normalized_id = str(values.get(id_field) or "").strip()
+    if envelope_id and normalized_id and envelope_id != normalized_id:
+        return "", "canonical_relation_stable_id_conflict"
+    stable_id = envelope_id or normalized_id
+    return (
+        (stable_id, "canonical_relation_stable_id_exact")
+        if stable_id
+        else ("", "canonical_relation_stable_id_missing")
+    )
+
+
+def _stable_relation_record_id(record: Mapping[str, Any], id_field: str) -> str:
+    return _stable_relation_record_identity(record, id_field)[0]
+
+
+def _merge_profile_phone_into_relation(
+    record: dict[str, Any],
+    *,
+    target_field: str,
+    normalized_value: Any,
+    observed_value: Any,
+    source_refs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Copy one proved scalar into an already identified relation row."""
+
+    merged = deepcopy(record)
+    values = _normalized(merged)
+    values[target_field] = deepcopy(normalized_value)
+    merged = _replace_normalized(merged, values)
+
+    raw_snapshot = deepcopy(merged.get("canonical_raw"))
+    if not isinstance(raw_snapshot, dict):
+        raw_snapshot = {}
+    raw_candidates: list[Any] = []
+    if raw_snapshot.get(target_field) not in (None, ""):
+        existing_raw = raw_snapshot[target_field]
+        raw_candidates.extend(existing_raw if isinstance(existing_raw, list) else [existing_raw])
+    if observed_value not in (None, "", []):
+        raw_candidates.extend(
+            observed_value if isinstance(observed_value, list) else [observed_value]
+        )
+    unique_raw: dict[str, Any] = {}
+    for raw_value in raw_candidates:
+        marker = json.dumps(raw_value, ensure_ascii=False, sort_keys=True, default=str)
+        unique_raw.setdefault(marker, deepcopy(raw_value))
+    if unique_raw:
+        retained = list(unique_raw.values())
+        raw_snapshot[target_field] = retained[0] if len(retained) == 1 else retained
+        merged["canonical_raw"] = raw_snapshot
+
+    merged_refs = [
+        ref
+        for ref in merged.get("source_refs") or ()
+        if isinstance(ref, Mapping)
+    ]
+    merged_refs.extend(source_refs)
+    if merged_refs:
+        merged["source_refs"] = _dedupe_source_ref_mappings(merged_refs)
+    return merged
+
+
+def _retarget_profile_phone_issue(
+    issue: dict[str, Any],
+    *,
+    target_dataset: str,
+    target_record_id: str | None,
+    target_field: str,
+    source_refs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Rebuild one source-profile issue against its terminal canonical field."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    values = _normalized(issue)
+    refs = (
+        list(source_refs)
+        if source_refs is not None
+        else [
+            ref
+            for pool_name in ("source_cell_refs", "source_refs")
+            for ref in issue.get(pool_name) or ()
+            if isinstance(ref, Mapping)
+        ]
+    )
+    return make_issue(
+        category=str(values.get("category") or "schema_incompleteness"),
+        issue_code=str(values.get("issue_code") or "canonical_profile_phone_unresolved"),
+        message=str(
+            values.get("message")
+            or "A profile telephone observation could not be published in its canonical relation."
+        ),
+        severity=str(values.get("severity") or "warning"),
+        status=str(values.get("status") or "requires_review"),
+        parser_stage=str(values.get("parser_stage") or "v2_profile_phone_conservation"),
+        target_dataset=target_dataset,
+        target_record_id=target_record_id,
+        field_name=target_field,
+        observed_value=values.get("observed_value"),
+        candidate_value=values.get("candidate_value"),
+        confidence=(
+            float(values["confidence"])
+            if isinstance(values.get("confidence"), (int, float))
+            and not isinstance(values.get("confidence"), bool)
+            else None
+        ),
+        source_refs=_dedupe_source_ref_mappings(refs),
+        reason_codes=values.get("reason_codes") or (),
+    )
+
+
+def _conserve_profile_phone_values(
+    source: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Route profile phones to proved existing relation owners or report loss."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    profiles = [
+        record
+        for record in source.get("personal_profile") or ()
+        if isinstance(record, dict)
+    ]
+    observations: list[dict[str, Any] | None] = [
+        record
+        for record in source.get("personal_detail_field_observations") or ()
+        if isinstance(record, dict)
+    ]
+    issues: list[dict[str, Any] | None] = [
+        record
+        for record in source.get("personal_detail_extraction_issues") or ()
+        if isinstance(record, dict)
+    ]
+    generated: list[dict[str, Any]] = []
+
+    profile_phone_owner_counts = {field_name: 0 for field_name in _PROFILE_PHONE_RELATIONS}
+    evidence_claims: dict[str, set[tuple[Any, ...]]] = {}
+    physical_claims: dict[tuple[Any, ...], set[tuple[Any, ...]]] = {}
+    control_owner_keys: dict[tuple[str, int, str], tuple[Any, ...]] = {}
+
+    def control_source_field(record: Mapping[str, Any]) -> str | None:
+        values = _normalized(dict(record))
+        if str(values.get("dataset_name") or values.get("target_dataset") or "") not in {
+            "personal_profile",
+            "subject_profile",
+        }:
+            return None
+        field_name = str(values.get("field_name") or "")
+        return field_name if field_name in _PROFILE_PHONE_RELATIONS else None
+
+    def control_owner_key(
+        pool_name: str,
+        index: int,
+        record: Mapping[str, Any],
+        field_name: str,
+    ) -> tuple[Any, ...]:
+        values = _normalized(dict(record))
+        matching_profiles = [
+            profile_index
+            for profile_index, profile in enumerate(profiles)
+            if _phone_control_matches(
+                dict(record),
+                profile_id=str(
+                    profile.get("record_id")
+                    or _normalized(profile).get("personal_profile_id")
+                    or _normalized(profile).get("subject_profile_id")
+                    or ""
+                ).strip(),
+                field_name=field_name,
+                profile_count=len(profiles),
+            )
+        ]
+        if len(matching_profiles) == 1:
+            return ("profile", matching_profiles[0], field_name)
+        profile_id = str(
+            values.get("business_record_id") or values.get("target_record_id") or ""
+        ).strip()
+        if profile_id:
+            return ("orphan_profile", profile_id, field_name)
+        return ("orphan_control", pool_name, index, field_name)
+
+    def profile_phone_control_refs(
+        record: Mapping[str, Any],
+        field_name: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        all_refs = _field_bound_source_refs(record, field_name)
+        all_refs.extend(
+            ref
+            for pool_name in ("source_cell_refs", "source_refs")
+            for ref in record.get(pool_name) or ()
+            if isinstance(ref, Mapping)
+        )
+        all_refs = _dedupe_source_ref_mappings(all_refs)
+        strict_refs = [
+            strict_ref
+            for ref in all_refs
+            if (strict_ref := _strict_profile_phone_ref(ref, field_name)) is not None
+        ]
+        return all_refs, strict_refs
+
+    def claim_control_refs(
+        pool_name: str,
+        index: int,
+        record: Mapping[str, Any],
+    ) -> None:
+        field_name = control_source_field(record)
+        if field_name is None:
+            return
+        owner_key = control_owner_key(pool_name, index, record, field_name)
+        control_owner_keys[(pool_name, index, field_name)] = owner_key
+        refs, _strict_refs = profile_phone_control_refs(record, field_name)
+        for ref in refs:
+            strict_ref = _strict_profile_phone_ref(ref, field_name)
+            if strict_ref is None:
+                continue
+            physical_claims.setdefault(_profile_phone_ref_owner(strict_ref), set()).add(
+                owner_key
+            )
+            for evidence_id in strict_ref["evidence_ids"]:
+                evidence_claims.setdefault(str(evidence_id), set()).add(owner_key)
+
+    for profile_index, profile in enumerate(profiles):
+        profile_values = _normalized(profile)
+        profile_id = str(
+            profile.get("record_id")
+            or profile_values.get("personal_profile_id")
+            or profile_values.get("subject_profile_id")
+            or ""
+        ).strip()
+        for source_field in _PROFILE_PHONE_RELATIONS:
+            relevant_observations = [
+                observation
+                for observation in observations
+                if isinstance(observation, dict)
+                and _phone_control_matches(
+                    observation,
+                    profile_id=profile_id,
+                    field_name=source_field,
+                    profile_count=len(profiles),
+                )
+            ]
+            snapshots = [
+                snapshot[source_field]
+                for snapshot_name in ("canonical_raw", "raw")
+                if isinstance(snapshot := profile.get(snapshot_name), Mapping)
+                and snapshot.get(source_field) not in (None, "")
+            ]
+            if (
+                profile_values.get(source_field) not in (None, "")
+                or snapshots
+                or any(
+                    _normalized(observation).get("raw_value") not in (None, "")
+                    for observation in relevant_observations
+                )
+            ):
+                profile_phone_owner_counts[source_field] += 1
+            _observed, candidate_refs = _profile_phone_evidence(
+                profile,
+                relevant_observations,
+                field_name=source_field,
+            )
+            owner_key = ("profile", profile_index, source_field)
+            for candidate_ref in candidate_refs:
+                strict_ref = _strict_profile_phone_ref(candidate_ref, source_field)
+                if strict_ref is None:
+                    continue
+                physical_claims.setdefault(
+                    _profile_phone_ref_owner(strict_ref), set()
+                ).add(owner_key)
+                for evidence_id in strict_ref["evidence_ids"]:
+                    evidence_claims.setdefault(str(evidence_id), set()).add(owner_key)
+    for observation_index, observation in enumerate(observations):
+        if isinstance(observation, Mapping):
+            claim_control_refs("observation", observation_index, observation)
+    for issue_index, issue in enumerate(issues):
+        if isinstance(issue, Mapping):
+            claim_control_refs("issue", issue_index, issue)
+    replayed_owner_keys = {
+        owner_key
+        for claims in (*evidence_claims.values(), *physical_claims.values())
+        if len(claims) > 1
+        for owner_key in claims
+    }
+
+    for profile_index, profile in enumerate(profiles):
+        profile_values = _normalized(profile)
+        profile_id = str(
+            profile.get("record_id")
+            or profile_values.get("personal_profile_id")
+            or profile_values.get("subject_profile_id")
+            or ""
+        ).strip()
+        for source_field, (
+            source_dataset,
+            target_dataset,
+            target_field,
+            relation_id_field,
+        ) in _PROFILE_PHONE_RELATIONS.items():
+            relevant_observation_indexes = [
+                index
+                for index, observation in enumerate(observations)
+                if isinstance(observation, dict)
+                and _phone_control_matches(
+                    observation,
+                    profile_id=profile_id,
+                    field_name=source_field,
+                    profile_count=len(profiles),
+                )
+            ]
+            relevant_issue_indexes = [
+                index
+                for index, issue in enumerate(issues)
+                if isinstance(issue, dict)
+                and _phone_control_matches(
+                    issue,
+                    profile_id=profile_id,
+                    field_name=source_field,
+                    profile_count=len(profiles),
+                )
+            ]
+            normalized_value = profile_values.get(source_field)
+            if (
+                normalized_value in (None, "")
+                and not relevant_observation_indexes
+                and not relevant_issue_indexes
+            ):
+                continue
+
+            relevant_observations = [
+                observation
+                for index in relevant_observation_indexes
+                if isinstance(observation := observations[index], dict)
+            ]
+            observed_value, source_refs = _profile_phone_evidence(
+                profile,
+                relevant_observations,
+                field_name=source_field,
+            )
+            if observed_value is None and normalized_value not in (None, ""):
+                observed_value = deepcopy(normalized_value)
+            all_source_refs = list(source_refs)
+            strict_source_refs = [
+                strict_ref
+                for ref in all_source_refs
+                if (strict_ref := _strict_profile_phone_ref(ref, source_field))
+                is not None
+            ]
+            value_contract_valid = False
+            value_contract_reason = "profile_phone_value_missing"
+            if normalized_value not in (None, ""):
+                value_contract_valid, value_contract_reason = _profile_phone_value_contract(
+                    source_field,
+                    normalized_value,
+                    observed_value,
+                )
+            authority_reason: str | None = None
+            if profile_phone_owner_counts[source_field] > 1:
+                authority_reason = "profile_phone_source_owner_ambiguous"
+            elif ("profile", profile_index, source_field) in replayed_owner_keys:
+                authority_reason = "profile_phone_source_ref_replayed"
+            elif not all_source_refs:
+                authority_reason = "profile_phone_exact_source_ref_missing"
+            elif len(strict_source_refs) != len(all_source_refs):
+                authority_reason = "profile_phone_source_ref_contract_failed"
+            elif not strict_source_refs:
+                authority_reason = "profile_phone_exact_source_ref_missing"
+            elif normalized_value not in (None, "") and not value_contract_valid:
+                authority_reason = value_contract_reason
+            source_refs = strict_source_refs
+
+            relation_rows = list(source.get(source_dataset) or ())
+            typed_relation_rows = [
+                (index, record)
+                for index, record in enumerate(relation_rows)
+                if isinstance(record, dict)
+            ]
+            exact_matches = [
+                (index, record)
+                for index, record in typed_relation_rows
+                if _normalized(record).get(target_field) not in (None, "")
+                and str(_normalized(record).get(target_field)) == str(normalized_value)
+            ]
+
+            owner: tuple[int, dict[str, Any], str] | None = None
+            issue_target_id: str | None = None
+            reason = authority_reason or "canonical_relation_owner_missing"
+            if authority_reason is not None:
+                pass
+            elif normalized_value not in (None, "") and len(exact_matches) == 1:
+                row_index, row = exact_matches[0]
+                stable_id, stable_status = _stable_relation_record_identity(
+                    row, relation_id_field
+                )
+                if stable_id:
+                    owner = (row_index, row, stable_id)
+                else:
+                    reason = stable_status
+            elif normalized_value not in (None, "") and len(exact_matches) > 1:
+                reason = "canonical_relation_owner_ambiguous"
+            elif normalized_value not in (None, "") and len(typed_relation_rows) == 1:
+                row_index, row = typed_relation_rows[0]
+                stable_id, stable_status = _stable_relation_record_identity(
+                    row, relation_id_field
+                )
+                current_value = _normalized(row).get(target_field)
+                if not stable_id:
+                    reason = stable_status
+                elif current_value in (None, ""):
+                    owner = (row_index, row, stable_id)
+                else:
+                    issue_target_id = stable_id
+                    reason = "canonical_relation_value_conflict"
+            elif len(typed_relation_rows) > 1:
+                reason = "canonical_relation_owner_ambiguous"
+            elif len(typed_relation_rows) == 1:
+                issue_target_id = _stable_relation_record_id(
+                    typed_relation_rows[0][1], relation_id_field
+                ) or None
+                reason = "profile_phone_value_unresolved"
+
+            if owner is not None:
+                row_index, row, stable_id = owner
+                relation_rows[row_index] = _merge_profile_phone_into_relation(
+                    row,
+                    target_field=target_field,
+                    normalized_value=normalized_value,
+                    observed_value=observed_value,
+                    source_refs=source_refs,
+                )
+                source[source_dataset] = relation_rows
+                for observation_index in relevant_observation_indexes:
+                    observation = observations[observation_index]
+                    if not isinstance(observation, dict):
+                        continue
+                    values = _normalized(observation)
+                    values["dataset_name"] = source_dataset
+                    values["business_record_id"] = stable_id
+                    values["field_name"] = target_field
+                    observations[observation_index] = _replace_normalized(
+                        observation, values
+                    )
+                issue_target_id = stable_id
+            else:
+                for observation_index in relevant_observation_indexes:
+                    observations[observation_index] = None
+
+            for issue_index in relevant_issue_indexes:
+                issue = issues[issue_index]
+                if not isinstance(issue, dict):
+                    continue
+                _issue_refs, strict_issue_refs = profile_phone_control_refs(
+                    issue, source_field
+                )
+                issues[issue_index] = _retarget_profile_phone_issue(
+                    issue,
+                    target_dataset=target_dataset,
+                    target_record_id=issue_target_id,
+                    target_field=target_field,
+                    source_refs=strict_issue_refs,
+                )
+
+            if owner is None and (
+                normalized_value not in (None, "") or not relevant_issue_indexes
+            ):
+                generated.append(
+                    make_issue(
+                        category="schema_incompleteness",
+                        issue_code="canonical_profile_phone_relation_unresolved",
+                        message=(
+                            "A source-profile telephone value had no unique existing "
+                            "canonical relation owner and was withheld."
+                        ),
+                        parser_stage="v2_profile_phone_conservation",
+                        target_dataset=target_dataset,
+                        target_record_id=issue_target_id,
+                        field_name=target_field,
+                        observed_value=observed_value,
+                        candidate_value=normalized_value,
+                        source_refs=strict_source_refs,
+                        reason_codes=(
+                            "source_profile_phone_value",
+                            reason,
+                            "raw_evidence_preserved",
+                            "normalized_value_withheld",
+                            "relation_row_not_invented",
+                        ),
+                    )
+                )
+
+    # A sparse source may carry a profile-phone observation or issue even when
+    # its profile business row was withheld upstream.  A sole relation is only
+    # a locator: the orphan control still needs the same exact field authority,
+    # raw/normalized equality, unique physical ownership, and stable relation
+    # identity as the ordinary profile path before it may name that relation.
+    authorized_orphan_targets: dict[tuple[Any, ...], str] = {}
+
+    for source_field, (
+        source_dataset,
+        target_dataset,
+        target_field,
+        relation_id_field,
+    ) in _PROFILE_PHONE_RELATIONS.items():
+        relation_rows = [
+            record
+            for record in source.get(source_dataset) or ()
+            if isinstance(record, dict)
+        ]
+        stable_relation_rows = [
+            (record, stable_id)
+            for record in relation_rows
+            if (stable_id := _stable_relation_record_id(record, relation_id_field))
+        ]
+        sole_owner = (
+            stable_relation_rows[0]
+            if len(relation_rows) == 1 and len(stable_relation_rows) == 1
+            else None
+        )
+
+        for observation_index, observation in enumerate(observations):
+            if not isinstance(observation, dict):
+                continue
+            values = _normalized(observation)
+            if str(values.get("dataset_name") or "") not in {
+                "personal_profile",
+                "subject_profile",
+            } or str(values.get("field_name") or "") != source_field:
+                continue
+            owner_key = control_owner_keys.get(
+                ("observation", observation_index, source_field)
+            )
+            matching_issue_indexes = [
+                issue_index
+                for issue_index, issue in enumerate(issues)
+                if isinstance(issue, dict)
+                and owner_key is not None
+                and control_owner_keys.get(("issue", issue_index, source_field))
+                == owner_key
+            ]
+            all_refs, strict_refs = profile_phone_control_refs(observation, source_field)
+            normalized_value = values.get("normalized_value")
+            raw_value = values.get("raw_value")
+            value_valid, value_reason = _profile_phone_value_contract(
+                source_field,
+                normalized_value,
+                raw_value,
+            )
+            authority_reason: str | None = None
+            if owner_key is None or owner_key[0] != "orphan_profile":
+                authority_reason = "profile_phone_source_owner_missing"
+            elif owner_key in replayed_owner_keys:
+                authority_reason = "profile_phone_source_ref_replayed"
+            elif not all_refs:
+                authority_reason = "profile_phone_exact_source_ref_missing"
+            elif len(strict_refs) != len(all_refs):
+                authority_reason = "profile_phone_source_ref_contract_failed"
+            elif not strict_refs:
+                authority_reason = "profile_phone_exact_source_ref_missing"
+            elif not value_valid:
+                authority_reason = value_reason
+            elif sole_owner is None:
+                authority_reason = "canonical_relation_owner_missing"
+            else:
+                relation_values = _normalized(sole_owner[0])
+                relation_value = relation_values.get(target_field)
+                if relation_value in (None, ""):
+                    authority_reason = "canonical_relation_value_missing"
+                elif str(relation_value) != str(normalized_value):
+                    authority_reason = "canonical_relation_value_conflict"
+
+            sole_owner_id = sole_owner[1] if authority_reason is None and sole_owner else None
+            if sole_owner_id is not None and owner_key is not None:
+                values["dataset_name"] = source_dataset
+                values["business_record_id"] = sole_owner_id
+                values["field_name"] = target_field
+                observations[observation_index] = _replace_normalized(
+                    observation, values
+                )
+                authorized_orphan_targets[owner_key] = sole_owner_id
+            else:
+                observations[observation_index] = None
+            for issue_index in matching_issue_indexes:
+                issue = issues[issue_index]
+                if isinstance(issue, dict):
+                    issue_all_refs, issue_strict_refs = profile_phone_control_refs(
+                        issue, source_field
+                    )
+                    issue_can_attach = bool(
+                        sole_owner_id is not None
+                        and issue_all_refs
+                        and len(issue_strict_refs) == len(issue_all_refs)
+                        and issue_strict_refs
+                    )
+                    issues[issue_index] = _retarget_profile_phone_issue(
+                        issue,
+                        target_dataset=target_dataset,
+                        target_record_id=sole_owner_id if issue_can_attach else None,
+                        target_field=target_field,
+                        source_refs=issue_strict_refs,
+                    )
+            raw_is_already_reported = any(
+                isinstance(issues[issue_index], dict)
+                and _normalized(issues[issue_index]).get("observed_value")
+                == raw_value
+                for issue_index in matching_issue_indexes
+            )
+            if authority_reason is not None and not raw_is_already_reported:
+                generated.append(
+                    make_issue(
+                        category="schema_incompleteness",
+                        issue_code="canonical_profile_phone_relation_unresolved",
+                        message=(
+                            "A source-profile telephone observation had no unique "
+                            "existing canonical relation owner and was withheld."
+                        ),
+                        parser_stage="v2_profile_phone_conservation",
+                        target_dataset=target_dataset,
+                        field_name=target_field,
+                        observed_value=raw_value,
+                        candidate_value=normalized_value,
+                        source_refs=strict_refs,
+                        reason_codes=(
+                            "source_profile_phone_observation",
+                            authority_reason,
+                            "raw_evidence_preserved",
+                            "normalized_value_withheld",
+                            "relation_row_not_invented",
+                        ),
+                    )
+                )
+
+        for issue_index, issue in enumerate(issues):
+            if not isinstance(issue, dict):
+                continue
+            values = _normalized(issue)
+            if str(values.get("target_dataset") or "") not in {
+                "personal_profile",
+                "subject_profile",
+            } or str(values.get("field_name") or "") != source_field:
+                continue
+            owner_key = control_owner_keys.get(("issue", issue_index, source_field))
+            all_refs, strict_refs = profile_phone_control_refs(issue, source_field)
+            target_id = authorized_orphan_targets.get(owner_key) if owner_key else None
+            issue_can_attach = bool(
+                target_id is not None
+                and owner_key not in replayed_owner_keys
+                and all_refs
+                and len(strict_refs) == len(all_refs)
+                and strict_refs
+            )
+            issues[issue_index] = _retarget_profile_phone_issue(
+                issue,
+                target_dataset=target_dataset,
+                target_record_id=target_id if issue_can_attach else None,
+                target_field=target_field,
+                source_refs=strict_refs,
+            )
+
+    source["personal_detail_field_observations"] = [
+        record for record in observations if isinstance(record, dict)
+    ]
+    source["personal_detail_extraction_issues"] = [
+        record for record in issues if isinstance(record, dict)
+    ]
+    return generated
+
+
 def _subject_profile(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "personal_profile_id", "subject_profile_id")
@@ -781,7 +1943,11 @@ def _subject_profile(values: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _credit_account(values: dict[str, Any]) -> dict[str, Any]:
+def _credit_account(
+    values: dict[str, Any],
+    *,
+    coerce_typed_values: bool = True,
+) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "validity_type", "credit_line_validity_type")
     if values.get("sequence") in (None, "") and values.get("category_sequence") not in (
@@ -802,6 +1968,16 @@ def _credit_account(values: dict[str, Any]) -> dict[str, Any]:
         "activation_state"
     ) not in (None, ""):
         values["card_activation_state"] = values["activation_state"]
+    if coerce_typed_values and values.get("repayment_periods") not in (None, ""):
+        raw_repayment_periods = values["repayment_periods"]
+        repayment_periods = _integer(raw_repayment_periods)
+        if repayment_periods is not None and repayment_periods >= 0:
+            values["repayment_periods"] = repayment_periods
+        elif is_explicit_source_absence(raw_repayment_periods):
+            # ``--`` is a printed non-applicable value, not a business string.
+            # Keep the exact sentinel in the source snapshots while exposing
+            # JSON null in the typed Community relation.
+            values["repayment_periods"] = None
 
     status_alias = values.get("account_status")
     if status_alias in (None, ""):
@@ -857,12 +2033,28 @@ def _credit_agreement(values: dict[str, Any]) -> dict[str, Any]:
 
 def _project_credit_accounts(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Apply the public account aliases consistently to values and evidence."""
-    projected = _project_records(records, _credit_account)
+    prepared = deepcopy(records)
+    for record in prepared:
+        if isinstance(record, dict):
+            _promote_corrected_account_currency_refs(
+                record,
+                dataset_name="credit_accounts",
+            )
+    projected = _project_records(prepared, _credit_account)
     for record in projected:
+        if isinstance(record.get("normalized"), dict):
+            # Live Candidate-B envelopes can retain a flat compatibility copy
+            # beside the authoritative normalized pool. Do not let a stale
+            # source sentinel or untyped value overwrite the coerced relation
+            # during downstream Community serialization.
+            record.pop("repayment_periods", None)
         for snapshot_name in ("canonical_raw", "raw"):
             snapshot = record.get(snapshot_name)
             if isinstance(snapshot, dict):
-                record[snapshot_name] = _credit_account(snapshot)
+                record[snapshot_name] = _credit_account(
+                    snapshot,
+                    coerce_typed_values=False,
+                )
     return projected
 
 
@@ -943,7 +2135,11 @@ def _responsible_party_category(values: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _repayment_responsibility(values: dict[str, Any]) -> dict[str, Any]:
+def _repayment_responsibility(
+    values: dict[str, Any],
+    *,
+    coerce_typed_values: bool = True,
+) -> dict[str, Any]:
     values = dict(values)
     _rename_key(values, "liability_id", "repayment_responsibility_id")
     id_type = str(values.get("related_party_id_type") or "").strip()
@@ -959,6 +2155,15 @@ def _repayment_responsibility(values: dict[str, Any]) -> dict[str, Any]:
         values.setdefault("extraction_status", "review")
     category = _responsible_party_category(values)
     values["related_party_category"] = category
+    if coerce_typed_values and values.get("overdue_months") not in (None, ""):
+        raw_overdue_months = values.get("overdue_months")
+        overdue_months = _integer(raw_overdue_months)
+        if overdue_months is None or overdue_months < 0:
+            values.pop("overdue_months", None)
+            values.setdefault("source_status_value", raw_overdue_months)
+            values.setdefault("extraction_status", "review")
+        else:
+            values["overdue_months"] = overdue_months
     combined = values.pop("overdue_months_or_repayment_status", None)
     if combined not in (None, ""):
         values["source_status_value"] = combined
@@ -984,15 +2189,34 @@ def _monthly_postpaid(values: dict[str, Any]) -> dict[str, Any]:
             values["source_month"] = month
     source_status = values.pop("status", None)
     projected_status = values.pop("status_code", None)
-    status = projected_status if projected_status not in (None, "") else source_status
-    status = str(status).strip() if status not in (None, "") else ""
-    if status and status not in _SOURCE_SENTINELS:
-        values["status_code"] = status
-    else:
-        values["status_code"] = "unknown"
+    if (
+        source_status not in (None, "")
+        and projected_status not in (None, "")
+        and str(source_status) != str(projected_status)
+    ):
+        values["status_code"] = deepcopy(projected_status)
+        values["_postpaid_status_alias_conflict"] = {
+            "status": deepcopy(source_status),
+            "status_code": deepcopy(projected_status),
+        }
+        values["raw_status"] = {
+            "status": deepcopy(source_status),
+            "status_code": deepcopy(projected_status),
+        }
         values["extraction_status"] = "review"
-        if status:
-            values["raw_status"] = status
+        return values
+    status = projected_status if projected_status not in (None, "") else source_status
+    if status in (None, ""):
+        values["status_code"] = None
+    elif isinstance(status, str) and is_explicit_source_absence(status):
+        values["status_code"] = None
+    else:
+        status_text = str(status)
+        values["status_code"] = status_text
+        if status_text in _POSTPAID_MONTHLY_STATUS_CODES:
+            return values
+        values["extraction_status"] = "review"
+        values["raw_status"] = deepcopy(status)
     return values
 
 
@@ -1006,7 +2230,10 @@ def _project_repayment_responsibilities(
         for snapshot_name in ("canonical_raw", "raw"):
             snapshot = record.get(snapshot_name)
             if isinstance(snapshot, dict):
-                record[snapshot_name] = _repayment_responsibility(snapshot)
+                record[snapshot_name] = _repayment_responsibility(
+                    snapshot,
+                    coerce_typed_values=False,
+                )
     return projected
 
 
@@ -1137,6 +2364,14 @@ def _project_closed_world_public_records(
         record_type = str(values.get("record_type") or "")
         target = _PUBLIC_RECORD_TARGETS.get(record_type)
         public_id = str(values.get("public_record_id") or record.get("record_id") or "")
+        record_source_refs = _dedupe_source_ref_mappings(
+            [
+                ref
+                for pool_name in ("source_cell_refs", "source_refs")
+                for ref in record.get(pool_name) or ()
+                if isinstance(ref, Mapping)
+            ]
+        )
         if target and public_id not in existing_source_ids:
             content = values.get("content")
             if isinstance(content, str):
@@ -1151,8 +2386,8 @@ def _project_closed_world_public_records(
                             parser_stage="v2_closed_world_projection",
                             target_dataset=target,
                             target_record_id=public_id or f"public_records:{index}",
-                            field_name="content",
                             observed_value=content,
+                            source_refs=record_source_refs,
                             reason_codes=(
                                 "closed_canonical_catalog",
                                 "unstructured_public_content",
@@ -1172,8 +2407,8 @@ def _project_closed_world_public_records(
                         parser_stage="v2_closed_world_projection",
                         target_dataset=target,
                         target_record_id=public_id or f"public_records:{index}",
-                        field_name="content",
                         observed_value=content,
+                        source_refs=record_source_refs,
                         reason_codes=(
                             "closed_canonical_catalog",
                             "structured_content_required",
@@ -1185,7 +2420,63 @@ def _project_closed_world_public_records(
             typed_values = dict(parsed)
             typed_values.setdefault("public_record_id", public_id)
             typed_values.setdefault("sequence", values.get("sequence"))
-            typed.setdefault(target, []).append(_replace_normalized(record, typed_values))
+            typed_record = _replace_normalized(record, typed_values)
+            raw_values = record.get("canonical_raw")
+            for field_name in sorted(_PUBLIC_MONEY_FIELDS_BY_DATASET.get(target, ())):
+                parsed_value = typed_values.get(field_name)
+                if (
+                    parsed_value in (None, "")
+                    or not isinstance(raw_values, Mapping)
+                    or field_name not in raw_values
+                ):
+                    continue
+                raw_value = deepcopy(raw_values[field_name])
+                raw_decimal_text = _canonical_decimal_text(raw_value)
+                parsed_decimal_text = _canonical_decimal_text(parsed_value)
+                raw_decimal: Decimal | None = None
+                parsed_decimal: Decimal | None = None
+                try:
+                    if raw_decimal_text is not None:
+                        candidate = Decimal(raw_decimal_text)
+                        raw_decimal = candidate if candidate.is_finite() else None
+                    if parsed_decimal_text is not None:
+                        candidate = Decimal(parsed_decimal_text)
+                        parsed_decimal = candidate if candidate.is_finite() else None
+                except (InvalidOperation, ValueError):
+                    pass
+                if raw_decimal is not None and raw_decimal == parsed_decimal:
+                    continue
+                issue_code = (
+                    "canonical_public_money_raw_invalid"
+                    if raw_decimal is None
+                    else "canonical_public_money_raw_mismatch"
+                )
+                typed_record, _ = _withhold(typed_record, field_name)
+                issues.append(
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code=issue_code,
+                        message=(
+                            "A public-record money value was not exactly supported by "
+                            "its complete source scalar; the normalized value was withheld."
+                        ),
+                        parser_stage="v2_closed_world_projection",
+                        target_dataset=target,
+                        target_record_id=public_id or f"public_records:{index}",
+                        field_name=field_name,
+                        observed_value=raw_value,
+                        candidate_value=parsed_value,
+                        source_refs=_field_bound_source_refs(record, field_name),
+                        reason_codes=(
+                            "canonical_public_money_raw_contract",
+                            "strict_complete_decimal_required",
+                            "semantic_equality_required",
+                            "raw_evidence_preserved",
+                            "normalized_value_withheld",
+                        ),
+                    )
+                )
+            typed.setdefault(target, []).append(typed_record)
         elif not target:
             unknown_content = values.get("content")
             if isinstance(unknown_content, str):
@@ -1200,11 +2491,11 @@ def _project_closed_world_public_records(
                     message="A public-record row was outside the finite canonical record catalog and was withheld.",
                     parser_stage="v2_closed_world_projection",
                     target_record_id=public_id or f"public_records:{index}",
-                    field_name="record_type",
                     observed_value={
                         "record_type": record_type or None,
                         "content": unknown_content,
                     },
+                    source_refs=record_source_refs,
                     reason_codes=(
                         "closed_canonical_catalog",
                         "unknown_public_record_type",
@@ -1358,18 +2649,33 @@ def _canonical_dataset_name(source_name: Any) -> str:
     return name
 
 
-def _canonical_field_name(dataset_name: str, field_name: Any) -> str:
+def _canonical_field_name(dataset_name: str, field_name: Any) -> str | None:
     """Return the final-v2 field that owns one source/compatibility value."""
 
     name = str(field_name or "")
+    if dataset_name in _PUBLIC_STATUS_TARGETS and name in {
+        "content",
+        "record_type",
+        "unmapped_content",
+    }:
+        # These are source-container/structural labels, not business fields in
+        # any final public dataset.  Their values remain issue evidence.
+        return None
     aliases = {
-        "subject_profile": {"personal_profile_id": "subject_profile_id"},
+        "subject_profile": {
+            "personal_profile_id": "subject_profile_id",
+            "mobile_phone": None,
+            "work_phone": None,
+            "residence_phone": None,
+        },
         "credit_accounts": {
             "category_sequence": "sequence",
             "institution": "management_institution",
             "currency": "account_currency",
             "activation_state": "card_activation_state",
             "account_status": "account_lifecycle_state",
+            "account_status_raw": "account_lifecycle_state",
+            "account_status_resolution": "account_lifecycle_state",
             "status": "account_lifecycle_state",
             "validity_type": "credit_line_validity_type",
         },
@@ -1379,6 +2685,77 @@ def _canonical_field_name(dataset_name: str, field_name: Any) -> str:
         },
         "credit_account_monthly_performance": {
             "overdue_amount": "status_amount",
+            "status": "status_code",
+        },
+        "postpaid_monthly_performance": {
+            "postpaid_payment_history_id": "postpaid_monthly_performance_id",
+            "year": "performance_month",
+            "month": "performance_month",
+            "status": "status_code",
+        },
+        "housing_fund_records": {
+            "personal_housing_fund_id": "public_record_id",
+            "personal_contribution_ratio": "personal_contribution_ratio_percent",
+            "employer_contribution_ratio": "employer_contribution_ratio_percent",
+        },
+        "tax_arrears_records": {
+            "authority": "tax_authority",
+        },
+        "civil_judgment_records": {
+            "authority": "filing_court",
+            "start_date": "filing_date",
+            "effective_date": "judgment_effective_date",
+        },
+        "enforcement_records": {
+            "authority": "court",
+            "start_date": "filing_date",
+            "end_date": "closure_date",
+        },
+        "administrative_penalty_records": {
+            "start_date": "effective_month",
+            "effective_date": "effective_month",
+            "end_date": "end_month",
+        },
+        "professional_qualification_records": {
+            "authority": "issuing_authority",
+            "obtained_date": "obtained_month",
+            "expiry_date": "expiry_month",
+            "revocation_date": "revocation_month",
+        },
+        "administrative_award_records": {
+            "start_date": "effective_month",
+            "effective_date": "effective_month",
+            "end_date": "end_month",
+        },
+        # These source names describe multi-field blobs or values that moved to
+        # their own canonical dataset.  Keeping them as ``field_name`` would
+        # falsely claim a field that does not exist in the closed-world API;
+        # the issue/observation evidence still preserves the source label.
+        "subject_employment": {
+            "employment_components": None,
+            "values": None,
+        },
+        # Summary-table source labels identify the metric row.  The unresolved
+        # cell itself projects to the canonical numeric value field.
+        "credit_business_overview": {
+            "value": "numeric_value",
+            "账户数": "numeric_value",
+            "授信总额": "numeric_value",
+            "余额": "numeric_value",
+            "最近6个月平均应还款": "numeric_value",
+            "担保责任": "numeric_value",
+            "其他相关还款责任": "numeric_value",
+            "为企业/担保责任": "numeric_value",
+            "为企业/其他相关还款责任": "numeric_value",
+            "最近1个月内的查询机构数": "numeric_value",
+            "最近1个月内的查询次数": "numeric_value",
+            "最近2年内的查询次数": "numeric_value",
+            "本人查询": "numeric_value",
+            "贷后管理": "numeric_value",
+            "贷款审批": "numeric_value",
+            "担保资格 审查": "numeric_value",
+            "特约商户 实名审查": "numeric_value",
+            "信用卡审批": "numeric_value",
         },
     }
     return aliases.get(dataset_name, {}).get(name, name)
@@ -1398,9 +2775,13 @@ def _field_observation(values: dict[str, Any]) -> dict[str, Any]:
     if canonical_name in PBOC_DATASET_ORDER and canonical_name not in _CONTROL_DATASETS:
         values["dataset_name"] = canonical_name
         if values.get("field_name"):
-            values["field_name"] = _canonical_field_name(
+            canonical_field = _canonical_field_name(
                 canonical_name, values["field_name"]
             )
+            if canonical_field is None:
+                values.pop("field_name", None)
+            else:
+                values["field_name"] = canonical_field
     else:
         values["dataset_name"] = "unknown"
         if source_name:
@@ -1535,10 +2916,24 @@ def _extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
         values["target_dataset"] = _canonical_dataset_name(values["target_dataset"])
     else:
         values.pop("target_dataset", None)
-    if values.get("field_name") and values.get("target_dataset"):
-        values["field_name"] = _canonical_field_name(
+    if (
+        values.get("issue_code")
+        == "candidate_b_native_source_cell_repayment_status_conflict"
+        and values.get("target_dataset") == "credit_account_monthly_performance"
+        and values.get("field_name") == "status"
+    ):
+        # This geometry-bound conflict contract is deliberately stricter than
+        # generic legacy monthly diagnostics: only its native ``status_code``
+        # target proves that a withheld row may survive the final gate.
+        values.pop("field_name", None)
+    elif values.get("field_name") and values.get("target_dataset"):
+        canonical_field = _canonical_field_name(
             str(values["target_dataset"]), values["field_name"]
         )
+        if canonical_field is None:
+            values.pop("field_name", None)
+        else:
+            values["field_name"] = canonical_field
     return values
 
 
@@ -1877,10 +3272,11 @@ def _money_field(field_name: str) -> bool:
 
 
 def _decimal_valid(value: Any) -> bool:
-    if isinstance(value, bool):
+    text = _canonical_decimal_text(value)
+    if text is None:
         return False
     try:
-        return Decimal(str(value).replace(",", "")).is_finite()
+        return Decimal(text).is_finite()
     except (InvalidOperation, ValueError):
         return False
 
@@ -1890,11 +3286,490 @@ def _explicit_valid_monthly_amount(value: Any) -> bool:
 
     if value in (None, "") or not _decimal_valid(value):
         return False
-    return Decimal(str(value).replace(",", "")) >= 0
+    text = _canonical_decimal_text(value)
+    return text is not None and Decimal(text) >= 0
+
+
+_EXACT_MONTHLY_OMISSION_BINDINGS = frozenset(
+    {
+        "canonical_field_slot",
+        "canonical_header_column",
+        "canonical_label_slot",
+        "grid_month_cell",
+        "monthly_grid_cell",
+        "source_monthly_field_cell",
+    }
+)
+_OWNED_GRID_MONTHLY_OMISSION_CODE = "candidate_b_monthly_owned_grid_missing_field"
+_OWNED_GRID_MONTHLY_REF_SOURCE = "candidate_b_monthly_owned_grid_cell"
+_OWNED_GRID_MONTHLY_INPUT_SOURCES = frozenset(
+    {"native_detail_table_cell", "sealed_native_physical_table_cell"}
+)
+_MONTHLY_OMISSION_FIELDS = frozenset({"performance_month", "status_code"})
+_MONTHLY_OMISSION_ISSUE_CODES = frozenset(
+    {
+        "candidate_b_monthly_account_range_missing_month",
+        "candidate_b_monthly_account_range_status_grid_unavailable",
+        "candidate_b_monthly_grid_owner_unresolved_field",
+        "candidate_b_monthly_grid_contract_missing_field",
+        _OWNED_GRID_MONTHLY_OMISSION_CODE,
+        "canonical_monthly_source_structure_missing_field",
+    }
+)
+_MONTHLY_STATUS_SOURCE_FIELDS = frozenset(
+    {"status", "status_code", "repayment_status_code"}
+)
+_EXACT_ACCOUNT_MONTH_OWNER_BASES = frozenset(
+    {
+        "canonical_account_segment",
+        "explicit_account_id_confirmed_by_canonical_segment",
+        "exact_source_table_account_owner",
+    }
+)
+_PERFORMANCE_MONTH_PATTERN = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])\Z")
+
+
+def _nonnegative_native_index(value: Any) -> int | None:
+    """Accept a source-table index only when it is already an integer."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _positive_native_page(value: Any) -> int | None:
+    """Accept a source page only when it is already a positive integer."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _exact_final_gate_monthly_identity(
+    record: Mapping[str, Any],
+) -> tuple[str, str, str, str] | None:
+    """Return a proven account/month target without trusting a grid alias."""
+
+    values = _normalized(dict(record))
+    account_id = str(values.get("account_id") or "").strip()
+    grid_id = str(values.get("grid_id") or "").strip()
+    performance_month = str(values.get("performance_month") or "").strip()
+    proof = values.get("_account_month_identity_proof")
+    proof_status = str(
+        values.get("_account_month_identity_proof_status") or ""
+    ).strip()
+    if not (
+        account_id
+        and grid_id
+        and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month)
+        and not proof_status.startswith("unproven")
+    ):
+        return None
+    if isinstance(proof, Mapping):
+        if not (
+            str(proof.get("account_id") or "").strip() == account_id
+            and str(proof.get("grid_id") or "").strip() == grid_id
+            and str(proof.get("performance_month") or "").strip()
+            == performance_month
+            and proof.get("account_anchor_exact") is True
+            and proof.get("printed_month_range_exact") is True
+            and proof.get("grid_geometry_exact") is True
+            and proof.get("unique_owner") is True
+            and str(proof.get("owner_basis") or "").strip()
+            in _EXACT_ACCOUNT_MONTH_OWNER_BASES
+        ):
+            return None
+    # Legacy/schema-only callers that carry no private proof marker retain
+    # their already-canonical compatibility path.  Any explicit unproven
+    # marker was rejected above.
+    expected_record_id = f"{grid_id}:{performance_month}"
+    source_record_id = str(
+        record.get("record_id")
+        or values.get("monthly_performance_id")
+        or ""
+    ).strip()
+    if source_record_id != expected_record_id:
+        return None
+    account_key = stable_record_id(
+        "source_account_month_owner", account_id
+    ).split(":", 1)[-1]
+    target_record_id = f"source_account_month:{account_key}:{performance_month}"
+    return target_record_id, account_id, grid_id, performance_month
+
+
+def _monthly_issue_account_month_identities(
+    record: Mapping[str, Any],
+    *,
+    account_owner_by_grid: Mapping[str, str],
+) -> set[tuple[str, str]]:
+    """Recover only explicit or uniquely owned account/month issue identities."""
+
+    values = _normalized(dict(record))
+    if (
+        str(values.get("target_dataset") or "")
+        != "credit_account_monthly_performance"
+    ):
+        return set()
+    identities: set[tuple[str, str]] = set()
+    for context in (values.get("observed_value"), values.get("candidate_value")):
+        if not isinstance(context, Mapping):
+            continue
+        account_id = str(context.get("account_id") or "").strip()
+        performance_month = str(context.get("performance_month") or "").strip()
+        if account_id and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month):
+            identities.add((account_id, performance_month))
+        if account_id:
+            for month in context.get("withheld_months") or ():
+                month_text = str(month or "").strip()
+                if _PERFORMANCE_MONTH_PATTERN.fullmatch(month_text):
+                    identities.add((account_id, month_text))
+    if identities:
+        return identities
+    observed = values.get("observed_value")
+    observed = observed if isinstance(observed, Mapping) else {}
+    grid_id = str(observed.get("grid_id") or "").strip()
+    performance_month = str(observed.get("performance_month") or "").strip()
+    target_record_id = str(values.get("target_record_id") or "").strip()
+    target_match = re.fullmatch(r"(.+):(\d{4}-(?:0[1-9]|1[0-2]))", target_record_id)
+    if target_match is not None and not (grid_id and performance_month):
+        grid_id, performance_month = target_match.groups()
+    account_id = account_owner_by_grid.get(grid_id, "")
+    if account_id and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month):
+        identities.add((account_id, performance_month))
+    return identities
+
+
+def _exact_final_gate_monthly_status_refs(
+    record: Mapping[str, Any],
+    *,
+    account_id: str,
+    grid_id: str,
+    performance_month: str,
+    field_name: str,
+) -> list[dict[str, Any]]:
+    """Retarget one trusted physical cell to an owned account/month identity."""
+
+    exact_refs: list[dict[str, Any]] = []
+    markers: set[str] = set()
+    for source_name in ("source_cell_refs", "source_refs"):
+        for raw_ref in record.get(source_name) or ():
+            if not isinstance(raw_ref, Mapping):
+                continue
+            source_field = str(raw_ref.get("field_name") or "").strip()
+            binding = str(raw_ref.get("binding") or "").strip()
+            binding_quality = str(raw_ref.get("binding_quality") or "").strip()
+            ref_grid_id = str(raw_ref.get("grid_id") or "").strip()
+            ref_month = str(raw_ref.get("performance_month") or "").strip()
+            evidence_ids = [
+                str(value).strip()
+                for value in raw_ref.get("evidence_ids") or ()
+                if str(value or "").strip()
+            ]
+            raw_column = raw_ref.get("column", raw_ref.get("col"))
+            column = _nonnegative_native_index(raw_column)
+            month_number = int(performance_month[5:7])
+            month_matches = ref_month == performance_month or (
+                not ref_month and column == month_number
+            )
+            logical_page = _positive_native_page(
+                raw_ref.get("logical_page") or raw_ref.get("page")
+            )
+            source_page = _positive_native_page(raw_ref.get("source_page"))
+            exact_bound_binding = bool(
+                evidence_ids
+                and binding in _EXACT_MONTHLY_OMISSION_BINDINGS
+                and source_page is not None
+                and str(raw_ref.get("table_id") or "").strip()
+                and ref_month == performance_month
+                and binding_quality in _EXACT_MONTHLY_OMISSION_BINDINGS
+            )
+            if (
+                str(raw_ref.get("source") or "")
+                not in _OWNED_GRID_MONTHLY_INPUT_SOURCES
+                or source_field not in _MONTHLY_STATUS_SOURCE_FIELDS
+                or str(raw_ref.get("geometry_scope") or "") != "cell"
+                or logical_page is None
+                or _nonnegative_native_index(raw_ref.get("row")) is None
+                or column is None
+                or _finite_cell_bbox(raw_ref.get("bbox")) is None
+                or not exact_bound_binding
+                or ref_grid_id != grid_id
+                or not month_matches
+            ):
+                continue
+            ref = dict(raw_ref)
+            ref.update(
+                {
+                    "source": _OWNED_GRID_MONTHLY_REF_SOURCE,
+                    "source_origin": str(raw_ref.get("source") or ""),
+                    "account_id": account_id,
+                    "evidence_ids": evidence_ids,
+                    "grid_id": grid_id,
+                    "performance_month": performance_month,
+                    "field_name": field_name,
+                    "page": logical_page,
+                    "logical_page": logical_page,
+                    "source_page": source_page,
+                    "column": column,
+                    "binding": "source_account_month_identity",
+                    "binding_quality": "source_account_month_identity",
+                }
+            )
+            if source_field != field_name:
+                ref["source_field_name"] = source_field
+            marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in markers:
+                continue
+            markers.add(marker)
+            exact_refs.append(ref)
+    exact_refs.sort(
+        key=lambda ref: (
+            int(ref["logical_page"]),
+            str(ref["table_id"]),
+            int(ref["row"]),
+            int(ref["column"]),
+            tuple(ref["evidence_ids"]),
+        )
+    )
+    return exact_refs[:1]
+
+
+def _exact_owned_grid_monthly_omission_ref(
+    ref: Mapping[str, Any],
+    *,
+    account_id: str,
+    performance_month: str,
+) -> bool:
+    """Validate the one closed-vocabulary ref allowed by the owned-grid issue."""
+
+    return bool(
+        str(ref.get("source") or "") == _OWNED_GRID_MONTHLY_REF_SOURCE
+        and str(ref.get("binding") or "") == "source_account_month_identity"
+        and str(ref.get("binding_quality") or "")
+        == "source_account_month_identity"
+        and str(ref.get("account_id") or "") == account_id
+        and str(ref.get("grid_id") or "").strip()
+        and str(ref.get("performance_month") or "") == performance_month
+        and str(ref.get("field_name") or "") == "performance_month"
+        and str(ref.get("geometry_scope") or "") == "cell"
+        and _positive_native_page(ref.get("logical_page") or ref.get("page"))
+        is not None
+        and _positive_native_page(ref.get("source_page")) is not None
+        and str(ref.get("table_id") or "").strip()
+        and _nonnegative_native_index(ref.get("row")) is not None
+        and _nonnegative_native_index(ref.get("column")) is not None
+        and _finite_cell_bbox(ref.get("bbox")) is not None
+        and bool(
+            [
+                value
+                for value in ref.get("evidence_ids") or ()
+                if isinstance(value, str) and value.strip()
+            ]
+        )
+    )
+
+
+def _monthly_omission_target_field(
+    record: Mapping[str, Any],
+) -> tuple[str, str] | None:
+    """Return the exact target/field owned by a localized monthly omission."""
+
+    values = _normalized(dict(record))
+    if (
+        str(values.get("target_dataset") or "")
+        != "credit_account_monthly_performance"
+        or str(values.get("issue_code") or "")
+        not in _MONTHLY_OMISSION_ISSUE_CODES
+        or str(values.get("field_name") or "") not in _MONTHLY_OMISSION_FIELDS
+    ):
+        return None
+    target_record_id = str(values.get("target_record_id") or "").strip()
+    field_name = str(values.get("field_name") or "").strip()
+    if (
+        str(values.get("issue_code") or "") == _OWNED_GRID_MONTHLY_OMISSION_CODE
+        and field_name != "performance_month"
+    ):
+        return None
+    return (target_record_id, field_name) if target_record_id else None
+
+
+def _exact_localized_monthly_issue_identities(
+    record: Mapping[str, Any],
+) -> set[tuple[str, str]]:
+    """Return only source-local exact account/month omission identities."""
+
+    values = _normalized(dict(record))
+    target = _monthly_omission_target_field(record)
+    if target is None:
+        return set()
+    target_record_id, field_name = target
+    issue_code = str(values.get("issue_code") or "").strip()
+    observed = values.get("observed_value")
+    if not isinstance(observed, Mapping):
+        return set()
+    account_id = str(observed.get("account_id") or "").strip()
+    performance_month = str(observed.get("performance_month") or "").strip()
+    if not (
+        account_id
+        and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month)
+        and field_name == "performance_month"
+    ):
+        return set()
+    account_key = stable_record_id(
+        "source_account_month_owner", account_id
+    ).split(":", 1)[-1]
+    if target_record_id != f"source_account_month:{account_key}:{performance_month}":
+        return set()
+    refs = record.get("source_refs")
+    if not isinstance(refs, (list, tuple)):
+        refs = values.get("source_refs")
+    refs = [ref for ref in refs or () if isinstance(ref, Mapping)]
+    if issue_code == _OWNED_GRID_MONTHLY_OMISSION_CODE:
+        if set(observed) != {"account_id", "performance_month"} or len(refs) != 1:
+            return set()
+        if not _exact_owned_grid_monthly_omission_ref(
+            refs[0],
+            account_id=account_id,
+            performance_month=performance_month,
+        ):
+            return set()
+        return {(account_id, performance_month)}
+    source_identity_type = str(
+        observed.get("source_identity_type") or ""
+    ).strip()
+    if not (
+        issue_code == "candidate_b_monthly_account_range_missing_month"
+        and source_identity_type == "account_month_from_printed_repayment_range"
+        and len(refs) == 1
+        and str(refs[0].get("performance_month") or "").strip()
+        == performance_month
+        and str(refs[0].get("account_id") or "").strip() == account_id
+        and str(refs[0].get("binding") or "").strip()
+        == "source_account_month_range"
+    ):
+        return set()
+    return {(account_id, performance_month)}
+
+
+_MONTHLY_CLOSURE_PROOF_DATASET = "_personal_detail_account_month_closure_proof"
+
+
+def _monthly_identity_digest(identities: set[tuple[str, str]]) -> str:
+    payload = "".join(
+        f"{account_id}\t{performance_month}\n"
+        for account_id, performance_month in sorted(identities)
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _strict_source_monthly_candidate_identities(
+    records: list[dict[str, Any]],
+) -> set[tuple[str, str]]:
+    """Recover only producer-authenticated source account/month identities."""
+
+    identities: set[tuple[str, str]] = set()
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        values = _normalized(dict(record))
+        account_id = str(values.get("account_id") or "").strip()
+        performance_month = str(values.get("performance_month") or "").strip()
+        year = values.get("year")
+        month = values.get("month")
+        if not _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month) and (
+            isinstance(year, int)
+            and not isinstance(year, bool)
+            and 1900 <= year <= 9999
+            and isinstance(month, int)
+            and not isinstance(month, bool)
+            and 1 <= month <= 12
+        ):
+            performance_month = f"{year:04d}-{month:02d}"
+        proof = values.get("_account_month_identity_proof")
+        proof_status = str(
+            values.get("_account_month_identity_proof_status") or ""
+        ).strip()
+        proof_grid_id = (
+            str(proof.get("grid_id") or "").strip()
+            if isinstance(proof, Mapping)
+            else ""
+        )
+        record_grid_id = str(values.get("grid_id") or "").strip()
+        if not (
+            account_id
+            and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month)
+            and isinstance(proof, Mapping)
+            and proof_grid_id
+            and not proof_status.startswith("unproven")
+            and str(proof.get("account_id") or "").strip() == account_id
+            and str(proof.get("performance_month") or "").strip()
+            == performance_month
+            and proof.get("account_anchor_exact") is True
+            and proof.get("printed_month_range_exact") is True
+            and proof.get("grid_geometry_exact") is True
+            and proof.get("unique_owner") is True
+            and str(proof.get("owner_basis") or "").strip()
+            in _EXACT_ACCOUNT_MONTH_OWNER_BASES
+            and (not record_grid_id or record_grid_id == proof_grid_id)
+        ):
+            continue
+        identities.add((account_id, performance_month))
+    return identities
+
+
+def _authenticated_source_monthly_closure(
+    source: Mapping[str, list[dict[str, Any]]],
+) -> frozenset[tuple[str, str]]:
+    """Validate the internal closure proof against exact source identities.
+
+    The public dataset-status row is intentionally excluded from this proof.
+    Direct schema callers may omit the singleton proof record, but still need
+    the same strict row/issue identity contracts; a supplied proof must match
+    both the complete identity set and its SHA-256 digest exactly.
+    """
+
+    identities = _strict_source_monthly_candidate_identities(
+        list(source.get("repayment_records") or ())
+    )
+    for raw_issue in source.get("personal_detail_extraction_issues") or ():
+        if not isinstance(raw_issue, Mapping):
+            continue
+        canonical_values = _extraction_issue(_normalized(dict(raw_issue)))
+        canonical_issue = _replace_normalized(dict(raw_issue), canonical_values)
+        identities.update(
+            _exact_localized_monthly_issue_identities(canonical_issue)
+        )
+
+    proof_rows = list(source.get(_MONTHLY_CLOSURE_PROOF_DATASET) or ())
+    if not proof_rows:
+        return frozenset(identities)
+    if len(proof_rows) != 1 or not isinstance(proof_rows[0], Mapping):
+        return frozenset()
+    proof_record = dict(proof_rows[0])
+    proof = _normalized(proof_record)
+    expected_count = proof.get("expected_identity_count")
+    valid = bool(
+        str(proof_record.get("record_id") or proof.get("record_id") or "")
+        == "personal_detail_account_month_closure_proof:1"
+        and str(proof.get("schema") or "")
+        == "docmirror.pboc.account_month_closure_proof.v1"
+        and proof.get("identity_fields") == ["account_id", "performance_month"]
+        and str(proof.get("proof_basis") or "")
+        == "exact_source_account_month_identity_set"
+        and isinstance(expected_count, int)
+        and not isinstance(expected_count, bool)
+        and expected_count == len(identities)
+        and re.fullmatch(r"[0-9a-f]{64}", str(proof.get("identity_sha256") or ""))
+        and str(proof.get("identity_sha256") or "")
+        == _monthly_identity_digest(identities)
+    )
+    return frozenset(identities) if valid else frozenset()
 
 
 def _canonical_quality_gate(
     projected: dict[str, list[dict[str, Any]]],
+    *,
+    authenticated_monthly_closure: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, list[dict[str, Any]]]:
     """Withhold invalid v2 values and publish one deduplicated uncertainty."""
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
@@ -1908,6 +3783,23 @@ def _canonical_quality_gate(
         if isinstance(record, dict) and _actionable_issue(record)
     ]
     generated: list[dict[str, Any]] = []
+    exact_report_dates: set[date] = set()
+    for dataset_name in ("report_metadata", "report_query"):
+        for record in projected.get(dataset_name) or ():
+            if not isinstance(record, dict):
+                continue
+            report_time = _normalized(record).get("report_time")
+            if not header_field_valid("report_time", report_time):
+                continue
+            try:
+                exact_report_dates.add(
+                    datetime.fromisoformat(str(report_time).strip()).date()
+                )
+            except (TypeError, ValueError):
+                continue
+    exact_report_date = (
+        next(iter(exact_report_dates)) if len(exact_report_dates) == 1 else None
+    )
 
     # Extraction keeps a private ``_source_absent_fields`` ledger until this
     # final public boundary.  Reconcile that typed evidence with dash-only
@@ -2187,6 +4079,18 @@ def _canonical_quality_gate(
     # that page-level OCR can repair while preventing ``unknown`` from becoming
     # a typed business status in Community JSON.
     monthly_rows = list(projected.get("credit_account_monthly_performance") or [])
+    account_owners_by_monthly_grid: dict[str, set[str]] = {}
+    for record in monthly_rows:
+        identity = _exact_final_gate_monthly_identity(record)
+        if identity is None:
+            continue
+        _target_record_id, account_id, grid_id, _performance_month = identity
+        account_owners_by_monthly_grid.setdefault(grid_id, set()).add(account_id)
+    unique_account_owner_by_monthly_grid = {
+        grid_id: next(iter(account_ids))
+        for grid_id, account_ids in account_owners_by_monthly_grid.items()
+        if len(account_ids) == 1
+    }
     if monthly_rows:
         field_resolved_status_record_ids = {
             _record_identity(
@@ -2369,16 +4273,16 @@ def _canonical_quality_gate(
 
         resolved_monthly_rows: list[dict[str, Any]] = []
         unresolved_by_grid: dict[str, list[tuple[int, dict[str, Any]]]] = {}
-        emitted_by_grid: dict[str, int] = {}
+        emitted_by_group: dict[str, int] = {}
         grid_order: dict[str, int] = {}
         withheld_record_ids: set[str] = set()
 
         def monthly_group(values: Mapping[str, Any]) -> str:
-            grid_id = str(values.get("grid_id") or "")
-            if grid_id:
-                return f"grid:{grid_id}"
             account_id = str(values.get("account_id") or "")
-            return f"account:{account_id or 'unresolved'}"
+            if account_id:
+                return f"account:{account_id}"
+            grid_id = str(values.get("grid_id") or "")
+            return f"unresolved-grid:{grid_id or 'unresolved'}"
 
         for index, record in enumerate(monthly_rows, start=1):
             values = _normalized(record)
@@ -2386,9 +4290,24 @@ def _canonical_quality_gate(
             grid_order.setdefault(group, len(grid_order))
             status = str(values.get("status_code") or "").strip().upper()
             account_id = str(values.get("account_id") or "").strip()
-            if status in _CANONICAL_MONTHLY_STATUS_CODES and account_id:
+            exact_identity = _exact_final_gate_monthly_identity(record)
+            proof = values.get("_account_month_identity_proof")
+            proof_status = str(
+                values.get("_account_month_identity_proof_status") or ""
+            ).strip()
+            explicit_proof_contract = bool(
+                isinstance(proof, Mapping) or proof_status
+            )
+            identity_contract_valid = bool(
+                exact_identity is not None or not explicit_proof_contract
+            )
+            if (
+                status in _CANONICAL_MONTHLY_STATUS_CODES
+                and account_id
+                and identity_contract_valid
+            ):
                 resolved_monthly_rows.append(record)
-                emitted_by_grid[group] = emitted_by_grid.get(group, 0) + 1
+                emitted_by_group[group] = emitted_by_group.get(group, 0) + 1
                 continue
             record_id = _record_identity(
                 record, "credit_account_monthly_performance", index
@@ -2398,13 +4317,15 @@ def _canonical_quality_gate(
                 or values.get("monthly_performance_id")
                 or ""
             ).strip()
-            grid_id = str(values.get("grid_id") or "").strip()
-            performance_month = str(values.get("performance_month") or "").strip()
             retain_native_source_conflict = bool(
                 stable_record_id
                 and account_id
-                and grid_id
-                and re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", performance_month)
+                # A same-cell status conflict can preserve an independently
+                # observed amount, but it cannot supply the missing grid or
+                # month owner.  Require the exact account-month identity even
+                # for legacy callers before retaining this otherwise partial
+                # row.
+                and exact_identity is not None
                 and _explicit_valid_monthly_amount(values.get("status_amount"))
                 and stable_record_id in native_source_status_conflict_record_ids
             )
@@ -2418,7 +4339,7 @@ def _canonical_quality_gate(
                 record = _replace_normalized(record, values)
                 record["record_id"] = stable_record_id
                 resolved_monthly_rows.append(record)
-                emitted_by_grid[group] = emitted_by_grid.get(group, 0) + 1
+                emitted_by_group[group] = emitted_by_group.get(group, 0) + 1
                 continue
             unresolved_by_grid.setdefault(group, []).append((index, record))
             withheld_record_ids.add(
@@ -2437,6 +4358,16 @@ def _canonical_quality_gate(
             )
         )
         projected["credit_account_monthly_performance"] = resolved_monthly_rows
+        emitted_account_month_values = {
+            (account_id, performance_month)
+            for record in resolved_monthly_rows
+            if (account_id := str(_normalized(record).get("account_id") or "").strip())
+            and _PERFORMANCE_MONTH_PATTERN.fullmatch(
+                performance_month := str(
+                    _normalized(record).get("performance_month") or ""
+                ).strip()
+            )
+        }
 
         # A valid status does not establish the paired amount.  Preserve every
         # emitted status row, but make a missing amount explicitly actionable
@@ -2496,9 +4427,28 @@ def _canonical_quality_gate(
         # ``status`` alias; normalize only those still-withheld exact targets to
         # the public ``status_code`` field.  Conversely, an active-looking
         # source issue is stale once that exact row now has a canonical status.
+        emitted_account_month_identities = {
+            (identity[1], identity[3])
+            for record in resolved_monthly_rows
+            if (identity := _exact_final_gate_monthly_identity(record)) is not None
+        }
         reconciled_monthly_status_issues: list[dict[str, Any]] = []
         for issue in issues:
             issue_values = _normalized(issue)
+            localized_target = _monthly_omission_target_field(issue)
+            issue_account_month_identities = _monthly_issue_account_month_identities(
+                issue,
+                account_owner_by_grid=unique_account_owner_by_monthly_grid,
+            )
+            if (
+                localized_target is not None
+                and issue_account_month_identities
+                and issue_account_month_identities <= emitted_account_month_identities
+            ):
+                # A previously withheld source position may become publishable
+                # after correction. Its omission report must not survive as a
+                # contradictory active finding on the emitted row.
+                continue
             is_monthly_status_contract_issue = bool(
                 str(issue_values.get("target_dataset") or "")
                 == "credit_account_monthly_performance"
@@ -2509,6 +4459,11 @@ def _canonical_quality_gate(
             )
             if not is_monthly_status_contract_issue:
                 reconciled_monthly_status_issues.append(issue)
+                continue
+            if (
+                issue_account_month_identities
+                and issue_account_month_identities <= emitted_account_month_identities
+            ):
                 continue
             target_record_id = str(
                 issue_values.get("target_record_id") or ""
@@ -2523,8 +4478,25 @@ def _canonical_quality_gate(
         issues = reconciled_monthly_status_issues
 
         for group, indexed_records in sorted(unresolved_by_grid.items()):
-            records = [record for _index, record in indexed_records]
+            records = []
+            for _index, record in indexed_records:
+                values = _normalized(record)
+                account_id = str(values.get("account_id") or "").strip()
+                performance_month = str(
+                    values.get("performance_month") or ""
+                ).strip()
+                if (account_id, performance_month) in emitted_account_month_values:
+                    continue
+                records.append(record)
+            if not records:
+                continue
             values = [_normalized(record) for record in records]
+            proven_identities = [
+                identity
+                for record in records
+                if (identity := _exact_final_gate_monthly_identity(record)) is not None
+            ]
+            all_identities_proven = len(proven_identities) == len(records)
             months = sorted(
                 {
                     str(item.get("performance_month") or "")
@@ -2567,7 +4539,16 @@ def _canonical_quality_gate(
                     field_name="status_code",
                     observed_value={
                         "grid_id": next(iter(grid_ids)) if len(grid_ids) == 1 else None,
-                        "account_id": next(iter(account_ids)) if len(account_ids) == 1 else None,
+                        "account_id": (
+                            next(iter(account_ids))
+                            if all_identities_proven and len(account_ids) == 1
+                            else None
+                        ),
+                        "account_month_identity_status": (
+                            "exact"
+                            if all_identities_proven
+                            else "unresolved_pending_exact_owner_proof"
+                        ),
                         "withheld_candidate_count": len(records),
                         "withheld_month_count": len(months) or len(records),
                         "withheld_months": months,
@@ -2575,7 +4556,9 @@ def _canonical_quality_gate(
                         "last_withheld_month": months[-1] if months else None,
                     },
                     candidate_value={
-                        "emitted_month_count_for_grid": emitted_by_grid.get(group, 0),
+                        "emitted_month_count_for_account_group": emitted_by_group.get(
+                            group, 0
+                        ),
                     },
                     source_refs=refs,
                     reason_codes=(
@@ -2586,6 +4569,60 @@ def _canonical_quality_gate(
                     ),
                 )
             )
+            existing_local_targets = {
+                target
+                for issue in (*issues, *generated)
+                if (target := _monthly_omission_target_field(issue)) is not None
+            }
+            for record in records:
+                identity = _exact_final_gate_monthly_identity(record)
+                if identity is None:
+                    continue
+                target_record_id, account_id, grid_id, performance_month = identity
+                refs = _exact_final_gate_monthly_status_refs(
+                    record,
+                    account_id=account_id,
+                    grid_id=grid_id,
+                    performance_month=performance_month,
+                    field_name="performance_month",
+                )
+                # The owned-grid code closes only the account/month identity.
+                # It never claims that an unresolved status value was observed.
+                if len(refs) != 1:
+                    continue
+                target = (target_record_id, "performance_month")
+                if target in existing_local_targets:
+                    continue
+                generated.append(
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code=_OWNED_GRID_MONTHLY_OMISSION_CODE,
+                        message=(
+                            "An exact uniquely owner-bound source grid/month "
+                            "identity was withheld by the final status gate."
+                        ),
+                        parser_stage="candidate_b_final_monthly_gate",
+                        target_dataset="credit_account_monthly_performance",
+                        target_record_id=target_record_id,
+                        field_name="performance_month",
+                        observed_value={
+                            "account_id": account_id,
+                            "performance_month": performance_month,
+                        },
+                        candidate_value={
+                            "resolution": "withheld_pending_review"
+                        },
+                        source_refs=refs,
+                        reason_codes=(
+                            "final_monthly_status_contract_failed",
+                            "exact_account_month_identity",
+                            "exact_source_monthly_field_cell",
+                            "normalized_value_withheld",
+                            "status_value_not_asserted",
+                        ),
+                    )
+                )
+                existing_local_targets.add(target)
 
     dictionary_datasets = personal_detail_data_dictionary()["datasets"]
     money_fields_by_dataset = {
@@ -2605,6 +4642,147 @@ def _canonical_quality_gate(
         dataset_name: set(dictionary_datasets.get(dataset_name, {}).get("columns") or {})
         for dataset_name in closed_world_datasets
     }
+
+    def gate_postpaid_finite_values(
+        dataset_name: str,
+        field_contracts: tuple[tuple[str, frozenset[str], str], ...],
+    ) -> None:
+        checked: list[dict[str, Any]] = []
+        for index, record in enumerate(projected.get(dataset_name) or [], start=1):
+            if not isinstance(record, dict):
+                continue
+            record_id = _record_identity(record, dataset_name, index)
+            refs_by_field = {
+                field_name: _field_bound_source_refs(record, field_name)
+                for field_name, _allowed, _issue_code in field_contracts
+            }
+            raw_snapshot = record.get("canonical_raw")
+            source_values = {
+                field_name: deepcopy(raw_snapshot[field_name])
+                for field_name, _allowed, _issue_code in field_contracts
+                if isinstance(raw_snapshot, Mapping) and field_name in raw_snapshot
+            }
+            conflicted_fields: set[str] = set()
+            alias_conflict = _normalized(record).get(
+                "_postpaid_status_alias_conflict"
+            )
+            if (
+                dataset_name == "postpaid_monthly_performance"
+                and isinstance(alias_conflict, Mapping)
+                and set(alias_conflict) == {"status", "status_code"}
+            ):
+                conflict_values = {
+                    alias: deepcopy(alias_conflict[alias])
+                    for alias in ("status", "status_code")
+                }
+                record = deepcopy(record)
+                conflict_raw = record.get("canonical_raw")
+                conflict_raw = dict(conflict_raw) if isinstance(conflict_raw, Mapping) else {}
+                for alias, raw_value in conflict_values.items():
+                    conflict_raw.setdefault(alias, deepcopy(raw_value))
+                record["canonical_raw"] = conflict_raw
+                record, _retained = _withhold(record, "status_code")
+                conflicted_fields.add("status_code")
+                target_field_key = (dataset_name, record_id, "status_code")
+                if target_field_key not in actionable_target_fields:
+                    conflict_refs = _dedupe_source_ref_mappings(
+                        [
+                            *_field_bound_source_refs(record, "status"),
+                            *_field_bound_source_refs(record, "status_code"),
+                        ]
+                    )
+                    generated.append(
+                        make_issue(
+                            category="ocr_cell_level_error",
+                            issue_code="canonical_postpaid_monthly_status_invalid",
+                            message=(
+                                "Conflicting source status aliases could not be "
+                                "collapsed into one postpaid monthly status; the "
+                                "normalized value was withheld."
+                            ),
+                            parser_stage="v2_post_projection_gate",
+                            target_dataset=dataset_name,
+                            target_record_id=record_id,
+                            field_name="status_code",
+                            observed_value=conflict_values,
+                            source_refs=conflict_refs,
+                            reason_codes=(
+                                "postpaid_status_alias_conflict",
+                                "exact_alias_equality_required",
+                                "raw_evidence_preserved",
+                                "normalized_value_withheld",
+                            ),
+                        )
+                    )
+                    actionable_target_fields.add(target_field_key)
+            for field_name, allowed, issue_code in field_contracts:
+                if field_name in conflicted_fields:
+                    continue
+                values = _normalized(record)
+                observed = values.get(field_name)
+                if observed in (None, ""):
+                    continue
+                if isinstance(observed, str) and is_explicit_source_absence(observed):
+                    values[field_name] = None
+                    record = _replace_normalized(record, values)
+                    continue
+                if isinstance(observed, str) and observed in allowed:
+                    continue
+                record, retained = _withhold(record, field_name)
+                target_field_key = (dataset_name, record_id, field_name)
+                if target_field_key in actionable_target_fields:
+                    continue
+                generated.append(
+                    make_issue(
+                        category="ocr_cell_level_error",
+                        issue_code=issue_code,
+                        message=(
+                            "A postpaid value was outside its finite native code "
+                            "list; the normalized value was withheld."
+                        ),
+                        parser_stage="v2_post_projection_gate",
+                        target_dataset=dataset_name,
+                        target_record_id=record_id,
+                        field_name=field_name,
+                        observed_value=source_values.get(field_name, retained),
+                        source_refs=refs_by_field[field_name],
+                        reason_codes=(
+                            "finite_native_vocabulary",
+                            "raw_evidence_preserved",
+                            "normalized_value_withheld",
+                        ),
+                    )
+                )
+                actionable_target_fields.add(target_field_key)
+            checked.append(record)
+        if checked:
+            projected[dataset_name] = checked
+
+    gate_postpaid_finite_values(
+        "postpaid_accounts",
+        (
+            (
+                "business_type",
+                _POSTPAID_BUSINESS_TYPES,
+                "canonical_postpaid_business_type_invalid",
+            ),
+            (
+                "payment_status",
+                _POSTPAID_PAYMENT_STATUSES,
+                "canonical_postpaid_payment_status_invalid",
+            ),
+        ),
+    )
+    gate_postpaid_finite_values(
+        "postpaid_monthly_performance",
+        (
+            (
+                "status_code",
+                _POSTPAID_MONTHLY_STATUS_CODES,
+                "canonical_postpaid_monthly_status_invalid",
+            ),
+        ),
+    )
 
     account_ids = {
         str(_normalized(record).get("account_id") or "")
@@ -2853,11 +5031,39 @@ def _canonical_quality_gate(
                     if not valid:
                         invalid.append((field_name, value, "required_header_field_unresolved"))
             if dataset_name == "subject_profile":
+                envelope_profile_id = str(record.get("record_id") or "").strip()
+                semantic_profile_id = str(values.get("subject_profile_id") or "").strip()
+                if (
+                    envelope_profile_id
+                    and semantic_profile_id
+                    and envelope_profile_id != semantic_profile_id
+                ):
+                    invalid.append(
+                        (
+                            "subject_profile_id",
+                            semantic_profile_id,
+                            "canonical_record_identity_conflict",
+                        )
+                    )
                 for field_name in ("subject_name", "primary_id_type", "primary_id_number"):
                     if values.get(field_name) not in (None, "") and not header_field_valid(
                         field_name, values[field_name], id_type=values.get("primary_id_type")
                     ):
                         invalid.append((field_name, values[field_name], "canonical_field_contract_failed"))
+                birth_date = values.get("birth_date")
+                if (
+                    exact_report_date is not None
+                    and birth_date not in (None, "")
+                    and valid_iso_date(birth_date)
+                    and date.fromisoformat(str(birth_date).strip()) > exact_report_date
+                ):
+                    invalid.append(
+                        (
+                            "birth_date",
+                            birth_date,
+                            "canonical_birth_date_after_report_date",
+                        )
+                    )
             if dataset_name == "subject_identity_documents":
                 for field_name in ("document_type", "document_number"):
                     if values.get(field_name) not in (None, "") and not header_field_valid(
@@ -2890,6 +5096,14 @@ def _canonical_quality_gate(
                     continue
                 elif isinstance(value, (Mapping, list, tuple, set)):
                     invalid.append((field_name, value, "canonical_unstructured_value_withheld"))
+                elif (
+                    dataset_name == "credit_accounts"
+                    and field_name == "repayment_periods"
+                    and (type(value) is not int or value < 0)
+                ):
+                    invalid.append(
+                        (field_name, value, "canonical_field_contract_failed")
+                    )
                 elif field_name.endswith("_date") or field_name in {"birth_date", "inquiry_date"}:
                     if not valid_iso_date(value):
                         invalid.append((field_name, value, "canonical_date_invalid"))
@@ -2930,11 +5144,16 @@ def _canonical_quality_gate(
                         for field_name in source_absent_fields:
                             snapshot.pop(field_name, None)
 
+            invalid_field_source_refs = {
+                field_name: _field_bound_source_refs(record, field_name)
+                for field_name, _observed, _issue_code in invalid
+            }
             seen_fields: set[str] = set()
             for field_name, observed, issue_code in invalid:
                 if field_name in seen_fields:
                     continue
                 seen_fields.add(field_name)
+                field_source_refs = invalid_field_source_refs[field_name]
                 if issue_code == "canonical_field_outside_closed_catalog":
                     record, retained = _remove_noncanonical_field(record, field_name)
                 else:
@@ -2959,8 +5178,33 @@ def _canonical_quality_gate(
                             parser_stage="v2_post_projection_gate",
                             target_dataset=dataset_name,
                             target_record_id=record_id,
-                            field_name=field_name,
-                            observed_value=retained,
+                            field_name=(
+                                None
+                                if issue_code == "canonical_field_outside_closed_catalog"
+                                else field_name
+                            ),
+                            observed_value=(
+                                {
+                                    "source_field_name": field_name,
+                                    "source_value": retained,
+                                }
+                                if issue_code == "canonical_field_outside_closed_catalog"
+                                else retained
+                            ),
+                            source_refs=(
+                                field_source_refs
+                                if issue_code
+                                in {
+                                    "canonical_birth_date_after_report_date",
+                                    "canonical_field_outside_closed_catalog",
+                                    "canonical_postpaid_business_type_invalid",
+                                    "canonical_postpaid_payment_status_invalid",
+                                    "canonical_postpaid_monthly_status_invalid",
+                                    "canonical_public_money_raw_invalid",
+                                    "canonical_public_money_raw_mismatch",
+                                }
+                                else ()
+                            ),
                             reason_codes=(
                                 "canonical_schema_gate",
                                 "raw_evidence_preserved",
@@ -3061,6 +5305,12 @@ def _canonical_quality_gate(
     unique_observations: dict[str, dict[str, Any]] = {}
     for record in observations:
         values = _field_observation(_normalized(record))
+        # Multi-field/source-collection aliases do not identify one canonical
+        # business field. Their extraction issue remains visible with typed
+        # evidence, but publishing a field observation without ``field_name``
+        # would violate the v2 control contract and falsely imply a field.
+        if not values.get("field_name"):
+            continue
         observation_target = (
             str(values.get("dataset_name") or ""),
             str(values.get("business_record_id") or ""),
@@ -3104,6 +5354,15 @@ def _canonical_quality_gate(
         if str(_normalized(record).get("target_dataset") or "") in PBOC_DATASET_ORDER
         and str(_normalized(record).get("target_dataset") or "") not in _CONTROL_DATASETS
     }
+    monthly_dataset = "credit_account_monthly_performance"
+    if authenticated_monthly_closure:
+        # An exact closure may contain only withheld identities.  Preserve the
+        # canonical dataset itself even when its published row set is empty.
+        projected.setdefault(monthly_dataset, [])
+    if monthly_dataset in status_index or projected.get(monthly_dataset):
+        # Never preserve a count-only/raw-grid monthly denominator.  Rebuild it
+        # below from distinct emitted or exact localized account/month keys.
+        affected.add(monthly_dataset)
     for target in sorted(affected):
         existing_values = (
             _normalized(statuses[status_index[target]])
@@ -3128,70 +5387,51 @@ def _canonical_quality_gate(
             "reason": str(existing_values.get("reason") or "unresolved_extraction_issue"),
         }
         if target == "credit_account_monthly_performance":
-            withheld_count = sum(
-                int(observed.get("withheld_month_count") or 0)
-                for issue in unique_issues.values()
-                if str(_normalized(issue).get("issue_code") or "")
-                == "candidate_b_monthly_status_grid_unresolved"
-                and isinstance(
-                    observed := _normalized(issue).get("observed_value"), Mapping
+            emitted_account_months = {
+                (account_id, performance_month)
+                for record in projected.get(target) or ()
+                if isinstance(record, Mapping)
+                and (account_id := str(_normalized(dict(record)).get("account_id") or "").strip())
+                and _PERFORMANCE_MONTH_PATTERN.fullmatch(
+                    performance_month := str(
+                        _normalized(dict(record)).get("performance_month") or ""
+                    ).strip()
                 )
-                and isinstance(observed.get("withheld_month_count"), int)
-                and not isinstance(observed.get("withheld_month_count"), bool)
-            )
-            materialized_population = normalized["observed_row_count"] + withheld_count
-            structural_expected_counts: list[int] = []
+            }
+            localized_account_months: set[tuple[str, str]] = set()
+            unresolved_source_positions: set[tuple[str, str]] = set()
             for issue in unique_issues.values():
                 issue_values = _normalized(issue)
-                if (
-                    str(issue_values.get("issue_code") or "")
-                    != "canonical_monthly_reconstruction_incomplete"
-                ):
+                if str(issue_values.get("target_dataset") or "") != target:
                     continue
-                candidate = issue_values.get("candidate_value")
+                identities = _exact_localized_monthly_issue_identities(issue)
+                if identities:
+                    localized_account_months.update(identities)
+                    continue
                 observed = issue_values.get("observed_value")
-                if not isinstance(candidate, Mapping):
+                if not isinstance(observed, Mapping):
                     continue
-                structural_expected = candidate.get("structural_expected_row_count")
-                if (
-                    isinstance(structural_expected, int)
-                    and not isinstance(structural_expected, bool)
-                    and structural_expected >= 0
-                ):
-                    structural_expected_counts.append(structural_expected)
-                missing = candidate.get("missing_month_count")
-                if (
-                    not isinstance(missing, int)
-                    or isinstance(missing, bool)
-                    or missing < 0
-                ):
-                    continue
-                canonical_count = (
-                    observed.get("canonical_row_count")
-                    if isinstance(observed, Mapping)
-                    else None
-                )
-                structural_expected_counts.append(
-                    (
-                        canonical_count
-                        if isinstance(canonical_count, int)
-                        and not isinstance(canonical_count, bool)
-                        and canonical_count >= 0
-                        else materialized_population
-                    )
-                    + missing
-                )
-            if withheld_count or structural_expected_counts:
-                source_expected = existing_values.get("expected_row_count")
-                normalized["expected_row_count"] = max(
-                    int(source_expected)
-                    if isinstance(source_expected, int)
-                    and not isinstance(source_expected, bool)
-                    and source_expected >= 0
-                    else 0,
-                    materialized_population,
-                    *structural_expected_counts,
-                )
+                grid_id = str(observed.get("grid_id") or "").strip()
+                performance_month = str(
+                    observed.get("performance_month") or ""
+                ).strip()
+                if grid_id and _PERFORMANCE_MONTH_PATTERN.fullmatch(performance_month):
+                    unresolved_source_positions.add((grid_id, performance_month))
+            closure = (
+                emitted_account_months
+                | localized_account_months
+                | set(authenticated_monthly_closure)
+            )
+            normalized["observed_row_count"] = len(emitted_account_months)
+            if closure:
+                normalized["expected_row_count"] = len(closure)
+            else:
+                normalized.pop("expected_row_count", None)
+            normalized["reason"] = (
+                "account_month_identity_partial_owner_unresolved"
+                if unresolved_source_positions
+                else "account_month_identity_closure"
+            )
         if target in status_index:
             index = status_index[target]
             statuses[index] = _replace_normalized(statuses[index], normalized)
@@ -3253,21 +5493,170 @@ def _bounded_observed_inquiry_date(value: Any) -> str | None:
     return candidate
 
 
+_EXACT_INQUIRY_ROW_REF_CONTRACTS = frozenset(
+    {
+        (
+            "native_detail_table",
+            "row",
+            "canonical_header_row",
+            "",
+        ),
+        (
+            "native_detail_table",
+            "row",
+            "canonical_header_business_row",
+            "",
+        ),
+        (
+            "candidate_b_canonical_inquiry_line",
+            "row",
+            "",
+            "",
+        ),
+        (
+            "native_detail_inquiry_token_row",
+            "token_row",
+            "canonical_header_token_row",
+            "exact_token_row",
+        ),
+    }
+)
+_EXACT_INQUIRY_FIELD_REF_CONTRACTS = frozenset(
+    {
+        (
+            "native_detail_table_cell",
+            "cell",
+            "canonical_header_column",
+            "canonical_header_column",
+        ),
+        (
+            "native_detail_inquiry_token",
+            "token",
+            "canonical_header_column_token",
+            "exact_token_in_canonical_cell",
+        ),
+    }
+)
+
+
+def _strict_inquiry_evidence_ids(value: Any) -> tuple[str, ...] | None:
+    """Return immutable evidence ownership without trimming or coalescing IDs."""
+
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        for item in value
+    ):
+        return None
+    evidence_ids = tuple(value)
+    if len(evidence_ids) != len(set(evidence_ids)):
+        return None
+    return tuple(sorted(evidence_ids))
+
+
+def _exact_inquiry_evidence_owner(ref: Any) -> tuple[Any, ...] | None:
+    """Return one closed-contract physical inquiry row or institution-cell owner."""
+
+    if not isinstance(ref, Mapping):
+        return None
+    logical_page = _positive_page_number(ref.get("logical_page"))
+    source_page = _positive_page_number(ref.get("source_page"))
+    bbox = _finite_cell_bbox(ref.get("bbox"))
+    evidence_ids = _strict_inquiry_evidence_ids(ref.get("evidence_ids"))
+    if (
+        logical_page is None
+        or source_page is None
+        or bbox is None
+        or evidence_ids is None
+    ):
+        return None
+
+    source = str(ref.get("source") or "")
+    geometry_scope = str(ref.get("geometry_scope") or "")
+    binding = str(ref.get("binding") or "")
+    binding_quality = str(ref.get("binding_quality") or "")
+    contract = (source, geometry_scope, binding, binding_quality)
+    coordinate_system = str(ref.get("coordinate_system") or "")
+    table_id = str(ref.get("table_id") or "")
+    row = _nonnegative_cell_index(ref.get("row"))
+
+    if contract in _EXACT_INQUIRY_ROW_REF_CONTRACTS:
+        if source != "candidate_b_canonical_inquiry_line" and (
+            not table_id or row is None
+        ):
+            return None
+        return (
+            "row",
+            source,
+            logical_page,
+            source_page,
+            table_id,
+            row,
+            bbox,
+            evidence_ids,
+            coordinate_system,
+        )
+
+    field_name = str(ref.get("field_name") or "")
+    column = _nonnegative_cell_index(ref.get("column"))
+    if (
+        contract not in _EXACT_INQUIRY_FIELD_REF_CONTRACTS
+        or field_name != "institution"
+        or not table_id
+        or row is None
+        or column is None
+    ):
+        return None
+    return (
+        "field",
+        source,
+        logical_page,
+        source_page,
+        table_id,
+        row,
+        column,
+        bbox,
+        evidence_ids,
+        coordinate_system,
+    )
+
+
+def _inquiry_evidence_owners(record: Mapping[str, Any]) -> dict[tuple[Any, ...], Mapping[str, Any]]:
+    """Index only exact envelope refs; nested values cannot assert ownership."""
+
+    owners: dict[tuple[Any, ...], Mapping[str, Any]] = {}
+    for source_name in ("source_refs", "source_cell_refs"):
+        for ref in record.get(source_name) or ():
+            owner = _exact_inquiry_evidence_owner(ref)
+            if owner is not None and isinstance(ref, Mapping):
+                owners.setdefault(owner, ref)
+    return owners
+
+
+def _compact_inquiry_glyphs(value: Any) -> str:
+    """Remove presentation whitespace while preserving every observed glyph."""
+
+    return re.sub(r"\s+", "", str(value or ""))
+
+
 def _reconcile_resolved_targetless_inquiry_issues(
     projected: dict[str, list[dict[str, Any]]],
 ) -> None:
     """Drop only stale malformed-row issues proved by one finalized inquiry row."""
 
-    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
-        normalize_institution_name,
-        normalize_role_candidate,
-    )
+    from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import normalize_role_candidate
 
     issues = list(projected.get("extraction_issues") or [])
     if not issues:
         return
 
-    institutional_by_sequence: dict[int, list[tuple[str, dict[str, Any]]]] = {}
+    institutional_by_sequence: dict[
+        int,
+        list[tuple[str, dict[str, Any], dict[str, Any]]],
+    ] = {}
     for index, record in enumerate(projected.get("inquiries") or [], start=1):
         if not isinstance(record, dict):
             continue
@@ -3291,7 +5680,9 @@ def _reconcile_resolved_targetless_inquiry_issues(
         ):
             continue
         record_id = _record_identity(record, "inquiries", index)
-        institutional_by_sequence.setdefault(sequence, []).append((record_id, values))
+        institutional_by_sequence.setdefault(sequence, []).append(
+            (record_id, values, record)
+        )
 
     issue_blocked_record_ids = {
         str(values.get("target_record_id") or "")
@@ -3334,19 +5725,24 @@ def _reconcile_resolved_targetless_inquiry_issues(
         ):
             reconciled.append(issue)
             continue
-        record_id, final = candidates[0]
+        record_id, final, final_record = candidates[0]
         observed_date = _bounded_observed_inquiry_date(row[1])
-        observed_institution = normalize_institution_name(str(row[2] or ""))
+        observed_institution = str(row[2] or "")
         observed_reason = normalize_role_candidate(row[3], "inquiry_reason")
+        exact_institution_glyphs = bool(
+            _compact_inquiry_glyphs(observed_institution)
+            and _compact_inquiry_glyphs(observed_institution)
+            == _compact_inquiry_glyphs(final.get("institution"))
+        )
+        exact_owner_match = bool(
+            set(_inquiry_evidence_owners(issue))
+            & set(_inquiry_evidence_owners(final_record))
+        )
         resolved = bool(
             record_id not in issue_blocked_record_ids
             and observed_date == final.get("inquiry_date")
-            and _bounded_inquiry_edge_equivalent(
-                observed_institution,
-                final.get("institution"),
-                max_noise=3,
-                max_han_noise=1,
-            )
+            and exact_institution_glyphs
+            and exact_owner_match
             and _bounded_inquiry_edge_equivalent(
                 observed_reason,
                 final.get("reason"),
@@ -3370,11 +5766,17 @@ def project_personal_detail_datasets(
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
 
     source = {name: list(rows or []) for name, rows in datasets.items()}
+    authenticated_monthly_closure = _authenticated_source_monthly_closure(source)
     employment_rows, blob_issues = _employment_source_records(source.get("employment_records") or [])
     if employment_rows:
         source["employment_records"] = employment_rows
     if blob_issues:
         source.setdefault("personal_detail_extraction_issues", []).extend(blob_issues)
+    profile_phone_issues = _conserve_profile_phone_values(source)
+    if profile_phone_issues:
+        source.setdefault("personal_detail_extraction_issues", []).extend(
+            profile_phone_issues
+        )
     projected: dict[str, list[dict[str, Any]]] = {}
 
     metadata = source.get("personal_report_metadata") or []
@@ -3683,7 +6085,10 @@ def project_personal_detail_datasets(
     if status_rows:
         projected["dataset_status"] = _project_dataset_status(status_rows, projected)
 
-    projected = _canonical_quality_gate(projected)
+    projected = _canonical_quality_gate(
+        projected,
+        authenticated_monthly_closure=authenticated_monthly_closure,
+    )
     if projected.get("extraction_issues"):
         compact_issues, evidence_rows = _issue_evidence_rows(projected["extraction_issues"])
         projected["extraction_issues"] = compact_issues
@@ -3756,10 +6161,23 @@ def project_personal_detail_datasets(
                 )
             ):
                 record["normalized"] = _normalized(record)
+    reportable_empty_datasets = {
+        str(values.get("dataset_name") or "")
+        for record in projected.get("dataset_status") or ()
+        if isinstance(record, dict)
+        and (values := _normalized(record))
+        and str(values.get("applicability") or "") == "applicable"
+        and str(values.get("presence_status") or "")
+        in {"partial", "extraction_failed", "unknown"}
+        and isinstance(values.get("expected_row_count"), int)
+        and not isinstance(values.get("expected_row_count"), bool)
+        and int(values["expected_row_count"]) > 0
+        and int(values.get("observed_row_count") or 0) == 0
+    }
     return {
-        name: projected[name]
+        name: projected.get(name, [])
         for name in PBOC_DATASET_ORDER
-        if name in projected and projected[name]
+        if (name in projected and projected[name]) or name in reportable_empty_datasets
     }
 
 
@@ -4256,6 +6674,10 @@ def personal_detail_semantic_extensions() -> dict[str, Any]:
             name: f"one row per {_PBOC_DATASET_LABELS[name]}"
             for name in PBOC_DATASET_ORDER
         },
+        # Only source-proven empty collections survive v2 projection.  Publish
+        # those zero-row envelopes so their independently known omitted count
+        # is visible instead of disappearing with the business rows.
+        "publish_empty_datasets": list(PBOC_DATASET_ORDER),
         # Community's generic warning is only a projection-conservation check.
         # Source-document completeness is represented explicitly by dataset_status.
         "completeness": {

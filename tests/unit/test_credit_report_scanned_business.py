@@ -13,6 +13,7 @@ from docmirror.models.entities.parse_result import (
     TextBlock,
 )
 from docmirror.plugins.credit_report.scanned_business import (
+    _normalize_inquiry_reason_text,
     extract_scanned_credit_accounts,
     extract_scanned_credit_business,
     link_repayment_records_to_accounts,
@@ -27,6 +28,53 @@ def _table(table_id: str, rows: list[list[str]]) -> TableBlock:
         metadata={"raw_rows": rows},
         confidence=0.94,
     )
+
+
+def test_inquiry_reason_ocr_alias_is_an_exact_trailing_field_not_a_substring_rule() -> None:
+    assert _normalize_inquiry_reason_text("货后管理") == "贷后管理"
+    assert (
+        _normalize_inquiry_reason_text("19 2024.01.01 示例银行 货后管理")
+        == "19 2024.01.01 示例银行 贷后管理"
+    )
+    assert _normalize_inquiry_reason_text("某货后管理服务有限公司") == "某货后管理服务有限公司"
+    assert (
+        _normalize_inquiry_reason_text("19 2024.01.01 某货后管理服务有限公司 贷款审批")
+        == "19 2024.01.01 某货后管理服务有限公司 贷款审批"
+    )
+
+
+def test_scanned_inquiry_uses_shared_pboc_reason_forms_without_institution_substrings() -> None:
+    bundles = [
+        {
+            "page": 3,
+            "source_page_number": 3,
+            "local_structure_evidence": {
+                "lines": [
+                    {"text": "1 2024.01.01 某货后管理服务有限公司 贷款审批"},
+                    {"text": "2 2024.01.02 某住房中心 公积金提取复核"},
+                    {"text": "1 2024.01.03 本人 本人查询(临柜)"},
+                    {"text": "3 2024.01.04 示例征信服务其他"},
+                ]
+            },
+        }
+    ]
+    result = ParseResult(
+        pages=[PageContent(page_number=3, source_page_number=3)],
+        entities=DocumentEntities(
+            document_type="credit_report",
+            domain_specific={"_page_evidence_bundles": bundles},
+        ),
+    )
+
+    actual = extract_scanned_credit_business(result, "查询记录")
+
+    assert [row["reason"] for row in actual["inquiry_records"]] == [
+        "贷款审批",
+        "公积金提取复核",
+        "本人查询",
+    ]
+    assert actual["inquiry_records"][0]["institution"] == "某货后管理服务有限公司"
+    assert actual["inquiry_records"][2]["reason_detail_raw"] == "本人查询(临柜)"
 
 
 def test_scanned_business_extracts_profile_and_query_rows_with_provenance() -> None:

@@ -32,9 +32,14 @@ from docmirror.plugins.bank_statement.extract_pipeline import (
 from docmirror.plugins.bank_statement.header_resolve import detect_headers
 from docmirror.plugins.bank_statement.institution import match_institution, normalize_table_headers
 from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
+from docmirror.plugins.bank_statement.row_extract import extract_logical_rows_with_provenance
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
-from docmirror.plugins.bank_statement.styles.grid_standard import normalize_record, normalize_split_debit_credit
+from docmirror.plugins.bank_statement.styles.grid_standard import (
+    _normalize_direction_text,
+    normalize_record,
+    normalize_split_debit_credit,
+)
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     _annotate_native_grid_matrix,
     _normalize_native_grid_table,
@@ -64,6 +69,50 @@ def test_normalize_table_headers_ccb_alias():
     assert normalized[0][0][-2:] == ["对方账号", "对方户名"]
 
 
+def test_normalize_table_headers_preserves_exact_bojs_date_role() -> None:
+    variant = match_institution("江苏银行")
+    headers = ["序号", "摘要/附言", "币别", "交易日期", "交易类型", "交易金额", "账户余额", "对方账号", "对方户名"]
+
+    normalized = normalize_table_headers([[headers]], variant=variant)
+
+    assert normalized[0][0] == headers
+
+
+def test_bojs_grid_extraction_preserves_exact_source_roles_end_to_end() -> None:
+    headers = ["序号", "摘要/附言", "币别", "交易日期", "交易类型", "交易金额", "账户余额", "对方账号", "对方户名"]
+    row = [
+        "1",
+        "0WL#2023083116926046280500090200404#WL协议#百果汇",
+        "人民币",
+        "20230831",
+        "支出",
+        "31.00",
+        "99.79",
+        "215500690",
+        "支付宝（中国）网络技术有限公司",
+    ]
+    ctx = StyleContext(
+        tables=[[headers, row]],
+        full_text="江苏银行交易明细",
+        institution="江苏银行",
+        page_count=1,
+        reconstruction=ReconstructionMeta(source="physical_table", expected_primary_rows=1),
+    )
+
+    from docmirror.plugins.bank_statement.styles.grid_standard import extract_transactions
+
+    raw = extract_transactions(ctx, BankStatementCommunityPlugin())[0]
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert {key: raw[key] for key in headers} == dict(zip(headers, row, strict=True))
+    assert "交易时间" not in raw
+    assert normalized["date"] == "2023-08-31"
+    assert normalized["timestamp"] == ""
+    assert normalized["direction"] == "expense"
+    assert normalized["summary"] == "百果汇"
+    assert normalized["reference"] == "2023083116926046280500090200404"
+
+
 def test_split_debit_credit_style_detection():
     ctx = StyleContext(
         tables=[
@@ -78,6 +127,11 @@ def test_split_debit_credit_style_detection():
     )
     result = BankStyleDetector().detect(ctx)
     assert result.primary_style == "split_debit_credit"
+
+
+@pytest.mark.parametrize(("source", "expected"), [("收", "income"), ("支", "expense")])
+def test_single_character_direction_flag_is_explicit(source: str, expected: str) -> None:
+    assert _normalize_direction_text(source) == expected
 
 
 def test_style_registry_icbc_split_columns():
@@ -217,7 +271,1159 @@ def test_explicit_zero_split_transaction_is_preserved_without_invented_direction
     assert norm["direction"] == ""
 
 
-def test_split_amount_canonical_raw_is_repaired_when_wrong_zero_is_present() -> None:
+def test_split_normalization_does_not_promote_remarks_to_counterparty() -> None:
+    normalized = normalize_split_debit_credit(
+        {
+            "交易日期": "2025-01-02",
+            "支出": "10.00",
+            "收入": "",
+            "余额": "90.00",
+            "备注": "退奥迪A6押金",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized is not None
+    assert normalized["amount"] == 10.0
+    assert normalized["direction"] == "expense"
+    assert normalized["counter_party"] == ""
+    assert normalized["note"] == "退奥迪A6押金"
+
+
+def test_explicit_counterparty_wins_and_remarks_remain_separate() -> None:
+    normalized = normalize_split_debit_credit(
+        {
+            "交易日期": "2025-01-02",
+            "支出": "10.00",
+            "收入": "",
+            "余额": "90.00",
+            "对方户名": "甲公司",
+            "Remarks": "采购付款",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized is not None
+    assert normalized["counter_party"] == "甲公司"
+    assert normalized["note"] == "采购付款"
+
+
+def test_shrcb_exact_counter_account_name_keeps_remittance_note_separate() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "2023-08-08",
+            "借方发生额": "14,350.00",
+            "贷方发生额": "",
+            "账户余额": "72,789.38",
+            "对方账号": "6210000000000001",
+            "对方账户名": "佛山市橡茂橡胶\n原料有限公司",
+            "附言": "运费",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_party"] == "佛山市橡茂橡胶原料有限公司"
+    assert normalized["remittance_note"] == "运费"
+    assert normalized.get("purpose", "") == ""
+
+
+def test_shrcb_source_counterparty_prevents_page_text_from_appending_remittance_note() -> None:
+    headers = [
+        "交易日期",
+        "借方发生额",
+        "贷方发生额",
+        "账户余额",
+        "对方账号",
+        "对方账户名",
+        "附言",
+    ]
+    raw_row = [
+        "2023-08-08",
+        "14,350.00",
+        "",
+        "72,789.38",
+        "6210000000000001",
+        "佛山市橡茂橡胶\n原料有限公司",
+        "运费",
+    ]
+    page_text = "2023-08-08 14,350.00 72,789.38 6210000000000001 佛山市橡茂橡胶原料有限公司 运费"
+    ctx = StyleContext(
+        tables=[[headers, raw_row]],
+        full_text=page_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=page_text)])]),
+        reconstruction=ReconstructionMeta(source="canonical_evidence_table", expected_primary_rows=1),
+    )
+
+    records, _identity = BankStyleParserRegistry().run(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 1
+    assert records[0]["raw"]["对方账户名"] == "佛山市橡茂橡胶\n原料有限公司"
+    assert records[0]["raw"]["附言"] == "运费"
+    assert records[0]["normalized"]["counter_party"] == "佛山市橡茂橡胶原料有限公司"
+    assert records[0]["normalized"]["remittance_note"] == "运费"
+
+
+@pytest.mark.parametrize(
+    "contaminated_party",
+    [
+        "贷款还款 2023-05-20 15:16:48 96000.00 96174.57 6214680161989726 彭超杰北京银行转存",
+        "彭超杰 宁波银行股份有限公司 转存 第4页/共6页 交易时间 收入金额 支出金额 账户余额",
+    ],
+)
+def test_counterparty_rejects_embedded_transaction_or_page_furniture(contaminated_party: str) -> None:
+    normalized = normalize_record(
+        {
+            "交易时间": "2023-05-20 15:16:48",
+            "收入金额": "",
+            "支出金额": "96,000.00",
+            "账户余额": "96,174.57",
+            "对方账号": "10130256900000185",
+            "对方户名": contaminated_party,
+            "摘要": "贷款还款",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_party"] == ""
+    assert normalized["counter_account"] == "10130256900000185"
+
+
+def test_counterparty_contamination_guard_preserves_legitimate_digit_bearing_company() -> None:
+    normalized = normalize_record(
+        {
+            "交易时间": "2023-05-20 15:16:48",
+            "收入金额": "10.00",
+            "支出金额": "",
+            "账户余额": "100.00",
+            "对方账号": "6210000000000001",
+            "对方户名": "重庆2023数字科技有限公司3G事业部",
+            "摘要": "往来款",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_party"] == "重庆2023数字科技有限公司3G事业部"
+
+
+def test_compound_counterparty_decomposes_source_roles_without_losing_raw_cell() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "交易日期": "20220105",
+        "交易时间": "120114",
+        "借/贷": "1",
+        "交易金额": "500000.00",
+        "账户余额": "591664.74",
+        "交易对手信息": "丁梦琴 6228480938715161379 中国农业银行九龙支行158966653255",
+    }
+
+    normalized = normalize_record(raw, plugin)
+
+    assert normalized["counter_party"] == "丁梦琴"
+    assert normalized["counter_account"] == "6228480938715161379"
+    assert normalized["counter_bank_name"] == "中国农业银行九龙支行"
+    assert normalized["counter_bank_code"] == "158966653255"
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+    assert canonical_raw["counter_party"] == "丁梦琴"
+    assert canonical_raw["counter_account"] == "6228480938715161379"
+    assert canonical_raw["counter_bank_name"] == "中国农业银行九龙支行"
+    assert canonical_raw["counter_bank_code"] == "158966653255"
+    assert raw["交易对手信息"] == "丁梦琴 6228480938715161379 中国农业银行九龙支行158966653255"
+
+
+def test_compound_counterparty_fails_closed_when_numeric_roles_are_ambiguous() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "20220105",
+            "借/贷": "1",
+            "交易金额": "10.00",
+            "账户余额": "20.00",
+            "交易对手信息": "甲公司 12345678 乙银行 87654321 99999999",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_party"] == ""
+    assert normalized["counter_account"] == ""
+    assert normalized["counter_bank_name"] == ""
+
+
+def test_compound_counterparty_maps_exact_account_only_value() -> None:
+    normalized = normalize_record(
+        {
+            "交易时间": "2023/01/22\n05:30:27",
+            "交易金额": "-2,061.15",
+            "账户余额": "0.00",
+            "对方户名/账号": "6226230006293805",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_party"] == ""
+    assert normalized["counter_account"] == "6226230006293805"
+
+
+def test_labelled_note_preserves_source_and_decomposes_business_roles() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "2025-06-27",
+            "交易发生金额": "-198.87",
+            "账户余额": "144.74",
+            "备注": "普通汇兑;业务编号:DEN0201;用途:往来结算款;附言:往来款;",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["note"] == "普通汇兑;业务编号:DEN0201;用途:往来结算款;附言:往来款;"
+    assert normalized["reference"] == "DEN0201"
+    assert normalized["purpose"] == "往来结算款"
+    assert normalized["remittance_note"] == "往来款"
+
+
+def test_pab_placeholder_note_stays_raw_only_and_labelled_transfer_maps_reference() -> None:
+    plugin = BankStatementCommunityPlugin()
+    pab_headers = {
+        "序号\nNo.": "721",
+        "交易日期\nDate": "2024-01-01",
+        "交易金额\nTransaction\nAmount": "-1.00",
+        "余额\nBalance": "999.00",
+        "交易地点\nTrading Place": "平安银行",
+        "摘要\nRemark": "取现",
+    }
+    placeholder_raw = {**pab_headers, "备注\nNotes": "/"}
+    labelled_raw = {
+        **pab_headers,
+        "交易日期\nDate": "2024-01-07",
+        "交易金额\nTransaction\nAmount": "-500.00",
+        "备注\nNotes": "平安信用卡口袋银行取现转出资金划拨: MQ20240107711839;信用卡账号:0002998000455801183",
+    }
+
+    placeholder = normalize_record(placeholder_raw, plugin)
+    labelled = normalize_record(labelled_raw, plugin)
+    labelled_canonical = plugin._canonical_raw_values(labelled_raw, labelled)
+
+    assert placeholder["note"] == ""
+    assert placeholder_raw["备注\nNotes"] == "/"
+    assert labelled["note"] == labelled_raw["备注\nNotes"]
+    assert labelled["business_system_reference"] == "MQ20240107711839"
+    assert labelled_canonical["business_system_reference"] == "MQ20240107711839"
+    assert labelled["counter_account"] == ""
+
+    cross_layout = normalize_record(
+        {
+            "交易日期": "2024-01-07",
+            "交易金额": "-500.00",
+            "备注": labelled_raw["备注\nNotes"],
+        },
+        plugin,
+    )
+    assert cross_layout["note"] == labelled_raw["备注\nNotes"]
+    assert cross_layout["business_system_reference"] == ""
+    assert plugin._canonical_raw_values(
+        {
+            "交易日期": "2024-01-07",
+            "交易金额": "-500.00",
+            "备注": labelled_raw["备注\nNotes"],
+        },
+        cross_layout,
+    ).get("business_system_reference") is None
+
+    incomplete_layout_raw = dict(labelled_raw)
+    incomplete_layout_raw.pop("交易地点\nTrading Place")
+    incomplete_layout = normalize_record(incomplete_layout_raw, plugin)
+    assert incomplete_layout["note"] == labelled_raw["备注\nNotes"]
+    assert incomplete_layout["business_system_reference"] == ""
+    assert plugin._canonical_raw_values(incomplete_layout_raw, incomplete_layout).get(
+        "business_system_reference"
+    ) is None
+
+    explicit_reference_raw = {**labelled_raw, "业务系统参考号": "SOURCE-REF-1"}
+    explicit_reference = normalize_record(explicit_reference_raw, plugin)
+    assert explicit_reference["business_system_reference"] == "SOURCE-REF-1"
+    assert (
+        plugin._canonical_raw_values(explicit_reference_raw, explicit_reference)["business_system_reference"]
+        == "SOURCE-REF-1"
+    )
+
+    slash_serialized_raw = {
+        "序号/No.": "721",
+        "交易日期/Date": "2024-01-07",
+        "交易金额/Transaction Amount": "-500.00",
+        "余额/Balance": "999.00",
+        "交易地点/Trading Place": "平安银行",
+        "摘要/Remark": "取现",
+        "备注/Notes": labelled_raw["备注\nNotes"],
+    }
+    slash_serialized = normalize_record(slash_serialized_raw, plugin)
+    assert slash_serialized["business_system_reference"] == "MQ20240107711839"
+    assert (
+        plugin._canonical_raw_values(slash_serialized_raw, slash_serialized)["business_system_reference"]
+        == "MQ20240107711839"
+    )
+
+    malformed_note_raw = {**labelled_raw, "备注\nNotes": "资金划拨 MQ20240107711839"}
+    malformed_note = normalize_record(malformed_note_raw, plugin)
+    assert malformed_note["business_system_reference"] == ""
+    assert plugin._canonical_raw_values(malformed_note_raw, malformed_note).get(
+        "business_system_reference"
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("compound", "code", "reference", "transaction_name", "summary"),
+    [
+        ("0WL#2023083116926046280500090200404#WL协议#百果汇", "0WL", "2023083116926046280500090200404", "WL协议", "百果汇"),
+        ("0WL#20230531131922923977443S0110301#WL退款#退款", "0WL", "20230531131922923977443S0110301", "WL退款", "退款"),
+        ("1银联#520032#银联贷记#财付通支付科技有限公司/银联入账,微信零钱提现", "1银联", "520032", "银联贷记", "财付通支付科技有限公司/银联入账,微信零钱提现"),
+    ],
+)
+def test_bojs_compound_memo_maps_distinct_source_roles(
+    compound: str,
+    code: str,
+    reference: str,
+    transaction_name: str,
+    summary: str,
+) -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "序号": "1",
+        "摘要/附言": compound,
+        "币别": "人民币",
+        "交易日期": "20230831",
+        "交易类型": "支出",
+        "交易金额": "31.00",
+        "账户余额": "99.79",
+        "对方账号": "215500690",
+        "对方户名": "支付宝（中国）网络技术有限公司",
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["date"] == "2023-08-31"
+    assert normalized["timestamp"] == ""
+    assert normalized["direction"] == "expense"
+    assert normalized["currency"] == "人民币"
+    assert normalized["transaction_code"] == code
+    assert normalized["reference"] == reference
+    assert normalized["transaction_name"] == transaction_name
+    assert normalized["summary"] == summary
+    assert normalized["business_detail"] == compound
+    assert canonical["date"] == "20230831"
+    assert canonical["direction"] == "支出"
+    assert canonical["currency"] == "人民币"
+    assert canonical["business_detail"] == compound
+    assert "timestamp" not in canonical
+
+
+@pytest.mark.parametrize("compound", ["0WL#123456#WL协议", "0WL#123456#WL协议#memo#extra", "UNKNOWN#123456#kind#memo"])
+def test_bojs_compound_memo_fails_closed_for_unproven_grammar(compound: str) -> None:
+    raw = {
+        "序号": "1",
+        "摘要/附言": compound,
+        "币别": "人民币",
+        "交易日期": "20230831",
+        "交易类型": "收入",
+        "交易金额": "1.00",
+        "账户余额": "1.00",
+        "对方账号": "",
+        "对方户名": "",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["summary"] == compound
+    assert normalized["business_detail"] == ""
+    assert normalized["reference"] == ""
+    assert normalized["transaction_code"] == ""
+    assert normalized["transaction_name"] == ""
+
+
+def test_psbc_subaccount_is_a_distinct_source_role() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "交易日期": "20240101",
+        "子账号": "0001",
+        "储种": "活期",
+        "币种": "人民币",
+        "钞汇": "钞",
+        "交易金额": "-10.00",
+        "账户余额": "90.00",
+        "对方户名": "甲公司",
+        "对方账号": "123456789",
+        "摘要": "转账",
+        "交易渠道": "网银",
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["sub_account"] == "0001"
+    assert normalized["own_account"] == ""
+    assert normalized["deposit_type"] == "活期"
+    assert normalized["counter_account"] == "123456789"
+    assert normalized["timestamp"] == ""
+    assert canonical["sub_account"] == "0001"
+
+
+def test_single_date_summary_layout_does_not_duplicate_posting_date() -> None:
+    normalized = normalize_record(
+        {
+            "序号": "1",
+            "记账日期": "2024-01-01",
+            "交易金额": "-1.00",
+            "账户余额": "9.00",
+            "摘要描述": "手续费",
+            "对方户名": "甲公司",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["date"] == "2024-01-01"
+    assert normalized["posting_date"] == ""
+    assert normalized["timestamp"] == ""
+
+
+def test_counterparty_null_token_is_source_null_without_erasing_source() -> None:
+    raw = {
+        "交易日期": "2022-06-21",
+        "交易金额": "53.14",
+        "对方户名": "NULL",
+    }
+    record = {
+        "raw": dict(raw),
+        "canonical_raw": {"counter_party": "NULL"},
+        "normalized": {"counter_party": "NULL", "counter_account": ""},
+    }
+
+    sanitized = _sanitize_bank_records([record])[0]
+
+    assert sanitized["raw"] == raw
+    assert sanitized["canonical_raw"] == {"counter_party": "NULL"}
+    assert sanitized["normalized"]["counter_party"] == ""
+    assert sanitized["normalized"]["counterparty_status"] == "source_null"
+
+
+def test_cscb_exact_compound_memo_and_number_map_to_distinct_roles() -> None:
+    raw = {
+        "交易日期": "20221202",
+        "交易金额": "-2,000.00",
+        "账户余额": "451,517.76",
+        "对方户名": "贺哲尧",
+        "对方账号": "6214857219035997",
+        "摘要/备注": "转账/其他合法款项-退奥迪A6押金",
+        "编号": "99018150246\n4669",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+    canonical = BankStatementCommunityPlugin()._canonical_raw_values(raw, normalized)
+
+    assert normalized["counter_party"] == "贺哲尧"
+    assert normalized["counter_account"] == "6214857219035997"
+    assert normalized["summary"] == "转账/其他合法款项-退奥迪A6押金"
+    assert normalized["note"] == ""
+    assert normalized["reference"] == "990181502464669"
+    assert normalized["timestamp"] == ""
+    assert canonical["summary"] == "转账/其他合法款项-退奥迪A6押金"
+    assert canonical["reference"] == "99018150246\n4669"
+    assert "note" not in canonical
+
+
+@pytest.mark.parametrize("missing_header", ["账户余额", "对方户名", "编号"])
+def test_cscb_mapping_requires_the_complete_source_layout(missing_header: str) -> None:
+    raw = {
+        "交易日期": "20221202",
+        "交易金额": "-2,000.00",
+        "账户余额": "451,517.76",
+        "对方户名": "贺哲尧",
+        "对方账号": "6214857219035997",
+        "摘要/备注": "CUSTOM/free/form",
+        "编号": "99018150246\n4669",
+    }
+    raw.pop(missing_header)
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+    canonical = BankStatementCommunityPlugin()._canonical_raw_values(raw, normalized)
+
+    # Without the full source contract, the generic mapping must not invent
+    # CSCB-specific role claims from globally ambiguous compound headers.
+    assert normalized.get("reference", "") == ""
+    assert canonical.get("reference", "") == ""
+    if missing_header != "编号":
+        assert normalized.get("note", "") == "CUSTOM/free/form"
+
+
+def test_exact_electronic_receipt_number_maps_to_reference_not_sequence() -> None:
+    normalized = normalize_record(
+        {
+            "交易时间": "2022-07-06 14:02:35",
+            "电子回单编号": "22187000001",
+            "交易类型": "转账",
+            "交易金额": "27,500.00",
+            "收/支": "收入",
+            "余额": "250,324.09",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["reference"] == "22187000001"
+    assert normalized["sequence_no"] == ""
+    assert normalized["transaction_name"] == "转账"
+
+
+def test_embedded_unique_business_identifier_is_promoted_without_truncating_summary() -> None:
+    summary = "汇兑-实时代收业务唯一编号202308150008"
+    normalized = normalize_record(
+        {
+            "序号": "1",
+            "记账日期": "2023-08-15",
+            "交易金额": "-2,500.00",
+            "账户余额": "13,804.01",
+            "摘要描述": summary,
+            "对方户名": "上海市公积金管理中心(房改资金)",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["summary"] == summary
+    assert normalized["reference"] == "202308150008"
+
+
+def test_explicit_value_date_alias_stays_distinct_from_transaction_date() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "2023-06-01",
+            "交易时间": "10:57:00",
+            "起息日期": "2023-06-02",
+            "支出金额": "503.00",
+            "收入金额": "0.00",
+            "余额": "85,623.04",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["date"] == "2023-06-01"
+    assert normalized["value_date"] == "2023-06-02"
+
+
+def test_boc_compound_business_layout_preserves_and_decomposes_roles_once() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "序号": "3",
+        "记账日": "251215",
+        "起息日": "251216",
+        "交易类型": "代发划转",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": ("A2755427C1202512155G001001/2025年11月工资/OBSS003568953795GIRO000000000000"),
+        "借方发生额": "61,073.80",
+        "贷方发生额": "",
+        "余额": "38,069.41",
+        "机构/柜员/流水": "12313/9880105/267174050",
+        "备注": "重庆正大华日软件有限公司/重庆农村商业银行",
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["date"] == "2025-12-15"
+    assert normalized["value_date"] == "2025-12-16"
+    assert normalized["posting_date"] == ""
+    assert normalized["transaction_name"] == "代发划转"
+    assert normalized["transaction_institution"] == "12313"
+    assert normalized["teller_id"] == "9880105"
+    assert normalized["bank_serial"] == "267174050"
+    assert normalized["reference"] == "A2755427C1202512155G001001"
+    assert normalized["purpose"] == "2025年11月工资"
+    assert normalized["business_system_reference"] == "OBSS003568953795GIRO000000000000"
+    assert normalized["summary"] == ""
+    assert normalized["counter_party"] == "重庆正大华日软件有限公司"
+    assert normalized["counter_bank_name"] == "重庆农村商业银行"
+    assert canonical["business_detail"] == raw["凭证号码/业务编号/用途/摘要"]
+    assert canonical["value_date"] == "251216"
+    assert "summary" not in canonical
+    assert "posting_date" not in canonical
+
+
+def test_boc_plain_detail_maps_to_purpose_without_inventing_reference() -> None:
+    raw = {
+        "序号": "7",
+        "记账日": "251226",
+        "起息日": "251226",
+        "交易类型": "收费",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": "对公跨行转账汇款手续费",
+        "借方发生额": "4.50",
+        "贷方发生额": "",
+        "余额": "25,180.12",
+        "机构/柜员/流水": "12313/9880105/238695600",
+        "备注": "国家金库长沙县支库（346）",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["purpose"] == "对公跨行转账汇款手续费"
+    assert normalized["reference"] == ""
+    assert normalized["counter_party"] == "国家金库长沙县支库（346）"
+    assert normalized["counter_bank_name"] == ""
+
+
+def test_boc_reference_with_embedded_tax_context_is_not_invented_as_purpose() -> None:
+    raw = {
+        "序号": "1",
+        "记账日": "251209",
+        "起息日": "251209",
+        "交易类型": "实时缴税",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": (
+            "19077378/2025120964867670 重庆正大华日软件有限公司长沙分公司 91430100MADRF3UN4A 国家税务"
+        ),
+        "借方发生额": "113.76",
+        "贷方发生额": "",
+        "余额": "31,622.44",
+        "机构/柜员/流水": "12313/9880800/256775918",
+        "备注": "国家金库长沙县支库（346）",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["reference"] == "19077378"
+    assert normalized["purpose"] == ""
+    assert normalized["business_context"].startswith("2025120964867670")
+    assert normalized["counter_party"] == "国家金库长沙县支库（346）"
+
+
+def test_boc_slash_note_requires_a_bank_shaped_right_side() -> None:
+    raw = {
+        "序号": "2",
+        "记账日": "251210",
+        "起息日": "251210",
+        "交易类型": "网上支付",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": "3146530000112025121142301261/往来结算款",
+        "借方发生额": "10.00",
+        "贷方发生额": "",
+        "余额": "20.00",
+        "机构/柜员/流水": "12313/9880105/1",
+        "备注": "甲公司/项目一部",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["note"] == "甲公司/项目一部"
+    assert normalized["counter_party"] == "甲公司"
+    assert normalized["counter_bank_name"] == ""
+
+
+def test_boc_truncated_bank_prefix_completes_only_from_unique_same_row_source() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "序号": "1",
+        "记账日": "220401",
+        "起息日": "220401",
+        "交易类型": "网上支付",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": "3235840008882022040194831167/贴现款",
+        "借方发生额": "",
+        "贷方发生额": "49,234.67",
+        "余额": "56,020.44",
+        "机构/柜员/流水": "06257/9880809/43627150",
+        "备注": "深圳前海微众银行股份有限公司/深圳前海微众银行股份有",
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["counter_bank_name"] == "深圳前海微众银行股份有限公司"
+    assert canonical["counter_bank_name"] == "深圳前海微众银行股份有"
+
+
+def test_boc_unsupported_truncated_bank_prefix_is_preserved() -> None:
+    raw = {
+        "序号": "1",
+        "记账日": "220401",
+        "起息日": "220401",
+        "交易类型": "网上支付",
+        "凭证": "",
+        "凭证号码/业务编号/用途/摘要": "1041000000042022040119694857/采购款",
+        "借方发生额": "150,000.00",
+        "贷方发生额": "",
+        "余额": "1,222,783.07",
+        "机构/柜员/流水": "06257/9880105/106234268",
+        "备注": "镇江世泽机电设备有限公司/招商银行股份有限公司天",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["counter_bank_name"] == "招商银行股份有限公司天"
+
+
+def test_directional_payer_payee_mapping_uses_only_the_counterparty_side() -> None:
+    plugin = BankStatementCommunityPlugin()
+    income = normalize_record(
+        {
+            "交易日期\n交易日期": "2025-10-28",
+            "付款账号\n付款账号": "651204680300015",
+            "付款账户名\n付款账户名": "重庆恒腾科技有限公司",
+            "收入\n收入": "3000000.00",
+            "收款账号\n收款账号": "100102029005622957",
+            "收款账户名\n收款账户名": "重庆数宜信信用管理有限公司",
+            "支出\n支出": "",
+            "余额\n余额": "3036962.83",
+        },
+        plugin,
+    )
+    expense = normalize_record(
+        {
+            "交易日期\n交易日期": "2025-10-28",
+            "付款账号\n付款账号": "100102029005622957",
+            "付款账户名\n付款账户名": "重庆数宜信信用管理有限公司",
+            "收入\n收入": "",
+            "收款账号\n收款账号": "01041560012000235",
+            "收款账户名\n收款账户名": "重庆正大能科科技有限公司",
+            "支出\n支出": "3418450.00",
+            "余额\n余额": "21507.83",
+        },
+        plugin,
+    )
+    fee = normalize_record(
+        {
+            "交易日期\n交易日期": "2025-10-28",
+            "付款账号\n付款账号": "100102029005622957",
+            "付款账户名\n付款账户名": "重庆数宜信信用管理有限公司",
+            "收入\n收入": "",
+            "收款账号\n收款账号": "",
+            "收款账户名\n收款账户名": "",
+            "支出\n支出": "5.00",
+            "余额\n余额": "3436957.83",
+        },
+        plugin,
+    )
+
+    assert (income["counter_account"], income["counter_party"]) == (
+        "651204680300015",
+        "重庆恒腾科技有限公司",
+    )
+    assert (expense["counter_account"], expense["counter_party"]) == (
+        "01041560012000235",
+        "重庆正大能科科技有限公司",
+    )
+    assert fee["counter_account"] == ""
+    assert fee["counter_party"] == ""
+
+
+def test_slash_delimited_counter_account_and_party_are_distinct() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "20240102",
+            "交易金额": "80000.00",
+            "账户余额": "102214.76",
+            "对方账号与户名": "35001677107*****5957/顺***融竹木有限公司",
+            "_document_scope_text": "中国建设银行个人活期账户收入交易明细",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["direction"] == "income"
+    assert normalized["counter_account"] == "35001677107*****5957"
+    assert normalized["counter_party"] == "顺***融竹木有限公司"
+
+
+def test_summary_direction_with_signed_amount_keeps_source_sign_only_in_raw() -> None:
+    raw = {
+        "交易时间": "20240102123045",
+        "短摘要": "转支",
+        "交易金额": "-13,900.00",
+        "本次余额": "18,381.12",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["direction"] == "expense"
+    assert normalized["amount"] == 13_900.0
+    assert raw["交易金额"] == "-13,900.00"
+
+
+def test_signed_amount_prefix_survives_trailing_page_overlay_text() -> None:
+    raw = {
+        "交易时间": "20240102123045",
+        "交易金额": "-500.00https://secure.example/statement",
+        "余额": "2,533.08",
+        "交易类型": "转账汇款",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["direction"] == "expense"
+    assert normalized["amount"] == 500.0
+    assert raw["交易金额"] == "-500.00https://secure.example/statement"
+
+
+def test_reverse_slash_counterparty_decomposes_without_guessing_fee_code() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "交易时间": "2025/01/0316:18:35",
+        "借方发生额": "15.00",
+        "贷方发生额": "0.00",
+        "账户余额": "363,693.02",
+        "流水号": "554202501030\n08247128705",
+        "对方户名/账号": "暂收款/190700000003371002",
+        "对方行名": "中华人民共和国国家金库江门市中心支库",
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["date"] == "2025-01-03"
+    assert normalized["timestamp"] == "2025-01-03T16:18:35"
+    assert normalized["balance"] == 363693.02
+    assert normalized["reference"] == "55420250103008247128705"
+    assert normalized["counter_party"] == "暂收款"
+    assert normalized["counter_account"] == "190700000003371002"
+    assert normalized["counter_bank_name"] == "中华人民共和国国家金库江门市中心支库"
+    assert canonical_raw["counter_party"] == "暂收款"
+    assert canonical_raw["counter_account"] == "190700000003371002"
+
+    ambiguous = normalize_record(
+        {
+            "交易时间": "2025/01/0316:18:35",
+            "借方发生额": "7.50",
+            "贷方发生额": "0.00",
+            "账户余额": "363,685.52",
+            "对方户名/账号": "4501-C070470",
+        },
+        plugin,
+    )
+    assert ambiguous["counter_party"] == ""
+    assert ambiguous["counter_account"] == ""
+
+
+def test_date_only_source_does_not_claim_canonical_raw_timestamp() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {"交易日期": "20221201", "交易金额": "10.00", "收/支": "收入"}
+    normalized = normalize_record(raw, plugin)
+
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+
+    assert canonical_raw["date"] == "20221201"
+    assert "timestamp" not in canonical_raw
+
+
+def test_combined_counter_account_and_bank_are_decomposed() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "2022-01-15",
+            "支/收": "支",
+            "交易金额": "-133.80",
+            "账户余额": "0.00",
+            "对方户名": "兴业消费金融股份公司",
+            "对方账户/对方银行": "129970100100190487 兴业银行厦门科技支行",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_account"] == "129970100100190487"
+    assert normalized["counter_bank_name"] == "兴业银行厦门科技支行"
+
+
+@pytest.mark.parametrize(
+    ("party", "account_bank", "expected_party", "expected_account", "expected_bank"),
+    [
+        ("宋鹏", "6230523170029107378中国农业银行", "宋鹏", "6230523170029107378", "中国农业银行"),
+        (
+            "郑萍杰",
+            "AW8BAGYF12345enWGZfG1财付通支付科技有限公司",
+            "郑萍杰",
+            "AW8BAGYF12345enWGZfG1",
+            "财付通支付科技有限公司",
+        ),
+        (
+            "微信转账1000050001",
+            "财付通支付科技有限公司",
+            "微信转账",
+            "1000050001",
+            "财付通支付科技有限公司",
+        ),
+    ],
+)
+def test_exact_counterparty_and_account_bank_columns_are_fully_decomposed(
+    party: str,
+    account_bank: str,
+    expected_party: str,
+    expected_account: str,
+    expected_bank: str,
+) -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "交易日期": "2024-02-20",
+        "支/收": "收",
+        "交易金额": "100.00",
+        "账户余额": "108.95",
+        "对方户名": party,
+        "对方账户/对方银行": account_bank,
+    }
+
+    normalized = normalize_record(raw, plugin)
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+
+    assert raw["对方户名"] == party
+    assert raw["对方账户/对方银行"] == account_bank
+    assert normalized["counter_party"] == expected_party
+    assert normalized["counter_account"] == expected_account
+    assert normalized["counter_bank_name"] == expected_bank
+    assert canonical_raw["counter_party"] == expected_party
+    assert canonical_raw["counter_account"] == expected_account
+    assert canonical_raw["counter_bank_name"] == expected_bank
+
+
+def test_exact_source_roles_override_reconstructed_headers_without_reverting_core_cells() -> None:
+    raw = {
+        "交易日期": "2023-04-15",
+        "摘要": "汇款汇入",
+        "收/支": "支出",
+        "交易金额": "50,000.00",
+        "余额": "150,050.05",
+        "对方户名": "样例公司",
+        "对方账号": "A84x9Z00231Q样例银行",
+        "_source_raw": {
+            "交易日期": "2023-04-15",
+            "摘要": "汇款汇入",
+            "支/收": "收",
+            "交易金额": "50,000.00",
+            "账户余额": "150,050.05",
+            "对方户名": "样例公司",
+            "对方账户/对方银行": "A84x9Z00231Q样例银行",
+        },
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["date"] == "2023-04-15"
+    assert normalized["amount"] == 50_000.0
+    assert normalized["balance"] == 150_050.05
+    assert normalized["direction"] == "income"
+    assert normalized["counter_party"] == "样例公司"
+    assert normalized["counter_account"] == "A84x9Z00231Q"
+    assert normalized["counter_bank_name"] == "样例银行"
+    assert raw["收/支"] == "支出"
+    assert raw["对方账号"] == "A84x9Z00231Q样例银行"
+
+
+def test_blank_exact_source_direction_does_not_erase_source_backed_reconstruction() -> None:
+    normalized = normalize_record(
+        {
+            "交易日期": "2023-05-25",
+            "摘要": "快捷支付支",
+            "收/支": "支出",
+            "交易金额": "-2,000.00",
+            "余额": "7,424.19",
+            "对方户名": "微信转账1000050001",
+            "对方账号": "财付通支付科技有限公司",
+            "_source_raw": {
+                "交易日期": "2023-05-25",
+                "摘要": "快捷支付支",
+                "支/收": "",
+                "交易金额": "-2,000.00",
+                "账户余额": "7,424.19",
+                "对方户名": "微信转账1000050001",
+                "对方账户/对方银行": "财付通支付科技有限公司",
+            },
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["direction"] == "expense"
+    assert normalized["counter_party"] == "微信转账"
+    assert normalized["counter_account"] == "1000050001"
+    assert normalized["counter_bank_name"] == "财付通支付科技有限公司"
+
+
+def test_income_scope_requires_exact_statement_title() -> None:
+    raw = {
+        "交易日期": "20240102",
+        "交易金额": "100.00",
+        "账户余额": "100.00",
+        "_document_scope_text": "中国建设银行个人活期账户交易明细",
+    }
+
+    assert normalize_record(raw, BankStatementCommunityPlugin())["direction"] == ""
+
+
+def test_finalization_preserves_exact_private_scope_when_parse_text_lacks_title() -> None:
+    from docmirror.plugins.bank_statement.styles.grid_standard import _finalize_transactions
+
+    rows = _finalize_transactions(
+        [
+            {
+                "交易日期": "20240102",
+                "交易金额": "100.00",
+                "账户余额": "100.00",
+                "_document_scope_text": "中国建设银行个人活期账户收入交易明细",
+            }
+        ],
+        full_text="序号 摘要 币别 钞汇 交易日期 交易金额 账户余额",
+    )
+
+    assert rows[0]["_document_scope_text"] == "中国建设银行个人活期账户收入交易明细"
+    assert normalize_record(rows[0], BankStatementCommunityPlugin())["direction"] == "income"
+
+
+def test_income_scope_is_not_rewritten_by_discontinuous_balance_chain() -> None:
+    from docmirror.plugins.bank_statement.canonical import records_from_raw_transactions
+    from docmirror.plugins.bank_statement.styles.grid_standard import refine_missing_directions_from_balance_chain
+
+    title = "中国建设银行个人活期账户收入交易明细"
+    transactions = [
+        {
+            "序号": "136",
+            "交易日期": "2024-03-01",
+            "摘要": "往来款",
+            "交易金额": "100000.00",
+            "账户余额": "108801.16",
+            "_document_scope_text": title,
+        },
+        {
+            "序号": "137",
+            "交易日期": "2024-03-01",
+            "摘要": "往来款",
+            "交易金额": "100000.00",
+            "账户余额": "208801.16",
+            "_document_scope_text": title,
+        },
+        {
+            "序号": "138",
+            "交易日期": "2024-03-01",
+            "摘要": "支付机构提现",
+            "交易金额": "100000.00",
+            "账户余额": "108801.16",
+            "_document_scope_text": title,
+        },
+    ]
+    plugin = BankStatementCommunityPlugin()
+    records = records_from_raw_transactions(
+        transactions,
+        normalize_fn=lambda raw: normalize_record(raw, plugin),
+        style_id="grid_standard",
+    )
+
+    refine_missing_directions_from_balance_chain(records)
+
+    assert [record["normalized"]["direction"] for record in records] == ["income", "income", "income"]
+
+
+def test_explicit_split_amount_direction_is_not_rewritten_by_same_time_balance_order() -> None:
+    from docmirror.plugins.bank_statement.styles.grid_standard import refine_missing_directions_from_balance_chain
+
+    records = [
+        {
+            "raw": {"交易日期": "2024-01-01", "借方发生额": "", "贷方发生额": "3,000,000.00"},
+            "normalized": {
+                "date": "2024-01-01",
+                "timestamp": "2024-01-01T10:00:00",
+                "amount": 3_000_000.0,
+                "direction": "income",
+                "balance": 2_000_000.0,
+            },
+        },
+        {
+            "raw": {"交易日期": "2024-01-01", "借方发生额": "1,000,000.00", "贷方发生额": ""},
+            "normalized": {
+                "date": "2024-01-01",
+                "timestamp": "2024-01-01T10:00:00",
+                "amount": 1_000_000.0,
+                "direction": "expense",
+                "balance": 1_000_000.0,
+            },
+        },
+    ]
+
+    refine_missing_directions_from_balance_chain(records)
+
+    assert [record["normalized"]["direction"] for record in records] == ["income", "expense"]
+
+
+def test_explicit_direction_label_is_not_rewritten_for_negative_reversal() -> None:
+    from docmirror.plugins.bank_statement.styles.grid_standard import refine_missing_directions_from_balance_chain
+
+    records = [
+        {
+            "raw": {"序号": "1", "借/贷": "借方", "交易金额": "100.00"},
+            "normalized": {
+                "sequence_no": "1",
+                "date": "2024-01-01",
+                "amount": 100.0,
+                "direction": "expense",
+                "balance": 100.0,
+            },
+        },
+        {
+            "raw": {"序号": "2", "借/贷": "借方", "交易金额": "-100.00"},
+            "normalized": {
+                "sequence_no": "2",
+                "date": "2024-01-02",
+                "amount": 100.0,
+                "direction": "expense",
+                "balance": 200.0,
+            },
+        },
+    ]
+
+    refine_missing_directions_from_balance_chain(records)
+
+    assert records[1]["normalized"]["direction"] == "expense"
+
+
+def test_missing_source_direction_still_allows_unique_balance_inference() -> None:
+    from docmirror.plugins.bank_statement.styles.grid_standard import refine_missing_directions_from_balance_chain
+
+    records = [
+        {
+            "raw": {"序号": "1", "交易金额": "100.00"},
+            "normalized": {
+                "sequence_no": "1",
+                "date": "2024-01-01",
+                "amount": 100.0,
+                "direction": "income",
+                "balance": 100.0,
+            },
+        },
+        {
+            "raw": {"序号": "2", "交易金额": "20.00"},
+            "normalized": {
+                "sequence_no": "2",
+                "date": "2024-01-02",
+                "amount": 20.0,
+                "direction": "expense",
+                "balance": 120.0,
+            },
+        },
+    ]
+
+    refine_missing_directions_from_balance_chain(records)
+
+    assert records[1]["normalized"]["direction"] == "income"
+
+
+def test_numeric_dedicated_debit_credit_flag_is_respected() -> None:
+    plugin = BankStatementCommunityPlugin()
+    income = normalize_record(
+        {"交易日期": "2025-01-02", "借/贷": "1", "交易金额": "10.00", "余额": "110.00"},
+        plugin,
+    )
+    expense = normalize_record(
+        {"交易日期": "2025-01-03", "借/贷": "0", "交易金额": "5.00", "余额": "105.00"},
+        plugin,
+    )
+
+    assert income["direction"] == "income"
+    assert expense["direction"] == "expense"
+
+
+def test_sanitizer_preserves_source_layers_when_normalized_amount_differs() -> None:
     records = _sanitize_bank_records(
         [
             {
@@ -228,11 +1434,11 @@ def test_split_amount_canonical_raw_is_repaired_when_wrong_zero_is_present() -> 
         ]
     )
 
-    assert records[0]["canonical_raw"]["amount"] == "2.25"
-    assert records[0]["canonical_raw"]["amount_cny"] == "2.25"
+    assert records[0]["raw"] == {"收入金额": "0", "支出金额": "2.25"}
+    assert records[0]["canonical_raw"] == {"amount": "0", "amount_cny": "0"}
 
 
-def test_normalize_transaction_location_as_channel_alias():
+def test_normalize_transaction_location_as_distinct_business_field():
     plugin = BankStatementCommunityPlugin()
     norm = normalize_split_debit_credit(
         {
@@ -246,7 +1452,8 @@ def test_normalize_transaction_location_as_channel_alias():
     )
 
     assert norm is not None
-    assert norm["channel"] == "支付平台"
+    assert norm["channel"] == ""
+    assert norm["transaction_location"] == "支付平台"
 
 
 def test_normalize_merged_balance_and_timestamp_split_columns():
@@ -265,6 +1472,7 @@ def test_normalize_merged_balance_and_timestamp_split_columns():
     assert norm["amount"] == 15.0
     assert norm["direction"] == "expense"
     assert norm["balance"] == 363693.02
+    assert norm["reference"] == "55420250100824712870"
 
 
 def test_normalize_direction_embedded_after_amount():
@@ -421,7 +1629,8 @@ def test_canonical_logical_grid_preserves_generic_row_provenance_and_raw_columns
 
     assert len(records) == 2
     assert [record["normalized"]["direction"] for record in records] == ["expense", "income"]
-    assert records[0]["normalized"]["summary"] == "财付通支付"
+    assert records[0]["normalized"]["summary"] == ""
+    assert records[0]["normalized"]["note"] == "财付通支付"
     assert records[0]["raw"]["备注"] == "财付通支\n付"
     assert records[0]["raw"]["交易机构"] == "101001"
     assert "交易机构" not in records[0]["normalized"]
@@ -619,9 +1828,10 @@ def test_canonical_stacked_bilingual_headers_preserve_debit_credit_and_counterpa
 
     sanitized = _sanitize_bank_records(records)
     assert [record["canonical_raw"]["amount"] for record in sanitized] == ["50.00", "75.00"]
+    assert [record["raw"] for record in sanitized] == [record["raw"] for record in records]
 
 
-def test_split_grid_reads_bilingual_counterparty_and_repairs_canonical_raw_amount() -> None:
+def test_split_grid_keeps_bilingual_counterparty_normalized_without_rewriting_source_layers() -> None:
     raw = {
         "交易日期\nTransaction Date": "2025-01-02",
         "发生额\nTransaction Amount\n借方\nDebit": "88.20",
@@ -648,10 +1858,8 @@ def test_split_grid_reads_bilingual_counterparty_and_repairs_canonical_raw_amoun
     assert normalized["amount"] == 88.2
     assert normalized["counter_party"] == "测试供应链有限公司"
     assert normalized["counter_bank_name"] == "测试银行科技支行"
-    assert records[0]["canonical_raw"]["amount"] == "88.20"
-    assert records[0]["canonical_raw"]["amount_cny"] == "88.20"
-    assert records[0]["canonical_raw"]["counter_party"] == "测试供应链有限公司"
-    assert records[0]["canonical_raw"]["counter_bank_name"] == "测试银行科技支行"
+    assert records[0]["raw"] == raw
+    assert records[0]["canonical_raw"] == {"amount": "", "amount_cny": "", "counter_party": ""}
 
 
 def test_stacked_split_grid_infers_single_page_sources_from_logical_rows():
@@ -784,6 +1992,34 @@ def test_stacked_split_grid_infers_sources_from_page_text_anchors_when_tables_ar
     assert len(records) == 4
     assert [record["source"]["source_page"] for record in records] == [1, 1, 2, 3]
     assert [record["source"]["page_range"] for record in records] == [[1, 1], [1, 1], [2, 2], [3, 3]]
+
+
+def test_page_source_inference_uses_boc_posting_day_to_break_repeated_row_tie() -> None:
+    from docmirror.plugins.bank_statement.styles.grid_standard import _text_page_row_sources
+
+    transaction = {
+        "序号": "1",
+        "记账日": "220414",
+        "借方发生额": "100,000.00",
+        "贷方发生额": "",
+        "余额": "98,133.91",
+    }
+    parse_result = ParseResult(
+        pages=[
+            PageContent(
+                page_number=2,
+                texts=[TextBlock(content="1 220401 100,000.00 98,133.91")],
+            ),
+            PageContent(
+                page_number=3,
+                texts=[TextBlock(content="1 220414 100,000.00 98,133.91")],
+            ),
+        ]
+    )
+
+    sources = _text_page_row_sources([transaction], parse_result)
+
+    assert sources[0]["source_page"] == 3
 
 
 def test_split_grid_recovers_empty_counterparty_from_same_page_source_text():
@@ -1091,10 +2327,181 @@ def test_explicit_counter_account_header_overrides_earlier_own_account_column() 
     header = detect_headers([table], BankStatementCommunityPlugin().column_registry)
 
     assert header is not None
+    assert header.col_map["own_account"] == 1
     assert header.col_map["counter_account"] == 6
 
 
-def test_source_reported_total_overrides_single_page_identity_count() -> None:
+def test_icbc_bare_account_headers_are_distinct_source_business_fields() -> None:
+    raw = {
+        "交易日期": "2022-09-0410:01:14",
+        "账号": "1104060001031076947",
+        "储种": "活期",
+        "序号": "00000",
+        "币种": "人民币",
+        "钞汇": "钞",
+        "摘要": "消费",
+        "地区": "1104",
+        "收入/支出金额": "-23.00",
+        "余额": "268.08",
+        "渠道": "快捷支付",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["own_account"] == "1104060001031076947"
+    assert normalized["deposit_type"] == "活期"
+    assert normalized["region_code"] == "1104"
+    assert normalized["sub_account"] == ""
+    assert normalized["counter_account"] == ""
+    assert normalized["counter_party"] == ""
+
+
+def _ccb_enterprise_17_column_row(
+    *,
+    stacked_headers: bool,
+    counter_header: str,
+    counter_account: str,
+    counter_party: str,
+) -> dict[str, str]:
+    headers = [
+        "账号",
+        "交易时\n间" if stacked_headers else "交易时间",
+        "借方发\n生额" if stacked_headers else "借方发生额",
+        "贷方发\n生额" if stacked_headers else "贷方发生额",
+        "余额",
+        "币种",
+        "对方户\n名" if stacked_headers else "对方户名",
+        counter_header[:2] + "\n" + counter_header[2:] if stacked_headers else counter_header,
+        "对方开户\n机构" if stacked_headers else "对方开户机构",
+        "记账日\n期" if stacked_headers else "记账日期",
+        "摘要",
+        "备注",
+        "账户明细编号-\n企业网银流水号" if stacked_headers else "账户明细编号-企业网银流水号",
+        "企业流水号",
+        "凭证种类",
+        "凭证号",
+        "交易介质编号",
+    ]
+    values = [
+        "51001660\n04305250\n1060",
+        "20240321\n00:41:05",
+        "1018.22",
+        "0.00",
+        "134967.51",
+        "人民币元",
+        counter_party,
+        counter_account,
+        "建行四川省分行营运管理部核算中心",
+        "20240321",
+        "收回贷款本息",
+        "",
+        "2170-51000170816XP2VG71F",
+        "",
+        "",
+        "",
+        "",
+    ]
+    return dict(zip(headers, values))
+
+
+@pytest.mark.parametrize("stacked_headers", [False, True])
+@pytest.mark.parametrize("counter_header", ["对方账号", "对方账户"])
+@pytest.mark.parametrize(
+    ("counter_account", "counter_party"),
+    [("", ""), ("6212261408013357748", "乔羽")],
+)
+def test_distinct_ccb_account_headers_preserve_exact_ownership_roles(
+    stacked_headers: bool,
+    counter_header: str,
+    counter_account: str,
+    counter_party: str,
+) -> None:
+    raw = _ccb_enterprise_17_column_row(
+        stacked_headers=stacked_headers,
+        counter_header=counter_header,
+        counter_account=counter_account,
+        counter_party=counter_party,
+    )
+    source_row = dict(raw)
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert raw == source_row
+    assert normalized["own_account"] == "51001660043052501060"
+    assert normalized["sub_account"] == ""
+    assert normalized["counter_account"] == counter_account
+    assert normalized["counter_party"] == counter_party
+
+
+def test_ambiguous_bare_account_without_distinct_counter_header_stays_unowned() -> None:
+    raw = _ccb_enterprise_17_column_row(
+        stacked_headers=False,
+        counter_header="往来账号",
+        counter_account="6212261408013357748",
+        counter_party="乔羽",
+    )
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["own_account"] == ""
+
+
+def test_distinct_account_headers_preserve_an_explicit_sub_account() -> None:
+    raw = {
+        "交易日期": "2024-03-21",
+        "账号": "51001660043052501060",
+        "子账号": "51001660043052501060-01",
+        "对方账号": "6212261408013357748",
+        "交易金额": "-10.00",
+        "余额": "90.00",
+    }
+
+    normalized = normalize_record(raw, BankStatementCommunityPlugin())
+
+    assert normalized["own_account"] == "51001660043052501060"
+    assert normalized["sub_account"] == "51001660043052501060-01"
+    assert normalized["counter_account"] == "6212261408013357748"
+
+
+def test_explicit_counter_account_does_not_backfill_own_account() -> None:
+    normalized = BankStatementCommunityPlugin()._normalize(
+        {
+            "交易日期": "2025-01-02",
+            "交易金额": "10.00",
+            "余额": "90.00",
+            "对方账号": "215500690",
+        }
+    )
+
+    assert normalized["counter_account"] == "215500690"
+    assert normalized["own_account"] == ""
+
+
+def test_ambiguous_bare_account_requires_source_owned_layout() -> None:
+    plugin = BankStatementCommunityPlugin()
+    ambiguous = plugin._normalize(
+        {
+            "交易日期": "2025-01-02",
+            "交易金额": "10.00",
+            "余额": "90.00",
+            "账号": "6222000000000000",
+        }
+    )
+    explicit = plugin._normalize(
+        {
+            "交易日期": "2025-01-02",
+            "交易金额": "10.00",
+            "余额": "90.00",
+            "本方账号": "6222000000000000",
+        }
+    )
+
+    assert ambiguous["own_account"] == ""
+    assert plugin._canonical_raw_values({"账号": "6222000000000000"}, ambiguous).get("own_account") is None
+    assert explicit["own_account"] == "6222000000000000"
+
+
+def test_scalar_count_cannot_override_single_page_identity_count() -> None:
     identity = {
         "total_transactions": {
             "raw_value": "25",
@@ -1105,13 +2512,7 @@ def test_source_reported_total_overrides_single_page_identity_count() -> None:
 
     _apply_source_reported_transaction_count(identity, 146)
 
-    assert identity["total_transactions"] == {
-        "raw_name": "page_footer_transaction_count",
-        "raw_value": "146",
-        "normalized_value": "146",
-        "data_type": "integer",
-        "source": "page_footer.sum",
-    }
+    assert identity["total_transactions"]["normalized_value"] == "25"
 
 
 def test_native_grid_recovers_watermarked_combined_amount_header_with_provenance() -> None:
@@ -1325,9 +2726,9 @@ def test_cross_page_split_grid_stitches_one_business_record_with_two_page_source
     assert second["source"]["page_range"] == [2, 2]
     assert result.ctx.reconstruction is not None
     assert result.ctx.reconstruction.stitched_continuation_rows == 1
-    assert result.style_meta.expected_primary_rows == 2
+    assert result.style_meta.expected_primary_rows == 0
     assert result.style_meta.extracted_rows == 2
-    assert result.style_meta.canonical_expected == 2
+    assert result.style_meta.canonical_expected == 0
     assert result.style_meta.canonical_extracted == 2
 
 
@@ -1358,6 +2759,100 @@ def test_cross_page_stitch_does_not_merge_repeated_page_header():
     assert result.records[0]["source"]["page_range"] == [2, 2]
     assert result.ctx.reconstruction is not None
     assert result.ctx.reconstruction.stitched_continuation_rows == 0
+
+
+def test_spdb_short_dates_use_same_page_period_and_preserve_business_roles() -> None:
+    normalized = normalize_record(
+        {
+            "交易日\n期": "08-01",
+            "柜员流水号": "999795591893",
+            "发生额\n借方": "",
+            "贷方": "100,000.00",
+            "账户余额": "168,083.80",
+            "交易对手信息\n对手机构": "浦发银行大众大厦支行",
+            "对手名称": "田野",
+            "摘要代码": "转账汇款借款",
+            "备注": "借款",
+            "_source_page_scope_text": "账单统计日期\n2022年08月31日\n第1页,共8页",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["date"] == "2022-08-01"
+    assert normalized["reference"] == "999795591893"
+    assert normalized["direction"] == "income"
+    assert normalized["amount"] == 100000.0
+    assert normalized["balance"] == 168083.8
+    assert normalized["counter_bank_name"] == "浦发银行大众大厦支行"
+    assert normalized["counter_party"] == "田野"
+    assert normalized["summary"] == "转账汇款借款"
+    assert normalized["note"] == "借款"
+
+
+def test_spdb_cross_page_continuation_survives_repeated_child_header() -> None:
+    headers = ["交易日期", "柜员流水号", "发生额", "", "账户余额", "交易对手信息", "", "摘要代码", "备注"]
+    rows = [
+        _sourced_bank_row(
+            [
+                "08-08",
+                "999572280710",
+                "14,350.00",
+                "",
+                "72,789.38",
+                "中国农业银行股份有",
+                "无锡康城物流有限公",
+                "电子渠道转账",
+                "郑州中海唯宝运费",
+            ],
+            page=1,
+            row_index=18,
+        ),
+        _sourced_bank_row(["", "", "借方", "贷方", "", "对手机构", "对手名称", "", ""], page=2, row_index=0),
+        _sourced_bank_row(["", "", "", "", "", "限公司无锡石塘湾支行", "司", "", ""], page=2, row_index=1),
+        _sourced_bank_row(
+            ["08-08", "999572280710", "7.50", "", "72,781.88", "", "", "跨行转账(网银异地)", ""], page=2, row_index=2
+        ),
+    ]
+    parse_result = ParseResult(
+        pages=[
+            PageContent(page_number=1, texts=[TextBlock(content="2022年08月31日")]),
+            PageContent(page_number=2, texts=[TextBlock(content="2022年08月31日")]),
+        ],
+        entities=DocumentEntities(document_type="bank_statement"),
+        logical_tables=[
+            LogicalTable(
+                table_id="lt_spdb",
+                headers=headers,
+                rows=rows,
+                row_count=len(rows),
+                source_pages=[1, 2],
+                source_physical_ids=["pt_1_0", "pt_2_0"],
+                page_span=(1, 2),
+                provenance=[
+                    RowProvenance(source_page=1, source_table_id="pt_1_0", source_row_index=18),
+                    RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=0, is_continuation=True),
+                    RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=1, is_continuation=True),
+                    RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=2, is_continuation=True),
+                ],
+                quality_passed=True,
+                data_row_estimate=2,
+            )
+        ],
+    )
+    stats: dict[str, int] = {}
+    extracted = extract_logical_rows_with_provenance(
+        parse_result,
+        BankStatementCommunityPlugin().column_registry,
+        strict_first_col=True,
+        stats=stats,
+    )
+
+    assert len(extracted) == 2
+    first = extracted[0]
+    assert first["交易对手信息"].replace("\n", "") == "中国农业银行股份有限公司无锡石塘湾支行"
+    assert first["col_6"].replace("\n", "") == "无锡康城物流有限公司"
+    assert first["_source"]["page_range"] == [1, 2]
+    assert stats["stitched_continuation_rows"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1442,7 +2937,7 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     assert first_audit["amount"]["value"] == "1000000.0"
     assert first_audit["amount"]["raw"] == "1000000"
     assert first_audit["balance"]["value"] == "1006296.3"
-    assert first_audit["balance"]["raw"] == "1006296.3"
+    assert first_audit["balance"]["raw"] == "1006296.\n3"
     assert first_audit["date"]["value"] == "2023-06-28"
     assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in markdown
     first_markdown_row = (

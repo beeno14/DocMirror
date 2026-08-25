@@ -261,17 +261,24 @@ def decode_employment_basic_cluster(value: object) -> ClusterDecodeResult:
     employer_type = _unique_vocabulary_span(text, _EMPLOYER_TYPES)
     if employer_type is not None:
         type_start, type_end, type_value = employer_type
-        fields["employer_type"] = type_value
-        consumed.append((type_start, type_end))
         employer_candidate = text[:type_start]
-        if _is_organization(employer_candidate):
-            fields["employer"] = employer_candidate
-            consumed.append((0, type_start))
-        tail_end = phone_span[0] if phone_span is not None and phone_span[0] > type_end else len(text)
-        address_candidate = text[type_end:tail_end]
-        if _is_address(address_candidate):
-            fields["employer_address"] = address_candidate
-            consumed.append((type_end, tail_end))
+        cluster_end = phone_span[0] if phone_span is not None else len(text)
+        organization_endpoints = _organization_endpoints(text[:cluster_end])
+        type_is_nested = any(endpoint > type_end for endpoint in organization_endpoints) or (
+            not _is_organization(employer_candidate)
+            and type_end in organization_endpoints
+        )
+        if not type_is_nested:
+            fields["employer_type"] = type_value
+            consumed.append((type_start, type_end))
+            if _is_organization(employer_candidate):
+                fields["employer"] = employer_candidate
+                consumed.append((0, type_start))
+            tail_end = phone_span[0] if phone_span is not None and phone_span[0] > type_end else len(text)
+            address_candidate = text[type_end:tail_end]
+            if _is_address(address_candidate):
+                fields["employer_address"] = address_candidate
+                consumed.append((type_end, tail_end))
     else:
         cluster_end = phone_span[0] if phone_span is not None else len(text)
         cluster = text[:cluster_end]

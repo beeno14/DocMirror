@@ -135,7 +135,7 @@ def _ocr_blocks_for_pdf_page(
     page_number: int,
     *,
     start_order: int = 0,
-) -> tuple[list[Block], Any | None]:
+) -> tuple[list[Block], Any | None, dict[str, Any]]:
     import fitz
 
     from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
@@ -144,7 +144,7 @@ def _ocr_blocks_for_pdf_page(
     zoom = 2.0
     with fitz.open(file_path) as doc:
         if page_index < 0 or page_index >= len(doc):
-            return [], None
+            return [], None, {}
         page = doc[page_index]
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -154,6 +154,21 @@ def _ocr_blocks_for_pdf_page(
     words, rotation, selected_image, page_width, page_height, ocr_metrics = _select_ocr_orientation(
         image, get_ocr_engine(), zoom=zoom
     )
+    from docmirror.layout.normalization import hough_deskew_image
+
+    selected_image, deskew = hough_deskew_image(selected_image)
+    if deskew.get("applied") is True:
+        words = get_ocr_engine().detect_image_words(selected_image)
+        ocr_metrics = _ocr_orientation_metrics(words)
+        page_width = round(float(selected_image.shape[1]) / zoom, 4)
+        page_height = round(float(selected_image.shape[0]) / zoom, 4)
+    deskew = {
+        **deskew,
+        "ocr_rotation": rotation,
+        "normalized_page_width": page_width,
+        "normalized_page_height": page_height,
+        "zoom": zoom,
+    }
     blocks: list[Block] = []
     for index, word in enumerate(words):
         if len(word) < 5:
@@ -179,13 +194,18 @@ def _ocr_blocks_for_pdf_page(
                     "confidence": round(confidence, 4),
                     "ocr_rotation": rotation,
                     "ocr_orientation_score": ocr_metrics["score"],
+                    "ocr_deskew_method": deskew.get("method"),
+                    "ocr_deskew_applied": deskew.get("applied") is True,
+                    "ocr_deskew_angle": float(deskew.get("angle") or 0.0),
+                    "ocr_deskew_reason": deskew.get("reason"),
+                    "ocr_deskew_support_line_count": int(deskew.get("support_line_count") or 0),
                     "normalized_page_width": page_width,
                     "normalized_page_height": page_height,
                 },
                 evidence_ids=(block_id,),
             )
         )
-    return blocks, selected_image
+    return blocks, selected_image, deskew
 
 
 def _select_ocr_orientation(
@@ -390,12 +410,19 @@ def _ocr_logical_pages_for_pdf_page(
     """OCR one physical page and return one or more logical page results."""
     if not decision.should_split:
         ocr_result = _ocr_blocks_for_pdf_page(file_path, page_index, source_page_number)
-        if isinstance(ocr_result, tuple) and len(ocr_result) == 2:
+        if isinstance(ocr_result, tuple) and len(ocr_result) == 3:
+            blocks, selected_image, deskew = ocr_result
+        elif isinstance(ocr_result, tuple) and len(ocr_result) == 2:
             blocks, selected_image = ocr_result
+            deskew = {}
         else:  # Backward-compatible test/extension seam.
             blocks, selected_image = ocr_result, None
+            deskew = {}
         rotation = 0
         width, height = source_width, source_height
+        rotation = int(deskew.get("ocr_rotation") or 0) % 360
+        width = float(deskew.get("normalized_page_width") or width)
+        height = float(deskew.get("normalized_page_height") or height)
         for block in blocks:
             attrs = block.attrs or {}
             rotation = int(attrs.get("ocr_rotation") or 0) % 360
@@ -403,6 +430,11 @@ def _ocr_logical_pages_for_pdf_page(
             height = float(attrs.get("normalized_page_height") or height)
             break
         matrix = rotation_matrix(source_width, source_height, rotation)
+        matrix = _compose_pixel_affine(
+            deskew.get("forward_matrix"),
+            matrix,
+            zoom=float(deskew.get("zoom") or 2.0),
+        )
         transform = _logical_page_transform(
             source_page_number=source_page_number,
             matrix=matrix,
@@ -414,6 +446,7 @@ def _ocr_logical_pages_for_pdf_page(
             confidence=decision.confidence,
             width=width,
             height=height,
+            deskew=deskew,
         )
         repaged = _repage_blocks(blocks, logical_start, source_page_number)
         return [
@@ -470,6 +503,11 @@ def _ocr_logical_pages_for_pdf_page(
     out: list[_OcrLogicalPage] = []
     for offset, page_slice in enumerate(slices):
         logical_page_number = logical_start + offset
+        from docmirror.layout.normalization import hough_deskew_image
+
+        deskewed_image, deskew = hough_deskew_image(page_slice.image)
+        deskewed_width = round(float(deskewed_image.shape[1]) / zoom, 4)
+        deskewed_height = round(float(deskewed_image.shape[0]) / zoom, 4)
         is_full_page = bool(full_words) and (
             len(slices) == 1
             and page_slice.crop_bbox_oriented[0] == 0.0
@@ -477,33 +515,44 @@ def _ocr_logical_pages_for_pdf_page(
             and abs(page_slice.width - _page_width) < 1.0
             and abs(page_slice.height - _page_height) < 1.0
         )
-        words = full_words if is_full_page else engine.detect_image_words(page_slice.image)
-        metrics = full_metrics if is_full_page else _ocr_orientation_metrics(words)
+        words = (
+            full_words
+            if is_full_page and deskew.get("applied") is not True
+            else engine.detect_image_words(deskewed_image)
+        )
+        metrics = (
+            full_metrics
+            if is_full_page and deskew.get("applied") is not True
+            else _ocr_orientation_metrics(words)
+        )
         blocks = _ocr_words_to_blocks(
             words,
             logical_page_number=logical_page_number,
             source_page_number=source_page_number,
             rotation=rotation,
             zoom=zoom,
-            page_width=page_slice.width,
-            page_height=page_slice.height,
+            page_width=deskewed_width,
+            page_height=deskewed_height,
             metrics=metrics,
+            deskew=deskew,
         )
         transform = _logical_page_transform_from_slice(
             page_slice,
             source_page_number=source_page_number,
-            width=page_slice.width,
-            height=page_slice.height,
+            width=deskewed_width,
+            height=deskewed_height,
+            deskew=deskew,
+            zoom=zoom,
         )
         out.append(
             _OcrLogicalPage(
                 page_number=logical_page_number,
                 source_page_number=source_page_number,
-                width=page_slice.width,
-                height=page_slice.height,
+                width=deskewed_width,
+                height=deskewed_height,
                 blocks=tuple(blocks),
                 coordinate_transform=transform,
-                image=page_slice.image,
+                image=deskewed_image,
             )
         )
     return out
@@ -519,7 +568,9 @@ def _ocr_words_to_blocks(
     page_width: float,
     page_height: float,
     metrics: dict[str, Any],
+    deskew: dict[str, Any] | None = None,
 ) -> list[Block]:
+    deskew = dict(deskew or {})
     blocks: list[Block] = []
     for index, word in enumerate(words):
         if len(word) < 5:
@@ -545,6 +596,11 @@ def _ocr_words_to_blocks(
                     "confidence": round(confidence, 4),
                     "ocr_rotation": rotation,
                     "ocr_orientation_score": metrics["score"],
+                    "ocr_deskew_method": deskew.get("method"),
+                    "ocr_deskew_applied": deskew.get("applied") is True,
+                    "ocr_deskew_angle": float(deskew.get("angle") or 0.0),
+                    "ocr_deskew_reason": deskew.get("reason"),
+                    "ocr_deskew_support_line_count": int(deskew.get("support_line_count") or 0),
                     "normalized_page_width": page_width,
                     "normalized_page_height": page_height,
                     "source_page_number": source_page_number,
@@ -577,11 +633,15 @@ def _logical_page_transform_from_slice(
     source_page_number: int,
     width: float,
     height: float,
+    deskew: dict[str, Any] | None = None,
+    zoom: float = 1.0,
 ) -> dict[str, Any]:
+    deskew = dict(deskew or {})
+    matrix = _compose_pixel_affine(deskew.get("forward_matrix"), page_slice.source_to_logical, zoom=zoom)
     return _logical_page_transform(
         source_page_number=source_page_number,
-        matrix=page_slice.source_to_logical,
-        inverse_matrix=page_slice.logical_to_source,
+        matrix=matrix,
+        inverse_matrix=invert_matrix(matrix),
         source_crop_bbox=page_slice.source_crop_bbox,
         rotation=page_slice.selected_rotation,
         split_kind="two_page_spread",
@@ -589,6 +649,7 @@ def _logical_page_transform_from_slice(
         confidence=page_slice.split_confidence,
         width=width,
         height=height,
+        deskew=deskew,
     )
 
 
@@ -604,13 +665,34 @@ def _logical_page_transform(
     confidence: float,
     width: float,
     height: float,
+    deskew: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    deskew = dict(deskew or {})
+    decomposition: dict[str, Any] = {
+        "kind": split_kind,
+        "segment_index": segment_index,
+        "selected_rotation": int(rotation) % 360,
+        "confidence": round(float(confidence), 4),
+    }
+    deskew_metadata: dict[str, Any] = {}
+    if deskew:
+        deskew_metadata = {
+            "deskew_angle": float(deskew.get("angle") or 0.0),
+            "deskew_applied": deskew.get("applied") is True,
+            "deskew_method": str(deskew.get("method") or "hough_lines_p_v1"),
+            "deskew_reason": str(deskew.get("reason") or "not_evaluated"),
+        }
+        decomposition.update(
+            deskew_metadata,
+            deskew_support_line_count=int(deskew.get("support_line_count") or 0),
+        )
     return {
         "source_page_number": source_page_number,
         "source_page_id": f"source-page:{source_page_number:04d}",
         "source_crop_bbox": [round(value, 4) for value in source_crop_bbox],
         "source_rotation": 0,
         "normalized_rotation": 0,
+        **deskew_metadata,
         "content_rotation_applied": int(rotation) % 360,
         "matrix": matrix,
         "inverse_matrix": inverse_matrix,
@@ -618,13 +700,36 @@ def _logical_page_transform(
         "source_height": float(source_crop_bbox[3] - source_crop_bbox[1]),
         "display_width": width,
         "display_height": height,
-        "decomposition": {
-            "kind": split_kind,
-            "segment_index": segment_index,
-            "selected_rotation": int(rotation) % 360,
-            "confidence": round(float(confidence), 4),
-        },
+        "decomposition": decomposition,
     }
+
+
+def _compose_pixel_affine(
+    pixel_matrix: Any,
+    source_to_logical: list[list[float]],
+    *,
+    zoom: float,
+) -> list[list[float]]:
+    """Compose a logical-image pixel affine into the PDF-point transform."""
+
+    if not (
+        isinstance(pixel_matrix, list)
+        and len(pixel_matrix) == 3
+        and all(isinstance(row, list) and len(row) == 3 for row in pixel_matrix)
+        and zoom > 0.0
+    ):
+        return source_to_logical
+    point_matrix = [[float(value) for value in row] for row in pixel_matrix]
+    point_matrix[0][2] /= zoom
+    point_matrix[1][2] /= zoom
+    return _matmul3(point_matrix, source_to_logical)
+
+
+def _matmul3(left: list[list[float]], right: list[list[float]]) -> list[list[float]]:
+    return [
+        [sum(float(left[row][inner]) * float(right[inner][col]) for inner in range(3)) for col in range(3)]
+        for row in range(3)
+    ]
 
 
 def _page_layout_from_blocks(
@@ -699,6 +804,41 @@ def _block_full_text(block: Block) -> str:
     if isinstance(block.raw_content, str):
         return block.raw_content
     return ""
+
+
+def _block_has_meaningful_content(block: Block) -> bool:
+    """Return whether a physical block carries document content.
+
+    A PDF page can contain only an empty graphics-state/content stream. Such
+    pages must not turn an otherwise native document into a hybrid document
+    merely because the OCR router inspected them. Text, tables, key/value
+    payloads, formulas, and source images are content-bearing; a page that
+    produced no such block is neutral.
+    """
+
+    if _block_full_text(block).strip():
+        return True
+    if block.block_type == "image":
+        return bool(block.raw_content is not None or block.evidence_ids)
+    if block.block_type == "key_value" and isinstance(block.raw_content, dict):
+        return any(str(key or "").strip() or str(value or "").strip() for key, value in block.raw_content.items())
+    return False
+
+
+def _content_acquisition_modes(pages: list[PageLayout]) -> tuple[bool, bool]:
+    """Return ``(has_scanned, has_native)`` for content-bearing pages.
+
+    If the whole selection is empty, retain the historical page-mode result
+    rather than guessing a route. The important distinction is that an empty
+    leading, middle, or trailing page is neutral when other pages have content.
+    """
+
+    content_pages = [page for page in pages if any(_block_has_meaningful_content(block) for block in page.blocks)]
+    routed_pages = content_pages or pages
+    return (
+        any(page.is_scanned for page in routed_pages),
+        any(not page.is_scanned for page in routed_pages),
+    )
 
 
 def _native_text_blocks(page_atoms: list[Any], *, page_number: int) -> list[Block]:
@@ -1220,6 +1360,7 @@ class CoreExtractor:
         if on_progress and selected_page_count == 0:
             on_progress("page_extraction", 100.0, "No pages selected for extraction")
         table_count = sum(1 for page in pages for block in page.blocks if block.block_type == "table")
+        has_scanned, has_native = _content_acquisition_modes(pages)
         confidence_values: list[tuple[float, int]] = []
         for logical_page in pages:
             for block in logical_page.blocks:
@@ -1236,10 +1377,8 @@ class CoreExtractor:
         overall_confidence = (
             sum(confidence * weight for confidence, weight in confidence_values) / confidence_weight
             if confidence_weight
-            else (0.0 if any(page.is_scanned for page in pages) else 1.0)
+            else (0.0 if has_scanned else 1.0)
         )
-        has_scanned = any(page.is_scanned for page in pages)
-        has_native = any(not page.is_scanned for page in pages)
         native_candidates = list((getattr(plane.evidence, "indexes", None) or {}).get("table_candidates") or [])
         selected_source_pages = {int(page.page_number) for page in plane.pages if page.page_index in selected_indices}
         selected_candidate_count = sum(

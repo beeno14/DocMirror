@@ -57,6 +57,21 @@ def test_employment_decoder_uses_field_contracts_not_known_business_values() -> 
     }
 
 
+def test_employment_decoder_never_splits_type_term_nested_in_legal_name() -> None:
+    result = decode_employment_basic_cluster(
+        "甲私营企业有限公司 福建省福州市星河路8号 01012345678"
+    )
+
+    assert result.fields == {"employer_phone": "01012345678"}
+    assert result.unresolved_fields == (
+        "employer",
+        "employer_type",
+        "employer_address",
+    )
+    assert "甲私营企业有限公司" in result.unresolved_residue
+    assert "福建省福州市星河路8号" in result.unresolved_residue
+
+
 def test_employment_decoder_does_not_choose_between_two_employer_types() -> None:
     result = decode_employment_basic_cluster(
         "北方星河科技有限公司 国有企业 私营企业 海州市新城路8号 01012345678"

@@ -7,6 +7,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from docmirror.plugins.credit_report.community_plugin import (
+    _apply_personal_detail_dataset_status,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
     collect_extraction_issues,
     make_issue,
@@ -16,6 +21,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction impo
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     project_personal_detail_datasets,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    prepare_personal_detail_source_collections,
 )
 from docmirror.plugins.credit_report.repayment_grid import (
     extract_credit_repayment_records,
@@ -54,6 +62,43 @@ def _monthly_row(
             },
         ],
     }
+
+
+def _exact_monthly_status_ref(
+    *,
+    grid_id: str,
+    performance_month: str,
+    column: int,
+) -> dict[str, object]:
+    return {
+        "source": "sealed_native_physical_table_cell",
+        "logical_page": 2,
+        "source_page": 1,
+        "table_id": "monthly-table:1",
+        "row": 4,
+        "column": column,
+        "bbox": [10.0, 10.0, 20.0, 20.0],
+        "geometry_scope": "cell",
+        "field_name": "status",
+        "grid_id": grid_id,
+        "performance_month": performance_month,
+        "evidence_ids": [f"native:monthly-table:4:{column}"],
+        "binding": "source_monthly_field_cell",
+        "binding_quality": "source_monthly_field_cell",
+    }
+
+
+def _unresolved_monthly_row(
+    record_id: str,
+    *,
+    month: int = 1,
+    source_refs: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    row = _monthly_row(record_id, status="unknown", overdue_amount=None)
+    row["month"] = month
+    if source_refs is not None:
+        row["source_cell_refs"] = source_refs
+    return row
 
 
 def test_final_overlay_withholds_numeric_status_without_positive_amount() -> None:
@@ -173,23 +218,423 @@ def test_community_projection_never_publishes_unpaired_numeric_status() -> None:
         for issue in projected["extraction_issues"]
         if issue.get("field_name") == "status_code"
     ]
-    assert len(status_issues) == 2
-    local_issue = next(
-        issue
-        for issue in status_issues
-        if issue.get("issue_code") == "pboc_cell_contract_unresolved"
-    )
-    assert local_issue["target_dataset"] == "credit_account_monthly_performance"
-    assert local_issue["target_record_id"] == "grid:bad:2024-01"
-    aggregate_issue = next(
-        issue
-        for issue in status_issues
-        if issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
-    )
-    assert aggregate_issue["target_dataset"] == "credit_account_monthly_performance"
-    assert "target_record_id" not in aggregate_issue
+    # Both detector grids describe the same account/month.  The emitted good
+    # observation closes that identity, so the bad grid alias must not leave a
+    # contradictory active omission/status issue.
+    assert status_issues == []
     assert not any(
         issue.get("target_record_id") == "grid:good:2024-01"
+        for issue in projected["extraction_issues"]
+    )
+
+
+def test_final_gate_reports_exact_source_bound_month_fields_and_keeps_aggregate() -> None:
+    grid_id = "grid:exact"
+    target = f"{grid_id}:2024-01"
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _unresolved_monthly_row(
+                    target,
+                    source_refs=[
+                        _exact_monthly_status_ref(
+                            grid_id=grid_id,
+                            performance_month="2024-01",
+                            column=1,
+                        )
+                    ],
+                )
+            ]
+        }
+    )
+
+    assert projected.get("credit_account_monthly_performance", []) == []
+    local = [
+        issue
+        for issue in projected.get("extraction_issues", [])
+        if issue.get("issue_code")
+        == "candidate_b_monthly_owned_grid_missing_field"
+    ]
+    target_ids = {issue["target_record_id"] for issue in local}
+    assert len(target_ids) == 1
+    assert next(iter(target_ids)).startswith("source_account_month:")
+    assert {issue["field_name"] for issue in local} == {"performance_month"}
+    assert sum(
+        issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
+        for issue in projected["extraction_issues"]
+    ) == 1
+    for issue in local:
+        issue_evidence = [
+            evidence
+            for evidence in projected["extraction_issue_evidence"]
+            if evidence.get("extraction_issue_id")
+            == issue["extraction_issue_id"]
+            and evidence.get("evidence_kind") == "observed"
+        ]
+        assert {
+            evidence["evidence_path"]: evidence.get("string_value")
+            for evidence in issue_evidence
+        } == {
+            "account_id": "account:1",
+            "performance_month": "2024-01",
+        }
+        assert len(issue["source_refs"]) == 1
+        ref = issue["source_refs"][0]
+        assert ref["field_name"] == issue["field_name"]
+        assert ref["source_field_name"] == "status"
+        assert ref["source_page"] == 1
+        assert ref["evidence_ids"] == ["native:monthly-table:4:1"]
+        assert (ref["table_id"], ref["row"], ref["column"]) == (
+            "monthly-table:1",
+            4,
+            1,
+        )
+        assert ref["source"] == "candidate_b_monthly_owned_grid_cell"
+        assert ref["source_origin"] == "sealed_native_physical_table_cell"
+        assert ref["binding"] == "source_account_month_identity"
+        assert ref["binding_quality"] == "source_account_month_identity"
+        assert ref["account_id"] == "account:1"
+
+
+def test_final_gate_accepts_fresh_geometry_proof_and_counts_account_month_set() -> None:
+    unresolved = _unresolved_monthly_row(
+        "grid:fresh:2024-02",
+        month=2,
+        source_refs=[
+            {
+                "page": 8,
+                "logical_page": 8,
+                "source_page": 4,
+                "source": "sealed_native_physical_table_cell",
+                "table_id": "monthly-table:fresh",
+                "coordinate_system": "pdf_points_top_left",
+                "geometry_scope": "cell",
+                "grid_id": "grid:fresh",
+                "row": 4,
+                "col": 2,
+                "field_name": "status",
+                "performance_month": "2024-02",
+                "bbox": [120.0, 400.0, 145.0, 414.0],
+                "evidence_ids": ["native:monthly-table:fresh:4:2"],
+                "binding": "source_monthly_field_cell",
+                "binding_quality": "source_monthly_field_cell",
+                "geometry_provenance": {
+                    "active_cell_geometry_exact": True,
+                    "coordinate_system": "pdf_points_top_left",
+                    "source": "source_table_geometry",
+                },
+            }
+        ],
+    )
+    unresolved["_account_month_identity_proof"] = {
+        "account_id": "account:1",
+        "performance_month": "2024-02",
+        "grid_id": "grid:fresh",
+        "owner_basis": "canonical_account_segment",
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+    unresolved["_account_month_identity_proof_status"] = "exact"
+    owner_unresolved = make_issue(
+        category="ocr_structure_correction",
+        issue_code="candidate_b_monthly_grid_owner_unresolved_field",
+        message="A printed grid month has no unique account owner.",
+        parser_stage="candidate_b_relationship_schema",
+        target_dataset="repayment_records",
+        target_record_id="grid:ambiguous:2024-03",
+        field_name="performance_month",
+        observed_value={
+            "grid_id": "grid:ambiguous",
+            "performance_month": "2024-03",
+        },
+    )
+
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _monthly_row(
+                    "grid:emitted:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                ),
+                unresolved,
+            ],
+            "personal_detail_extraction_issues": [owner_unresolved],
+        }
+    )
+
+    local = [
+        issue
+        for issue in projected["extraction_issues"]
+        if issue.get("issue_code")
+        == "candidate_b_monthly_owned_grid_missing_field"
+    ]
+    assert {issue["field_name"] for issue in local} == {"performance_month"}
+    assert len({issue["target_record_id"] for issue in local}) == 1
+    assert all(
+        issue["target_record_id"].startswith("source_account_month:")
+        for issue in local
+    )
+    for issue in local:
+        evidence = {
+            row["evidence_path"]: row.get("string_value")
+            for row in projected["extraction_issue_evidence"]
+            if row["extraction_issue_id"] == issue["extraction_issue_id"]
+            and row["evidence_kind"] == "observed"
+        }
+        assert evidence["account_id"] == "account:1"
+        assert evidence["performance_month"] == "2024-02"
+        assert set(evidence) == {"account_id", "performance_month"}
+        assert len(issue["source_refs"]) == 1
+        assert issue["source_refs"][0]["source"] == (
+            "candidate_b_monthly_owned_grid_cell"
+        )
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("owner_basis", "proof_status"),
+    (
+        ("page_proximity", "exact"),
+        (
+            "canonical_account_segment",
+            "unproven_exact_anchor_range_geometry_owner",
+        ),
+    ),
+)
+def test_final_gate_rejects_forged_or_explicitly_unproven_identity(
+    owner_basis: str,
+    proof_status: str,
+) -> None:
+    row = _monthly_row(
+        "grid:forged:2024-01",
+        status="N",
+        overdue_amount="0",
+    )
+    row["_account_month_identity_proof"] = {
+        "account_id": "account:1",
+        "performance_month": "2024-01",
+        "grid_id": "grid:forged",
+        "owner_basis": owner_basis,
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+    row["_account_month_identity_proof_status"] = proof_status
+
+    projected = project_personal_detail_datasets({"repayment_records": [row]})
+
+    assert projected.get("credit_account_monthly_performance", []) == []
+    monthly_status = next(
+        status
+        for status in projected["dataset_status"]
+        if status["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert "expected_row_count" not in monthly_status
+
+
+def test_monthly_expected_count_ignores_non_omission_issue_identity_mentions() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _monthly_row(
+                    "grid:emitted:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_cell_level_error",
+                    issue_code="candidate_b_monthly_duplicate_conflict",
+                    message="A conflicting detector replay mentioned another month.",
+                    parser_stage="candidate_b_relationship_schema",
+                    target_dataset="repayment_records",
+                    target_record_id="grid:diagnostic:2024-02",
+                    field_name="status_code",
+                    observed_value={
+                        "account_id": "account:1",
+                        "grid_id": "grid:diagnostic",
+                        "performance_month": "2024-02",
+                    },
+                    reason_codes=("duplicate_account_month",),
+                )
+            ],
+        }
+    )
+
+    monthly_status = next(
+        status
+        for status in projected["dataset_status"]
+        if status["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 1
+
+
+def test_final_gate_deduplicates_local_month_fields_and_drops_stale_emitted_claims() -> None:
+    unresolved_grid = "grid:duplicate"
+    unresolved_target = f"{unresolved_grid}:2024-01"
+    exact_ref = _exact_monthly_status_ref(
+        grid_id=unresolved_grid,
+        performance_month="2024-01",
+        column=1,
+    )
+    existing_local = make_issue(
+        category="ocr_cell_level_error",
+        issue_code="candidate_b_monthly_grid_contract_missing_field",
+        message="already localized",
+        parser_stage="candidate_b_relationship_schema",
+        target_dataset="repayment_records",
+        target_record_id=unresolved_target,
+        field_name="status",
+        observed_value={
+            "grid_id": unresolved_grid,
+            "performance_month": "2024-01",
+        },
+        source_refs=[exact_ref],
+    )
+    emitted_target = "grid:emitted:2024-01"
+    stale = make_issue(
+        category="ocr_cell_level_error",
+        issue_code="candidate_b_monthly_grid_contract_missing_field",
+        message="stale omitted field",
+        parser_stage="candidate_b_relationship_schema",
+        target_dataset="repayment_records",
+        target_record_id=emitted_target,
+        field_name="performance_month",
+        observed_value={
+            "grid_id": "grid:emitted",
+            "performance_month": "2024-01",
+        },
+        source_refs=[
+            _exact_monthly_status_ref(
+                grid_id="grid:emitted",
+                performance_month="2024-01",
+                column=1,
+            )
+        ],
+    )
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _unresolved_monthly_row(
+                    unresolved_target,
+                    source_refs=[exact_ref, dict(exact_ref)],
+                ),
+                _monthly_row(
+                    emitted_target,
+                    status="N",
+                    overdue_amount="0",
+                ),
+            ],
+            "personal_detail_extraction_issues": [existing_local, stale],
+        }
+    )
+
+    local = [
+        issue
+        for issue in projected.get("extraction_issues", [])
+        if issue.get("issue_code")
+        in {
+            "candidate_b_monthly_grid_contract_missing_field",
+            "candidate_b_monthly_owned_grid_missing_field",
+        }
+    ]
+    # The unresolved and emitted grids alias the same account/month.  Closure
+    # is identity-based, so neither the prior grid-local claim nor a newly
+    # generated account-month claim survives.
+    assert local == []
+
+
+@pytest.mark.parametrize(
+    "missing",
+    (
+        "source_page",
+        "evidence_ids",
+        "table_id",
+        "row",
+        "column",
+        "bbox",
+        "grid_id",
+        "performance_month",
+        "binding",
+        "binding_quality",
+        "source",
+    ),
+)
+def test_final_gate_refuses_local_claim_when_exact_provenance_is_incomplete(
+    missing: str,
+) -> None:
+    grid_id = "grid:incomplete"
+    target = f"{grid_id}:2024-01"
+    source_ref = _exact_monthly_status_ref(
+        grid_id=grid_id,
+        performance_month="2024-01",
+        column=1,
+    )
+    source_ref.pop(missing)
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _unresolved_monthly_row(target, source_refs=[source_ref])
+            ]
+        }
+    )
+
+    assert sum(
+        issue.get("issue_code") == "candidate_b_monthly_status_grid_unresolved"
+        for issue in projected["extraction_issues"]
+    ) == 1
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_monthly_owned_grid_missing_field"
+        for issue in projected["extraction_issues"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "forged_value"),
+    (
+        ("grid_id", "grid:neighbor"),
+        ("performance_month", "2024-02"),
+        ("source", "unrelated_cell"),
+    ),
+)
+def test_final_gate_refuses_local_claim_for_mismatched_cell_identity(
+    field: str,
+    forged_value: str,
+) -> None:
+    grid_id = "grid:exact-identity"
+    target = f"{grid_id}:2024-01"
+    source_ref = _exact_monthly_status_ref(
+        grid_id=grid_id,
+        performance_month="2024-01",
+        column=1,
+    )
+    source_ref[field] = forged_value
+
+    projected = project_personal_detail_datasets(
+        {
+            "repayment_records": [
+                _unresolved_monthly_row(target, source_refs=[source_ref])
+            ]
+        }
+    )
+
+    assert not any(
+        issue.get("issue_code")
+        == "candidate_b_monthly_owned_grid_missing_field"
         for issue in projected["extraction_issues"]
     )
 
@@ -354,7 +799,7 @@ def test_zero_overdue_status_withholds_nonzero_amount_without_inference() -> Non
     )
 
 
-def test_monthly_dataset_status_includes_unmaterialized_structural_gap_count() -> None:
+def test_monthly_dataset_status_ignores_unlocalized_structural_grid_count() -> None:
     projected = project_personal_detail_datasets(
         {
             "credit_accounts": [
@@ -380,10 +825,16 @@ def test_monthly_dataset_status_includes_unmaterialized_structural_gap_count() -
                     target_dataset="repayment_records",
                     observed_value={"canonical_row_count": 1},
                     candidate_value={
-                        "structural_expected_row_count": 3,
-                        "missing_month_count": 2,
+                        "source_structure_row_count": 3,
+                        "unreconciled_source_position_count": 2,
+                        "account_month_expected_row_count": None,
+                        "localization_status": "pending_unique_account_owner_reconciliation",
                     },
-                    reason_codes=("dataset_incomplete",),
+                    reason_codes=(
+                        "source_structure_is_audit_only",
+                        "raw_grid_positions_not_a_population_denominator",
+                        "dataset_incomplete",
+                    ),
                 )
             ],
         }
@@ -395,8 +846,7 @@ def test_monthly_dataset_status_includes_unmaterialized_structural_gap_count() -
         if row["dataset_name"] == "credit_account_monthly_performance"
     )
     assert monthly_status["observed_row_count"] == 1
-    assert monthly_status["expected_row_count"] == 3
-    assert monthly_status["expected_row_count"] - monthly_status["observed_row_count"] == 2
+    assert monthly_status["expected_row_count"] == 1
 
 
 def test_monthly_expected_count_does_not_double_count_materialized_withheld_rows() -> None:
@@ -432,10 +882,16 @@ def test_monthly_expected_count_does_not_double_count_materialized_withheld_rows
                     target_dataset="repayment_records",
                     observed_value={"canonical_row_count": 2},
                     candidate_value={
-                        "structural_expected_row_count": 3,
-                        "missing_month_count": 1,
+                        "source_structure_row_count": 3,
+                        "unreconciled_source_position_count": 1,
+                        "account_month_expected_row_count": None,
+                        "localization_status": "pending_unique_account_owner_reconciliation",
                     },
-                    reason_codes=("dataset_incomplete",),
+                    reason_codes=(
+                        "source_structure_is_audit_only",
+                        "raw_grid_positions_not_a_population_denominator",
+                        "dataset_incomplete",
+                    ),
                 )
             ],
         }
@@ -448,5 +904,466 @@ def test_monthly_expected_count_does_not_double_count_materialized_withheld_rows
     )
     assert len(projected["credit_account_monthly_performance"]) == 1
     assert monthly_status["observed_row_count"] == 1
-    assert monthly_status["expected_row_count"] == 3
-    assert monthly_status["expected_row_count"] - monthly_status["observed_row_count"] == 2
+    assert monthly_status["expected_row_count"] == 1
+    assert monthly_status["expected_row_count"] - monthly_status["observed_row_count"] == 0
+
+
+def test_monthly_dataset_status_does_not_turn_account_gap_count_into_months() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:1:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="schema_incompleteness",
+                    issue_code="monthly_population_incomplete_from_account_gap",
+                    message="The canonical grid plane contains three source positions.",
+                    parser_stage="candidate_b_account_monthly_population",
+                    target_dataset="repayment_records",
+                    observed_value={"canonical_grid_row_count": 3},
+                    candidate_value={
+                        "missing_account_category_sequences": {"credit_card": [2]}
+                    },
+                    reason_codes=("dataset_incomplete",),
+                )
+            ],
+        }
+    )
+
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 1
+
+
+def test_monthly_expected_count_excludes_owner_unresolved_grid_positions() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:owned:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_status_grid_unresolved",
+                    message="Two owned monthly positions were withheld.",
+                    parser_stage="candidate_b_monthly_status_grid",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:owned",
+                        "withheld_month_count": 2,
+                    },
+                    candidate_value={"emitted_month_count_for_grid": 1},
+                    reason_codes=("dataset_incomplete",),
+                ),
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="Three exact grid/month positions have no account owner.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 3,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                ),
+            ],
+        }
+    )
+
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 1
+
+
+def test_zero_row_monthly_dataset_is_published_from_status_and_owner_issues() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_status_grid_unresolved",
+                    message="Two owned monthly positions were withheld.",
+                    parser_stage="candidate_b_monthly_status_grid",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:owned",
+                        "withheld_month_count": 2,
+                    },
+                    reason_codes=("dataset_incomplete",),
+                ),
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="Three exact grid/month positions have no account owner.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 3,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                ),
+            ]
+        }
+    )
+
+    assert projected.get("credit_account_monthly_performance", []) == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert "expected_row_count" not in monthly_status
+
+
+def test_monthly_owner_unresolved_grid_count_is_deduplicated_and_not_conflict_summed() -> None:
+    def owner_issue(count: int, *, message: str) -> dict:
+        return make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_monthly_grid_owner_unresolved",
+            message=message,
+            parser_stage="candidate_b_monthly_linkage",
+            target_dataset="repayment_records",
+            observed_value={
+                "grid_id": "grid:unowned",
+                "observed_candidate_count": count,
+            },
+            candidate_value={"expected_month_count": count},
+            reason_codes=("relation_withheld",),
+        )
+
+    duplicate = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                owner_issue(3, message="First exact owner failure."),
+                owner_issue(3, message="Duplicate exact owner failure."),
+            ]
+        }
+    )
+    duplicate_status = next(
+        row
+        for row in duplicate["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert "expected_row_count" not in duplicate_status
+
+    conflicting = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                owner_issue(3, message="First conflicting owner failure."),
+                owner_issue(4, message="Second conflicting owner failure."),
+            ]
+        }
+    )
+    conflicting_status = next(
+        row
+        for row in conflicting["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert conflicting_status.get("expected_row_count", 0) == 0
+
+
+def test_monthly_owner_unresolved_count_is_not_added_without_observed_agreement() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": "account:1",
+                    "account_id": "account:1",
+                    "account_type": "credit_card",
+                }
+            ],
+            "repayment_records": [
+                _monthly_row(
+                    "grid:owned:2024-01",
+                    status="N",
+                    overdue_amount="0",
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code="candidate_b_monthly_grid_owner_unresolved",
+                    message="The candidate and observed grid populations disagree.",
+                    parser_stage="candidate_b_monthly_linkage",
+                    target_dataset="repayment_records",
+                    observed_value={
+                        "grid_id": "grid:unowned",
+                        "observed_candidate_count": 2,
+                    },
+                    candidate_value={"expected_month_count": 3},
+                    reason_codes=("relation_withheld",),
+                )
+            ]
+        }
+    )
+    assert len(projected["credit_account_monthly_performance"]) == 1
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 1
+
+
+def test_monthly_status_grid_count_is_deduplicated_and_not_conflict_summed() -> None:
+    def status_issue(count: int, *, message: str) -> dict:
+        return make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_monthly_status_grid_unresolved",
+            message=message,
+            parser_stage="candidate_b_monthly_status_grid",
+            target_dataset="repayment_records",
+            observed_value={
+                "grid_id": "grid:status-unresolved",
+                "withheld_month_count": count,
+            },
+            reason_codes=("dataset_incomplete",),
+        )
+
+    duplicate = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                status_issue(3, message="First exact status-grid failure."),
+                status_issue(3, message="Duplicate exact status-grid failure."),
+            ]
+        }
+    )
+    duplicate_status = next(
+        row
+        for row in duplicate["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert "expected_row_count" not in duplicate_status
+
+    conflicting = project_personal_detail_datasets(
+        {
+            "personal_detail_extraction_issues": [
+                status_issue(3, message="First conflicting status-grid failure."),
+                status_issue(4, message="Second conflicting status-grid failure."),
+            ]
+        }
+    )
+    conflicting_status = next(
+        row
+        for row in conflicting["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert conflicting_status.get("expected_row_count", 0) == 0
+
+
+def test_count_only_empty_monthly_status_does_not_define_canonical_denominator() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_dataset_status": [
+                {
+                    "record_id": "dataset_status:repayment_records",
+                    "dataset_name": "repayment_records",
+                    "applicability": "applicable",
+                    "presence_status": "partial",
+                    "observed_row_count": 0,
+                    "expected_row_count": 176,
+                }
+            ]
+        }
+    )
+
+    assert projected.get("credit_account_monthly_performance", []) == []
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert "expected_row_count" not in monthly_status
+
+
+def test_authenticated_monthly_closure_drives_status_and_community_completeness() -> None:
+    def exact_row(
+        grid_id: str,
+        performance_month: str,
+        *,
+        status: str,
+        overdue_amount: object,
+    ) -> dict[str, object]:
+        row = _monthly_row(
+            f"{grid_id}:{performance_month}",
+            status=status,
+            overdue_amount=overdue_amount,
+        )
+        row["month"] = int(performance_month[-2:])
+        row["_account_month_identity_proof"] = {
+            "account_id": "account:1",
+            "performance_month": performance_month,
+            "grid_id": grid_id,
+            "owner_basis": "canonical_account_segment",
+            "account_anchor_exact": True,
+            "printed_month_range_exact": True,
+            "grid_geometry_exact": True,
+            "unique_owner": True,
+        }
+        row["_account_month_identity_proof_status"] = "exact"
+        return row
+
+    prepared = prepare_personal_detail_source_collections(
+        {
+            "facts": {},
+            "datasets": {
+                "repayment_records": [
+                    exact_row(
+                        "grid:published",
+                        "2024-01",
+                        status="N",
+                        overdue_amount="0",
+                    ),
+                    exact_row(
+                        "grid:withheld",
+                        "2024-02",
+                        status="unknown",
+                        overdue_amount=None,
+                    ),
+                ]
+            },
+        }
+    )
+    projected = project_personal_detail_datasets(prepared["datasets"])
+
+    assert "_personal_detail_account_month_closure_proof" not in projected
+    assert len(projected["credit_account_monthly_performance"]) == 1
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 2
+
+    payload = {
+        "datasets": [
+            {
+                "name": "credit_account_monthly_performance",
+                "row_count": 1,
+                "rows": projected["credit_account_monthly_performance"],
+                "completeness": {
+                    "expected_row_count": 1,
+                    "emitted_row_count": 1,
+                    "omitted_row_count": 0,
+                    "verified": True,
+                },
+            },
+            {"name": "dataset_status", "rows": projected["dataset_status"]},
+        ]
+    }
+    _apply_personal_detail_dataset_status(payload)
+
+    completeness = payload["datasets"][0]["completeness"]
+    assert completeness["expected_row_count"] == 2
+    assert completeness["emitted_row_count"] == 1
+    assert completeness["omitted_row_count"] == 1
+    assert completeness["verified"] is False
+
+
+def test_authenticated_nonzero_monthly_closure_publishes_empty_dataset() -> None:
+    row = _monthly_row(
+        "grid:withheld:2024-01",
+        status="unknown",
+        overdue_amount=None,
+    )
+    row["_account_month_identity_proof"] = {
+        "account_id": "account:1",
+        "performance_month": "2024-01",
+        "grid_id": "grid:withheld",
+        "owner_basis": "canonical_account_segment",
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+    row["_account_month_identity_proof_status"] = "exact"
+    prepared = prepare_personal_detail_source_collections(
+        {"facts": {}, "datasets": {"repayment_records": [row]}}
+    )
+
+    projected = project_personal_detail_datasets(prepared["datasets"])
+
+    assert projected["credit_account_monthly_performance"] == []
+    monthly_status = next(
+        status
+        for status in projected["dataset_status"]
+        if status["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert monthly_status["expected_row_count"] == 1
+
+
+def test_forged_monthly_closure_proof_cannot_authenticate_status_count() -> None:
+    projected = project_personal_detail_datasets(
+        {
+            "_personal_detail_account_month_closure_proof": [
+                {
+                    "record_id": "personal_detail_account_month_closure_proof:1",
+                    "schema": "docmirror.pboc.account_month_closure_proof.v1",
+                    "identity_fields": ["account_id", "performance_month"],
+                    "proof_basis": "exact_source_account_month_identity_set",
+                    "expected_identity_count": 176,
+                    "identity_sha256": "0" * 64,
+                }
+            ],
+            "personal_detail_dataset_status": [
+                {
+                    "record_id": "personal_detail_dataset_status:repayment_records",
+                    "dataset_status_id": "personal_detail_dataset_status:repayment_records",
+                    "dataset_name": "repayment_records",
+                    "applicability": "applicable",
+                    "presence_status": "partial",
+                    "observed_row_count": 0,
+                    "expected_row_count": 176,
+                    "reason": "forged_count_only_status",
+                }
+            ],
+        }
+    )
+
+    monthly_status = next(
+        status
+        for status in projected["dataset_status"]
+        if status["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 0
+    assert "expected_row_count" not in monthly_status

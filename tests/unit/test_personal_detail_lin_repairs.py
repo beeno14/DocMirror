@@ -23,6 +23,56 @@ def _table(table_id: str, top: float, rows: list[list[str]]) -> SimpleNamespace:
     )
 
 
+def _exact_header_table(
+    table_id: str,
+    top: float,
+    rows: list[list[str]],
+) -> SimpleNamespace:
+    """Build one source-owned header table with exact field-cell evidence."""
+
+    width = max((len(row) for row in rows), default=0)
+    normalized = [row + [""] * (width - len(row)) for row in rows]
+    bboxes = [
+        [
+            [
+                10.0 + column * 100.0,
+                top + row * 20.0,
+                110.0 + column * 100.0,
+                top + (row + 1) * 20.0,
+            ]
+            for column in range(width)
+        ]
+        for row in range(len(normalized))
+    ]
+    evidence = [
+        [
+            [f"source:{table_id}:{row}:{column}"] if value else []
+            for column, value in enumerate(values)
+        ]
+        for row, values in enumerate(normalized)
+    ]
+    statuses = [
+        ["exact" if value else "derived" for value in values]
+        for values in normalized
+    ]
+    table = _table(table_id, top, normalized)
+    table.metadata.update(
+        {
+            "canonical_template_id": "report_header_and_identity",
+            "source_cell_bboxes": bboxes,
+            "cell_evidence_ids": evidence,
+            "cell_geometry_status": statuses,
+            "geometry": {
+                "coordinate_system": "pdf_points_top_left",
+                "cell_bboxes": bboxes,
+                "cell_evidence_ids": evidence,
+                "cell_geometry_status": statuses,
+            },
+        }
+    )
+    return table
+
+
 def _page(number: int, tables: list[SimpleNamespace]) -> SimpleNamespace:
     return SimpleNamespace(
         page_number=number,
@@ -155,17 +205,34 @@ def test_r2_exact_anchor_resolves_shared_native_revolving_table_signature(monkey
                 "_canonical_segment": {
                     "pages": [{"logical_page": 12, "min_y": 360.0, "max_y": None}]
                 },
-                "source_refs": [
-                    {
-                        "source": "candidate_b_account_anchor",
-                        "logical_page": 12,
-                        "source_page": 12,
-                        "bbox": [10.0, 360.0, 300.0, 369.0],
-                    }
-                ],
-            }
-        ],
-    )
+                    "source_refs": [
+                        {
+                            "source": "candidate_b_account_anchor",
+                            "logical_page": 12,
+                            "source_page": 12,
+                            "bbox": [10.0, 360.0, 300.0, 369.0],
+                        }
+                    ],
+                    "source_refs_by_field": {
+                        "account_identifier": [
+                            {
+                                "source": "native_detail_table_cell",
+                                "logical_page": 12,
+                                "source_page": 12,
+                                "table_id": "r2-account-base",
+                                "row": 1,
+                                "column": 1,
+                                "bbox": [80.0, 370.0, 160.0, 390.0],
+                                "evidence_ids": ["r2-account-identifier"],
+                                "geometry_scope": "cell",
+                                "binding": "canonical_field_slot",
+                                "field_name": "account_identifier",
+                            }
+                        ]
+                    },
+                }
+            ],
+        )
 
     accounts, _repayments, _events = native_extraction._extract_accounts(context)
 
@@ -235,7 +302,7 @@ def test_closed_collapsed_account_clusters_recover_only_shape_unique_fields() ->
     assert card["current_overdue_periods"] == card["current_overdue_amount"] == 0
 
 
-def test_watermarked_canonical_terminal_subtable_recovers_settled_state_and_close_date() -> None:
+def test_watermarked_terminal_subtable_without_token_partition_is_withheld() -> None:
     page = _page(8, [])
     table = _table(
         "pt_8_2",
@@ -259,21 +326,12 @@ def test_watermarked_canonical_terminal_subtable_recovers_settled_state_and_clos
         table=table,
     )
 
-    assert account["account_status"] == "settled"
-    assert account["account_lifecycle_state"] == "settled"
-    assert account["current_overdue"] is False
-    assert account["close_date"] == "2020-02-21"
-    assert account["source_refs_by_field"]["account_lifecycle_state"][0][
-        "binding_quality"
-    ] == "canonical_account_terminal_subtable"
-    assert account["source_refs_by_field"]["close_date"][0]["binding_quality"] == (
-        "canonical_account_terminal_subtable"
-    )
-    assert not any(
-        issue.get("status") not in {"resolved", "informational"}
-        and issue.get("field_name") in {"account_lifecycle_state", "close_date"}
-        for issue in context._personal_detail_extraction_issues
-    )
+    assert "account_status" not in account
+    assert "account_lifecycle_state" not in account
+    assert "current_overdue" not in account
+    assert "close_date" not in account
+    assert "source_refs_by_field" not in account
+    assert context._personal_detail_extraction_issues == []
 
 
 def test_terminal_subtable_rejects_multiple_candidate_blocks() -> None:
@@ -360,8 +418,8 @@ def test_malformed_account_institution_is_withheld_and_reported() -> None:
     assert "normalized_value_withheld" in issue["reason_codes"]
 
 
-def test_header_recovers_one_deleted_timestamp_digit_and_exact_visible_query_reason() -> None:
-    header = _table(
+def test_header_ignores_unowned_damaged_timestamp_and_keeps_owned_query_reason() -> None:
+    header = _exact_header_table(
         "report-header",
         20.0,
         [
@@ -369,20 +427,24 @@ def test_header_recovers_one_deleted_timestamp_digit_and_exact_visible_query_rea
             ["林岚挺", "身份证", "350102198311011933", "本人", "本人查询（自助查询机）"],
         ],
     )
-    context = SimpleNamespace(pages=[_page(1, [header])])
+    header.metadata["canonical_template_id"] = "report_header_and_identity"
+    page = _page(1, [header])
+    page.canonical_template_id = "report_header_and_identity"
+    context = SimpleNamespace(pages=[page])
     text = "报告编号:2023011314453720187289 报告时间:2023.01314:45:37"
 
     result = native_extraction._extract_header_datasets(context, text)
     metadata = result["personal_report_metadata"][0]
 
-    assert metadata["report_time"] == "2023-01-13T14:45:37+08:00"
+    assert metadata["report_number"] is None
+    assert metadata["report_time"] is None
     assert metadata["query_reason"] == "本人查询(自助查询机)"
 
 
 def test_spouse_document_columns_are_not_secondary_subject_identity_documents(
     monkeypatch,
 ) -> None:
-    header = _table(
+    header = _exact_header_table(
         "report-header",
         20.0,
         [
@@ -398,8 +460,11 @@ def test_spouse_document_columns_are_not_secondary_subject_identity_documents(
             ["--", '"', "** Te", "--", "-."],
         ],
     )
+    header.metadata["canonical_template_id"] = "report_header_and_identity"
+    page = _page(1, [header, spouse])
+    page.canonical_template_id = "report_header_and_identity"
     context = SimpleNamespace(
-        pages=[_page(1, [header, spouse])],
+        pages=[page],
         _personal_detail_extraction_issues=[],
     )
     monkeypatch.setattr(

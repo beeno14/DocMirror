@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+    _decimal,
     apply_candidate_b_native_status_conflict_guard,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -195,6 +196,86 @@ def _case(
     return context, records
 
 
+def _source_owned_p19_case() -> tuple[SimpleNamespace, list[dict[str, Any]]]:
+    """Reproduce p19's row-8 header and row-9/10 source-owned lattice."""
+
+    context, records = _case(basis="source_table_year_plus_twelve_ownership")
+    table = context.parse_result.pages[0].tables[0]
+    target_rows = table.rows
+    for offset, row in enumerate(target_rows, start=8):
+        for cell in row.cells:
+            cell.row_index = offset
+    year_cell = target_rows[1].cells[0]
+    year_cell.text = "2022 搜"
+    year_cell.token_ids = ["ocr:p19:year:2022", "ocr:p19:year:noise"]
+    year_cell.evidence_ids = list(year_cell.token_ids)
+
+    table.rows = (
+        [SimpleNamespace(cells=[]) for _ in range(8)]
+        + target_rows
+        + [SimpleNamespace(cells=[]) for _ in range(6)]
+    )
+    geometry = table.metadata["geometry"]
+    missing_boxes = [[None] * 13 for _ in range(8)]
+    missing_statuses = [["missing"] * 13 for _ in range(8)]
+    trailing_boxes = [[None] * 13 for _ in range(6)]
+    trailing_statuses = [["missing"] * 13 for _ in range(6)]
+    geometry["cell_bboxes"] = (
+        missing_boxes + geometry["cell_bboxes"] + trailing_boxes
+    )
+    geometry["cell_geometry_status"] = (
+        missing_statuses + geometry["cell_geometry_status"] + trailing_statuses
+    )
+    geometry["cell_spans"] = [
+        {"row": 9, "col": 0, "row_span": 2, "col_span": 1}
+    ]
+    row_edges = [53.5 + 13.0 * index for index in range(18)]
+    geometry["row_bands"] = [
+        {"index": index, "y0": row_edges[index], "y1": row_edges[index + 1]}
+        for index in range(17)
+    ]
+    geometry["horizontal_lines"] = row_edges
+    table.bbox = [table.bbox[0], row_edges[0], table.bbox[2], row_edges[-1]]
+
+    provenance = {
+        "selection_basis": "source_table_year_plus_twelve_ownership",
+        "source": "source_table_geometry",
+        "reason": "exact_source_table_month_lattice_calibration",
+        "table_id": "pt_19_0",
+        "vertical_rule_count": 14,
+        "rule_count": 14,
+        "horizontal_rule_count": 18,
+        "column_count": 13,
+        "month_column_count": 12,
+        "status_row_index": 9,
+        "amount_row_index": 10,
+        "year_anchor_row_index": 9,
+        "year_anchor_mode": "spanning_year_cell",
+        "year_row_span": 2,
+        "active_cell_geometry_exact": True,
+        "active_cell_rule_derived_count": 0,
+        "coordinate_system": "pdf_points_top_left",
+        "value_inputs_used": False,
+        "logical_page": 19,
+    }
+    refs = records[0]["source_cell_refs"]
+    refs[0].update(
+        {
+            "geometry_status": "exact",
+            "bbox": [262.0, 170.5, 289.0, 183.5],
+            "geometry_provenance": deepcopy(provenance),
+        }
+    )
+    refs[1].update(
+        {
+            "geometry_status": "exact",
+            "bbox": [262.0, 183.5, 289.0, 196.5],
+            "geometry_provenance": deepcopy(provenance),
+        }
+    )
+    return context, records
+
+
 def test_same_cell_native_conflict_withholds_only_status_and_conserves_all_evidence() -> None:
     context, records = _case()
 
@@ -227,6 +308,193 @@ def test_same_cell_native_conflict_withholds_only_status_and_conserves_all_evide
     ]
     assert audit["conflicts_withheld"] == 1
     assert audit["unique_native_witnesses"] == 1
+
+
+def test_source_owned_base_page_binds_actual_p19_shape_with_damaged_year_text() -> None:
+    context, records = _source_owned_p19_case()
+    header_cells = context.parse_result.pages[0].tables[0].rows[8].cells
+    year_cell = context.parse_result.pages[0].tables[0].rows[9].cells[0]
+    assert header_cells[1].text == "28"
+    assert header_cells[8].text == "T.8"
+    assert year_cell.text == "2022 搜"
+    assert len(year_cell.token_ids) == 2
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in records[0]
+    assert records[0]["overdue_amount"] == "0"
+    assert records[0]["canonical_raw"]["status"] == ["M", "N"]
+    assert audit["unique_native_witnesses"] == 1
+    assert audit["conflicts_withheld"] == 1
+    issue = context._personal_detail_extraction_issues[0]
+    assert issue["target_record_id"] == "mg_p19_repayment_0:2022-08"
+    assert {(ref["row"], ref["col"]) for ref in issue["source_refs"][2:]} == {
+        (9, 8),
+        (10, 8),
+    }
+
+
+def test_source_owned_base_page_never_uses_geometry_only_when_typed_header_is_missing() -> None:
+    context, records = _source_owned_p19_case()
+    context.parse_result.pages[0].tables[0].rows[8].cells = []
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "logical_page_mismatch",
+        "table_mismatch",
+        "status_row_mismatch",
+        "year_anchor_mismatch",
+        "header_row_mismatch",
+        "shifted_header_bbox",
+        "contradictory_rule_counts",
+    ),
+)
+def test_source_owned_base_page_requires_all_declared_and_raw_rows_to_agree(
+    defect: str,
+) -> None:
+    context, records = _source_owned_p19_case()
+    refs = records[0]["source_cell_refs"]
+    table = context.parse_result.pages[0].tables[0]
+    if defect == "logical_page_mismatch":
+        refs[1]["geometry_provenance"]["logical_page"] = 18
+    elif defect == "table_mismatch":
+        refs[1]["geometry_provenance"]["table_id"] = "pt_19_other"
+    elif defect == "status_row_mismatch":
+        refs[1]["geometry_provenance"]["status_row_index"] = 8
+    elif defect == "year_anchor_mismatch":
+        refs[1]["geometry_provenance"]["year_anchor_row_index"] = 8
+    elif defect == "header_row_mismatch":
+        table.rows[8].cells[8].row_index = 7
+    elif defect == "shifted_header_bbox":
+        table.rows[8].cells[8].bbox = list(table.rows[8].cells[9].bbox)
+    elif defect == "contradictory_rule_counts":
+        for ref in refs:
+            ref["geometry_provenance"]["vertical_rule_count"] = 0
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
+
+
+def test_source_owned_base_page_requires_one_unique_physical_lattice() -> None:
+    context, records = _source_owned_p19_case()
+    duplicate = deepcopy(context.parse_result.pages[0].tables[0])
+    duplicate.table_id = "pt_19_duplicate"
+    context.parse_result.pages[0].tables.append(duplicate)
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "nonexact_header",
+        "nonexact_status",
+        "nonexact_amount",
+        "multitoken_status",
+        "multitoken_amount",
+        "missing_header_evidence",
+        "reordered_header_evidence",
+    ),
+)
+def test_source_owned_base_page_requires_exact_single_token_raw_month_cells(
+    defect: str,
+) -> None:
+    context, records = _source_owned_p19_case()
+    table = context.parse_result.pages[0].tables[0]
+    if defect == "nonexact_header":
+        table.rows[8].cells[8].geometry_status = "derived"
+    elif defect == "nonexact_status":
+        table.rows[9].cells[8].geometry_status = "derived"
+    elif defect == "nonexact_amount":
+        table.rows[10].cells[8].geometry_status = "derived"
+    elif defect == "multitoken_status":
+        table.rows[9].cells[8].token_ids.append("ocr:p19:status:noise")
+        table.rows[9].cells[8].evidence_ids.append("ocr:p19:status:noise")
+    elif defect == "multitoken_amount":
+        table.rows[10].cells[8].token_ids.append("ocr:p19:amount:noise")
+        table.rows[10].cells[8].evidence_ids.append("ocr:p19:amount:noise")
+    elif defect == "missing_header_evidence":
+        table.rows[8].cells[8].evidence_ids = []
+    elif defect == "reordered_header_evidence":
+        table.rows[8].cells[8].token_ids = ["ocr:p19:header:8", "ocr:p19:header:noise"]
+        table.rows[8].cells[8].evidence_ids = ["ocr:p19:header:noise", "ocr:p19:header:8"]
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
+
+
+@pytest.mark.parametrize("year_text", ("2021 搜", "2022 2021"))
+def test_source_owned_base_page_requires_one_matching_year(year_text: str) -> None:
+    context, records = _source_owned_p19_case()
+    context.parse_result.pages[0].tables[0].rows[9].cells[0].text = year_text
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
+
+
+@pytest.mark.parametrize("defect", ("missing", "reordered"))
+def test_source_owned_base_page_requires_matching_year_evidence(defect: str) -> None:
+    context, records = _source_owned_p19_case()
+    year_cell = context.parse_result.pages[0].tables[0].rows[9].cells[0]
+    if defect == "missing":
+        year_cell.evidence_ids = []
+    elif defect == "reordered":
+        year_cell.evidence_ids = list(reversed(year_cell.evidence_ids))
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "M"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["conflicts_withheld"] == 0
 
 
 def test_same_cell_agreement_is_silent_and_default_scope_is_disabled() -> None:
@@ -265,6 +533,58 @@ def test_numeric_zero_forms_preserve_native_conflict_detection(zero: Any) -> Non
 
     assert "status" not in records[0]
     assert records[0]["overdue_amount"] == zero
+    assert audit["conflicts_withheld"] == 1
+
+
+@pytest.mark.parametrize("value", ("1,2", "1,,000", "1234,567", "12,34.56"))
+def test_native_status_conflict_rejects_malformed_decimal_grouping(value: str) -> None:
+    assert _decimal(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("1,234", Decimal("1234")), ("12,345.67", Decimal("12345.67")), ("1234.5", Decimal("1234.5"))),
+)
+def test_native_status_conflict_accepts_registered_decimal_grouping(
+    value: str,
+    expected: Decimal,
+) -> None:
+    assert _decimal(value) == expected
+
+
+def test_native_digit_with_zero_amount_cannot_override_symbolic_final_status() -> None:
+    context, records = _case(final_status="*")
+    context.parse_result.pages[0].tables[0].rows[1].cells[8].text = "3"
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert records[0]["status"] == "*"
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+    assert audit["unique_native_witnesses"] == 1
+    assert audit["native_numeric_witnesses_rejected_for_nonpositive_amount"] == 1
+    assert audit["conflicts_withheld"] == 0
+
+
+def test_native_digit_with_positive_amount_remains_a_conflicting_witness() -> None:
+    context, records = _case(final_status="*")
+    table = context.parse_result.pages[0].tables[0]
+    table.rows[1].cells[8].text = "3"
+    table.rows[2].cells[8].text = "1"
+    records[0]["overdue_amount"] = "1"
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in records[0]
+    assert records[0]["canonical_raw"]["status"] == ["*", "3"]
+    assert audit["native_numeric_witnesses_rejected_for_nonpositive_amount"] == 0
     assert audit["conflicts_withheld"] == 1
 
 
@@ -448,7 +768,7 @@ def test_mismatched_source_table_bindings_never_fall_back_to_header_scan() -> No
 
 
 def test_conflict_survives_personal_detail_community_projection() -> None:
-    context, records = _case()
+    context, records = _source_owned_p19_case()
     apply_candidate_b_native_status_conflict_guard(context, records, enabled=True)
 
     projected = project_personal_detail_datasets(

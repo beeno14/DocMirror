@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+
 from docmirror.models.entities.parse_result import DocumentEntities, ParseResult
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
@@ -37,7 +39,7 @@ def test_bank_statement_projection_publishes_chinese_reading_labels() -> None:
     assert dictionary["enums"]["layout_profile_id_refined"]["borderless_ledger_bank"] == "无框银行流水版式"
 
 
-def test_bank_statement_dedupe_keeps_repeated_page_sequences() -> None:
+def test_bank_statement_dedupe_keeps_unproven_repeated_rows_on_the_same_page() -> None:
     records = [
         {
             "normalized": {"sequence_no": "1", "date": "2023-03-09", "amount": 1, "balance": 9},
@@ -58,7 +60,10 @@ def test_bank_statement_dedupe_keeps_repeated_page_sequences() -> None:
 
     deduped = dedupe_transaction_rows(records)
 
-    assert len(deduped) == 2
+    # With no bbox, evidence id, or source-row index, the final two records
+    # may be two genuine same-value ledger events.  Plane overlap is handled
+    # upstream; the canonical row layer must preserve ambiguous source rows.
+    assert len(deduped) == 3
 
 
 def test_bank_statement_content_markdown_is_record_complete_and_generic() -> None:
@@ -78,11 +83,11 @@ def test_bank_statement_content_markdown_is_record_complete_and_generic() -> Non
         {
             "raw": {
                 "序号": "549",
-                "摘要": "电子汇入生成时间:2025-02-0710:29:08",
+                "摘要": "电子汇入",
                 "交易日期": "20241231",
                 "交易金额": "40,000.00",
                 "余额": "168,166.41",
-                "对方户名": "6230522020*****8471/陈*明总页数：29",
+                "对方户名": "6230522020*****8471/陈*明",
             },
             "normalized": {"direction": "income"},
             "source": {"source_page": 29, "page_range": [29, 29]},
@@ -926,12 +931,13 @@ def test_bank_statement_record_sanitizer_removes_footer_and_money_noise() -> Non
         }
     ]
 
+    source_records = copy.deepcopy(records)
     sanitized = _sanitize_bank_records(records)
 
-    assert sanitized[0]["raw"]["摘要"] == "电子汇入"
-    assert sanitized[0]["raw"]["余额"] == "168,166.41"
-    assert sanitized[0]["raw"]["对方户名"] == "6230522020*****8471/陈*明"
-    assert sanitized[0]["canonical_raw"]["balance"] == "168,166.41"
+    assert sanitized[0]["raw"] == source_records[0]["raw"]
+    assert sanitized[0]["canonical_raw"] == source_records[0]["canonical_raw"]
+    assert sanitized[0]["normalized"]["summary"] == "电子汇入"
+    assert sanitized[0]["normalized"]["balance"] == "168,166.41"
     assert sanitized[0]["normalized"]["counter_party"] == "6230522020*****8471/陈*明"
 
 
@@ -1073,21 +1079,61 @@ def test_bank_statement_record_sanitizer_removes_counterparty_pollution() -> Non
         },
     ]
 
+    source_records = copy.deepcopy(records)
     sanitized = _sanitize_bank_records(records)
 
+    for source, cleaned in zip(source_records, sanitized, strict=True):
+        assert cleaned["raw"] == source["raw"]
+        assert cleaned["canonical_raw"] == source["canonical_raw"]
+
     assert sanitized[0]["normalized"]["counter_party"] == "镇江小松鼠计算机技术服务有限公司"
-    assert sanitized[0]["raw"]["对方户名"] == "镇江小松鼠计算机技术服务有限公司"
-    assert sanitized[1]["normalized"]["counter_party"] == "企业电子渠道跨行转账手续费收入"
+    assert sanitized[1]["normalized"]["counter_party"] == ""
     assert sanitized[1]["normalized"]["counterparty_status"] == "present"
     assert sanitized[2]["normalized"]["counter_party"] == "镇江市住房公积金管理中心"
     assert sanitized[3]["normalized"]["counter_party"] == "夏炎"
     assert sanitized[4]["normalized"]["counter_party"] == "夏炎"
     assert sanitized[5]["normalized"]["counter_party"] == ""
-    assert sanitized[6]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
+    assert sanitized[6]["normalized"]["counter_party"] == ""
     assert sanitized[7]["normalized"]["counter_party"] == "企业电子渠道跨行转账手续费收入"
     assert sanitized[8]["normalized"]["counter_party"] == "待报解预算收入（财税库银联网代收）"
     assert sanitized[9]["normalized"]["counter_party"] == ""
-    assert sanitized[9]["raw"]["对方户名"] == ""
+
+
+def test_bank_statement_record_sanitizer_never_backfills_a_party_from_another_row() -> None:
+    records = [
+        {
+            "raw": {"对方账号与户名": "210401324测试供应商有限公司"},
+            "canonical_raw": {
+                "counter_account": "210401324",
+                "counter_party": "测试供应商有限公司",
+            },
+            "normalized": {
+                "counter_account": "210401324",
+                "counter_party": "测试供应商有限公司",
+            },
+        },
+        {
+            "raw": {"对方账号与户名": "210401324"},
+            "canonical_raw": {"counter_account": "210401324", "counter_party": ""},
+            "normalized": {"counter_account": "210401324", "counter_party": ""},
+        },
+        {
+            "raw": {"对方账号与户名": "210401324", "对方户名": "限公司"},
+            "canonical_raw": {"counter_account": "210401324", "counter_party": "限公司"},
+            "normalized": {"counter_account": "210401324", "counter_party": "限公司"},
+        },
+    ]
+
+    source_records = copy.deepcopy(records)
+    sanitized = _sanitize_bank_records(records)
+
+    assert sanitized[0]["normalized"]["counter_party"] == "测试供应商有限公司"
+    assert sanitized[1]["normalized"]["counter_party"] == ""
+    assert sanitized[1]["normalized"]["counterparty_status"] == "present"
+    assert sanitized[2]["normalized"]["counter_party"] == ""
+    assert sanitized[2]["normalized"]["counterparty_status"] == "present"
+    assert [row["raw"] for row in sanitized] == [row["raw"] for row in source_records]
+    assert [row["canonical_raw"] for row in sanitized] == [row["canonical_raw"] for row in source_records]
 
 
 def test_bank_statement_counterparty_pollution_allows_one_long_identifier_only() -> None:

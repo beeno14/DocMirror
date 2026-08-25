@@ -60,7 +60,7 @@ def test_merge_continuation_rows():
     cont = split_pipe_row(BOC_CONT)
     table = merge_pipe_continuation_rows([header, row1, cont])
     assert len(table) == 2
-    assert "深圳前海微众银行" in table[1][-1]
+    assert table[1][-1] == "深圳前海微众银行股份有限公司/深圳前海微众银行股份有"
 
 
 def test_build_tables_from_pipe_text():

@@ -60,15 +60,29 @@ def _coordinate_roundtrip_gate(pages: list[Any], atoms: list[Any]) -> dict[str, 
         matrix = transform.get("matrix") if isinstance(transform, dict) else None
         if not _matrix(matrix):
             continue
-        projected = _transform_bbox(source_bbox, matrix)
-        error = max(abs(float(projected[index]) - float(bbox[index])) for index in range(4))
+        metadata = _value(atom, "metadata", {}) or {}
+        source_quad = metadata.get("source_quad") if isinstance(metadata, dict) else None
+        if _quad(source_quad):
+            projected_quad = [_apply(matrix, float(point[0]), float(point[1])) for point in source_quad]
+            expected_quad = _bbox_quad(bbox)
+            error = max(
+                abs(float(projected_quad[index][axis]) - float(expected_quad[index][axis]))
+                for index in range(4)
+                for axis in range(2)
+            )
+        else:
+            projected = _transform_bbox(source_bbox, matrix)
+            error = max(abs(float(projected[index]) - float(bbox[index])) for index in range(4))
         max_error = max(max_error, error)
         checked += 1
         atom_id = str(_value(atom, "id", "") or "")
         if error > 0.5:
             bad.append(atom_id)
         crop = transform.get("source_crop_bbox") if isinstance(transform, dict) else None
-        if _bbox(crop) and not _bbox_inside(source_bbox, crop, tolerance=1.0):
+        if _bbox(crop) and _quad(source_quad):
+            if not all(_point_inside(point, crop, tolerance=1.0) for point in source_quad):
+                outside_crop.append(atom_id)
+        elif _bbox(crop) and not _bbox_inside(source_bbox, crop, tolerance=1.0):
             outside_crop.append(atom_id)
     if checked == 0:
         return _gate("gate:coordinate_roundtrip", "not_applicable", 1.0, 1.0)
@@ -341,6 +355,28 @@ def _text_source_conservation_gate(blocks: list[Any], atoms: list[Any]) -> dict[
 
 def _bbox(value: Any) -> bool:
     return isinstance(value, list | tuple) and len(value) == 4
+
+
+def _quad(value: Any) -> bool:
+    return bool(
+        isinstance(value, list | tuple)
+        and len(value) == 4
+        and all(isinstance(point, list | tuple) and len(point) == 2 for point in value)
+    )
+
+
+def _bbox_quad(value: Any) -> list[tuple[float, float]]:
+    x0, y0, x1, y1 = [float(item) for item in value]
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+def _point_inside(point: Any, outer: Any, *, tolerance: float) -> bool:
+    return bool(
+        float(point[0]) >= float(outer[0]) - tolerance
+        and float(point[1]) >= float(outer[1]) - tolerance
+        and float(point[0]) <= float(outer[2]) + tolerance
+        and float(point[1]) <= float(outer[3]) + tolerance
+    )
 
 
 def _matrix(value: Any) -> bool:

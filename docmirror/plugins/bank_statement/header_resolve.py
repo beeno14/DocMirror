@@ -61,6 +61,9 @@ RELAXED_LOOKAHEAD = 15
 _BANK_MATCH_TRANSLATION = str.maketrans(
     {
         "戶": "户",
+        "賬": "账",
+        "帳": "账",
+        "幣": "币",
         "⼈": "人",
         "⺠": "民",
         "⾏": "行",
@@ -72,6 +75,10 @@ _BANK_MATCH_TRANSLATION = str.maketrans(
 )
 _TIME_VALUE_RE = re.compile(r"^(?:\d{6}|\d{1,2}:\d{2}(?::\d{2})?)$")
 _MONEY_VALUE_RE = re.compile(r"^[+-]?(?:[¥￥$])?\d[\d,]*\.\d{1,2}$")
+_TRANSACTION_MONEY_VALUE_RE = re.compile(r"^[+-]?(?:[¥￥$])?\d[\d,]*(?:\.\d{1,2})?$")
+_TRANSACTION_DATE_VALUE_RE = re.compile(
+    r"^(?:(?:19|20)\d{2}(?:[-/.]\d{1,2}){2}|(?:19|20)\d{6})(?:[ T]\d{1,2}:?\d{2}(?::?\d{2})?)?$"
+)
 
 
 @dataclass(frozen=True)
@@ -346,6 +353,13 @@ def _merge_stacked_header_row(
     if next_index >= len(table):
         return header
     child_row = [str(cell or "").strip() for cell in table[next_index]]
+    if _row_is_transaction_shaped(child_row):
+        # A transaction can legitimately contain both an expense marker and an
+        # income-looking counterparty/summary.  It must never be consumed as a
+        # debit/credit subheader merely because those words occur in different
+        # business cells.  Stacked header rows contain labels, not a valid
+        # transaction date plus monetary values.
+        return header
     if not has_split_debit_credit_headers([[child_row]]):
         return header
 
@@ -367,3 +381,12 @@ def _merge_stacked_header_row(
         col_map=matched[1] if matched is not None else header.col_map,
         mode=header.mode,
     )
+
+
+def _row_is_transaction_shaped(row: list[str]) -> bool:
+    """Return whether a prospective child header is clearly a ledger row."""
+
+    cells = [re.sub(r"\s+", "", normalize_bank_matching_text(cell)) for cell in row if str(cell or "").strip()]
+    has_date = any(_TRANSACTION_DATE_VALUE_RE.fullmatch(cell) for cell in cells)
+    monetary_cells = sum(bool(_TRANSACTION_MONEY_VALUE_RE.fullmatch(cell)) for cell in cells)
+    return has_date and monetary_cells >= 1

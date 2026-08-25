@@ -6,7 +6,7 @@ from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.input.extraction import extractor as extractor_module
 from docmirror.input.extraction.extractor import CoreExtractor
 from docmirror.input.extraction.page_splitter import DocumentSpreadPlan, PageSplitDecision
-from docmirror.models.entities.domain import Block, TextSpan
+from docmirror.models.entities.domain import Block, PageLayout, TextSpan
 
 
 def _fake_plane():
@@ -55,6 +55,20 @@ def _ocr_block(text: str, page_number: int) -> Block:
         raw_content=text,
         evidence_ids=(block_id,),
     )
+
+
+def test_content_acquisition_modes_ignore_empty_scanned_pages() -> None:
+    native = PageLayout(page_number=1, blocks=(_ocr_block("native ledger", 1),), is_scanned=False)
+    blank_scanned = PageLayout(page_number=2, blocks=(), is_scanned=True)
+
+    assert extractor_module._content_acquisition_modes([native, blank_scanned]) == (False, True)
+
+
+def test_content_acquisition_modes_keep_real_hybrid_content() -> None:
+    native = PageLayout(page_number=1, blocks=(_ocr_block("native ledger", 1),), is_scanned=False)
+    scanned = PageLayout(page_number=2, blocks=(_ocr_block("OCR ledger", 2),), is_scanned=True)
+
+    assert extractor_module._content_acquisition_modes([native, scanned]) == (True, True)
 
 
 def test_vnext_extractor_respects_page_selection_and_auto_ocr(monkeypatch):

@@ -27,19 +27,51 @@ if TYPE_CHECKING:
     from docmirror.plugins.bank_statement.context import StyleContext
 
 _HEADER_LIMIT = 4000
-_HEADER_BANK_PATTERNS = (
-    re.compile(
-        r"(?<!对方)开户行(?:\s+The Bank(?:\s+of Account Opening)?)?[:：]?\s*"
-        r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|账单统计日期|起始日期|From\(|\n|$)",
-        re.I,
+_HEADER_ISSUER_PATTERNS = (
+    (
+        "银行名称",
+        re.compile(
+            r"(?<!对方)银行名称[:：]?\s*"
+            r"([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)(?:\s{2,}|开户行|开户机构|账号|户名|币种|起始日期|From\(|\n|$)",
+            re.I,
+        ),
     ),
-    re.compile(r"开户机构[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|年份|月份|账号|户名|\n)"),
-    re.compile(r"(?<!对方)开户行\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,40}?)(?:\s{2,}|起始日期|From\(|\n)"),
-    re.compile(
-        r"(?<!对方)开户行[:：]?\s*"
-        r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|账号|户名|\n)"
+    (
+        "Bank Name",
+        re.compile(
+            r"\bBank Name\s*[:：]?\s*"
+            r"([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)(?:\s{2,}|From\(|Account(?:\s+Number)?|账号|户名|币种|\n|$)",
+            re.I,
+        ),
     ),
-    re.compile(r"Bank Name\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|From\(|\n)", re.I),
+)
+
+_HEADER_BRANCH_PATTERNS = (
+    (
+        "开户行",
+        re.compile(
+            r"(?<!对方)开户行(?:\s+The Bank(?:\s+of Account Opening)?)?[:：]?\s*"
+            r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|账单统计日期|起始日期|From\(|\n|$)",
+            re.I,
+        ),
+    ),
+    (
+        "开户机构",
+        re.compile(
+            r"开户机构[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|年份|月份|账号|户名|\n)"
+        ),
+    ),
+    (
+        "开户行",
+        re.compile(r"(?<!对方)开户行\s+([\u4e00-\u9fa5A-Za-z（）()·\s]{4,40}?)(?:\s{2,}|起始日期|From\(|\n)"),
+    ),
+    (
+        "开户行",
+        re.compile(
+            r"(?<!对方)开户行[:：]?\s*"
+            r"([\u4e00-\u9fa5A-Za-z（）()·\s]{4,60}?)(?:\s{2,}|币种|账号|户名|\n)"
+        ),
+    ),
 )
 _IDENTITY_SKIP_KEYWORDS = (
     "币种",
@@ -149,15 +181,40 @@ def _transaction_header_start(text: str) -> int | None:
     return None
 
 
-def _header_bank_name(full_text: str) -> str | None:
+def _header_institution_fact(
+    full_text: str,
+    patterns: tuple[tuple[str, re.Pattern[str]], ...],
+) -> tuple[str, str] | None:
     header = _header_text(full_text)
-    for pat in _HEADER_BANK_PATTERNS:
+    for label, pat in patterns:
         m = pat.search(header)
         if m:
             name = m.group(1).strip()
             if _looks_like_institution(name):
-                return name
+                return label, name
     return None
+
+
+def _header_bank_name(full_text: str) -> str | None:
+    fact = _header_institution_fact(full_text, _HEADER_ISSUER_PATTERNS)
+    return fact[1] if fact else None
+
+
+def _header_branch_fact(full_text: str) -> tuple[str, str] | None:
+    return _header_institution_fact(full_text, _HEADER_BRANCH_PATTERNS)
+
+
+def extract_header_institution_fields(full_text: str) -> dict[str, tuple[str, str]]:
+    """Return explicitly labelled issuer and opening-branch source facts."""
+
+    fields: dict[str, tuple[str, str]] = {}
+    issuer = _header_institution_fact(full_text, _HEADER_ISSUER_PATTERNS)
+    if issuer:
+        fields["bank_name"] = issuer
+    branch = _header_branch_fact(full_text)
+    if branch:
+        fields["branch_name"] = branch
+    return fields
 
 
 def _filename_bank_token(file_path: str | None) -> str | None:
@@ -176,7 +233,11 @@ def resolve_institution_from_context(parse_result: Any, full_text: str) -> tuple
     """Resolve institution for StyleContext (IAS v2 stack)."""
     header_bank = _header_bank_name(full_text)
     if header_bank:
-        return header_bank, "header.kv"
+        return header_bank, "header.issuer"
+
+    header_branch = _header_branch_fact(full_text)
+    if header_branch:
+        return header_branch[1], "header.branch"
 
     entities = getattr(parse_result, "entities", None)
     if entities is not None:
@@ -214,12 +275,16 @@ def resolve_institution_hint(
 ) -> tuple[str | None, str]:
     """Resolve institution hint for style metadata (IAS full stack)."""
     if ctx.institution and _looks_like_institution(ctx.institution):
-        return ctx.institution, "entities.organization"
+        return ctx.institution, ctx.institution_authority or "context.institution"
 
     header = _header_text(ctx.full_text)
     header_bank = _header_bank_name(ctx.full_text)
     if header_bank:
-        return header_bank, "header.kv"
+        return header_bank, "header.issuer"
+
+    header_branch = _header_branch_fact(ctx.full_text)
+    if header_branch:
+        return header_branch[1], "header.branch"
 
     file_path = getattr(ctx.parse_result, "file_path", None) if ctx.parse_result is not None else None
     filename_bank = _filename_bank_token(str(file_path) if file_path else None)
@@ -358,9 +423,8 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
     if "currency" not in out and "人民币" in header:
         out["currency"] = "CNY"
 
-    bank = _header_bank_name(full_text)
-    if bank:
-        out["bank_name"] = bank
+    for field_name, (_raw_name, value) in extract_header_institution_fields(full_text).items():
+        out[field_name] = value
 
     return out
 

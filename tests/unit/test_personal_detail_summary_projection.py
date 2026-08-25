@@ -11,8 +11,38 @@ from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     project_personal_detail_datasets,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
+    _summary_value,
     prepare_personal_detail_source_collections,
 )
+
+
+@pytest.mark.parametrize("raw", ("1,2", "1,,2", "1,23,456", "12,34.5"))
+def test_summary_scalar_never_concatenates_malformed_grouping(raw: str) -> None:
+    value_type, normalized, status = _summary_value(raw)
+
+    assert (value_type, normalized, status) == ("text", None, "reported")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_type", "expected"),
+    (
+        ("1,234", "integer", "1234"),
+        ("12,345.60", "decimal", "12345.60"),
+        ("1,234.5%", "percentage", "1234.5"),
+    ),
+)
+def test_summary_scalar_accepts_registered_numeric_presentations(
+    raw: str,
+    expected_type: str,
+    expected: str,
+) -> None:
+    value_type, normalized, status = _summary_value(raw)
+
+    assert (value_type, normalized, status) == (
+        expected_type,
+        expected,
+        "reported",
+    )
 
 
 def _summary_cell(

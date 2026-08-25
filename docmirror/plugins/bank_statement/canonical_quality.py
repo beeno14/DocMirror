@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import date
 from math import isfinite
 from typing import Any
 
@@ -30,17 +31,52 @@ def is_canonical_row(norm: dict[str, Any]) -> bool:
     A source value of zero is a valid ledger fact. Missing or unparseable
     amounts remain non-canonical and must never be defaulted to zero.
     """
-    if not norm.get("date"):
+    if not _is_valid_calendar_date(norm.get("date")):
         return False
-    direction = norm.get("direction")
     amount = norm.get("amount")
-    if direction not in ("income", "expense") or amount in (None, ""):
+    if amount in (None, ""):
         return False
     try:
         numeric_amount = float(amount)
     except (TypeError, ValueError):
         return False
-    return isfinite(numeric_amount) and numeric_amount >= 0.0
+    if not isfinite(numeric_amount) or numeric_amount < 0.0:
+        return False
+    if numeric_amount == 0.0:
+        # A source-backed zero-value ledger event (for example an interest-tax
+        # line) has no mathematically meaningful debit/credit direction.  Keep
+        # the business row without fabricating one, but still require another
+        # transaction semantic so a bare date/zero fragment cannot become a
+        # dataset row. Non-zero amounts require an explicit or uniquely
+        # derived direction below.
+        return norm.get("direction") in ("income", "expense") or any(
+            norm.get(field) not in (None, "")
+            for field in ("balance", "summary", "reference", "note", "counter_party", "counter_account")
+        )
+    return norm.get("direction") in ("income", "expense")
+
+
+def _is_valid_calendar_date(value: Any) -> bool:
+    """Return whether a normalized ledger date names a real calendar day.
+
+    Candidate selection runs before the public dataset is assembled.  Treating
+    a merely non-empty date as canonical allowed reconstruction furniture such
+    as ``2023-06-00`` to compete with genuine transactions.  Normalizers may
+    still present compact or slash-separated source dates, so validate those
+    losslessly instead of requiring one display format here.
+    """
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    match = re.fullmatch(
+        r"(?P<year>(?:19|20)\d{2})[-/.年]?(?P<month>\d{1,2})[-/.月]?(?P<day>\d{1,2})(?:日)?",
+        text,
+    )
+    if match is None:
+        return False
+    try:
+        date(int(match.group("year")), int(match.group("month")), int(match.group("day")))
+    except ValueError:
+        return False
+    return True
 
 
 def audit_amount_consistency(records: list[dict[str, Any]]) -> list[str]:
@@ -108,7 +144,12 @@ def _normalized_amount(value: Any) -> float | None:
 
 
 def canonical_expected_from_parse_result(parse_result: Any) -> int:
-    """Return the strongest independent transaction-row estimate."""
+    """Return the strongest candidate-local transaction-row estimate.
+
+    The result helps rank and diagnose parser candidates. It is not independent
+    issuer evidence and must not be exposed as an exact document-completeness
+    denominator.
+    """
     if parse_result is None:
         return 0
     from docmirror.evidence.spe_consumer import read_ltqg_summary, read_structure_spe
@@ -140,14 +181,22 @@ def physical_transaction_row_estimate(parse_result: Any) -> int:
     """Estimate visible ledger rows without summing overlapping table candidates."""
     if parse_result is None:
         return 0
+    pages = list(getattr(parse_result, "pages", []) or [])
+    schema_signatures = {
+        signature
+        for page in pages
+        for table in getattr(page, "tables", []) or []
+        if (headers := [str(header or "") for header in getattr(table, "headers", []) or []])
+        and (signature := _physical_ledger_role_signature(headers)) is not None
+    }
     total = 0
-    for page in getattr(parse_result, "pages", []) or []:
+    for page in pages:
         table_counts: list[int] = []
         for table in getattr(page, "tables", []) or []:
             from docmirror.plugins.bank_statement.header_resolve import align_bank_ledger_row
 
             headers = [str(header or "") for header in getattr(table, "headers", []) or []]
-            count = sum(
+            row_count = sum(
                 _looks_like_physical_transaction_row(
                     align_bank_ledger_row(
                         headers,
@@ -157,11 +206,84 @@ def physical_transaction_row_estimate(parse_result: Any) -> int:
                 )
                 for row in getattr(table, "rows", []) or []
             )
+            # Some table extractors promote the first transaction on a
+            # continuation page into ``headers``.  Count it only when the same
+            # table also contains an ordinary transaction row.  This local
+            # lineage witness avoids treating an isolated date-and-money
+            # furniture table as a ledger page.
+            promoted_transaction_header = (
+                row_count > 0
+                and _looks_like_physical_transaction_row(headers, headers)
+                and any(_transaction_values_match_role_signature(headers, signature) for signature in schema_signatures)
+            )
+            count = row_count + int(promoted_transaction_header)
             if count > 0:
                 table_counts.append(count)
         if table_counts:
             total += max(table_counts)
     return total
+
+
+def _looks_like_physical_ledger_header(headers: list[str]) -> bool:
+    """Return whether a source header independently names date and amount roles."""
+    return _physical_ledger_role_signature(headers) is not None
+
+
+def _physical_ledger_role_signature(
+    headers: list[str],
+) -> tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
+    """Describe independently labelled ledger roles by their physical columns."""
+    compact = [_compact_header(header) for header in headers]
+    date_roles = (
+        "交易日期",
+        "记账日期",
+        "交易时间",
+        "日期",
+        "transactiondate",
+        "bookingdate",
+        "valuedate",
+    )
+    amount_roles = (
+        "交易金额",
+        "发生额",
+        "借方",
+        "贷方",
+        "收入金额",
+        "支出金额",
+        "transactionamount",
+        "debit",
+        "credit",
+    )
+    balance_roles = ("余额", "账户余额", "balance")
+    date_indices = tuple(
+        index for index, value in enumerate(compact) if any(role in value for role in date_roles)
+    )
+    amount_indices = tuple(
+        index for index, value in enumerate(compact) if any(role in value for role in amount_roles)
+    )
+    balance_indices = tuple(
+        index for index, value in enumerate(compact) if any(role in value for role in balance_roles)
+    )
+    if not date_indices or not amount_indices:
+        return None
+    return len(headers), date_indices, amount_indices, balance_indices
+
+
+def _transaction_values_match_role_signature(
+    values: list[str],
+    signature: tuple[int, tuple[int, ...], tuple[int, ...], tuple[int, ...]],
+) -> bool:
+    """Require a promoted row to occupy the same roles as a real source schema."""
+    width, date_indices, amount_indices, balance_indices = signature
+    if len(values) != width:
+        return False
+
+    compact_values = [re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))) for value in values]
+    if not any(_DATE_CELL_RE.fullmatch(compact_values[index]) for index in date_indices):
+        return False
+    if not any(_money_value(compact_values[index]) is not None for index in amount_indices):
+        return False
+    return not balance_indices or any(_money_value(compact_values[index]) is not None for index in balance_indices)
 
 
 def _looks_like_physical_transaction_row(values: list[str], headers: list[str]) -> bool:
@@ -239,8 +361,11 @@ def audit_cqf(
     canonical_extracted = sum(1 for rec in records if is_canonical_row(rec.get("normalized") or {}))
     expected = max(int(canonical_expected or 0), 0)
     if expected <= 0:
-        coverage_ratio = 1.0 if canonical_extracted > 0 else 0.0
-        canonical_ratio = coverage_ratio
+        # Extracted rows cannot prove that no rows are missing. Without an
+        # independently supplied denominator, completeness remains unknown and
+        # must never self-certify as 100%/success.
+        coverage_ratio = 0.0
+        canonical_ratio = 0.0
     else:
         coverage_ratio = min(canonical_extracted / expected, 1.0)
         canonical_ratio = min(canonical_extracted / expected, 1.0)

@@ -10,6 +10,10 @@ import pytest
 from docmirror.models.entities.parse_result import ExtractionMethod, ParserInfo
 from docmirror.plugins.bank_statement.community_plugin import BANK_COLUMN_REGISTRY, BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.extraction_dispatch import (
+    SCANNED_POLICY,
+    BankExtractionRoute,
+)
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.styles.borderless_ocr import (
@@ -88,6 +92,8 @@ def test_detector_borderless_ocr_style():
         full_text="个人客户交易明细",
         institution=None,
         page_count=1,
+        extraction_route=BankExtractionRoute.SCANNED,
+        extraction_policy=SCANNED_POLICY,
     )
     result = BankStyleDetector().detect(ctx)
     assert result.primary_style == "borderless_ocr"
@@ -100,6 +106,8 @@ def test_registry_borderless_ocr_records():
         full_text="个人客户交易明细",
         institution=None,
         page_count=1,
+        extraction_route=BankExtractionRoute.SCANNED,
+        extraction_policy=SCANNED_POLICY,
     )
     detection = BankStyleDetector().detect(ctx)
     plugin = BankStatementCommunityPlugin()

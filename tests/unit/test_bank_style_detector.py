@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.extraction_dispatch import SCANNED_POLICY
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
 
 
@@ -37,6 +38,22 @@ def test_detector_yinzuo_compact_merged():
     assert result.primary_style == "compact_merged_ledger"
     assert "compact_merged" in result.parser_chain
     assert result.confidence >= 0.55
+
+
+def test_scanned_detector_does_not_select_forbidden_compact_style():
+    ctx = StyleContext(
+        tables=[_yinzuo_table()],
+        full_text="閾跺骇閾惰浜ゆ槗鏄庣粏",
+        institution="閾跺骇閾惰",
+        page_count=1,
+        extraction_route=SCANNED_POLICY.route,
+        extraction_policy=SCANNED_POLICY,
+    )
+
+    result = BankStyleDetector().detect(ctx)
+
+    assert result.primary_style != "compact_merged_ledger"
+    assert "compact_merged" not in result.parser_chain
 
 
 def test_detector_grid_standard():

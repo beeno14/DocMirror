@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import date as calendar_date
+from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Any
 
@@ -17,6 +20,19 @@ _MONEY_RE = re.compile(r"^-?\d[\d,]*\.\d{2}$")
 _MONEY_ANY_RE = re.compile(r"-?\d[\d,]*\.\d{2}")
 _COMPOSITE_MARKERS = ("支出", "收入", "账户余额")
 _RECOVERY_CACHE_KEY = "_bank_evidence_atom_recovery"
+_NATIVE_DATETIME_CENSUS_SOURCE = "native_page_datetime_census"
+_NATIVE_SIGNED_LEDGER_CENSUS_SOURCE = "native_page_signed_ledger_census"
+_SOURCE_COVERAGE_CONFIDENCE = 0.80
+_NATIVE_DATETIME_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}$")
+_NATIVE_TIME_RE = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+_NATIVE_ACCOUNT_RE = re.compile(r"^(?:账号|账户号)\s*[:：]\s*(?P<account>[\d*]{6,40})$")
+_NATIVE_LEDGER_TITLE_RE = re.compile(r"^\S{1,24}银行交易明细$")
+_NATIVE_LEDGER_HEADERS = ("日期", "支出", "收入", "余额", "对方账户", "对方户名", "摘要/附言")
+_CIB_NATIVE_LEDGER_TITLE = "兴业银行交易流水"
+_CIB_NATIVE_ACCOUNT_RE = re.compile(r"^号[:：](?P<account>[\d*]{6,40})$")
+_CIB_NATIVE_LEDGER_HEADERS = ("交易日期", "记账日期", "摘要", "对方户名", "对方账户/对方银行")
+_CIB_NATIVE_COMPOUND_MONEY_HEADER = "支/收交易金额账户余额交易地点"
+_CIB_NATIVE_FOOTER_PREFIX = "说明：交易明细涉及您的个人隐私"
 _GEOMETRY_FOOTER_MARKERS = (
     "本页合计",
     "本页支出",
@@ -25,6 +41,13 @@ _GEOMETRY_FOOTER_MARKERS = (
     "总收入金额",
     "总支出笔数",
     "总支出金额",
+    "收入交易笔数",
+    "收入金额合计",
+    "支出交易笔数",
+    "支出金额合计",
+    "支出交易总额",
+    "收入交易总额",
+    "合计笔数",
     "收入总额",
     "支出总额",
     "当前账单借方发生数",
@@ -42,8 +65,11 @@ _GEOMETRY_FOOTER_MARKERS = (
     "友情提示",
     "重要提示",
     "风险提示",
+    "说明：交易明细涉及",
     "本回单",
     "对账单专用章",
+    "https://",
+    "http://",
 )
 _COMMON_BANK_SUMMARY_OCR_CORRECTIONS = {
     "网银路行互联": "网银跨行互联",
@@ -100,6 +126,26 @@ _COLUMN_AGGREGATE_HEADER_MARKERS = {
     "counterparty": ("对方账号与户名", "对方账户", "对方账号", "对手方"),
 }
 
+_GEOMETRY_OVERLAY_LABELS_BY_ROLE = {
+    "date": ("交易日期", "业务日期", "日期"),
+    "timestamp": ("交易时间", "交易日期时间", "日期时间"),
+    "posting_date": ("记账日期", "会计日期", "入账日期"),
+    "summary": ("交易摘要", "摘要"),
+    "purpose": ("交易用途", "用途"),
+    "direction": ("支/收", "收/支", "借/贷", "借贷"),
+    "amount": ("交易金额", "发生金额", "发生额", "金额"),
+    "balance": ("账户余额", "本次余额", "账面余额", "余额"),
+    "transaction_location": ("交易地点", "交易场所"),
+    "institution": ("交易机构", "交易网点", "交易地点"),
+    "counter_party": ("对方户名", "对方名称", "对手方名称"),
+    "counter_account": (
+        "对方账户/对方银行",
+        "对方账号/对方银行",
+        "对方账户",
+        "对方账号",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class PositionedBlockRecovery:
@@ -110,7 +156,482 @@ class PositionedBlockRecovery:
     expected_rows: int
 
 
-def recover_positioned_record_block_bank_tables(parse_result: Any) -> PositionedBlockRecovery:
+def recovered_native_datetime_row_evidence(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> tuple[int, str, float]:
+    """Count structurally witnessed rows in a bounded native ledger plane.
+
+    This is a source-coverage signal, not an independent completeness proof.
+    It deliberately recognizes only narrow, well-witnessed native layouts.
+    One requires date/time anchors and reconciled debit/credit page totals; the
+    other requires transaction/posting dates and a signed amount/balance chain.
+    Both require the same account, declared page numbering, exact ledger headers,
+    source-row geometry, and footer boundaries on every observed page.  These
+    checks prove internal representation consistency but cannot rule out a row
+    omitted symmetrically from all observed planes, so the result intentionally
+    remains below the authoritative-count threshold.  Repeated values remain
+    distinct because rows are matched as bbox-backed observations.
+    """
+    if source_route not in (None, "digital"):
+        return 0, "", 0.0
+    if not _native_document_plane_is_bounded(parse_result):
+        return 0, "", 0.0
+
+    from docmirror.plugins._runtime.evidence_access import text_atoms
+
+    native_atoms = [
+        atom
+        for atom in text_atoms(parse_result)
+        if isinstance(atom, dict)
+        and str(atom.get("source_kind") or "").strip().lower() == "pdf_native"
+        and str(atom.get("page_id") or "")
+        and str(atom.get("text") or "").strip()
+        and isinstance(atom.get("bbox"), list)
+        and len(atom["bbox"]) >= 4
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for atom in native_atoms:
+        grouped[str(atom["page_id"])].append(atom)
+
+    page_ids = _native_document_page_ids(parse_result)
+    if not page_ids or set(grouped) != set(page_ids):
+        return 0, "", 0.0
+
+    expected_account = ""
+    total_rows = 0
+    datetime_layout_valid = True
+    for page_number, page_id in enumerate(page_ids, start=1):
+        page_coverage = _bounded_native_datetime_page_coverage(
+            grouped[page_id],
+            page_number=page_number,
+            page_count=len(page_ids),
+        )
+        if page_coverage is None:
+            datetime_layout_valid = False
+            break
+        page_rows, account = page_coverage
+        if expected_account and account != expected_account:
+            datetime_layout_valid = False
+            break
+        expected_account = account
+        total_rows += page_rows
+
+    if datetime_layout_valid and total_rows > 0 and expected_account:
+        return total_rows, _NATIVE_DATETIME_CENSUS_SOURCE, _SOURCE_COVERAGE_CONFIDENCE
+
+    cib_coverage = _bounded_cib_native_document_coverage(grouped, page_ids)
+    if cib_coverage is not None:
+        return cib_coverage[0], _NATIVE_SIGNED_LEDGER_CENSUS_SOURCE, _SOURCE_COVERAGE_CONFIDENCE
+    return 0, "", 0.0
+
+
+def _native_document_plane_is_bounded(parse_result: Any) -> bool:
+    parser_info = getattr(parse_result, "parser_info", None)
+    raw_method = getattr(parser_info, "extraction_method", "")
+    extraction_method = str(getattr(raw_method, "value", raw_method) or "").strip().lower()
+    if extraction_method and extraction_method != "digital":
+        return False
+
+    page_ids = _native_document_page_ids(parse_result)
+    if not page_ids:
+        return False
+    expected_numbers = list(range(1, len(page_ids) + 1))
+    if page_ids != [f"page:{number:04d}" for number in expected_numbers]:
+        return False
+
+    plane = getattr(parse_result, "evidence_plane", None)
+    plane_pages = list(getattr(plane, "pages", None) or [])
+    if len(plane_pages) != len(page_ids):
+        return False
+    for expected, page in zip(expected_numbers, plane_pages):
+        if int(getattr(page, "page_number", 0) or 0) != expected:
+            return False
+        mode = str(getattr(page, "content_mode", "") or "").strip().lower()
+        if mode and mode != "unknown" and "native" not in mode:
+            return False
+
+    options = getattr(parser_info, "options", None)
+    if hasattr(options, "model_dump"):
+        options = options.model_dump(mode="python")
+    options = options if isinstance(options, dict) else {}
+    source_page_count = int(options.get("source_page_count") or 0)
+    if source_page_count and source_page_count != len(page_ids):
+        return False
+    selected_pages = options.get("selected_source_pages")
+    if isinstance(selected_pages, list) and selected_pages:
+        try:
+            selected = [int(value) for value in selected_pages]
+        except (TypeError, ValueError):
+            return False
+        if selected != expected_numbers:
+            return False
+    return True
+
+
+def _native_document_page_ids(parse_result: Any) -> list[str]:
+    pages = list(getattr(parse_result, "pages", None) or [])
+    numbered: list[tuple[int, str]] = []
+    for page in pages:
+        page_number = int(getattr(page, "page_number", 0) or 0)
+        if page_number <= 0:
+            return []
+        numbered.append((page_number, f"page:{page_number:04d}"))
+    numbered.sort()
+    if [number for number, _page_id in numbered] != list(range(1, len(numbered) + 1)):
+        return []
+    return [page_id for _number, page_id in numbered]
+
+
+def _bounded_native_datetime_page_coverage(
+    atoms: list[dict[str, Any]],
+    *,
+    page_number: int,
+    page_count: int,
+) -> tuple[int, str] | None:
+    ordered = sorted(
+        atoms,
+        key=lambda atom: (
+            float(atom["bbox"][1]),
+            float(atom["bbox"][0]),
+            str(atom.get("id") or ""),
+        ),
+    )
+    header_atoms = [_first_exact(ordered, label) for label in _NATIVE_LEDGER_HEADERS]
+    if any(atom is None for atom in header_atoms):
+        return None
+    headers = [atom for atom in header_atoms if atom is not None]
+    header_y = median(_y_center(atom) for atom in headers)
+    if any(abs(_y_center(atom) - header_y) > 1.5 for atom in headers):
+        return None
+    header_centers = [_x_center(atom) for atom in headers]
+    if any(right <= left for left, right in zip(header_centers, header_centers[1:])):
+        return None
+    bounds = [
+        float("-inf"),
+        *((left + right) / 2 for left, right in zip(header_centers, header_centers[1:])),
+        float("inf"),
+    ]
+
+    title = next(
+        (
+            atom
+            for atom in ordered
+            if _NATIVE_LEDGER_TITLE_RE.fullmatch(str(atom.get("text") or "").strip()) and _y_center(atom) < header_y
+        ),
+        None,
+    )
+    account_atoms = [
+        (atom, match.group("account"))
+        for atom in ordered
+        if _y_center(atom) < header_y
+        and (match := _NATIVE_ACCOUNT_RE.fullmatch(str(atom.get("text") or "").strip())) is not None
+    ]
+    if title is None or len(account_atoms) != 1:
+        return None
+    account = account_atoms[0][1]
+
+    header_texts = [str(atom.get("text") or "").strip() for atom in ordered if _y_center(atom) < header_y]
+    required_page_tokens = (f"第{page_number}", "/", str(page_count), "页")
+    if any(token not in header_texts for token in required_page_tokens):
+        return None
+
+    footer_labels = [
+        atom
+        for atom in ordered
+        if str(atom.get("text") or "").strip() in {"合计:", "合计："} and _y_center(atom) > header_y
+    ]
+    if len(footer_labels) != 1:
+        return None
+    footer_y = _y_center(footer_labels[0])
+    footer_texts = [str(atom.get("text") or "").strip() for atom in ordered if _y_center(atom) > footer_y]
+    if not all(
+        any(text.startswith(prefix) for text in footer_texts) for prefix in ("打印操作员", "打印日期", "打印时间")
+    ):
+        return None
+
+    body = [atom for atom in ordered if header_y + 2.0 < _y_center(atom) < footer_y - 2.0]
+    date_atoms = [
+        atom
+        for atom in body
+        if _NATIVE_DATETIME_RE.fullmatch(str(atom.get("text") or "").strip())
+        and bounds[0] <= _x_center(atom) < bounds[1]
+    ]
+    time_atoms = [
+        atom
+        for atom in body
+        if _NATIVE_TIME_RE.fullmatch(str(atom.get("text") or "").strip()) and bounds[0] <= _x_center(atom) < bounds[1]
+    ]
+    if not date_atoms or len(date_atoms) != len(time_atoms):
+        return None
+
+    # The date column is the page's structural row-boundary plane.  Preserve
+    # its native layout cadence as part of coverage checking: debit/credit totals alone
+    # cannot witness a missing zero-value transaction.  Real rows may grow by
+    # one or two wrapped text lines, hence the deliberately broad multiples of
+    # the minimum source pitch rather than a fixed case-specific row height.
+    row_centers = sorted(_y_center(atom) for atom in date_atoms)
+    if len(row_centers) > 1:
+        row_gaps = [right - left for left, right in zip(row_centers, row_centers[1:])]
+        source_pitch = min(row_gaps)
+        if not 15.0 <= source_pitch <= 60.0 or any(
+            gap > (2.25 * source_pitch) or abs((gap / source_pitch) - round(gap / source_pitch)) > 0.2
+            for gap in row_gaps
+        ):
+            return None
+        if row_centers[0] - header_y > 1.5 * source_pitch:
+            return None
+        # A final page can legitimately end well above its fixed footer band.
+        # On a filled page, however, removing the terminal row creates a blank
+        # band wider than any complete wrapped source-row slot.
+        tail_gap = footer_y - row_centers[-1]
+        if tail_gap <= 3.0 * source_pitch and tail_gap > 2.25 * source_pitch:
+            return None
+
+    money_atoms = [
+        atom
+        for atom in body
+        if _MONEY_RE.fullmatch(str(atom.get("text") or "").strip()) and bounds[1] <= _x_center(atom) < bounds[4]
+    ]
+    unused_times = set(range(len(time_atoms)))
+    unused_money = set(range(len(money_atoms)))
+    debit_total = Decimal("0")
+    credit_total = Decimal("0")
+
+    for date_atom in sorted(date_atoms, key=lambda atom: (_y_center(atom), _x_center(atom))):
+        raw_date = str(date_atom.get("text") or "").strip()
+        try:
+            calendar_date.fromisoformat(raw_date)
+        except ValueError:
+            return None
+        date_y = _y_center(date_atom)
+        matching_times = [
+            index
+            for index in unused_times
+            if 6.0 <= _y_center(time_atoms[index]) - date_y <= 14.0
+            and abs(_x_center(time_atoms[index]) - _x_center(date_atom)) <= 15.0
+        ]
+        if len(matching_times) != 1:
+            return None
+        time_index = matching_times[0]
+        raw_time = str(time_atoms[time_index].get("text") or "").strip()
+        try:
+            int(raw_time[:2]) < 24 and int(raw_time[3:5]) < 60 and int(raw_time[6:8]) < 60
+        except (TypeError, ValueError):
+            return None
+        if not (int(raw_time[:2]) < 24 and int(raw_time[3:5]) < 60 and int(raw_time[6:8]) < 60):
+            return None
+        unused_times.remove(time_index)
+
+        row_money = [index for index in unused_money if abs(_y_center(money_atoms[index]) - date_y) <= 1.5]
+        amount_indexes = [index for index in row_money if bounds[1] <= _x_center(money_atoms[index]) < bounds[3]]
+        balance_indexes = [index for index in row_money if bounds[3] <= _x_center(money_atoms[index]) < bounds[4]]
+        if len(amount_indexes) != 1 or len(balance_indexes) != 1:
+            return None
+        amount_index = amount_indexes[0]
+        amount_atom = money_atoms[amount_index]
+        try:
+            amount = Decimal(str(amount_atom.get("text") or "").replace(",", ""))
+            Decimal(str(money_atoms[balance_indexes[0]].get("text") or "").replace(",", ""))
+        except InvalidOperation:
+            return None
+        if bounds[1] <= _x_center(amount_atom) < bounds[2]:
+            debit_total += amount
+        elif bounds[2] <= _x_center(amount_atom) < bounds[3]:
+            credit_total += amount
+        else:
+            return None
+        unused_money.difference_update({amount_index, balance_indexes[0]})
+
+    if unused_times or unused_money:
+        return None
+
+    footer_money = [
+        atom
+        for atom in ordered
+        if abs(_y_center(atom) - footer_y) <= 1.5
+        and _MONEY_RE.fullmatch(str(atom.get("text") or "").strip())
+        and bounds[1] <= _x_center(atom) < bounds[3]
+    ]
+    debit_footer = [atom for atom in footer_money if bounds[1] <= _x_center(atom) < bounds[2]]
+    credit_footer = [atom for atom in footer_money if bounds[2] <= _x_center(atom) < bounds[3]]
+    if len(debit_footer) != 1 or len(credit_footer) != 1:
+        return None
+    try:
+        expected_debit = Decimal(str(debit_footer[0].get("text") or "").replace(",", ""))
+        expected_credit = Decimal(str(credit_footer[0].get("text") or "").replace(",", ""))
+    except InvalidOperation:
+        return None
+    if debit_total != expected_debit or credit_total != expected_credit:
+        return None
+    return len(date_atoms), account
+
+
+def _bounded_cib_native_document_coverage(
+    grouped: dict[str, list[dict[str, Any]]],
+    page_ids: list[str],
+) -> tuple[int, str] | None:
+    """Count internally consistent signed-ledger rows in the native source plane.
+
+    The exact title/header signature selects the layout, while structural quality
+    is checked on every observed page: each has the same account and footer,
+    and every bounded transaction anchor owns one posting date, signed amount,
+    and balance.  The balance chain must close across pages.  This cannot prove
+    that a terminal row absent from the source plane was never omitted upstream.
+    """
+    expected_account = ""
+    ledger_rows: list[tuple[Decimal, Decimal]] = []
+    page_count = len(page_ids)
+    for page_number, page_id in enumerate(page_ids, start=1):
+        ordered = sorted(
+            grouped.get(page_id, []),
+            key=lambda atom: (
+                float(atom["bbox"][1]),
+                float(atom["bbox"][0]),
+                str(atom.get("id") or ""),
+            ),
+        )
+        title = _first_exact(ordered, _CIB_NATIVE_LEDGER_TITLE)
+        header_atoms = [_first_exact(ordered, label) for label in _CIB_NATIVE_LEDGER_HEADERS]
+        if title is None or any(atom is None for atom in header_atoms):
+            return None
+        headers = [atom for atom in header_atoms if atom is not None]
+        header_y = median(_y_center(atom) for atom in headers)
+        if _y_center(title) >= header_y or any(abs(_y_center(atom) - header_y) > 1.5 for atom in headers):
+            return None
+        header_centers = [_x_center(atom) for atom in headers]
+        if any(right <= left for left, right in zip(header_centers, header_centers[1:])):
+            return None
+
+        money_header_atoms = [
+            atom
+            for atom in ordered
+            if _y_center(atom) < header_y + 1.5
+            and "".join(str(atom.get("text") or "").split())
+            in {
+                _CIB_NATIVE_COMPOUND_MONEY_HEADER,
+                "支/收交易金额",
+                "账户余额",
+                "交易地点",
+            }
+        ]
+        compact_money_headers = {"".join(str(atom.get("text") or "").split()) for atom in money_header_atoms}
+        if not (
+            _CIB_NATIVE_COMPOUND_MONEY_HEADER in compact_money_headers
+            or {"支/收交易金额", "账户余额", "交易地点"}.issubset(compact_money_headers)
+        ):
+            return None
+
+        account_facts = {
+            match.group("account")
+            for atom in ordered
+            if _y_center(atom) < header_y
+            and (match := _CIB_NATIVE_ACCOUNT_RE.fullmatch(str(atom.get("text") or "").strip())) is not None
+        }
+        if len(account_facts) != 1:
+            return None
+        account = account_facts.pop()
+        if expected_account and account != expected_account:
+            return None
+        expected_account = account
+
+        page_marker = f"第{page_number}页/共{page_count}页"
+        marker_atoms = [atom for atom in ordered if str(atom.get("text") or "").strip() == page_marker]
+        footer_atoms = [
+            atom for atom in ordered if str(atom.get("text") or "").strip().startswith(_CIB_NATIVE_FOOTER_PREFIX)
+        ]
+        if len(marker_atoms) != 1 or len(footer_atoms) != 1:
+            return None
+        footer_y = _y_center(footer_atoms[0])
+        if footer_y <= header_y or _y_center(marker_atoms[0]) <= footer_y:
+            return None
+
+        transaction_header, posting_header, summary_header, party_header, _counter_header = headers
+        body = [atom for atom in ordered if header_y + 2.0 < _y_center(atom) < footer_y - 2.0]
+        transaction_dates = [
+            atom
+            for atom in body
+            if _NATIVE_DATETIME_RE.fullmatch(str(atom.get("text") or "").strip())
+            and float(transaction_header["bbox"][0]) - 2.0
+            <= _x_center(atom)
+            <= float(transaction_header["bbox"][2]) + 10.0
+        ]
+        posting_dates = [
+            atom
+            for atom in body
+            if _NATIVE_DATETIME_RE.fullmatch(str(atom.get("text") or "").strip())
+            and float(posting_header["bbox"][0]) - 2.0 <= _x_center(atom) <= float(posting_header["bbox"][2]) + 10.0
+        ]
+        money_atoms = [
+            atom
+            for atom in body
+            if _MONEY_RE.fullmatch(str(atom.get("text") or "").strip())
+            and float(summary_header["bbox"][2]) < _x_center(atom) < float(party_header["bbox"][0])
+        ]
+        if not transaction_dates or not (
+            len(transaction_dates) == len(posting_dates) and len(money_atoms) == 2 * len(transaction_dates)
+        ):
+            return None
+        ordered_row_centers = sorted(_y_center(atom) for atom in transaction_dates)
+        if (
+            not 15.0 <= ordered_row_centers[0] - header_y <= 55.0
+            or not 15.0 <= footer_y - ordered_row_centers[-1] <= 55.0
+            or any(
+                not 20.0 <= right - left <= 55.0 for left, right in zip(ordered_row_centers, ordered_row_centers[1:])
+            )
+        ):
+            return None
+
+        unused_postings = set(range(len(posting_dates)))
+        unused_money = set(range(len(money_atoms)))
+        for date_atom in sorted(transaction_dates, key=lambda atom: (_y_center(atom), _x_center(atom))):
+            raw_date = str(date_atom.get("text") or "").strip()
+            try:
+                calendar_date.fromisoformat(raw_date)
+            except ValueError:
+                return None
+            row_y = _y_center(date_atom)
+            posting_matches = [
+                index for index in unused_postings if abs(_y_center(posting_dates[index]) - row_y) <= 1.5
+            ]
+            row_money = [index for index in unused_money if abs(_y_center(money_atoms[index]) - row_y) <= 1.5]
+            if len(posting_matches) != 1 or len(row_money) != 2:
+                return None
+            posting_index = posting_matches[0]
+            try:
+                calendar_date.fromisoformat(str(posting_dates[posting_index].get("text") or "").strip())
+            except ValueError:
+                return None
+            ordered_money = sorted(row_money, key=lambda index: _x_center(money_atoms[index]))
+            try:
+                amount = Decimal(str(money_atoms[ordered_money[0]].get("text") or "").replace(",", ""))
+                balance = Decimal(str(money_atoms[ordered_money[1]].get("text") or "").replace(",", ""))
+            except InvalidOperation:
+                return None
+            if amount == 0:
+                return None
+            ledger_rows.append((amount, balance))
+            unused_postings.remove(posting_index)
+            unused_money.difference_update(row_money)
+        if unused_postings or unused_money:
+            return None
+
+    if not expected_account or not ledger_rows:
+        return None
+    if any(
+        abs((previous_balance + amount) - balance) > Decimal("0.01")
+        for previous_balance, (amount, balance) in zip((row[1] for row in ledger_rows), ledger_rows[1:])
+    ):
+        return None
+    return len(ledger_rows), expected_account
+
+
+def recover_positioned_record_block_bank_tables(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> PositionedBlockRecovery:
     """Recover rotated or column-major ledgers where one positioned block is one record.
 
     Some native PDFs write each visual ledger row as a vertically arranged text
@@ -124,7 +645,7 @@ def recover_positioned_record_block_bank_tables(parse_result: Any) -> Positioned
     expected_rows = 0
     previous_page_record: dict[str, Any] | None = None
     page_candidates: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]] = []
-    for page_id, atoms in sorted(_positioned_atoms_by_page(parse_result).items()):
+    for page_id, atoms in sorted(_positioned_atoms_by_page(parse_result, source_route=source_route).items()):
         page_records = [record for atom in atoms if (record := _positioned_block_record(page_id, atom)) is not None]
         if len(page_records) < 3:
             aggregate_records = _column_aggregate_block_records(parse_result, page_id, atoms)
@@ -794,11 +1315,18 @@ def _positioned_block_row_source(
     return source
 
 
-def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]]:
+def recover_evidence_atom_bank_tables(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> list[list[list[str]]]:
     """Return one canonical table when issuer headers and column geometry agree."""
-    atoms_by_page = _normalize_page_orientations(parse_result, _atoms_by_page(parse_result))
+    atoms_by_page = _normalize_page_orientations(
+        parse_result,
+        _atoms_by_page(parse_result, source_route=source_route),
+    )
     if not atoms_by_page:
-        _store_recovery_cache(parse_result, [], [], 0)
+        _store_recovery_cache(parse_result, [], [], 0, source_route=source_route)
         return []
     all_atoms = [atom for atoms in atoms_by_page.values() for atom in atoms]
     geometry_fallback, geometry_sources, geometry_expected = _recover_geometry_bank_tables(
@@ -824,20 +1352,38 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
         None,
     )
     if composite_header is None or any(atom is None for atom in headers.values()):
-        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(
+            parse_result,
+            geometry_fallback,
+            geometry_sources,
+            geometry_expected,
+            source_route=source_route,
+        )
         return geometry_fallback
 
     composite_left = float(composite_header["bbox"][0])
     composite_right = float(composite_header["bbox"][2])
     endpoints = _money_column_endpoints(all_atoms, composite_left, composite_right)
     if len(endpoints) != 3:
-        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(
+            parse_result,
+            geometry_fallback,
+            geometry_sources,
+            geometry_expected,
+            source_route=source_route,
+        )
         return geometry_fallback
     expense_end, income_end, balance_end = endpoints
 
     anchors = {name: float(atom["bbox"][0]) for name, atom in headers.items() if atom is not None}
     if [anchors[name] for name in header_names] != sorted(anchors[name] for name in header_names):
-        _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+        _store_geometry_recovery_cache(
+            parse_result,
+            geometry_fallback,
+            geometry_sources,
+            geometry_expected,
+            source_route=source_route,
+        )
         return geometry_fallback
     sequence_right = (anchors["序号"] + anchors["交易日期"]) / 2
     date_x = anchors["交易日期"]
@@ -905,28 +1451,52 @@ def recover_evidence_atom_bank_tables(parse_result: Any) -> list[list[list[str]]
             row_sources.append(_row_source(page_id, row_atoms, row))
     if rows:
         tables = [[_OUTPUT_HEADER, *rows]]
-        _store_recovery_cache(parse_result, tables, row_sources, expected_rows)
+        _store_recovery_cache(
+            parse_result,
+            tables,
+            row_sources,
+            expected_rows,
+            source_route=source_route,
+        )
         return tables
-    _store_geometry_recovery_cache(parse_result, geometry_fallback, geometry_sources, geometry_expected)
+    _store_geometry_recovery_cache(
+        parse_result,
+        geometry_fallback,
+        geometry_sources,
+        geometry_expected,
+        source_route=source_route,
+    )
     return geometry_fallback
 
 
-def recovered_evidence_atom_row_sources(parse_result: Any) -> list[dict[str, Any]]:
+def recovered_evidence_atom_row_sources(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> list[dict[str, Any]]:
     """Return row provenance aligned with recovered evidence-atom table rows."""
-    cache = _recovery_cache(parse_result)
+    cache = _recovery_cache(parse_result, source_route=source_route)
     sources = cache.get("row_sources") if cache else None
     return deepcopy(sources) if isinstance(sources, list) else []
 
 
-def recovered_evidence_atom_expected_row_count(parse_result: Any) -> int:
+def recovered_evidence_atom_expected_row_count(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> int:
     """Return the independent positioned-date candidate count from recovery."""
-    cache = _recovery_cache(parse_result)
+    cache = _recovery_cache(parse_result, source_route=source_route)
     return int(cache.get("expected_row_count") or 0) if cache else 0
 
 
-def recovered_evidence_atom_expected_row_evidence(parse_result: Any) -> tuple[int, str, float]:
+def recovered_evidence_atom_expected_row_evidence(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> tuple[int, str, float]:
     """Return count, source, and confidence for evidence-atom row anchors."""
-    cache = _recovery_cache(parse_result)
+    cache = _recovery_cache(parse_result, source_route=source_route)
     if not cache:
         return 0, "", 0.0
     return (
@@ -945,25 +1515,46 @@ def _recover_geometry_bank_tables(
     row_sources: list[dict[str, Any]] = []
     expected_rows = 0
     previous_balance: float | None = None
+    carried_header: (
+        tuple[list[dict[str, Any]], list[str], dict[str, int], list[float], dict[str, Any] | None] | None
+    ) = None
     for page_id in sorted(atoms_by_page):
         atoms = atoms_by_page[page_id]
         header = _geometry_header(atoms)
-        if header is None:
+        header_is_carried = header is None
+        if header is not None:
+            header_atoms, col_map = header
+            header_cells = [str(atom.get("text") or "").strip() for atom in header_atoms]
+            centers = [_x_center(atom) for atom in header_atoms]
+            auxiliary_header = _geometry_auxiliary_header(atoms, header_atoms)
+            carried_header = (header_atoms, header_cells, col_map, centers, auxiliary_header)
+        elif carried_header is not None:
+            header_atoms, header_cells, col_map, centers, auxiliary_header = carried_header
+        else:
             continue
-        header_atoms, col_map = header
-        header_cells = [str(atom.get("text") or "").strip() for atom in header_atoms]
-        centers = [_x_center(atom) for atom in header_atoms]
         bounds = [float("-inf"), *((left + right) / 2 for left, right in zip(centers, centers[1:])), float("inf")]
+        geometry_atoms = _expand_geometry_data_atoms(atoms, bounds, centers, col_map)
         horizontal_rules = _page_horizontal_rules(
             parse_result,
             page_id,
             atoms,
             header_atoms,
         )
-        date_idx = col_map.get("date", col_map.get("timestamp"))
+        date_idx = col_map.get("date", col_map.get("timestamp", col_map.get("posting_date")))
         if date_idx is None:
             continue
-        header_bottom = max(float(atom["bbox"][3]) for atom in header_atoms)
+        if header_is_carried:
+            header_bottom = _carried_geometry_header_bottom(geometry_atoms, bounds, col_map)
+            if header_bottom is None:
+                continue
+        else:
+            header_bottom = max(
+                float(atom["bbox"][3]) for atom in [*header_atoms, *([auxiliary_header] if auxiliary_header else [])]
+            )
+        source_headers = [
+            *header_cells,
+            *([str(auxiliary_header.get("text") or "").strip()] if auxiliary_header else []),
+        ]
         footer_atoms = [
             atom
             for atom in atoms
@@ -991,7 +1582,7 @@ def _recover_geometry_bank_tables(
             default=footer_content_bottom,
         )
         row_anchors, anchor_type = _geometry_row_anchors(
-            atoms,
+            geometry_atoms,
             bounds,
             col_map,
             header_bottom=header_bottom,
@@ -1001,9 +1592,15 @@ def _recover_geometry_bank_tables(
         rows: list[list[str]] = []
         row_atom_groups: list[list[dict[str, Any]]] = []
         original_rows: list[list[str]] = []
+        overlay_repairs_by_row: list[list[dict[str, str]]] = []
+        boundary_atoms_owned_by_previous: set[int] = set()
         for idx, anchor in enumerate(row_anchors):
-            anchor_y = _y_center(anchor)
-            next_y = _y_center(row_anchors[idx + 1]) if idx + 1 < len(row_anchors) else float("inf")
+            anchor_y = _geometry_transaction_anchor_y(anchor, typical_atom_height)
+            next_y = (
+                _geometry_transaction_anchor_y(row_anchors[idx + 1], typical_atom_height)
+                if idx + 1 < len(row_anchors)
+                else float("inf")
+            )
             footer_limit: float | None = None
             if next_y == float("inf"):
                 footer_starts = [
@@ -1014,10 +1611,27 @@ def _recover_geometry_bank_tables(
                 footer_limit = min(footer_starts, default=float("inf"))
             previous_rule = max((rule for rule in horizontal_rules if rule < anchor_y), default=None)
             next_rule = min((rule for rule in horizontal_rules if rule > anchor_y), default=None)
-            if previous_rule is not None and next_rule is not None:
+            anchors_between_rules = (
+                sum(
+                    previous_rule < _geometry_transaction_anchor_y(candidate, typical_atom_height) < next_rule
+                    for candidate in row_anchors
+                )
+                if previous_rule is not None and next_rule is not None
+                else 0
+            )
+            anchor_is_bracketed = (
+                previous_rule is not None
+                and next_rule is not None
+                and float(anchor["bbox"][1]) > previous_rule
+                and float(anchor["bbox"][3]) < next_rule
+            )
+            uses_row_rules = anchor_is_bracketed and anchors_between_rules == 1
+            if uses_row_rules:
                 # Native ledger rules are the strongest boundary evidence:
                 # wrapped cells may begin above the date baseline or end well
-                # below it, but cannot cross a full-width separator.
+                # below it, but cannot cross a full-width separator.  A page
+                # frame enclosing several anchors is not a row separator and
+                # must fall back to the date-anchor Voronoi boundaries below.
                 row_top = previous_rule + 0.5
                 row_bottom = next_rule - 0.5
             else:
@@ -1025,28 +1639,82 @@ def _recover_geometry_bank_tables(
                 # anchors. Wrapped cells can start above their own date
                 # baseline, so assigning everything to the preceding date
                 # leaks the next transaction into the previous row.
-                previous_y = _y_center(row_anchors[idx - 1]) if idx > 0 else None
-                row_top = header_bottom if previous_y is None else (previous_y + anchor_y) / 2
+                previous_y = (
+                    _geometry_transaction_anchor_y(row_anchors[idx - 1], typical_atom_height) if idx > 0 else None
+                )
+                # A documented second-tier column is printed below its core
+                # transaction baseline and therefore needs a small downward
+                # bias.  Ordinary wrapped cells use the true nearest-anchor
+                # midpoint; applying the auxiliary bias globally would pull
+                # leading text from the next transaction into the prior row.
+                voronoi_bias = max(typical_atom_height * 0.20, 1.0) if auxiliary_header else 0.0
+                row_top = header_bottom if previous_y is None else (previous_y + anchor_y) / 2 + voronoi_bias
                 if next_y != float("inf"):
-                    row_bottom = (anchor_y + next_y) / 2
+                    row_bottom = (anchor_y + next_y) / 2 + voronoi_bias
                 else:
                     row_bottom = footer_limit if footer_limit is not None else float("inf")
             if footer_limit is not None:
                 row_bottom = min(row_bottom, footer_limit)
+            semantic_voronoi_boundary = (
+                not uses_row_rules
+                and auxiliary_header is None
+                and idx + 1 < len(row_anchors)
+            )
+            previous_owned_boundary_atoms = {
+                id(atom)
+                for atom in geometry_atoms
+                if semantic_voronoi_boundary
+                and _geometry_transaction_anchor_y(atom, typical_atom_height) == row_bottom
+                and _boundary_account_fragment_owner(
+                    atom,
+                    geometry_atoms,
+                    boundary_y=row_bottom,
+                    previous_anchor_y=anchor_y,
+                    next_anchor_y=next_y,
+                    bounds=bounds,
+                    col_map=col_map,
+                    typical_atom_height=typical_atom_height,
+                )
+                == "previous"
+            }
+            boundary_atoms_owned_by_previous.update(previous_owned_boundary_atoms)
             row_atoms = [
                 atom
-                for atom in atoms
-                if row_top < _y_center(atom) < row_bottom and float(atom["bbox"][1]) > header_bottom
+                for atom in geometry_atoms
+                if (
+                    (
+                        row_top < _geometry_transaction_anchor_y(atom, typical_atom_height) < row_bottom
+                    )
+                    or (
+                        _geometry_transaction_anchor_y(atom, typical_atom_height) == row_top
+                        and id(atom) not in boundary_atoms_owned_by_previous
+                    )
+                    or (
+                        id(atom) in previous_owned_boundary_atoms
+                        and _geometry_transaction_anchor_y(atom, typical_atom_height) == row_bottom
+                    )
+                )
+                and _geometry_transaction_anchor_y(atom, typical_atom_height) > header_bottom
             ]
+            auxiliary_atoms = _geometry_auxiliary_row_atoms(
+                row_atoms,
+                anchor_y=anchor_y,
+                auxiliary_header=auxiliary_header,
+                typical_atom_height=typical_atom_height,
+            )
+            auxiliary_atom_ids = {id(atom) for atom in auxiliary_atoms}
+            core_row_atoms = [atom for atom in row_atoms if id(atom) not in auxiliary_atom_ids]
             row: list[str] = []
             for col_idx in range(len(header_cells)):
-                selected = [atom for atom in row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]]
+                selected = [atom for atom in core_row_atoms if bounds[col_idx] <= _x_center(atom) < bounds[col_idx + 1]]
                 row.append(
                     _join_geometry_atoms(
                         selected,
                         line_tolerance=1.5,
                     )
                 )
+            if auxiliary_header is not None:
+                row.append(_join_geometry_atoms(auxiliary_atoms, line_tolerance=1.5))
             date_match = _DATE_ANY_RE.search(row[date_idx])
             if date_match:
                 sequence_idx = col_map.get("sequence_no")
@@ -1054,20 +1722,33 @@ def _recover_geometry_bank_tables(
                 if sequence_idx is not None and sequence_idx < len(row) and not row[sequence_idx] and prefix.isdigit():
                     row[sequence_idx] = prefix
                 row[date_idx] = row[date_idx][date_match.start() :]
+            overlay_repairs = _strip_geometry_page_header_overlay(row, col_map)
             original_row = list(row)
             _repair_geometry_cell_spill(row, col_map)
             if _geometry_row_is_transaction(row):
                 rows.append(row)
                 row_atom_groups.append(row_atoms)
                 original_rows.append(original_row)
+                overlay_repairs_by_row.append(overlay_repairs)
         if rows:
             previous_balance = _repair_geometry_rows(rows, col_map, previous_balance=previous_balance)
-            for row_atoms, original_row, row in zip(row_atom_groups, original_rows, rows):
-                source = _row_source(page_id, row_atoms, row)
+            for row_atoms, original_row, row, overlay_repairs in zip(
+                row_atom_groups,
+                original_rows,
+                rows,
+                overlay_repairs_by_row,
+            ):
+                source = _row_source(
+                    page_id,
+                    row_atoms,
+                    row,
+                    source_headers=source_headers,
+                    source_values=original_row,
+                )
                 source["row_anchor_type"] = anchor_type
                 repairs = [
                     {
-                        "field": header_cells[index],
+                        "field": source_headers[index],
                         "ocr_raw": original,
                         "reconstructed": repaired,
                     }
@@ -1076,9 +1757,348 @@ def _recover_geometry_bank_tables(
                 ]
                 if repairs:
                     source["reconstruction_repairs"] = repairs
+                if overlay_repairs:
+                    source["source_overlay_repairs"] = overlay_repairs
                 row_sources.append(source)
-            tables.append([header_cells, *rows])
+            tables.append([source_headers, *rows])
     return tables, row_sources, expected_rows
+
+
+def _carried_geometry_header_bottom(
+    atoms: list[dict[str, Any]],
+    bounds: list[float],
+    col_map: dict[str, int],
+) -> float | None:
+    """Return a safe top boundary when a prior-page ledger schema continues.
+
+    A carried schema is only admitted when the new page independently exposes
+    a transaction-shaped baseline in the same date, amount, and balance
+    columns.  This lets issuer layouts omit repeated headers without turning a
+    date and money mentioned in prose into a ledger row.
+    """
+    date_idx = col_map.get("date", col_map.get("timestamp", col_map.get("posting_date")))
+    amount_idx = col_map.get("amount")
+    balance_idx = col_map.get("balance")
+    if date_idx is None or amount_idx is None or balance_idx is None:
+        return None
+
+    candidates = sorted(
+        (
+            atom
+            for atom in atoms
+            if bounds[date_idx] <= _x_center(atom) < bounds[date_idx + 1]
+            and not _is_geometry_footer_text(str(atom.get("text") or ""))
+            and _DATE_ANY_RE.search(str(atom.get("text") or "").strip())
+        ),
+        key=_y_center,
+    )
+    typical_height = median(
+        [
+            float(atom["bbox"][3]) - float(atom["bbox"][1])
+            for atom in atoms
+            if float(atom["bbox"][3]) > float(atom["bbox"][1])
+        ]
+        or [8.0]
+    )
+    baseline_tolerance = max(typical_height * 0.65, 3.0)
+    for anchor in candidates:
+        anchor_y = _y_center(anchor)
+        baseline_atoms = [atom for atom in atoms if abs(_y_center(atom) - anchor_y) <= baseline_tolerance]
+        row = [
+            _join_geometry_atoms(
+                [atom for atom in baseline_atoms if bounds[index] <= _x_center(atom) < bounds[index + 1]],
+                line_tolerance=1.5,
+            )
+            for index in range(len(bounds) - 1)
+        ]
+        amount = row[amount_idx] if amount_idx < len(row) else ""
+        balance = row[balance_idx] if balance_idx < len(row) else ""
+        if not (_MONEY_ANY_RE.search(amount) and _MONEY_ANY_RE.search(balance)):
+            continue
+        candidate_row = list(row)
+        _repair_geometry_cell_spill(candidate_row, col_map)
+        if not _geometry_row_is_transaction(candidate_row):
+            continue
+
+        # Keep nearby wrapped text above the first date baseline, while
+        # excluding distant page furniture such as ``Page 2 of 72``.
+        row_cluster_top = float(anchor["bbox"][1])
+        preceding_groups = [
+            group
+            for group in _baseline_groups(atoms)
+            if max(float(item["bbox"][3]) for item in group) <= float(anchor["bbox"][1])
+        ]
+        for group in reversed(preceding_groups):
+            group_bottom = max(float(item["bbox"][3]) for item in group)
+            if row_cluster_top - group_bottom > max(typical_height * 1.8, 12.0):
+                break
+            if any(
+                bounds[date_idx] <= _x_center(item) < bounds[date_idx + 1]
+                and _DATE_ANY_RE.search(str(item.get("text") or ""))
+                for item in group
+            ):
+                break
+            if any(_is_geometry_footer_text(str(item.get("text") or "")) for item in group):
+                break
+            row_cluster_top = min(float(item["bbox"][1]) for item in group)
+        return row_cluster_top - 0.5
+    return None
+
+
+def _geometry_auxiliary_header(
+    atoms: list[dict[str, Any]],
+    header_atoms: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return a bounded second-tier business column below a main ledger header."""
+    markers = {
+        "对方账号户名/附言",
+        "对方账户户名/附言",
+        "对方账号与户名/附言",
+    }
+    header_top = min(float(atom["bbox"][1]) for atom in header_atoms)
+    header_bottom = max(float(atom["bbox"][3]) for atom in header_atoms)
+    typical_height = median([float(atom["bbox"][3]) - float(atom["bbox"][1]) for atom in header_atoms] or [8.0])
+    candidates = [
+        atom
+        for atom in atoms
+        if re.sub(r"\s+", "", str(atom.get("text") or "")) in markers
+        and header_top <= float(atom["bbox"][1]) <= header_bottom + max(typical_height * 2.5, 16.0)
+    ]
+    return min(candidates, key=lambda atom: float(atom["bbox"][1]), default=None)
+
+
+def _geometry_auxiliary_row_atoms(
+    row_atoms: list[dict[str, Any]],
+    *,
+    anchor_y: float,
+    auxiliary_header: dict[str, Any] | None,
+    typical_atom_height: float,
+) -> list[dict[str, Any]]:
+    """Return the same-row value band belonging to a second-tier header."""
+    if auxiliary_header is None:
+        return []
+    x0, _, x1, _ = [float(value) for value in auxiliary_header["bbox"][:4]]
+    groups = [
+        group
+        for group in _baseline_groups(row_atoms)
+        if sum(_y_center(atom) for atom in group) / len(group) > anchor_y + max(typical_atom_height * 0.65, 3.0)
+        and any(float(atom["bbox"][2]) >= x0 - 8.0 and float(atom["bbox"][0]) <= x1 + 8.0 for atom in group)
+    ]
+    if not groups:
+        return []
+    nearest = min(groups, key=lambda group: sum(_y_center(atom) for atom in group) / len(group))
+    return [atom for atom in nearest if float(atom["bbox"][2]) >= x0 - 8.0 and float(atom["bbox"][0]) <= x1 + 120.0]
+
+
+def _expand_geometry_data_atoms(
+    atoms: list[dict[str, Any]],
+    bounds: list[float],
+    centers: list[float],
+    col_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Split source-fragmented ledger values using the proven header geometry.
+
+    Native PDF text can split one date vertically (``2023-03-`` + ``01``)
+    or glue adjacent date/money cells into one horizontal atom.  The source
+    header already proves the semantic columns, so virtual fragments may be
+    placed at those column centers while retaining the original atom bbox and
+    evidence ids.  No values are inferred or copied between rows.
+    """
+    coalesced = _coalesce_fragmented_geometry_dates(atoms, bounds, col_map)
+    expanded: list[dict[str, Any]] = []
+    for atom in coalesced:
+        fragments = _split_glued_geometry_data_atom(atom, bounds, centers, col_map)
+        expanded.extend(fragments or [atom])
+    return expanded
+
+
+def _coalesce_fragmented_geometry_dates(
+    atoms: list[dict[str, Any]],
+    bounds: list[float],
+    col_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    date_indexes = {index for key in ("date", "timestamp", "posting_date") if (index := col_map.get(key)) is not None}
+    if not date_indexes:
+        return list(atoms)
+
+    typical_height = median([float(atom["bbox"][3]) - float(atom["bbox"][1]) for atom in atoms] or [8.0])
+    ordered = sorted(enumerate(atoms), key=lambda item: (_y_center(item[1]), float(item[1]["bbox"][0])))
+    used: set[int] = set()
+    merged_by_index: dict[int, dict[str, Any]] = {}
+    for ordered_pos, (first_index, first) in enumerate(ordered):
+        if first_index in used:
+            continue
+        first_text = re.sub(r"\s+", "", str(first.get("text") or ""))
+        if not re.match(r"^(?:19|20)\d{2}", first_text) or _DATE_ANY_RE.fullmatch(first_text):
+            continue
+        first_col = next(
+            (index for index in date_indexes if bounds[index] <= _x_center(first) < bounds[index + 1]),
+            None,
+        )
+        if first_col is None:
+            continue
+        first_x0 = float(first["bbox"][0])
+        first_bottom = float(first["bbox"][3])
+        for second_index, second in ordered[ordered_pos + 1 :]:
+            if second_index in used:
+                continue
+            second_top = float(second["bbox"][1])
+            gap = second_top - first_bottom
+            if gap > max(typical_height * 0.8, 6.0):
+                break
+            if gap < -1.0 or abs(float(second["bbox"][0]) - first_x0) > 4.0:
+                continue
+            if not (bounds[first_col] <= _x_center(second) < bounds[first_col + 1]):
+                continue
+            second_text = re.sub(r"\s+", "", str(second.get("text") or ""))
+            if not re.fullmatch(r"[\d./年月日-]{1,8}", second_text):
+                continue
+            combined = f"{first_text}{second_text}"
+            if _DATE_ANY_RE.fullmatch(combined) is None or not _normalize_block_date(combined):
+                continue
+            virtual = dict(first)
+            virtual["text"] = combined
+            virtual["bbox"] = _union_bbox([first["bbox"], second["bbox"]])
+            virtual["_source_bbox"] = _union_bbox(
+                [
+                    first.get("_source_bbox") or first["bbox"],
+                    second.get("_source_bbox") or second["bbox"],
+                ]
+            )
+            virtual["evidence_ids"] = list(
+                dict.fromkeys(
+                    str(value)
+                    for source in (first, second)
+                    for value in [source.get("id"), *(source.get("evidence_ids") or [])]
+                    if str(value or "")
+                )
+            )
+            # This bbox is the union of two source-visible date fragments, not
+            # one unusually tall native glyph.  Mark it explicitly so row
+            # anchoring can use the union midpoint without changing the
+            # lower-baseline behavior required by genuine tall PDF atoms.
+            virtual["_coalesced_fragmented_date_anchor"] = True
+            merged_by_index[first_index] = virtual
+            used.update({first_index, second_index})
+            break
+
+    return [
+        merged_by_index[index] if index in merged_by_index else atom
+        for index, atom in enumerate(atoms)
+        if index not in used or index in merged_by_index
+    ]
+
+
+def _split_glued_geometry_data_atom(
+    atom: dict[str, Any],
+    bounds: list[float],
+    centers: list[float],
+    col_map: dict[str, int],
+) -> list[dict[str, Any]]:
+    text = re.sub(r"\s+", "", str(atom.get("text") or ""))
+    if not text:
+        return []
+
+    date_idx = col_map.get("date", col_map.get("timestamp"))
+    posting_idx = col_map.get("posting_date")
+    summary_idx = next(
+        (index for key in ("summary", "purpose") if (index := col_map.get(key)) is not None),
+        None,
+    )
+    date_matches = list(_DATE_ANY_RE.finditer(text))
+    if (
+        date_idx is not None
+        and posting_idx is not None
+        and summary_idx is not None
+        and len(date_matches) >= 2
+        and date_matches[0].start() == 0
+        and date_matches[1].start() == date_matches[0].end()
+    ):
+        residue = text[date_matches[1].end() :]
+        if residue:
+            return [
+                _virtual_geometry_data_atom(atom, date_matches[0].group(0), centers[date_idx]),
+                _virtual_geometry_data_atom(atom, date_matches[1].group(0), centers[posting_idx]),
+                _virtual_geometry_data_atom(atom, residue, centers[summary_idx]),
+            ]
+
+    direction_idx = col_map.get("direction")
+    if summary_idx is not None and direction_idx is not None and summary_idx < direction_idx:
+        x0, _, x1, _ = [float(value) for value in atom["bbox"][:4]]
+        marker = text[-1:] if text[-1:] in {"收", "支", "借", "贷"} else ""
+        summary_text = text[:-1]
+        summary_owns_left = bounds[summary_idx] <= x0 < bounds[summary_idx + 1]
+        crosses_direction = float(atom["bbox"][2]) >= bounds[direction_idx]
+        if marker and summary_text and summary_owns_left and crosses_direction:
+            # A native word can straddle the proven summary/direction boundary
+            # (for example ``快捷支付支``). Keep the exact compound in source
+            # provenance, but expose its two source-visible business roles in
+            # the canonical row rather than polluting the summary or losing
+            # the dedicated direction.
+            return [
+                _virtual_geometry_data_atom(atom, summary_text, centers[summary_idx]),
+                _virtual_geometry_data_atom(atom, marker, centers[direction_idx]),
+            ]
+
+    amount_idx = col_map.get("amount")
+    balance_idx = col_map.get("balance")
+    location_idx = next(
+        (index for key in ("transaction_location", "institution") if (index := col_map.get(key)) is not None),
+        None,
+    )
+    if amount_idx is None or balance_idx is None:
+        return []
+    money_matches = list(_MONEY_ANY_RE.finditer(text))
+    if not money_matches or money_matches[0].start() != 0:
+        return []
+    x0, _, x1, _ = [float(value) for value in atom["bbox"][:4]]
+    if (
+        len(money_matches) >= 2
+        and money_matches[1].start() == money_matches[0].end()
+        and balance_idx == amount_idx + 1
+        and x0 <= centers[amount_idx] + 12.0
+        and x1 >= centers[balance_idx] - 12.0
+    ):
+        residue = text[money_matches[1].end() :]
+        if residue and location_idx != balance_idx + 1:
+            return []
+        fragments = [
+            _virtual_geometry_data_atom(atom, money_matches[0].group(0), centers[amount_idx]),
+            _virtual_geometry_data_atom(atom, money_matches[1].group(0), centers[balance_idx]),
+        ]
+        if residue:
+            fragments.append(_virtual_geometry_data_atom(atom, residue, centers[location_idx]))
+        return fragments
+    residue = text[money_matches[0].end() :]
+    balance_owns_left = bounds[balance_idx] - 12.0 <= x0 < bounds[balance_idx + 1]
+    if (
+        residue
+        and location_idx is not None
+        and location_idx == balance_idx + 1
+        and balance_owns_left
+        and x1 >= centers[location_idx] - 12.0
+    ):
+        return [
+            _virtual_geometry_data_atom(atom, money_matches[0].group(0), centers[balance_idx]),
+            _virtual_geometry_data_atom(atom, residue, centers[location_idx]),
+        ]
+    return []
+
+
+def _virtual_geometry_data_atom(
+    atom: dict[str, Any],
+    text: str,
+    center: float,
+) -> dict[str, Any]:
+    virtual = dict(atom)
+    virtual["text"] = text
+    _, y0, _, y1 = [float(value) for value in atom["bbox"][:4]]
+    virtual["bbox"] = [center - 0.5, y0, center + 0.5, y1]
+    virtual["_source_bbox"] = list(atom.get("_source_bbox") or atom["bbox"])
+    virtual["evidence_ids"] = list(
+        dict.fromkeys(str(value) for value in [atom.get("id"), *(atom.get("evidence_ids") or [])] if str(value or ""))
+    )
+    return virtual
 
 
 def _geometry_row_anchors(
@@ -1096,7 +2116,7 @@ def _geometry_row_anchors(
             (
                 atom
                 for atom in atoms
-                if float(atom["bbox"][1]) > header_bottom
+                if _y_center(atom) > header_bottom
                 and _y_center(atom) < table_bottom
                 and bounds[sequence_idx] <= _x_center(atom) < bounds[sequence_idx + 1]
                 and re.fullmatch(r"\d{1,6}", re.sub(r"\s+", "", str(atom.get("text") or "")))
@@ -1106,7 +2126,7 @@ def _geometry_row_anchors(
         if _sequence_anchors_are_reliable(sequence_anchors):
             return sequence_anchors, "sequence"
 
-    date_idx = col_map.get("date", col_map.get("timestamp"))
+    date_idx = col_map.get("date", col_map.get("timestamp", col_map.get("posting_date")))
     if date_idx is None:
         return [], ""
     return (
@@ -1114,7 +2134,7 @@ def _geometry_row_anchors(
             (
                 atom
                 for atom in atoms
-                if float(atom["bbox"][1]) > header_bottom
+                if _y_center(atom) > header_bottom
                 and _y_center(atom) < table_bottom
                 and bounds[date_idx] <= _x_center(atom) < bounds[date_idx + 1]
                 and not _is_geometry_footer_text(str(atom.get("text") or ""))
@@ -1139,7 +2159,7 @@ def _sequence_anchors_are_reliable(anchors: list[dict[str, Any]]) -> bool:
 
 def _repair_geometry_cell_spill(row: list[str], col_map: dict[str, int]) -> None:
     """Separate OCR atoms that combine balance, summary, or a malformed date."""
-    date_idx = col_map.get("date", col_map.get("timestamp"))
+    date_idx = col_map.get("date", col_map.get("timestamp", col_map.get("posting_date")))
     if date_idx is not None and date_idx < len(row):
         row[date_idx] = _repair_malformed_date(row[date_idx])
 
@@ -1150,6 +2170,19 @@ def _repair_geometry_cell_spill(row: list[str], col_map: dict[str, int]) -> None
     )
     if balance_idx is None or summary_idx is None or max(balance_idx, summary_idx) >= len(row):
         return
+
+    amount_idx = col_map.get("amount")
+    if amount_idx is not None and amount_idx < len(row) and amount_idx == summary_idx + 1:
+        summary_prefix, signed_money = _signed_money_summary_prefix(row[amount_idx])
+        if summary_prefix and signed_money:
+            # A short narrative atom can begin just over the summary/amount
+            # Voronoi boundary and therefore join the following signed-money
+            # atom (for example ``Apple`` + ``-19.00``).  Under an already
+            # proven adjacent summary/amount schema, move only a bounded
+            # alphabetic prefix back to the summary.  The pre-repair source
+            # cell and evidence ids remain in ``source_raw``/repair provenance.
+            row[summary_idx] = _merge_geometry_text(row[summary_idx], summary_prefix)
+            row[amount_idx] = signed_money
 
     balance_money, balance_residue = _money_and_residue(row[balance_idx])
     summary_money, summary_residue = _money_and_residue(row[summary_idx])
@@ -1165,6 +2198,142 @@ def _repair_geometry_cell_spill(row: list[str], col_map: dict[str, int]) -> None
         row[summary_idx] = _clean_geometry_residue(summary_residue, summary_money)
     _repair_geometry_summary_prefix(row, col_map, balance_idx, summary_idx)
     row[summary_idx] = _repair_common_bank_summary_ocr(row[summary_idx])
+
+
+def _signed_money_summary_prefix(value: str) -> tuple[str, str]:
+    """Split a bounded narrative prefix from one terminal explicitly signed amount."""
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+    match = re.fullmatch(
+        r"(?P<prefix>[A-Za-z\u3400-\u9fff][A-Za-z\u3400-\u9fff._:/()（）-]{0,63})"
+        r"(?P<money>[+-]\d[\d,]*\.\d{2})",
+        compact,
+    )
+    if match is None:
+        return "", ""
+    prefix = match.group("prefix")
+    if prefix.upper() in {"CNY", "RMB", "USD", "HKD", "EUR", "JPY"} or prefix in {"人民币", "美元"}:
+        return "", ""
+    return prefix, match.group("money")
+
+
+def _strip_geometry_page_header_overlay(
+    row: list[str],
+    col_map: dict[str, int],
+) -> list[dict[str, str]]:
+    """Remove page-header furniture fused into a source-backed first row.
+
+    Some native PDF writers expose a tall word/block spanning the page header
+    and the first ledger row. Once an ordered ledger header has proven the
+    column roles, a repeated field label within that cell is a safe boundary:
+    only the value after the last label belongs to the transaction. Numeric
+    date/amount/balance roles are additionally bounded by their final typed
+    token. The source bbox/evidence ids remain attached to the reconstructed
+    row, and the discarded compound is retained in repair provenance.
+    """
+
+    repairs: list[dict[str, str]] = []
+    handled_indexes: set[int] = set()
+    for role, labels in _GEOMETRY_OVERLAY_LABELS_BY_ROLE.items():
+        index = col_map.get(role)
+        if index is None or index >= len(row) or index in handled_indexes:
+            continue
+        original = str(row[index] or "")
+        cleaned = _geometry_overlay_business_value(original, role=role, labels=labels)
+        if cleaned == original or not cleaned:
+            continue
+        row[index] = cleaned
+        handled_indexes.add(index)
+        repairs.append({"field": role, "source_compound": original, "reconstructed": cleaned})
+    return repairs
+
+
+def _geometry_overlay_business_value(
+    value: str,
+    *,
+    role: str,
+    labels: tuple[str, ...],
+) -> str:
+    original = str(value or "")
+    compact, source_ends = _compact_nfkc_with_source_ends(original)
+    if not compact:
+        return original
+
+    normalized_labels = tuple(
+        sorted(
+            {re.sub(r"\s+", "", unicodedata.normalize("NFKC", label)) for label in labels},
+            key=len,
+            reverse=True,
+        )
+    )
+    marker_matches = [
+        (position, label)
+        for label in normalized_labels
+        if (position := compact.rfind(label)) >= 0
+    ]
+    marker_end = max((position + len(label) for position, label in marker_matches), default=-1)
+
+    if role in {"date", "timestamp", "posting_date"}:
+        matches = list(_DATE_ANY_RE.finditer(compact))
+        if not matches or (len(matches) == 1 and marker_end < 0):
+            return original
+        match = matches[-1]
+        end = match.end()
+        time_match = re.match(r"(?:[T ])?(\d{1,2}:\d{2}(?::\d{2})?)", compact[end:])
+        if time_match:
+            end += time_match.end()
+        return _source_compact_slice(original, source_ends, match.start(), end)
+
+    if role in {"amount", "balance"}:
+        matches = list(_MONEY_ANY_RE.finditer(compact))
+        if not matches:
+            return original
+        match = matches[-1]
+        prefix_is_overlay = match.start() > 0 and (
+            marker_end >= 0
+            or bool(_DATE_ANY_RE.search(compact[: match.start()]))
+            or any(marker in compact[: match.start()] for marker in ("账单", "流水", "账户"))
+        )
+        if not prefix_is_overlay:
+            return original
+        return _source_compact_slice(original, source_ends, match.start(), match.end())
+
+    if role == "direction":
+        direction_match = re.search(r"(?:收入|支出|借|贷|收|支)$", compact)
+        if direction_match is None:
+            return original
+        prefix = compact[: direction_match.start()]
+        if marker_end < 0 and not re.search(r"\d{1,2}:\d{2}(?::\d{2})?", prefix):
+            return original
+        return _source_compact_slice(original, source_ends, direction_match.start(), direction_match.end())
+
+    if marker_end < 0 or marker_end >= len(compact):
+        return original
+    return _source_compact_slice(original, source_ends, marker_end, len(compact)).lstrip(":：")
+
+
+def _compact_nfkc_with_source_ends(value: str) -> tuple[str, list[int]]:
+    chars: list[str] = []
+    source_ends: list[int] = []
+    for source_index, char in enumerate(str(value or "")):
+        for normalized_char in unicodedata.normalize("NFKC", char):
+            if normalized_char.isspace():
+                continue
+            chars.append(normalized_char)
+            source_ends.append(source_index + 1)
+    return "".join(chars), source_ends
+
+
+def _source_compact_slice(
+    original: str,
+    source_ends: list[int],
+    compact_start: int,
+    compact_end: int,
+) -> str:
+    if compact_start < 0 or compact_end <= compact_start or compact_end > len(source_ends):
+        return str(original or "")
+    source_start = 0 if compact_start == 0 else source_ends[compact_start - 1]
+    source_end = source_ends[compact_end - 1]
+    return str(original or "")[source_start:source_end].strip()
 
 
 def _repair_common_bank_summary_ocr(value: str) -> str:
@@ -1376,7 +2545,18 @@ def _expand_composite_header_atoms(atoms: list[dict[str, Any]]) -> list[dict[str
         "序号交易日期交易类型": ("序号", "交易日期", "交易类型"),
         "收入/支出交易金额": ("收入/支出", "交易金额"),
         "收入支出交易金额": ("收入/支出", "交易金额"),
+        "支/收交易金额": ("支/收", "交易金额"),
+        "支收交易金额": ("支/收", "交易金额"),
+        "交易金额账户余额": ("交易金额", "账户余额"),
+        "账户余额交易地点": ("账户余额", "交易地点"),
+        "交易金额账户余额交易地点": ("交易金额", "账户余额", "交易地点"),
+        "对方户名对方账户/对方银行": ("对方户名", "对方账户/对方银行"),
+        "对方户名对方账号/对方银行": ("对方户名", "对方账号/对方银行"),
+        "对方名称对方账户/对方银行": ("对方名称", "对方账户/对方银行"),
+        "对方名称对方账号/对方银行": ("对方名称", "对方账号/对方银行"),
         "交易类型收入/支出交易金额": ("交易类型", "收入/支出", "交易金额"),
+        "支/收交易金额账户余额交易地点": ("支/收", "交易金额", "账户余额", "交易地点"),
+        "支收交易金额账户余额交易地点": ("支/收", "交易金额", "账户余额", "交易地点"),
         "序号交易日期交易类型收入/支出交易金额": (
             "序号",
             "交易日期",
@@ -1387,7 +2567,11 @@ def _expand_composite_header_atoms(atoms: list[dict[str, Any]]) -> list[dict[str
     }
     expanded: list[dict[str, Any]] = []
     for atom in atoms:
-        normalized_text = re.sub(r"\s+", "", str(atom.get("text") or ""))
+        normalized_text = re.sub(
+            r"\s+",
+            "",
+            unicodedata.normalize("NFKC", str(atom.get("text") or "")),
+        )
         parts = patterns.get(normalized_text)
         if not parts:
             expanded.append(atom)
@@ -1439,6 +2623,19 @@ def _split_stacked_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _stacked_text_parts(text: str) -> list[str]:
     date_matches = list(_DATE_ANY_RE.finditer(text))
     if len(date_matches) >= 2:
+        # Some native PDFs emit one *horizontal* business row as a tall
+        # bounding box containing ``transaction date + posting date +
+        # summary``.  Splitting that box vertically destroys the proven
+        # column position: both date fragments retain the source-wide x
+        # span and can no longer act as the transaction spine.  Leave this
+        # source-backed compound intact so the header-aware geometry pass
+        # can place its three fragments at their semantic column centers.
+        if (
+            date_matches[0].start() == 0
+            and date_matches[1].start() == date_matches[0].end()
+            and text[date_matches[1].end() :].strip()
+        ):
+            return []
         return [
             text[match.start() : date_matches[index + 1].start() if index + 1 < len(date_matches) else len(text)]
             for index, match in enumerate(date_matches)
@@ -1478,7 +2675,14 @@ def _orientation_score(atoms: list[dict[str, Any]]) -> float:
     )
 
 
-def _row_source(page_id: str, atoms: list[dict[str, Any]], row: list[str]) -> dict[str, Any]:
+def _row_source(
+    page_id: str,
+    atoms: list[dict[str, Any]],
+    row: list[str],
+    *,
+    source_headers: list[str] | None = None,
+    source_values: list[str] | None = None,
+) -> dict[str, Any]:
     source_boxes = [
         atom.get("_source_bbox") or atom.get("bbox")
         for atom in atoms
@@ -1497,7 +2701,7 @@ def _row_source(page_id: str, atoms: list[dict[str, Any]], row: list[str]) -> di
         source_page = int(page_id.rsplit(":", 1)[-1])
     except ValueError:
         source_page = 0
-    return {
+    source = {
         "source": "canonical_evidence_table",
         "page_id": page_id,
         **({"source_page": source_page} if source_page > 0 else {}),
@@ -1505,6 +2709,20 @@ def _row_source(page_id: str, atoms: list[dict[str, Any]], row: list[str]) -> di
         **({"evidence_ids": evidence_ids} if evidence_ids else {}),
         "row_values": list(row),
     }
+    raw_values = source_values if source_values is not None else row
+    if (
+        source_headers
+        and len(source_headers) == len(raw_values)
+        and all(str(header or "").strip() for header in source_headers)
+        and len(set(source_headers)) == len(source_headers)
+    ):
+        # Preserve the physical source roles separately from parser keys.  A
+        # bare ICBC ``账号`` is an own-account field and must never be relabelled
+        # as ``对方账号`` in the lossless raw layer.
+        source["source_raw"] = {
+            str(header).strip(): str(value or "").strip() for header, value in zip(source_headers, raw_values)
+        }
+    return source
 
 
 def _union_bbox(boxes: list[list[float]]) -> list[float]:
@@ -1533,11 +2751,12 @@ def _store_recovery_cache(
     *,
     expected_row_source: str = "positioned_date_anchors",
     expected_row_confidence: float = 0.80,
+    source_route: str | None = None,
 ) -> None:
     domain = _domain_specific(parse_result)
     if domain is None:
         return
-    domain[_RECOVERY_CACHE_KEY] = {
+    domain[_recovery_cache_key(source_route)] = {
         "status": "ready",
         "table_count": len(tables),
         "row_count": sum(max(len(table) - 1, 0) for table in tables),
@@ -1553,25 +2772,33 @@ def _store_geometry_recovery_cache(
     tables: list[list[list[str]]],
     row_sources: list[dict[str, Any]],
     expected_row_count: int,
+    *,
+    source_route: str | None = None,
 ) -> None:
-    sequence_complete = (
-        bool(expected_row_count)
-        and len(row_sources) == expected_row_count
-        and all(source.get("row_anchor_type") == "sequence" for source in row_sources)
-    )
+    # Sequence-labelled geometry rows prove that this recovery is internally
+    # ordered; they do not prove that the source did not contain a terminal
+    # row that every retained geometry row missed.  Keep this candidate-local
+    # signal at structural confidence and never relabel it as independent
+    # page-transaction evidence.
     _store_recovery_cache(
         parse_result,
         tables,
         row_sources,
         expected_row_count,
-        expected_row_source="page_transaction_anchors" if sequence_complete else "positioned_date_anchors",
-        expected_row_confidence=0.97 if sequence_complete else 0.80,
+        expected_row_source="positioned_date_anchors",
+        expected_row_confidence=0.80,
+        source_route=source_route,
     )
 
 
-def _recovery_cache(parse_result: Any) -> dict[str, Any]:
+def _recovery_cache_key(source_route: str | None) -> str:
+    route = str(source_route or "").strip().lower()
+    return f"{_RECOVERY_CACHE_KEY}:{route}" if route in {"digital", "scanned"} else _RECOVERY_CACHE_KEY
+
+
+def _recovery_cache(parse_result: Any, *, source_route: str | None = None) -> dict[str, Any]:
     domain = _domain_specific(parse_result)
-    cache = domain.get(_RECOVERY_CACHE_KEY) if domain else None
+    cache = domain.get(_recovery_cache_key(source_route)) if domain else None
     return cache if isinstance(cache, dict) and cache.get("status") == "ready" else {}
 
 
@@ -1589,7 +2816,12 @@ def _geometry_header(
     matcher = ColumnMatcher(BANK_COLUMN_REGISTRY)
     best: tuple[list[dict[str, Any]], dict[str, int]] | None = None
     for group in _baseline_groups(atoms):
-        ordered = sorted(group, key=lambda atom: float(atom["bbox"][0]))
+        ordered = sorted(
+            (atom for atom in group if not _is_geometry_transaction_value(str(atom.get("text") or ""))),
+            key=lambda atom: float(atom["bbox"][0]),
+        )
+        if not ordered:
+            continue
         cells = [normalize_header_cell(str(atom.get("text") or "")) for atom in ordered]
         joined = "".join(cells)
         if not any(marker in joined for marker in ("交易日期", "记账日期", "交易时间", "日期")):
@@ -1607,7 +2839,7 @@ def _geometry_header(
         valid = (
             "balance" in fields
             and ("amount" in fields or split_debit_credit)
-            and bool(fields.intersection({"date", "timestamp"}))
+            and bool(fields.intersection({"date", "timestamp", "posting_date"}))
         )
         if valid and (best is None or len(col_map) > len(best[1])):
             expanded = _expand_staggered_header(atoms, ordered)
@@ -1619,7 +2851,7 @@ def _geometry_header(
             expanded_valid = (
                 "balance" in expanded_fields
                 and ("amount" in expanded_fields or expanded_split_debit_credit)
-                and bool(expanded_fields.intersection({"date", "timestamp"}))
+                and bool(expanded_fields.intersection({"date", "timestamp", "posting_date"}))
             )
             best = (
                 (expanded, expanded_map) if expanded_valid and len(expanded_map) >= len(col_map) else (ordered, col_map)
@@ -1633,8 +2865,89 @@ def _expand_staggered_header(
 ) -> list[dict[str, Any]]:
     """Merge lower labels from multi-tier headers without pulling in English rows."""
     baseline = sum(float(atom["bbox"][1]) for atom in header_atoms) / len(header_atoms)
-    band = [atom for atom in atoms if baseline - 4.0 <= float(atom["bbox"][1]) <= baseline + 6.0]
+    band = [
+        atom
+        for atom in atoms
+        if baseline - 4.0 <= float(atom["bbox"][1]) <= baseline + 6.0
+        and not _is_geometry_transaction_value(str(atom.get("text") or ""))
+    ]
+    direction = _staggered_direction_header_atom(atoms, baseline)
+    if direction is not None:
+        direction_ids = set(direction.get("evidence_ids") or [])
+        band = [atom for atom in band if str(atom.get("id") or "") not in direction_ids]
+        band.append(direction)
     return sorted(band, key=lambda atom: float(atom["bbox"][0]))
+
+
+def _staggered_direction_header_atom(
+    atoms: list[dict[str, Any]],
+    baseline: float,
+) -> dict[str, Any] | None:
+    candidates = [atom for atom in atoms if baseline - 10.0 <= float(atom["bbox"][1]) <= baseline + 10.0]
+    for upper in candidates:
+        upper_text = re.sub(
+            r"\s+",
+            "",
+            unicodedata.normalize("NFKC", str(upper.get("text") or "")),
+        )
+        expected_lower = {"支/": ("收", "支/收"), "收/": ("支", "收/支")}.get(upper_text)
+        if expected_lower is None:
+            continue
+        lower_text, combined = expected_lower
+        for lower in candidates:
+            normalized_lower = re.sub(
+                r"\s+",
+                "",
+                unicodedata.normalize("NFKC", str(lower.get("text") or "")),
+            )
+            if normalized_lower != lower_text or float(lower["bbox"][1]) <= float(upper["bbox"][1]):
+                continue
+            if abs(_x_center(lower) - _x_center(upper)) > 5.0:
+                continue
+            virtual = dict(upper)
+            virtual["text"] = combined
+            virtual["bbox"] = _union_bbox([upper["bbox"], lower["bbox"]])
+            virtual["_source_bbox"] = _union_bbox(
+                [
+                    upper.get("_source_bbox") or upper["bbox"],
+                    lower.get("_source_bbox") or lower["bbox"],
+                ]
+            )
+            virtual["evidence_ids"] = list(
+                dict.fromkeys(
+                    str(value)
+                    for source in (upper, lower)
+                    for value in [source.get("id"), *(source.get("evidence_ids") or [])]
+                    if str(value or "")
+                )
+            )
+            return virtual
+    return None
+
+
+def _is_geometry_transaction_value(text: str) -> bool:
+    """Return whether an overlapping atom is row data, not a column label."""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return False
+    if _DATE_ANY_RE.fullmatch(compact) or _MONEY_ANY_RE.fullmatch(compact):
+        return True
+    if re.fullmatch(r"(?:19|20)\d{2}[-/.]\d{1,2}[-/.]?", compact):
+        return True
+    date_matches = list(_DATE_ANY_RE.finditer(compact))
+    if len(date_matches) >= 2 and date_matches[0].start() == 0 and date_matches[1].start() == date_matches[0].end():
+        return True
+    money_matches = list(_MONEY_ANY_RE.finditer(compact))
+    if (
+        len(money_matches) >= 2
+        and money_matches[0].start() == 0
+        and money_matches[1].start() == money_matches[0].end()
+    ):
+        # Tall first-row atoms can overlap the visual header band.  A glued
+        # amount+balance (optionally followed by a location) is transaction
+        # data, never an extra statement column label.
+        return True
+    return compact in {"收", "支", "借", "贷", "Cr", "Dr"}
 
 
 def _baseline_groups(atoms: list[dict[str, Any]], tolerance: float = 3.0) -> list[list[dict[str, Any]]]:
@@ -1791,12 +3104,106 @@ def _y_center(atom: dict[str, Any]) -> float:
     return (float(atom["bbox"][1]) + float(atom["bbox"][3])) / 2
 
 
-def _atoms_by_page(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
+def _geometry_transaction_anchor_y(atom: dict[str, Any], typical_height: float) -> float:
+    """Return the visual baseline for a date spine with a possibly tall PDF bbox."""
+    top = float(atom["bbox"][1])
+    bottom = float(atom["bbox"][3])
+    if atom.get("_coalesced_fragmented_date_anchor") is True:
+        return (top + bottom) / 2
+    height = bottom - top
+    if typical_height > 0 and height > max(typical_height * 1.8, 16.0):
+        return bottom - typical_height / 2
+    return (top + bottom) / 2
+
+
+def _boundary_account_fragment_owner(
+    atom: dict[str, Any],
+    geometry_atoms: list[dict[str, Any]],
+    *,
+    boundary_y: float,
+    previous_anchor_y: float,
+    next_anchor_y: float,
+    bounds: list[float],
+    col_map: dict[str, int],
+    typical_atom_height: float,
+) -> str:
+    """Resolve an exact Voronoi tie from adjacent account/bank text."""
+    account_idx = col_map.get("counter_account")
+    if account_idx is None or account_idx + 1 >= len(bounds):
+        return "default"
+    if not (bounds[account_idx] <= _x_center(atom) < bounds[account_idx + 1]):
+        return "default"
+
+    candidate = unicodedata.normalize("NFKC", re.sub(r"\s+", "", str(atom.get("text") or "")))
+    evidence_span = max(typical_atom_height * 2.0, 16.0)
+    previous_atoms = [
+        target
+        for target in geometry_atoms
+        if id(target) != id(atom)
+        and bounds[account_idx] <= _x_center(target) < bounds[account_idx + 1]
+        and previous_anchor_y - evidence_span
+        <= _geometry_transaction_anchor_y(target, typical_atom_height)
+        < boundary_y
+    ]
+    target_atoms = [
+        target
+        for target in geometry_atoms
+        if id(target) != id(atom)
+        and bounds[account_idx] <= _x_center(target) < bounds[account_idx + 1]
+        and boundary_y
+        < _geometry_transaction_anchor_y(target, typical_atom_height)
+        <= next_anchor_y + evidence_span
+    ]
+    previous_text = unicodedata.normalize(
+        "NFKC",
+        re.sub(r"\s+", "", _join_geometry_atoms(previous_atoms, line_tolerance=1.5)),
+    )
+    target_text = unicodedata.normalize(
+        "NFKC",
+        re.sub(r"\s+", "", _join_geometry_atoms(target_atoms, line_tolerance=1.5)),
+    )
+    if (
+        re.fullmatch(r"[\u3400-\u9fff]{1,4}", candidate)
+        and _is_account_bank_compound(previous_text + candidate)
+        and not _is_account_bank_compound(previous_text)
+    ):
+        return "previous"
+    if (
+        re.fullmatch(r"[0-9A-Za-z*._-]{6,64}", candidate)
+        and re.search(r"\d", candidate)
+        and _is_account_bank_compound(candidate + target_text)
+        and not _is_account_bank_compound(target_text)
+    ):
+        return "next"
+    return "default"
+
+
+def _is_account_bank_compound(value: str) -> bool:
+    match = re.fullmatch(r"(?P<account>[0-9A-Za-z*._-]{6,64})(?P<bank>[\u3400-\u9fff].+)", value)
+    if match is None or re.search(r"\d", match.group("account")) is None:
+        return False
+    return match.group("bank").endswith(
+        ("银行", "支行", "分行", "营业部", "信用社", "合作社", "财务公司", "有限公司", "有限责任公司")
+    )
+
+
+def _atoms_by_page(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     from docmirror.plugins._runtime.evidence_access import text_atoms
 
-    atoms = text_atoms(parse_result)
-    if not atoms:
-        atoms = _page_text_atoms(parse_result)
+    page_modes = _evidence_page_modes(parse_result)
+    atoms = [
+        atom
+        for atom in text_atoms(parse_result)
+        if _atom_matches_source_route(
+            atom,
+            source_route,
+            page_mode=page_modes.get(str(atom.get("page_id") or "")),
+        )
+    ]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for atom in atoms:
         if not isinstance(atom, dict):
@@ -1806,10 +3213,20 @@ def _atoms_by_page(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
         text = str(atom.get("text") or "").strip()
         if page_id and text and isinstance(bbox, list) and len(bbox) >= 4:
             grouped[page_id].append(atom)
+    fallback_by_page: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for atom in _page_text_atoms(parse_result, source_route=source_route):
+        fallback_by_page[str(atom.get("page_id") or "")].append(atom)
+    for page_id, fallback_atoms in fallback_by_page.items():
+        if page_id and page_id not in grouped:
+            grouped[page_id].extend(fallback_atoms)
     return dict(grouped)
 
 
-def _positioned_atoms_by_page(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
+def _positioned_atoms_by_page(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     """Prefer page text blocks when recovering one-block-per-record layouts.
 
     The evidence plane often tokenizes a native PDF into individual visual text
@@ -1818,19 +3235,19 @@ def _positioned_atoms_by_page(parse_result: Any) -> dict[str, list[dict[str, Any
     that boundary, so it prefers the page blocks while preserving the evidence
     atom path when page blocks are unavailable.
     """
-    page_atoms = _page_text_atoms(parse_result)
+    page_atoms = _page_text_atoms(parse_result, source_route=source_route)
     if page_atoms:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for atom in page_atoms:
             grouped[str(atom["page_id"])].append(atom)
-        for page_id, atoms in _atoms_by_page(parse_result).items():
+        for page_id, atoms in _atoms_by_page(parse_result, source_route=source_route).items():
             if page_id not in grouped:
                 grouped[page_id].extend(atoms)
         return dict(grouped)
-    return _atoms_by_page(parse_result)
+    return _atoms_by_page(parse_result, source_route=source_route)
 
 
-def _page_text_atoms(parse_result: Any) -> list[dict[str, Any]]:
+def _page_text_atoms(parse_result: Any, *, source_route: str | None = None) -> list[dict[str, Any]]:
     """Adapt positioned OCR text blocks when the sealed evidence plane has no atoms.
 
     Bank projection runs before every parser configuration has promoted page OCR
@@ -1839,6 +3256,8 @@ def _page_text_atoms(parse_result: Any) -> list[dict[str, Any]]:
     """
     atoms: list[dict[str, Any]] = []
     for page in getattr(parse_result, "pages", []) or []:
+        if not _page_matches_source_route(getattr(page, "page_mode", None), source_route):
+            continue
         logical_page_number = int(getattr(page, "page_number", 1) or 1)
         source_page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 1) or 1)
         page_id = f"page:{logical_page_number:04d}"
@@ -1860,9 +3279,65 @@ def _page_text_atoms(parse_result: Any) -> list[dict[str, Any]]:
                     "text": text,
                     "bbox": [float(value) for value in bbox[:4]],
                     "evidence_ids": evidence_ids,
+                    "source_kind": ("page_ocr_text" if source_route == "scanned" else "parse_result_text"),
                 }
             )
     return atoms
+
+
+def _atom_matches_source_route(
+    atom: dict[str, Any],
+    source_route: str | None,
+    *,
+    page_mode: Any = None,
+) -> bool:
+    if source_route not in {"digital", "scanned"}:
+        return True
+    source_kind = str(atom.get("source_kind") or "").lower()
+    is_ocr = "ocr" in source_kind or "image" in source_kind or source_kind.endswith(("_token", "_line"))
+    is_generic_parse_result = not source_kind or source_kind.startswith("parse_result_")
+    page_mode_is_known = str(page_mode or "").strip().lower() not in {"", "unknown"}
+    if page_mode_is_known:
+        page_matches = _page_matches_source_route(page_mode, source_route)
+        if not page_matches:
+            return False
+        # Generic ParseResult atom labels describe the canonical container, not
+        # necessarily the acquisition source. A scanned page may therefore use
+        # generic canonical atoms, but an explicitly native atom still belongs
+        # exclusively to the digital route.
+        if source_route == "scanned":
+            return is_ocr or is_generic_parse_result
+        return not is_ocr
+    if source_route == "scanned":
+        return is_ocr
+    return not is_ocr
+
+
+def _evidence_page_modes(parse_result: Any) -> dict[str, str]:
+    plane = getattr(parse_result, "evidence_plane", None)
+    modes = {
+        str(getattr(page, "page_id", "") or ""): str(getattr(page, "content_mode", "") or "")
+        for page in (getattr(plane, "pages", None) or [])
+        if str(getattr(page, "page_id", "") or "")
+    }
+    for page in getattr(parse_result, "pages", []) or []:
+        page_number = int(getattr(page, "page_number", 1) or 1)
+        page_id = f"page:{page_number:04d}"
+        modes.setdefault(page_id, str(getattr(page, "page_mode", "") or ""))
+    return modes
+
+
+def _page_matches_source_route(page_mode: Any, source_route: str | None) -> bool:
+    if source_route not in {"digital", "scanned"}:
+        return True
+    mode = str(page_mode or "").strip().lower()
+    if not mode or mode == "unknown":
+        # Older cached ParseResults may omit page_mode. The document-level
+        # extraction route remains authoritative when no contradictory
+        # page-level provenance exists.
+        return True
+    scanned = any(marker in mode for marker in ("scan", "ocr", "image"))
+    return scanned if source_route == "scanned" else not scanned
 
 
 def _first_exact(atoms: list[dict[str, Any]], text: str) -> dict[str, Any] | None:
@@ -1898,4 +3373,5 @@ __all__ = [
     "recovered_evidence_atom_expected_row_count",
     "recovered_evidence_atom_expected_row_evidence",
     "recovered_evidence_atom_row_sources",
+    "recovered_native_datetime_row_evidence",
 ]

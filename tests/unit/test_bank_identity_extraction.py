@@ -26,7 +26,7 @@ def test_extract_identity_matches_账户号_kv():
     assert fields["account_number"]["normalized_value"] == "03-869900040010370"
 
 
-def test_enrich_identity_maps_subject_id_to_account_number():
+def test_enrich_identity_keeps_routing_institution_out_of_bank_name():
     pr = ParseResult(
         entities=DocumentEntities(
             organization="中国农业银行",
@@ -34,8 +34,52 @@ def test_enrich_identity_maps_subject_id_to_account_number():
         )
     )
     fields = enrich_identity_fields({}, "", pr, institution="中国农业银行")
-    assert fields["bank_name"]["normalized_value"] == "中国农业银行"
+    assert "bank_name" not in fields
     assert fields["account_number"]["normalized_value"] == "03-869900040010370"
+
+
+def test_enrich_identity_rejects_filename_only_issuer() -> None:
+    parse_result = SimpleNamespace(
+        pages=[],
+        entities=DocumentEntities(),
+        file_path="/tmp/银行流水_中国建设银行_20231228.pdf",
+    )
+
+    fields = enrich_identity_fields({}, "网上银行 网银结算", parse_result)
+
+    assert "bank_name" not in fields
+
+
+def test_enrich_identity_separates_explicit_issuer_from_opening_branch() -> None:
+    parse_result = SimpleNamespace(pages=[], entities=DocumentEntities(), file_path="/tmp/statement.pdf")
+    fields = enrich_identity_fields(
+        {},
+        "银行名称：测试银行\n开户行：测试银行科技支行\n交易日期 交易金额 余额",
+        parse_result,
+    )
+
+    assert fields["bank_name"]["normalized_value"] == "测试银行"
+    assert fields["bank_name"]["raw_name"] == "银行名称"
+    assert fields["bank_name"]["source"] == "header.kv"
+    assert fields["branch_name"]["normalized_value"] == "测试银行科技支行"
+    assert fields["branch_name"]["raw_name"] == "开户行"
+
+
+def test_opening_branch_detail_cannot_be_relabelled_as_bank_name() -> None:
+    fields = enrich_identity_fields(
+        {
+            "bank_name": {
+                "raw_name": "开户行",
+                "raw_value": "测试银行科技支行",
+                "normalized_value": "测试银行科技支行",
+                "source_refs": [{"source": "canonical_evidence_atoms", "page": 1}],
+            }
+        },
+        "",
+        SimpleNamespace(pages=[], entities=DocumentEntities()),
+    )
+
+    assert "bank_name" not in fields
 
 
 def test_extract_identity_rejects_transaction_summary_account_kv() -> None:

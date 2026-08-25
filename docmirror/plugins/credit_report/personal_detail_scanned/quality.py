@@ -20,6 +20,9 @@ from docmirror.plugins.credit_report.currency_codes import (
     CURRENCY_CODE_BY_ALIAS,
     ISO_4217_CURRENT_CODES,
 )
+from docmirror.plugins.credit_report.pboc_vocabularies import (
+    is_pboc_institution_name,
+)
 
 _CURRENCY_CODES = {
     **CURRENCY_CODE_BY_ALIAS,
@@ -82,11 +85,7 @@ def header_field_valid(field_name: str, value: Any, *, id_type: Any = None) -> b
             re.fullmatch(r"[0-9A-Za-z()（）-]{5,40}", compact)
         )
     if field_name == "query_institution":
-        return compact == "本人" or bool(
-            re.search(r"[\u3400-\u9fff]", compact)
-            and len(compact) >= 4
-            and re.search(r"(?:银行|中心|公司|联社|机构|本人|分行|支行|营业部|信用社)$", compact)
-        )
+        return is_pboc_institution_name(compact)
     if field_name == "report_number":
         return bool(re.fullmatch(r"\d{18,30}", compact))
     if field_name == "report_time":

@@ -83,6 +83,61 @@ def _scanner_table(
     }
 
 
+def _boundary_split_year_table(
+    *,
+    table_id: str,
+    logical_page: int,
+    left: float,
+    year_right: float,
+    right: float,
+    row_edges: tuple[float, float, float],
+) -> dict[str, object]:
+    """Build the exact two-singleton year-column shape seen on Lin p6/p17."""
+
+    pitch = (right - year_right) / 12.0
+    column_edges = [left, year_right, *[year_right + pitch * index for index in range(1, 13)]]
+    cell_bboxes = [
+        [
+            [
+                column_edges[column],
+                row_edges[row],
+                column_edges[column + 1],
+                row_edges[row + 1],
+            ]
+            for column in range(13)
+        ]
+        for row in range(2)
+    ]
+    return {
+        "table_id": table_id,
+        "logical_page": logical_page,
+        "source_page": logical_page,
+        "bbox": [left, row_edges[0], right, row_edges[-1]],
+        "geometry_source": "scanned_image_line_grid",
+        "coordinate_system": "pdf_points_top_left",
+        "cell_bboxes": cell_bboxes,
+        "cell_geometry_status": [["exact"] * 13 for _row in range(2)],
+        "cell_spans": [
+            {"row": row, "col": 0, "row_span": 1, "col_span": 1}
+            for row in range(2)
+        ],
+        "row_bands": [
+            {"index": row, "y0": row_edges[row], "y1": row_edges[row + 1]}
+            for row in range(2)
+        ],
+        "col_bands": [
+            {
+                "index": column,
+                "x0": column_edges[column],
+                "x1": column_edges[column + 1],
+            }
+            for column in range(13)
+        ],
+        "vertical_lines": column_edges,
+        "horizontal_lines": list(row_edges),
+    }
+
+
 def _primitive_split_table(
     split_effective_columns: tuple[int, ...],
     *,
@@ -296,6 +351,178 @@ def test_resolver_binds_unique_saved_shape_pair_height_year_target(
     assert provenance["year_anchor_mode"] == "row_pair_year_column"
     assert provenance["year_row_span"] == 2
     assert provenance["value_inputs_used"] is False
+
+
+@pytest.mark.parametrize(
+    (
+        "table_id",
+        "logical_page",
+        "expected_year",
+        "left",
+        "year_right",
+        "right",
+        "row_edges",
+        "year_bbox",
+    ),
+    (
+        (
+            "pt_6_0",
+            6,
+            2022,
+            53.5,
+            81.0,
+            403.5,
+            (43.5, 58.5, 73.5),
+            [59.5, 53.5, 77.0, 63.0],
+        ),
+        (
+            "pt_17_0",
+            17,
+            2019,
+            34.0,
+            62.0,
+            389.0,
+            (38.5, 53.0, 65.5),
+            [40.5, 47.5, 58.5, 58.5],
+        ),
+    ),
+    ids=("lin_p6_2022", "lin_p17_2019"),
+)
+def test_resolver_binds_real_boundary_straddling_year_singletons(
+    table_id: str,
+    logical_page: int,
+    expected_year: int,
+    left: float,
+    year_right: float,
+    right: float,
+    row_edges: tuple[float, float, float],
+    year_bbox: list[float],
+) -> None:
+    table = _boundary_split_year_table(
+        table_id=table_id,
+        logical_page=logical_page,
+        left=left,
+        year_right=year_right,
+        right=right,
+        row_edges=row_edges,
+    )
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=logical_page,
+        expected_year=expected_year,
+        active_months=range(1, 13),
+        year_bbox=year_bbox,
+        status_bbox=[year_right, row_edges[0], right, row_edges[1]],
+    )
+
+    assert lattice is not None
+    assert lattice.table_id == table_id
+    assert lattice.year_anchor_row_index == 0
+    assert lattice.status_row_index == 0
+    assert lattice.amount_row_index == 1
+    assert lattice.year_bbox == (left, row_edges[0], year_right, row_edges[2])
+    provenance = lattice.provenance_dict()
+    assert provenance["year_anchor_mode"] == (
+        "boundary_straddling_singleton_year_cells"
+    )
+    assert provenance["year_row_span"] == 2
+    assert provenance["active_cell_geometry_exact"] is True
+    assert provenance["value_inputs_used"] is False
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    (
+        "outside_row_pair",
+        "month_column_target",
+        "tiny_boundary_speck",
+        "status_non_exact",
+        "amount_missing",
+        "amount_inset",
+        "status_spanned",
+        "duplicate_candidate",
+    ),
+)
+def test_boundary_straddling_year_singleton_fallback_fails_closed(
+    failure_mode: str,
+) -> None:
+    table = _boundary_split_year_table(
+        table_id="pt_6_0",
+        logical_page=6,
+        left=53.5,
+        year_right=81.0,
+        right=403.5,
+        row_edges=(43.5, 58.5, 73.5),
+    )
+    year_bbox = [59.5, 53.5, 77.0, 63.0]
+    tables = [table]
+    if failure_mode == "outside_row_pair":
+        year_bbox = [59.5, 30.0, 77.0, 40.0]
+    elif failure_mode == "month_column_target":
+        year_bbox = [90.0, 53.5, 107.5, 63.0]
+    elif failure_mode == "tiny_boundary_speck":
+        year_bbox = [59.5, 57.9, 77.0, 59.1]
+    elif failure_mode == "status_non_exact":
+        table["cell_geometry_status"][0][0] = "derived"  # type: ignore[index]
+    elif failure_mode == "amount_missing":
+        table["cell_bboxes"][1][0] = None  # type: ignore[index]
+        table["cell_geometry_status"][1][0] = "missing"  # type: ignore[index]
+    elif failure_mode == "amount_inset":
+        table["cell_bboxes"][1][0] = [53.5, 59.0, 81.0, 73.5]  # type: ignore[index]
+    elif failure_mode == "status_spanned":
+        table["cell_spans"][0]["row_span"] = 2  # type: ignore[index]
+    else:
+        duplicate = deepcopy(table)
+        duplicate["table_id"] = "pt_6_1"
+        tables.append(duplicate)
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership(
+            tables,
+            logical_page=6,
+            expected_year=2022,
+            active_months=range(1, 13),
+            year_bbox=year_bbox,
+            status_bbox=[81.0, 43.5, 403.5, 58.5],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "year_bbox",
+    (
+        [59.5, 45.0, 77.0, 55.0],
+        [59.5, 50.0, 77.0, 60.0],
+    ),
+    ids=("wholly_status_row", "sub_twenty_percent_boundary_graze"),
+)
+def test_year_target_owned_by_one_singleton_keeps_existing_mode(
+    year_bbox: list[float],
+) -> None:
+    table = _boundary_split_year_table(
+        table_id="pt_6_0",
+        logical_page=6,
+        left=53.5,
+        year_right=81.0,
+        right=403.5,
+        row_edges=(43.5, 58.5, 73.5),
+    )
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        [table],
+        logical_page=6,
+        expected_year=2022,
+        active_months=range(1, 13),
+        year_bbox=year_bbox,
+        status_bbox=[81.0, 43.5, 403.5, 58.5],
+    )
+
+    assert lattice is not None
+    assert lattice.provenance_dict()["year_anchor_mode"] == (
+        "target_bound_singleton_year_cell"
+    )
 
 
 def test_resolver_rejects_non_repeated_or_competing_primitive_split() -> None:
