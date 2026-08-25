@@ -7,9 +7,17 @@ provider:
   implementation: docmirror.plugins.bank_statement.community_plugin:plugin
 
 projection:
-  dataset_aliases: {records: transactions}
-  dataset_labels: {transactions: 交易流水}
-  dataset_types: {transactions: transaction}
+  dataset_aliases: {statement_header: statement_header, records: transactions}
+  dataset_labels: {statement_header: 流水表头, transactions: 交易流水}
+  dataset_types: {statement_header: statement_header, transactions: transaction}
+  dataset_grains:
+    statement_header: one row per source statement/account period
+    transactions: one row per transaction
+  dataset_foreign_keys:
+    transactions:
+      - columns: [statement_header_id]
+        reference_dataset: statement_header
+        reference_columns: [record_id]
   section_type_markers: {交易: transactions}
   completeness:
     records:
@@ -19,8 +27,10 @@ projection:
       count_candidates:
         - key: source_reported_transaction_count
           public_basis: source_footer_transaction_count
+          minimum: 1
         - key: expected_primary_rows
           public_basis: bank_expected_primary_rows
+          minimum: 1
       verification_status_key: extract_status
       verified_statuses: [success]
 
@@ -37,5 +47,6 @@ resources:
 projection_outputs:
   document_type: bank_statement
   datasets:
+    - statement_header
     - transactions
   domain_fact_prefix: bank_statement

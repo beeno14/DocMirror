@@ -16,8 +16,14 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_detail_scanned.agreement_ocr import (
+    CREDIT_AGREEMENT_CARD_HEADING_RE,
+    CREDIT_AGREEMENT_LABEL_OCR_ALIASES,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
     make_issue,
     record_issue,
@@ -25,6 +31,14 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
 from docmirror.plugins.credit_report.personal_detail_scanned.liability_clusters import (
     decode_packed_liability_row,
     normalize_packed_liability_header,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.section_headings import (
+    canonical_registered_section_heading,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.table_ownership import (
+    canonical_cross_page_agreement_anchor,
+    canonical_table_owned_by,
+    canonical_table_role,
 )
 
 _LABELS = frozenset(
@@ -61,14 +75,17 @@ _LABELS = frozenset(
     }
 )
 
-# Closed-world label repair.  Keep this deliberately small: an entry must be a
+# Closed-world label repair. Keep this deliberately small: an entry must be a
 # known OCR rendering of one canonical PBOC label, not a spelling-similarity
 # candidate.  Unknown/damaged labels stay unresolved so the coordinated page
 # repair can observe them without authorizing a neighbouring business value.
 _LABEL_OCR_ALIASES = {
-    "营理机构": "管理机构",
-    "开立白期": "开立日期",
+        "营理机构": "管理机构",
+        "管斑机构": "管理机构",
+        "开立白期": "开立日期",
 }
+
+_LABEL_OCR_ALIASES.update(CREDIT_AGREEMENT_LABEL_OCR_ALIASES)
 
 _SECTION_MARKERS = {
     "credit_lines": frozenset({"授信协议标识", "授信额度用途"}),
@@ -80,8 +97,12 @@ _EVIDENCE_SECTION_HEADINGS = {
     "credit_lines": "授信协议信息",
     "repayment_liability_records": "相关还款责任信息",
 }
+_EVIDENCE_SECTION_TEMPLATE_IDS = {
+    "credit_lines": "credit_agreement",
+    "repayment_liability_records": "repayment_responsibility",
+}
 _EVIDENCE_ANCHORS = {
-    "credit_lines": re.compile(r"授信协议\s*\d{1,3}"),
+    "credit_lines": CREDIT_AGREEMENT_CARD_HEADING_RE,
     "repayment_liability_records": re.compile(r"账户\s*\d{1,3}"),
 }
 _PRIMARY_RECORD_LABELS = {
@@ -90,7 +111,7 @@ _PRIMARY_RECORD_LABELS = {
 }
 _CREDIT_AGREEMENT_INLINE_LABELS = tuple(
     sorted(
-        (
+        {
             "授信协议标识",
             "管理机构",
             "授信额度用途",
@@ -101,7 +122,12 @@ _CREDIT_AGREEMENT_INLINE_LABELS = tuple(
             "已用额度",
             "授信限额编号",
             "币种",
-        ),
+            *(
+                alias
+                for alias, canonical in _LABEL_OCR_ALIASES.items()
+                if canonical.startswith("授信")
+            ),
+        },
         key=len,
         reverse=True,
     )
@@ -181,8 +207,21 @@ def _collapsed_credit_agreement_pairs(value: Any) -> list[tuple[str, str]]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         candidate = text[match.end() : end].strip(" \t:：,，;；|/")
         if candidate:
-            pairs.append((match.group(0), candidate))
+            canonical, _score = _canonical_label(match.group(0))
+            if canonical is not None:
+                pairs.append((canonical, candidate))
     return pairs
+
+
+def _agreement_labels_in_cell(value: Any) -> tuple[str, ...]:
+    """Return finite agreement labels embedded in one merged header cell."""
+
+    labels: list[str] = []
+    for match in _CREDIT_AGREEMENT_INLINE_LABEL_RE.finditer(str(value or "")):
+        canonical, _score = _canonical_label(match.group(0))
+        if canonical and canonical not in labels:
+            labels.append(canonical)
+    return tuple(labels)
 
 
 def _source_ref(page: Any, table: Any) -> dict[str, Any]:
@@ -365,9 +404,39 @@ def _packed_value_equivalent(label: str, left: Any, right: Any) -> bool:
     """Compare raw direct-cell and normalized packed-row representations."""
 
     if label in {"开立日期", "到期日期"}:
-        return re.sub(r"\D", "", str(left or "")) == re.sub(r"\D", "", str(right or ""))
+        def date_key(value: Any) -> date | None:
+            match = re.fullmatch(
+                r"((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})",
+                str(value or "").strip(),
+            )
+            if match is None:
+                return None
+            try:
+                return date(*(int(part) for part in match.groups()))
+            except ValueError:
+                return None
+
+        left_date = date_key(left)
+        right_date = date_key(right)
+        return left_date is not None and left_date == right_date
     if label == "还款责任金额":
-        return re.sub(r"\D", "", str(left or "")) == re.sub(r"\D", "", str(right or ""))
+        def amount_key(value: Any) -> Decimal | None:
+            if value is None or isinstance(value, bool):
+                return None
+            raw = str(value).strip().replace("，", ",")
+            if not re.fullmatch(
+                r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?",
+                raw,
+            ):
+                return None
+            try:
+                return Decimal(raw.replace(",", ""))
+            except InvalidOperation:
+                return None
+
+        left_amount = amount_key(left)
+        right_amount = amount_key(right)
+        return left_amount is not None and left_amount == right_amount
     if label == "币种":
         currencies = {
             "人民币": "CNY",
@@ -568,12 +637,65 @@ class PBOCPersonalDetailNativeParser:
                 ),
             )
 
+    def _canonical_template_id(self, page: Any, table: Any) -> str:
+        """Return only a canonical role whose table ownership is coherent."""
+
+        return canonical_table_role(self.context, page, table) or ""
+
     @staticmethod
-    def _canonical_template_id(page: Any, table: Any) -> str:
-        page_template = str(getattr(page, "canonical_template_id", "") or "")
-        metadata = getattr(table, "metadata", None) or {}
-        table_template = str(metadata.get("canonical_template_id") or "") if isinstance(metadata, dict) else ""
-        return table_template or page_template
+    def _credit_agreement_table_schema(rows: list[list[Any]]) -> bool:
+        """Require an agreement id plus three independent printed field roles."""
+
+        observed: set[str] = set()
+        agreement_labels = {
+            "授信协议标识",
+            "管理机构",
+            "授信额度用途",
+            "生效日期",
+            "到期日期",
+            "授信额度",
+            "授信限额",
+            "已用额度",
+            "授信限额编号",
+            "币种",
+        }
+        for row in rows:
+            for cell in row:
+                compact = _compact(_cell_text(cell))
+                label, _score = _canonical_label(compact)
+                if label in agreement_labels:
+                    observed.add(label)
+                for candidate in agreement_labels:
+                    if candidate in compact:
+                        observed.add(candidate)
+                for alias, canonical in _LABEL_OCR_ALIASES.items():
+                    if canonical in agreement_labels and alias in compact:
+                        observed.add(canonical)
+        independent_roles = observed & {
+            "管理机构",
+            "授信额度用途",
+            "生效日期",
+            "到期日期",
+        }
+        return "授信协议标识" in observed and len(independent_roles) >= 3
+
+    @classmethod
+    def _credit_agreement_table_on_mixed_page(
+        cls,
+        page: Any,
+        table: Any,
+        rows: list[list[Any]],
+    ) -> bool:
+        """Admit one mixed-role table only with local schema and heading proof."""
+
+        if not cls._credit_agreement_table_schema(rows):
+            return False
+        sequence, anchor_ref = cls._printed_sequence_anchor_above_table(
+            page,
+            table,
+            "credit_lines",
+        )
+        return bool(sequence and anchor_ref)
 
     @staticmethod
     def _printed_sequence_anchor_above_table(
@@ -601,13 +723,11 @@ class PBOCPersonalDetailNativeParser:
         ):
             return "", None
         candidates: list[tuple[float, str, dict[str, Any]]] = []
-        pattern = (
-            re.compile(r"授信协议\s*(\d{1,3})")
-            if dataset_name == "credit_lines"
-            else re.compile(r"账户\s*(\d{1,3})")
-        )
+        credit_agreement = dataset_name == "credit_lines"
+        pattern = CREDIT_AGREEMENT_CARD_HEADING_RE if credit_agreement else re.compile(r"账户\s*(\d{1,3})")
         for text_item in getattr(page, "texts", None) or ():
-            match = pattern.search(str(getattr(text_item, "content", "") or ""))
+            content = str(getattr(text_item, "content", "") or "")
+            match = pattern.fullmatch(_compact(content)) if credit_agreement else pattern.search(content)
             text_box = getattr(text_item, "bbox", None)
             if match is None or not isinstance(text_box, (list, tuple)) or len(text_box) != 4:
                 continue
@@ -634,7 +754,7 @@ class PBOCPersonalDetailNativeParser:
                 candidates.append(
                     (
                         bottom,
-                        match.group(1),
+                        match.group("sequence") if credit_agreement else match.group(1),
                         {
                             "source": "native_detail_canonical_anchor_text",
                             "logical_page": int(getattr(page, "page_number", 0) or 0),
@@ -650,9 +770,12 @@ class PBOCPersonalDetailNativeParser:
                         },
                     )
                 )
-        if not candidates:
+        # One nearby heading owns one card.  Competing headings are not a
+        # deterministic entity boundary, even when the table itself is on a
+        # registered agreement page.
+        if len(candidates) != 1:
             return "", None
-        _bottom, sequence, ref = max(candidates, key=lambda item: item[0])
+        _bottom, sequence, ref = candidates[0]
         return sequence, ref
 
     @staticmethod
@@ -790,7 +913,12 @@ class PBOCPersonalDetailNativeParser:
                 continue
             for box in row:
                 if isinstance(box, (list, tuple)) and len(box) == 4:
-                    tops.append(float(box[1]))
+                    try:
+                        top = float(box[1])
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(top):
+                        tops.append(top)
         return min(tops) if tops else None
 
     @classmethod
@@ -805,17 +933,49 @@ class PBOCPersonalDetailNativeParser:
 
         if dataset_name != "credit_lines" or not groups:
             return {}
-        pattern = re.compile(r"授信协议\s*(\d{1,3})")
+        table_box = getattr(table, "bbox", None)
+        if not isinstance(table_box, (list, tuple)) or len(table_box) != 4:
+            return {}
+        try:
+            table_left, table_top, table_right, table_bottom = (
+                float(value) for value in table_box
+            )
+        except (TypeError, ValueError):
+            return {}
+        if not (
+            all(
+                math.isfinite(value)
+                for value in (table_left, table_top, table_right, table_bottom)
+            )
+            and table_right > table_left
+            and table_bottom > table_top
+        ):
+            return {}
+        pattern = CREDIT_AGREEMENT_CARD_HEADING_RE
         anchors: list[tuple[float, str, dict[str, Any]]] = []
         for text_item in getattr(page, "texts", None) or ():
-            match = pattern.search(str(getattr(text_item, "content", "") or ""))
+            match = pattern.fullmatch(
+                _compact(str(getattr(text_item, "content", "") or ""))
+            )
             box = getattr(text_item, "bbox", None)
             if match is None or not isinstance(box, (list, tuple)) or len(box) != 4:
                 continue
+            try:
+                left, top, right, bottom = (float(value) for value in box)
+            except (TypeError, ValueError):
+                continue
+            if not (
+                all(math.isfinite(value) for value in (left, top, right, bottom))
+                and right > left
+                and bottom > top
+                and min(table_right, right) - max(table_left, left) > 0.0
+                and table_top - 24.0 <= bottom <= table_bottom + 8.0
+            ):
+                continue
             anchors.append(
                 (
-                    float(box[3]),
-                    match.group(1),
+                    bottom,
+                    match.group("sequence"),
                     {
                         "source": "native_detail_canonical_anchor_text",
                         "logical_page": int(getattr(page, "page_number", 0) or 0),
@@ -840,43 +1000,45 @@ class PBOCPersonalDetailNativeParser:
         ]
         assigned: dict[int, tuple[str, dict[str, Any]]] = {}
         used: set[int] = set()
+        assigned_sequences: set[str] = set()
         if all(top is not None for top in group_tops):
             for (row_offset, _record_rows), group_top in zip(groups, group_tops, strict=True):
                 eligible = [
                     (index, anchor)
                     for index, anchor in enumerate(anchors)
-                    if index not in used and anchor[0] <= float(group_top) + 8.0
+                    if index not in used
+                    and float(group_top) - 24.0 <= anchor[0] <= float(group_top) + 8.0
                 ]
-                if not eligible:
-                    continue
-                index, (_bottom, sequence, ref) = max(eligible, key=lambda item: item[1][0])
+                if len(eligible) != 1:
+                    return {}
+                index, (_bottom, sequence, ref) = eligible[0]
+                if sequence in assigned_sequences:
+                    return {}
                 used.add(index)
+                assigned_sequences.add(sequence)
                 assigned[row_offset] = (sequence, ref)
             return assigned
 
-        # Geometry-free fallback is authorized only by a complete one-to-one
-        # set of explicit headings.  Never reuse one heading for several cards.
-        table_box = getattr(table, "bbox", None)
-        if isinstance(table_box, (list, tuple)) and len(table_box) == 4:
-            nearby = [
-                anchor
-                for anchor in anchors
-                if float(table_box[1]) - 120.0 <= anchor[0] <= float(table_box[3]) + 8.0
-            ]
-        else:
-            nearby = anchors
-        if len(nearby) == len(groups) and len({sequence for _bottom, sequence, _ref in nearby}) == len(groups):
-            for (row_offset, _record_rows), (_bottom, sequence, ref) in zip(
-                groups, nearby, strict=True
-            ):
-                assigned[row_offset] = (sequence, ref)
-        return assigned
+        # Row order alone is not card ownership. Repeated records without
+        # per-row source geometry remain withheld.
+        return {}
 
-    def _table_groups(self) -> list[tuple[Any, Any, list[list[str]], tuple[dict[str, Any], ...]]]:
+    def _table_groups(
+        self,
+        *,
+        required_role: str | None = None,
+    ) -> list[tuple[Any, Any, list[list[str]], tuple[dict[str, Any], ...]]]:
         entries: list[tuple[Any, Any, list[list[str]], dict[str, Any]]] = []
         reading_order = dict(getattr(self.context, "reading_order_by_logical", {}) or {})
         for page in getattr(self.context, "pages", None) or []:
             for table in getattr(page, "tables", None) or []:
+                if required_role and not canonical_table_owned_by(
+                    self.context,
+                    page,
+                    table,
+                    required_role,
+                ):
+                    continue
                 table_rows = _rows(table)
                 if table_rows:
                     entries.append((page, table, table_rows, _source_ref(page, table)))
@@ -912,6 +1074,74 @@ class PBOCPersonalDetailNativeParser:
             groups.append((page, table, table_rows, (ref,)))
         return groups
 
+    def _credit_agreement_table_groups(
+        self,
+    ) -> list[tuple[Any, Any, list[list[str]], tuple[dict[str, Any], ...]]]:
+        """Keep separately numbered agreement cards separate.
+
+        The generic entity graph can treat a run of same-schema tables as one
+        logical table.  For agreement cards, a unique heading immediately above
+        each table is a stronger business boundary.  Return those source tables
+        independently; only unnumbered fragments remain withheld for explicit
+        continuation handling.
+        """
+
+        reading_order = dict(getattr(self.context, "reading_order_by_logical", {}) or {})
+        groups: list[tuple[Any, Any, list[list[str]], tuple[dict[str, Any], ...]]] = []
+        for page in getattr(self.context, "pages", None) or []:
+            for table in getattr(page, "tables", None) or []:
+                table_rows = _rows(table)
+                if not table_rows:
+                    continue
+                template_id = self._canonical_template_id(page, table)
+                if template_id != "credit_agreement":
+                    # Exact agreement labels identify a schema, not the entity
+                    # which owns it.  The same labels can occur in account cards,
+                    # summaries, and unrelated native tables.  Only a page/table
+                    # already registered to the PBOC agreement template (or the
+                    # explicit mixed-page card proof below) may publish an
+                    # agreement record.
+                    continue
+                sequence, anchor_ref = self._printed_sequence_anchor_above_table(
+                    page,
+                    table,
+                    "credit_lines",
+                )
+                record_groups = self._split_repeated_cards_with_offsets(
+                    "credit_lines",
+                    table_rows,
+                )
+                assigned = self._printed_sequence_anchors_for_groups(
+                    page,
+                    table,
+                    "credit_lines",
+                    record_groups,
+                )
+                cross_page_anchor = canonical_cross_page_agreement_anchor(
+                    self.context,
+                    page,
+                    table,
+                )
+                if len(record_groups) == 1:
+                    locally_owned = bool(
+                        (sequence and anchor_ref) or cross_page_anchor is not None
+                    )
+                else:
+                    locally_owned = len(assigned) == len(record_groups)
+                if not locally_owned:
+                    continue
+                groups.append((page, table, table_rows, (_source_ref(page, table),)))
+        groups.sort(
+            key=lambda item: (
+                reading_order.get(
+                    int(getattr(item[0], "page_number", 0) or 0),
+                    int(getattr(item[0], "page_number", 0) or 0),
+                ),
+                _table_top(item[1]),
+            )
+        )
+        return groups
+
     @staticmethod
     def _split_repeated_cards_with_offsets(
         dataset_name: str, rows: list[list[str]]
@@ -935,7 +1165,9 @@ class PBOCPersonalDetailNativeParser:
         for row_index, row in enumerate(rows):
             compact = _compact("".join(str(cell or "") for cell in row))
             has_anchor = bool(anchor.search(compact))
-            has_primary = primary_label in compact
+            has_primary = primary_label in compact or any(
+                _canonical_label(cell)[0] == primary_label for cell in row
+            )
             if current and (has_anchor or (has_primary and current_has_primary)):
                 groups.append((current_start, current))
                 current = []
@@ -984,6 +1216,48 @@ class PBOCPersonalDetailNativeParser:
                         fields.setdefault(label, candidate)
                         positions.setdefault(label, (row_index, column))
                         scores.append(1.0)
+                    continue
+                embedded_labels = _agreement_labels_in_cell(cell_text)
+                if len(embedded_labels) > 1:
+                    observed.update(embedded_labels)
+                    if row_index + 1 < len(rows) and len(rows[row_index + 1]) == len(row):
+                        value_row = rows[row_index + 1]
+                        empty_columns = [
+                            index
+                            for index, value in enumerate(row)
+                            if not _cell_text(value).strip()
+                        ]
+                        candidate_columns = [column, *empty_columns]
+                        typed: dict[str, list[int]] = {label: [] for label in embedded_labels}
+                        for candidate_column in candidate_columns:
+                            if not 0 <= candidate_column < len(value_row):
+                                continue
+                            candidate = _cell_text(value_row[candidate_column]).strip()
+                            if not candidate:
+                                continue
+                            for label in embedded_labels:
+                                if label in {"生效日期", "到期日期"} and re.fullmatch(
+                                    r"(?:19|20)\d{2}[.年/-]\d{1,2}[.月/-]\d{1,2}日?",
+                                    candidate,
+                                ):
+                                    typed[label].append(candidate_column)
+                                elif label == "授信协议标识" and re.search(
+                                    r"[A-Za-z]\s*[A-Za-z0-9\s]{7,}",
+                                    candidate,
+                                ):
+                                    typed[label].append(candidate_column)
+                        unique_columns = {
+                            label: columns[0]
+                            for label, columns in typed.items()
+                            if len(columns) == 1
+                        }
+                        if len(set(unique_columns.values())) == len(unique_columns):
+                            for label, candidate_column in unique_columns.items():
+                                candidate = _cell_text(value_row[candidate_column]).strip()
+                                fields.setdefault(label, candidate)
+                                positions.setdefault(label, (row_index + 1, candidate_column))
+                                scores.append(0.96)
+                    unresolved.update(label for label in embedded_labels if label not in fields)
                     continue
                 label, score = _canonical_label(cell_text)
                 if label is None:
@@ -1226,12 +1500,30 @@ class PBOCPersonalDetailNativeParser:
         raw_pages = loader() or []
         pages, reading_order = self._validated_evidence_page_order(raw_pages)
         if dataset_name == "report_header":
-            if not pages:
+            registered_pages = [
+                page
+                for page in getattr(self.context, "pages", None) or ()
+                if str(getattr(page, "canonical_template_id", "") or "")
+                == "report_header_and_identity"
+            ]
+            owned_pages = [
+                page
+                for page in pages
+                if isinstance(page, Mapping)
+                and str(page.get("canonical_template_id") or "")
+                == "report_header_and_identity"
+                and sum(
+                    int(getattr(owner, "page_number", 0) or 0)
+                    == int(page.get("page") or 0)
+                    and int(getattr(owner, "source_page_number", 0) or 0)
+                    == int(page.get("source_page") or page.get("page") or 0)
+                    for owner in registered_pages
+                )
+                == 1
+            ]
+            if len(owned_pages) != 1:
                 return []
-            if len({int(page.get("page") or 0) for page in pages}) > 1 and reading_order is None:
-                self._record_evidence_page_order_unresolved(dataset_name, pages)
-                return []
-            page = pages[0]
+            page = owned_pages[0]
             logical_page = int(page.get("page") or 0)
             source_page = int(page.get("source_page") or logical_page)
             rows = self._ocr_positioned_rows(page)
@@ -1250,9 +1542,10 @@ class PBOCPersonalDetailNativeParser:
             ] if rows else []
 
         heading = _EVIDENCE_SECTION_HEADINGS.get(dataset_name)
+        expected_template_id = _EVIDENCE_SECTION_TEMPLATE_IDS.get(dataset_name)
         anchor = _EVIDENCE_ANCHORS.get(dataset_name)
         primary_label = _PRIMARY_RECORD_LABELS.get(dataset_name, "")
-        if not heading or anchor is None:
+        if not heading or not expected_template_id or anchor is None:
             return []
         groups: list[tuple[list[list[_PositionedEvidenceCell]], tuple[dict[str, Any], ...]]] = []
         active = False
@@ -1279,6 +1572,15 @@ class PBOCPersonalDetailNativeParser:
         for page in pages:
             logical_page = int(page.get("page") or 0)
             source_page = int(page.get("source_page") or 0)
+            declared_template_id = str(page.get("canonical_template_id") or "")
+            incompatible_page_owner = bool(
+                declared_template_id
+                and declared_template_id != expected_template_id
+            )
+            if incompatible_page_owner and active:
+                flush()
+                active = False
+                liability_party_category = ""
             page_rows = self._ocr_positioned_rows(page)
             page_compact_rows = [
                 _compact("".join(_cell_text(cell) for cell in row))
@@ -1303,7 +1605,13 @@ class PBOCPersonalDetailNativeParser:
                 flush()
                 active = False
                 liability_party_category = ""
-                starts_new_section = any(heading in text for text in page_compact_rows)
+                starts_new_section = any(
+                    canonical_registered_section_heading(
+                        "".join(_cell_text(cell) for cell in row)
+                    )
+                    == heading
+                    for row in page_rows
+                )
                 fragment_labels = set(_SECTION_MARKERS.get(dataset_name, ()))
                 if dataset_name == "credit_lines":
                     fragment_labels.update(_CREDIT_AGREEMENT_INLINE_LABELS)
@@ -1324,7 +1632,10 @@ class PBOCPersonalDetailNativeParser:
             }
             for row in page_rows:
                 compact = _compact("".join(_cell_text(cell) for cell in row))
-                if heading in compact:
+                section_title = canonical_registered_section_heading(
+                    "".join(_cell_text(cell) for cell in row)
+                )
+                if section_title == heading and not incompatible_page_owner:
                     flush()
                     active = True
                     continue
@@ -1332,7 +1643,7 @@ class PBOCPersonalDetailNativeParser:
                     (
                         value
                         for name, value in _EVIDENCE_SECTION_HEADINGS.items()
-                        if name != dataset_name and value in compact
+                        if name != dataset_name and value == section_title
                     ),
                     None,
                 )
@@ -1563,12 +1874,15 @@ class PBOCPersonalDetailNativeParser:
         fields, confidence, refs, bindings, observed, unresolved = cls._positioned_pairs(rows)
         if dataset_name in {"credit_lines", "repayment_liability_records"}:
             sequence_pattern = (
-                re.compile(r"授信协议\s*(\d{1,3})")
+                CREDIT_AGREEMENT_CARD_HEADING_RE
                 if dataset_name == "credit_lines"
                 else re.compile(r"账户\s*(\d{1,3})")
             )
             sequence_cells = [
-                (match.group(1), cell)
+                (
+                    match.group("sequence") if dataset_name == "credit_lines" else match.group(1),
+                    cell,
+                )
                 for row in rows
                 for cell in row
                 if (match := sequence_pattern.search(cell.text))
@@ -1609,11 +1923,28 @@ class PBOCPersonalDetailNativeParser:
     def records(self, dataset_name: str) -> list[NativeLabeledRecord]:
         required = _SECTION_MARKERS[dataset_name]
         result: list[NativeLabeledRecord] = []
-        for _page, _table, rows, refs in self._table_groups():
+        table_groups = (
+            self._credit_agreement_table_groups()
+            if dataset_name == "credit_lines"
+            else (
+                self._table_groups(required_role="repayment_responsibility")
+                if dataset_name == "repayment_liability_records"
+                else self._table_groups()
+            )
+        )
+        for _page, _table, rows, refs in table_groups:
             template_id = self._canonical_template_id(_page, _table)
-            if dataset_name == "credit_lines" and template_id and template_id != "credit_agreement":
-                # Account-detail cards also print ``授信协议标识`` in their
-                # heading.  They are account evidence, not agreement rows.
+            if dataset_name == "credit_lines" and template_id != "credit_agreement":
+                continue
+            if (
+                dataset_name == "report_header"
+                and template_id != "report_header_and_identity"
+            ):
+                continue
+            if (
+                dataset_name == "repayment_liability_records"
+                and template_id != "repayment_responsibility"
+            ):
                 continue
             record_groups = self._split_repeated_cards_with_offsets(dataset_name, rows)
             assigned_sequence_anchors = self._printed_sequence_anchors_for_groups(
@@ -1691,12 +2022,16 @@ class PBOCPersonalDetailNativeParser:
                         confidence = confidence or 1.0
                 if dataset_name in {"credit_lines", "repayment_liability_records"}:
                     sequence_pattern = (
-                        re.compile(r"授信协议\s*(\d{1,3})")
+                        CREDIT_AGREEMENT_CARD_HEADING_RE
                         if dataset_name == "credit_lines"
                         else re.compile(r"账户\s*(\d{1,3})")
                     )
                     sequence_cells = [
-                        (match.group(1), row_index, column_index)
+                        (
+                            match.group("sequence") if dataset_name == "credit_lines" else match.group(1),
+                            row_index,
+                            column_index,
+                        )
                         for row_index, row in enumerate(record_rows)
                         for column_index, cell in enumerate(row)
                         if (match := sequence_pattern.search(str(cell or "")))
@@ -1732,6 +2067,14 @@ class PBOCPersonalDetailNativeParser:
                                 _table,
                                 dataset_name,
                             )
+                            if not printed_sequence or not anchor_ref:
+                                cross_page_anchor = canonical_cross_page_agreement_anchor(
+                                    self.context,
+                                    _page,
+                                    _table,
+                                )
+                                if cross_page_anchor is not None:
+                                    printed_sequence, anchor_ref = cross_page_anchor
                         else:
                             printed_sequence, anchor_ref = "", None
                         if printed_sequence and anchor_ref:

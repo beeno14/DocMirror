@@ -12,16 +12,30 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from docmirror.plugins.credit_report.value_utils import stable_record_id
 
-_REPAYMENT_RANGE_RE = re.compile(
-    r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?\s*[-—–－至到]\s*"
-    r"(20\d{2})\s*年?\s*(\d{1,2})\s*月?"
-)
+_REPAYMENT_ENDPOINT_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月")
+_REPAYMENT_RANGE_SEPARATORS = frozenset({"", "-", "—", "–", "－", "至", "到", "一"})
 _PERFORMANCE_MONTH_RE = re.compile(r"((?:19|20)\d{2})-(0[1-9]|1[0-2])\Z")
+_OWNED_GRID_MONTHLY_OMISSION_CODE = "candidate_b_monthly_owned_grid_missing_field"
+_OWNED_GRID_MONTHLY_REF_SOURCE = "candidate_b_monthly_owned_grid_cell"
+_OWNED_GRID_MONTHLY_INPUT_SOURCES = frozenset(
+    {"native_detail_table_cell", "sealed_native_physical_table_cell"}
+)
+_OWNED_GRID_MONTHLY_INPUT_BINDINGS = frozenset(
+    {
+        "canonical_field_slot",
+        "canonical_header_column",
+        "canonical_label_slot",
+        "grid_month_cell",
+        "monthly_grid_cell",
+        "source_monthly_field_cell",
+    }
+)
 
 
 def _geometry_box(value: Any) -> list[float] | None:
@@ -83,6 +97,55 @@ def _grid_months(grid: dict[str, Any]) -> set[tuple[int, int]]:
     if end < start or end - start > 120:
         return set()
     return {(value // 12, value % 12 + 1) for value in range(start, end + 1)}
+
+
+def _printed_repayment_range(text: Any) -> dict[str, int] | None:
+    """Decode exactly two printed year/month endpoints from one repayment anchor.
+
+    A finite separator catalog handles the normal dash forms first.  OCR may
+    substitute that single separator with one short non-numeric token (for
+    example ``一``) or omit it entirely.  That fallback remains fail-closed:
+    the normalized line must contain the repayment-record suffix and exactly
+    two complete ``YYYY年M月`` endpoints, with no third endpoint nearby.
+    """
+
+    compact = re.sub(r"\s+", "", str(text or ""))
+    endpoints = list(_REPAYMENT_ENDPOINT_RE.finditer(compact))
+    if len(endpoints) not in {1, 2}:
+        return None
+    prefix = compact[: endpoints[0].start()]
+    suffix = compact[endpoints[-1].end() :]
+    # OCR line grouping occasionally prepends one isolated sequence/glyph.  It
+    # may not prepend a word or another date, and the repayment suffix must be
+    # consumed completely rather than merely found somewhere in the line.
+    if len(prefix) > 1 or suffix not in {"还款记录", "的还款记录"}:
+        return None
+    if len(endpoints) == 2:
+        separator = compact[endpoints[0].end() : endpoints[1].start()]
+        if separator not in _REPAYMENT_RANGE_SEPARATORS:
+            return None
+    raw_values = (
+        int(endpoints[0].group(1)),
+        int(endpoints[0].group(2)),
+        int(endpoints[-1].group(1)),
+        int(endpoints[-1].group(2)),
+    )
+    start_year, start_month, end_year, end_month = raw_values
+    start = start_year * 12 + start_month - 1
+    end = end_year * 12 + end_month - 1
+    if (
+        not 1 <= start_month <= 12
+        or not 1 <= end_month <= 12
+        or end < start
+        or end - start > 120
+    ):
+        return None
+    return {
+        "start_year": start_year,
+        "start_month": start_month,
+        "end_year": end_year,
+        "end_month": end_month,
+    }
 
 
 def _exact_performance_month(record: Any) -> tuple[int, int] | None:
@@ -341,13 +404,11 @@ def _monthly_business_signature(record: dict[str, Any]) -> tuple[str, str | None
         raw_amount = record.get("status_amount")
     if raw_amount in (None, ""):
         return status, None
-    compact = re.sub(r"[,，\s]", "", str(raw_amount))
-    try:
-        amount = format(Decimal(compact).normalize(), "f")
-        if amount == "-0":
-            amount = "0"
-    except (InvalidOperation, TypeError, ValueError):
-        amount = f"raw:{compact}"
+    amount = _number(raw_amount)
+    if amount is None:
+        amount = f"raw:{str(raw_amount).strip()}"
+    elif Decimal(amount) == 0:
+        amount = "0"
     return status, amount
 
 
@@ -383,6 +444,631 @@ def _merged_source_refs(*records: dict[str, Any]) -> list[dict[str, Any]]:
             markers.add(marker)
             refs.append(dict(ref))
     return refs
+
+
+_MONTHLY_CANONICAL_FIELD_ALIASES = {
+    "performance_month": frozenset({"performance_month", "year", "month"}),
+    "status_code": frozenset({"status", "status_code", "repayment_status_code"}),
+    "status_amount": frozenset(
+        {"overdue_amount", "status_amount", "source_status_amount"}
+    ),
+}
+
+
+def _candidate_b_monthly_position(
+    record: Mapping[str, Any],
+) -> tuple[str, int, int] | None:
+    """Return an exact grid/month identity without accepting coerced aliases."""
+
+    refs = [
+        ref
+        for ref in record.get("source_cell_refs") or ()
+        if isinstance(ref, Mapping)
+    ]
+    grid_ids = {
+        str(value).strip()
+        for value in (
+            record.get("grid_id"),
+            *(ref.get("grid_id") for ref in refs),
+        )
+        if str(value or "").strip()
+    }
+    calendar_identity = _exact_performance_month(dict(record))
+    if calendar_identity is None or len(grid_ids) != 1:
+        return None
+    year, month = calendar_identity
+    return next(iter(grid_ids)), year, month
+
+
+def _candidate_b_monthly_observed_position(
+    record: Mapping[str, Any],
+) -> tuple[str, int, int] | None:
+    """Accept an exact native year/month pair when performance_month is absent."""
+
+    exact = _candidate_b_monthly_position(record)
+    if exact is not None:
+        return exact
+    if record.get("performance_month") not in (None, ""):
+        return None
+    refs = [
+        ref
+        for ref in record.get("source_cell_refs") or ()
+        if isinstance(ref, Mapping)
+    ]
+    grid_ids = {
+        str(value).strip()
+        for value in (
+            record.get("grid_id"),
+            *(ref.get("grid_id") for ref in refs),
+        )
+        if str(value or "").strip()
+    }
+    year = _positive_native_int(record.get("year"))
+    month = _positive_native_int(record.get("month"))
+    if len(grid_ids) != 1 or year is None or month is None:
+        return None
+    if year < 1900 or not 1 <= month <= 12:
+        return None
+    return next(iter(grid_ids)), year, month
+
+
+def _monthly_source_observations(
+    records: Iterable[Mapping[str, Any]],
+    field_name: str,
+) -> list[str]:
+    """Return only explicit source observations for one canonical month field."""
+
+    keys = {
+        "status_code": ("raw_status", "status_code", "status"),
+        "status_amount": (
+            "raw_overdue_amount",
+            "source_status_amount",
+            "status_amount",
+            "overdue_amount",
+        ),
+    }.get(field_name, ())
+    observations: set[str] = set()
+    for record in records:
+        containers = [record]
+        containers.extend(
+            value
+            for key in ("canonical_raw", "raw", "normalized")
+            if isinstance((value := record.get(key)), Mapping)
+        )
+        for container in containers:
+            for key in keys:
+                value = container.get(key)
+                text = str(value).strip() if value is not None else ""
+                if text and text.lower() not in {"unknown", "unreadable"}:
+                    observations.add(text)
+    return sorted(observations)
+
+
+def _has_observed_monthly_amount(records: Iterable[Mapping[str, Any]]) -> bool:
+    """Distinguish a visible amount cell from inferred/default amount aliases."""
+
+    amount_aliases = _MONTHLY_CANONICAL_FIELD_ALIASES["status_amount"]
+    for record in records:
+        for ref in record.get("source_cell_refs") or ():
+            if (
+                isinstance(ref, Mapping)
+                and str(ref.get("field_name") or "").strip() in amount_aliases
+            ):
+                return True
+        raw = record.get("canonical_raw")
+        if isinstance(raw, Mapping) and any(
+            raw.get(field_name) not in (None, "") for field_name in amount_aliases
+        ):
+            return True
+    return False
+
+
+def _monthly_grid_source_ref(
+    grid: Mapping[str, Any] | None,
+    *,
+    grid_id: str,
+    year: int,
+    month: int,
+    field_name: str,
+) -> dict[str, Any]:
+    """Build a value-free locator for one exact printed grid/month position."""
+
+    grid = grid if isinstance(grid, Mapping) else {}
+    page = _positive_native_int(grid.get("page"))
+    bbox: list[float] | None = None
+    for band in grid.get("col_bands") or ():
+        if not isinstance(band, Mapping):
+            continue
+        header = str(band.get("header") or "").strip()
+        index = band.get("index")
+        if header == str(month) or (isinstance(index, int) and index == month):
+            bbox = _geometry_box({"bbox": band.get("bbox")})
+            if bbox is not None:
+                break
+    if bbox is None:
+        bbox = _geometry_box({"bbox": grid.get("bbox")}) or _geometry_box(dict(grid))
+    ref: dict[str, Any] = {
+        "source": "candidate_b_monthly_grid_omission",
+        "grid_id": grid_id,
+        "performance_month": f"{year:04d}-{month:02d}",
+        "field_name": field_name,
+        "geometry_scope": "grid",
+    }
+    if page is not None:
+        ref.update({"page": page, "logical_page": page})
+    if bbox is not None:
+        ref["bbox"] = bbox
+    if grid.get("coordinate_system"):
+        ref["coordinate_system"] = grid["coordinate_system"]
+    identity = _exact_grid_source_table_identity(dict(grid))
+    if identity is not None:
+        ref["table_id"] = identity[1]
+    return ref
+
+
+def _localized_monthly_source_refs(
+    records: Iterable[Mapping[str, Any]],
+    grid: Mapping[str, Any] | None,
+    *,
+    grid_id: str,
+    year: int,
+    month: int,
+    field_name: str,
+) -> list[dict[str, Any]]:
+    """Retarget exact source refs to one canonical monthly field."""
+
+    records = list(records)
+    aliases = _MONTHLY_CANONICAL_FIELD_ALIASES[field_name]
+    refs: list[dict[str, Any]] = []
+    fallback_refs: list[dict[str, Any]] = []
+    for record in records:
+        for raw_ref in record.get("source_cell_refs") or ():
+            if not isinstance(raw_ref, Mapping):
+                continue
+            ref_month = raw_ref.get("performance_month")
+            if ref_month not in (None, "", f"{year:04d}-{month:02d}"):
+                continue
+            raw_col = raw_ref.get("col")
+            if (
+                isinstance(raw_col, int)
+                and not isinstance(raw_col, bool)
+                and 1 <= raw_col <= 12
+                and raw_col != month
+            ):
+                continue
+            source_field = str(raw_ref.get("field_name") or "").strip()
+            ref = dict(raw_ref)
+            if source_field and source_field != field_name:
+                ref["source_field_name"] = source_field
+            ref.update(
+                {
+                    "grid_id": grid_id,
+                    "performance_month": f"{year:04d}-{month:02d}",
+                    "field_name": field_name,
+                }
+            )
+            fallback_refs.append(ref)
+            if source_field in aliases:
+                refs.append(ref)
+    if not refs and field_name in {"performance_month", "status_code"}:
+        refs = fallback_refs
+    if not refs:
+        refs = [
+            _monthly_grid_source_ref(
+                grid,
+                grid_id=grid_id,
+                year=year,
+                month=month,
+                field_name=field_name,
+            )
+        ]
+    unique: dict[str, dict[str, Any]] = {}
+    for ref in refs:
+        unique.setdefault(repr(sorted(ref.items())), ref)
+    return list(unique.values())
+
+
+def _has_exact_month_source_ref(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    grid_id: str,
+    year: int,
+    month: int,
+) -> bool:
+    """Require a bounded source cell for source-diff field localization."""
+
+    month_label = f"{year:04d}-{month:02d}"
+    for record in records:
+        if _candidate_b_monthly_observed_position(record) != (grid_id, year, month):
+            continue
+        for ref in record.get("source_cell_refs") or ():
+            if not isinstance(ref, Mapping):
+                continue
+            ref_grid_id = str(ref.get("grid_id") or "").strip()
+            if ref_grid_id and ref_grid_id != grid_id:
+                continue
+            ref_month = str(ref.get("performance_month") or "").strip()
+            raw_col = ref.get("col")
+            month_matches = ref_month == month_label or (
+                isinstance(raw_col, int)
+                and not isinstance(raw_col, bool)
+                and raw_col == month
+            )
+            bbox = _geometry_box({"bbox": ref.get("bbox")})
+            if month_matches and bbox is not None and ref.get("geometry_scope") == "cell":
+                return True
+    return False
+
+
+def _owned_grid_month_source_ref(
+    refs: Iterable[Mapping[str, Any]],
+    *,
+    account_id: str,
+    grid_id: str,
+    year: int,
+    month: int,
+) -> dict[str, Any] | None:
+    """Return one closed-vocabulary cell ref for an exact owned grid/month.
+
+    The stable account/month target is stronger than a grid-local diagnostic.
+    It therefore accepts only a physical native table cell with complete row,
+    column, page, table, bbox, and evidence identity.  The output uses one
+    dedicated derived ``source`` and binding so downstream Community checks do
+    not need to trust the producer-specific source alias.
+    """
+
+    month_label = f"{year:04d}-{month:02d}"
+    candidates: list[dict[str, Any]] = []
+    for raw_ref in refs:
+        if not isinstance(raw_ref, Mapping):
+            continue
+        source = str(raw_ref.get("source") or "").strip()
+        binding = str(raw_ref.get("binding") or "").strip()
+        binding_quality = str(raw_ref.get("binding_quality") or "").strip()
+        ref_grid_id = str(raw_ref.get("grid_id") or "").strip()
+        ref_month = str(raw_ref.get("performance_month") or "").strip()
+        raw_column = raw_ref.get("column", raw_ref.get("col"))
+        column = (
+            raw_column
+            if isinstance(raw_column, int)
+            and not isinstance(raw_column, bool)
+            and raw_column >= 0
+            else None
+        )
+        raw_row = raw_ref.get("row")
+        row = (
+            raw_row
+            if isinstance(raw_row, int)
+            and not isinstance(raw_row, bool)
+            and raw_row >= 0
+            else None
+        )
+        raw_evidence_ids = raw_ref.get("evidence_ids")
+        evidence_ids = (
+            [value.strip() for value in raw_evidence_ids]
+            if isinstance(raw_evidence_ids, (list, tuple))
+            and raw_evidence_ids
+            and all(
+                isinstance(value, str) and value.strip()
+                for value in raw_evidence_ids
+            )
+            and len(set(raw_evidence_ids)) == len(raw_evidence_ids)
+            else []
+        )
+        logical_page = _positive_native_int(
+            raw_ref.get("logical_page") or raw_ref.get("page")
+        )
+        source_page = _positive_native_int(raw_ref.get("source_page"))
+        if not (
+            source in _OWNED_GRID_MONTHLY_INPUT_SOURCES
+            and binding in _OWNED_GRID_MONTHLY_INPUT_BINDINGS
+            and binding_quality in _OWNED_GRID_MONTHLY_INPUT_BINDINGS
+            and ref_grid_id == grid_id
+            and (ref_month == month_label or (not ref_month and column == month))
+            and str(raw_ref.get("geometry_scope") or "") == "cell"
+            and logical_page is not None
+            and source_page is not None
+            and str(raw_ref.get("table_id") or "").strip()
+            and row is not None
+            and column is not None
+            and _geometry_box({"bbox": raw_ref.get("bbox")}) is not None
+            and evidence_ids
+        ):
+            continue
+        source_field = str(raw_ref.get("field_name") or "").strip()
+        ref = dict(raw_ref)
+        ref.update(
+            {
+                "source": _OWNED_GRID_MONTHLY_REF_SOURCE,
+                "source_origin": source,
+                "account_id": account_id,
+                "grid_id": grid_id,
+                "performance_month": month_label,
+                "field_name": "performance_month",
+                "page": logical_page,
+                "logical_page": logical_page,
+                "source_page": source_page,
+                "row": row,
+                "column": column,
+                "evidence_ids": evidence_ids,
+                "binding": "source_account_month_identity",
+                "binding_quality": "source_account_month_identity",
+            }
+        )
+        if source_field and source_field != "performance_month":
+            ref["source_field_name"] = source_field
+        candidates.append(ref)
+    if not candidates:
+        return None
+    unique_cells: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for ref in candidates:
+        bbox = tuple(float(value) for value in ref["bbox"])
+        key = (
+            str(ref.get("source_origin") or ""),
+            int(ref["logical_page"]),
+            int(ref["source_page"]),
+            str(ref["table_id"]),
+            int(ref["row"]),
+            int(ref["column"]),
+            bbox,
+            tuple(sorted(ref["evidence_ids"])),
+        )
+        unique_cells.setdefault(key, ref)
+    if len(unique_cells) != 1:
+        return None
+    return next(iter(unique_cells.values()))
+
+
+def report_localized_monthly_omissions(
+    issue_context: Any,
+    *,
+    issue_code: str,
+    message: str,
+    parser_stage: str,
+    grid_id: str,
+    months: Iterable[tuple[int, int]],
+    account_id: str | None = None,
+    account_month_identity_proven: bool = False,
+    source_records: Iterable[Mapping[str, Any]] = (),
+    grid: Mapping[str, Any] | None = None,
+    reason_codes: Iterable[str] = (),
+    observed_context: Mapping[str, Any] | None = None,
+    require_exact_cell_ref: bool = False,
+) -> int:
+    """Report one exact issue per withheld canonical month field.
+
+    This is diagnostic-only.  It never materializes a monthly row, owner, or
+    status value, and it deliberately emits ``status_amount`` only when an
+    explicit source amount observation belongs to that exact grid/month.  A
+    caller may promote the diagnostic to canonical ``(account_id, month)``
+    identity only after proving the printed account anchor, month range, grid
+    geometry, and unique owner.  Otherwise the issue deliberately remains a
+    grid-local, non-denominator source-position diagnostic.
+    """
+
+    if issue_context is None or not grid_id:
+        return 0
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    records_by_month: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for record in source_records:
+        if not isinstance(record, Mapping):
+            continue
+        position = _candidate_b_monthly_observed_position(record)
+        if position is None or position[0] != grid_id:
+            continue
+        records_by_month.setdefault(position[1:], []).append(record)
+
+    existing_targets = {
+        (
+            str(issue.get("target_record_id") or ""),
+            {
+                "status": "status_code",
+                "repayment_status_code": "status_code",
+                "overdue_amount": "status_amount",
+            }.get(str(issue.get("field_name") or ""), str(issue.get("field_name") or "")),
+        )
+        for issue in getattr(issue_context, "_personal_detail_extraction_issues", ())
+        if isinstance(issue, Mapping)
+        and str(issue.get("target_dataset") or "")
+        in {"repayment_records", "credit_account_monthly_performance"}
+    }
+    exact_account_id = str(account_id or "").strip()
+    if not account_month_identity_proven:
+        exact_account_id = ""
+    emitted = 0
+    for year, month in sorted(set(months)):
+        if year < 1900 or not 1 <= month <= 12:
+            continue
+        month_label = f"{year:04d}-{month:02d}"
+        month_records = records_by_month.get((year, month), [])
+        if require_exact_cell_ref and not _has_exact_month_source_ref(
+            month_records,
+            grid_id=grid_id,
+            year=year,
+            month=month,
+        ):
+            continue
+        owned_ref = None
+        if exact_account_id:
+            owned_ref = _owned_grid_month_source_ref(
+                (
+                    ref
+                    for record in month_records
+                    for ref in record.get("source_cell_refs") or ()
+                    if isinstance(ref, Mapping)
+                ),
+                account_id=exact_account_id,
+                grid_id=grid_id,
+                year=year,
+                month=month,
+            )
+        month_account_id = exact_account_id if owned_ref is not None else ""
+        target_record_id = (
+            _source_account_month_record_id(month_account_id, year, month)
+            if month_account_id
+            else f"{grid_id}:{month_label}"
+        )
+        fields = ["performance_month"] if month_account_id else [
+            "performance_month",
+            "status_code",
+        ]
+        if not month_account_id and _has_observed_monthly_amount(month_records):
+            fields.append("status_amount")
+        for field_name in fields:
+            target = (target_record_id, field_name)
+            if target in existing_targets:
+                continue
+            observations = (
+                [month_label]
+                if field_name == "performance_month"
+                else _monthly_source_observations(month_records, field_name)
+            )
+            if month_account_id:
+                observed_value = {
+                    "account_id": month_account_id,
+                    "performance_month": month_label,
+                }
+                localized_refs = [owned_ref]
+                effective_issue_code = _OWNED_GRID_MONTHLY_OMISSION_CODE
+            else:
+                observed_value = {
+                    "grid_id": grid_id,
+                    "performance_month": month_label,
+                    "field_state": "source_position_withheld",
+                }
+                if observations:
+                    observed_value["source_observations"] = observations
+                if observed_context:
+                    observed_value.update(dict(observed_context))
+                localized_refs = _localized_monthly_source_refs(
+                    month_records,
+                    grid,
+                    grid_id=grid_id,
+                    year=year,
+                    month=month,
+                    field_name=field_name,
+                )
+                effective_issue_code = issue_code
+            record_issue(
+                issue_context,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code=effective_issue_code,
+                    message=message,
+                    parser_stage=parser_stage,
+                    target_dataset="repayment_records",
+                    target_record_id=target_record_id,
+                    field_name=field_name,
+                    observed_value=observed_value,
+                    candidate_value={"resolution": "withheld_pending_review"},
+                    source_refs=localized_refs,
+                    reason_codes=(
+                        *reason_codes,
+                        (
+                            "exact_account_month_identity"
+                            if month_account_id
+                            else "exact_grid_month_source_position"
+                        ),
+                        "normalized_value_withheld",
+                        "owner_or_status_value_not_invented",
+                    ),
+                ),
+            )
+            existing_targets.add(target)
+            emitted += 1
+    return emitted
+
+
+def _report_reconciled_monthly_source_alias(
+    issue_context: Any,
+    *,
+    account_id: str,
+    year: int,
+    month: int,
+    grid_id: str,
+    source_records: Iterable[Mapping[str, Any]],
+    grid: Mapping[str, Any] | None,
+    linkage_basis: str,
+) -> None:
+    """Keep one source-position alias visible without double-counting it.
+
+    A second exact printed position may resolve to an account/month identity
+    already represented by another grid.  It is source-audit evidence, not a
+    second canonical month.  Publish an informational, source-localized issue
+    so the raw plane remains conserved while canonical closure stays set based.
+    """
+
+    if issue_context is None or not account_id or not grid_id:
+        return
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    month_label = f"{year:04d}-{month:02d}"
+    localized_refs = _localized_monthly_source_refs(
+        source_records,
+        grid,
+        grid_id=grid_id,
+        year=year,
+        month=month,
+        field_name="performance_month",
+    )
+    if not localized_refs:
+        return
+    localized_refs = [
+        {
+            **ref,
+            "account_id": account_id,
+            "performance_month": month_label,
+            "field_name": "performance_month",
+            "binding": str(ref.get("binding") or "source_account_month_alias"),
+            "binding_quality": str(
+                ref.get("binding_quality") or "source_account_month_alias"
+            ),
+        }
+        for ref in localized_refs
+    ]
+    record_issue(
+        issue_context,
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="candidate_b_monthly_source_position_alias_reconciled",
+            message=(
+                "An exact printed grid/month position resolved to an already represented "
+                "account-month identity and was retained as an audit-only alias."
+            ),
+            severity="info",
+            status="informational",
+            parser_stage="candidate_b_relationship_schema",
+            target_dataset="repayment_records",
+            target_record_id=_source_account_month_record_id(
+                account_id, year, month
+            ),
+            field_name="performance_month",
+            observed_value={
+                "account_id": account_id,
+                "grid_id": grid_id,
+                "performance_month": month_label,
+                "source_position_state": "owner_bound_alias",
+                "account_month_owner_basis": linkage_basis or None,
+            },
+            candidate_value={
+                "resolution": "reconciled_to_existing_account_month_identity"
+            },
+            source_refs=localized_refs,
+            reason_codes=(
+                "exact_account_month_identity",
+                "distinct_source_position_alias",
+                "canonical_identity_not_double_counted",
+                "source_position_audit_preserved",
+            ),
+        ),
+    )
 
 
 def _account_segments(accounts: list[dict[str, Any]]) -> dict[str, list[tuple[int, float, float | None]]]:
@@ -457,8 +1143,9 @@ def candidate_b_repayment_anchor_ledger(
                 top = box[1]
             except (TypeError, ValueError):
                 continue
-            range_match = _REPAYMENT_RANGE_RE.search(text)
-            if range_match is None:
+            source_lines = [line]
+            date_range = _printed_repayment_range(text)
+            if date_range is None:
                 for neighbor_index in (index - 1, index + 1):
                     if not 0 <= neighbor_index < len(lines):
                         continue
@@ -471,9 +1158,16 @@ def candidate_b_repayment_anchor_ledger(
                         nearby = abs(float(neighbor_box[1]) - top) <= 32.0
                     except (TypeError, ValueError):
                         nearby = False
-                    if nearby and _REPAYMENT_RANGE_RE.search(neighbor_text):
-                        text = f"{neighbor_text} {text}" if neighbor_index < index else f"{text} {neighbor_text}"
-                        range_match = _REPAYMENT_RANGE_RE.search(text)
+                    combined = (
+                        f"{neighbor_text} {text}"
+                        if neighbor_index < index
+                        else f"{text} {neighbor_text}"
+                    )
+                    combined_range = _printed_repayment_range(combined)
+                    if nearby and combined_range is not None:
+                        text = combined
+                        date_range = combined_range
+                        source_lines.append(neighbor)
                         box = [
                             min(box[0], float(neighbor_box[0])),
                             min(box[1], float(neighbor_box[1])),
@@ -497,20 +1191,22 @@ def candidate_b_repayment_anchor_ledger(
             if marker in seen:
                 continue
             seen.add(marker)
-            date_range = None
-            if range_match is not None:
-                start_year, start_month, end_year, end_month = map(int, range_match.groups())
-                if (
-                    1 <= start_month <= 12
-                    and 1 <= end_month <= 12
-                    and end_year * 12 + end_month >= start_year * 12 + start_month
-                ):
-                    date_range = {
-                        "start_year": start_year,
-                        "start_month": start_month,
-                        "end_year": end_year,
-                        "end_month": end_month,
-                    }
+            evidence_ids = {
+                str(value).strip()
+                for value in (
+                    *(
+                        evidence_id
+                        for source_line in source_lines
+                        for evidence_id in source_line.get("evidence_ids") or ()
+                    ),
+                    *(
+                        token_id
+                        for source_line in source_lines
+                        for token_id in source_line.get("token_ids") or ()
+                    ),
+                )
+                if str(value or "").strip()
+            }
             anchors.append(
                 {
                     "anchor_id": stable_record_id("monthly_repayment_anchor", account_id, page, round(top), text),
@@ -529,11 +1225,220 @@ def candidate_b_repayment_anchor_ledger(
                             "source_page": source_page,
                             "bbox": box,
                             "geometry_scope": "line",
+                            **(
+                                {"evidence_ids": sorted(evidence_ids)}
+                                if evidence_ids
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "line_ids": sorted(
+                                        {
+                                            str(source_line["line_id"])
+                                            for source_line in source_lines
+                                            if source_line.get("line_id")
+                                        }
+                                    )
+                                }
+                                if any(source_line.get("line_id") for source_line in source_lines)
+                                else {}
+                            ),
                         }
                     ],
                 }
             )
     return anchors
+
+
+def _exact_repayment_anchor_source_ref(anchor: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the single immutable line ref that proves an account-bound range."""
+
+    account_id = str(anchor.get("account_id") or "").strip()
+    page = _positive_native_int(anchor.get("page"))
+    source_page = _positive_native_int(anchor.get("source_page"))
+    refs = [ref for ref in anchor.get("source_refs") or () if isinstance(ref, Mapping)]
+    if not account_id or page is None or source_page is None or len(refs) != 1:
+        return None
+    raw_ref = refs[0]
+    ref_page = _positive_native_int(raw_ref.get("logical_page"))
+    ref_source_page = _positive_native_int(raw_ref.get("source_page"))
+    bbox = _geometry_box({"bbox": raw_ref.get("bbox")})
+    evidence_ids = {
+        str(value).strip()
+        for value in raw_ref.get("evidence_ids") or ()
+        if str(value or "").strip()
+    }
+    if (
+        raw_ref.get("source") != "candidate_b_monthly_anchor_ledger"
+        or raw_ref.get("geometry_scope") != "line"
+        or ref_page != page
+        or ref_source_page != source_page
+        or bbox is None
+        or not evidence_ids
+    ):
+        return None
+    return {**dict(raw_ref), "evidence_ids": sorted(evidence_ids), "bbox": bbox}
+
+
+def _source_account_month_record_id(account_id: str, year: int, month: int) -> str:
+    """Stable typed identity for a printed account/month with no parser grid."""
+
+    account_key = stable_record_id("source_account_month_owner", account_id).split(":", 1)[-1]
+    return f"source_account_month:{account_key}:{year:04d}-{month:02d}"
+
+
+def _account_month_identity_proof(
+    account: Mapping[str, Any] | None,
+    grid: Mapping[str, Any] | None,
+    *,
+    linkage_basis: str,
+    year: int,
+    month: int,
+) -> dict[str, Any] | None:
+    """Prove one canonical account/month without relying on parser aliases."""
+
+    if not (
+        isinstance(account, dict)
+        and isinstance(grid, Mapping)
+        and _account_has_exact_anchor_ownership(account)
+    ):
+        return None
+    account_id = str(account.get("account_id") or "").strip()
+    grid_id = str(grid.get("grid_id") or "").strip()
+    grid_page = _positive_native_int(grid.get("page"))
+    grid_box = _geometry_box(grid)
+    printed_months = _grid_months(dict(grid))
+    if (
+        not account_id
+        or not grid_id
+        or grid_page is None
+        or grid_box is None
+        or (year, month) not in printed_months
+        or linkage_basis
+        not in {
+            "canonical_account_segment",
+            "explicit_account_id_confirmed_by_canonical_segment",
+            "exact_source_table_account_owner",
+        }
+    ):
+        return None
+    segments = _account_segments([dict(account)]).get(account_id, [])
+    segment_contains_grid = any(
+        page == grid_page
+        and grid_box[1] + 8.0 >= minimum
+        and (maximum is None or grid_box[1] < maximum)
+        for page, minimum, maximum in segments
+    )
+    if not segment_contains_grid and linkage_basis != "exact_source_table_account_owner":
+        return None
+    return {
+        "account_id": account_id,
+        "performance_month": f"{year:04d}-{month:02d}",
+        "grid_id": grid_id,
+        "owner_basis": linkage_basis,
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+
+
+def _report_account_range_monthly_omissions(
+    issue_context: Any,
+    *,
+    anchor: Mapping[str, Any],
+    missing_months: Iterable[tuple[int, int]],
+) -> int:
+    """Report exact range-derived identities while keeping status unknown."""
+
+    if issue_context is None:
+        return 0
+    account_id = str(anchor.get("account_id") or "").strip()
+    anchor_id = str(anchor.get("anchor_id") or "").strip()
+    exact_ref = _exact_repayment_anchor_source_ref(anchor)
+    if not account_id or not anchor_id or exact_ref is None:
+        return 0
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    existing_targets = {
+        (str(issue.get("target_record_id") or ""), str(issue.get("field_name") or ""))
+        for issue in getattr(issue_context, "_personal_detail_extraction_issues", ())
+        if isinstance(issue, Mapping)
+    }
+    emitted = 0
+    for year, month in sorted(set(missing_months)):
+        if year < 1900 or not 1 <= month <= 12:
+            continue
+        month_label = f"{year:04d}-{month:02d}"
+        target_record_id = _source_account_month_record_id(account_id, year, month)
+        common_observed = {
+            "source_identity_type": "account_month_from_printed_repayment_range",
+            "account_id": account_id,
+            "performance_month": month_label,
+            "anchor_id": anchor_id,
+            "anchor_text": anchor.get("anchor_text"),
+        }
+        field_contracts = (
+            (
+                "performance_month",
+                "candidate_b_monthly_account_range_missing_month",
+                "An exact account-bound printed repayment range proves this month identity, but no canonical monthly row was emitted.",
+                "source_account_month_range",
+                "printed_range_proves_performance_month",
+            ),
+            (
+                "status_code",
+                "candidate_b_monthly_account_range_status_grid_unavailable",
+                "The account/month identity is proven by a printed repayment range, but its status grid/cell was not reconstructed; no status was invented.",
+                "source_account_month_identity",
+                "status_source_grid_unavailable",
+            ),
+        )
+        for field_name, issue_code, message, binding, reason in field_contracts:
+            target = (target_record_id, field_name)
+            if target in existing_targets:
+                continue
+            ref = {
+                **exact_ref,
+                "account_id": account_id,
+                "performance_month": month_label,
+                "field_name": field_name,
+                "binding": binding,
+                "binding_quality": binding,
+            }
+            record_issue(
+                issue_context,
+                make_issue(
+                    category="ocr_structure_correction",
+                    issue_code=issue_code,
+                    message=message,
+                    parser_stage="candidate_b_relationship_schema",
+                    target_dataset="repayment_records",
+                    target_record_id=target_record_id,
+                    field_name=field_name,
+                    observed_value={
+                        **common_observed,
+                        "field_state": "source_position_withheld",
+                    },
+                    candidate_value={"resolution": "withheld_pending_review"},
+                    source_refs=(ref,),
+                    reason_codes=(
+                        "independent_visible_repayment_anchor",
+                        "exact_account_segment_owner",
+                        "exact_printed_date_range",
+                        "source_account_month_identity",
+                        reason,
+                        "normalized_value_withheld",
+                        "monthly_status_value_not_invented",
+                    ),
+                ),
+            )
+            existing_targets.add(target)
+            emitted += 1
+    return emitted
 
 
 def link_candidate_b_repayments(
@@ -559,6 +1464,31 @@ def link_candidate_b_repayments(
             duplicate_grid_ids.add(grid_id)
             continue
         grids[grid_id] = grid
+    source_structure_grids: dict[str, dict[str, Any]] = {}
+    duplicate_source_structure_grid_ids: set[str] = set()
+    for grid in getattr(
+        issue_context,
+        "_candidate_b_monthly_source_structure_grids",
+        (),
+    ):
+        if not isinstance(grid, dict):
+            continue
+        grid_id = str(grid.get("grid_id") or "").strip()
+        if not grid_id:
+            continue
+        if grid_id in source_structure_grids:
+            duplicate_source_structure_grid_ids.add(grid_id)
+            continue
+        source_structure_grids[grid_id] = grid
+    source_structure_records = [
+        record
+        for record in getattr(
+            issue_context,
+            "_candidate_b_monthly_source_structure_records",
+            (),
+        )
+        if isinstance(record, dict)
+    ]
     valid_ids: set[str] = set()
     account_segments: dict[str, list[tuple[int, float, float | None]]] = {}
     fallback_anchors_by_page: dict[int, list[tuple[float, str]]] = {}
@@ -689,6 +1619,12 @@ def link_candidate_b_repayments(
             observed_explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
         if grid_id and explicit_id in valid_ids:
             explicit_ids_by_grid.setdefault(grid_id, set()).add(explicit_id)
+    source_structure_records_by_grid: dict[str, list[dict[str, Any]]] = {}
+    for record in source_structure_records:
+        position = _candidate_b_monthly_observed_position(record)
+        if position is None:
+            continue
+        source_structure_records_by_grid.setdefault(position[0], []).append(record)
     for grid_id, grid in grids.items():
         explicit_id = str(grid.get("account_id") or "")
         if explicit_id:
@@ -711,6 +1647,39 @@ def link_candidate_b_repayments(
                 if account is not None:
                     candidates.append(account)
         return candidates
+
+    def exact_segment_owner(
+        grid_id: str,
+        grid: Mapping[str, Any],
+        *,
+        duplicate_ids: set[str],
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Resolve one grid from scale-invariant segment containment only."""
+
+        if grid_id in duplicate_ids:
+            return None, "duplicate_grid_id"
+        page = _positive_native_int(grid.get("page"))
+        box = _geometry_box(grid)
+        if page is None or box is None:
+            return None, "account_segment_geometry_unresolved"
+        candidates = segment_candidates(page, float(box[1]), geometry_known=True)
+        exact_candidates = [
+            candidate
+            for candidate in candidates
+            if _account_has_exact_anchor_ownership(candidate)
+        ]
+        explicit_id = str(grid.get("account_id") or "").strip()
+        if explicit_id:
+            exact_candidates = [
+                candidate
+                for candidate in exact_candidates
+                if str(candidate.get("account_id") or "") == explicit_id
+            ]
+        if len(exact_candidates) == 1:
+            return exact_candidates[0], "canonical_account_segment"
+        if len(exact_candidates) > 1:
+            return None, "ambiguous_account_segments"
+        return None, "account_segment_not_observed"
 
     def exact_source_table_owner(
         grid_id: str,
@@ -931,6 +1900,22 @@ def link_candidate_b_repayments(
                     item["account_identifier"] = identifier
                 else:
                     item.pop("account_identifier", None)
+            observed_position = _candidate_b_monthly_observed_position(item)
+            if observed_position is not None and observed_position[0] == grid_id:
+                identity_proof = _account_month_identity_proof(
+                    selected,
+                    grid,
+                    linkage_basis=linkage_basis,
+                    year=observed_position[1],
+                    month=observed_position[2],
+                )
+                if identity_proof is not None:
+                    item["_account_month_identity_proof"] = identity_proof
+                    item["_account_month_identity_proof_status"] = "exact"
+                else:
+                    item["_account_month_identity_proof_status"] = (
+                        "unproven_exact_anchor_range_geometry_owner"
+                    )
         else:
             item.pop("account_id", None)
             item.pop("account_identifier", None)
@@ -1000,6 +1985,31 @@ def link_candidate_b_repayments(
                             "nearest_or_single_account_inference_disabled",
                             "relation_withheld",
                         ),
+                    ),
+                )
+                report_localized_monthly_omissions(
+                    issue_context,
+                    issue_code="candidate_b_monthly_grid_owner_unresolved_field",
+                    message=(
+                        "A source-known monthly field was withheld because its printed grid could not be "
+                        "assigned to exactly one canonical account owner."
+                    ),
+                    parser_stage="candidate_b_relationship_schema",
+                    grid_id=grid_id,
+                    months=_grid_months(grid)
+                    or {
+                        position[1:]
+                        for candidate in source_candidates
+                        if (position := _candidate_b_monthly_observed_position(candidate))
+                        is not None
+                    },
+                    source_records=source_candidates,
+                    grid=grid,
+                    observed_context={"linkage_basis": linkage_basis},
+                    reason_codes=(
+                        "exact_account_segment_or_source_table_owner_required",
+                        linkage_basis,
+                        "relation_withheld",
                     ),
                 )
             # A canonical monthly row cannot exist in v2 without a proven
@@ -1208,12 +2218,79 @@ def link_candidate_b_repayments(
         from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue, record_issue
 
         records_by_grid: dict[str, list[dict[str, Any]]] = {}
+        emitted_account_months: set[tuple[str, int, int]] = set()
         for record in output:
             refs = record.get("source_cell_refs") if isinstance(record.get("source_cell_refs"), list) else []
             first_ref = refs[0] if refs and isinstance(refs[0], dict) else {}
             grid_id = str(record.get("grid_id") or first_ref.get("grid_id") or "")
             if grid_id:
                 records_by_grid.setdefault(grid_id, []).append(record)
+            observed_position = _candidate_b_monthly_observed_position(record)
+            account_id = str(record.get("account_id") or "").strip()
+            if account_id and observed_position is not None:
+                emitted_account_months.add(
+                    (account_id, observed_position[1], observed_position[2])
+                )
+
+        bound_source_positions: dict[
+            tuple[str, int, int],
+            dict[tuple[str, str], dict[str, Any]],
+        ] = {}
+
+        def register_bound_source_position(
+            *,
+            account_id: str,
+            year: int,
+            month: int,
+            grid_id: str,
+            source_records: Iterable[Mapping[str, Any]],
+            grid: Mapping[str, Any] | None,
+            linkage_basis: str,
+        ) -> None:
+            """Register one exact source position under its canonical identity."""
+
+            if not account_id or not grid_id or year < 1900 or not 1 <= month <= 12:
+                return
+            position = (grid_id, f"{year:04d}-{month:02d}")
+            bound_source_positions.setdefault((account_id, year, month), {}).setdefault(
+                position,
+                {
+                    "grid_id": grid_id,
+                    "source_records": list(source_records),
+                    "grid": grid,
+                    "linkage_basis": linkage_basis,
+                },
+            )
+
+        for record in linked:
+            proof = record.get("_account_month_identity_proof")
+            calendar_identity = _exact_performance_month(record)
+            account_id = str(record.get("account_id") or "").strip()
+            if not (
+                isinstance(proof, Mapping)
+                and calendar_identity is not None
+                and str(proof.get("account_id") or "").strip() == account_id
+                and proof.get("account_anchor_exact") is True
+                and proof.get("printed_month_range_exact") is True
+                and proof.get("grid_geometry_exact") is True
+                and proof.get("unique_owner") is True
+            ):
+                continue
+            year, month = calendar_identity
+            grid_id = str(proof.get("grid_id") or record_grid_id(record)).strip()
+            if str(proof.get("performance_month") or "").strip() != (
+                f"{year:04d}-{month:02d}"
+            ):
+                continue
+            register_bound_source_position(
+                account_id=account_id,
+                year=year,
+                month=month,
+                grid_id=grid_id,
+                source_records=source_candidates_by_grid.get(grid_id, [record]),
+                grid=grids.get(grid_id),
+                linkage_basis=str(proof.get("owner_basis") or ""),
+            )
         for grid_id, grid in grids.items():
             expected_months = _grid_months(grid)
             if not expected_months:
@@ -1276,7 +2353,52 @@ def link_candidate_b_repayments(
                     observed_months.add((year, month))
                 if record.get("account_id"):
                     owners.add(str(record["account_id"]))
-            if observed_months == expected_months and len(owners) == 1:
+            grid_owner, linkage_basis = owner_by_grid.get(grid_id, (None, ""))
+            if grid_owner is None and grid_id not in owner_by_grid:
+                grid_owner, linkage_basis = exact_segment_owner(
+                    grid_id,
+                    grid,
+                    duplicate_ids=duplicate_grid_ids,
+                )
+                if grid_owner is None:
+                    table_owner, table_basis = source_table_owner_by_grid.get(
+                        grid_id,
+                        (None, "source_table_grid_not_observed"),
+                    )
+                    if table_owner is not None:
+                        grid_owner, linkage_basis = table_owner, table_basis
+                owner_by_grid[grid_id] = grid_owner, linkage_basis
+            owner_id = str((grid_owner or {}).get("account_id") or "").strip()
+            proven_months = {
+                (year, month)
+                for year, month in expected_months
+                if owner_id
+                and _account_month_identity_proof(
+                    grid_owner,
+                    grid,
+                    linkage_basis=linkage_basis,
+                    year=year,
+                    month=month,
+                )
+                is not None
+            }
+            for year, month in proven_months:
+                register_bound_source_position(
+                    account_id=owner_id,
+                    year=year,
+                    month=month,
+                    grid_id=grid_id,
+                    source_records=source_candidates_by_grid.get(grid_id, []),
+                    grid=grid,
+                    linkage_basis=linkage_basis,
+                )
+            covered_months = {
+                (year, month)
+                for year, month in proven_months
+                if (owner_id, year, month) in emitted_account_months
+            }
+            contract_months = covered_months if proven_months else observed_months
+            if contract_months == expected_months and len(owners) == 1:
                 continue
             record_issue(
                 issue_context,
@@ -1299,6 +2421,9 @@ def link_candidate_b_repayments(
                             source_candidates_by_grid.get(grid_id, [])
                         ),
                         "account_owners": sorted(owners),
+                        "canonical_account_id": owner_id or None,
+                        "account_month_covered_count": len(covered_months),
+                        "account_month_owner_basis": linkage_basis or None,
                     },
                     candidate_value={
                         "printed_month_count": len(expected_months),
@@ -1311,6 +2436,115 @@ def link_candidate_b_repayments(
                         "single_account_grid_contract",
                         "dataset_incomplete",
                     ),
+                ),
+            )
+            missing_months = expected_months - contract_months
+            if missing_months:
+                report_localized_monthly_omissions(
+                    issue_context,
+                    issue_code="candidate_b_monthly_grid_contract_missing_field",
+                    message=(
+                        "A source-known field for a printed grid/month was not present in the linked "
+                        "canonical monthly relation."
+                    ),
+                    parser_stage="candidate_b_relationship_schema",
+                    grid_id=grid_id,
+                    months=missing_months,
+                    account_id=owner_id or None,
+                    account_month_identity_proven=bool(
+                        owner_id and missing_months <= proven_months
+                    ),
+                    source_records=source_candidates_by_grid.get(grid_id, []),
+                    grid=grid,
+                    observed_context={
+                        "linked_months": sorted(
+                            f"{year:04d}-{month:02d}" for year, month in observed_months
+                        ),
+                        "account_month_owner_basis": linkage_basis or None,
+                    },
+                    reason_codes=(
+                        "printed_date_range_contract",
+                        "grid_month_missing_from_linked_relation",
+                        "dataset_incomplete",
+                    ),
+                )
+
+        # The detached plane contributes only source positions.  Promote one
+        # to the account-month closure iff its own geometry falls inside one
+        # exact account segment; extraction-local grid aliases are then
+        # reconciled against the global emitted identity set.
+        for grid_id, grid in source_structure_grids.items():
+            records = source_structure_records_by_grid.get(grid_id, [])
+            source_months = {
+                position[1:]
+                for record in records
+                if (position := _candidate_b_monthly_observed_position(record))
+                is not None
+            }
+            source_months.update(_grid_months(grid))
+            if not source_months:
+                continue
+            grid_owner, linkage_basis = exact_segment_owner(
+                grid_id,
+                grid,
+                duplicate_ids=duplicate_source_structure_grid_ids,
+            )
+            owner_id = str((grid_owner or {}).get("account_id") or "").strip()
+            proven_source_months = {
+                (year, month)
+                for year, month in source_months
+                if owner_id
+                and _account_month_identity_proof(
+                    grid_owner,
+                    grid,
+                    linkage_basis=linkage_basis,
+                    year=year,
+                    month=month,
+                )
+                is not None
+            }
+            for year, month in proven_source_months:
+                register_bound_source_position(
+                    account_id=owner_id,
+                    year=year,
+                    month=month,
+                    grid_id=grid_id,
+                    source_records=records,
+                    grid=grid,
+                    linkage_basis=linkage_basis,
+                )
+            proven_missing_months = {
+                (year, month)
+                for year, month in proven_source_months
+                if (owner_id, year, month) not in emitted_account_months
+            }
+            if not proven_missing_months:
+                continue
+            report_localized_monthly_omissions(
+                issue_context,
+                issue_code="canonical_monthly_source_structure_missing_field",
+                message=(
+                    "A detached printed grid/month source position has a unique exact account owner, "
+                    "but no canonical monthly business row was emitted."
+                ),
+                parser_stage="candidate_b_relationship_schema",
+                grid_id=grid_id,
+                months=proven_missing_months,
+                account_id=owner_id,
+                account_month_identity_proven=True,
+                source_records=records,
+                grid=grid,
+                observed_context={
+                    "linkage_basis": linkage_basis,
+                    "source_structure_is_audit_only": True,
+                },
+                require_exact_cell_ref=True,
+                reason_codes=(
+                    "detached_source_structure_exact_key",
+                    "exact_account_segment_owner",
+                    "printed_date_range_contract",
+                    "grid_alias_reconciled_by_account_month",
+                    "dataset_incomplete",
                 ),
             )
         for anchor in repayment_anchors or ():
@@ -1330,10 +2564,16 @@ def link_candidate_b_repayments(
                 segment_maximum = None
             anchor_range = anchor.get("date_range")
             anchor_months = _grid_months({"audit": {"date_range": anchor_range}})
-            candidates: list[str] = []
-            for grid_id, grid in grids.items():
-                if int(grid.get("page") or 0) != page:
-                    continue
+            candidate_months: set[tuple[int, int]] = set()
+            anchor_grid_candidates = (
+                *((grid_id, grid, False) for grid_id, grid in grids.items()),
+                *(
+                    (grid_id, grid, True)
+                    for grid_id, grid in source_structure_grids.items()
+                ),
+            )
+            for grid_id, grid, source_structure_only in anchor_grid_candidates:
+                grid_page = int(grid.get("page") or 0)
                 explicit_account_id = str(grid.get("account_id") or "")
                 if explicit_account_id and explicit_account_id != account_id:
                     continue
@@ -1351,12 +2591,53 @@ def link_candidate_b_repayments(
                     and re.sub(r"\s+", "", str(anchor.get("anchor_text") or ""))
                     == re.sub(r"\s+", "", str(grid.get("anchor_text") or ""))
                 )
-                range_match = bool(anchor_months and anchor_months == _grid_months(grid))
-                if geometry_match or (
-                    explicit_account_id == account_id and (text_match or range_match)
+                grid_months = _grid_months(grid)
+                overlapping_months = anchor_months & grid_months
+                if not overlapping_months:
+                    continue
+                if source_structure_only:
+                    grid_owner, owner_basis = exact_segment_owner(
+                        grid_id,
+                        grid,
+                        duplicate_ids=duplicate_source_structure_grid_ids,
+                    )
+                else:
+                    grid_owner, owner_basis = owner_by_grid.get(grid_id, (None, ""))
+                if (
+                    grid_owner is None
+                    or str(grid_owner.get("account_id") or "") != account_id
                 ):
-                    candidates.append(grid_id)
-            if candidates:
+                    continue
+                grid_is_in_account_segment = any(
+                    segment_page == grid_page
+                    and grid_box is not None
+                    and grid_box[1] + 8.0 >= minimum
+                    and (maximum is None or grid_box[1] < maximum)
+                    for segment_page, minimum, maximum in account_segments.get(
+                        account_id, []
+                    )
+                )
+                same_page_match = grid_page == page and (
+                    geometry_match or text_match or bool(overlapping_months)
+                )
+                cross_page_match = grid_page != page and grid_is_in_account_segment
+                if not (same_page_match or cross_page_match):
+                    continue
+                proven_overlapping_months = {
+                    (year, month)
+                    for year, month in overlapping_months
+                    if _account_month_identity_proof(
+                        grid_owner,
+                        grid,
+                        linkage_basis=owner_basis,
+                        year=year,
+                        month=month,
+                    )
+                    is not None
+                }
+                candidate_months.update(proven_overlapping_months)
+            missing_anchor_months = anchor_months - candidate_months
+            if anchor_months and not missing_anchor_months:
                 continue
             record_issue(
                 issue_context,
@@ -1371,12 +2652,16 @@ def link_candidate_b_repayments(
                     target_dataset="repayment_records",
                     target_record_id=account_id,
                     field_name="account_id",
-                    observed_value={
+                        observed_value={
                         "anchor_id": anchor.get("anchor_id"),
                         "account_id": account_id or None,
                         "anchor_text": anchor.get("anchor_text"),
                         "date_range": anchor_range,
-                        "materialized_grid_count": 0,
+                            "materialized_grid_count": int(bool(candidate_months)),
+                            "missing_months": sorted(
+                                f"{year:04d}-{month:02d}"
+                                for year, month in missing_anchor_months
+                            ),
                     },
                     candidate_value={"resolution": "missing_grid_reported_for_account"},
                     source_refs=tuple(
@@ -1390,15 +2675,55 @@ def link_candidate_b_repayments(
                     ),
                 ),
             )
+            if missing_anchor_months:
+                _report_account_range_monthly_omissions(
+                    issue_context,
+                    anchor=anchor,
+                    missing_months=missing_anchor_months,
+                )
+        for identity, source_positions in bound_source_positions.items():
+            if len(source_positions) <= 1:
+                continue
+            account_id, year, month = identity
+            primary_position: tuple[str, str] | None = None
+            retained_index = positions.get(identity)
+            if retained_index is not None:
+                retained_grid_id = record_grid_id(output[retained_index])
+                retained_position = (
+                    retained_grid_id,
+                    f"{year:04d}-{month:02d}",
+                )
+                if retained_position in source_positions:
+                    primary_position = retained_position
+            if primary_position is None:
+                primary_position = min(source_positions)
+            for position, payload in sorted(source_positions.items()):
+                if position == primary_position:
+                    continue
+                _report_reconciled_monthly_source_alias(
+                    issue_context,
+                    account_id=account_id,
+                    year=year,
+                    month=month,
+                    grid_id=payload["grid_id"],
+                    source_records=payload["source_records"],
+                    grid=payload["grid"],
+                    linkage_basis=payload["linkage_basis"],
+                )
     return output
 
 
 def _number(value: Any) -> str | None:
-    text = re.sub(r"[,，\s]", "", str(value or ""))
-    if not text:
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip().replace("，", ",")
+    if not re.fullmatch(
+        r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?",
+        text,
+    ):
         return None
     try:
-        parsed = Decimal(text)
+        parsed = Decimal(text.replace(",", ""))
     except InvalidOperation:
         return None
     return format(parsed, "f")

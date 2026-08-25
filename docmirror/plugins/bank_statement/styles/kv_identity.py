@@ -66,20 +66,21 @@ def enrich_identity_fields(
                             continue
                         for ck in candidate_keys:
                             if _matches_identity_key(key, ck):
+                                source_ref = {
+                                    "source": "page.table_kv",
+                                    "page": int(getattr(page, "page_number", 0) or 0),
+                                }
+                                if getattr(cell, "bbox", None):
+                                    source_ref["bbox"] = list(cell.bbox)
                                 fields[field_name] = {
                                     "raw_name": key,
                                     "raw_value": val,
                                     "normalized_value": val,
                                     "data_type": "string",
+                                    "source": "page.table_kv",
+                                    "source_refs": [source_ref],
+                                    "evidence_ids": list(getattr(cell, "evidence_ids", []) or []),
                                 }
                                 break
-
-    if "银座银行" in ctx.full_text and "bank_name" not in fields:
-        fields["bank_name"] = {
-            "raw_name": "银行名称",
-            "raw_value": "银座银行",
-            "normalized_value": "银座银行",
-            "data_type": "string",
-        }
 
     return fields

@@ -383,7 +383,7 @@ def test_v2_monthly_gate_keeps_exact_status_issues_and_aggregates_grid() -> None
     )
     assert status_row["presence_status"] == "partial"
     assert status_row["observed_row_count"] == 1
-    assert status_row["expected_row_count"] == 3
+    assert status_row["expected_row_count"] == 1
 
 
 def test_v2_monthly_gate_prunes_stale_exact_status_issue_after_resolution() -> None:
@@ -493,14 +493,14 @@ def test_v2_monthly_gate_keeps_exact_status_issue_for_noncanonical_orphan() -> N
         }
     )
 
-    assert projected["credit_account_monthly_performance"] == []
+    assert projected.get("credit_account_monthly_performance", []) == []
     monthly_status = next(
         row
         for row in projected["dataset_status"]
         if row["dataset_name"] == "credit_account_monthly_performance"
     )
     assert monthly_status["observed_row_count"] == 0
-    assert monthly_status["expected_row_count"] == 1
+    assert "expected_row_count" not in monthly_status
     local_issue = next(
         issue
         for issue in projected["extraction_issues"]
@@ -770,14 +770,14 @@ def test_v2_monthly_null_overlay_is_withheld_with_explicit_grid_issue() -> None:
         }
     )
 
-    assert projected["credit_account_monthly_performance"] == []
+    assert projected.get("credit_account_monthly_performance", []) == []
     monthly_status = next(
         row
         for row in projected["dataset_status"]
         if row["dataset_name"] == "credit_account_monthly_performance"
     )
     assert monthly_status["observed_row_count"] == 0
-    assert monthly_status["expected_row_count"] == 1
+    assert "expected_row_count" not in monthly_status
     issue = next(
         row
         for row in projected["extraction_issues"]
@@ -877,8 +877,263 @@ def test_control_field_names_use_only_canonical_dataset_fields() -> None:
     assert _canonical_field_name("subject_employment", "employment_components") is None
     assert _canonical_field_name("subject_profile", "mobile_phone") is None
     assert (
+        _canonical_field_name("credit_accounts", "account_status_raw")
+        == "account_lifecycle_state"
+    )
+    assert (
+        _canonical_field_name("credit_accounts", "account_status_resolution")
+        == "account_lifecycle_state"
+    )
+    assert (
         _canonical_field_name("credit_business_overview", "最近2年内的查询次数")
         == "numeric_value"
+    )
+
+
+def test_transformed_control_field_names_land_in_the_final_catalog() -> None:
+    aliases = (
+        (
+            "postpaid_payment_history",
+            "postpaid_monthly_performance",
+            "postpaid_payment_history_id",
+            "postpaid_monthly_performance_id",
+        ),
+        (
+            "postpaid_payment_history",
+            "postpaid_monthly_performance",
+            "year",
+            "performance_month",
+        ),
+        (
+            "postpaid_payment_history",
+            "postpaid_monthly_performance",
+            "month",
+            "performance_month",
+        ),
+        (
+            "postpaid_payment_history",
+            "postpaid_monthly_performance",
+            "status",
+            "status_code",
+        ),
+        (
+            "personal_housing_fund_records",
+            "housing_fund_records",
+            "personal_housing_fund_id",
+            "public_record_id",
+        ),
+        (
+            "personal_housing_fund_records",
+            "housing_fund_records",
+            "personal_contribution_ratio",
+            "personal_contribution_ratio_percent",
+        ),
+        (
+            "personal_housing_fund_records",
+            "housing_fund_records",
+            "employer_contribution_ratio",
+            "employer_contribution_ratio_percent",
+        ),
+        (
+            "tax_arrears_records",
+            "tax_arrears_records",
+            "authority",
+            "tax_authority",
+        ),
+        (
+            "civil_judgment_records",
+            "civil_judgment_records",
+            "authority",
+            "filing_court",
+        ),
+        (
+            "civil_judgment_records",
+            "civil_judgment_records",
+            "start_date",
+            "filing_date",
+        ),
+        (
+            "civil_judgment_records",
+            "civil_judgment_records",
+            "effective_date",
+            "judgment_effective_date",
+        ),
+        (
+            "enforcement_records",
+            "enforcement_records",
+            "authority",
+            "court",
+        ),
+        (
+            "enforcement_records",
+            "enforcement_records",
+            "start_date",
+            "filing_date",
+        ),
+        (
+            "enforcement_records",
+            "enforcement_records",
+            "end_date",
+            "closure_date",
+        ),
+        (
+            "administrative_penalty_records",
+            "administrative_penalty_records",
+            "start_date",
+            "effective_month",
+        ),
+        (
+            "professional_qualification_records",
+            "professional_qualification_records",
+            "authority",
+            "issuing_authority",
+        ),
+        (
+            "award_records",
+            "administrative_award_records",
+            "start_date",
+            "effective_month",
+        ),
+        (
+            "administrative_penalty_records",
+            "administrative_penalty_records",
+            "effective_date",
+            "effective_month",
+        ),
+        (
+            "administrative_penalty_records",
+            "administrative_penalty_records",
+            "end_date",
+            "end_month",
+        ),
+        (
+            "professional_qualification_records",
+            "professional_qualification_records",
+            "obtained_date",
+            "obtained_month",
+        ),
+        (
+            "professional_qualification_records",
+            "professional_qualification_records",
+            "expiry_date",
+            "expiry_month",
+        ),
+        (
+            "professional_qualification_records",
+            "professional_qualification_records",
+            "revocation_date",
+            "revocation_month",
+        ),
+        (
+            "award_records",
+            "administrative_award_records",
+            "effective_date",
+            "effective_month",
+        ),
+        (
+            "award_records",
+            "administrative_award_records",
+            "end_date",
+            "end_month",
+        ),
+    )
+    source_refs = {
+        index: [
+            {
+                "ref_type": "source_cell",
+                "ref_id": f"cell:{index}",
+                "field_name": source_field,
+                "page": index,
+            }
+        ]
+        for index, (_source, _target, source_field, _canonical) in enumerate(
+            aliases, start=1
+        )
+    }
+    projected = project_personal_detail_datasets(
+        {
+            "personal_detail_field_observations": [
+                _record(
+                    f"observation:{index}",
+                    field_observation_id=f"observation:{index}",
+                    dataset_name=source_dataset,
+                    business_record_id=f"business:{index}",
+                    field_name=source_field,
+                    observation_status="unreadable",
+                    raw_value="unreadable",
+                    source_refs=source_refs[index],
+                )
+                for index, (source_dataset, _target, source_field, _canonical) in enumerate(
+                    aliases, start=1
+                )
+            ],
+            "personal_detail_extraction_issues": [
+                _record(
+                    f"issue:{index}",
+                    extraction_issue_id=f"issue:{index}",
+                    category="schema_incompleteness",
+                    issue_code="transformed_control_field_probe",
+                    target_dataset=source_dataset,
+                    target_record_id=f"business:{index}",
+                    field_name=source_field,
+                    observed_value="unreadable",
+                    source_refs=source_refs[index],
+                )
+                for index, (source_dataset, _target, source_field, _canonical) in enumerate(
+                    aliases, start=1
+                )
+            ],
+        }
+    )
+    catalog = personal_detail_data_dictionary()["datasets"]
+    observations = projected["field_observations"]
+    issues = projected["extraction_issues"]
+
+    for index, (_source, target, source_field, canonical_field) in enumerate(
+        aliases, start=1
+    ):
+        observation = next(
+            row
+            for row in observations
+            if row["field_observation_id"] == f"observation:{index}"
+        )
+        issue = next(
+            row for row in issues if row["extraction_issue_id"] == f"issue:{index}"
+        )
+        assert observation["record_id"] == f"observation:{index}"
+        assert observation["dataset_name"] == target
+        assert observation["business_record_id"] == f"business:{index}"
+        assert observation["field_name"] == canonical_field
+        assert observation["field_name"] in catalog[target]["columns"]
+        assert observation["source_refs"] == source_refs[index]
+        assert issue["record_id"] == f"issue:{index}"
+        assert issue["target_dataset"] == target
+        assert issue["target_record_id"] == f"business:{index}"
+        assert issue["field_name"] == canonical_field
+        assert issue["field_name"] in catalog[target]["columns"]
+        assert issue["source_refs"] == source_refs[index]
+
+
+def test_public_structural_control_labels_are_not_canonical_fields() -> None:
+    public_datasets = (
+        "tax_arrears_records",
+        "civil_judgment_records",
+        "enforcement_records",
+        "administrative_penalty_records",
+        "housing_fund_records",
+        "social_assistance_records",
+        "professional_qualification_records",
+        "administrative_award_records",
+    )
+
+    assert all(
+        _canonical_field_name(dataset_name, source_field) is None
+        for dataset_name in public_datasets
+        for source_field in ("content", "record_type", "unmapped_content")
+    )
+    assert (
+        _canonical_field_name("tax_arrears_records", "arrears_amount")
+        == "arrears_amount"
     )
 
 
@@ -1003,6 +1258,16 @@ def test_v2_successful_business_row_drops_redundant_evidence_snapshots() -> None
 
 
 def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
+    def row_ref(owner: str) -> dict[str, Any]:
+        return {
+            "source": "candidate_b_canonical_inquiry_line",
+            "logical_page": 26,
+            "source_page": 13,
+            "bbox": [50.0, 100.0, 390.0, 112.0],
+            "geometry_scope": "row",
+            "evidence_ids": [f"personal_detail_page_reocr:{owner}"],
+        }
+
     def inquiry(
         sequence: int,
         inquiry_date: str,
@@ -1011,9 +1276,10 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
         *,
         channel: str = "institution",
         suffix: str = "",
+        owner: str | None = None,
     ) -> dict[str, Any]:
         inquiry_id = f"inquiry:{sequence}{suffix}"
-        return _record(
+        record = _record(
             inquiry_id,
             inquiry_id=inquiry_id,
             sequence=sequence,
@@ -1023,13 +1289,18 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
             query_channel=channel,
             inquiry_type=channel,
         )
+        if owner is not None:
+            record["source_refs"] = [row_ref(owner)]
+        return record
 
     def unresolved(
         issue_id: str,
         sequence: int,
         row: list[str],
+        *,
+        owner: str | None = None,
     ) -> dict[str, Any]:
-        return _record(
+        issue = _record(
             issue_id,
             extraction_issue_id=issue_id,
             issue_code="candidate_b_inquiry_row_cells_unresolved",
@@ -1043,12 +1314,27 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
             observed_value={"sequence": sequence, "row": row},
             candidate_value={"missing_fields": ["inquiry_date"]},
         )
+        if owner is not None:
+            issue["source_refs"] = [row_ref(owner)]
+        return issue
 
     projected = project_personal_detail_datasets(
         {
             "inquiry_records": [
-                inquiry(3, "2023-01-03", "广发银行股份有限公司", "贷后管理"),
-                inquiry(82, "2021-04-25", "中国光大银行股份有限公司", "贷后管理"),
+                inquiry(
+                    3,
+                    "2023-01-03",
+                    "广发银行股份有限公司",
+                    "贷后管理",
+                    owner="row:3",
+                ),
+                inquiry(
+                    82,
+                    "2021-04-25",
+                    "中国光大银行股份有限公司",
+                    "贷后管理",
+                    owner="row:82",
+                ),
                 inquiry(90, "2021-01-01", "中信银行股份有限公司", "贷后管理"),
                 inquiry(
                     90,
@@ -1064,12 +1350,40 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
                     "本人查询",
                     channel="personal",
                 ),
+                inquiry(
+                    92,
+                    "2021-01-03",
+                    "中信银行股份有限公司",
+                    "贷后管理",
+                    owner="row:92",
+                ),
+                inquiry(
+                    93,
+                    "2021-01-04",
+                    "中信银行股份有限公司",
+                    "贷后管理",
+                    owner="final-row:93",
+                ),
+                inquiry(
+                    94,
+                    "2021-01-05",
+                    "中信银行股份有限公司",
+                    "贷后管理",
+                    owner="row:94",
+                ),
+                inquiry(
+                    95,
+                    "2021-01-06",
+                    "中信银行股份有限公司",
+                    "贷后管理",
+                ),
             ],
             "personal_detail_extraction_issues": [
                 unresolved(
                     "issue:matched-date-noise",
                     3,
                     ["3", "2023.01.03 20", "广发银行股份有限公司", "贷后管理"],
+                    owner="row:3",
                 ),
                 unresolved(
                     "issue:matched-edge-noise",
@@ -1080,6 +1394,7 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
                         "多 中国光大银行股份有限公司",
                         "贷后管理 司 %5",
                     ],
+                    owner="row:82",
                 ),
                 unresolved(
                     "issue:missing-sequence",
@@ -1090,6 +1405,7 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
                     "issue:mismatched-reason",
                     3,
                     ["3", "2023.01.03", "广发银行股份有限公司", "贷款审批"],
+                    owner="row:3",
                 ),
                 unresolved(
                     "issue:duplicate-sequence",
@@ -1106,6 +1422,29 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
                     3,
                     ["3", "2023.01.03", "广发银行股份有限公司"],
                 ),
+                unresolved(
+                    "issue:matched-whitespace",
+                    92,
+                    ["92", "2021.01.03", "中 信银行股份有限公司", "贷后管理"],
+                    owner="row:92",
+                ),
+                unresolved(
+                    "issue:different-owner",
+                    93,
+                    ["93", "2021.01.04", "中信银行股份有限公司", "贷后管理"],
+                    owner="issue-row:93",
+                ),
+                unresolved(
+                    "issue:leading-han-residue",
+                    94,
+                    ["94", "2021.01.05", "福中信银行股份有限公司", "贷后管理"],
+                    owner="row:94",
+                ),
+                unresolved(
+                    "issue:no-owner-proof",
+                    95,
+                    ["95", "2021.01.06", "中信银行股份有限公司", "贷后管理"],
+                ),
             ],
         }
     )
@@ -1115,14 +1454,92 @@ def test_v2_reconciles_only_fully_matched_targetless_inquiry_issues() -> None:
         for row in projected.get("extraction_issues", [])
     }
     assert "issue:matched-date-noise" not in issue_ids
-    assert "issue:matched-edge-noise" not in issue_ids
+    assert "issue:matched-whitespace" not in issue_ids
     assert {
+        "issue:matched-edge-noise",
         "issue:missing-sequence",
         "issue:mismatched-reason",
         "issue:duplicate-sequence",
         "issue:personal-channel",
         "issue:incomplete-fingerprint",
+        "issue:different-owner",
+        "issue:leading-han-residue",
+        "issue:no-owner-proof",
     } <= issue_ids
+
+
+def test_v2_targetless_inquiry_does_not_trust_textless_repair_geometry() -> None:
+    raw_institution = "福 中信银行股份有限公司"
+    clean_institution = "中信银行股份有限公司"
+    institution_ref = {
+        "source": "native_detail_table_cell",
+        "logical_page": 26,
+        "source_page": 13,
+        "table_id": "pt_26_0",
+        "row": 4,
+        "column": 2,
+        "bbox": [130.0, 100.0, 330.0, 112.0],
+        "coordinate_system": "pdf_points_top_left",
+        "geometry_scope": "cell",
+        "evidence_ids": ["ocr:sp0013:lp0026:r4:c2"],
+        "field_name": "institution",
+        "binding": "canonical_header_column",
+        "binding_quality": "canonical_header_column",
+    }
+    repair_ref = {
+        "source": "personal_detail_installed_page_evidence",
+        "logical_page": 26,
+        "source_page": 13,
+        "bbox": [140.0, 101.0, 320.0, 111.0],
+        "coordinate_system": "pdf_points_top_left",
+        "geometry_scope": "token_band",
+        "geometry_status": "exact",
+        "evidence_ids": ["personal_detail_page_reocr:source:13:w94"],
+        "binding": "canonical_field_slot_repair_candidate",
+        "binding_quality": "exact_source_bound_candidate",
+    }
+    inquiry = _record(
+        "inquiry:94",
+        inquiry_id="inquiry:94",
+        sequence=94,
+        inquiry_date="2021-01-05",
+        institution=clean_institution,
+        reason="贷后管理",
+        query_channel="institution",
+        inquiry_type="institution",
+    )
+    inquiry["canonical_raw"] = {"institution": raw_institution}
+    inquiry["source_cell_refs"] = [institution_ref, repair_ref]
+    issue = _record(
+        "issue:source-bound-correction",
+        extraction_issue_id="issue:source-bound-correction",
+        issue_code="candidate_b_inquiry_row_cells_unresolved",
+        category="ocr_structure_correction",
+        status="requires_review",
+        severity="warning",
+        parser_stage="candidate_b_inquiry_schema",
+        target_dataset="inquiry_records",
+        target_record_id=None,
+        field_name="inquiry_date",
+        observed_value={
+            "sequence": 94,
+            "row": ["94", "2021.01.05", raw_institution, "贷后管理"],
+        },
+        candidate_value={"missing_fields": ["inquiry_date"]},
+    )
+    issue["source_refs"] = [institution_ref]
+
+    projected = project_personal_detail_datasets(
+        {
+            "inquiry_records": [inquiry],
+            "personal_detail_extraction_issues": [issue],
+        }
+    )
+
+    assert {
+        row.get("extraction_issue_id")
+        for row in projected.get("extraction_issues", [])
+    } == {"issue:source-bound-correction"}
 
 
 def test_v2_summary_issue_targets_follow_metric_types_when_values_are_withheld() -> None:
@@ -1213,14 +1630,14 @@ def test_v2_source_sentinel_is_silent_absence_but_monthly_dash_is_reported() -> 
     spouse = projected["subject_spouse"][0]
     assert spouse["name"] is None
     assert spouse.get("canonical_raw", {}).get("name") is None
-    assert projected["credit_account_monthly_performance"] == []
+    assert projected.get("credit_account_monthly_performance", []) == []
     monthly_status = next(
         row
         for row in projected["dataset_status"]
         if row["dataset_name"] == "credit_account_monthly_performance"
     )
     assert monthly_status["observed_row_count"] == 0
-    assert monthly_status["expected_row_count"] == 1
+    assert "expected_row_count" not in monthly_status
     assert not any(
         row.get("target_record_id") in {"residence:sentinel", "spouse:sentinel"}
         and row.get("field_name") in {"residential_phone", "name"}
@@ -1762,20 +2179,34 @@ def test_v2_preserves_sparse_uncertainty_as_typed_control_datasets() -> None:
     )
 
     observation = next(
-        row for row in projected["field_observations"] if row["field_observation_id"] == "field:1"
+        row
+        for row in projected["field_observations"]
+        if row["dataset_name"] == "subject_employment"
+        and row["field_name"] == "employer_phone"
     )
     unresolved = next(
         row for row in projected["field_observations"] if row["field_observation_id"] == "field:2"
     )
-    issue = projected["extraction_issues"][0]
-    assert observation["dataset_name"] == "subject_profile"
+    issue = next(
+        row
+        for row in projected["extraction_issues"]
+        if row.get("target_dataset") == "credit_agreements"
+    )
     assert observation["observation_status"] == "unreadable"
+    assert observation["business_record_id"] == "unresolved_record"
     assert unresolved["dataset_name"] == "unknown"
     assert unresolved["source_dataset_name"] == "datasets"
     assert issue["target_dataset"] == "credit_agreements"
     assert any(
         row["dataset_name"] == "credit_agreements" and row["field_name"] == "facility_limit"
         for row in projected["field_observations"]
+    )
+    assert any(
+        row.get("issue_code") == "canonical_profile_phone_relation_unresolved"
+        and row.get("target_dataset") == "subject_employment"
+        and row.get("field_name") == "employer_phone"
+        and "target_record_id" not in row
+        for row in projected["extraction_issues"]
     )
     assert "pboc_extension_fields" not in projected
 

@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("docmirror_enterprise", reason="enterprise package is not available in OSS CI")
-
-from docmirror_enterprise.plugins.bank_statement.table_rebuild import rebuild_bank_table_from_transactions
+table_rebuild_module = pytest.importorskip(
+    "docmirror_enterprise.plugins.bank_statement.table_rebuild",
+    reason="enterprise bank-statement table rebuild package is not available in OSS CI",
+)
+rebuild_bank_table_from_transactions = table_rebuild_module.rebuild_bank_table_from_transactions
 
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult
 

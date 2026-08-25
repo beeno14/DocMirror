@@ -35,6 +35,24 @@ from docmirror.layout.profile.registry import (
     resolve_header_aliases,
 )
 
+_BOJS_EXACT_SOURCE_HEADERS = frozenset(
+    {
+        "序号",
+        "摘要/附言",
+        "币别",
+        "交易日期",
+        "交易类型",
+        "交易金额",
+        "账户余额",
+        "对方账号",
+        "对方户名",
+    }
+)
+
+
+def _source_header_identity(value: Any) -> str:
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+
 _CONFIG_PATH = files(__package__).joinpath("resources").joinpath("institution_overrides.yaml")
 _INSTITUTIONS_PATH = files(__package__).joinpath("resources").joinpath("institutions.yaml")
 
@@ -164,14 +182,28 @@ def normalize_table_headers(
 
     out: list[list[list[str]]] = []
     for tbl in tables:
+        exact_bojs_header_rows = {
+            row_index
+            for row_index, row in enumerate(tbl[:10])
+            if _BOJS_EXACT_SOURCE_HEADERS.issubset({_source_header_identity(cell) for cell in row})
+        }
         normalized_tbl: list[list[str]] = []
-        for row in tbl:
+        for row_index, row in enumerate(tbl):
             normalized_row: list[str] = []
             for cell in row:
                 text = str(cell or "").strip()
                 if variant and text in variant.column_map:
                     text = variant.column_map[text]
-                if profile:
+                # This Jiangsu Bank layout declares separate, exact source
+                # roles.  In particular, profile matching must not rename its
+                # date-only ``交易日期`` column to ``交易时间`` before ``raw`` is
+                # materialized.  The complete signature keeps this exception
+                # local to the proven issuer layout.
+                protected_source_header = (
+                    row_index in exact_bojs_header_rows
+                    and _source_header_identity(text) in _BOJS_EXACT_SOURCE_HEADERS
+                )
+                if profile and not protected_source_header:
                     text = resolve_header_aliases(profile, text)
                 normalized_row.append(text)
             normalized_tbl.append(normalized_row)

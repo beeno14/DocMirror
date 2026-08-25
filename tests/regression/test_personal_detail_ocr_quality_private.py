@@ -61,7 +61,32 @@ _EXPECTED_SCHEMA_INPUT_COUNTS = {
     # omitted valid grids and could make a silent population loss look healthy.
     "林岚挺征信.pdf": (45, 944),
     "洪晓鑫征信报告2025.11.05.pdf": (8, 176),
-    "王根镇征信.pdf": (61, 757),
+    # Full source audit: D1=28, R1=1, R2=2, card=11, quasi-card=2;
+    # the inclusive printed repayment ranges contain 798 month positions.
+    # Printed overview and section endpoints reconcile exactly: D1 28,
+    # R1 3, R2 17, cards 12, no quasi-card.  Earlier 44/61 values were
+    # extractor-derived and crossed family boundaries.
+    "王根镇征信.pdf": (60, 798),
+    # Visually audited printed section endpoints: D1 18, R1 55, R2 8,
+    # cards 34, quasi-card 1. The exact account/month source-ledger audit
+    # reconciles 875 unique identities: parser universe 697, 122 months from
+    # missing-anchor printed ranges, and 56 new detached months after removing
+    # 27 aliases. The prior 697 value measured only parser-visible grids.
+    "黄圣辉_个人详版征信报告.pdf": (116, 875),
+    # Printed section endpoints: D1 115 + R1 6 + R2 2.  The former 121
+    # census omitted the two R2 accounts on printed page 48.
+    "曹末艳-征信.pdf": (123, 666),
+}
+_EXPECTED_RAW_MONTH_POSITION_COUNTS = {
+    fixture_name: monthly_count
+    for fixture_name, (_account_count, monthly_count) in _EXPECTED_SCHEMA_INPUT_COUNTS.items()
+    if fixture_name != "黄圣辉_个人详版征信报告.pdf"
+}
+_EXPECTED_ACCOUNT_MONTH_IDENTITY_COUNTS = {
+    # Human source-render signoff certifies distinct account/month identities,
+    # after separately removing source-position aliases.  It is not a raw-grid
+    # position count.
+    "黄圣辉_个人详版征信报告.pdf": 875,
 }
 _EXPECTED_AGREEMENT_COUNTS = {
     "叶永燕征信.pdf": 16,
@@ -69,6 +94,9 @@ _EXPECTED_AGREEMENT_COUNTS = {
     "余泽熙7.15征信.pdf": 8,
     "杨松林个人征信24.7.29.pdf": 7,
     "洪晓鑫征信报告2025.11.05.pdf": 7,
+    "王根镇征信.pdf": 23,
+    "黄圣辉_个人详版征信报告.pdf": 19,
+    "曹末艳-征信.pdf": 2,
 }
 _EXPECTED_INQUIRY_COUNTS = {
     "叶永燕征信.pdf": 112,
@@ -76,6 +104,9 @@ _EXPECTED_INQUIRY_COUNTS = {
     "余泽熙7.15征信.pdf": 26,
     "杨松林个人征信24.7.29.pdf": 117,
     "洪晓鑫征信报告2025.11.05.pdf": 20,
+    "王根镇征信.pdf": 143,
+    "黄圣辉_个人详版征信报告.pdf": 151,
+    "曹末艳-征信.pdf": 18,
 }
 
 _LIN_EXPECTED_ACCOUNTS = 45
@@ -91,7 +122,7 @@ _LIN_EXPECTED_LIABILITIES = 3
 _YANG_EXPECTED_LIABILITIES = 6
 _YE_EXPECTED_MONTH_POSITIONS = 951
 _YE_EXPECTED_STATUS_WITHHELD = 95
-_YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS = 42
+_YE_EXPECTED_UNRECONCILED_SOURCE_POSITIONS = 42
 _YE_RECOVERED_N_ZERO_REVIEW_IDS = {
     "mg_p17_repayment_0:2019-04",
     "mg_p17_repayment_0:2019-07",
@@ -224,39 +255,6 @@ _LIN_MONTH_GEOMETRY_GUARDS = {
 }
 
 
-def _inclusive_month_keys(start: str, end: str) -> tuple[str, ...]:
-    start_year, start_month = (int(part) for part in start.split("-"))
-    end_year, end_month = (int(part) for part in end.split("-"))
-    result: list[str] = []
-    year, month = start_year, start_month
-    while (year, month) <= (end_year, end_month):
-        result.append(f"{year:04d}-{month:02d}")
-        month += 1
-        if month == 13:
-            year += 1
-            month = 1
-    return tuple(result)
-
-
-_YU_EXPECTED_MONTHS_BY_GRID = {
-    "mg_p4_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p7_repayment_0": _inclusive_month_keys("2017-08", "2018-08"),
-    "mg_p7_repayment_1": _inclusive_month_keys("2018-03", "2019-03"),
-    "mg_p8_repayment_0": _inclusive_month_keys("2017-08", "2022-07"),
-    "mg_p8_repayment_1": _inclusive_month_keys("2017-08", "2022-07"),
-    "mg_p9_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p9_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p10_repayment_0": _inclusive_month_keys("2017-08", "2022-07"),
-    "mg_p11_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p11_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p12_repayment_0": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p12_repayment_1": _inclusive_month_keys("2017-08", "2022-06"),
-    "mg_p13_repayment_0": _inclusive_month_keys("2017-08", "2022-02"),
-    "mg_p14_repayment_0": _inclusive_month_keys("2017-08", "2018-07"),
-    "mg_p14_repayment_1": _inclusive_month_keys("2017-08", "2022-07"),
-}
-
-
 def _dataset_map(payload: dict) -> dict[str, dict]:
     return {
         str(dataset.get("name") or ""): dataset
@@ -265,7 +263,308 @@ def _dataset_map(payload: dict) -> dict[str, dict]:
     }
 
 
-def _assert_five_report_population_reporting(payload: dict, fixture: Path) -> None:
+_ACCOUNT_FAMILIES = frozenset(
+    {
+        "non_revolving_loan",
+        "revolving_loan_subaccount",
+        "revolving_loan_account",
+        "credit_card",
+        "quasi_credit_card",
+    }
+)
+_CANONICAL_ACCOUNT_ID_RE = re.compile(
+    r"^credit_account:(?:non_revolving_loan|revolving_loan_subaccount|"
+    r"revolving_loan_account|credit_card|quasi_credit_card):[1-9]\d*$"
+)
+
+
+def _exact_positive_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _exact_account_gap_ref_identity(ref: object) -> str | None:
+    if not isinstance(ref, dict):
+        return None
+    family = str(ref.get("account_type") or "")
+    ordinal = _exact_positive_int(ref.get("category_sequence"))
+    logical_page = _exact_positive_int(ref.get("logical_page"))
+    source_page = _exact_positive_int(ref.get("source_page"))
+    bbox = ref.get("bbox")
+    evidence_ids = ref.get("evidence_ids")
+    if (
+        family not in _ACCOUNT_FAMILIES
+        or ordinal is None
+        or logical_page is None
+        or source_page is None
+        or ref.get("source") != "candidate_b_account_anchor"
+        or ref.get("geometry_scope") != "line"
+        or ref.get("binding") != "printed_account_ordinal"
+        or ref.get("binding_quality") != "printed_account_ordinal"
+        or not isinstance(bbox, (list, tuple))
+        or len(bbox) != 4
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in bbox
+        )
+        or float(bbox[2]) <= float(bbox[0])
+        or float(bbox[3]) <= float(bbox[1])
+        or not isinstance(evidence_ids, (list, tuple))
+        or not evidence_ids
+        or any(
+            not isinstance(evidence_id, str) or not evidence_id.strip()
+            for evidence_id in evidence_ids
+        )
+        or len(evidence_ids) != len(set(evidence_ids))
+    ):
+        return None
+    return f"credit_account:{family}:{ordinal}"
+
+
+def _canonical_account_id_candidates(issue: dict) -> set[str]:
+    candidates = {str(issue.get("target_record_id") or "")}
+    for container_name in ("observed_value", "candidate_value"):
+        container = issue.get(container_name)
+        if not isinstance(container, dict):
+            continue
+        candidates.update(
+            str(container.get(key) or "")
+            for key in (
+                "canonical_account_id",
+                "account_id",
+                "account_observation_id",
+                "table_observation_id",
+            )
+        )
+    return {
+        candidate
+        for candidate in candidates
+        if _CANONICAL_ACCOUNT_ID_RE.fullmatch(candidate)
+    }
+
+
+def _localized_account_omission_identities(
+    account_issues: list[dict],
+) -> set[str]:
+    """Return uniquely localized missing account identities, never tolerances."""
+
+    localized: set[str] = set()
+    for issue in account_issues:
+        if (
+            not isinstance(issue, dict)
+            or issue.get("target_dataset") != "credit_accounts"
+            or str(issue.get("status") or "requires_review")
+            in {"resolved", "suppressed_redundant", "informational"}
+        ):
+            continue
+        issue_code = str(issue.get("issue_code") or "")
+        if issue_code == "candidate_b_account_sequence_gap":
+            observed_value = issue.get("observed_value")
+            candidate_value = issue.get("candidate_value")
+            if not isinstance(observed_value, dict) or not isinstance(candidate_value, dict):
+                continue
+            family = str(observed_value.get("account_type") or "")
+            endpoint = _exact_positive_int(
+                candidate_value.get("authoritative_family_endpoint")
+            )
+            raw_observed = observed_value.get("observed_category_sequences")
+            raw_missing = candidate_value.get("missing_category_sequences")
+            raw_outliers = candidate_value.get("outlier_category_sequences")
+            unresolved = candidate_value.get("unresolved_printed_ordinal_count")
+            if (
+                family not in _ACCOUNT_FAMILIES
+                or endpoint is None
+                or not isinstance(raw_observed, list)
+                or not isinstance(raw_missing, list)
+                or raw_outliers != []
+                or unresolved != 0
+            ):
+                continue
+            observed = [_exact_positive_int(value) for value in raw_observed]
+            missing = [_exact_positive_int(value) for value in raw_missing]
+            if (
+                any(value is None for value in observed)
+                or any(value is None for value in missing)
+                or observed != sorted(set(observed))
+                or missing != sorted(set(missing))
+                or endpoint not in observed
+                or missing
+                != sorted(set(range(1, endpoint + 1)).difference(observed))
+            ):
+                continue
+            refs = issue.get("source_refs")
+            if not isinstance(refs, list):
+                continue
+            ref_identities = [_exact_account_gap_ref_identity(ref) for ref in refs]
+            expected_observed = {
+                f"credit_account:{family}:{ordinal}" for ordinal in observed
+            }
+            physical_owners = {
+                (
+                    ref.get("source_page"),
+                    tuple(float(value) for value in ref.get("bbox") or ()),
+                )
+                for ref in refs
+                if isinstance(ref, dict)
+            }
+            evidence_ids = [
+                evidence_id
+                for ref in refs
+                if isinstance(ref, dict)
+                for evidence_id in ref.get("evidence_ids") or ()
+            ]
+            if (
+                any(identity is None for identity in ref_identities)
+                or set(ref_identities) != expected_observed
+                or len(ref_identities) != len(expected_observed)
+                or len(physical_owners) != len(refs)
+                or len(evidence_ids) != len(set(evidence_ids))
+            ):
+                continue
+            localized.update(
+                f"credit_account:{family}:{ordinal}" for ordinal in missing
+            )
+            continue
+
+        if issue_code == "source_account_record_omitted":
+            target_record_id = str(issue.get("target_record_id") or "")
+            refs = issue.get("source_refs")
+            if (
+                issue.get("field_name") != "account_id"
+                or _CANONICAL_ACCOUNT_ID_RE.fullmatch(target_record_id) is None
+                or not isinstance(refs, list)
+                or len(refs) != 1
+                or _exact_account_gap_ref_identity(refs[0]) != target_record_id
+            ):
+                continue
+            localized.add(target_record_id)
+            continue
+
+        if issue_code != "candidate_b_unmatched_account_table_suppressed":
+            continue
+        canonical_candidates = _canonical_account_id_candidates(issue)
+        if len(canonical_candidates) == 1:
+            localized.update(canonical_candidates)
+            continue
+        if canonical_candidates:
+            continue
+        stable_observation = str(
+            issue.get("target_record_id")
+            or issue.get("extraction_issue_id")
+            or ""
+        ).strip()
+        refs = issue.get("source_refs")
+        if stable_observation and isinstance(refs, list) and refs:
+            localized.add(f"suppressed_account_observation:{stable_observation}")
+    return localized
+
+
+def test_account_omission_identity_union_sums_families_without_double_counting() -> None:
+    def gap_issue(
+        family: str,
+        observed: list[int],
+        missing: list[int],
+    ) -> dict:
+        return {
+            "issue_code": "candidate_b_account_sequence_gap",
+            "status": "requires_review",
+            "target_dataset": "credit_accounts",
+            "observed_value": {
+                "account_type": family,
+                "observed_category_sequences": observed,
+            },
+            "candidate_value": {
+                "missing_category_sequences": missing,
+                "outlier_category_sequences": [],
+                "authoritative_family_endpoint": 13,
+                "unresolved_printed_ordinal_count": 0,
+            },
+            "source_refs": [
+                {
+                    "source": "candidate_b_account_anchor",
+                    "logical_page": index + 1,
+                    "source_page": index + 1,
+                    "geometry_scope": "line",
+                    "binding": "printed_account_ordinal",
+                    "binding_quality": "printed_account_ordinal",
+                    "account_type": family,
+                    "category_sequence": ordinal,
+                    "bbox": [10.0, index * 20.0 + 10.0, 110.0, index * 20.0 + 18.0],
+                    "evidence_ids": [f"anchor:{family}:{ordinal}"],
+                }
+                for index, ordinal in enumerate(observed)
+            ],
+        }
+
+    non_revolving = gap_issue(
+        "non_revolving_loan",
+        [1, 2, 3, 12, 13],
+        list(range(4, 12)),
+    )
+    cards = gap_issue(
+        "credit_card",
+        [1, *range(3, 14)],
+        [2],
+    )
+    duplicate_suppression = {
+        "issue_code": "candidate_b_unmatched_account_table_suppressed",
+        "status": "requires_review",
+        "target_dataset": "credit_accounts",
+        "target_record_id": "credit_account:non_revolving_loan:4",
+    }
+    exact_source_omission = {
+        "issue_code": "source_account_record_omitted",
+        "status": "requires_review",
+        "target_dataset": "credit_accounts",
+        "target_record_id": "credit_account:credit_card:2",
+        "field_name": "account_id",
+        "source_refs": [
+            {
+                "source": "candidate_b_account_anchor",
+                "logical_page": 8,
+                "source_page": 4,
+                "geometry_scope": "line",
+                "binding": "printed_account_ordinal",
+                "binding_quality": "printed_account_ordinal",
+                "account_type": "credit_card",
+                "category_sequence": 2,
+                "bbox": [75.0, 241.0, 318.0, 248.0],
+                "evidence_ids": ["anchor:credit_card:2"],
+            }
+        ],
+    }
+
+    localized = _localized_account_omission_identities(
+        [
+            non_revolving,
+            deepcopy(non_revolving),
+            cards,
+            exact_source_omission,
+            deepcopy(exact_source_omission),
+            duplicate_suppression,
+            deepcopy(duplicate_suppression),
+        ]
+    )
+
+    assert localized == {
+        *(f"credit_account:non_revolving_loan:{ordinal}" for ordinal in range(4, 12)),
+        "credit_account:credit_card:2",
+    }
+    assert 18 + len(localized) == 27
+    assert _localized_account_omission_identities([exact_source_omission]) == {
+        "credit_account:credit_card:2"
+    }
+    malformed_source_omission = deepcopy(exact_source_omission)
+    malformed_source_omission["source_refs"][0]["category_sequence"] = 3
+    assert not _localized_account_omission_identities([malformed_source_omission])
+
+
+def _assert_five_report_population_reporting(
+    payload: dict,
+    fixture: Path,
+    semantic: dict,
+) -> None:
     """Require every source-audited population to be reported without denominator loss."""
 
     expected_account_months = _EXPECTED_SCHEMA_INPUT_COUNTS.get(fixture.name)
@@ -278,10 +577,13 @@ def _assert_five_report_population_reporting(payload: dict, fixture: Path) -> No
     ):
         return
 
-    expected_accounts, expected_months = expected_account_months
+    expected_accounts, _monthly_source_audit = expected_account_months
+    expected_raw_positions = _EXPECTED_RAW_MONTH_POSITION_COUNTS.get(fixture.name)
+    expected_account_month_identities = (
+        _EXPECTED_ACCOUNT_MONTH_IDENTITY_COUNTS.get(fixture.name)
+    )
     expected_by_dataset = {
         "credit_accounts": expected_accounts,
-        "credit_account_monthly_performance": expected_months,
         "credit_agreements": expected_agreements,
         "inquiries": expected_inquiries,
     }
@@ -311,6 +613,86 @@ def _assert_five_report_population_reporting(payload: dict, fixture: Path) -> No
             defects.append(
                 f"{dataset_name}: omitted-row report {reported_omitted!r}, source gap "
                 f"{expected_count - emitted}"
+            )
+
+    monthly = datasets.get("credit_account_monthly_performance")
+    closure = (
+        ((semantic.get("domain") or {}).get("facts") or {}).get(
+            "personal_detail_account_month_closure"
+        )
+    )
+    if monthly is None:
+        defects.append(
+            "credit_account_monthly_performance: missing public dataset"
+        )
+    elif not isinstance(closure, dict):
+        defects.append("personal_detail_account_month_closure: missing source ledger")
+    else:
+        raw_positions = closure.get("raw_source_month_positions")
+        owner_bound = closure.get("owner_bound_account_months")
+        owner_unresolved = closure.get("owner_unresolved_positions")
+        aliases = closure.get("alias_source_month_positions")
+        expected_identities = closure.get("expected_identity_count")
+        if (
+            expected_raw_positions is not None
+            and raw_positions != expected_raw_positions
+        ):
+            defects.append(
+                "personal_detail_account_month_closure: raw source positions "
+                f"{raw_positions!r}, source audit {expected_raw_positions}"
+            )
+        if (
+            expected_account_month_identities is not None
+            and expected_identities != expected_account_month_identities
+        ):
+            defects.append(
+                "personal_detail_account_month_closure: exact identities "
+                f"{expected_identities!r}, signed source ledger "
+                f"{expected_account_month_identities}"
+            )
+        if not (
+            type(owner_bound) is int
+            and type(owner_unresolved) is int
+            and raw_positions == owner_bound + owner_unresolved
+            and closure.get("source_position_balance_valid") is True
+        ):
+            defects.append(
+                "personal_detail_account_month_closure: "
+                "raw != owner-bound + owner-unresolved"
+            )
+        if type(aliases) is not int or aliases < 0:
+            defects.append(
+                "personal_detail_account_month_closure: aliases are not separately audited"
+            )
+        elif type(owner_bound) is int and aliases > owner_bound:
+            defects.append(
+                "personal_detail_account_month_closure: aliases exceed owner-bound positions"
+            )
+        if closure.get("unlocalized_owner_unresolved_positions") != 0:
+            defects.append(
+                "personal_detail_account_month_closure: unresolved positions lack source-local refs"
+            )
+        emitted = int(
+            monthly.get("row_count") or len(monthly.get("rows") or ())
+        )
+        completeness = monthly.get("completeness") or {}
+        if completeness.get("expected_row_count") != expected_identities:
+            defects.append(
+                "credit_account_monthly_performance: canonical expected-row report "
+                f"{completeness.get('expected_row_count')!r}, exact identities "
+                f"{expected_identities!r}"
+            )
+        if completeness.get("emitted_row_count") != emitted:
+            defects.append(
+                "credit_account_monthly_performance: emitted-row report disagrees with public rows"
+            )
+        if (
+            type(expected_identities) is int
+            and completeness.get("omitted_row_count")
+            != expected_identities - emitted
+        ):
+            defects.append(
+                "credit_account_monthly_performance: omitted-row report disagrees with canonical closure"
             )
     if defects:
         raise AssertionError(
@@ -493,124 +875,6 @@ def _assert_community_closed_world_dataset_catalog(payload: dict) -> None:
     for sample_excluded_dataset in sample_excluded_datasets:
         assert dataset_map.get(sample_excluded_dataset, {}).get("row_count", 0) == 0
     assert dataset_map.get("pboc_extension_fields", {}).get("row_count", 0) == 0
-
-
-def _assert_exact_month_grid_partition(
-    payload: dict,
-    *,
-    expected_months_by_grid: dict[str, tuple[str, ...]],
-) -> None:
-    """Require every source-audited grid/month key to be emitted or localized once."""
-
-    datasets = _dataset_map(payload)
-    monthly = datasets["credit_account_monthly_performance"]
-    expected_ids = {
-        f"{grid_id}:{month}"
-        for grid_id, months in expected_months_by_grid.items()
-        for month in months
-    }
-    emitted_ids = {
-        str(
-            wrapper.get("record_id")
-            or (wrapper.get("normalized") or {}).get("monthly_performance_id")
-            or ""
-        )
-        for wrapper in monthly.get("rows") or ()
-    }
-    assert "" not in emitted_ids
-    assert len(emitted_ids) == int(monthly.get("row_count") or 0)
-
-    issue_rows = [
-        wrapper.get("normalized") or {}
-        for wrapper in datasets["extraction_issues"].get("rows") or ()
-    ]
-    evidence_rows = [
-        wrapper.get("normalized") or {}
-        for wrapper in datasets["extraction_issue_evidence"].get("rows") or ()
-    ]
-    evidence_by_issue: dict[str, list[dict]] = {}
-    for evidence in evidence_rows:
-        evidence_by_issue.setdefault(
-            str(evidence.get("extraction_issue_id") or ""), []
-        ).append(evidence)
-
-    localized_ids: set[str] = set()
-    for issue in issue_rows:
-        if (
-            issue.get("target_dataset") != "credit_account_monthly_performance"
-            or str(issue.get("status") or "requires_review")
-            in {"resolved", "suppressed_redundant", "informational"}
-        ):
-            continue
-        issue_code = str(issue.get("issue_code") or "")
-        if issue_code not in {
-            "candidate_b_monthly_status_grid_unresolved",
-            "candidate_b_monthly_grid_owner_unresolved",
-        }:
-            continue
-        issue_id = str(issue.get("extraction_issue_id") or "")
-        evidence = evidence_by_issue.get(issue_id, [])
-        grid_ids = {
-            str(row.get("string_value") or "")
-            for row in evidence
-            if row.get("evidence_kind") == "observed"
-            and row.get("evidence_path") == "grid_id"
-        }
-        assert len(grid_ids) == 1, issue_id
-        grid_id = next(iter(grid_ids))
-        if issue_code == "candidate_b_monthly_status_grid_unresolved":
-            months = {
-                str(row.get("string_value") or "")
-                for row in evidence
-                if row.get("evidence_kind") == "observed"
-                and re.fullmatch(
-                    r"withheld_months\[\d+\]",
-                    str(row.get("evidence_path") or ""),
-                )
-            }
-            counts = [
-                int(row.get("integer_value") or 0)
-                for row in evidence
-                if row.get("evidence_kind") == "observed"
-                and row.get("evidence_path") == "withheld_month_count"
-            ]
-        else:
-            months = {
-                str(row.get("string_value") or "")
-                for row in evidence
-                if row.get("evidence_kind") == "candidate"
-                and re.fullmatch(
-                    r"expected_months\[\d+\]",
-                    str(row.get("evidence_path") or ""),
-                )
-            }
-            observed_months = {
-                str(row.get("string_value") or "")
-                for row in evidence
-                if row.get("evidence_kind") == "observed"
-                and re.fullmatch(
-                    r"observed_candidate_months\[\d+\]",
-                    str(row.get("evidence_path") or ""),
-                )
-            }
-            assert observed_months == months, issue_id
-            counts = [
-                int(row.get("integer_value") or 0)
-                for row in evidence
-                if row.get("evidence_kind") == "candidate"
-                and row.get("evidence_path") == "expected_month_count"
-            ]
-        assert counts == [len(months)], issue_id
-        record_ids = {f"{grid_id}:{month}" for month in months}
-        assert localized_ids.isdisjoint(record_ids), issue_id
-        localized_ids.update(record_ids)
-
-    assert emitted_ids.isdisjoint(localized_ids)
-    assert emitted_ids | localized_ids == expected_ids
-    completeness = monthly.get("completeness") or {}
-    assert completeness.get("expected_row_count") == len(expected_ids)
-    assert completeness.get("emitted_row_count") == len(emitted_ids)
-    assert completeness.get("omitted_row_count") == len(localized_ids)
 
 
 def _compact_source_table(table: dict) -> str:
@@ -1399,7 +1663,10 @@ def _assert_lin_p20_continuation_month_binding_oracle(community: dict) -> None:
     )
 
 
-def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
+def _assert_lin_monthly_position_conservation_oracle(
+    community: dict,
+    semantic: dict,
+) -> None:
     datasets = _dataset_map(community)
     monthly_dataset = datasets["credit_account_monthly_performance"]
     rows = monthly_dataset.get("rows") or []
@@ -1407,8 +1674,23 @@ def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
     emitted = int(completeness.get("emitted_row_count") or 0)
     omitted = int(completeness.get("omitted_row_count") or 0)
     expected = int(completeness.get("expected_row_count") or 0)
+    closure = ((semantic.get("domain") or {}).get("facts") or {}).get(
+        "personal_detail_account_month_closure"
+    )
+    assert isinstance(closure, dict)
+    owner_bound = closure.get("owner_bound_account_months")
+    owner_unresolved = closure.get("owner_unresolved_positions")
+    assert closure.get("raw_source_month_positions") == _LIN_EXPECTED_MONTH_POSITIONS
+    assert (
+        type(owner_bound) is int
+        and type(owner_unresolved) is int
+        and closure["raw_source_month_positions"] == owner_bound + owner_unresolved
+    )
+    assert closure.get("source_position_balance_valid") is True
+    assert closure.get("unlocalized_owner_unresolved_positions") == 0
+    assert 0 <= int(closure.get("alias_source_month_positions") or 0) <= owner_bound
     assert monthly_dataset.get("row_count") == len(rows) == emitted
-    assert expected == emitted + omitted == _LIN_EXPECTED_MONTH_POSITIONS
+    assert expected == emitted + omitted == closure.get("expected_identity_count")
 
     emitted_ids = {
         str(
@@ -1525,11 +1807,12 @@ def _assert_lin_monthly_position_conservation_oracle(community: dict) -> None:
 
     assert emitted_ids.isdisjoint(status_withheld_ids | owner_withheld_ids)
     assert status_withheld_ids.isdisjoint(owner_withheld_ids)
-    assert omitted == len(status_withheld_ids) + len(owner_withheld_ids)
-    assert expected == len(emitted_ids | status_withheld_ids | owner_withheld_ids)
 
 
-def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
+def _assert_ye_monthly_position_conservation_oracle(
+    community: dict,
+    semantic: dict,
+) -> None:
     """Partition every printed Ye month into one mutually exclusive outcome."""
 
     datasets = _dataset_map(community)
@@ -1539,8 +1822,23 @@ def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
     emitted = int(completeness.get("emitted_row_count") or 0)
     omitted = int(completeness.get("omitted_row_count") or 0)
     expected = int(completeness.get("expected_row_count") or 0)
+    closure = ((semantic.get("domain") or {}).get("facts") or {}).get(
+        "personal_detail_account_month_closure"
+    )
+    assert isinstance(closure, dict)
+    owner_bound = closure.get("owner_bound_account_months")
+    owner_unresolved = closure.get("owner_unresolved_positions")
+    assert closure.get("raw_source_month_positions") == _YE_EXPECTED_MONTH_POSITIONS
+    assert (
+        type(owner_bound) is int
+        and type(owner_unresolved) is int
+        and closure["raw_source_month_positions"] == owner_bound + owner_unresolved
+    )
+    assert closure.get("source_position_balance_valid") is True
+    assert closure.get("unlocalized_owner_unresolved_positions") == 0
+    assert 0 <= int(closure.get("alias_source_month_positions") or 0) <= owner_bound
     assert monthly_dataset.get("row_count") == len(monthly_wrappers) == emitted
-    assert expected == emitted + omitted == _YE_EXPECTED_MONTH_POSITIONS
+    assert expected == emitted + omitted == closure.get("expected_identity_count")
 
     emitted_ids = {
         str(
@@ -1640,11 +1938,11 @@ def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
     structural_evidence = evidence_by_issue.get(
         str(structural_issues[0].get("extraction_issue_id") or ""), []
     )
-    unlocalized_counts = [
+    unreconciled_counts = [
         int(row.get("integer_value") or 0)
         for row in structural_evidence
         if row.get("evidence_kind") == "candidate"
-        and row.get("evidence_path") == "missing_month_count"
+        and row.get("evidence_path") == "unreconciled_source_position_count"
     ]
     localization_statuses = {
         str(row.get("string_value") or "")
@@ -1652,16 +1950,27 @@ def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
         if row.get("evidence_kind") == "candidate"
         and row.get("evidence_path") == "localization_status"
     }
-    within_series_counts = [
+    source_structure_counts = [
         int(row.get("integer_value") or 0)
         for row in structural_evidence
         if row.get("evidence_kind") == "candidate"
-        and row.get("evidence_path") == "within_series_missing_position_count"
+        and row.get("evidence_path") == "source_structure_row_count"
     ]
-    assert unlocalized_counts == [_YE_EXPECTED_UNLOCALIZED_MONTH_POSITIONS]
-    assert localization_statuses == {"unresolved_from_detached_source_structure"}
-    assert within_series_counts == [0]
-    unlocalized = unlocalized_counts[0]
+    legacy_denominator_paths = {
+        str(row.get("evidence_path") or "")
+        for row in structural_evidence
+        if row.get("evidence_kind") == "candidate"
+        and row.get("evidence_path")
+        in {
+            "structural_expected_row_count",
+            "missing_month_count",
+            "within_series_missing_position_count",
+        }
+    }
+    assert unreconciled_counts == [_YE_EXPECTED_UNRECONCILED_SOURCE_POSITIONS]
+    assert localization_statuses == {"pending_unique_account_owner_reconciliation"}
+    assert len(source_structure_counts) == 1 and source_structure_counts[0] > 0
+    assert not legacy_denominator_paths
 
     owner_issues = [
         issue
@@ -1716,9 +2025,6 @@ def _assert_ye_monthly_position_conservation_oracle(community: dict) -> None:
         assert unowned_ids.isdisjoint(record_ids), issue_id
         unowned_ids.update(record_ids)
     assert unowned_ids.isdisjoint(emitted_ids | status_withheld_ids)
-
-    assert omitted == len(status_withheld_ids) + unlocalized + len(unowned_ids)
-    assert expected == emitted + len(status_withheld_ids) + unlocalized + len(unowned_ids)
 
 
 def _assert_ye_recovered_n_zero_months_oracle(
@@ -2078,12 +2384,14 @@ def test_personal_detail_ocr_correction_invariants(
     raw_bundles = domain_specific.get("_page_evidence_bundles") or []
     raw_snapshot = deepcopy(raw_bundles)
     topology_audit = context.page_topology_audit()
+    conserved_pages_before_repair = context.conserved_corrected_evidence_pages()
 
     corrected_pages = context.corrected_evidence_pages()
     business = context.scanned_business(result.full_text or "")
     native_business = context.native_business(result.full_text or "")
     repayment_records = context.corrected_repayment_records()
     audit = context.ocr_correction_audit()
+    conserved_pages_after_repair = context.conserved_corrected_evidence_pages()
     ocr_bundles = [
         bundle
         for bundle in raw_bundles
@@ -2110,17 +2418,11 @@ def test_personal_detail_ocr_correction_invariants(
             encoding="utf-8",
         )
 
-    _assert_five_report_population_reporting(payload, fixture)
+    _assert_five_report_population_reporting(payload, fixture, semantic)
     _assert_community_closed_world_dataset_catalog(payload)
     if fixture.name == "杨松林个人征信24.7.29.pdf":
         _assert_yang_liability_dataset_oracle(payload)
         _assert_yang_monthly_native_conflict_oracle(payload)
-    if fixture.name == "余泽熙7.15征信.pdf":
-        _assert_exact_month_grid_partition(
-            payload,
-            expected_months_by_grid=_YU_EXPECTED_MONTHS_BY_GRID,
-        )
-
     assert raw_bundles == raw_snapshot
     assert topology_audit["valid"] is True
     assert topology_audit["logical_page_count"] == len(result.pages)
@@ -2129,7 +2431,38 @@ def test_personal_detail_ocr_correction_invariants(
         range(1, len(context.reading_order_by_logical) + 1)
     )
     assert context.entity_context.content_conserved is True
-    static_pages = [page for page in corrected_pages if page.get("plugin_static_subpage")]
+    assert conserved_pages_after_repair == conserved_pages_before_repair
+    conservation = audit["corrected_evidence_conservation"]
+    assert conservation["valid"] is True, conservation
+    assert conservation["raw_bundle_count"] == len(ocr_bundles)
+    assert conservation["conserved_plane_sha256"] == topology_audit[
+        "corrected_evidence_conservation"
+    ]["conserved_plane_sha256"]
+    projection_history = audit["canonical_projection_phase_history"]
+    assert projection_history
+    discovery_projection = next(
+        phase for phase in projection_history if phase.get("phase") == "discovery"
+    )
+    assert discovery_projection["canonical_page_count"] == len(corrected_pages)
+    assert all(phase.get("valid") is True for phase in projection_history), projection_history
+    assert all(
+        row.get("localized") is True
+        and row.get("localization_issue_code")
+        in {
+            "canonical_blank_fragment_explicitly_withheld",
+            "canonical_fragment_group_withheld",
+            "canonical_page_registration_failed",
+        }
+        and row.get("source_refs")
+        for phase in projection_history
+        for row in phase.get("withheld_pages") or ()
+    )
+    assert {
+        phase.get("conserved_plane_sha256") for phase in projection_history
+    } == {conservation["conserved_plane_sha256"]}
+    static_pages = [
+        page for page in conserved_pages_before_repair if page.get("plugin_static_subpage")
+    ]
     static_sources = {int(page.get("source_page") or 0) for page in static_pages}
     if static_pages:
         raw_counts = Counter(
@@ -2140,10 +2473,13 @@ def test_personal_detail_ocr_correction_invariants(
             )
             for bundle in ocr_bundles
         )
-        corrected_counts = Counter(int(page.get("source_page") or 0) for page in corrected_pages)
+        corrected_counts = Counter(
+            int(page.get("source_page") or 0)
+            for page in conserved_pages_before_repair
+        )
         for source in static_sources:
             corrected_segments = []
-            for page in corrected_pages:
+            for page in conserved_pages_before_repair:
                 if int(page.get("source_page") or 0) != source:
                     continue
                 if page.get("plugin_static_subpage"):
@@ -2158,7 +2494,7 @@ def test_personal_detail_ocr_correction_invariants(
             corrected_counts[source] == count for source, count in raw_counts.items() if source not in static_sources
         )
     else:
-        assert len(corrected_pages) == len(ocr_bundles)
+        assert len(conserved_pages_before_repair) == len(ocr_bundles)
     assert audit["ocr_started_by_correction_overlay"] is False
     repair_decisions = audit["business_repair"]["page_decisions"]
     assert audit["business_repair"]["field_triggered_ocr_requests"] == sum(
@@ -2194,20 +2530,25 @@ def test_personal_detail_ocr_correction_invariants(
                 for issue in collect_extraction_issues(context)
                 if issue.get("target_dataset") == "credit_accounts"
             ]
-            suppressed = {
-                str(issue.get("extraction_issue_id") or issue.get("target_record_id") or "")
-                for issue in account_issues
-                if issue.get("issue_code") == "candidate_b_unmatched_account_table_suppressed"
-            }
-            sequence_gap = max(
-                (
-                    len((issue.get("candidate_value") or {}).get("missing_category_sequences") or ())
-                    for issue in account_issues
-                    if issue.get("issue_code") == "candidate_b_account_sequence_gap"
-                ),
-                default=0,
+            for wrapper in (_dataset_map(payload)["extraction_issues"].get("rows") or []):
+                normalized = wrapper.get("normalized")
+                if not isinstance(normalized, dict):
+                    continue
+                projected_issue = dict(normalized)
+                source_refs = (wrapper.get("source") or {}).get("source_refs")
+                if isinstance(source_refs, list):
+                    projected_issue["source_refs"] = source_refs
+                if projected_issue.get("target_dataset") == "credit_accounts":
+                    account_issues.append(projected_issue)
+            localized_omissions = _localized_account_omission_identities(
+                account_issues
             )
-            assert len(accounts) + max(len(suppressed), sequence_gap) >= expected_accounts
+            assert len(accounts) + len(localized_omissions) == expected_accounts, {
+                "emitted_account_count": len(accounts),
+                "localized_omission_count": len(localized_omissions),
+                "source_expected_account_count": expected_accounts,
+                "localized_omission_identities": sorted(localized_omissions),
+            }
     # Candidate B owns the final account/month relation. Re-running the retired
     # shared linker against sealed pre-repair grids would compare two different
     # evidence planes and can discard valid corrected-grid rows.
@@ -2243,6 +2584,13 @@ def test_personal_detail_ocr_correction_invariants(
             for issue in source_issues
             if issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
         ]
+        localized_source_structure_positions = {
+            str(issue.get("target_record_id") or "")
+            for issue in source_issues
+            if issue.get("issue_code")
+            == "canonical_monthly_source_structure_missing_field"
+            and str(issue.get("target_record_id") or "")
+        }
         if len(linked_repayments) < int(expected_repayments * 0.90):
             assert (
                 canonical_gaps
@@ -2256,8 +2604,24 @@ def test_personal_detail_ocr_correction_invariants(
             assert canonical_count >= len(linked_repayments)
             if canonical_count > len(linked_repayments):
                 assert population_gaps or linkage_gaps or status_gaps or owner_gaps
-            assert canonical_gap["candidate_value"]["structural_expected_row_count"] > len(linked_repayments)
-            assert canonical_gap["candidate_value"]["missing_month_count"] > 0
+            candidate = canonical_gap["candidate_value"]
+            unreconciled_count = candidate["unreconciled_source_position_count"]
+            assert type(candidate["source_structure_row_count"]) is int
+            assert candidate["source_structure_row_count"] >= 0
+            assert type(unreconciled_count) is int and unreconciled_count > 0
+            assert len(localized_source_structure_positions) == unreconciled_count
+            assert candidate["account_month_expected_row_count"] is None
+            assert (
+                candidate["localization_status"]
+                == "pending_unique_account_owner_reconciliation"
+            )
+            assert "structural_expected_row_count" not in candidate
+            assert "missing_month_count" not in candidate
+            assert {
+                "source_structure_is_audit_only",
+                "raw_grid_positions_not_a_population_denominator",
+                "printed_ranges_do_not_imply_intervening_months",
+            }.issubset(set(canonical_gap.get("reason_codes") or ()))
         for population_gap in population_gaps:
             assert population_gap["observed_value"]["canonical_grid_row_count"] >= len(linked_repayments)
             missing_sequences = population_gap["candidate_value"]["missing_account_category_sequences"]
@@ -2818,7 +3182,7 @@ def test_personal_detail_ocr_correction_invariants(
     if expected_counts == (45, 944):
         _assert_lin_semantic_account_oracle(semantic, payload)
         _assert_lin_month_ref_physical_ownership_oracle(semantic)
-        _assert_lin_monthly_position_conservation_oracle(payload)
+        _assert_lin_monthly_position_conservation_oracle(payload, semantic)
         _assert_lin_august_2022_status_oracle(payload)
         _assert_lin_p20_continuation_month_binding_oracle(payload)
         _assert_lin_risky_zero_amount_cells_oracle(payload)
@@ -3025,7 +3389,6 @@ def test_personal_detail_ocr_correction_invariants(
             account_completeness["emitted_row_count"]
             + account_completeness["omitted_row_count"]
         )
-        assert monthly_completeness["expected_row_count"] == 951
         inquiry_completeness = v2_datasets["inquiries"]["completeness"]
         assert inquiry_completeness["expected_row_count"] == 112
         assert inquiry_completeness["emitted_row_count"] == len(inquiries)
@@ -3040,7 +3403,7 @@ def test_personal_detail_ocr_correction_invariants(
                 "Ye physical month-column ownership failures:\n- "
                 + "\n- ".join(geometry_defects)
             )
-        _assert_ye_monthly_position_conservation_oracle(payload)
+        _assert_ye_monthly_position_conservation_oracle(payload, semantic)
         _assert_ye_recovered_n_zero_months_oracle(payload, semantic)
         for record_id in (
             "mg_p10_repayment_0:2022-06",
@@ -3104,7 +3467,14 @@ def test_saved_five_community_dataset_catalog() -> None:
         assert detailed_validation.valid, (community_path, detailed_validation.errors)
         _assert_community_closed_world_dataset_catalog(payload)
         fixture = expected_by_stem[community_path.name.removesuffix(".community.json")]
-        _assert_five_report_population_reporting(payload, fixture)
+        semantic_path = community_path.with_name(
+            community_path.name.replace(".community.json", ".semantic.json")
+        )
+        assert semantic_path.is_file(), semantic_path
+        semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+        semantic_validation = validate_projection_payload("community_semantic", semantic)
+        assert semantic_validation.valid, (semantic_path, semantic_validation.errors)
+        _assert_five_report_population_reporting(payload, fixture, semantic)
         if fixture.name == "杨松林个人征信24.7.29.pdf":
             _assert_yang_liability_dataset_oracle(payload)
             _assert_yang_monthly_native_conflict_oracle(payload)
@@ -3137,17 +3507,17 @@ def test_saved_lin_semantic_account_fragment_oracle() -> None:
     community = json.loads(community_path.read_text(encoding="utf-8"))
     _assert_lin_semantic_account_oracle(semantic, community)
     saved_oracle_failures: list[str] = []
-    for oracle, payload in (
-        (_assert_lin_month_ref_physical_ownership_oracle, semantic),
-        (_assert_lin_monthly_position_conservation_oracle, community),
-        (_assert_lin_february_2020_status_oracle, community),
-        (_assert_lin_august_2022_status_oracle, community),
-        (_assert_lin_p20_continuation_month_binding_oracle, community),
-        (_assert_lin_risky_zero_amount_cells_oracle, community),
-        (_assert_zero_overdue_status_amount_oracle, community),
+    for oracle, args in (
+        (_assert_lin_month_ref_physical_ownership_oracle, (semantic,)),
+        (_assert_lin_monthly_position_conservation_oracle, (community, semantic)),
+        (_assert_lin_february_2020_status_oracle, (community,)),
+        (_assert_lin_august_2022_status_oracle, (community,)),
+        (_assert_lin_p20_continuation_month_binding_oracle, (community,)),
+        (_assert_lin_risky_zero_amount_cells_oracle, (community,)),
+        (_assert_zero_overdue_status_amount_oracle, (community,)),
     ):
         try:
-            oracle(payload)
+            oracle(*args)
         except AssertionError as exc:
             saved_oracle_failures.append(str(exc))
     assert not saved_oracle_failures, "Saved Lin oracle failures:\n- " + "\n- ".join(
@@ -3631,11 +4001,12 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
         pytest.skip("set DOCMIRROR_PERSONAL_DETAIL_SAVED_YE_AUDIT_DIR")
 
     directory = Path(audit_dir)
-    semantic_paths = list(directory.glob("*.semantic.json"))
-    community_paths = list(directory.glob("*.community.json"))
-    assert len(semantic_paths) == len(community_paths) == 1, directory
-    semantic = json.loads(semantic_paths[0].read_text(encoding="utf-8"))
-    community = json.loads(community_paths[0].read_text(encoding="utf-8"))
+    semantic_path = directory / "叶永燕征信.semantic.json"
+    community_path = directory / "叶永燕征信.community.json"
+    assert semantic_path.is_file(), semantic_path
+    assert community_path.is_file(), community_path
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    community = json.loads(community_path.read_text(encoding="utf-8"))
     datasets = _dataset_map(community)
     ledger = semantic["domain"]["facts"]["personal_detail_source_completeness_ledger"]
 
@@ -3777,7 +4148,7 @@ def test_saved_ye_population_and_month_geometry_oracle() -> None:
         failures.append("Ye physical month-column oracle compared no exact refs")
     failures.extend(geometry_defects)
     try:
-        _assert_ye_monthly_position_conservation_oracle(community)
+        _assert_ye_monthly_position_conservation_oracle(community, semantic)
     except AssertionError as exc:
         failures.append(str(exc))
     try:
@@ -3820,3 +4191,48 @@ def test_year_plus_twelve_month_bands_require_a_source_year_row() -> None:
     assert _year_plus_twelve_month_bands(source_table) is not None
     source_table["rows"] = [["year", *("N" for _ in range(12))]]
     assert _year_plus_twelve_month_bands(source_table) is None
+
+
+def test_population_reporting_separates_raw_positions_from_identity_denominator() -> None:
+    fixture = Path("余泽熙7.15征信.pdf")
+
+    def dataset(name: str, *, rows: int, expected: int) -> dict:
+        return {
+            "name": name,
+            "row_count": rows,
+            "completeness": {
+                "expected_row_count": expected,
+                "emitted_row_count": rows,
+                "omitted_row_count": expected - rows,
+            },
+        }
+
+    community = {
+        "datasets": [
+            dataset("credit_accounts", rows=27, expected=27),
+            dataset("credit_agreements", rows=8, expected=8),
+            dataset("inquiries", rows=26, expected=26),
+            dataset(
+                "credit_account_monthly_performance",
+                rows=600,
+                expected=610,
+            ),
+        ]
+    }
+    semantic = {
+        "domain": {
+            "facts": {
+                "personal_detail_account_month_closure": {
+                    "expected_identity_count": 610,
+                    "raw_source_month_positions": 746,
+                    "owner_bound_account_months": 615,
+                    "owner_unresolved_positions": 131,
+                    "alias_source_month_positions": 5,
+                    "unlocalized_owner_unresolved_positions": 0,
+                    "source_position_balance_valid": True,
+                }
+            }
+        }
+    }
+
+    _assert_five_report_population_reporting(community, fixture, semantic)

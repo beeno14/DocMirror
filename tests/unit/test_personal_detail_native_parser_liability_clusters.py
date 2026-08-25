@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
+    _packed_value_equivalent,
 )
 
 PACKED_HEADER = (
@@ -17,8 +18,25 @@ PACKED_VALUE = (
 )
 
 
+def test_packed_liability_equivalence_rejects_deleted_residue() -> None:
+    assert not _packed_value_equivalent("开立日期", "2024?01?02", "2024-01-02")
+    assert not _packed_value_equivalent("开立日期", "任意文本", "其他文本")
+    assert not _packed_value_equivalent("还款责任金额", "1,2", "12")
+    assert not _packed_value_equivalent("还款责任金额", "$1,200", "1200")
+
+
+def test_packed_liability_equivalence_accepts_registered_presentations() -> None:
+    assert _packed_value_equivalent("开立日期", "2024.01.02", "2024-01-02")
+    assert _packed_value_equivalent("还款责任金额", "1,200", "1200")
+
+
+def _owned_liability_table(table: SimpleNamespace) -> SimpleNamespace:
+    table.metadata["canonical_template_id"] = "repayment_responsibility"
+    return table
+
+
 def _native_context(value: str) -> SimpleNamespace:
-    table = SimpleNamespace(
+    table = _owned_liability_table(SimpleNamespace(
         table_id="liability-packed-1",
         metadata={
             "raw_rows": [[PACKED_HEADER], [value]],
@@ -31,11 +49,11 @@ def _native_context(value: str) -> SimpleNamespace:
         headers=[],
         rows=[],
         bbox=[20.0, 40.0, 580.0, 88.0],
-    )
+    ))
     page = SimpleNamespace(
         page_number=6,
         source_page_number=3,
-        canonical_template_id="repayment_liability",
+        canonical_template_id="repayment_responsibility",
         texts=[],
         tables=[table],
     )
@@ -95,7 +113,7 @@ def _adjacent_liability_anchor_context(
         ]
         for row in range(2)
     ]
-    table = SimpleNamespace(
+    table = _owned_liability_table(SimpleNamespace(
         table_id="pt_19_2",
         metadata={
             "raw_rows": [headers, values],
@@ -113,11 +131,11 @@ def _adjacent_liability_anchor_context(
         headers=[],
         rows=[],
         bbox=[47.0, 339.5, 399.0, 444.0],
-    )
+    ))
     page = SimpleNamespace(
         page_number=19,
         source_page_number=10,
-        canonical_template_id="repayment_liability",
+        canonical_template_id="repayment_responsibility",
         texts=[
             SimpleNamespace(
                 content="账户4",
@@ -362,17 +380,17 @@ def test_unresolved_packed_gate_does_not_erase_exact_same_column_fields() -> Non
         "多 民币元",
         "HT0000001",
     ]
-    table = SimpleNamespace(
+    table = _owned_liability_table(SimpleNamespace(
         table_id="liability-columns-1",
         metadata={"raw_rows": [header, values]},
         headers=[],
         rows=[],
         bbox=[20.0, 40.0, 580.0, 88.0],
-    )
+    ))
     page = SimpleNamespace(
         page_number=8,
         source_page_number=4,
-        canonical_template_id="repayment_liability",
+        canonical_template_id="repayment_responsibility",
         texts=[],
         tables=[table],
     )
@@ -395,4 +413,139 @@ def test_unresolved_packed_gate_does_not_erase_exact_same_column_fields() -> Non
     assert (
         context._personal_detail_extraction_issues[0]["issue_code"]
         == "candidate_b_packed_liability_row_unresolved"
+    )
+
+
+def test_native_liability_requires_coherent_page_and_table_owner() -> None:
+    for page_role, table_role in (
+        ("public_information", "public_information"),
+        ("information_summary", "information_summary"),
+        ("", ""),
+        ("repayment_responsibility", "public_information"),
+        ("public_information", "repayment_responsibility"),
+    ):
+        context = _native_context(PACKED_VALUE)
+        page = context.pages[0]
+        table = page.tables[0]
+        page.canonical_template_id = page_role
+        table.metadata["canonical_template_id"] = table_role
+
+        assert (
+            PBOCPersonalDetailNativeParser(context).records(
+                "repayment_liability_records"
+            )
+            == []
+        )
+
+
+def test_native_liability_owner_accepts_reordered_columns_and_variable_rows() -> None:
+    context = _native_context(PACKED_VALUE)
+    table = context.pages[0].tables[0]
+    headers = [
+        "保证合同编号",
+        "币种",
+        "还款责任金额",
+        "责任人类型",
+        "到期日期",
+        "开立日期",
+        "业务种类",
+        "管理机构",
+    ]
+    first = [
+        "GENERIC-CONTRACT-ALPHA",
+        "人民币元",
+        "25,000",
+        "保证",
+        "2027.11.03",
+        "2025.02.14",
+        "贷款",
+        "甲银行",
+    ]
+    second = [
+        "GENERIC-CONTRACT-BETA",
+        "人民币元",
+        "98,765",
+        "共同借款人",
+        "2031.01.09",
+        "2024.12.28",
+        "贷款",
+        "乙银行",
+    ]
+    table.metadata["raw_rows"] = [headers, first, headers, second]
+    table.metadata["source_cell_bboxes"] = [
+        [
+            [20.0 + column * 60.0, 40.0 + row * 22.0, 76.0 + column * 60.0, 58.0 + row * 22.0]
+            for column in range(8)
+        ]
+        for row in range(4)
+    ]
+    table.metadata["cell_evidence_ids"] = [
+        [[f"liability:{row}:{column}"] for column in range(8)]
+        for row in range(4)
+    ]
+
+    records = PBOCPersonalDetailNativeParser(context).records(
+        "repayment_liability_records"
+    )
+
+    assert [record.fields["保证合同编号"] for record in records] == [
+        "GENERIC-CONTRACT-ALPHA",
+        "GENERIC-CONTRACT-BETA",
+    ]
+    assert [record.fields["管理机构"] for record in records] == ["甲银行", "乙银行"]
+
+
+def test_corrected_liability_rejects_heading_inside_prose_or_contents() -> None:
+    for heading in (
+        "目录 （六）相关还款责任信息 ........ 9",
+        "本页说明相关还款责任信息的填报规则",
+    ):
+        context = SimpleNamespace(
+            pages=[],
+            _personal_detail_extraction_issues=[],
+            corrected_evidence_pages=lambda heading=heading: [
+                {
+                    "page": 27,
+                    "source_page": 14,
+                    "canonical_template_id": "public_information",
+                    "lines": [
+                        _line(heading, 10.0, evidence_id="prose"),
+                        _line(PACKED_HEADER, 40.0, evidence_id="header"),
+                        _line(PACKED_VALUE, 70.0, evidence_id="value"),
+                    ],
+                }
+            ],
+        )
+
+        assert (
+            PBOCPersonalDetailNativeParser(context).records(
+                "repayment_liability_records"
+            )
+            == []
+        )
+
+
+def test_corrected_liability_rejects_exact_heading_on_incompatible_page_owner() -> None:
+    context = SimpleNamespace(
+        pages=[],
+        _personal_detail_extraction_issues=[],
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 31,
+                "source_page": 16,
+                "canonical_template_id": "public_information",
+                "lines": [
+                    _line("（九）相关还款责任信息", 10.0, evidence_id="heading"),
+                    _line(PACKED_HEADER, 40.0, evidence_id="header"),
+                    _line(PACKED_VALUE, 70.0, evidence_id="value"),
+                ],
+            }
+        ],
+    )
+
+    assert (
+        PBOCPersonalDetailNativeParser(context).records(
+            "repayment_liability_records"
+        )
+        == []
     )

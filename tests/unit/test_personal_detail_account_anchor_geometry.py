@@ -35,10 +35,7 @@ def _card_header(y: float, *, page: int = 1, source_page: int = 1) -> list[dict]
         ("业务种类", 315, 360),
         ("担保方式", 360, 410),
     )
-    return [
-        _line(text, [left, y, right, y + 12], page=page, source_page=source_page)
-        for text, left, right in labels
-    ]
+    return [_line(text, [left, y, right, y + 12], page=page, source_page=source_page) for text, left, right in labels]
 
 
 def _card_values(
@@ -255,6 +252,37 @@ def test_anchor_interval_recovers_basic_fields_when_line_grid_misses_the_table(
     )
 
 
+def test_anchor_interval_currency_residue_is_withheld_with_exact_field_issues(
+    monkeypatch,
+) -> None:
+    values = _card_values(55)
+    currency_line = next(line for line in values if line["text"] == "人民币元")
+    currency_line["text"] = "非人民币"
+    lines = [
+        _line("贷记卡账户", [20, 10, 120, 22]),
+        _line("账户1（授信协议标识：A00000001）", [20, 25, 250, 36]),
+        *_card_header(40),
+        *values,
+        _line("截至2022年12月14日", [160, 100, 270, 112]),
+    ]
+
+    account, context = _extract_one(monkeypatch, lines)
+
+    assert "currency" not in account
+    assert "account_currency" not in account
+    assert account["canonical_raw"]["currency"] == ["非人民币"]
+    assert account["canonical_raw"]["account_currency"] == ["非人民币"]
+    issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        and issue.get("field_name") in {"currency", "account_currency"}
+    ]
+    assert {issue["field_name"] for issue in issues} == {"currency", "account_currency"}
+    assert all(issue["observed_value"] == ["非人民币"] for issue in issues)
+    assert all(issue["status"] == "requires_review" for issue in issues)
+
+
 def test_anchor_interval_enriches_collapsed_table_without_required_field_issues(
     monkeypatch,
 ) -> None:
@@ -284,8 +312,7 @@ def test_anchor_interval_enriches_collapsed_table_without_required_field_issues(
     assert accounts[0]["guarantee_type"] == "信用/免担保"
     assert not any(
         issue["issue_code"] == "candidate_b_account_required_field_unresolved"
-        and issue.get("field_name")
-        in {"management_institution", "account_identifier", "open_date", "currency"}
+        and issue.get("field_name") in {"management_institution", "account_identifier", "open_date", "currency"}
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -361,8 +388,7 @@ def test_anchor_interval_does_not_shift_neighbor_column_currency(monkeypatch) ->
     assert "currency" not in accounts[0]
     assert "account_currency" not in accounts[0]
     assert any(
-        issue["issue_code"] == "candidate_b_account_required_field_unresolved"
-        and issue.get("field_name") == "currency"
+        issue["issue_code"] == "candidate_b_exact_slot_value_invalid" and issue.get("field_name") == "account_currency"
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -387,8 +413,7 @@ def test_anchor_interval_withholds_conflicting_open_dates(monkeypatch) -> None:
 
     assert "open_date" not in accounts[0]
     assert any(
-        issue["issue_code"] == "candidate_b_exact_slot_value_conflict"
-        and issue.get("field_name") == "open_date"
+        issue["issue_code"] == "candidate_b_exact_slot_value_conflict" and issue.get("field_name") == "open_date"
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -455,10 +480,7 @@ def test_identifier_wrap_requires_evidence_order_to_match_physical_order(monkeyp
 
 def test_identifier_accepts_one_exact_typed_box(monkeypatch) -> None:
     values = [
-        value
-        for value in _card_values(55)
-        if value["text"]
-        not in {"B10111000H", "00014100000", "02100474560", "01"}
+        value for value in _card_values(55) if value["text"] not in {"B10111000H", "00014100000", "02100474560", "01"}
     ]
     values.append(
         _line(
@@ -484,11 +506,7 @@ def test_identifier_accepts_generic_two_letter_prefix_and_one_glyph_final_wrap(
 ) -> None:
     prefix = "RL2014082100004"
     final = "6"
-    values = [
-        value
-        for value in _loan_values(55)
-        if not str(value["text"]).startswith("J101")
-    ]
+    values = [value for value in _loan_values(55) if not str(value["text"]).startswith("J101")]
     values.extend(
         (
             _line(prefix, [84, 55, 141, 64]),
@@ -577,16 +595,11 @@ def test_transposed_header_roles_withhold_all_geometry_fields(monkeypatch) -> No
 
 
 def test_combined_header_or_value_boxes_never_guess_individual_fields(monkeypatch) -> None:
-    header = [
-        line
-        for line in _card_header(40)
-        if line["text"] not in {"发卡机构", "账户标识"}
-    ]
+    header = [line for line in _card_header(40) if line["text"] not in {"发卡机构", "账户标识"}]
     values = [
         line
         for line in _card_values(55)
-        if line["text"]
-        not in {"B10111000H", "00014100000", "02100474560", "01", "2021.05.31"}
+        if line["text"] not in {"B10111000H", "00014100000", "02100474560", "01", "2021.05.31"}
     ]
     lines = [
         _line("贷记卡账户", [20, 10, 120, 22]),
@@ -611,12 +624,8 @@ def test_combined_header_or_value_boxes_never_guess_individual_fields(monkeypatc
     }
 
 
-def test_exact_adjacent_composite_header_is_split_into_typed_columns(monkeypatch) -> None:
-    header = [
-        line
-        for line in _card_header(40)
-        if line["text"] not in {"开立日期", "账户授信额度"}
-    ]
+def test_geometryless_composite_header_cannot_invent_equal_columns(monkeypatch) -> None:
+    header = [line for line in _card_header(40) if line["text"] not in {"开立日期", "账户授信额度"}]
     lines = [
         _line("贷记卡账户", [20, 10, 120, 22]),
         _line("账户1", [20, 25, 80, 36]),
@@ -628,16 +637,229 @@ def test_exact_adjacent_composite_header_is_split_into_typed_columns(monkeypatch
 
     account, _context = _extract_one(monkeypatch, lines)
 
-    assert account["open_date"] == "2021-05-31"
-    assert account["credit_limit"] == 50_000
+    assert "open_date" not in account
+    assert "credit_limit" not in account
+
+
+def test_exact_unequal_composite_header_tokens_bind_unique_roles(monkeypatch) -> None:
+    header = [line for line in _card_header(40) if line["text"] not in {"开立日期", "账户授信额度"}]
+    composite = _line(
+        "开立日期账户授信额度",
+        [125, 40, 225, 52],
+        evidence="composite-header",
+    )
+    composite["evidence_ids"] = ["header-open", "header-limit"]
+    lines = [
+        _line("贷记卡账户", [20, 10, 120, 22]),
+        _line("账户1", [20, 25, 80, 36]),
+        *header,
+        composite,
+        *_card_values(55),
+        _line("截至2022年12月24日", [160, 105, 270, 117]),
+    ]
+    context = _single_card_context(lines)
+    context.evidence_plane = SimpleNamespace(
+        evidence=SimpleNamespace(
+            text_atoms=[
+                {"id": "header-limit", "text": "账户授信额度", "bbox": [170, 40, 225, 52]},
+                {"id": "header-open", "text": "开立日期", "bbox": [125, 40, 165, 52]},
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([], [], []),
+    )
+
+    accounts, _, _ = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    assert accounts[0]["open_date"] == "2021-05-31"
+    assert accounts[0]["credit_limit"] == 50_000
+
+
+@pytest.mark.parametrize(
+    ("role_order", "split"),
+    [
+        (("credit_limit", "open_date"), 0.7),
+        (("open_date", "credit_limit"), 0.3),
+    ],
+)
+def test_exact_reordered_scaled_composite_tokens_bind_semantic_roles(
+    role_order: tuple[str, str],
+    split: float,
+) -> None:
+    scale = 1.8
+    labels = {"credit_limit": "账户授信额度", "open_date": "开立日期"}
+    left = 40.0 * scale
+    right = 180.0 * scale
+    boundary = left + (right - left) * split
+    line = _line(
+        "".join(labels[role] for role in role_order),
+        [left, 30 * scale, right, 44 * scale],
+        page=9,
+        source_page=4,
+        evidence="unused",
+    )
+    line["evidence_ids"] = ["left-token", "right-token"]
+    context = SimpleNamespace(
+        evidence_plane=SimpleNamespace(
+            evidence=SimpleNamespace(
+                text_atoms=[
+                    {
+                        "id": "right-token",
+                        "text": labels[role_order[1]],
+                        "bbox": [boundary + scale, 30 * scale, right, 44 * scale],
+                    },
+                    {
+                        "id": "left-token",
+                        "text": labels[role_order[0]],
+                        "bbox": [left, 30 * scale, boundary - scale, 44 * scale],
+                    },
+                ]
+            )
+        )
+    )
+
+    parts = native_extraction._account_composite_header_parts(
+        context,
+        line,
+        template=native_extraction._ACCOUNT_BASIC_CARD_TEMPLATE,
+    )
+
+    assert [part["_account_composite_role"] for part in parts or ()] == list(role_order)
+    assert [part["evidence_ids"] for part in parts or ()] == [
+        ["left-token"],
+        ["right-token"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("missing", "duplicate_store", "partial", "shared", "overlap", "geometryless"),
+)
+def test_composite_header_token_ownership_defects_fail_closed(defect: str) -> None:
+    line = _line(
+        "开立日期到期日期",
+        [100, 30, 250, 44],
+        evidence="unused",
+    )
+    line["evidence_ids"] = ["open-token", "due-token"]
+    atoms = [
+        {"id": "open-token", "text": "开立日期", "bbox": [100, 30, 145, 44]},
+        {"id": "due-token", "text": "到期日期", "bbox": [190, 30, 250, 44]},
+    ]
+    if defect == "missing":
+        line["evidence_ids"] = []
+    elif defect == "duplicate_store":
+        atoms.append({**atoms[0]})
+    elif defect == "partial":
+        atoms = atoms[:1]
+    elif defect == "shared":
+        line["evidence_ids"] = ["open-token", "open-token"]
+    elif defect == "overlap":
+        atoms[1] = {**atoms[1], "bbox": [140, 30, 250, 44]}
+    elif defect == "geometryless":
+        atoms[1] = {"id": "due-token", "text": "到期日期"}
+    context = SimpleNamespace(evidence_plane=SimpleNamespace(evidence=SimpleNamespace(text_atoms=atoms)))
+
+    assert (
+        native_extraction._account_composite_header_parts(
+            context,
+            line,
+            template=("open_date", "due_date"),
+        )
+        is None
+    )
+
+
+def test_unequal_merged_true_due_date_never_routes_to_open_date(monkeypatch) -> None:
+    header = [line for line in _loan_header(40) if line["text"] not in {"开立日期", "到期日期"}]
+    composite = _line(
+        "开立日期到期日期",
+        [145, 40, 255, 52],
+        evidence="unused",
+    )
+    composite["evidence_ids"] = ["open-header", "due-header"]
+    values = _loan_values(55, include_open_date=False)
+    due = next(line for line in values if line["text"] == "2031.05.31")
+    # The true due value sits left of the former equal-width split (x=200),
+    # but inside the exact wide due-date header token region.
+    due["bbox"] = [180, 55, 190, 64]
+    lines = [
+        _line("非循环贷账户", [20, 10, 140, 22]),
+        _line("账户1", [20, 25, 80, 36]),
+        *header,
+        composite,
+        *values,
+        _line("截至2022年12月24日", [160, 105, 270, 117]),
+    ]
+    context = _single_card_context(lines)
+    context.evidence_plane = SimpleNamespace(
+        evidence=SimpleNamespace(
+            text_atoms=[
+                {"id": "due-header", "text": "到期日期", "bbox": [180, 40, 255, 52]},
+                {"id": "open-header", "text": "开立日期", "bbox": [145, 40, 175, 52]},
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([], [], []),
+    )
+
+    accounts, _, _ = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    assert "open_date" not in accounts[0]
+    assert accounts[0]["due_date"] == "2031-05-31"
+
+
+def test_composite_atom_gap_never_becomes_a_semantic_column(monkeypatch) -> None:
+    header = [line for line in _loan_header(40) if line["text"] not in {"开立日期", "到期日期"}]
+    composite = _line(
+        "开立日期到期日期",
+        [145, 40, 255, 52],
+        evidence="unused",
+    )
+    composite["evidence_ids"] = ["open-header", "due-header"]
+    values = _loan_values(55, include_open_date=False)
+    due = next(line for line in values if line["text"] == "2031.05.31")
+    due["bbox"] = [176, 55, 179, 64]
+    lines = [
+        _line("非循环贷账户", [20, 10, 140, 22]),
+        _line("账户1", [20, 25, 80, 36]),
+        *header,
+        composite,
+        *values,
+        _line("截至2022年12月24日", [160, 105, 270, 117]),
+    ]
+    context = _single_card_context(lines)
+    context.evidence_plane = SimpleNamespace(
+        evidence=SimpleNamespace(
+            text_atoms=[
+                {"id": "open-header", "text": "开立日期", "bbox": [145, 40, 175, 52]},
+                {"id": "due-header", "text": "到期日期", "bbox": [180, 40, 255, 52]},
+            ]
+        )
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([], [], []),
+    )
+
+    accounts, _, _ = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    assert "open_date" not in accounts[0]
+    assert "due_date" not in accounts[0]
 
 
 def test_narrow_composite_header_cannot_invent_column_geometry(monkeypatch) -> None:
-    header = [
-        line
-        for line in _card_header(40)
-        if line["text"] not in {"开立日期", "账户授信额度"}
-    ]
+    header = [line for line in _card_header(40) if line["text"] not in {"开立日期", "账户授信额度"}]
     lines = [
         _line("贷记卡账户", [20, 10, 120, 22]),
         _line("账户1", [20, 25, 80, 36]),
@@ -773,11 +995,7 @@ def test_explicit_dashes_mark_canonical_source_absence(monkeypatch) -> None:
 
 
 def test_cross_column_finite_values_are_retained_only_with_residue_issues(monkeypatch) -> None:
-    values = [
-        line
-        for line in _card_values(55)
-        if line["text"] not in {"贷记卡", "信用/免担保"}
-    ]
+    values = [line for line in _card_values(55) if line["text"] not in {"贷记卡", "信用/免担保"}]
     values.append(_line("贷记卡 信用/免担保", [315, 55, 410, 64]))
     lines = [
         _line("贷记卡账户", [20, 10, 120, 22]),
@@ -1003,11 +1221,7 @@ def test_invalid_geometry_does_not_erase_independently_valid_table_values(
         "business_type": "贷记卡",
         "guarantee_type": "信用/免担保",
     }
-    header = [
-        line
-        for line in _card_header(40)
-        if line["text"] not in {"开立日期", "账户授信额度"}
-    ]
+    header = [line for line in _card_header(40) if line["text"] not in {"开立日期", "账户授信额度"}]
     lines = [
         _line("贷记卡账户", [20, 10, 120, 22]),
         _line("账户1", [20, 25, 80, 36]),

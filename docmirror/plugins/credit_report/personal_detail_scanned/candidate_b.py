@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any
@@ -31,6 +32,18 @@ _CROSS_PLANE_INDIVIDUALIZED_FIELDS = (
     ("credit_accounts", "account_id", ("management_institution",)),
     ("credit_lines", "credit_line_id", ("institution",)),
 )
+
+_HEADER_OWNER_TEMPLATE = "report_header_and_identity"
+_HEADER_METADATA_FIELDS = (
+    "report_number",
+    "report_time",
+    "subject_name",
+    "primary_id_type",
+    "primary_id_number",
+    "query_institution",
+    "query_reason",
+)
+_HEADER_IDENTITY_FIELDS = ("document_type", "document_number")
 
 _CANONICAL_REPAYMENT_STATUS_VALUES = frozenset(
     {
@@ -149,6 +162,746 @@ def _plane_refs(
         for ref in refs or ()
         if isinstance(ref, Mapping)
     ]
+
+
+def _exact_header_lifecycle_ref(
+    ref: Any,
+    *,
+    field_name: str,
+) -> tuple[dict[str, Any], tuple[int, int, str, int, int], tuple[str, ...]] | None:
+    """Validate one immutable, canonical PBOC header-cell observation.
+
+    Candidate B's repaired page plane may legitimately replace the table that
+    exposed this cell.  The discovery value is nevertheless reusable only when
+    its record retains the complete source-owned cell identity produced by
+    ``_exact_report_header_cell_ref``.  Labels, row order, and page location by
+    themselves are deliberately insufficient authority.
+    """
+
+    if not isinstance(ref, Mapping):
+        return None
+    if (
+        str(ref.get("source") or "") != "native_detail_table_cell"
+        or str(ref.get("geometry_scope") or "") != "cell"
+        or str(ref.get("canonical_template_id") or "") != _HEADER_OWNER_TEMPLATE
+        or str(ref.get("binding") or "") != "canonical_field_slot"
+        or str(ref.get("binding_quality") or "") != "canonical_header_column"
+        or str(ref.get("field_name") or "") != field_name
+    ):
+        return None
+    for key in ("logical_page", "source_page", "row", "column", "canonical_row", "canonical_column"):
+        if isinstance(ref.get(key), bool):
+            return None
+    try:
+        logical_page = int(ref["logical_page"])
+        source_page = int(ref["source_page"])
+        row = int(ref["row"])
+        column = int(ref["column"])
+        canonical_row = int(ref["canonical_row"])
+        canonical_column = int(ref["canonical_column"])
+        bbox = tuple(float(value) for value in ref["bbox"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    table_id = str(ref.get("table_id") or "").strip()
+    raw_evidence_ids = ref.get("evidence_ids")
+    if not isinstance(raw_evidence_ids, (list, tuple)):
+        return None
+    evidence_ids = tuple(str(value).strip() for value in raw_evidence_ids)
+    if (
+        logical_page <= 0
+        or source_page <= 0
+        or row < 0
+        or column < 0
+        or canonical_row != row
+        or canonical_column != column
+        or not table_id
+        or len(bbox) != 4
+        or not all(isfinite(value) for value in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+        or not evidence_ids
+        or any(not value for value in evidence_ids)
+        or len(set(evidence_ids)) != len(evidence_ids)
+    ):
+        return None
+    return (
+        dict(ref),
+        (logical_page, source_page, table_id, row, column),
+        evidence_ids,
+    )
+
+
+@dataclass(frozen=True)
+class _HeaderFieldObservation:
+    plane: str
+    row_index: int
+    field_name: str
+    value: Any
+    ref: dict[str, Any]
+    slot: tuple[int, int, str, int, int]
+    evidence_ids: tuple[str, ...]
+
+
+def _header_field_observation(
+    row: Mapping[str, Any],
+    *,
+    row_index: int,
+    field_name: str,
+    plane: str,
+) -> _HeaderFieldObservation | None:
+    """Return one field only when exactly one sealed cell owns its value."""
+
+    value = row.get(field_name)
+    if value in (None, "") or str(row.get("source") or "") != "native_detail_header":
+        return None
+    try:
+        confidence = float(row.get("confidence"))
+    except (TypeError, ValueError):
+        return None
+    if confidence != 1.0:
+        return None
+    refs = row.get("source_refs")
+    if not isinstance(refs, (list, tuple)):
+        return None
+    matching = [
+        ref
+        for ref in refs
+        if isinstance(ref, Mapping)
+        and str(ref.get("field_name") or "") == field_name
+    ]
+    # Two cells claiming one field are not a consensus.  This also makes an
+    # injected duplicate owner fail closed instead of being hidden by dedupe.
+    if len(matching) != 1:
+        return None
+    validated = _exact_header_lifecycle_ref(matching[0], field_name=field_name)
+    if validated is None:
+        return None
+    ref, slot, evidence_ids = validated
+    return _HeaderFieldObservation(
+        plane=plane,
+        row_index=row_index,
+        field_name=field_name,
+        value=value,
+        ref=ref,
+        slot=slot,
+        evidence_ids=evidence_ids,
+    )
+
+
+def _header_field_ref_state(
+    row: Mapping[str, Any],
+    *,
+    field_name: str,
+) -> str:
+    """Classify exact field ownership without treating duplicates as absence."""
+
+    if row.get(field_name) in (None, ""):
+        return "absent"
+    refs = row.get("source_refs")
+    matching = [
+        ref
+        for ref in refs or ()
+        if isinstance(ref, Mapping)
+        and str(ref.get("field_name") or "") == field_name
+        and _exact_header_lifecycle_ref(ref, field_name=field_name) is not None
+    ]
+    if len(matching) > 1:
+        return "duplicate"
+    return "exact" if len(matching) == 1 else "unproven"
+
+
+def _record_header_lifecycle_conflict(
+    context: Any,
+    *,
+    dataset: str,
+    target_record_id: str,
+    field_name: str,
+    observations: list[_HeaderFieldObservation],
+    reason_code: str,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    record_issue(
+        context,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_header_lifecycle_conflict",
+            message=(
+                "Exact source-owned PBOC header observations conflicted across "
+                "the Candidate B discovery and repaired-page lifecycle; the "
+                "field or identity row was withheld without choosing a plane."
+            ),
+            parser_stage="candidate_b_header_lifecycle_reconciliation",
+            target_dataset=dataset,
+            target_record_id=target_record_id,
+            field_name=field_name,
+            observed_value={
+                observation.plane: observation.value
+                for observation in observations
+            },
+            source_refs=(
+                {
+                    **observation.ref,
+                    "evidence_plane": observation.plane,
+                }
+                for observation in observations
+            ),
+            reason_codes=(
+                "registered_report_header_owner",
+                "exact_canonical_header_cell",
+                "immutable_header_cell_slot",
+                reason_code,
+                "normalized_value_withheld",
+            ),
+        ),
+    )
+
+
+def _reconcile_header_metadata_lifecycle(
+    context: Any,
+    discovery_rows: list[Mapping[str, Any]],
+    repaired_rows: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Conserve exact metadata fields lost solely through page replacement."""
+
+    if len(repaired_rows) > 1:
+        # Candidate B emits one report-metadata entity.  Multiple repaired
+        # entities provide no generic basis for selecting a destination row.
+        return [deepcopy(dict(row)) for row in repaired_rows]
+
+    observations: dict[str, dict[str, list[_HeaderFieldObservation]]] = {
+        "discovery_static": {field: [] for field in _HEADER_METADATA_FIELDS},
+        "repaired_page": {field: [] for field in _HEADER_METADATA_FIELDS},
+    }
+    for plane, rows in (
+        ("discovery_static", discovery_rows),
+        ("repaired_page", repaired_rows),
+    ):
+        for row_index, row in enumerate(rows):
+            for field_name in _HEADER_METADATA_FIELDS:
+                observation = _header_field_observation(
+                    row,
+                    row_index=row_index,
+                    field_name=field_name,
+                    plane=plane,
+                )
+                if observation is not None:
+                    observations[plane][field_name].append(observation)
+
+    metadata_owner_conflicts: set[
+        tuple[str, int, int, str, int, int]
+    ] = set()
+    metadata_evidence_owners: dict[
+        tuple[str, str],
+        set[tuple[int, int, str, int, int, str, str]],
+    ] = {}
+    for plane in ("discovery_static", "repaired_page"):
+        for field_name in _HEADER_METADATA_FIELDS:
+            for observation in observations[plane][field_name]:
+                for evidence_id in observation.evidence_ids:
+                    metadata_evidence_owners.setdefault(
+                        (plane, evidence_id),
+                        set(),
+                    ).add(
+                        (
+                            *observation.slot,
+                            field_name,
+                            _individualized_scalar_key(observation.value),
+                        )
+                    )
+    for (plane, _evidence_id), owners in metadata_evidence_owners.items():
+        if len(owners) <= 1:
+            continue
+        for logical_page, source_page, table_id, row, column, _field, _value in owners:
+            metadata_owner_conflicts.add(
+                (plane, logical_page, source_page, table_id, row, column)
+            )
+
+    discovery_has_exact = any(
+        observations["discovery_static"][field]
+        for field in _HEADER_METADATA_FIELDS
+    )
+    if not repaired_rows and not discovery_has_exact:
+        return []
+    if repaired_rows:
+        merged = deepcopy(dict(repaired_rows[0]))
+    else:
+        # Copy policy/default columns from the sole discovery entity, but only
+        # exact cell-owned header values survive below.
+        source_rows = {
+            observation.row_index
+            for field in _HEADER_METADATA_FIELDS
+            for observation in observations["discovery_static"][field]
+        }
+        if len(source_rows) != 1:
+            return []
+        merged = deepcopy(dict(discovery_rows[next(iter(source_rows))]))
+        for field_name in _HEADER_METADATA_FIELDS:
+            merged[field_name] = None
+    original_merged = deepcopy(merged)
+
+    retained_refs: list[dict[str, Any]] = []
+    for field_name in _HEADER_METADATA_FIELDS:
+        discovery = observations["discovery_static"][field_name]
+        repaired = observations["repaired_page"][field_name]
+        global_owner_conflicts = [
+            observation
+            for observation in (*discovery, *repaired)
+            if (observation.plane, *observation.slot) in metadata_owner_conflicts
+        ]
+        discovery_duplicate_rows = [
+            (row_index, row)
+            for row_index, row in enumerate(discovery_rows)
+            if _header_field_ref_state(row, field_name=field_name) == "duplicate"
+        ]
+        repaired_duplicate_rows = [
+            (row_index, row)
+            for row_index, row in enumerate(repaired_rows)
+            if _header_field_ref_state(row, field_name=field_name) == "duplicate"
+        ]
+        if (
+            len(discovery) > 1
+            or len(repaired) > 1
+            or discovery_duplicate_rows
+            or repaired_duplicate_rows
+            or global_owner_conflicts
+        ):
+            merged[field_name] = None
+            conflicting = [*discovery, *repaired]
+            for plane, duplicate_rows in (
+                ("discovery_static", discovery_duplicate_rows),
+                ("repaired_page", repaired_duplicate_rows),
+            ):
+                for row_index, row in duplicate_rows:
+                    for ref in row.get("source_refs") or ():
+                        validated = _exact_header_lifecycle_ref(
+                            ref,
+                            field_name=field_name,
+                        )
+                        if validated is None:
+                            continue
+                        exact_ref, slot, evidence_ids = validated
+                        conflicting.append(
+                            _HeaderFieldObservation(
+                                plane=plane,
+                                row_index=row_index,
+                                field_name=field_name,
+                                value=row.get(field_name),
+                                ref=exact_ref,
+                                slot=slot,
+                                evidence_ids=evidence_ids,
+                            )
+                        )
+            _record_header_lifecycle_conflict(
+                context,
+                dataset="personal_report_metadata",
+                target_record_id=str(
+                    merged.get("personal_report_metadata_id")
+                    or "personal_report_metadata:header_lifecycle"
+                ),
+                field_name=field_name,
+                observations=[*conflicting, *global_owner_conflicts],
+                reason_code=(
+                    "conflicting_exact_header_evidence_owner"
+                    if global_owner_conflicts
+                    else "duplicate_exact_header_field_owner"
+                ),
+            )
+            continue
+        if discovery and repaired:
+            native_value = _individualized_scalar_key(discovery[0].value)
+            repaired_value = _individualized_scalar_key(repaired[0].value)
+            if native_value != repaired_value:
+                merged[field_name] = None
+                merged.setdefault("canonical_raw", {})[field_name] = [
+                    discovery[0].value,
+                    repaired[0].value,
+                ]
+                unresolved = merged.setdefault("_unresolved_fields", [])
+                if field_name not in unresolved:
+                    unresolved.append(field_name)
+                _record_header_lifecycle_conflict(
+                    context,
+                    dataset="personal_report_metadata",
+                    target_record_id=str(
+                        merged.get("personal_report_metadata_id")
+                        or "personal_report_metadata:header_lifecycle"
+                    ),
+                    field_name=field_name,
+                    observations=[discovery[0], repaired[0]],
+                    reason_code="independent_exact_header_value_conflict",
+                )
+                continue
+            merged[field_name] = repaired[0].value
+            retained_refs.extend((discovery[0].ref, repaired[0].ref))
+            continue
+        observation = (repaired or discovery)
+        if observation:
+            merged[field_name] = observation[0].value
+            retained_refs.append(observation[0].ref)
+            continue
+        # No exact lifecycle observation owns this field. Preserve the
+        # repaired pass's ordinary fail-closed result; discovery values are
+        # never resurrected through an unowned row.
+        if repaired_rows:
+            merged[field_name] = original_merged.get(field_name)
+
+    # Header refs are field-specific and exact.  Do not carry a stale repaired
+    # ref for a field that was just withheld.
+    unique_refs: list[dict[str, Any]] = []
+    seen_refs: set[tuple[Any, ...]] = set()
+    for ref in retained_refs:
+        marker = (
+            ref.get("logical_page"),
+            ref.get("source_page"),
+            ref.get("table_id"),
+            ref.get("row"),
+            ref.get("column"),
+            ref.get("field_name"),
+            tuple(ref.get("evidence_ids") or ()),
+        )
+        if marker not in seen_refs:
+            seen_refs.add(marker)
+            unique_refs.append(deepcopy(ref))
+    merged["source_refs"] = unique_refs
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        register_issue_target_remap,
+    )
+    from docmirror.plugins.credit_report.value_utils import stable_record_id
+
+    old_ids = {
+        str(row.get("personal_report_metadata_id") or "")
+        for row in (*discovery_rows, *repaired_rows)
+        if row.get("personal_report_metadata_id")
+    }
+    metadata_id = stable_record_id(
+        "personal_report_metadata",
+        merged.get("report_number"),
+        merged.get("report_time"),
+        merged.get("subject_name"),
+    )
+    merged["personal_report_metadata_id"] = metadata_id
+    for old_id in old_ids:
+        register_issue_target_remap(context, old_id, metadata_id)
+    return [merged]
+
+
+@dataclass(frozen=True)
+class _ExactIdentityObservation:
+    plane: str
+    row_index: int
+    row: dict[str, Any]
+    fields: tuple[_HeaderFieldObservation, _HeaderFieldObservation]
+
+    @property
+    def is_primary(self) -> bool:
+        return self.row.get("is_primary") is True
+
+    @property
+    def semantic_key(self) -> tuple[str, str, str]:
+        return (
+            "primary" if self.is_primary else "additional",
+            _individualized_scalar_key(self.row.get("document_type")).upper(),
+            _individualized_scalar_key(self.row.get("document_number")).upper(),
+        )
+
+
+def _exact_identity_observations(
+    rows: list[Mapping[str, Any]],
+    *,
+    plane: str,
+) -> list[_ExactIdentityObservation]:
+    observations: list[_ExactIdentityObservation] = []
+    for row_index, row in enumerate(rows):
+        fields = tuple(
+            observation
+            for field_name in _HEADER_IDENTITY_FIELDS
+            if (
+                observation := _header_field_observation(
+                    row,
+                    row_index=row_index,
+                    field_name=field_name,
+                    plane=plane,
+                )
+            )
+            is not None
+        )
+        if len(fields) != len(_HEADER_IDENTITY_FIELDS):
+            continue
+        observations.append(
+            _ExactIdentityObservation(
+                plane=plane,
+                row_index=row_index,
+                row=deepcopy(dict(row)),
+                fields=(fields[0], fields[1]),
+            )
+        )
+    return observations
+
+
+def _reconcile_header_identity_lifecycle(
+    context: Any,
+    discovery_rows: list[Mapping[str, Any]],
+    repaired_rows: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union exact identity rows while vetoing duplicate/conflicting owners."""
+
+    discovery = _exact_identity_observations(
+        discovery_rows,
+        plane="discovery_static",
+    )
+    repaired = _exact_identity_observations(
+        repaired_rows,
+        plane="repaired_page",
+    )
+    candidates = [*discovery, *repaired]
+    invalid: set[tuple[str, int]] = set()
+
+    def invalidate(
+        grouped: list[_ExactIdentityObservation],
+        reason_code: str,
+    ) -> None:
+        if len(grouped) < 2:
+            return
+        observations = [field for candidate in grouped for field in candidate.fields]
+        for candidate in grouped:
+            invalid.add((candidate.plane, candidate.row_index))
+        _record_header_lifecycle_conflict(
+            context,
+            dataset="identity_documents",
+            target_record_id="identity_document:header_lifecycle",
+            field_name="identity_document",
+            observations=observations,
+            reason_code=reason_code,
+        )
+
+    # More than one primary or the same additional document twice inside one
+    # plane is an ambiguous entity population, even when the glyphs agree.
+    for plane_candidates in (discovery, repaired):
+        primaries = [candidate for candidate in plane_candidates if candidate.is_primary]
+        if len(primaries) > 1:
+            invalidate(primaries, "duplicate_exact_primary_identity_owner")
+        by_semantic: dict[tuple[str, str, str], list[_ExactIdentityObservation]] = {}
+        for candidate in plane_candidates:
+            by_semantic.setdefault(candidate.semantic_key, []).append(candidate)
+        for grouped in by_semantic.values():
+            if len(grouped) > 1:
+                invalidate(grouped, "duplicate_exact_identity_owner")
+
+        by_slot: dict[
+            tuple[int, int, str, int, int],
+            list[tuple[_ExactIdentityObservation, _HeaderFieldObservation]],
+        ] = {}
+        by_evidence: dict[
+            str,
+            list[tuple[_ExactIdentityObservation, _HeaderFieldObservation]],
+        ] = {}
+        for candidate in plane_candidates:
+            for field in candidate.fields:
+                by_slot.setdefault(field.slot, []).append((candidate, field))
+                for evidence_id in field.evidence_ids:
+                    by_evidence.setdefault(evidence_id, []).append((candidate, field))
+        for grouped in by_slot.values():
+            if len({(field.field_name, field.value) for _candidate, field in grouped}) > 1:
+                invalidate(
+                    [candidate for candidate, _field in grouped],
+                    "duplicate_exact_identity_cell_owner",
+                )
+        for grouped in by_evidence.values():
+            signatures = {
+                (field.field_name, field.slot)
+                for _candidate, field in grouped
+            }
+            if len(signatures) > 1:
+                invalidate(
+                    [candidate for candidate, _field in grouped],
+                    "conflicting_exact_identity_evidence_owner",
+                )
+
+    # The same immutable cell/evidence ID cannot publish two different fields
+    # or values across the discovery and repaired planes.
+    global_slots: dict[
+        tuple[int, int, str, int, int],
+        list[tuple[_ExactIdentityObservation, _HeaderFieldObservation]],
+    ] = {}
+    global_evidence: dict[
+        str,
+        list[tuple[_ExactIdentityObservation, _HeaderFieldObservation]],
+    ] = {}
+    for candidate in candidates:
+        for field in candidate.fields:
+            global_slots.setdefault(field.slot, []).append((candidate, field))
+            for evidence_id in field.evidence_ids:
+                global_evidence.setdefault(evidence_id, []).append((candidate, field))
+    for grouped in global_slots.values():
+        meanings = {
+            (field.field_name, _individualized_scalar_key(field.value).upper())
+            for _candidate, field in grouped
+        }
+        if len(meanings) > 1:
+            invalidate(
+                [candidate for candidate, _field in grouped],
+                "independent_exact_identity_cell_conflict",
+            )
+    for grouped in global_evidence.values():
+        owners = {
+            (
+                field.slot,
+                field.field_name,
+                _individualized_scalar_key(field.value).upper(),
+            )
+            for _candidate, field in grouped
+        }
+        if len(owners) > 1:
+            invalidate(
+                [candidate for candidate, _field in grouped],
+                "independent_exact_identity_evidence_conflict",
+            )
+
+    valid_primaries = [
+        candidate
+        for candidate in candidates
+        if candidate.is_primary
+        and (candidate.plane, candidate.row_index) not in invalid
+    ]
+    if len({candidate.semantic_key for candidate in valid_primaries}) > 1:
+        invalidate(valid_primaries, "independent_exact_primary_identity_conflict")
+
+    accepted: dict[tuple[str, str, str], list[_ExactIdentityObservation]] = {}
+    for candidate in candidates:
+        if (candidate.plane, candidate.row_index) in invalid:
+            continue
+        accepted.setdefault(candidate.semantic_key, []).append(candidate)
+    blocked_semantic_keys = {
+        candidate.semantic_key
+        for candidate in candidates
+        if (candidate.plane, candidate.row_index) in invalid
+    }
+
+    accepted_rows: list[dict[str, Any]] = []
+    for semantic_key, grouped in accepted.items():
+        preferred = next(
+            (candidate for candidate in grouped if candidate.plane == "repaired_page"),
+            grouped[0],
+        )
+        merged = deepcopy(preferred.row)
+        discovery_match = next(
+            (candidate for candidate in grouped if candidate.plane == "discovery_static"),
+            None,
+        )
+        if discovery_match is not None:
+            for key, value in discovery_match.row.items():
+                if merged.get(key) in (None, "") and value not in (None, ""):
+                    merged[key] = deepcopy(value)
+        refs: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for candidate in grouped:
+            for field in candidate.fields:
+                marker = (
+                    field.slot,
+                    field.field_name,
+                    field.evidence_ids,
+                )
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                refs.append(deepcopy(field.ref))
+        merged["source_refs"] = refs
+        accepted_rows.append(merged)
+
+    accepted_keys = set(accepted)
+    exact_primary_candidate_seen = any(candidate.is_primary for candidate in candidates)
+    primary_blocked = exact_primary_candidate_seen and not any(
+        key[0] == "primary" for key in accepted_keys
+    )
+    repaired_exact_indices = {candidate.row_index for candidate in repaired}
+    retained_unproven: list[dict[str, Any]] = []
+    for row_index, row in enumerate(repaired_rows):
+        if row_index in repaired_exact_indices:
+            continue
+        semantic_key = (
+            "primary" if row.get("is_primary") is True else "additional",
+            _individualized_scalar_key(row.get("document_type")).upper(),
+            _individualized_scalar_key(row.get("document_number")).upper(),
+        )
+        if semantic_key in accepted_keys or semantic_key in blocked_semantic_keys:
+            continue
+        if row.get("source") == "native_detail_header" and all(
+            row.get(field_name) not in (None, "")
+            for field_name in _HEADER_IDENTITY_FIELDS
+        ):
+            # A header row whose essential fields lack the complete immutable
+            # slot proof is not a lifecycle-preservable entity.  Leaving it in
+            # the repaired pass would let duplicate/malformed owners bypass
+            # the exact population gate above.
+            continue
+        if semantic_key[0] == "primary" and (
+            primary_blocked or any(key[0] == "primary" for key in accepted_keys)
+        ):
+            continue
+        retained_unproven.append(deepcopy(dict(row)))
+
+    final_rows = [*accepted_rows, *retained_unproven]
+
+    def sequence_key(row: Mapping[str, Any]) -> tuple[int, int]:
+        primary_rank = 0 if row.get("is_primary") is True else 1
+        try:
+            sequence = int(row.get("sequence") or 10**9)
+        except (TypeError, ValueError):
+            sequence = 10**9
+        return primary_rank, sequence
+
+    final_rows.sort(key=sequence_key)
+    return final_rows
+
+
+def _reconcile_candidate_b_header_lifecycle(
+    context: Any,
+    discovery_datasets: Mapping[str, Any],
+    repaired_datasets: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Preserve only sealed header observations across page-repair replacement."""
+
+    reconciled = {
+        name: [deepcopy(dict(row)) for row in rows if isinstance(row, Mapping)]
+        for name, rows in repaired_datasets.items()
+        if isinstance(rows, (list, tuple))
+    }
+    discovery_metadata = [
+        row
+        for row in discovery_datasets.get("personal_report_metadata") or ()
+        if isinstance(row, Mapping)
+    ]
+    repaired_metadata = [
+        row
+        for row in repaired_datasets.get("personal_report_metadata") or ()
+        if isinstance(row, Mapping)
+    ]
+    reconciled["personal_report_metadata"] = _reconcile_header_metadata_lifecycle(
+        context,
+        discovery_metadata,
+        repaired_metadata,
+    )
+    discovery_identities = [
+        row
+        for row in discovery_datasets.get("identity_documents") or ()
+        if isinstance(row, Mapping)
+    ]
+    repaired_identities = [
+        row
+        for row in repaired_datasets.get("identity_documents") or ()
+        if isinstance(row, Mapping)
+    ]
+    reconciled["identity_documents"] = _reconcile_header_identity_lifecycle(
+        context,
+        discovery_identities,
+        repaired_identities,
+    )
+    return reconciled
 
 
 def _repayment_performance_month(record: Mapping[str, Any]) -> str | None:
@@ -545,7 +1298,7 @@ def _final_account_field_is_valid(field_name: str, value: Any) -> bool:
         validate_pboc_field,
     )
     from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
-        _account_institution,
+        _exact_source_account_institution,
         _typed_identifier,
     )
 
@@ -562,21 +1315,14 @@ def _final_account_field_is_valid(field_name: str, value: Any) -> bool:
         return _typed_identifier(text) is not None
     if field_name == "management_institution":
         compact = "".join(text.split())
-        normalized = _account_institution(text, independently_corroborated=True)
+        normalized = _exact_source_account_institution(
+            text,
+            independently_corroborated=True,
+        )
         return bool(
             compact
             and any(root in compact for root in _ACCOUNT_INSTITUTION_LEGAL_ROOTS)
-            and (
-                normalized is not None
-                or any(
-                    root in compact
-                    for root in (
-                        "银行股份有限公司",
-                        "银行有限责任公司",
-                        "小额贷款有限公司",
-                    )
-                )
-            )
+            and normalized is not None
         )
     return False
 
@@ -842,6 +1588,7 @@ class CandidateBPipeline:
             _extract_summary_datasets,
             _record_pre_repair_source_gaps,
             _source_completeness_ledger,
+            reconcile_candidate_b_account_sequence_issues,
             reconcile_candidate_b_credit_lines,
         )
         from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
@@ -949,6 +1696,11 @@ class CandidateBPipeline:
         if repair_applied:
             source_business, source_datasets, source_profile = extract_source_pass()
             source_status_glyph_observations = status_glyph_observations()
+            source_datasets = _reconcile_candidate_b_header_lifecycle(
+                self.context,
+                first_datasets,
+                source_datasets,
+            )
             _withhold_independent_plane_conflicts(
                 self.context,
                 first_datasets,
@@ -1056,6 +1808,15 @@ class CandidateBPipeline:
                 if isinstance(row, Mapping)
             ],
         )
+        canonical_layout_owner_census = deepcopy(
+            self.context.canonical_layout_audit()
+        )
+        source_completeness_ledger = _source_completeness_ledger(self.context)
+        reconcile_candidate_b_account_sequence_issues(
+            self.context,
+            source_completeness_ledger,
+            all_datasets.get("credit_accounts") or (),
+        )
         issues = collect_extraction_issues(self.context)
         if issues:
             all_datasets["personal_detail_extraction_issues"] = issues
@@ -1068,7 +1829,12 @@ class CandidateBPipeline:
             "subject_profile": source_profile,
             "credit_summary": dict(business.get("credit_summary") or {}),
             "canonical_dataset_schema": "personal_credit_report_detailed.v2",
-            "personal_detail_source_completeness_ledger": _source_completeness_ledger(self.context),
+            # Publish the immutable topology/registration plane before source
+            # projection. Fail-closed field conservation must resolve exact
+            # metadata cells against their canonical owner at this stage; the
+            # public extraction audit is assembled only after projection.
+            "_personal_detail_canonical_layout_owner_census": canonical_layout_owner_census,
+            "personal_detail_source_completeness_ledger": source_completeness_ledger,
             "personal_detail_document_consistency_ledger": consistency_audit,
             "personal_detail_dataset_states": dataset_states_from_issues(issues),
             **{f"personal_detail_expected_{name}_count": count for name, count in final_counts.items()},
@@ -1078,6 +1844,11 @@ class CandidateBPipeline:
             business,
             final_dataset_counts=final_counts,
         )
+        projected_facts = content.get("facts")
+        if isinstance(projected_facts, dict):
+            projected_facts.pop(
+                "_personal_detail_canonical_layout_owner_census", None
+            )
         supplemental = {
             name: rows
             for name, rows in (content.get("datasets") or {}).items()
@@ -1095,7 +1866,7 @@ class CandidateBPipeline:
             if self.context.ocr_correction_audit().get("business_repair", {}).get("second_schema_pass_required")
             else 1,
             "parse_result_mutated": False,
-            "canonical_layout": self.context.canonical_layout_audit(),
+            "canonical_layout": canonical_layout_owner_census,
             "page_topology": self.context.page_topology_audit(),
             "ocr_correction": self.context.ocr_correction_audit(),
             "document_consistency": consistency_audit,

@@ -10,6 +10,8 @@ extractors without exposing mutable cached values to their consumers.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -156,13 +158,34 @@ def _page_ocr_score(words: Iterable[dict[str, Any]], *, image_shape: Any = None)
     )
 
 
-def _single_page_ocr(image: Any) -> tuple[list[dict[str, Any]], float]:
-    """OCR one already-oriented, frozen logical subpage exactly once."""
+def _single_page_ocr(image: Any) -> tuple[list[dict[str, Any]], float, dict[str, Any]]:
+    """Deskew and OCR one already-oriented, frozen logical subpage once."""
 
+    from docmirror.layout.normalization import hough_deskew_image, inverse_project_hough_bbox
     from docmirror.ocr.repair.recognizers import rapidocr_recognize
 
-    words = rapidocr_recognize(image, source="personal_detail_page_reocr_once")
-    return words, _page_ocr_score(words, image_shape=getattr(image, "shape", None))
+    deskewed, deskew = hough_deskew_image(image)
+    words = rapidocr_recognize(deskewed, source="personal_detail_page_reocr_once")
+    shape = getattr(image, "shape", None)
+    if deskew.get("applied") is True and isinstance(shape, (list, tuple)) and len(shape) >= 2:
+        restored: list[dict[str, Any]] = []
+        for word in words:
+            mapped = inverse_project_hough_bbox(
+                word.get("bbox"),
+                deskew,
+                width=float(shape[1]),
+                height=float(shape[0]),
+            )
+            if mapped is None:
+                continue
+            restored.append({**word, "bbox": mapped})
+        words = restored
+    audit = {
+        key: deepcopy(value)
+        for key, value in deskew.items()
+        if key not in {"forward_matrix", "inverse_matrix"}
+    }
+    return words, _page_ocr_score(words, image_shape=shape), audit
 
 
 def _bbox(value: Any) -> tuple[float, float, float, float] | None:
@@ -844,6 +867,7 @@ def _printed_reading_order_resolution(
         source_by_logical,
         topology=topology,
         expected_total=expected_total,
+        full_footer_logical_pages=full_footer_pages,
         excluded_logical_pages=blank_logical_pages,
     )
     unprinted_nonblank_pages = (
@@ -948,29 +972,202 @@ def _infer_paired_printed_pages(
     *,
     topology: PersonalDetailPageTopology | None = None,
     expected_total: int | None = None,
+    full_footer_logical_pages: Iterable[int] = (),
     excluded_logical_pages: Iterable[int] = (),
 ) -> set[int]:
-    """Infer one unread footer from a geometry-confirmed adjacent half."""
+    """Infer unread spread footers only from a repeated imposition profile.
+
+    A core ``two_page_spread`` label proves that two logical fragments share a
+    source surface; it does not prove report-page order.  Establish that order
+    from at least two independent spreads whose two full printed footers are
+    consecutive left-to-right and whose validated crop/orientation profiles
+    agree.  Booklet scans, top/bottom crops, and a lone example therefore stay
+    unresolved rather than manufacturing an ``N +/- 1`` identity.
+    """
     inferred: set[int] = set()
+    if topology is None:
+        return inferred
     excluded = {int(value) for value in excluded_logical_pages}
+    full_footers = {int(value) for value in full_footer_logical_pages}
     logicals_by_source: dict[int, list[int]] = {}
     for logical, source in source_by_logical.items():
         logicals_by_source.setdefault(source, []).append(logical)
-    for logicals in logicals_by_source.values():
-        ordered = topology.ordered_pair(logicals) if topology is not None else None
+
+    def affine_signature(logical: int) -> tuple[float, ...] | None:
+        page = topology.page(logical)
+        transform = getattr(page, "coordinate_transform", None) if page is not None else None
+        transform = transform if isinstance(transform, Mapping) else {}
+        matrix = _matrix3(transform.get("matrix"))
+        if matrix is None:
+            return None
+        source_x_norm = math.hypot(matrix[0][0], matrix[1][0])
+        source_y_norm = math.hypot(matrix[0][1], matrix[1][1])
+        if source_x_norm <= 1e-12 or source_y_norm <= 1e-12:
+            return None
+        return (
+            matrix[0][0] / source_x_norm,
+            matrix[1][0] / source_x_norm,
+            matrix[0][1] / source_y_norm,
+            matrix[1][1] / source_y_norm,
+            source_x_norm / source_y_norm,
+        )
+
+    def numeric_profile_matches(left: Iterable[float], right: Iterable[float]) -> bool:
+        left_values = tuple(float(value) for value in left)
+        right_values = tuple(float(value) for value in right)
+        return len(left_values) == len(right_values) and all(
+            math.isclose(left_value, right_value, rel_tol=0.02, abs_tol=0.01)
+            for left_value, right_value in zip(left_values, right_values, strict=True)
+        )
+
+    def spread_profiles_match(
+        left: tuple[int, tuple[float, ...], tuple[float, ...]],
+        right: tuple[int, tuple[float, ...], tuple[float, ...]],
+    ) -> bool:
+        return (
+            left[0] == right[0]
+            and numeric_profile_matches(left[1], right[1])
+            and numeric_profile_matches(left[2], right[2])
+        )
+
+    def spread_profile(
+        logicals: Iterable[int],
+    ) -> tuple[int, tuple[float, ...], tuple[float, ...]] | None:
+        ordered = topology.ordered_pair(logicals)
         if ordered is None:
+            return None
+        left, right = ordered
+        left_geometry = topology.geometry(left)
+        right_geometry = topology.geometry(right)
+        if (
+            left_geometry is None
+            or right_geometry is None
+            or not left_geometry.transform_usable
+            or not right_geometry.transform_usable
+            or left_geometry.split_kind != "two_page_spread"
+            or right_geometry.split_kind != "two_page_spread"
+            or left_geometry.segment_index != 0
+            or right_geometry.segment_index != 1
+            or left_geometry.selected_rotation != right_geometry.selected_rotation
+            or left_geometry.source_crop_bbox is None
+            or right_geometry.source_crop_bbox is None
+        ):
+            return None
+        left_crop = left_geometry.source_crop_bbox
+        right_crop = right_geometry.source_crop_bbox
+        left_height = left_crop[3] - left_crop[1]
+        right_height = right_crop[3] - right_crop[1]
+        vertical_overlap = max(
+            0.0,
+            min(left_crop[3], right_crop[3]) - max(left_crop[1], right_crop[1]),
+        )
+        # Crop coordinates are source evidence.  Both halves must describe a
+        # horizontal imposition; a top/bottom partition cannot establish
+        # left-to-right report reading order.
+        if vertical_overlap < min(left_height, right_height) * 0.98:
+            return None
+        if left_crop[2] <= right_crop[0]:
+            source_crop_order = 1
+        elif right_crop[2] <= left_crop[0]:
+            source_crop_order = -1
+        else:
+            return None
+        if source_crop_order != 1:
+            return None
+        left_transform = affine_signature(left)
+        right_transform = affine_signature(right)
+        if (
+            left_transform is None
+            or right_transform is None
+            or not numeric_profile_matches(left_transform, right_transform)
+        ):
+            return None
+
+        union_x0 = min(left_crop[0], right_crop[0])
+        union_y0 = min(left_crop[1], right_crop[1])
+        union_x1 = max(left_crop[2], right_crop[2])
+        union_y1 = max(left_crop[3], right_crop[3])
+        union_width = union_x1 - union_x0
+        union_height = union_y1 - union_y0
+        display_width = left_geometry.width + right_geometry.width
+        display_height = max(left_geometry.height, right_geometry.height)
+        if union_width <= 0 or union_height <= 0 or display_width <= 0 or display_height <= 0:
+            return None
+
+        def normalized_crop(crop: tuple[float, float, float, float]) -> tuple[float, ...]:
+            return (
+                (crop[0] - union_x0) / union_width,
+                (crop[1] - union_y0) / union_height,
+                (crop[2] - union_x0) / union_width,
+                (crop[3] - union_y0) / union_height,
+            )
+
+        crop_and_dimension_profile = (
+            *normalized_crop(left_crop),
+            *normalized_crop(right_crop),
+            union_width / union_height,
+            left_geometry.width / display_width,
+            right_geometry.width / display_width,
+            left_geometry.height / display_height,
+            right_geometry.height / display_height,
+        )
+        return (
+            left_geometry.selected_rotation,
+            left_transform,
+            crop_and_dimension_profile,
+        )
+
+    fully_printed_profiles: list[
+        tuple[int, tuple[float, ...], tuple[float, ...]]
+    ] = []
+    for logicals in logicals_by_source.values():
+        ordered = topology.ordered_pair(logicals)
+        if ordered is None or not set(ordered).issubset(full_footers):
+            continue
+        left, right = ordered
+        profile = spread_profile(logicals)
+        if (
+            profile is None
+            or printed_by_logical.get(right) != printed_by_logical.get(left, 0) + 1
+        ):
+            # One nonconsecutive or geometrically incompatible fully printed
+            # spread disproves a document-wide sequential imposition profile.
+            return inferred
+        fully_printed_profiles.append(profile)
+
+    if len(fully_printed_profiles) < 2 or not all(
+        spread_profiles_match(fully_printed_profiles[0], profile)
+        for profile in fully_printed_profiles[1:]
+    ):
+        return inferred
+    proved_profile = fully_printed_profiles[0]
+
+    for logicals in logicals_by_source.values():
+        ordered = topology.ordered_pair(logicals)
+        profile = spread_profile(logicals)
+        if (
+            ordered is None
+            or profile is None
+            or not spread_profiles_match(profile, proved_profile)
+        ):
             continue
         left, right = ordered
         if left in excluded or right in excluded:
             continue
         if left in printed_by_logical and right not in printed_by_logical:
             candidate = printed_by_logical[left] + 1
-            if expected_total is None or 1 <= candidate <= expected_total:
+            if (
+                (expected_total is None or 1 <= candidate <= expected_total)
+                and candidate not in printed_by_logical.values()
+            ):
                 printed_by_logical[right] = candidate
                 inferred.add(right)
         elif right in printed_by_logical and left not in printed_by_logical:
             candidate = printed_by_logical[right] - 1
-            if expected_total is None or 1 <= candidate <= expected_total:
+            if (
+                (expected_total is None or 1 <= candidate <= expected_total)
+                and candidate not in printed_by_logical.values()
+            ):
                 printed_by_logical[left] = candidate
                 inferred.add(left)
     return inferred
@@ -1197,12 +1394,23 @@ class PersonalDetailExtractionContext:
         page_topology: PersonalDetailPageTopology,
     ) -> None:
         self.parse_result = parse_result
+        # Canonical template pages are detached from ParseResult, but exact
+        # merged-cell decoders still need the immutable OCR atom store.  Expose
+        # the lossless runtime plane on the context so every source pass uses
+        # the same evidence IDs/bboxes rather than falling back to raw cell text.
+        canonical_plane = getattr(parse_result, "evidence_plane", None)
+        self.evidence_plane = (
+            canonical_plane.to_runtime()
+            if canonical_plane is not None and callable(getattr(canonical_plane, "to_runtime", None))
+            else canonical_plane
+        )
         self.entity_context = entity_context
         self.evidence_unit_ids = MappingProxyType(dict(evidence_unit_ids))
         # Plugin-owned logical subpages are added during static topology
         # construction, so these two ledgers intentionally remain mutable while
         # the sealed ParseResult and evidence IDs stay immutable.
         self.source_page_by_logical = dict(source_page_by_logical)
+        self._conserved_source_page_by_logical = dict(source_page_by_logical)
         self.reading_order_by_logical = dict(reading_order_by_logical)
         self.reading_order_resolution = deepcopy(dict(reading_order_resolution))
         self.page_topology = page_topology
@@ -1216,6 +1424,10 @@ class PersonalDetailExtractionContext:
             getattr(self, "_personal_detail_extraction_issues", [])
         )
         self._canonical_layout_projection_cache: Any | None = None
+        self._canonical_projection_conservation_by_phase: dict[str, dict[str, Any]] = {}
+        self._conserved_corrected_evidence_pages_cache: tuple[dict[str, Any], ...] | None = None
+        self._conserved_corrected_evidence_sha256 = ""
+        self._pboc_layout_profile_cache: Any | None = None
         self._canonical_entity_context_ready = False
         self._business_repair_plan: Any | None = None
         self._business_repair_evidence_by_page: dict[int, dict[str, Any]] = {}
@@ -1311,7 +1523,22 @@ class PersonalDetailExtractionContext:
             self._initial_personal_detail_extraction_issues
         )
         self._cache.clear()
+        # Account anchors are cached directly on the context because several
+        # account/table consumers share the same source skeleton.  Unlike the
+        # ordinary extraction cache above, that attribute survives ``clear``.
+        # A repaired complete-page evidence plane can split or recover an
+        # anchor that was unreadable in the discovery pass, so the second pass
+        # must rebuild the skeleton from the repaired canonical pages.
+        discovery_account_skeletons = self.__dict__.get(
+            "_candidate_b_account_anchor_skeleton_cache"
+        )
+        if isinstance(discovery_account_skeletons, list):
+            self._candidate_b_pre_repair_account_anchor_inventory = tuple(
+                deepcopy(discovery_account_skeletons)
+            )
+        self.__dict__.pop("_candidate_b_account_anchor_skeleton_cache", None)
         self._canonical_layout_projection_cache = None
+        self._pboc_layout_profile_cache = None
         self._canonical_entity_context_ready = False
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
@@ -1349,6 +1576,9 @@ class PersonalDetailExtractionContext:
             from docmirror.plugins.credit_report.micro_grid_materialize import (
                 augment_credit_repayment_evidence_bundles,
                 materialize_credit_repayment_micro_grids_from_bundles,
+            )
+            from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+                report_localized_monthly_omissions,
             )
             from docmirror.plugins.credit_report.repayment_grid import (
                 dedupe_repayment_records,
@@ -1711,64 +1941,123 @@ class PersonalDetailExtractionContext:
                 enable_cell_ocr=False,
                 extra_status_chars={"A", "#"},
             )
+            source_structure_grids = micro_grid_structures_from_domain_specific(
+                source_baseline
+            )
             source_structure_records = dedupe_repayment_records(
                 [
                     record
-                    for grid in micro_grid_structures_from_domain_specific(source_baseline)
+                    for grid in source_structure_grids
                     for record in records_from_micro_grid_dict(grid)
                 ]
             )
+            # Keep the detached structural plane private and value-inert.  The
+            # relationship layer may use only its printed range/cell geometry
+            # to reconcile extraction-local grid aliases after a unique account
+            # owner is proven; no detached status value enters business rows.
+            self._candidate_b_monthly_source_structure_grids = deepcopy(
+                source_structure_grids
+            )
+            self._candidate_b_monthly_source_structure_records = deepcopy(
+                source_structure_records
+            )
             source_structure_count = len(source_structure_records)
 
-            months_by_series: dict[str, set[int]] = {}
-            for record in deduped:
-                account_id = str(record.get("account_id") or "").strip()
-                grid_id = str(record.get("grid_id") or "").strip()
-                if not grid_id:
-                    grid_id = next(
-                        (
-                            str(ref.get("grid_id") or "").strip()
-                            for ref in record.get("source_cell_refs") or []
-                            if isinstance(ref, dict) and str(ref.get("grid_id") or "").strip()
-                        ),
-                        "",
+            def exact_monthly_key(
+                record: Mapping[str, Any],
+            ) -> tuple[str, int, int] | None:
+                refs = [
+                    ref
+                    for ref in record.get("source_cell_refs") or ()
+                    if isinstance(ref, Mapping)
+                ]
+                grid_ids = {
+                    str(value).strip()
+                    for value in (
+                        record.get("grid_id"),
+                        *(ref.get("grid_id") for ref in refs),
                     )
-                month = str(record.get("performance_month") or "").strip()
-                if not month:
-                    year_value = int(record.get("year") or 0)
-                    month_value = int(record.get("month") or 0)
-                    if 2000 <= year_value <= 2099 and 1 <= month_value <= 12:
-                        month = f"{year_value:04d}-{month_value:02d}"
-                match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])", month)
-                series_id = account_id or grid_id
-                if not series_id or match is None:
+                    if str(value or "").strip()
+                }
+                raw_month = str(record.get("performance_month") or "").strip()
+                if raw_month:
+                    match = re.fullmatch(r"(20\d{2})-(0[1-9]|1[0-2])", raw_month)
+                    if match is None:
+                        return None
+                    year, month = int(match.group(1)), int(match.group(2))
+                else:
+                    raw_year = record.get("year")
+                    raw_month_number = record.get("month")
+                    if (
+                        isinstance(raw_year, bool)
+                        or not isinstance(raw_year, int)
+                        or isinstance(raw_month_number, bool)
+                        or not isinstance(raw_month_number, int)
+                    ):
+                        return None
+                    year, month = raw_year, raw_month_number
+                if len(grid_ids) != 1 or not 2000 <= year <= 2099 or not 1 <= month <= 12:
+                    return None
+                return next(iter(grid_ids)), year, month
+
+            canonical_keys = {
+                key
+                for record in deduped
+                if isinstance(record, Mapping)
+                and (key := exact_monthly_key(record)) is not None
+            }
+            source_records_by_key: dict[
+                tuple[str, int, int], list[Mapping[str, Any]]
+            ] = {}
+            for record in source_structure_records:
+                if not isinstance(record, Mapping):
                     continue
-                month_index = int(match.group(1)) * 12 + int(match.group(2))
-                months_by_series.setdefault(series_id, set()).add(month_index)
-            # The schema requires one observation per account/month.  Once an
-            # account has observations on both sides of a month, a hole in
-            # that interval is direct structural evidence of missing or
-            # mis-linked cells.  This capacity check is independent of the
-            # retired typed-cell OCR result and of any fixture-specific count.
-            schema_implied_count = sum(
-                max(months) - min(months) + 1
-                for months in months_by_series.values()
-                if months
-            )
-            structural_expected_count = max(schema_implied_count, source_structure_count)
-            missing_month_count = max(0, structural_expected_count - len(deduped))
-            if missing_month_count:
-                interval_gap_series_count = sum(
-                    1
-                    for months in months_by_series.values()
-                    if months and max(months) - min(months) + 1 > len(months)
+                key = exact_monthly_key(record)
+                if key is not None:
+                    source_records_by_key.setdefault(key, []).append(record)
+            source_keys = set(source_records_by_key)
+            missing_source_keys = source_keys - canonical_keys
+            grids_by_id = {
+                str(grid.get("grid_id") or ""): grid
+                for grid in source_structure_grids
+                if isinstance(grid, Mapping) and str(grid.get("grid_id") or "")
+            }
+            for grid_id in sorted({key[0] for key in missing_source_keys}):
+                localized_keys = sorted(
+                    key for key in missing_source_keys if key[0] == grid_id
                 )
-                within_series_missing_position_count = max(
-                    0, schema_implied_count - len(deduped)
+                report_localized_monthly_omissions(
+                    self,
+                    issue_code="canonical_monthly_source_structure_missing_field",
+                    message=(
+                        "A detached source-structure grid/month position was absent from the deduplicated "
+                        "canonical monthly population."
+                    ),
+                    parser_stage="canonical_monthly_grid_materialization",
+                    grid_id=grid_id,
+                    months=((key[1], key[2]) for key in localized_keys),
+                    source_records=(
+                        record
+                        for key in localized_keys
+                        for record in source_records_by_key[key]
+                    ),
+                    grid=grids_by_id.get(grid_id),
+                    observed_context={"source_structure_key_count": len(localized_keys)},
+                    reason_codes=(
+                        "detached_source_structure_exact_key",
+                        "canonical_deduplicated_key_missing",
+                        "source_structure_is_audit_only",
+                        "account_month_owner_reconciliation_pending",
+                        "dataset_incomplete",
+                    ),
                 )
-                unlocalized_source_structure_delta = max(
-                    0, source_structure_count - max(schema_implied_count, len(deduped))
-                )
+
+            # Grid IDs are extraction-local aliases, and gaps between two
+            # printed ranges are not implied months.  Report only the detached
+            # source-position delta here; the relationship layer owns the
+            # unique account/month reconciliation and the public denominator.
+            unreconciled_source_position_count = len(missing_source_keys)
+            if unreconciled_source_position_count:
                 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
                     make_issue,
                     record_issue,
@@ -1780,32 +2069,28 @@ class PersonalDetailExtractionContext:
                         category="ocr_structure_correction",
                         issue_code="canonical_monthly_reconstruction_incomplete",
                         message=(
-                            "The unified canonical-page pass reconstructed fewer account-month positions than "
-                            "the schema and detached source-structure witnesses; missing cells were not silently invented."
+                            "The canonical pass omitted detached grid/month source positions; they remain "
+                            "audit-only until a unique account owner proves canonical account/month identities."
                         ),
                         parser_stage="canonical_monthly_grid_materialization",
                         target_dataset="repayment_records",
                         observed_value={"canonical_row_count": len(deduped)},
                         candidate_value={
-                            "structural_expected_row_count": structural_expected_count,
-                            "schema_implied_row_count": schema_implied_count,
                             "source_structure_row_count": source_structure_count,
-                            "missing_month_count": missing_month_count,
-                            "within_series_missing_position_count": within_series_missing_position_count,
-                            "unlocalized_source_structure_delta": unlocalized_source_structure_delta,
-                            "affected_account_or_grid_count": (
-                                interval_gap_series_count or None
+                            "unreconciled_source_position_count": (
+                                unreconciled_source_position_count
                             ),
+                            "account_month_expected_row_count": None,
                             "localization_status": (
-                                "localized_to_account_or_grid_intervals"
-                                if interval_gap_series_count
-                                else "unresolved_from_detached_source_structure"
+                                "pending_unique_account_owner_reconciliation"
                             ),
                         },
                         reason_codes=(
                             "cell_level_ocr_disabled",
                             "canonical_page_evidence_only",
                             "source_structure_is_audit_only",
+                            "raw_grid_positions_not_a_population_denominator",
+                            "printed_ranges_do_not_imply_intervening_months",
                             "dataset_incomplete",
                         ),
                     ),
@@ -1876,12 +2161,45 @@ class PersonalDetailExtractionContext:
         return deepcopy(self.candidate_b_extraction(full_text).section_content)
 
     def corrected_evidence_pages(self) -> list[dict[str, Any]]:
-        """Return the registered canonical evidence shared by every extractor."""
+        """Return only extraction-safe, registered canonical evidence.
+
+        This is intentionally a canonical subset.  Call
+        :meth:`conserved_corrected_evidence_pages` when auditing lossless page
+        conservation; unresolved or explicitly blank source pages must never
+        be reopened to generic extraction merely to make the counts equal.
+        """
         return deepcopy(list(self._canonical_layout_projection().evidence_pages))
 
+    def conserved_corrected_evidence_pages(self) -> list[dict[str, Any]]:
+        """Return the immutable, lossless corrected source-page plane.
+
+        One ordinary OCR bundle contributes exactly one page.  A source page
+        may contribute two pages only through the registered static two-way
+        split path.  Business-repair evidence is deliberately excluded: the
+        discovery and repaired canonical projections may change their admitted
+        subset, but they cannot rewrite this frozen source census.
+        """
+
+        if self._conserved_corrected_evidence_pages_cache is None:
+            frozen = tuple(deepcopy(self._build_source_evidence_pages()))
+            self._conserved_corrected_evidence_pages_cache = frozen
+            serialized = json.dumps(
+                frozen,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+            self._conserved_corrected_evidence_sha256 = hashlib.sha256(serialized).hexdigest()
+        return deepcopy(list(self._conserved_corrected_evidence_pages_cache))
+
     def _source_evidence_pages(self) -> list[dict[str, Any]]:
-        """Return detached static evidence used to register canonical pages."""
-        return self.cached("source_evidence_pages", self._build_source_evidence_pages)
+        """Return the phase-local evidence used to register canonical pages."""
+
+        conserved = self.conserved_corrected_evidence_pages()
+        if not self._business_repair_active:
+            return conserved
+        return self._build_business_repaired_source_evidence_pages(conserved)
 
     def _canonical_layout_projection(self) -> Any:
         if self._canonical_layout_projection_cache is None:
@@ -1898,6 +2216,17 @@ class PersonalDetailExtractionContext:
                 source_page_loader=lambda: list(self._frozen_logical_pages.values()),
             )
             self._canonical_layout_projection_cache = assembler.build()
+            phase = "business_repair" if self._business_repair_active else "discovery"
+            phase_audit = self._canonical_subset_conservation_audit(
+                self._canonical_layout_projection_cache,
+                phase=phase,
+            )
+            # Preserve the first completed audit for each phase.  A later
+            # repaired projection must not erase discovery-pass withholds.
+            self._canonical_projection_conservation_by_phase.setdefault(
+                phase,
+                deepcopy(phase_audit),
+            )
             self._adopt_canonical_entity_context()
         return self._canonical_layout_projection_cache
 
@@ -1977,13 +2306,22 @@ class PersonalDetailExtractionContext:
                 item["page"],
             ),
         )
-        static_pages = self._construct_static_topology_pages(ordered)
-        if not self._business_repair_active:
-            return static_pages
+        conserved = self._construct_static_topology_pages(ordered)
+        self._conserved_source_page_by_logical = {
+            int(page.get("page") or 0): int(page.get("source_page") or 0)
+            for page in conserved
+        }
+        return conserved
+
+    def _build_business_repaired_source_evidence_pages(
+        self,
+        conserved_pages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Overlay repair evidence without mutating the conserved page census."""
 
         merged: list[dict[str, Any]] = []
         affected = set(self._business_repair_evidence_by_page)
-        for source in static_pages:
+        for source in conserved_pages:
             logical = int(source.get("page") or 0)
             replacement = self._business_repair_evidence_by_page.get(logical)
             if replacement is None:
@@ -2218,7 +2556,10 @@ class PersonalDetailExtractionContext:
                     coordinate_transform=deepcopy(static_page.get("coordinate_transform") or {}),
                     tables=partitioned_tables.get(segment, []),
                     texts=[
-                        SimpleNamespace(content=str(line.get("text") or ""), bbox=list(line.get("bbox") or []))
+                        SimpleNamespace(
+                            content=str(line.get("text") or ""),
+                            bbox=list(line.get("bbox") or []),
+                        )
                         for line in static_page["lines"]
                     ],
                 )
@@ -2273,7 +2614,17 @@ class PersonalDetailExtractionContext:
                 shape = getattr(image, "shape", None)
                 if not shape or len(shape) < 2 or not shape[0] or not shape[1]:
                     return None, "invalid_image", {"ocr_invocations": 0}
-                words, page_score = _single_page_ocr(image)
+                ocr_result = _single_page_ocr(image)
+                if isinstance(ocr_result, tuple) and len(ocr_result) == 3:
+                    words, page_score, deskew = ocr_result
+                else:  # Backward-compatible test seam.
+                    words, page_score = ocr_result
+                    deskew = {
+                        "method": "hough_lines_p_v1",
+                        "applied": False,
+                        "angle": 0.0,
+                        "reason": "test_seam_not_evaluated",
+                    }
                 page_width = float(rendered.get("page_width") or 0.0)
                 page_height = float(rendered.get("page_height") or 0.0)
                 if page_width <= 0 or page_height <= 0:
@@ -2307,6 +2658,7 @@ class PersonalDetailExtractionContext:
                     "ocr_invocations": 1,
                     "word_count": len(lines),
                     "page_score": page_score,
+                    "deskew": deepcopy(deskew),
                 }
                 if not lines:
                     return None, "ocr_empty", details
@@ -2323,6 +2675,10 @@ class PersonalDetailExtractionContext:
                         "page_width": page_width,
                         "page_height": page_height,
                         "selected_rotation": int(decomposition.get("selected_rotation") or 0),
+                        "deskew_method": str(deskew.get("method") or "hough_lines_p_v1"),
+                        "deskew_applied": deskew.get("applied") is True,
+                        "deskew_angle": float(deskew.get("angle") or 0.0),
+                        "deskew_reason": str(deskew.get("reason") or "not_evaluated"),
                         "lines": sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0])),
                     },
                     "completed",
@@ -2343,9 +2699,52 @@ class PersonalDetailExtractionContext:
         """Return a detached audit snapshot for diagnostics and regression tests."""
         registry = self._page_reocr_registry.audit()
         requests = registry.pop("page_reocr_requests", [])
+        core_deskew: list[dict[str, Any]] = []
+        parse_result = self.__dict__.get("parse_result")
+        for page in getattr(parse_result, "pages", None) or []:
+            transform = getattr(page, "coordinate_transform", None) or {}
+            if not isinstance(transform, Mapping) or not transform.get("deskew_method"):
+                continue
+            decomposition = transform.get("decomposition") or {}
+            core_deskew.append(
+                {
+                    "logical_page": int(getattr(page, "page_number", 0) or 0),
+                    "source_page": int(getattr(page, "source_page_number", 0) or 0),
+                    "method": str(transform.get("deskew_method") or ""),
+                    "applied": transform.get("deskew_applied") is True,
+                    "angle": float(transform.get("deskew_angle") or 0.0),
+                    "reason": str(transform.get("deskew_reason") or ""),
+                    "support_line_count": (
+                        int(decomposition.get("deskew_support_line_count") or 0)
+                        if isinstance(decomposition, Mapping)
+                        else 0
+                    ),
+                }
+            )
+        conservation = (
+            self.corrected_evidence_conservation_audit()
+            if "_conserved_corrected_evidence_pages_cache" in self.__dict__
+            else {
+                "schema": "docmirror.personal_detail.corrected_evidence_conservation.v1",
+                "available": False,
+                "reason": "lightweight_context_without_source_census",
+            }
+        )
         return {
             **deepcopy(self._ocr_correction_overlay.audit()),
             **registry,
+            "corrected_evidence_conservation": conservation,
+            "canonical_projection_phase_history": self._canonical_projection_phase_history(),
+            "core_ocr_deskew": core_deskew,
+            "page_reocr_deskew": [
+                {
+                    "page_key": str(row.get("page_key") or ""),
+                    "logical_page": int(row.get("logical_page") or 0),
+                    **deepcopy(dict(row.get("deskew") or {})),
+                }
+                for row in requests
+                if isinstance(row, Mapping) and isinstance(row.get("deskew"), Mapping)
+            ],
             "business_repair": (
                 deepcopy(self.__dict__["_business_repair_plan"].audit())
                 if self.__dict__.get("_business_repair_plan") is not None
@@ -2363,19 +2762,297 @@ class PersonalDetailExtractionContext:
             ],
         }
 
+    def corrected_evidence_conservation_audit(self) -> dict[str, Any]:
+        """Reconcile every raw logical OCR bundle to the frozen source plane."""
+
+        raw_pages: list[dict[str, int]] = []
+        for bundle in _domain_specific(self.parse_result).get("_page_evidence_bundles") or ():
+            if not isinstance(bundle, Mapping):
+                continue
+            local = bundle.get("local_structure_evidence")
+            if not isinstance(local, Mapping) or not any(
+                isinstance(line, Mapping) for line in local.get("lines") or ()
+            ):
+                continue
+            raw_pages.append(
+                {
+                    "logical_page": int(bundle.get("page") or local.get("page") or 0),
+                    "source_page": int(
+                        bundle.get("source_page_number") or local.get("source_page") or 0
+                    ),
+                }
+            )
+
+        conserved_pages = self.conserved_corrected_evidence_pages()
+        frozen_source_map = getattr(
+            self,
+            "_conserved_source_page_by_logical",
+            self.source_page_by_logical,
+        )
+        raw_by_source: dict[int, list[int]] = {}
+        for page in raw_pages:
+            raw_by_source.setdefault(page["source_page"], []).append(page["logical_page"])
+        conserved_by_source: dict[int, list[dict[str, Any]]] = {}
+        for page in conserved_pages:
+            conserved_by_source.setdefault(int(page.get("source_page") or 0), []).append(page)
+
+        raw_logicals = [page["logical_page"] for page in raw_pages]
+        conserved_logicals = [int(page.get("page") or 0) for page in conserved_pages]
+        duplicate_raw_logicals = sorted(
+            logical for logical, count in Counter(raw_logicals).items() if logical <= 0 or count != 1
+        )
+        duplicate_conserved_logicals = sorted(
+            logical
+            for logical, count in Counter(conserved_logicals).items()
+            if logical <= 0 or count != 1
+        )
+        source_mappings: list[dict[str, Any]] = []
+        static_replacement_sources: list[int] = []
+        unexpected_conserved_logicals: set[int] = set(conserved_logicals).difference(raw_logicals)
+        mapping_valid = True
+        for source in sorted(set(raw_by_source) | set(conserved_by_source)):
+            raw_for_source = sorted(raw_by_source.get(source, ()))
+            conserved_for_source = sorted(
+                conserved_by_source.get(source, ()),
+                key=lambda page: (
+                    int(page.get("segment_index") or 0),
+                    int(page.get("page") or 0),
+                ),
+            )
+            conserved_for_source_logicals = [
+                int(page.get("page") or 0) for page in conserved_for_source
+            ]
+            segments = sorted(
+                int(page.get("segment_index") or 0) for page in conserved_for_source
+            )
+            has_static_registration = any(
+                page.get("plugin_static_subpage") is True for page in conserved_for_source
+            )
+            registered_to_source = all(
+                frozen_source_map.get(logical) == source
+                and logical in self._frozen_logical_pages
+                for logical in conserved_for_source_logicals
+            )
+            if (
+                len(raw_for_source) == 1
+                and len(conserved_for_source_logicals) == 2
+                and segments == [0, 1]
+                and has_static_registration
+                and raw_for_source[0] in conserved_for_source_logicals
+                and registered_to_source
+            ):
+                status = "registered_static_two_way_replacement"
+                valid = True
+                static_replacement_sources.append(source)
+                unexpected_conserved_logicals.difference_update(
+                    set(conserved_for_source_logicals).difference(raw_for_source)
+                )
+            else:
+                status = "one_to_one_preserved"
+                valid = (
+                    raw_for_source == sorted(conserved_for_source_logicals)
+                    and len(raw_for_source) == len(conserved_for_source_logicals)
+                    and not has_static_registration
+                    and registered_to_source
+                )
+                if not valid:
+                    status = "invalid_or_incomplete_mapping"
+            mapping_valid = mapping_valid and valid
+            source_mappings.append(
+                {
+                    "source_page": source,
+                    "status": status,
+                    "valid": valid,
+                    "raw_logical_pages": raw_for_source,
+                    "conserved_logical_pages": conserved_for_source_logicals,
+                    "conserved_segments": segments,
+                    "plugin_static_registration": has_static_registration,
+                    "registered_to_source": registered_to_source,
+                }
+            )
+
+        dropped_raw_logicals = sorted(set(raw_logicals).difference(conserved_logicals))
+        valid = (
+            mapping_valid
+            and not duplicate_raw_logicals
+            and not duplicate_conserved_logicals
+            and not dropped_raw_logicals
+            and not unexpected_conserved_logicals
+            and all(source > 0 for source in set(raw_by_source) | set(conserved_by_source))
+        )
+        return {
+            "schema": "docmirror.personal_detail.corrected_evidence_conservation.v1",
+            "valid": valid,
+            "frozen_before_business_repair": True,
+            "business_repair_can_mutate_conserved_plane": False,
+            "raw_bundle_count": len(raw_pages),
+            "conserved_page_count": len(conserved_pages),
+            "raw_source_page_count": len(raw_by_source),
+            "conserved_source_page_count": len(conserved_by_source),
+            "raw_logical_pages": sorted(raw_logicals),
+            "conserved_logical_pages": sorted(conserved_logicals),
+            "static_replacement_sources": static_replacement_sources,
+            "source_mappings": source_mappings,
+            "duplicate_raw_logical_pages": duplicate_raw_logicals,
+            "duplicate_conserved_logical_pages": duplicate_conserved_logicals,
+            "dropped_raw_logical_pages": dropped_raw_logicals,
+            "unexpected_conserved_logical_pages": sorted(unexpected_conserved_logicals),
+            "conserved_plane_sha256": self._conserved_corrected_evidence_sha256,
+        }
+
+    def _canonical_subset_conservation_audit(
+        self,
+        projection: Any,
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        """Localize every source page omitted from one canonical projection."""
+
+        conserved = self.conserved_corrected_evidence_pages()
+        source_by_logical = {
+            int(page.get("page") or 0): int(page.get("source_page") or 0)
+            for page in conserved
+        }
+        registrations = {
+            int(row.get("logical_page") or 0): row
+            for row in getattr(projection, "registrations", ())
+            if isinstance(row, Mapping)
+        }
+        admitted_projection_logicals = {
+            int(logical)
+            for group in getattr(projection, "fragment_groups", ())
+            if isinstance(group, Mapping)
+            for logical in group.get("fragment_logical_pages") or ()
+        }
+        conserved_logicals = set(source_by_logical)
+        admitted_logicals = admitted_projection_logicals.intersection(
+            conserved_logicals
+        )
+        unresolved_projection_logicals = {
+            int(logical)
+            for logical in getattr(projection, "unresolved_pages", ())
+        }
+        withheld_pages: list[dict[str, Any]] = []
+        for logical in sorted(set(source_by_logical).difference(admitted_logicals)):
+            registration = registrations.get(logical, {})
+            registration_status = str(registration.get("status") or "missing")
+            basis = str(registration.get("basis") or "")
+            if registration_status == "blank" and basis == "explicitly_blank_fragment":
+                issue_code = "canonical_blank_fragment_explicitly_withheld"
+                localized = True
+            elif registration_status == "unresolved" and basis:
+                issue_code = "canonical_page_registration_failed"
+                localized = True
+            elif logical in unresolved_projection_logicals and basis:
+                # A complete printed-page fragment group can be withheld after
+                # its members were individually registered (for example, due
+                # to conflicting template IDs).  The group-level issue is still
+                # a localized canonical disposition, not a silent page loss.
+                issue_code = "canonical_fragment_group_withheld"
+                localized = True
+            else:
+                issue_code = "canonical_page_omission_unlocalized"
+                localized = False
+            withheld_pages.append(
+                {
+                    "logical_page": logical,
+                    "source_page": source_by_logical[logical],
+                    "registration_status": registration_status,
+                    "template_id": str(registration.get("template_id") or ""),
+                    "basis": basis,
+                    "signals": list(registration.get("signals") or ()),
+                    "localization_issue_code": issue_code,
+                    "localized": localized,
+                    "source_refs": [
+                        {
+                            "source": "canonical_template_registration",
+                            "logical_page": logical,
+                            "source_page": source_by_logical[logical],
+                            "geometry_scope": "logical_page",
+                        }
+                    ],
+                }
+            )
+        registered_logicals = set(registrations)
+        partition_valid = admitted_logicals.isdisjoint(
+            {row["logical_page"] for row in withheld_pages}
+        ) and admitted_logicals | {
+            row["logical_page"] for row in withheld_pages
+        } == conserved_logicals
+        return {
+            "phase": phase,
+            "valid": (
+                self.corrected_evidence_conservation_audit()["valid"]
+                and registered_logicals.issuperset(conserved_logicals)
+                and partition_valid
+                and all(row["localized"] is True for row in withheld_pages)
+            ),
+            "conserved_plane_sha256": self._conserved_corrected_evidence_sha256,
+            "canonical_page_count": len(getattr(projection, "pages", ())),
+            "admitted_logical_page_count": len(admitted_logicals),
+            "admitted_logical_pages": sorted(admitted_logicals),
+            "admitted_non_census_logical_pages": sorted(
+                admitted_projection_logicals.difference(conserved_logicals)
+            ),
+            "withheld_logical_page_count": len(withheld_pages),
+            "withheld_logical_pages": [row["logical_page"] for row in withheld_pages],
+            "withheld_pages": withheld_pages,
+            "unregistered_conserved_logical_pages": sorted(
+                conserved_logicals.difference(registered_logicals)
+            ),
+        }
+
+    def _canonical_projection_phase_history(self) -> list[dict[str, Any]]:
+        order = {"discovery": 0, "business_repair": 1}
+        return [
+            deepcopy(audit)
+            for phase, audit in sorted(
+                self.__dict__.get(
+                    "_canonical_projection_conservation_by_phase",
+                    {},
+                ).items(),
+                key=lambda item: (order.get(item[0], 99), item[0]),
+            )
+        ]
+
     def page_topology_audit(self) -> dict[str, Any]:
         """Return the plugin's detached logical-page validation result."""
+        # Freezing the conserved plane may run the static, OCR-free split
+        # validator.  Capture the resolver audit only after those decisions so
+        # the returned snapshot cannot lag the page census it contains.
+        conservation = self.corrected_evidence_conservation_audit()
         audit = deepcopy(self._page_image_resolver.audit())
         audit["issues"] = [*(audit.get("issues") or []), *deepcopy(self._topology_recovery_issues)]
         audit["ocr_used_for_topology"] = False
         audit["topology_frozen_before_reocr"] = True
+        audit["corrected_evidence_conservation"] = conservation
         return audit
 
     def canonical_layout_audit(self) -> dict[str, Any]:
         """Return the detached template-registration and fragment audit."""
-        audit = deepcopy(self._canonical_layout_projection().audit())
+        projection = self._canonical_layout_projection()
+        audit = deepcopy(projection.audit())
         audit["reading_order_resolution"] = deepcopy(self.reading_order_resolution)
+        audit["pboc_layout_profile"] = self.pboc_layout_profile().audit()
+        phase = "business_repair" if self._business_repair_active else "discovery"
+        audit["corrected_evidence_conservation"] = self.corrected_evidence_conservation_audit()
+        audit["canonical_subset_conservation"] = self._canonical_subset_conservation_audit(
+            projection,
+            phase=phase,
+        )
+        audit["canonical_projection_phase_history"] = self._canonical_projection_phase_history()
         return audit
+
+    def pboc_layout_profile(self) -> Any:
+        """Return the immutable evidence-detected PBOC layout profile."""
+
+        if self._pboc_layout_profile_cache is None:
+            from docmirror.plugins.credit_report.personal_detail_scanned.layout_profile import (
+                detect_pboc_layout_profile,
+            )
+
+            self._pboc_layout_profile_cache = detect_pboc_layout_profile(self.pages)
+        return self._pboc_layout_profile_cache
 
     def tables_continue(self, left_table_id: str, right_table_id: str) -> bool | None:
         left_unit_id = self.entity_context.table_unit_id(left_table_id)
@@ -2467,22 +3144,10 @@ class PersonalDetailExtractionContext:
         left_id = self.evidence_unit_ids.get(_evidence_key(left_page, left_line, left_index))
         right_id = self.evidence_unit_ids.get(_evidence_key(right_page, right_line, right_index))
         if not left_id or not right_id:
-            left_box = _bbox(left_line)
-            right_box = _bbox(right_line)
-            left_geometry = self.page_topology.geometry(left_page)
-            right_geometry = self.page_topology.geometry(right_page)
-            if (
-                left_box
-                and right_box
-                and left_geometry
-                and right_geometry
-                and left_geometry.height > 0
-                and right_geometry.height > 0
-                and left_box[3] / left_geometry.height >= 0.75
-                and right_box[1] / right_geometry.height <= 0.25
-                and self.pages_adjacent_in_reading_order(left_page, right_page)
-            ):
-                return True
+            # Page-edge placement corroborates a known continuation, but it
+            # cannot create entity identity.  Adjacent PBOC sections routinely
+            # end and begin near these same margins, so accepting geometry alone
+            # can join unrelated records across a real section boundary.
             return None
         left = self.entity_context.entity_for_unit(left_id)
         right = self.entity_context.entity_for_unit(right_id)

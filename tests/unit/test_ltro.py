@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+import pytest
+
+from docmirror.plugins.bank_statement import ltro as ltro_module
 from docmirror.plugins.bank_statement.ltro import reconstruct_tables
+from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence
 from tests.unit.test_pipe_text_table_builder import BOC_ROW1, _synthetic_boc_text
 
 SAMPLE_OCR = """
@@ -105,6 +109,8 @@ def test_canonical_stacked_debit_credit_headers_are_usable() -> None:
     assert tables == mirror
     assert meta.source == "canonical_table"
     assert meta.expected_primary_rows == 2
+    assert meta.expected_evidence_source == ""
+    assert meta.expected_evidence_confidence == 0.0
 
 
 def test_richer_pipe_table_wins_over_sparse_canonical_table():
@@ -126,7 +132,7 @@ def test_canonical_noise_table_falls_through_to_spaced_ocr():
             ["合计", "100.00", "200.00"],
         ]
     ]
-    tables, meta = reconstruct_tables(mirror, SAMPLE_OCR)
+    tables, meta = reconstruct_tables(mirror, SAMPLE_OCR, route="scanned")
     assert meta.source == "spaced_ocr"
     assert len(tables[0]) >= 2
 
@@ -178,7 +184,7 @@ def test_mirror_table_expected_uses_mirror_ssot_not_raw_max():
     assert meta.expected_primary_rows < 127
 
 
-def test_source_reported_count_overrides_stale_mirror_expected_rows() -> None:
+def test_unbounded_count_label_does_not_override_stale_mirror_expected_rows() -> None:
     from docmirror.models.entities.parse_result import ParseResult, ParserInfo
 
     mirror = [
@@ -199,13 +205,65 @@ def test_source_reported_count_overrides_stale_mirror_expected_rows() -> None:
 
     _, meta = reconstruct_tables(
         mirror,
-        "总条数：2",
+        "账户名称：测试企业\n交易日期 交易金额 账户余额\n总条数：2",
         parse_result=parse_result,
         structure_spe=parse_result.parser_info.structure,
     )
 
     assert meta.source == "canonical_table"
-    assert meta.expected_primary_rows == 2
+    assert meta.expected_primary_rows == 1
+    assert meta.expected_evidence_source == ""
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        RowCountEvidence(9, "unknown", 0.99),
+        RowCountEvidence(9, "candidate_rows", 0.99),
+        RowCountEvidence(9, "page_transaction_anchors", 0.99),
+        RowCountEvidence(9, "physical_rows", 0.99),
+        RowCountEvidence(9, "positioned_date_anchors", 0.99),
+        RowCountEvidence(9, "positioned_record_blocks", 0.99),
+    ],
+)
+def test_canonical_reconstruction_rejects_nonissuer_row_count_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: RowCountEvidence,
+) -> None:
+    mirror = [[["Date", "Amount", "Balance"], ["2025-01-01", "1.00", "9.00"]]]
+    monkeypatch.setattr(ltro_module, "_resolve_source_row_count_evidence", lambda *_args, **_kwargs: evidence)
+
+    _, meta = reconstruct_tables(mirror, "")
+
+    assert meta.expected_primary_rows == 1
+    assert meta.expected_evidence_source == ""
+    assert meta.expected_evidence_confidence == 0.0
+
+
+@pytest.mark.parametrize(
+    "source,confidence",
+    [
+        ("split_footer", 0.98),
+        ("header_total", 0.94),
+        ("statement_header_totals", 0.97),
+        ("cumulative_footer_total", 0.99),
+        ("page_footer", 0.90),
+    ],
+)
+def test_canonical_reconstruction_accepts_issuer_row_count_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    confidence: float,
+) -> None:
+    mirror = [[["Date", "Amount", "Balance"], ["2025-01-01", "1.00", "9.00"]]]
+    evidence = RowCountEvidence(9, source, confidence)
+    monkeypatch.setattr(ltro_module, "_resolve_source_row_count_evidence", lambda *_args, **_kwargs: evidence)
+
+    _, meta = reconstruct_tables(mirror, "")
+
+    assert meta.expected_primary_rows == 9
+    assert meta.expected_evidence_source == source
+    assert meta.expected_evidence_confidence == confidence
 
 
 def test_mirror_table_raw_max_without_parse_result():
@@ -234,6 +292,6 @@ def test_pipe_fail_no_spaced_fallback():
 
 
 def test_spaced_ocr_when_no_pipe():
-    tables, meta = reconstruct_tables([], SAMPLE_OCR)
+    tables, meta = reconstruct_tables([], SAMPLE_OCR, route="scanned")
     assert meta.source == "spaced_ocr"
     assert len(tables[0]) >= 2

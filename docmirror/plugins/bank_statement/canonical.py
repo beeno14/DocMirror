@@ -26,13 +26,37 @@ CANONICAL_FIELDS = (
     "timestamp",
     "summary",
     "amount",
-    "amount_cny",
     "direction",
     "balance",
     "counter_party",
     "counter_account",
     "counterparty_status",
     "reference",
+)
+
+_ISSUER_COUNT_SOURCES = frozenset(
+    {
+        "split_footer",
+        "header_total",
+        "statement_header_totals",
+        "cumulative_footer_total",
+        "page_footer",
+    }
+)
+
+_NATIVE_SOURCE_REPAIR_KIND = "adjacent_summary_signed_amount_spill"
+_NATIVE_SOURCE_REPAIR_KEYS = frozenset(
+    {
+        "kind",
+        "summary_header",
+        "amount_header",
+        "summary_prefix",
+        "source_summary",
+        "source_amount",
+        "working_summary",
+        "working_amount",
+        "working_transform",
+    }
 )
 
 
@@ -86,9 +110,8 @@ def build_style_meta(
     parse_result: Any = None,
     records: list[dict[str, Any]] | None = None,
     blo_meta: Any = None,
-    source_reported_count: int = 0,
+    source_reported_count: Any = None,
 ) -> StyleMeta:
-    expected_candidates: list[int] = []
     source = ""
     pipe_failed = False
     expected_evidence_source = ""
@@ -96,67 +119,64 @@ def build_style_meta(
     stitched_continuation_rows = int(getattr(reconstruction, "stitched_continuation_rows", 0) or 0)
     if reconstruction is not None:
         reconstruction_expected = int(getattr(reconstruction, "expected_primary_rows", 0) or 0)
-        if stitched_continuation_rows > 0:
-            reconstruction_expected = max(0, reconstruction_expected - stitched_continuation_rows)
         source = getattr(reconstruction, "source", "") or ""
         expected_evidence_source = str(getattr(reconstruction, "expected_evidence_source", "") or "")
         expected_evidence_confidence = float(getattr(reconstruction, "expected_evidence_confidence", 0.0) or 0.0)
-        pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
+        # A stitched continuation is a source fragment merged into an existing
+        # transaction, not an extra transaction.  Only candidate/raw-table row
+        # estimates can include that fragment in their denominator.  Issuer
+        # totals already count business transactions and must never be reduced
+        # by the stitch count. Candidate/source-row-plane counts can include a
+        # continuation fragment and therefore receive no such exemption.
         if (
-            source
-            in {
-                "canonical_table",
-                "canonical_physical_tables",
-                "canonical_evidence_table",
-                "native_wide_table",
-                "positioned_record_block",
-                "ocr_implicit_table",
+            stitched_continuation_rows > 0
+            and expected_evidence_source
+            not in {
+                "split_footer",
+                "header_total",
+                "statement_header_totals",
+                "cumulative_footer_total",
+                "page_footer",
             }
-            and reconstruction_expected > 0
         ):
-            expected_candidates.append(reconstruction_expected)
-
+            reconstruction_expected = max(0, reconstruction_expected - stitched_continuation_rows)
+        pipe_failed = bool(getattr(reconstruction, "pipe_parse_failed", False))
     from docmirror.plugins.bank_statement.canonical_quality import (
         audit_cqf,
-        canonical_expected_from_parse_result,
     )
 
-    canonical_expected = canonical_expected_from_parse_result(parse_result)
-    if canonical_expected > 0 and stitched_continuation_rows > 0:
-        canonical_expected = max(0, canonical_expected - stitched_continuation_rows)
-    # A source-reported total is independent of every parser candidate and must
-    # remain the strongest denominator. Positioned blocks and a selected evidence
-    # table are stronger than a sparse physical-table estimate when no such total exists.
-    if source_reported_count > 0:
-        expected = int(source_reported_count)
+    # Parser tables, positioned blocks, page anchors, and mirror row estimates
+    # describe only the rows a candidate happened to recover. They remain
+    # available to candidate selection and diagnostics, but cannot certify that
+    # the public dataset covers the complete source document. Only an issuer
+    # count may populate the public completeness denominator.
+    reported_source = str(getattr(source_reported_count, "source", "") or "")
+    if hasattr(source_reported_count, "confidence"):
+        confidence = float(getattr(source_reported_count, "confidence", 0.0) or 0.0)
+        reported_count = (
+            int(getattr(source_reported_count, "count", 0) or 0)
+            if confidence >= 0.85 and reported_source in _ISSUER_COUNT_SOURCES
+            else 0
+        )
+    else:
+        # A scalar has no provenance and therefore cannot prove that the count
+        # came from the issuer instead of the selected parser candidate.
+        reported_count = 0
+    if reported_count > 0:
+        expected = reported_count
     elif (
-        expected_evidence_source
-        in {
-            "split_footer",
-            "header_total",
-            "page_footer",
-            "page_transaction_anchors",
-            "physical_rows",
-            "positioned_date_anchors",
-            "positioned_record_blocks",
-        }
+        expected_evidence_source in _ISSUER_COUNT_SOURCES
         and expected_evidence_confidence >= 0.85
         and reconstruction_expected > 0
     ):
-        expected = max(reconstruction_expected, canonical_expected)
-    elif source in {"positioned_record_block", "canonical_evidence_table"} and reconstruction_expected > 0:
-        expected = max(reconstruction_expected, canonical_expected)
-    elif canonical_expected > 0:
-        expected = canonical_expected
+        expected = reconstruction_expected
     else:
-        expected = max(expected_candidates, default=0)
+        expected = 0
 
     cqf = audit_cqf(records or [], canonical_expected=expected)
     coverage = cqf.coverage_ratio
     if records is None and expected > 0:
         coverage = min(record_count / expected, 1.0) if record_count > 0 else 0.0
-    if expected <= 0 and record_count > 0:
-        coverage = 1.0
 
     blo_parsed = 0
     blo_skipped = 0
@@ -186,7 +206,15 @@ def build_style_meta(
 
 
 def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Dedupe by (date, amount, balance, counter_party) — ADR-BS-05."""
+    """Dedupe only records that identify the same physical source row.
+
+    Equal business values are not row identity.  Ledgers commonly contain
+    repeated fees, reversals, and batch payments on the same page.  A row may
+    therefore be collapsed only when its provenance identifies the same table
+    row, evidence row, or bounding box; page membership alone is insufficient.
+    Alternative extraction planes are reconciled before this function during
+    candidate selection rather than by value-only deletion here.
+    """
     seen: set[tuple[Any, ...]] = set()
     out: list[dict[str, Any]] = []
     for rec in records:
@@ -204,7 +232,7 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
         except (TypeError, ValueError):
             amount_key = norm.get("amount")
         source = rec.get("source") if isinstance(rec.get("source"), dict) else {}
-        source_scope = _source_sequence_scope(source)
+        source_row = _source_row_identity(source)
         business_key = (
             str(norm.get("date") or ""),
             str(norm.get("direction") or ""),
@@ -214,16 +242,16 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
             str(norm.get("counter_account") or ""),
             str(norm.get("summary") or ""),
         )
-        if sequence and source_scope:
-            key = ("sequence", source_scope, sequence, business_key)
-        elif sequence:
-            key = ("sequence", sequence, business_key)
-        elif reference:
-            key = ("reference", reference, business_key)
-        elif source_scope:
-            key = ("business", source_scope, business_key)
+        if sequence and source_row:
+            key = ("sequence", source_row, sequence, business_key)
+        elif reference and source_row:
+            key = ("reference", source_row, reference, business_key)
+        elif source_row:
+            key = ("business", source_row, business_key)
         else:
-            key = ("business", business_key)
+            # Sequence/reference values can repeat or reset.  Without physical
+            # row provenance, equal values still do not prove row identity.
+            key = ("unsourced", len(out), business_key)
         if key in seen:
             continue
         seen.add(key)
@@ -233,15 +261,35 @@ def dedupe_transaction_rows(records: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
-def _source_sequence_scope(source: dict[str, Any]) -> tuple[Any, ...]:
+def _source_row_identity(source: dict[str, Any]) -> tuple[Any, ...]:
+    """Return stable row-level provenance, never a page-only scope."""
+
     source_page = source.get("source_page")
     page_range = source.get("page_range")
     table_id = str(source.get("table_id") or "").strip()
     row_index = source.get("source_row_index")
-    if source_page in (None, "") and not page_range and not table_id and row_index in (None, ""):
-        return ()
     normalized_range = tuple(page_range) if isinstance(page_range, (list, tuple)) else ()
-    return ("source", source_page, normalized_range, table_id, row_index)
+    page_scope = (source_page, normalized_range)
+
+    if table_id and row_index not in (None, ""):
+        return ("table_row", *page_scope, table_id, row_index)
+
+    bbox = source.get("bbox") or source.get("source_bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        try:
+            normalized_bbox = tuple(round(float(value), 4) for value in bbox[:4])
+        except (TypeError, ValueError):
+            normalized_bbox = ()
+        if normalized_bbox:
+            return ("bbox", *page_scope, normalized_bbox)
+
+    evidence_ids = source.get("evidence_ids")
+    if isinstance(evidence_ids, (list, tuple, set)):
+        normalized_evidence = tuple(sorted({str(value) for value in evidence_ids if str(value)}))
+        if normalized_evidence:
+            return ("evidence", *page_scope, normalized_evidence)
+
+    return ()
 
 
 def _raw_sequence(raw: dict[str, Any]) -> str:
@@ -270,8 +318,6 @@ def ensure_canonical_normalized(normalized: dict[str, Any], standard_fields: lis
     for fld in standard_fields:
         if fld not in out:
             out[fld] = "" if fld not in ("amount", "amount_cny", "balance") else None
-    if out.get("amount_cny") is None:
-        out["amount_cny"] = out.get("amount")
     if "direction" not in out:
         out["direction"] = "other"
     if not str(out.get("counterparty_status") or "").strip():
@@ -279,6 +325,44 @@ def ensure_canonical_normalized(normalized: dict[str, Any], standard_fields: lis
         counter_account = str(out.get("counter_account") or "").strip()
         out["counterparty_status"] = "present" if counter_party or counter_account else "source_null"
     return out
+
+
+def _canonical_raw_input_for_source_repair(
+    raw_txn: dict[str, Any],
+    *,
+    source_public: dict[str, Any],
+    working_public: dict[str, Any],
+) -> dict[str, Any]:
+    """Choose repaired working cells only under an exact source-repair contract."""
+    if raw_txn.get("_canonical_raw_from_working") is not True:
+        return source_public
+    source_raw = raw_txn.get("_source_raw")
+    manifest = raw_txn.get("_source_repair_manifest")
+    if (
+        not isinstance(source_raw, dict)
+        or not isinstance(manifest, dict)
+        or set(manifest) != _NATIVE_SOURCE_REPAIR_KEYS
+        or not all(isinstance(value, str) for value in manifest.values())
+        or manifest.get("kind") != _NATIVE_SOURCE_REPAIR_KIND
+        or set(source_public) != set(working_public)
+        or set(source_raw) != set(working_public)
+    ):
+        return source_public
+
+    if source_public != source_raw:
+        return source_public
+    from docmirror.plugins.bank_statement.wide_table_recovery import (
+        _validated_native_source_repair_working_map,
+    )
+
+    expected_working = _validated_native_source_repair_working_map(
+        source_raw,
+        list(source_raw),
+        manifest,
+    )
+    if expected_working is None or working_public != expected_working:
+        return source_public
+    return working_public
 
 
 def records_from_raw_transactions(
@@ -295,15 +379,24 @@ def records_from_raw_transactions(
         raw = dict(raw_txn)
         raw.setdefault("_style_id", style_id)
         normalized = normalize_fn(raw_txn)
+        working_public = public_record_raw(raw)
         source_raw = raw_txn.get("_source_raw")
-        raw_public = public_record_raw(dict(source_raw)) if isinstance(source_raw, dict) else public_record_raw(raw)
+        raw_public = public_record_raw(dict(source_raw)) if isinstance(source_raw, dict) else working_public
         record = {
             "row_index": idx,
             "raw": raw_public,
             "normalized": normalized,
         }
+        scope_text = str(raw_txn.get("_document_scope_text") or "").strip()
+        if scope_text:
+            record["_document_scope_text"] = scope_text
         if callable(canonical_raw_fn):
-            record["canonical_raw"] = canonical_raw_fn(raw_public, normalized)
+            canonical_raw_input = _canonical_raw_input_for_source_repair(
+                raw_txn,
+                source_public=raw_public,
+                working_public=working_public,
+            )
+            record["canonical_raw"] = canonical_raw_fn(canonical_raw_input, normalized)
         source = raw_txn.get("_source")
         if not isinstance(source, dict):
             try:

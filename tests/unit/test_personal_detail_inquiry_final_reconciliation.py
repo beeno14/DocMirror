@@ -163,6 +163,7 @@ def _exact_inquiry_table(rows: list[list[str]]) -> SimpleNamespace:
         rows=[],
         metadata={
             "raw_rows": rows,
+            "canonical_template_id": "annotations_and_inquiries",
             "geometry": {
                 "coordinate_system": "pdf_points_top_left",
                 "row_bands": row_bands,
@@ -209,8 +210,9 @@ def test_final_inquiry_fields_withhold_leading_han_and_bound_reason_residue() ->
     assert record["canonical_raw"]["institution"] == [
         "讯 广州广汽租赁有限公司 2"
     ]
-    assert record["reason"] == "贷后管理"
+    assert record["reason"] is None
     assert record["source_reason"] == "公 贷后管理"
+    assert record["canonical_raw"]["reason"] == ["公 贷后管理"]
     active_institution = next(
         issue
         for issue in context._personal_detail_extraction_issues
@@ -220,16 +222,16 @@ def test_final_inquiry_fields_withhold_leading_han_and_bound_reason_residue() ->
     assert active_institution["status"] == "requires_review"
     assert active_institution["field_name"] == "institution"
     assert "normalized_value_withheld" in active_institution["reason_codes"]
-    reason_correction = next(
+    reason_issue = next(
         issue
         for issue in context._personal_detail_extraction_issues
         if issue["issue_code"]
-        == "candidate_b_inquiry_reason_edge_residue_corrected"
+        == "candidate_b_inquiry_reason_unresolved"
     )
-    assert reason_correction["status"] == "resolved"
-    assert reason_correction["candidate_value"] == {
-        "normalized_reason": "贷后管理"
-    }
+    assert reason_issue["status"] == "requires_review"
+    assert reason_issue["field_name"] == "reason"
+    assert reason_issue["observed_value"] == {"raw_values": ["公 贷后管理"]}
+    assert "normalized_value_withheld" in reason_issue["reason_codes"]
 
     apply_document_consistency_ledger(
         context,
@@ -439,10 +441,7 @@ def test_reason_token_inside_damaged_long_reason_is_not_shortened() -> None:
         )
         is None
     )
-    assert (
-        native_extraction._bounded_canonical_inquiry_reason("贷后管理 司 %5")
-        == "贷后管理"
-    )
+    assert native_extraction._bounded_canonical_inquiry_reason("贷后管理 司 %5") is None
 
 
 def test_bounded_inquiry_date_accepts_one_missing_printed_separator() -> None:
@@ -450,3 +449,5 @@ def test_bounded_inquiry_date_accepts_one_missing_printed_separator() -> None:
     assert native_extraction._bounded_inquiry_date("20221214") == "2022-12-14"
     assert native_extraction._bounded_inquiry_date("2022.1314") is None
     assert native_extraction._bounded_inquiry_date("12022.1214") is None
+    assert native_extraction._bounded_inquiry_date("X2024-01-02Y") is None
+    assert native_extraction._bounded_inquiry_date("???2024-01-02!!!") is None

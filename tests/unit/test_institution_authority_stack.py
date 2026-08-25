@@ -20,6 +20,7 @@ def test_organization_over_body_keyword():
         tables=[],
         full_text=text,
         institution="中国银行",
+        institution_authority="entities.organization",
         page_count=1,
     )
     hint, authority = resolve_institution_hint(ctx, {"中国建设银行": ["建设银行"]})
@@ -63,6 +64,18 @@ def test_filename_bank_token_priority_over_body_keyword():
     assert authority == "filename.token"
 
 
+def test_context_institution_authority_is_not_laundered() -> None:
+    ctx = StyleContext(
+        tables=[],
+        full_text="交易明细",
+        institution="中国银行",
+        institution_authority="filename.token",
+        page_count=1,
+    )
+
+    assert resolve_institution_hint(ctx, {}) == ("中国银行", "filename.token")
+
+
 def test_personal_bank_product_name_is_not_institution_hint():
     ctx = StyleContext(
         tables=[],
@@ -87,6 +100,14 @@ def test_extract_identity_from_header():
     assert identity["account_holder"] == "南京创沃电气设备有限公司"
     assert identity["account_number"] == "544362180589"
     assert "2022-04-01" in identity["query_period"]
+    assert identity["branch_name"] == "中国银行南京浦东路支行"
+    assert "bank_name" not in identity
+
+
+def test_explicit_bank_name_is_source_issuer() -> None:
+    identity = extract_identity_from_header("银行名称：中国银行\n账号：12345678")
+
+    assert identity["bank_name"] == "中国银行"
 
 
 def test_extract_identity_accepts_rural_credit_cooperative_as_institution():
@@ -100,7 +121,8 @@ def test_extract_identity_accepts_rural_credit_cooperative_as_institution():
 
     identity = extract_identity_from_header(text)
 
-    assert identity["bank_name"] == "东山县农村信用合作联社陈城信用社"
+    assert identity["branch_name"] == "东山县农村信用合作联社陈城信用社"
+    assert "bank_name" not in identity
 
 
 def test_extract_identity_from_header_when_holder_is_nearby_line():

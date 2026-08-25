@@ -8,20 +8,25 @@ from __future__ import annotations
 import pytest
 
 from docmirror.models.entities.parse_result import (
+    CanonicalEvidencePlane,
     CellValue,
     DocumentEntities,
+    ExtractionMethod,
     PageContent,
     ParseResult,
+    ParserInfo,
     TableBlock,
     TableRow,
     TextBlock,
 )
+from docmirror.models.mirror.vnext import EvidenceAtom, EvidenceStore
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
     _repair_balance_chain_rows,
     recover_ocr_implicit_ledger_tables,
     recovered_ocr_implicit_row_count,
+    recovered_ocr_implicit_row_evidence,
 )
 from docmirror.plugins.bank_statement.styles import grid_standard
 
@@ -565,3 +570,262 @@ def test_recover_ocr_implicit_table_caches_tables_on_parse_result() -> None:
     assert len(second) == 1
     assert len(second[0]) == 3
     assert recovered_ocr_implicit_row_count(parse_result) == 2
+
+
+def _pab_ordinal_page(
+    page_number: int,
+    total_pages: int,
+    month: str,
+    ordinals: list[int],
+    *,
+    page_mode: str = "scanned_ocr",
+    account: str = "11005350836201",
+) -> PageContent:
+    columns = [
+        ("序号", 30.0, 58.0),
+        ("日期", 80.0, 104.0),
+        ("借/贷方发生额", 140.0, 212.0),
+        ("余额", 246.0, 272.0),
+        ("对方户名", 353.0, 399.0),
+        ("对方账户", 538.0, 585.0),
+        ("传票号", 666.0, 703.0),
+        ("摘要", 721.0, 747.0),
+    ]
+    header = [
+        ("中国平安", [35.0, 30.0, 79.0, 44.0]),
+        ("PINGANBANK", [103.0, 46.0, 183.0, 58.0]),
+        ("平安银行", [101.0, 25.0, 185.0, 45.0]),
+        ("客户存款月结单", [225.0, 47.0, 303.0, 61.0]),
+        ("结单号:23090821289990000809", [337.0, 46.0, 492.0, 61.0]),
+        (month, [565.0, 47.0, 620.0, 60.0]),
+        (f"第{page_number}页共{total_pages}页", [650.0, 49.0, 716.0, 62.0]),
+        (f"账号:{account}", [33.0, 81.0, 139.0, 93.0]),
+    ]
+    blocks = [TextBlock(content=text, bbox=bbox) for text, bbox in header]
+    blocks.extend(TextBlock(content=text, bbox=[x0, 103.0, x1, 119.0]) for text, x0, x1 in columns)
+    year_month = month.replace("年", "").replace("月", "")
+    for offset, ordinal in enumerate(ordinals):
+        y = 127.0 + offset * 15.0
+        blocks.extend(
+            [
+                TextBlock(content=str(ordinal), bbox=[31.0, y, 40.0, y + 11.0]),
+                TextBlock(content=f"{year_month}{offset + 1:02d}", bbox=[79.0, y, 123.0, y + 11.0]),
+                TextBlock(content=f"-{ordinal:,}.00", bbox=[140.0, y, 190.0, y + 11.0]),
+                TextBlock(content=f"{1000 - ordinal:,}.00", bbox=[246.0, y, 300.0, y + 11.0]),
+            ]
+        )
+    footer_y = 127.0 + len(ordinals) * 15.0 + 8.0
+    blocks.extend(
+        TextBlock(content=text, bbox=[x0, footer_y + offset * 13.0, x1, footer_y + offset * 13.0 + 11.0])
+        for offset, (text, x0, x1) in enumerate(
+            [
+                ("平安银行", 100.0, 185.0),
+                ("电子回单专用章", 330.0, 420.0),
+                ("已打印次数:2", 35.0, 120.0),
+                ("打印时间:2023-09-08", 160.0, 290.0),
+                ("打印方式:系统PDF生成", 320.0, 470.0),
+                ("设备编号:0000", 500.0, 590.0),
+                ("柜员号:3100525", 620.0, 720.0),
+            ]
+        )
+    )
+    return PageContent(
+        page_number=page_number,
+        source_page_number=page_number,
+        page_mode=page_mode,
+        texts=blocks,
+    )
+
+
+def _pab_ordinal_result(pages: list[PageContent], *, method: ExtractionMethod = ExtractionMethod.OCR) -> ParseResult:
+    native_atoms = []
+    for page in pages:
+        page_id = f"page:{page.page_number:04d}"
+        for index, block in enumerate(page.texts):
+            native_atoms.append(
+                EvidenceAtom(
+                    id=f"native:{page.page_number}:{index}",
+                    source_kind="pdf_native",
+                    page_id=page_id,
+                    text=block.content,
+                    bbox=list(block.bbox or []),
+                )
+            )
+    return ParseResult(
+        pages=pages,
+        entities=DocumentEntities(domain_specific={}),
+        parser_info=ParserInfo(extraction_method=method, page_count=len(pages)),
+        evidence_plane=CanonicalEvidencePlane(evidence=EvidenceStore(text_atoms=native_atoms)),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "ocr_title",
+        "ocr_missing_header",
+        "ocr_header_order",
+        "ocr_page_marker",
+        "ocr_footer",
+        "native_missing_header",
+        "native_header_order",
+        "native_footer",
+    ],
+)
+def test_pab_page_ordinal_census_fails_closed_on_layout_contract_mutation(mutation: str) -> None:
+    page = _pab_ordinal_page(1, 1, "2023年04月", [1, 2, 3])
+    parse_result = _pab_ordinal_result([page])
+
+    if mutation == "ocr_title":
+        next(block for block in page.texts if block.content == "客户存款月结单").content = "账户明细"
+    elif mutation == "ocr_missing_header":
+        page.texts = [block for block in page.texts if block.content != "余额"]
+    elif mutation == "ocr_header_order":
+        sequence = next(block for block in page.texts if block.content == "序号")
+        balance = next(block for block in page.texts if block.content == "余额")
+        sequence.bbox, balance.bbox = balance.bbox, sequence.bbox
+    elif mutation == "ocr_page_marker":
+        next(block for block in page.texts if block.content == "第1页共1页").content = "第2页共2页"
+    elif mutation == "ocr_footer":
+        page.texts = [block for block in page.texts if block.content != "电子回单专用章"]
+    elif mutation == "native_missing_header":
+        atoms = parse_result.evidence_plane.evidence.text_atoms
+        parse_result.evidence_plane.evidence.text_atoms = [atom for atom in atoms if atom.text != "余额"]
+    elif mutation == "native_header_order":
+        atoms = parse_result.evidence_plane.evidence.text_atoms
+        sequence = next(atom for atom in atoms if atom.text == "序号")
+        balance = next(atom for atom in atoms if atom.text == "余额")
+        sequence.bbox, balance.bbox = balance.bbox, sequence.bbox
+    elif mutation == "native_footer":
+        atoms = parse_result.evidence_plane.evidence.text_atoms
+        parse_result.evidence_plane.evidence.text_atoms = [
+            atom
+            for atom in atoms
+            if not (atom.text.startswith("已打印次数:") or atom.text.startswith("打印时间:"))
+        ]
+
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == (0, "", 0.0)
+
+
+def test_scanned_pab_page_ordinal_census_caches_low_confidence_row_coverage() -> None:
+    parse_result = _pab_ordinal_result(
+        [
+            _pab_ordinal_page(1, 3, "2023年03月", [1, 2, 3]),
+            _pab_ordinal_page(2, 3, "2023年04月", [1, 2, 3, 4]),
+            _pab_ordinal_page(3, 3, "2023年04月", [5, 6]),
+        ]
+    )
+
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == (9, "ocr_page_ordinal_census", 0.80)
+    assert parse_result.entities.domain_specific["_bank_ocr_implicit_recovery"]["expected_row_page_counts"] == [
+        3,
+        4,
+        2,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("digital", (0, "", 0.0)),
+        ("ordinal_gap", (0, "", 0.0)),
+        ("missing_amount", (0, "", 0.0)),
+        ("account_change", (0, "", 0.0)),
+    ],
+)
+def test_pab_page_ordinal_census_rejects_unproved_or_non_scanned_sources(
+    mutation: str,
+    expected: tuple[int, str, float],
+) -> None:
+    pages = [
+        _pab_ordinal_page(1, 2, "2023年04月", [1, 2, 3]),
+        _pab_ordinal_page(2, 2, "2023年04月", [4, 5]),
+    ]
+    method = ExtractionMethod.OCR
+    if mutation == "digital":
+        method = ExtractionMethod.DIGITAL
+        for page in pages:
+            page.page_mode = None
+    elif mutation == "ordinal_gap":
+        sequence = next(block for block in pages[1].texts if block.content == "5" and block.bbox[0] < 50.0)
+        sequence.content = "6"
+    elif mutation == "missing_amount":
+        pages[0].texts = [block for block in pages[0].texts if block.content != "-2.00"]
+    elif mutation == "account_change":
+        account = next(block for block in pages[1].texts if block.content.startswith("账号:"))
+        account.content = "账号:11005350836202"
+    parse_result = _pab_ordinal_result(pages, method=method)
+
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == expected
+
+
+def test_pab_page_ordinal_census_rejects_whole_ocr_terminal_row_loss() -> None:
+    pages = [
+        _pab_ordinal_page(1, 2, "2023年04月", [1, 2, 3]),
+        _pab_ordinal_page(2, 2, "2023年04月", [4, 5, 6]),
+    ]
+    parse_result = _pab_ordinal_result(pages)
+    # The independent native evidence plane was sealed before OCR loss.  Remove
+    # the complete final OCR row: ordinal continuity alone would falsely call
+    # the shorter 1..5 prefix document-complete.
+    final_y = next(
+        block.bbox[1]
+        for block in pages[1].texts
+        if block.content == "6" and block.bbox is not None and block.bbox[0] < 50.0
+    )
+    pages[1].texts = [
+        block
+        for block in pages[1].texts
+        if block.bbox is None or abs(float(block.bbox[1]) - float(final_y)) > 1.0
+    ]
+
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == (0, "", 0.0)
+
+
+def test_pab_page_ordinal_census_symmetric_terminal_deletion_remains_low_confidence() -> None:
+    pages = [
+        _pab_ordinal_page(1, 2, "2023年04月", [1, 2, 3]),
+        _pab_ordinal_page(2, 2, "2023年04月", [4, 5, 6]),
+    ]
+    parse_result = _pab_ordinal_result(pages)
+    final_y = next(
+        block.bbox[1]
+        for block in pages[1].texts
+        if block.content == "6" and block.bbox is not None and block.bbox[0] < 50.0
+    )
+    pages[1].texts = [
+        block
+        for block in pages[1].texts
+        if block.bbox is None or abs(float(block.bbox[1]) - float(final_y)) > 1.0
+    ]
+    native_atoms = parse_result.evidence_plane.evidence.text_atoms
+    parse_result.evidence_plane.evidence.text_atoms = [
+        atom
+        for atom in native_atoms
+        if atom.page_id != "page:0002"
+        or atom.bbox is None
+        or abs(float(atom.bbox[1]) - float(final_y)) > 1.0
+    ]
+
+    # Both representations now agree on a shorter contiguous prefix.  That
+    # agreement remains useful for ranking, but cannot certify the missing tail.
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == (5, "ocr_page_ordinal_census", 0.80)
+
+
+def test_pab_page_ordinal_census_requires_independent_native_row_spine() -> None:
+    parse_result = _pab_ordinal_result([_pab_ordinal_page(1, 1, "2023年04月", [1, 2, 3])])
+    parse_result.evidence_plane = None
+
+    recover_ocr_implicit_ledger_tables(parse_result, "")
+
+    assert recovered_ocr_implicit_row_evidence(parse_result) == (0, "", 0.0)

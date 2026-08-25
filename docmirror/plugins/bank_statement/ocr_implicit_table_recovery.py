@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections import defaultdict
 from copy import deepcopy
+from datetime import date
 from typing import Any
 
 from docmirror.plugins.bank_statement.header_resolve import normalize_header_cell
@@ -34,6 +36,8 @@ _AMOUNT_TOKEN_RE = re.compile(r"[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)\.\s*\d{2}")
 _ACCOUNT_RE = re.compile(r"(?<!\d)\d{7,24}(?!\d)")
 _NOISE_RE = re.compile(r"第\s*\d+\s*页|业务用章|交易机构|产品说明|账号序号|起始日期|终止日期")
 _CACHE_KEY = "_bank_ocr_implicit_recovery"
+_OCR_PAGE_ORDINAL_CENSUS_SOURCE = "ocr_page_ordinal_census"
+_SOURCE_COVERAGE_CONFIDENCE = 0.80
 _TEXT_BLOCK_TYPES = {"paragraph", "list", "footer", "unknown", "text"}
 _MIN_DISTRIBUTED_ROWS = 3
 _MIN_DISTRIBUTED_VALID_RATIO = 0.6
@@ -100,6 +104,39 @@ _AMOUNT_HEADER_MARKERS = (
     "发生额",
 )
 
+# The scanned Ping An monthly statement carries a page-local ordinal beside
+# three independently positioned row fields.  These source labels are used to
+# prove the document family and derive column boundaries; they are not an
+# alternate transaction schema.
+_PAB_STATEMENT_TITLE = "客户存款月结单"
+_PAB_COLUMN_HEADERS = (
+    "序号",
+    "日期",
+    "借/贷方发生额",
+    "余额",
+    "对方户名",
+    "对方账户",
+    "传票号",
+    "摘要",
+)
+_PAB_FOOTER_PREFIXES = (
+    "电子回单专用章",
+    "已打印次数:",
+    "打印时间:",
+    "打印方式:",
+    "设备编号:",
+    "柜员号:",
+)
+_PAB_PAGE_RE = re.compile(r"第(?P<page>\d+)页共(?P<total>\d+)页")
+_PAB_MONTH_RE = re.compile(r"(?P<year>20\d{2})年(?P<month>\d{2})月")
+_PAB_STATEMENT_RE = re.compile(r"结单号[:：](?P<value>\d{12,})")
+_PAB_ACCOUNT_RE = re.compile(r"账号[:：](?P<value>\d{10,24})")
+_PAB_SEQUENCE_RE = re.compile(r"\d{1,4}")
+_PAB_COMPACT_DATE_RE = re.compile(r"20\d{6}")
+_PAB_SIGNED_AMOUNT_RE = re.compile(r"[+-](?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}")
+_PAB_BALANCE_RE = re.compile(r"-?(?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}")
+_PAB_ROW_Y_TOLERANCE = 4.0
+
 
 def recover_ocr_implicit_ledger_tables(parse_result: Any, full_text: str = "") -> list[list[list[str]]]:
     """Build bank ledger tables from canonical tables and positioned text."""
@@ -131,6 +168,25 @@ def recovered_ocr_implicit_row_count(parse_result: Any) -> int:
     return _recovered_row_count(cached or [])
 
 
+def recovered_ocr_implicit_row_evidence(parse_result: Any) -> tuple[int, str, float]:
+    """Return low-confidence OCR/native row-coverage metadata from cache."""
+    ds = _domain_specific(parse_result)
+    cache = ds.get(_CACHE_KEY) if ds is not None else None
+    if not isinstance(cache, dict) or cache.get("status") != "ready":
+        return 0, "", 0.0
+    source = str(cache.get("expected_row_source") or "")
+    if source != _OCR_PAGE_ORDINAL_CENSUS_SOURCE:
+        return 0, "", 0.0
+    try:
+        count = int(cache.get("expected_row_count") or 0)
+        confidence = float(cache.get("expected_row_confidence") or 0.0)
+    except (TypeError, ValueError):
+        return 0, "", 0.0
+    if count <= 0 or not 0.0 < confidence <= 1.0:
+        return 0, "", 0.0
+    return count, source, confidence
+
+
 def _domain_specific(parse_result: Any) -> dict[str, Any] | None:
     entities = getattr(parse_result, "entities", None)
     ds = getattr(entities, "domain_specific", None) if entities is not None else None
@@ -154,13 +210,319 @@ def _store_cache(parse_result: Any, tables: list[list[list[str]]], *, source: st
     ds = _domain_specific(parse_result)
     if ds is None:
         return
-    ds[_CACHE_KEY] = {
+    ordinal_coverage = _pab_ocr_page_ordinal_coverage(parse_result)
+    cache: dict[str, Any] = {
         "status": "ready",
         "source": source,
         "table_count": len(tables),
         "row_count": _recovered_row_count(tables),
         "tables": deepcopy(tables),
+        "expected_row_count": 0,
+        "expected_row_source": "",
+        "expected_row_confidence": 0.0,
     }
+    if ordinal_coverage is not None:
+        cache.update(ordinal_coverage)
+    ds[_CACHE_KEY] = cache
+
+
+def _pab_ocr_page_ordinal_coverage(parse_result: Any) -> dict[str, Any] | None:
+    """Count PAB rows when OCR and native source planes agree structurally.
+
+    Agreement between those representations is useful for recovery and candidate
+    ranking, but it is not independent evidence that neither plane omitted the
+    same terminal row.  The cached confidence therefore stays below authority.
+    """
+    if not _is_scanned_ocr_parse_result(parse_result):
+        return None
+    pages = list(getattr(parse_result, "pages", []) or [])
+    parser_page_count = int(getattr(getattr(parse_result, "parser_info", None), "page_count", 0) or 0)
+    if parser_page_count and parser_page_count != len(pages):
+        return None
+
+    statement_ids: set[str] = set()
+    account_ids: set[str] = set()
+    page_counts: list[int] = []
+    month_sequences: list[tuple[tuple[int, int], list[int]]] = []
+    for expected_page, page in enumerate(pages, start=1):
+        source_page = int(getattr(page, "source_page_number", None) or getattr(page, "page_number", 0) or 0)
+        if source_page != expected_page:
+            return None
+        page_coverage = _pab_page_ordinal_rows(page, expected_page=expected_page, total_pages=len(pages))
+        if page_coverage is None:
+            return None
+        statement_ids.add(str(page_coverage["statement_id"]))
+        account_ids.add(str(page_coverage["account_id"]))
+        sequences = list(page_coverage["sequences"])
+        if _pab_native_page_ordinals(parse_result, page=expected_page) != sequences:
+            return None
+        page_counts.append(len(sequences))
+        month_sequences.append((page_coverage["month"], sequences))
+
+    if len(statement_ids) != 1 or len(account_ids) != 1 or not _monthly_ordinals_are_complete(month_sequences):
+        return None
+    return {
+        "expected_row_count": sum(page_counts),
+        "expected_row_source": _OCR_PAGE_ORDINAL_CENSUS_SOURCE,
+        "expected_row_confidence": _SOURCE_COVERAGE_CONFIDENCE,
+        "expected_row_page_counts": page_counts,
+    }
+
+
+def _pab_native_page_ordinals(parse_result: Any, *, page: int) -> list[int] | None:
+    """Return the native ordinal spine for one scanned PAB page.
+
+    These PDFs retain selectable native ledger text beneath the OCR page.  A
+    native spine with matching ordinals, dates, signed amounts, and balances on
+    every baseline is a strong consistency check.  Because OCR and native text
+    may still share an upstream omission, their agreement is retained only as a
+    low-confidence coverage signal.  Generic OCR-only statements receive none.
+    """
+    from docmirror.plugins._runtime.evidence_access import text_atoms
+
+    page_id = f"page:{page:04d}"
+    atoms = [
+        atom
+        for atom in text_atoms(parse_result)
+        if str(atom.get("page_id") or "") == page_id
+        and str(atom.get("source_kind") or "").strip().casefold() == "pdf_native"
+        and isinstance(atom.get("bbox"), list)
+        and len(atom["bbox"]) >= 4
+        and str(atom.get("text") or "").strip()
+    ]
+    if not atoms:
+        return None
+
+    def compact(atom: dict[str, Any]) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(atom.get("text") or "")))
+
+    def center(atom: dict[str, Any], axis: int) -> float:
+        bbox = atom["bbox"]
+        return (float(bbox[axis]) + float(bbox[axis + 2])) / 2.0
+
+    sequence_header = [atom for atom in atoms if compact(atom) == "序号"]
+    date_header = [atom for atom in atoms if compact(atom) == "日期"]
+    amount_header = [atom for atom in atoms if compact(atom) == "借/贷方发生额"]
+    balance_header = [atom for atom in atoms if compact(atom) == "余额"]
+    if not all(len(group) == 1 for group in (sequence_header, date_header, amount_header, balance_header)):
+        return None
+    header_y = sum(center(group[0], 1) for group in (sequence_header, date_header, amount_header, balance_header)) / 4
+    footer_y_values = [
+        center(atom, 1)
+        for atom in atoms
+        if compact(atom).startswith(("已打印次数:", "打印时间:")) and center(atom, 1) > header_y
+    ]
+    if not footer_y_values:
+        return None
+    footer_y = min(footer_y_values)
+    if footer_y <= header_y:
+        return None
+
+    header_x = [
+        center(sequence_header[0], 0),
+        center(date_header[0], 0),
+        center(amount_header[0], 0),
+        center(balance_header[0], 0),
+    ]
+    if any(right <= left for left, right in zip(header_x, header_x[1:])):
+        return None
+    bounds = [float("-inf"), *((left + right) / 2.0 for left, right in zip(header_x, header_x[1:])), float("inf")]
+
+    def column(index: int, pattern: re.Pattern[str]) -> list[dict[str, Any]]:
+        return [
+            atom
+            for atom in atoms
+            if header_y + 2.0 < center(atom, 1) < footer_y - 2.0
+            and bounds[index] < center(atom, 0) < bounds[index + 1]
+            and pattern.fullmatch(compact(atom)) is not None
+        ]
+
+    sequences = sorted(column(0, _PAB_SEQUENCE_RE), key=lambda atom: center(atom, 1))
+    dates = column(1, _PAB_COMPACT_DATE_RE)
+    amounts = column(2, _PAB_SIGNED_AMOUNT_RE)
+    balances = column(3, _PAB_BALANCE_RE)
+    if not sequences or not (len(sequences) == len(dates) == len(amounts) == len(balances)):
+        return None
+    used_dates: set[int] = set()
+    used_amounts: set[int] = set()
+    used_balances: set[int] = set()
+    ordinals: list[int] = []
+    for sequence in sequences:
+        aligned: list[int] = []
+        for candidates, used in ((dates, used_dates), (amounts, used_amounts), (balances, used_balances)):
+            matches = [
+                index
+                for index, candidate in enumerate(candidates)
+                if index not in used and abs(center(candidate, 1) - center(sequence, 1)) <= _PAB_ROW_Y_TOLERANCE
+            ]
+            if len(matches) != 1:
+                return None
+            aligned.append(matches[0])
+        used_dates.add(aligned[0])
+        used_amounts.add(aligned[1])
+        used_balances.add(aligned[2])
+        ordinals.append(int(compact(sequence)))
+    return ordinals
+
+
+def _is_scanned_ocr_parse_result(parse_result: Any) -> bool:
+    parser_info = getattr(parse_result, "parser_info", None)
+    method = getattr(parser_info, "extraction_method", "")
+    method = getattr(method, "value", method)
+    pages = list(getattr(parse_result, "pages", []) or [])
+    return (
+        str(method or "").strip().casefold() == "ocr"
+        and bool(pages)
+        and all(str(getattr(page, "page_mode", "") or "").strip().casefold() == "scanned_ocr" for page in pages)
+    )
+
+
+def _pab_page_ordinal_rows(page: Any, *, expected_page: int, total_pages: int) -> dict[str, Any] | None:
+    blocks = _positioned_page_text_blocks(page)
+    if not blocks:
+        return None
+    texts = [block[0] for block in blocks]
+    if texts.count(_PAB_STATEMENT_TITLE) != 1 or texts.count("PINGANBANK") != 1 or texts.count("平安银行") < 2:
+        return None
+
+    page_markers = [_PAB_PAGE_RE.fullmatch(text) for text in texts]
+    page_markers = [match for match in page_markers if match is not None]
+    if len(page_markers) != 1:
+        return None
+    if int(page_markers[0].group("page")) != expected_page or int(page_markers[0].group("total")) != total_pages:
+        return None
+
+    months = [_PAB_MONTH_RE.fullmatch(text) for text in texts]
+    months = [match for match in months if match is not None]
+    statements = [_PAB_STATEMENT_RE.fullmatch(text) for text in texts]
+    statements = [match for match in statements if match is not None]
+    accounts = [_PAB_ACCOUNT_RE.fullmatch(text) for text in texts]
+    accounts = [match for match in accounts if match is not None]
+    if len(months) != 1 or len(statements) != 1 or len(accounts) != 1:
+        return None
+    month = (int(months[0].group("year")), int(months[0].group("month")))
+    if not 1 <= month[1] <= 12:
+        return None
+
+    header_blocks: list[tuple[str, float, float, float, float, float, float]] = []
+    for label in _PAB_COLUMN_HEADERS:
+        matches = [block for block in blocks if block[0] == label]
+        if len(matches) != 1:
+            return None
+        header_blocks.append(matches[0])
+    header_centers = [block[5] for block in header_blocks]
+    if any(right <= left for left, right in zip(header_centers, header_centers[1:])):
+        return None
+
+    footer_matches = {
+        prefix: [block for block in blocks if block[0].startswith(prefix)] for prefix in _PAB_FOOTER_PREFIXES
+    }
+    if any(len(matches) != 1 for matches in footer_matches.values()):
+        return None
+    footer_top = footer_matches["电子回单专用章"][0][2]
+    header_bottom = max(block[4] for block in header_blocks)
+    if footer_top <= header_bottom:
+        return None
+
+    bounds = [
+        float("-inf"),
+        *((left + right) / 2.0 for left, right in zip(header_centers, header_centers[1:])),
+        float("inf"),
+    ]
+
+    def column_blocks(
+        index: int, pattern: re.Pattern[str]
+    ) -> list[tuple[str, float, float, float, float, float, float]]:
+        return [
+            block
+            for block in blocks
+            if header_bottom < block[6] < footer_top
+            and bounds[index] < block[5] < bounds[index + 1]
+            and pattern.fullmatch(block[0]) is not None
+        ]
+
+    sequences = sorted(column_blocks(0, _PAB_SEQUENCE_RE), key=lambda block: block[6])
+    dates = column_blocks(1, _PAB_COMPACT_DATE_RE)
+    amounts = column_blocks(2, _PAB_SIGNED_AMOUNT_RE)
+    balances = column_blocks(3, _PAB_BALANCE_RE)
+    if not sequences or not (len(sequences) == len(dates) == len(amounts) == len(balances)):
+        return None
+
+    used_dates: set[int] = set()
+    used_amounts: set[int] = set()
+    used_balances: set[int] = set()
+    ordinal_values: list[int] = []
+    for sequence in sequences:
+        date_match = _unique_y_aligned_index(sequence, dates, used_dates)
+        amount_match = _unique_y_aligned_index(sequence, amounts, used_amounts)
+        balance_match = _unique_y_aligned_index(sequence, balances, used_balances)
+        if date_match is None or amount_match is None or balance_match is None:
+            return None
+        used_dates.add(date_match)
+        used_amounts.add(amount_match)
+        used_balances.add(balance_match)
+        if not _compact_date_matches_month(dates[date_match][0], month):
+            return None
+        ordinal_values.append(int(sequence[0]))
+    if ordinal_values != list(range(ordinal_values[0], ordinal_values[0] + len(ordinal_values))):
+        return None
+    return {
+        "month": month,
+        "sequences": ordinal_values,
+        "statement_id": statements[0].group("value"),
+        "account_id": accounts[0].group("value"),
+    }
+
+
+def _positioned_page_text_blocks(page: Any) -> list[tuple[str, float, float, float, float, float, float]]:
+    blocks: list[tuple[str, float, float, float, float, float, float]] = []
+    for source in getattr(page, "texts", []) or []:
+        text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(getattr(source, "content", "") or "")))
+        bbox = getattr(source, "bbox", None)
+        if not text or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        try:
+            x0, y0, x1, y1 = (float(value) for value in bbox[:4])
+        except (TypeError, ValueError):
+            continue
+        if x1 <= x0 or y1 <= y0:
+            continue
+        blocks.append((text, x0, y0, x1, y1, (x0 + x1) / 2.0, (y0 + y1) / 2.0))
+    return blocks
+
+
+def _unique_y_aligned_index(
+    anchor: tuple[str, float, float, float, float, float, float],
+    candidates: list[tuple[str, float, float, float, float, float, float]],
+    used: set[int],
+) -> int | None:
+    matches = [
+        index
+        for index, candidate in enumerate(candidates)
+        if index not in used and abs(candidate[6] - anchor[6]) <= _PAB_ROW_Y_TOLERANCE
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _compact_date_matches_month(value: str, month: tuple[int, int]) -> bool:
+    try:
+        parsed = date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+    except (TypeError, ValueError):
+        return False
+    return (parsed.year, parsed.month) == month
+
+
+def _monthly_ordinals_are_complete(month_pages: list[tuple[tuple[int, int], list[int]]]) -> bool:
+    grouped: list[tuple[tuple[int, int], list[int]]] = []
+    seen: set[tuple[int, int]] = set()
+    for month, sequences in month_pages:
+        if not grouped or grouped[-1][0] != month:
+            if month in seen or (grouped and month <= grouped[-1][0]):
+                return False
+            seen.add(month)
+            grouped.append((month, []))
+        grouped[-1][1].extend(sequences)
+    return bool(grouped) and all(sequences == list(range(1, len(sequences) + 1)) for _, sequences in grouped)
 
 
 def _is_table_list(value: Any) -> bool:
@@ -1223,4 +1585,8 @@ def _amount_marker_direction(text: str, start: int, raw_amount: str) -> str:
     return ""
 
 
-__all__ = ["recover_ocr_implicit_ledger_tables", "recovered_ocr_implicit_row_count"]
+__all__ = [
+    "recover_ocr_implicit_ledger_tables",
+    "recovered_ocr_implicit_row_count",
+    "recovered_ocr_implicit_row_evidence",
+]

@@ -273,52 +273,87 @@ def test_yu_credit_card_prefix_carry_fails_closed(defect: str) -> None:
     assert [row["category_sequence"] for row in cards] == [11]
 
 
-def _split_personal_geometry() -> dict:
-    return {
-        "row_bands": [
-            {"index": 0, "y0": 254.5, "y1": 257.5},
-            {"index": 1, "y0": 257.5, "y1": 268.5},
-            {"index": 2, "y0": 268.5, "y1": 281.5},
-            {"index": 3, "y0": 281.5, "y1": 295.0},
-            {"index": 4, "y0": 295.0, "y1": 298.0},
+def _split_personal_geometry(*, body_count: int = 2) -> dict:
+    row_bands = [
+        {"index": 0, "y0": 254.5, "y1": 257.5},
+        {"index": 1, "y0": 257.5, "y1": 268.5},
+        *[
+            {
+                "index": row_index,
+                "y0": 268.5 + (row_index - 2) * 13.0,
+                "y1": 268.5 + (row_index - 1) * 13.0,
+            }
+            for row_index in range(2, 2 + body_count)
         ],
+        {
+            "index": body_count + 2,
+            "y0": 268.5 + body_count * 13.0,
+            "y1": 271.5 + body_count * 13.0,
+        },
+    ]
+    cell_bboxes: list[list[list[float] | None]] = [
+        [
+            [52.0, 254.5, 92.0, 268.5],
+            [92.0, 254.5, 171.0, 257.5],
+            [171.0, 254.5, 324.0, 257.5],
+            [324.0, 254.5, 401.5, 257.5],
+        ],
+        [
+            None,
+            [92.0, 257.5, 171.0, 268.5],
+            [171.0, 257.5, 324.0, 268.5],
+            [324.0, 257.5, 401.5, 268.5],
+        ],
+    ]
+    cell_status = [
+        ["exact", "exact", "exact", "exact"],
+        ["derived", "exact", "exact", "exact"],
+    ]
+    cell_evidence = [
+        [["header:sequence"], [], [], []],
+        [[], ["header:date"], ["header:institution"], ["header:reason"]],
+    ]
+    for sequence in range(1, body_count + 1):
+        band = row_bands[sequence + 1]
+        cell_bboxes.append(
+            [
+                [52.0, band["y0"], 92.0, band["y1"]],
+                [92.0, band["y0"], 171.0, band["y1"]],
+                [171.0, band["y0"], 324.0, band["y1"]],
+                [324.0, band["y0"], 401.5, band["y1"]],
+            ]
+        )
+        cell_status.append(["exact", "exact", "exact", "exact"])
+        cell_evidence.append(
+            [
+                [f"row:{sequence}:sequence"],
+                [f"row:{sequence}:date"],
+                [f"row:{sequence}:institution"],
+                [f"row:{sequence}:reason"],
+            ]
+        )
+    trailing_band = row_bands[-1]
+    cell_bboxes.append(
+        [
+            [52.0, trailing_band["y0"], 92.0, trailing_band["y1"]],
+            [92.0, trailing_band["y0"], 171.0, trailing_band["y1"]],
+            [171.0, trailing_band["y0"], 324.0, trailing_band["y1"]],
+            [324.0, trailing_band["y0"], 401.5, trailing_band["y1"]],
+        ]
+    )
+    cell_status.append(["exact", "exact", "exact", "derived"])
+    cell_evidence.append([[], [], [], []])
+    return {
+        "row_bands": row_bands,
         "col_bands": [
             {"index": 0, "x0": 52.0, "x1": 92.0},
             {"index": 1, "x0": 92.0, "x1": 171.0},
             {"index": 2, "x0": 171.0, "x1": 324.0},
             {"index": 3, "x0": 324.0, "x1": 401.5},
         ],
-        "cell_bboxes": [
-            [
-                [52.0, 254.5, 92.0, 268.5],
-                [92.0, 254.5, 171.0, 257.5],
-                [171.0, 254.5, 324.0, 257.5],
-                [324.0, 254.5, 401.5, 257.5],
-            ],
-            [
-                None,
-                [92.0, 257.5, 171.0, 268.5],
-                [171.0, 257.5, 324.0, 268.5],
-                [324.0, 257.5, 401.5, 268.5],
-            ],
-            [[52.0, 268.5, 92.0, 281.5]] * 4,
-            [[52.0, 281.5, 92.0, 295.0]] * 4,
-            [[52.0, 295.0, 92.0, 298.0]] * 4,
-        ],
-        "cell_geometry_status": [
-            ["exact", "exact", "exact", "exact"],
-            ["derived", "exact", "exact", "exact"],
-            ["exact", "exact", "exact", "exact"],
-            ["exact", "exact", "exact", "exact"],
-            ["exact", "exact", "exact", "derived"],
-        ],
-        "cell_evidence_ids": [
-            [["header:sequence"], [], [], []],
-            [[], ["header:date"], ["header:institution"], ["header:reason"]],
-            [["row:1:sequence"], ["row:1:date"], ["row:1:institution"], ["row:1:reason"]],
-            [["row:2:sequence"], ["row:2:date"], ["row:2:institution"], ["row:2:reason"]],
-            [[], [], [], []],
-        ],
+        "cell_bboxes": cell_bboxes,
+        "cell_geometry_status": cell_status,
+        "cell_evidence_ids": cell_evidence,
         "cell_spans": [
             {
                 "row": 0,
@@ -331,7 +366,11 @@ def _split_personal_geometry() -> dict:
     }
 
 
-def _yu_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
+def _yu_inquiry_context(
+    *,
+    defect: str | None = None,
+    personal_count: int = 2,
+) -> SimpleNamespace:
     institution_rows = [["编号", "查询日期", "查询机构", "查询原因"]]
     institution_rows.extend(
         [str(sequence), "2022.04.26", f"机构{sequence}", "贷款审批"]
@@ -340,22 +379,57 @@ def _yu_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
     personal_rows = [
         ["编号", "", "", ""],
         ["", "查询日期", "查询机构", "查询原因"],
-        ["1", "2022.06.13", "本人", "本人查询(自助查询机)"],
-        ["2", "2022.02.18", "本人", "本人查询(自助查询机)"],
+        *[
+            [
+                str(sequence),
+                (
+                    ["2022.06.13", "2022.02.18"][sequence - 1]
+                    if personal_count == 2
+                    else f"2022.{((sequence - 1) % 12) + 1:02d}.13"
+                ),
+                "本人",
+                "本人查询(自助查询机)",
+            ]
+            for sequence in range(1, personal_count + 1)
+        ],
         ["", "", "", ""],
     ]
-    geometry = _split_personal_geometry()
+    geometry = _split_personal_geometry(body_count=personal_count)
     if defect == "transposed_header":
         personal_rows[1][1], personal_rows[1][2] = personal_rows[1][2], personal_rows[1][1]
     elif defect == "missing_row_span":
         geometry["cell_spans"] = []
     elif defect == "non_personal_body":
         personal_rows[3][2] = "某银行"
-    elif defect == "extra_body_row":
-        personal_rows.insert(
-            4,
-            ["3", "2021.12.01", "本人", "本人查询(自助查询机)"],
+    elif defect == "sequence_gap":
+        personal_rows[-2][0] = str(personal_count + 1)
+    elif defect == "duplicate_sequence":
+        personal_rows[-2][0] = str(max(1, personal_count - 1))
+    elif defect == "outlier_sequence":
+        personal_rows[-2][0] = "999"
+    elif defect == "inexact_body_cell":
+        geometry["cell_geometry_status"][-2][2] = "derived"
+    elif defect == "ambiguous_header_span":
+        geometry["cell_spans"].append(
+            {
+                "row": 0,
+                "col": 1,
+                "row_span": 2,
+                "col_span": 1,
+                "bbox": geometry["cell_bboxes"][0][1],
+            }
         )
+    elif defect == "extra_section_after_blank":
+        personal_rows.append(
+            ["1", "2021.12.01", "本人", "本人查询(自助查询机)"]
+        )
+    elif defect == "damaged_first_ordinal":
+        personal_rows[2][0] = "?"
+    elif defect == "second_unreadable_ordinal":
+        personal_rows[2][0] = "?"
+        personal_rows[3][0] = "#"
+    elif defect == "alphanumeric_first_residue":
+        personal_rows[2][0] = "A?"
     tables = [
         _table("pt_16_4", institution_rows, top=430.0, bottom=561.5),
         _table(
@@ -366,6 +440,8 @@ def _yu_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
             geometry=geometry,
         ),
     ]
+    for table in tables:
+        table.metadata["canonical_template_id"] = "annotations_and_inquiries"
     return SimpleNamespace(
         pages=[_page(17, tables, template="annotations_and_inquiries")],
         corrected_evidence_pages=lambda: [],
@@ -385,15 +461,86 @@ def test_yu_split_personal_inquiry_header_emits_both_channels_and_coverage() -> 
     assert [row["sequence"] for row in personal] == [1, 2]
     assert [row["inquiry_date"] for row in personal] == ["2022-06-13", "2022-02-18"]
     assert coverage["sequence_endpoints"] == {"institution": 24, "personal": 2}
-    assert coverage["expected_row_count"] == 26
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+
+
+@pytest.mark.parametrize("personal_count", [1, 4, 7])
+def test_split_personal_inquiry_header_derives_variable_dense_population(
+    personal_count: int,
+) -> None:
+    context = _yu_inquiry_context(personal_count=personal_count)
+
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    personal = [row for row in rows if row["inquiry_type"] == "personal"]
+    assert [row["sequence"] for row in personal] == list(
+        range(1, personal_count + 1)
+    )
+    assert coverage["sequence_endpoints"]["personal"] == personal_count
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+
+
+@pytest.mark.parametrize("personal_count", [2, 3, 4, 7])
+def test_split_personal_inquiry_header_repairs_one_damaged_first_ordinal_for_variable_population(
+    personal_count: int,
+) -> None:
+    context = _yu_inquiry_context(
+        defect="damaged_first_ordinal",
+        personal_count=personal_count,
+    )
+
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    personal = [row for row in rows if row["inquiry_type"] == "personal"]
+    assert [row["sequence"] for row in personal] == list(range(1, personal_count + 1))
+    assert coverage["sequence_endpoints"]["personal"] == personal_count
 
 
 @pytest.mark.parametrize(
     "defect",
-    ["transposed_header", "missing_row_span", "non_personal_body", "extra_body_row"],
+    [
+        "sequence_gap",
+        "duplicate_sequence",
+        "second_unreadable_ordinal",
+        "alphanumeric_first_residue",
+        "inexact_body_cell",
+        "extra_section_after_blank",
+    ],
+)
+def test_split_personal_damaged_first_ordinal_fails_closed_without_complete_exact_lattice(
+    defect: str,
+) -> None:
+    context = _yu_inquiry_context(defect=defect, personal_count=4)
+    if defect in {"sequence_gap", "duplicate_sequence", "inexact_body_cell", "extra_section_after_blank"}:
+        context.pages[0].tables[1].metadata["raw_rows"][2][0] = "?"
+
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert not [row for row in rows if row["inquiry_type"] == "personal"]
+    assert coverage["sequence_endpoints"] == {"institution": 24}
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "transposed_header",
+        "missing_row_span",
+        "non_personal_body",
+        "sequence_gap",
+        "duplicate_sequence",
+        "outlier_sequence",
+        "inexact_body_cell",
+        "ambiguous_header_span",
+        "extra_section_after_blank",
+    ],
 )
 def test_yu_split_personal_inquiry_header_fails_closed(defect: str) -> None:
-    context = _yu_inquiry_context(defect=defect)
+    context = _yu_inquiry_context(defect=defect, personal_count=4)
 
     rows = native_extraction._extract_inquiries(context)
     coverage = native_extraction._inquiry_source_coverage(context)

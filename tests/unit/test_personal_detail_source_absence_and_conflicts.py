@@ -18,6 +18,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.profile_extraction 
 from docmirror.plugins.credit_report.personal_detail_scanned.source_projection import (
     prepare_personal_detail_source_collections,
 )
+from tests.unit.personal_detail_employment_test_support import employment_page
 
 
 def _table(table_id: str, rows: list[list[str]]) -> SimpleNamespace:
@@ -153,6 +154,17 @@ def test_agreement_optional_dash_variants_are_null_source_absence(
         PBOCPersonalDetailNativeParser,
     )
 
+    dash_fields = {
+        "管理机构": "institution",
+        "授信额度用途": "facility_type",
+        "生效日期": "effective_date",
+        "到期日期": "due_date",
+        "授信额度": "total_limit",
+        "授信限额": "credit_limit",
+        "已用额度": "used_limit",
+        "授信限额编号": "limit_identifier",
+        "币种": "currency",
+    }
     candidate = SimpleNamespace(
         fields={
             "授信协议标识": "T10151210H0001ABC12345",
@@ -167,7 +179,15 @@ def test_agreement_optional_dash_variants_are_null_source_absence(
             "币种": "‒",
         },
         source_refs=[],
-        source_refs_by_field={},
+        source_refs_by_field={
+            label: [
+                _exact_agreement_ref(
+                    field_name,
+                    f"ocr:agreement:{field_name}:dash",
+                )
+            ]
+            for label, field_name in dash_fields.items()
+        },
         binding_quality_by_field={},
         unresolved_labels=frozenset(),
         observed_labels=frozenset(),
@@ -204,9 +224,181 @@ def test_agreement_optional_dash_variants_are_null_source_absence(
     )
 
 
+def _exact_agreement_ref(field_name: str, evidence_id: str) -> dict[str, Any]:
+    return {
+        "source": "personal_detail_corrected_page_cell",
+        "logical_page": 8,
+        "source_page": 4,
+        "bbox": [10.0, 20.0, 80.0, 36.0],
+        "geometry_scope": "cell",
+        "field_name": field_name,
+        "binding": "canonical_label_slot",
+        "evidence_ids": [evidence_id],
+    }
+
+
+@pytest.mark.parametrize(
+    "raw_institution",
+    (
+        "导中国工商银行股份有限公司",
+        "S 中国工商银行股份有限公司",
+        "中国工商银行股份有限公司 Ss",
+    ),
+)
+def test_credit_agreement_institution_never_deletes_unowned_source_glyphs(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_institution: str,
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
+        PBOCPersonalDetailNativeParser,
+    )
+
+    institution_ref = _exact_agreement_ref(
+        "institution",
+        "ocr:agreement:institution:glyph-preservation",
+    )
+    candidate = SimpleNamespace(
+        fields={
+            "授信协议标识": "T10151210H0001ABC12345",
+            "管理机构": raw_institution,
+        },
+        source_refs=[],
+        source_refs_by_field={"管理机构": [institution_ref]},
+        binding_quality_by_field={},
+        unresolved_labels=frozenset(),
+        observed_labels=frozenset({"管理机构"}),
+        confidence=0.9,
+    )
+    monkeypatch.setattr(
+        PBOCPersonalDetailNativeParser,
+        "records",
+        lambda _self, dataset_name: [candidate] if dataset_name == "credit_lines" else [],
+    )
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    rows = native_extraction._extract_credit_lines(context)
+
+    assert rows[0].get("institution") is None
+    raw = rows[0]["canonical_raw"]["institution"]
+    assert raw_institution in raw if isinstance(raw, list) else raw == raw_institution
+    assert any(
+        issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        and issue.get("target_dataset") == "credit_lines"
+        and issue.get("field_name") == "institution"
+        for issue in context._personal_detail_extraction_issues
+    ), context._personal_detail_extraction_issues
+
+
+def test_agreement_dash_and_source_present_observations_do_not_claim_absence() -> None:
+    identifier = "B10512900H00010010011135264974289"
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    dash_ref = _exact_agreement_ref("institution", "ocr:agreement:dash")
+    value_ref = _exact_agreement_ref("institution", "ocr:agreement:value")
+
+    rows = native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        [
+            {
+                "account_identifier": identifier,
+                "institution": None,
+                "_printed_sequence": 1,
+                "_source_absent_fields": ["institution"],
+                "_observed_fields": ["institution"],
+                "canonical_raw": {"institution": "--"},
+                "source_refs_by_field": {"institution": [dash_ref]},
+            },
+            {
+                "account_identifier": identifier,
+                "institution": "示例银行股份有限公司",
+                "_printed_sequence": 1,
+                "_observed_fields": ["institution"],
+                "source_refs_by_field": {"institution": [value_ref]},
+                "_field_binding_quality": {"institution": "canonical_cell_slot"},
+            },
+        ],
+    )
+
+    assert rows[0]["institution"] == "示例银行股份有限公司"
+    assert "institution" not in set(rows[0].get("_source_absent_fields") or ())
+    assert "institution" in set(rows[0].get("_unresolved_fields") or ())
+
+
+def test_agreement_dash_consensus_requires_every_observation_to_be_exact() -> None:
+    identifier = "B10512900H00010010011135264974289"
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    rows = native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        [
+            {
+                "account_identifier": identifier,
+                "institution": None,
+                "_printed_sequence": 1,
+                "_source_absent_fields": ["institution"],
+                "_observed_fields": ["institution"],
+                "canonical_raw": {"institution": "--"},
+                "source_refs_by_field": {
+                    "institution": [
+                        _exact_agreement_ref("institution", "ocr:agreement:dash")
+                    ]
+                },
+            },
+            {
+                "account_identifier": identifier,
+                "institution": None,
+                "_printed_sequence": 1,
+                "_source_absent_fields": ["institution"],
+                "_observed_fields": ["institution"],
+                "canonical_raw": {"institution": "--"},
+                "source_refs_by_field": {
+                    "institution": [
+                        {
+                            "logical_page": 8,
+                            "source_page": 4,
+                            "geometry_scope": "table",
+                            "field_name": "institution",
+                        }
+                    ]
+                },
+            },
+        ],
+    )
+
+    assert "institution" not in set(rows[0].get("_source_absent_fields") or ())
+    assert "institution" in set(rows[0].get("_unresolved_fields") or ())
+
+
+def test_agreement_absence_marker_requires_dash_only_raw_evidence() -> None:
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    rows = native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        [
+            {
+                "account_identifier": "B10512900H00010010011135264974289",
+                "institution": None,
+                "_printed_sequence": 1,
+                "_source_absent_fields": ["institution"],
+                "_observed_fields": ["institution"],
+                "canonical_raw": {"institution": "示例银行股份有限公司"},
+                "source_refs_by_field": {
+                    "institution": [
+                        _exact_agreement_ref(
+                            "institution",
+                            "ocr:agreement:forged-absence",
+                        )
+                    ]
+                },
+            }
+        ],
+    )
+
+    assert "institution" not in set(rows[0].get("_source_absent_fields") or ())
+    assert "institution" in set(rows[0].get("_unresolved_fields") or ())
+
+
 def _employment_context(*, address: str, position: str = "一般员工") -> SimpleNamespace:
-    return _context(
-        _table(
+    table = _table(
             "employment",
             [
                 ["编号", "工作单位", "单位性质", "单位地址", "单位电话", "", ""],
@@ -216,7 +408,11 @@ def _employment_context(*, address: str, position: str = "一般员工") -> Simp
                 ["编号", "数据发生机构名称", "", "", "", "", ""],
                 ["1", "示例银行股份有限公司", "", "", "", "", ""],
             ],
-        )
+    )
+    return SimpleNamespace(
+        pages=[employment_page(table, logical_page=1)],
+        tables_continue=lambda _left, _right: False,
+        _personal_detail_extraction_issues=[],
     )
 
 

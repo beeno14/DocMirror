@@ -1,12 +1,12 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""
-Bank statement style parser registry and fallback orchestration.
+"""Bank-statement table parser and candidate-selection registry.
 
-Maps detected style IDs to parser modules under ``bank_statement.styles``,
-runs the primary parser chain, scores record completeness with CAPS coverage,
-and falls back to ``grid_standard`` / ``borderless_ocr`` when primary is sparse.
+Maps detected style IDs to parser modules under ``bank_statement.styles`` and
+materializes the recovery candidates allowed by the pre-resolved acquisition
+policy.  All candidates are scored and selected once; source strategies are
+never invoked as a late cross-route fallback.
 
 Pipeline role: plugin-local dispatch between ``BankStyleDetector`` and record
 builders inside the post-seal bank-statement projector.
@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass, replace
+from datetime import date
 from typing import Any, Callable
 
 from docmirror.plugins.bank_statement.canonical import ensure_canonical_normalized, records_from_raw_transactions
@@ -29,17 +31,24 @@ from docmirror.plugins.bank_statement.canonical_quality import (
     is_canonical_row,
     physical_transaction_row_estimate,
 )
-from docmirror.plugins.bank_statement.context import StyleContext, collect_physical_tables_from_parse_result
+from docmirror.plugins.bank_statement.context import (
+    StyleContext,
+    collect_physical_table_row_sources_from_parse_result,
+    collect_physical_tables_from_parse_result,
+)
 from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     recover_evidence_atom_bank_tables,
     recover_positioned_record_block_bank_tables,
-    recovered_evidence_atom_expected_row_count,
     recovered_evidence_atom_expected_row_evidence,
     recovered_evidence_atom_row_sources,
+    recovered_native_datetime_row_evidence,
 )
+from docmirror.plugins.bank_statement.extraction_dispatch import BankExtractionRoute
+from docmirror.plugins.bank_statement.header_resolve import normalize_header_cell
 from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
     recover_ocr_implicit_ledger_tables,
     recovered_ocr_implicit_row_count,
+    recovered_ocr_implicit_row_evidence,
 )
 from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
 from docmirror.plugins.bank_statement.styles import (
@@ -68,11 +77,38 @@ _PARSERS = {
     "borderless_ocr": borderless_ocr,
 }
 
-_FALLBACK_PARSER_IDS = ("grid_standard", "borderless_ocr", "signed_amount", "compact_merged")
-_CAPS_THRESHOLD = 0.55
-_COVERAGE_THRESHOLD = 0.80
+_PARSER_CANDIDATE_ORDER = ("grid_standard", "signed_amount", "compact_merged", "borderless_ocr")
 _INDEPENDENT_ROW_COUNT_SOURCES = frozenset(
-    {"split_footer", "header_total", "page_footer", "page_transaction_anchors", "physical_rows"}
+    {
+        "split_footer",
+        "header_total",
+        "statement_header_totals",
+        "cumulative_footer_total",
+        "page_footer",
+    }
+)
+_ISSUER_ROW_COUNT_SOURCES = frozenset(
+    {
+        "split_footer",
+        "header_total",
+        "statement_header_totals",
+        "cumulative_footer_total",
+        "page_footer",
+    }
+)
+_ROW_PLANE_COUNT_SOURCES = frozenset(
+    {
+        "complete_page_local_sequences",
+        "ccb_primary_source_sequence",
+        "cmb_primary_source_rows",
+        "native_page_datetime_census",
+        "native_page_signed_ledger_census",
+        "ocr_page_ordinal_census",
+        "page_transaction_anchors",
+        "physical_rows",
+        "positioned_date_anchors",
+        "positioned_record_blocks",
+    }
 )
 _SOURCE_DATE_RE = re.compile(r"20\d{2}(?:[-/.]?\d{1,2}){2}")
 _SOURCE_DATE_HEADERS = frozenset(
@@ -87,17 +123,43 @@ _SOURCE_DATE_HEADERS = frozenset(
         "记账时间",
     }
 )
-
-
-def _field_completeness(records: list[dict[str, Any]], sample: int = 8) -> float:
-    if not records:
-        return 0.0
-    fields = ("date", "amount", "direction", "balance")
-    scores = []
-    for rec in records[:sample]:
-        norm = rec.get("normalized") or {}
-        scores.append(sum(1 for f in fields if norm.get(f) not in (None, "", 0)) / len(fields))
-    return sum(scores) / len(scores)
+_SOURCE_SUMMARY_HEADERS = frozenset(
+    {
+        "summary",
+        "摘要",
+        "摘要描述",
+        "交易摘要",
+        "description",
+        "memo",
+    }
+)
+_FURNITURE_LABELS = (
+    "打印时间",
+    "打印日期",
+    "记录数",
+    "用户所属公司",
+    "查询条件",
+    "查询账号",
+    "账户信息",
+)
+_SEMANTIC_ECHO_FIELDS = (
+    "date",
+    "timestamp",
+    "summary",
+    "purpose",
+    "sequence_no",
+    "reference",
+    "channel",
+    "counter_account",
+    "counter_party",
+)
+_DELIMITED_BUSINESS_LAYOUT_HEADERS = frozenset(
+    {"序号", "摘要/附言", "币别", "交易日期", "交易类型", "交易金额", "账户余额", "对方账号", "对方户名"}
+)
+_DELIMITED_BUSINESS_CODES = frozenset({"0WL", "_0WL", "1银联"})
+_DELIMITED_BUSINESS_TYPES = frozenset({"WL协议", "WL付款", "WL退款", "银联贷记"})
+_DELIMITED_BUSINESS_MARKER_RE = re.compile(r"(?<![0-9A-Za-z_])(?:0WL|_0WL|1银联)#")
+_DELIMITED_BUSINESS_REFERENCE_RE = re.compile(r"[0-9S]{6,31}", re.IGNORECASE)
 
 
 def _batch_field_completeness(
@@ -113,62 +175,25 @@ def _batch_field_completeness(
             "余额" in grid_standard.normalize_header_cell(str(key)) or "balance" in str(key).lower()
             for key in transaction
         )
-        for transaction in transactions[:8]
+        for transaction in transactions
     )
     fields = ("date", "amount", "direction", *(("balance",) if balance_expected else ()))
     scores = []
-    for txn in transactions[:8]:
+    for txn in transactions:
         norm = ensure_canonical_normalized(nf(txn), plugin.standard_fields)
-        scores.append(sum(1 for f in fields if norm.get(f) not in (None, "", 0)) / len(fields))
+        scores.append(sum(1 for f in fields if norm.get(f) not in (None, "")) / len(fields))
     return sum(scores) / len(scores)
 
 
-def _batch_raw_width(transactions: list[dict[str, str]], sample: int = 8) -> float:
+def _batch_raw_width(transactions: list[dict[str, str]], sample: int | None = None) -> float:
     """Average number of populated source columns, used only as a tie-breaker."""
     if not transactions:
         return 0.0
     widths = [
         sum(bool(str(value or "").strip()) for key, value in transaction.items() if not key.startswith("_"))
-        for transaction in transactions[:sample]
+        for transaction in (transactions if sample is None else transactions[:sample])
     ]
     return sum(widths) / len(widths)
-
-
-def _batch_source_coverage(transactions: list[dict[str, Any]]) -> float:
-    if not transactions:
-        return 0.0
-    sourced = 0
-    for transaction in transactions:
-        source = transaction.get("_source")
-        if not isinstance(source, dict):
-            continue
-        source_page = source.get("source_page")
-        page_range = source.get("page_range")
-        if source_page not in (None, "", 0) and isinstance(page_range, (list, tuple)) and page_range:
-            sourced += 1
-    return sourced / len(transactions)
-
-
-def _parser_score(
-    transactions: list[dict[str, str]],
-    normalize_fn: Any,
-    plugin: Any,
-    expected_rows: int,
-) -> tuple[float, float]:
-    if not transactions:
-        return 0.0, 0.0
-    nf = normalize_fn or plugin._normalize
-    canonical_count = sum(
-        is_canonical_row(ensure_canonical_normalized(nf(transaction), plugin.standard_fields))
-        for transaction in transactions
-    )
-    expected = max(expected_rows if expected_rows > 0 else len(transactions), 1)
-    coverage = min(canonical_count / expected, 1.0)
-    completeness = _batch_field_completeness(transactions, normalize_fn, plugin)
-    source_coverage = _batch_source_coverage(transactions)
-    raw_width = min(_batch_raw_width(transactions) / 8.0, 1.0)
-    score = 0.60 * coverage + 0.20 * completeness + 0.15 * source_coverage + 0.05 * raw_width
-    return score, coverage
 
 
 def _expected_rows(ctx: StyleContext) -> int:
@@ -179,7 +204,9 @@ def _expected_rows(ctx: StyleContext) -> int:
     if footer_expected > 0:
         return footer_expected
     canonical_expected = canonical_expected_from_parse_result(ctx.parse_result)
-    ocr_expected = recovered_ocr_implicit_row_count(ctx.parse_result)
+    ocr_expected = (
+        recovered_ocr_implicit_row_count(ctx.parse_result) if ctx.extraction_route is BankExtractionRoute.SCANNED else 0
+    )
     if canonical_expected > 0 or ocr_expected > 0:
         return max(canonical_expected, ocr_expected)
     candidates: list[int] = []
@@ -231,8 +258,12 @@ def _attach_recovered_sources(
     """Attach positioned row provenance without changing the recovered table contract."""
     if not transactions or not row_sources:
         return
+    identity_queues: dict[tuple[int, str, int], list[dict[str, Any]]] = {}
     source_queues: dict[tuple[str, ...], list[dict[str, Any]]] = {}
     for source in row_sources:
+        identity = _physical_row_identity(source)
+        if identity is not None:
+            identity_queues.setdefault(identity, []).append(source)
         signature = _row_value_signature(source.get("row_values") or [])
         if signature:
             source_queues.setdefault(signature, []).append(source)
@@ -240,8 +271,13 @@ def _attach_recovered_sources(
     unmatched: list[int] = []
     used_source_ids: set[int] = set()
     for index, transaction in enumerate(transactions):
-        queue = source_queues.get(_row_value_signature(transaction)) or []
-        source = queue.pop(0) if queue else None
+        transaction_source = transaction.get("_source")
+        identity = _physical_row_identity(transaction_source) if isinstance(transaction_source, dict) else None
+        queue = identity_queues.get(identity) or []
+        source = _pop_unused_source(queue, used_source_ids)
+        if source is None:
+            queue = source_queues.get(_row_value_signature(transaction)) or []
+            source = _pop_unused_source(queue, used_source_ids)
         if source is None:
             unmatched.append(index)
             continue
@@ -257,6 +293,29 @@ def _attach_recovered_sources(
         transactions[index]["_source"] = _single_page_source(source)
         if isinstance(source.get("source_raw"), dict):
             transactions[index]["_source_raw"] = dict(source["source_raw"])
+
+
+def _physical_row_identity(source: dict[str, Any]) -> tuple[int, str, int] | None:
+    try:
+        page = int(source.get("source_page") or source.get("page") or 0)
+        row_index = int(source.get("source_row_index"))
+    except (TypeError, ValueError):
+        return None
+    table_id = str(source.get("table_id") or "").strip()
+    if page <= 0 or not table_id or row_index < 0:
+        return None
+    return page, table_id, row_index
+
+
+def _pop_unused_source(
+    queue: list[dict[str, Any]],
+    used_source_ids: set[int],
+) -> dict[str, Any] | None:
+    while queue:
+        source = queue.pop(0)
+        if id(source) not in used_source_ids:
+            return source
+    return None
 
 
 def _single_page_source(source: dict[str, Any]) -> dict[str, Any]:
@@ -310,6 +369,10 @@ class BankTableCandidate:
     source_column_width: float = 0.0
     sequence_continuity: float = 0.0
     native_cell_coverage: float = 0.0
+    semantic_anomaly_rows: int = 0
+    source_role_swap_ratio: float = 0.0
+    rejected_row_indexes: tuple[int, ...] = ()
+    rejection_reason: str = ""
 
 
 def _candidate_expected_rows(
@@ -319,24 +382,211 @@ def _candidate_expected_rows(
     source: str = "candidate_rows",
     confidence: float = 0.55,
 ) -> RowCountEvidence | None:
+    row_plane_signal = source_evidence.source in _ROW_PLANE_COUNT_SOURCES
+    if row_plane_signal:
+        source_evidence = replace(source_evidence, confidence=min(source_evidence.confidence, 0.80))
     if source_evidence.count > 0 and source_evidence.confidence >= 0.85:
         return source_evidence
     if count > 0:
-        return RowCountEvidence(count=count, source=source, confidence=confidence)
+        fallback_confidence = min(confidence, 0.80) if source in _ROW_PLANE_COUNT_SOURCES else confidence
+        return RowCountEvidence(count=count, source=source, confidence=fallback_confidence)
+    if row_plane_signal and source_evidence.count > 0:
+        # Keep the bounded row-plane signal available for ranking when this
+        # candidate has no count of its own.  When it does, however, describe
+        # the candidate with that local count: a separate row plane at 0.80 is
+        # structural corroboration, not the candidate's completeness proof.
+        return source_evidence
     return source_evidence if source_evidence.count > 0 else None
+
+
+def _continuous_source_sequence_evidence(transactions: list[dict[str, Any]]) -> RowCountEvidence | None:
+    """Return candidate-local continuity evidence for an exact ``1..N`` spine.
+
+    A retained prefix ``1..5`` is still continuous when source row 6 was lost,
+    so this signal is useful for ranking candidates but is not an independent
+    document-completeness proof.  Other source-row-plane censuses have the
+    same limitation and likewise stay below the public count-authority
+    threshold.
+    """
+    values: list[int] = []
+    for transaction in transactions:
+        if _source_row_contains_multiple_transaction_dates(transaction):
+            continue
+        raw_sequence = ""
+        for key, value in transaction.items():
+            if normalize_header_cell(str(key or "")) in {"序号", "交易序号", "sequence"}:
+                raw_sequence = re.sub(r"\s+", "", str(value or ""))
+                break
+        if not re.fullmatch(r"\d{1,9}", raw_sequence):
+            return None
+        values.append(int(raw_sequence))
+    if not values or values != list(range(1, len(values) + 1)):
+        return None
+    return RowCountEvidence(
+        count=len(values),
+        source="continuous_source_sequence",
+        confidence=0.80,
+    )
+
+
+def _transaction_source_page(transaction: dict[str, Any]) -> int:
+    source = transaction.get("_source")
+    values = (
+        source.get("source_page") if isinstance(source, dict) else None,
+        source.get("page") if isinstance(source, dict) else None,
+        transaction.get("_source_page"),
+    )
+    for value in values:
+        try:
+            page = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if page > 0:
+            return page
+    return 0
+
+
+def _source_sequence_values(transactions: list[dict[str, Any]]) -> list[tuple[int, int]] | None:
+    values: list[tuple[int, int]] = []
+    for transaction in transactions:
+        if _source_row_contains_multiple_transaction_dates(transaction):
+            continue
+        raw_sequence = ""
+        for key, value in transaction.items():
+            if normalize_header_cell(str(key or "")) in {"序号", "交易序号", "sequence"}:
+                raw_sequence = re.sub(r"\s+", "", str(value or ""))
+                break
+        if not re.fullmatch(r"\d{1,9}", raw_sequence):
+            return None
+        values.append((_transaction_source_page(transaction), int(raw_sequence)))
+    return values or None
+
+
+def _page_complete_sequence_evidence(
+    transactions: list[dict[str, Any]],
+    *,
+    page_count: int,
+    page_texts: list[tuple[int, str]] | None = None,
+) -> RowCountEvidence | None:
+    """Return a source-row-plane consistency signal for page-local ordinals.
+
+    A candidate-local consecutive sequence is not a completeness witness: rows
+    ``1..5`` are still consecutive when row 6 was dropped.  The BOC statements
+    for which page-local ordinals reset expose a stable bilingual pipe ledger in
+    each sealed page text.  Count only those bounded source rows, require their
+    page markers and footer band, and then require the candidate ordinals to
+    match that source census exactly.
+    """
+    values = _source_sequence_values(transactions)
+    if not values or page_count <= 0:
+        return None
+    pages = [page for page, _value in values]
+    if any(page <= 0 for page in pages) or set(pages) != set(range(1, page_count + 1)):
+        return None
+    scoped_text = {page: str(text or "") for page, text in (page_texts or [])}
+    if set(scoped_text) != set(range(1, page_count + 1)):
+        return None
+    by_page: dict[int, list[int]] = {}
+    for page, value in values:
+        by_page.setdefault(page, []).append(value)
+
+    source_by_page: dict[int, list[int]] = {}
+    row_pattern = re.compile(
+        r"(?m)^\|\s*(?P<sequence>\d{1,4})\s*\|\s*"
+        r"(?P<posting>\d{6})\s*\|\s*(?P<value>\d{6})\s*\|"
+    )
+    page_marker = re.compile(r"\bPage\s+(?P<page>\d+)\s+of\s+(?P<total>\d+)\b", re.I)
+    exact_header_markers = ("|No.", "|Bk.D.", "|Val.D.", "| Type ", "| Notes |")
+
+    for page in range(1, page_count + 1):
+        text = scoped_text[page]
+        marker = page_marker.search(text)
+        if (
+            marker is None
+            or int(marker.group("page")) != page
+            or int(marker.group("total")) != page_count
+            or not all(label in text for label in exact_header_markers)
+            or "Debit Total" not in text
+            or "Credit Total" not in text
+        ):
+            return None
+        source_rows: list[int] = []
+        for match in row_pattern.finditer(text):
+            for field in ("posting", "value"):
+                raw_date = match.group(field)
+                try:
+                    date(2000 + int(raw_date[:2]), int(raw_date[2:4]), int(raw_date[4:6]))
+                except ValueError:
+                    return None
+            source_rows.append(int(match.group("sequence")))
+        if not source_rows or source_rows != list(range(1, len(source_rows) + 1)):
+            return None
+        source_by_page[page] = source_rows
+
+    if by_page != source_by_page:
+        return None
+    # The candidate and page-text rows are two representations of the same row
+    # plane.  Agreement is useful for ranking, but a shared truncation can make
+    # both representations agree on a short prefix, so it is not an independent
+    # document-level denominator.
+    return RowCountEvidence(sum(len(rows) for rows in source_by_page.values()), "complete_page_local_sequences", 0.80)
+
+
+def _candidate_row_count_evidence(
+    transactions: list[dict[str, Any]],
+    expected: RowCountEvidence | None,
+    *,
+    page_count: int = 0,
+    page_texts: list[tuple[int, str]] | None = None,
+) -> RowCountEvidence | None:
+    """Prefer exact candidate sequences without letting a prefix defeat issuer evidence.
+
+    Sequence evidence must be computed for every candidate representation. Doing
+    so only for native-wide recovery lets a short 1..N native prefix claim exact
+    completeness while a fuller parser candidate carrying the same source
+    sequence is scored against weak text anchors.
+    """
+    # Prefer the independently bounded page-text census.  A one-page table can
+    # also be globally 1..N; checking bare continuity first would discard the
+    # stronger source-boundary proof and unnecessarily demote the result.
+    sequence = _page_complete_sequence_evidence(
+        transactions,
+        page_count=page_count,
+        page_texts=page_texts,
+    ) or _continuous_source_sequence_evidence(transactions)
+    if sequence is None:
+        return expected
+    if sequence.confidence < 0.85:
+        # Bare continuity is candidate quality, never a reason to replace an
+        # independently counted (or even independently anchored) denominator.
+        return expected if expected is not None and expected.count > 0 else sequence
+    if expected is None or expected.count <= 0 or expected.confidence < 0.85:
+        return sequence
+    if expected.source in _ISSUER_ROW_COUNT_SOURCES:
+        return expected
+    if expected.source in {"page_transaction_anchors", "physical_rows"}:
+        return sequence if sequence.count >= expected.count else expected
+    return expected
 
 
 def _evidence_atom_expected_rows(
     parse_result: Any,
     atom_tables: list[list[list[str]]],
+    *,
+    source_route: str | None = None,
 ) -> RowCountEvidence | None:
     """Return independent page-anchor evidence when recovery can prove it."""
     table_rows = sum(max(len(table) - 1, 0) for table in atom_tables)
-    evidence_count, evidence_source, evidence_confidence = recovered_evidence_atom_expected_row_evidence(parse_result)
+    evidence_count, evidence_source, evidence_confidence = recovered_evidence_atom_expected_row_evidence(
+        parse_result,
+        source_route=source_route,
+    )
     expected = max(table_rows, evidence_count)
     if expected <= 0:
         return None
     if evidence_count == expected and evidence_source:
+        if evidence_source in _ROW_PLANE_COUNT_SOURCES:
+            evidence_confidence = min(evidence_confidence, 0.80)
         return RowCountEvidence(
             count=expected,
             source=evidence_source,
@@ -370,21 +620,94 @@ def _candidate_balance_chain_score(normalized_rows: list[dict[str, Any]]) -> flo
     return max(score(normalized_rows), score(list(reversed(normalized_rows))))
 
 
-def _candidate_sequence_continuity(normalized_rows: list[dict[str, Any]]) -> float:
-    """Return source-order sequence coverage, uniqueness, and continuity."""
-    numbers: list[int] = []
-    for row in normalized_rows:
+def _candidate_sequence_continuity(
+    normalized_rows: list[dict[str, Any]],
+    transactions: list[dict[str, Any]] | None = None,
+) -> float:
+    """Return source-order sequence coverage across legitimate local resets.
+
+    Many statements reset an ordinal to ``1`` at a page, query batch, or
+    statement-segment boundary. Global uniqueness therefore measures document
+    segmentation rather than extraction quality. A reset counts as continuous
+    only when its source provenance moves strictly forward; concatenating a
+    duplicate extraction plane jumps back to an earlier page and remains
+    penalized.
+    """
+    numbered: list[tuple[int, dict[str, Any] | None]] = []
+    transaction_rows = transactions or []
+    for index, row in enumerate(normalized_rows):
         value = str(row.get("sequence_no") or "").strip()
         if re.fullmatch(r"\d{1,9}", value):
-            numbers.append(int(value))
-    if len(numbers) < 2:
+            transaction = transaction_rows[index] if index < len(transaction_rows) else None
+            numbered.append((int(value), transaction))
+    if len(numbered) < 2:
         return 0.0
-    coverage = len(numbers) / max(len(normalized_rows), 1)
-    uniqueness = len(set(numbers)) / len(numbers)
-    continuity = sum(abs(current - previous) == 1 for previous, current in zip(numbers, numbers[1:])) / (
-        len(numbers) - 1
-    )
-    return coverage * uniqueness * continuity
+    coverage = len(numbered) / max(len(normalized_rows), 1)
+    continuous = 0
+    for (previous, previous_transaction), (current, current_transaction) in zip(numbered, numbered[1:]):
+        if (
+            previous_transaction is not None
+            and current_transaction is not None
+            and _candidate_source_page_rewinds(previous_transaction, current_transaction)
+        ):
+            continue
+        if abs(current - previous) == 1:
+            continuous += 1
+            continue
+        if (
+            current == 1
+            and previous_transaction is not None
+            and current_transaction is not None
+            and _candidate_source_row_follows(previous_transaction, current_transaction)
+        ):
+            continuous += 1
+    return coverage * continuous / (len(numbered) - 1)
+
+
+def _candidate_source_page_rewinds(
+    previous_transaction: dict[str, Any],
+    current_transaction: dict[str, Any],
+) -> bool:
+    previous_source = previous_transaction.get("_source")
+    current_source = current_transaction.get("_source")
+    if not isinstance(previous_source, dict) or not isinstance(current_source, dict):
+        return False
+    try:
+        previous_page = int(previous_source.get("source_page") or 0)
+        current_page = int(current_source.get("source_page") or 0)
+    except (TypeError, ValueError):
+        return False
+    return previous_page > 0 and current_page > 0 and current_page < previous_page
+
+
+def _candidate_source_row_follows(
+    previous_transaction: dict[str, Any],
+    current_transaction: dict[str, Any],
+) -> bool:
+    previous_source = previous_transaction.get("_source")
+    current_source = current_transaction.get("_source")
+    if not isinstance(previous_source, dict) or not isinstance(current_source, dict):
+        return False
+    try:
+        previous_page = int(previous_source.get("source_page") or 0)
+        current_page = int(current_source.get("source_page") or 0)
+    except (TypeError, ValueError):
+        return False
+    if previous_page <= 0 or current_page <= 0 or current_page < previous_page:
+        return False
+    if current_page > previous_page:
+        return True
+
+    previous_bbox = _candidate_source_bbox(previous_transaction)
+    current_bbox = _candidate_source_bbox(current_transaction)
+    if previous_bbox is not None and current_bbox is not None:
+        return current_bbox[1] > previous_bbox[1] + 0.5
+    try:
+        previous_index = int(previous_source.get("source_row_index") or 0)
+        current_index = int(current_source.get("source_row_index") or 0)
+    except (TypeError, ValueError):
+        return False
+    return previous_index > 0 and current_index > previous_index
 
 
 def _candidate_source_page_coverage(transactions: list[dict[str, Any]]) -> float:
@@ -436,30 +759,72 @@ def _candidate_from_batch(
     extraction_confidence: float,
 ) -> BankTableCandidate:
     normalizer = normalize_fn or plugin._normalize
+    retained_transactions: list[dict[str, Any]] = []
     normalized_rows: list[dict[str, Any]] = []
     canonical_rows = 0
     directional_rows = 0
-    for transaction in transactions:
+    semantic_anomaly_rows = 0
+    aggregate_anomaly_rows = 0
+    rejected_row_indexes: list[int] = []
+    role_swap_eligible = 0
+    role_swap_rows = 0
+    for row_index, transaction in enumerate(transactions):
+        # A native page can expose one column-aggregated pseudo-row alongside
+        # all of its correctly bounded physical rows.  Multiple complete dates
+        # in a single source date cell prove that this item is not a transaction;
+        # discard that furniture without condemning the valid physical rows beside it.
+        if _source_row_contains_multiple_transaction_dates(transaction):
+            semantic_anomaly_rows += 1
+            aggregate_anomaly_rows += 1
+            rejected_row_indexes.append(row_index)
+            continue
         try:
             normalized = ensure_canonical_normalized(normalizer(transaction), plugin.standard_fields)
         except Exception:
             normalized = {}
         normalized_rows.append(normalized)
+        retained_transactions.append(transaction)
         if normalized.get("direction") in {"income", "expense"}:
             directional_rows += 1
-        if is_canonical_row(normalized) and not _source_row_contains_multiple_transaction_dates(transaction):
+        source_date, source_summary = _source_date_and_summary(transaction)
+        if source_date and source_summary:
+            role_swap_eligible += 1
+            if _compact_semantic_value(source_date) == _compact_semantic_value(source_summary):
+                role_swap_rows += 1
+        semantic_anomaly = _row_has_semantic_anomaly(transaction, normalized)
+        if semantic_anomaly:
+            semantic_anomaly_rows += 1
+            rejected_row_indexes.append(row_index)
+        if is_canonical_row(normalized) and not semantic_anomaly:
             canonical_rows += 1
+    role_swap_ratio = role_swap_rows / role_swap_eligible if role_swap_eligible else 0.0
+    rejection_reason = ""
+    nonaggregate_anomalies = semantic_anomaly_rows - aggregate_anomaly_rows
+    if nonaggregate_anomalies:
+        # A row with transaction-shaped core values may still be a genuine row
+        # whose columns were shifted by reconstruction.  Removing just that row
+        # would manufacture incompleteness, so reject the whole alignment and
+        # let a source-faithful candidate compete instead.
+        canonical_rows = 0
+        rejection_reason = "source_role_corruption"
+    if role_swap_eligible >= 3 and role_swap_ratio >= 0.80:
+        # A whole candidate whose source summary is systematically the source
+        # date has lost column roles.  Row counts alone cannot make it viable.
+        semantic_anomaly_rows += canonical_rows
+        canonical_rows = 0
+        rejected_row_indexes = list(range(len(transactions)))
+        rejection_reason = "systemic_summary_date_collision"
     expected_count = int(expected_rows.count or 0) if expected_rows is not None else 0
     if expected_count > 0 and (expected_rows is not None and expected_rows.confidence >= 0.85):
         canonical_coverage = min(canonical_rows / expected_count, 1.0)
     else:
         canonical_coverage = canonical_rows / max(len(transactions), 1)
-    field_completeness = _batch_field_completeness(transactions, normalize_fn, plugin)
-    source_column_width = _batch_raw_width(transactions)
-    source_page_coverage = _candidate_source_page_coverage(transactions)
-    native_cell_coverage = _candidate_native_cell_coverage(transactions)
+    field_completeness = _batch_field_completeness(retained_transactions, normalize_fn, plugin)
+    source_column_width = _batch_raw_width(retained_transactions)
+    source_page_coverage = _candidate_source_page_coverage(retained_transactions)
+    native_cell_coverage = _candidate_native_cell_coverage(retained_transactions)
     balance_chain_score = _candidate_balance_chain_score(normalized_rows)
-    sequence_continuity = _candidate_sequence_continuity(normalized_rows)
+    sequence_continuity = _candidate_sequence_continuity(normalized_rows, retained_transactions)
     score = (
         0.35 * canonical_coverage
         + 0.25 * source_page_coverage
@@ -469,11 +834,11 @@ def _candidate_from_batch(
     )
     return BankTableCandidate(
         candidate_id=candidate_id,
-        records=transactions,
+        records=retained_transactions,
         source=source,
         canonical_rows=canonical_rows,
         directional_rows=directional_rows,
-        source_page_rows=round(source_page_coverage * len(transactions)),
+        source_page_rows=round(source_page_coverage * len(retained_transactions)),
         expected_rows=expected_rows,
         balance_chain_score=balance_chain_score,
         field_completeness=field_completeness,
@@ -485,6 +850,10 @@ def _candidate_from_batch(
         source_column_width=source_column_width,
         sequence_continuity=sequence_continuity,
         native_cell_coverage=native_cell_coverage,
+        semantic_anomaly_rows=semantic_anomaly_rows,
+        source_role_swap_ratio=role_swap_ratio,
+        rejected_row_indexes=tuple(rejected_row_indexes),
+        rejection_reason=rejection_reason,
     )
 
 
@@ -507,6 +876,94 @@ def _source_row_contains_multiple_transaction_dates(transaction: dict[str, Any])
     return False
 
 
+def _source_fact_pool(transaction: dict[str, Any]) -> dict[str, Any]:
+    source_raw = transaction.get("_source_raw")
+    return source_raw if isinstance(source_raw, dict) else transaction
+
+
+def _normalized_source_header(value: Any) -> str:
+    return re.sub(r"\s+", "", grid_standard.normalize_header_cell(str(value or ""))).lower()
+
+
+def _source_date_and_summary(transaction: dict[str, Any]) -> tuple[str, str]:
+    source = _source_fact_pool(transaction)
+    source_date = ""
+    source_summary = ""
+    for raw_header, value in source.items():
+        if str(raw_header).startswith("_") or value in (None, ""):
+            continue
+        header = _normalized_source_header(raw_header)
+        header_parts = {
+            _normalized_source_header(part) for part in str(raw_header or "").splitlines() if str(part).strip()
+        }
+        if not source_date and (header in _SOURCE_DATE_HEADERS or header_parts.intersection(_SOURCE_DATE_HEADERS)):
+            source_date = str(value).strip()
+        if not source_summary and (
+            header in _SOURCE_SUMMARY_HEADERS or header_parts.intersection(_SOURCE_SUMMARY_HEADERS)
+        ):
+            source_summary = str(value).strip()
+    return source_date, source_summary
+
+
+def _compact_semantic_value(value: Any) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _row_has_semantic_anomaly(transaction: dict[str, Any], normalized: dict[str, Any]) -> bool:
+    """Reject only high-specificity row-boundary or field-role corruption.
+
+    Missing optional fields are deliberately not anomalies.  These guards target
+    patterns observed in digital source recovery where page metadata or one
+    repeated token was copied into several unrelated business roles.
+    """
+    source = _source_fact_pool(transaction)
+    # A delimited source business cell is self-describing: once a recognized
+    # code family appears, shifted/truncated geometry must not silently turn it
+    # into a transaction. This is grammar evidence, not an issuer/file switch;
+    # ordinary free-text summaries and unknown delimiters remain untouched.
+    source_headers = {
+        re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(raw_header or "")))
+        for raw_header in source
+        if not str(raw_header or "").startswith("_")
+    }
+    delimited_layout = _DELIMITED_BUSINESS_LAYOUT_HEADERS.issubset(source_headers)
+    for raw_header, value in source.items():
+        header = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(raw_header or "")))
+        if not delimited_layout or header != "摘要/附言":
+            continue
+        compact_value = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+        parts = compact_value.split("#")
+        recognized_marker = _DELIMITED_BUSINESS_MARKER_RE.search(compact_value) is not None
+        recognized_grammar = bool(parts and parts[0] in _DELIMITED_BUSINESS_CODES)
+        if recognized_marker and (
+            not recognized_grammar
+            or len(parts) != 4
+            or parts[2] not in _DELIMITED_BUSINESS_TYPES
+            or _DELIMITED_BUSINESS_REFERENCE_RE.fullmatch(parts[1]) is None
+            or not parts[3]
+        ):
+            return True
+    source_text = " ".join(
+        str(value or "") for key, value in source.items() if not str(key).startswith("_") and value not in (None, "")
+    )
+    furniture_hits = sum(label in source_text for label in _FURNITURE_LABELS)
+    if furniture_hits >= 2:
+        return True
+
+    role_values: dict[str, str] = {}
+    for field in _SEMANTIC_ECHO_FIELDS:
+        compact = _compact_semantic_value(normalized.get(field))
+        if len(compact) < 6 or compact in {"000000", "none", "null", "na"}:
+            continue
+        role_values[field] = compact
+    occurrences: dict[str, set[str]] = {}
+    for field, value in role_values.items():
+        occurrences.setdefault(value, set()).add(field)
+    if any(len(fields) >= 4 for fields in occurrences.values()):
+        return True
+    return False
+
+
 def _candidate_reliable_count_coverage(candidate: BankTableCandidate) -> float | None:
     """Return exact-count agreement only when the candidate evidence is reliable."""
     evidence = candidate.expected_rows
@@ -519,6 +976,174 @@ def _candidate_reliable_count_coverage(candidate: BankTableCandidate) -> float |
         return None
     ratio = candidate.canonical_rows / evidence.count
     return max(0.0, 1.0 - abs(1.0 - ratio))
+
+
+def _is_semantically_comparable_fuller_candidate(
+    candidate: BankTableCandidate,
+    selected: BankTableCandidate,
+) -> bool:
+    """Return whether ``candidate`` safely demonstrates more canonical rows.
+
+    Candidate identifiers describe extraction routes, not evidence authority.  A
+    completeness guard must therefore work for any pair of routes.  The modest
+    tolerances account for normal scoring noise while protecting every semantic
+    dimension that can make a shorter reconstruction genuinely preferable.
+    """
+    if len(candidate.records) <= len(selected.records) or candidate.canonical_rows <= selected.canonical_rows:
+        return False
+
+    candidate_density = candidate.canonical_rows / max(len(candidate.records), 1)
+    selected_density = selected.canonical_rows / max(len(selected.records), 1)
+    broadens_source_scope = _candidate_strictly_broadens_source_scope(candidate, selected)
+    balance_is_comparable = (
+        candidate.balance_chain_score >= selected.balance_chain_score - 0.10
+        or (broadens_source_scope and candidate.balance_chain_score >= 0.45)
+    )
+    sequence_is_comparable = (
+        candidate.sequence_continuity >= selected.sequence_continuity - 0.10 or broadens_source_scope
+    )
+    score_is_comparable = candidate.score >= selected.score - (0.12 if broadens_source_scope else 0.05)
+    return (
+        candidate_density >= selected_density - 0.01
+        and candidate.canonical_coverage >= selected.canonical_coverage - 0.03
+        and candidate.source_page_coverage >= selected.source_page_coverage - 0.05
+        and candidate.field_completeness >= selected.field_completeness - 0.05
+        and balance_is_comparable
+        and sequence_is_comparable
+        and candidate.source_column_width
+        >= selected.source_column_width - max(0.25, selected.source_column_width * 0.02)
+        and score_is_comparable
+    )
+
+
+def _candidate_strictly_broadens_source_scope(
+    candidate: BankTableCandidate,
+    selected: BankTableCandidate,
+) -> bool:
+    candidate_pages = _candidate_source_pages(candidate.records)
+    selected_pages = _candidate_source_pages(selected.records)
+    return bool(selected_pages and selected_pages < candidate_pages)
+
+
+def _candidate_source_pages(transactions: list[dict[str, Any]]) -> set[int]:
+    pages: set[int] = set()
+    for transaction in transactions:
+        source = transaction.get("_source")
+        if not isinstance(source, dict):
+            continue
+        try:
+            source_page = int(source.get("source_page") or 0)
+        except (TypeError, ValueError):
+            source_page = 0
+        if source_page > 0:
+            pages.add(source_page)
+        page_range = source.get("page_range")
+        if not isinstance(page_range, (list, tuple)) or len(page_range) != 2:
+            continue
+        try:
+            first_page, last_page = (int(value) for value in page_range)
+        except (TypeError, ValueError):
+            continue
+        if 0 < first_page <= last_page and last_page - first_page <= 10_000:
+            pages.update(range(first_page, last_page + 1))
+    return pages
+
+
+def _candidate_overlap_signature(
+    transaction: dict[str, Any],
+    normalizer: Callable[[dict[str, Any]], dict[str, Any]],
+    standard_fields: list[str],
+) -> tuple[str, str, str, str] | None:
+    """Return a conservative business spine for cross-plane overlap checks."""
+
+    try:
+        normalized = ensure_canonical_normalized(normalizer(transaction), standard_fields)
+    except Exception:
+        return None
+    date_value = str(normalized.get("date") or "").strip()
+    if not date_value:
+        timestamp = str(normalized.get("timestamp") or "").strip()
+        match = _SOURCE_DATE_RE.search(timestamp)
+        date_value = match.group(0) if match else ""
+    amount = normalized.get("amount")
+    balance = normalized.get("balance")
+    amount_value = "" if amount in (None, "") else _compact_semantic_value(amount)
+    balance_value = "" if balance in (None, "") else _compact_semantic_value(balance)
+    sequence = _compact_semantic_value(normalized.get("sequence_no"))
+    reference = _compact_semantic_value(normalized.get("reference"))
+    if not date_value or not amount_value or not (balance_value or sequence or reference):
+        return None
+    return (date_value, amount_value, balance_value, sequence or reference)
+
+
+def _candidate_source_bbox(transaction: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    source = transaction.get("_source")
+    if not isinstance(source, dict):
+        source = transaction.get("source")
+    if not isinstance(source, dict):
+        return None
+    bbox = source.get("bbox") or source.get("source_bbox")
+    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+        return None
+    try:
+        return tuple(float(value) for value in bbox[:4])
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_rows_can_be_the_same(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    """Return whether two matching business spines can represent one row."""
+
+    left_page = _transaction_source_page(left)
+    right_page = _transaction_source_page(right)
+    if left_page > 0 and right_page > 0 and left_page != right_page:
+        return False
+    if left_page <= 0 or right_page <= 0:
+        return True
+    left_bbox = _candidate_source_bbox(left)
+    right_bbox = _candidate_source_bbox(right)
+    if left_bbox is None or right_bbox is None:
+        return True
+    vertical_overlap = min(left_bbox[3], right_bbox[3]) - max(left_bbox[1], right_bbox[1])
+    return vertical_overlap >= -1.0
+
+
+def _native_batches_prove_disjoint(
+    batches: list[tuple[list[dict[str, Any]], Callable[[dict[str, Any]], dict[str, Any]] | None]],
+    plugin: Any,
+) -> bool:
+    """Require every native recovery component to be source-disjoint.
+
+    Recovery components are normally alternative acquisition planes.  An
+    issuer total can validate their union only after their transaction spines
+    also show that no component contains or overlaps another.
+    """
+
+    indexed: list[dict[tuple[str, str, str, str], list[dict[str, Any]]]] = []
+    for batch, normalize_fn in batches:
+        normalizer = normalize_fn or plugin._normalize
+        by_signature: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+        for transaction in batch:
+            signature = _candidate_overlap_signature(transaction, normalizer, plugin.standard_fields)
+            if signature is not None:
+                by_signature.setdefault(signature, []).append(transaction)
+        if not by_signature:
+            return False
+        indexed.append(by_signature)
+
+    for left_index, left in enumerate(indexed):
+        for right in indexed[left_index + 1 :]:
+            for signature in left.keys() & right.keys():
+                if any(
+                    _source_rows_can_be_the_same(left_row, right_row)
+                    for left_row in left[signature]
+                    for right_row in right[signature]
+                ):
+                    return False
+    return True
 
 
 def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCandidate | None, dict[str, Any]]:
@@ -534,9 +1159,21 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
 
     def selection_key(candidate: BankTableCandidate) -> tuple[float, ...]:
         reliable_coverage = _candidate_reliable_count_coverage(candidate)
+        evidence = candidate.expected_rows
+        evidence_authority = 0.0
+        if evidence is not None and evidence.confidence >= 0.85:
+            # A labelled issuer count describes the whole statement.  An exact
+            # 1..N sequence is also strong evidence, but it can describe only a
+            # truncated table when the source parser starts the sequence over
+            # or stops early.  Never let that candidate-local sequence override
+            # a conflicting issuer footer/header total.
+            if evidence.source in _ISSUER_ROW_COUNT_SOURCES:
+                evidence_authority = 2.0
         return (
             1.0 if reliable_coverage is not None else 0.0,
             reliable_coverage if reliable_coverage is not None else 0.0,
+            evidence_authority,
+            float(evidence.count) if reliable_coverage is not None and evidence is not None else 0.0,
             candidate.canonical_coverage,
             candidate.sequence_continuity,
             candidate.source_page_coverage,
@@ -554,6 +1191,14 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         candidate
         for candidate in viable
         if candidate.source_column_width > selected.source_column_width + 0.25
+        and (
+            _candidate_reliable_count_coverage(selected) is None
+            or (
+                _candidate_reliable_count_coverage(candidate) is not None
+                and _candidate_reliable_count_coverage(candidate)
+                >= (_candidate_reliable_count_coverage(selected) or 0.0)
+            )
+        )
         and candidate.canonical_rows >= selected.canonical_rows
         and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
         and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
@@ -567,21 +1212,21 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
             source_faithful,
             key=lambda candidate: (
                 candidate.source_column_width,
-                candidate.candidate_id == "legacy_primary",
+                candidate.candidate_id.startswith("parser:"),
                 selection_key(candidate),
             ),
         )
     native_grid_candidates = [
         candidate
         for candidate in viable
-        if candidate.candidate_id == "native_wide_table"
+        if candidate.candidate_id.startswith("native_wide_table")
         and candidate.native_cell_coverage >= 0.99
         and len(candidate.records) >= len(selected.records)
         and candidate.canonical_rows >= selected.canonical_rows
         and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
         and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
         and candidate.field_completeness >= selected.field_completeness - 0.01
-        and candidate.balance_chain_score >= selected.balance_chain_score - 0.01
+        and (candidate.balance_chain_score >= selected.balance_chain_score - 0.01)
         and candidate.source_column_width >= selected.source_column_width - 0.25
         and (
             _candidate_reliable_count_coverage(selected) is None
@@ -599,19 +1244,20 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         selected = max(
             native_grid_candidates, key=lambda candidate: (candidate.native_cell_coverage, selection_key(candidate))
         )
-    legacy = next((candidate for candidate in viable if candidate.candidate_id == "legacy_primary"), None)
-    if (
-        legacy is not None
-        and selected is not legacy
-        and _candidate_reliable_count_coverage(selected) is None
-        and len(selected.records) < len(legacy.records)
-        and selected.canonical_rows <= legacy.canonical_rows
-    ):
-        # A low-confidence recovery cannot manufacture a denominator from its
-        # own smaller result and use it to replace an equally canonical source
-        # table.  Keep the fuller established candidate until independent row
-        # count evidence proves the smaller result is complete.
-        selected = legacy
+    if _candidate_reliable_count_coverage(selected) is None:
+        fuller_candidates = [
+            candidate
+            for candidate in viable
+            if candidate is not selected and _is_semantically_comparable_fuller_candidate(candidate, selected)
+        ]
+        if fuller_candidates:
+            # A candidate-local denominator cannot certify that a shorter result
+            # is complete.  Prefer the strongest fuller representation regardless
+            # of extraction route when it preserves the selected row semantics.
+            selected = max(
+                fuller_candidates,
+                key=lambda candidate: (candidate.canonical_rows, len(candidate.records), selection_key(candidate)),
+            )
     reason = (
         f"score={selected.score:.3f}:canonical_coverage={selected.canonical_coverage:.3f}:"
         f"sequence_continuity={selected.sequence_continuity:.3f}:"
@@ -622,6 +1268,8 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         "selected_candidate": selected.candidate_id,
         "candidate_counts": candidate_counts,
         "selection_reason": reason,
+        "rejected_rows": len(selected.rejected_row_indexes),
+        "rejection_reason": selected.rejection_reason,
     }
 
 
@@ -629,17 +1277,37 @@ def _collect_table_candidates(
     detection: StyleDetectionResult,
     ctx: StyleContext,
     plugin: Any,
-    *,
-    legacy_transactions: list[dict[str, Any]],
-    legacy_normalize_fn: Callable[[dict[str, Any]], dict[str, Any]] | None,
 ) -> list[BankTableCandidate]:
-    """Materialize every bank recovery source before selecting one candidate."""
-    source_evidence = resolve_row_count_evidence(
-        ctx.full_text,
-        page_texts=page_texts_from_parse_result(ctx.parse_result),
+    """Materialize the candidates allowed by the context's acquisition policy."""
+    context_tables_only = bool(ctx.prefer_context_tables)
+    scope_page_texts = [] if context_tables_only else page_texts_from_parse_result(ctx.parse_result)
+    source_evidence = (
+        RowCountEvidence(0, "none", 0.0)
+        if context_tables_only
+        else resolve_row_count_evidence(ctx.full_text, page_texts=scope_page_texts)
     )
-    atom_tables = recover_evidence_atom_bank_tables(ctx.parse_result)
-    atom_row_evidence = _evidence_atom_expected_rows(ctx.parse_result, atom_tables)
+    policy = ctx.extraction_policy
+    if not context_tables_only and policy.route is BankExtractionRoute.DIGITAL:
+        count, source, confidence = recovered_native_datetime_row_evidence(
+            ctx.parse_result,
+            source_route=policy.route.value,
+        )
+        if count > 0 and source and confidence >= 0.85 and source in _INDEPENDENT_ROW_COUNT_SOURCES:
+            source_evidence = RowCountEvidence(count=count, source=source, confidence=confidence)
+    atom_tables = (
+        recover_evidence_atom_bank_tables(ctx.parse_result, source_route=policy.route.value)
+        if policy.allow_evidence_atoms and not context_tables_only
+        else []
+    )
+    atom_row_evidence = (
+        _evidence_atom_expected_rows(
+            ctx.parse_result,
+            atom_tables,
+            source_route=policy.route.value,
+        )
+        if atom_tables
+        else None
+    )
     atom_expected = atom_row_evidence.count if atom_row_evidence is not None else 0
     if source_evidence.count <= 0 and atom_row_evidence is not None:
         source_evidence = atom_row_evidence
@@ -655,6 +1323,12 @@ def _collect_table_candidates(
     ) -> None:
         if not batch:
             return
+        candidate_expected = _candidate_row_count_evidence(
+            batch,
+            expected or _candidate_expected_rows(source_evidence),
+            page_count=ctx.page_count,
+            page_texts=scope_page_texts,
+        )
         candidates.append(
             _candidate_from_batch(
                 candidate_id=candidate_id,
@@ -662,34 +1336,32 @@ def _collect_table_candidates(
                 normalize_fn=normalize_fn,
                 plugin=plugin,
                 source=source,
-                expected_rows=expected or _candidate_expected_rows(source_evidence),
+                expected_rows=candidate_expected,
                 extraction_confidence=confidence,
             )
         )
 
-    add(
-        "legacy_primary",
-        legacy_transactions,
-        legacy_normalize_fn,
-        (ctx.reconstruction.source if ctx.reconstruction is not None else "canonical_table"),
-        confidence=0.8,
-    )
-    for parser_id in dict.fromkeys([*detection.parser_chain, *_FALLBACK_PARSER_IDS]):
-        if parser_id == "kv_identity" or parser_id not in _PARSERS:
+    for parser_id in dict.fromkeys([*detection.parser_chain, *_PARSER_CANDIDATE_ORDER]):
+        if parser_id == "kv_identity" or parser_id not in _PARSERS or not policy.allows_parser(parser_id):
             continue
         batch, normalize_fn = _run_parser(parser_id, ctx, plugin)
-        add(f"parser:{parser_id}", batch, normalize_fn, "canonical_table", confidence=0.8)
-
-    if detection.primary_style == "compact_merged_ledger":
         add(
-            "compact_merged",
-            compact_merged.extract_transactions(ctx.tables),
-            compact_merged.normalize_record,
-            "compact_merged",
-            confidence=0.75,
+            f"parser:{parser_id}",
+            batch,
+            normalize_fn,
+            (ctx.reconstruction.source if ctx.reconstruction is not None else "canonical_table"),
+            confidence=0.8,
         )
 
-    for index, semantic_table in enumerate(_semantic_text_table_candidates(ctx.full_text)):
+    if context_tables_only:
+        # ``prefer_context_tables`` is a top-level acquisition boundary, not
+        # merely a hint to grid_standard. BLO uses it for a strictly guarded
+        # continuation fragment; admitting document-wide physical/native/OCR
+        # planes here would contaminate that local batch before final dedupe.
+        return candidates
+
+    semantic_tables = _semantic_text_table_candidates(ctx.full_text) if policy.allow_semantic_text else []
+    for index, semantic_table in enumerate(semantic_tables):
         semantic_ctx = replace(ctx, tables=[semantic_table], prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", semantic_ctx, plugin)
         add(
@@ -706,11 +1378,17 @@ def _collect_table_candidates(
             confidence=0.65,
         )
 
-    physical_tables = collect_physical_tables_from_parse_result(ctx.parse_result)
-    physical_expected = physical_transaction_row_estimate(ctx.parse_result)
+    physical_tables = (
+        collect_physical_tables_from_parse_result(ctx.parse_result) if policy.allow_physical_tables else []
+    )
+    physical_expected = physical_transaction_row_estimate(ctx.parse_result) if physical_tables else 0
     if physical_tables:
         physical_ctx = replace(ctx, tables=physical_tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", physical_ctx, plugin)
+        _attach_recovered_sources(
+            batch,
+            collect_physical_table_row_sources_from_parse_result(ctx.parse_result),
+        )
         add(
             "physical_table",
             batch,
@@ -725,8 +1403,12 @@ def _collect_table_candidates(
             confidence=0.85,
         )
 
-    positioned = recover_positioned_record_block_bank_tables(ctx.parse_result)
-    if positioned.tables:
+    positioned = (
+        recover_positioned_record_block_bank_tables(ctx.parse_result, source_route=policy.route.value)
+        if policy.allow_positioned_records
+        else None
+    )
+    if positioned is not None and positioned.tables:
         positioned_ctx = replace(ctx, tables=positioned.tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", positioned_ctx, plugin)
         _attach_recovered_sources(batch, positioned.row_sources)
@@ -747,7 +1429,13 @@ def _collect_table_candidates(
     if atom_tables:
         atom_ctx = replace(ctx, tables=atom_tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", atom_ctx, plugin)
-        _attach_recovered_sources(batch, recovered_evidence_atom_row_sources(ctx.parse_result))
+        _attach_recovered_sources(
+            batch,
+            recovered_evidence_atom_row_sources(
+                ctx.parse_result,
+                source_route=policy.route.value,
+            ),
+        )
         add(
             "evidence_atom",
             batch,
@@ -762,27 +1450,81 @@ def _collect_table_candidates(
             confidence=0.90,
         )
 
-    wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text)
+    wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text) if policy.allow_native_wide_tables else []
     if wide_tables:
-        wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
-        wide_parser_id = "signed_amount" if detection.primary_style == "signed_amount" else "grid_standard"
-        batch, normalize_fn = _run_parser(wide_parser_id, wide_ctx, plugin)
-        add(
-            "native_wide_table",
-            batch,
-            normalize_fn,
-            "native_wide_table",
-            _candidate_expected_rows(
-                source_evidence,
-                count=len(batch),
-                source="native_wide_rows",
-                confidence=0.70,
-            ),
-            confidence=0.85,
+        wide_parser_id = (
+            "signed_amount"
+            if detection.primary_style == "signed_amount" or signed_amount.table_has_signed_amount_cells(wide_tables)
+            else "grid_standard"
         )
+        # Native and borderless recovery streams are whole-table alternatives,
+        # not rows to union implicitly.  Materialize each separately so source
+        # evidence and semantic quality can choose the faithful representation.
+        # Keep a combined candidate only for documents whose tables are truly
+        # disjoint statement sections; an independent total can then validate
+        # that larger interpretation.
+        native_batches: list[tuple[list[dict[str, Any]], Callable[[dict[str, Any]], dict[str, Any]] | None]] = []
+        for index, table in enumerate(wide_tables):
+            candidate_id = f"native_wide_table:{index}"
+            candidate_tables = [table]
+            wide_ctx = replace(ctx, tables=candidate_tables, prefer_context_tables=True)
+            batch, normalize_fn = _run_parser(wide_parser_id, wide_ctx, plugin)
+            native_batches.append((batch, normalize_fn))
+            add(
+                candidate_id,
+                batch,
+                normalize_fn,
+                "native_wide_table",
+                _candidate_expected_rows(
+                    source_evidence,
+                    count=len(batch),
+                    source="native_wide_rows",
+                    confidence=0.70,
+                ),
+                confidence=0.85,
+            )
+        issuer_proves_union = (
+            source_evidence.count > 0
+            and source_evidence.confidence >= 0.85
+            and source_evidence.source in _ISSUER_ROW_COUNT_SOURCES
+        )
+        if len(wide_tables) > 1 and issuer_proves_union and _native_batches_prove_disjoint(native_batches, plugin):
+            wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
+            batch, normalize_fn = _run_parser(wide_parser_id, wide_ctx, plugin)
+            if len(batch) == source_evidence.count:
+                add(
+                    "native_wide_table:combined",
+                    batch,
+                    normalize_fn,
+                    "native_wide_table",
+                    _candidate_expected_rows(
+                        source_evidence,
+                        count=len(batch),
+                        source="native_wide_rows",
+                        confidence=0.70,
+                    ),
+                    confidence=0.85,
+                )
 
-    ocr_tables = recover_ocr_implicit_ledger_tables(ctx.parse_result, ctx.full_text)
+    ocr_tables = (
+        recover_ocr_implicit_ledger_tables(ctx.parse_result, ctx.full_text) if policy.allow_ocr_implicit_tables else []
+    )
     if ocr_tables:
+        ocr_count, ocr_source, ocr_confidence = recovered_ocr_implicit_row_evidence(ctx.parse_result)
+        if ocr_source in _ROW_PLANE_COUNT_SOURCES:
+            ocr_confidence = min(ocr_confidence, 0.80)
+        ocr_expected = (
+            RowCountEvidence(ocr_count, ocr_source, ocr_confidence)
+            if (
+                ocr_count > 0 and ocr_source and ocr_confidence >= 0.85 and ocr_source in _INDEPENDENT_ROW_COUNT_SOURCES
+            )
+            else _candidate_expected_rows(
+                source_evidence,
+                count=sum(max(len(table) - 1, 0) for table in ocr_tables),
+                source="ocr_recovered_rows",
+                confidence=0.70,
+            )
+        )
         ocr_ctx = replace(ctx, tables=ocr_tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", ocr_ctx, plugin)
         add(
@@ -790,12 +1532,7 @@ def _collect_table_candidates(
             batch,
             normalize_fn,
             "ocr_implicit_table",
-            _candidate_expected_rows(
-                source_evidence,
-                count=sum(max(len(table) - 1, 0) for table in ocr_tables),
-                source="ocr_recovered_rows",
-                confidence=0.70,
-            ),
+            ocr_expected,
             confidence=0.70,
         )
     return candidates
@@ -822,325 +1559,74 @@ class BankStyleParserRegistry:
         plugin: Any,
     ) -> tuple[list[dict[str, Any]], dict[str, dict]]:
         identity_fields = plugin._extract_identity(ctx.parse_result)
-        transactions: list[dict[str, Any]] = []
-        normalize_fn = None
-        expected = _expected_rows(ctx)
-
-        for parser_id in detection.parser_chain:
-            module = _PARSERS.get(parser_id)
-            if module is None:
-                logger.warning("[BankStyleRegistry] unknown parser: %s", parser_id)
-                continue
-
-            if parser_id == "kv_identity":
-                identity_fields = kv_identity.enrich_identity_fields(
-                    ctx,
-                    identity_fields,
-                    plugin.identity_fields,
-                )
-                continue
-
-            batch, norm = _run_parser(parser_id, ctx, plugin)
-            if batch:
-                transactions = batch
-                normalize_fn = norm
-                continue
-
-        if not transactions and detection.primary_style == "compact_merged_ledger":
-            transactions = compact_merged.extract_transactions(ctx.tables)
-            normalize_fn = compact_merged.normalize_record
-
-        if not transactions:
-            stacked_tables = _semantic_text_table_candidates(ctx.full_text)
-            if stacked_tables:
-                stacked_ctx = replace(ctx, tables=stacked_tables, prefer_context_tables=True)
-                transactions = grid_standard.extract_transactions(stacked_ctx, plugin)
-                if transactions:
-
-                    def _stacked_normalize(raw):
-                        return grid_standard.normalize_record(raw, plugin)
-
-                    normalize_fn = _stacked_normalize
-                    if ctx.reconstruction is not None:
-                        ctx.reconstruction = replace(
-                            ctx.reconstruction,
-                            source="stacked_text",
-                            expected_primary_rows=expected,
-                            pipe_parse_failed=False,
-                        )
-                    logger.info(
-                        "[BankStyleRegistry] stacked text fallback rows=%d",
-                        len(transactions),
-                    )
-
-        primary_parser = (detection.parser_chain or ["grid_standard"])[-1]
-        primary_score, coverage = _parser_score(transactions, normalize_fn, plugin, expected)
-        physical_tables = collect_physical_tables_from_parse_result(ctx.parse_result)
-        physical_expected = physical_transaction_row_estimate(ctx.parse_result)
-        if physical_tables and physical_expected > 0:
-            physical_ctx = replace(ctx, tables=physical_tables, prefer_context_tables=True)
-            physical_batch, physical_norm = _run_parser("grid_standard", physical_ctx, plugin)
-            candidate_expected = max(expected, physical_expected)
-            physical_score, physical_coverage = _parser_score(
-                physical_batch,
-                physical_norm,
-                plugin,
-                candidate_expected,
+        if "kv_identity" in detection.parser_chain:
+            identity_fields = kv_identity.enrich_identity_fields(
+                ctx,
+                identity_fields,
+                plugin.identity_fields,
             )
-            if physical_score > primary_score or (
-                physical_coverage >= coverage and len(physical_batch) > len(transactions)
-            ):
-                transactions = physical_batch
-                normalize_fn = physical_norm
-                primary_score = physical_score
-                coverage = physical_coverage
-                expected = candidate_expected
-                if ctx.reconstruction is not None:
-                    ctx.reconstruction = replace(
-                        ctx.reconstruction,
-                        source="canonical_physical_tables",
-                        expected_primary_rows=candidate_expected,
-                        pipe_parse_failed=False,
-                    )
-                logger.info(
-                    "[BankStyleRegistry] canonical physical table recovery rows=%d score=%.2f",
-                    len(physical_batch),
-                    physical_score,
-                )
-        if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
-            for semantic_table in _semantic_text_table_candidates(ctx.full_text):
-                semantic_tables = [semantic_table]
-                semantic_expected = max(expected, sum(max(len(table) - 1, 0) for table in semantic_tables))
-                semantic_ctx = replace(ctx, tables=semantic_tables, prefer_context_tables=True)
-                semantic_batch, semantic_norm = _run_parser("grid_standard", semantic_ctx, plugin)
-                semantic_score, semantic_coverage = _parser_score(
-                    semantic_batch,
-                    semantic_norm,
-                    plugin,
-                    semantic_expected,
-                )
-                if semantic_score > primary_score or (
-                    semantic_coverage >= coverage and len(semantic_batch) > len(transactions)
-                ):
-                    transactions = semantic_batch
-                    normalize_fn = semantic_norm
-                    primary_score = semantic_score
-                    coverage = semantic_coverage
-                    expected = semantic_expected
-                    if ctx.reconstruction is not None:
-                        ctx.reconstruction = replace(
-                            ctx.reconstruction,
-                            source="semantic_text_table",
-                            expected_primary_rows=semantic_expected,
-                            pipe_parse_failed=False,
-                        )
-                    logger.info(
-                        "[BankStyleRegistry] semantic text table recovery rows=%d score=%.2f",
-                        len(semantic_batch),
-                        semantic_score,
-                    )
-        positioned = recover_positioned_record_block_bank_tables(ctx.parse_result)
-        if positioned.tables:
-            positioned_ctx = replace(ctx, tables=positioned.tables, prefer_context_tables=True)
-            positioned_batch, positioned_norm = _run_parser("grid_standard", positioned_ctx, plugin)
-            _attach_recovered_sources(positioned_batch, positioned.row_sources)
-            positioned_expected = max(expected, positioned.expected_rows)
-            positioned_score, positioned_coverage = _parser_score(
-                positioned_batch,
-                positioned_norm,
-                plugin,
-                positioned_expected,
-            )
-            if positioned_score > primary_score or (
-                positioned_coverage >= coverage and len(positioned_batch) > len(transactions)
-            ):
-                transactions = positioned_batch
-                normalize_fn = positioned_norm
-                primary_score = positioned_score
-                coverage = positioned_coverage
-                expected = positioned_expected
-                if ctx.reconstruction is not None:
-                    ctx.reconstruction = replace(
-                        ctx.reconstruction,
-                        source="positioned_record_block",
-                        expected_primary_rows=positioned_expected,
-                        pipe_parse_failed=False,
-                    )
-                logger.info(
-                    "[BankStyleRegistry] positioned record-block recovery rows=%d score=%.2f",
-                    len(positioned_batch),
-                    positioned_score,
-                )
-        atom_tables = [] if positioned.tables else recover_evidence_atom_bank_tables(ctx.parse_result)
-        if atom_tables:
-            atom_count = sum(max(len(table) - 1, 0) for table in atom_tables)
-            atom_expected = max(
-                atom_count,
-                recovered_evidence_atom_expected_row_count(ctx.parse_result),
-            )
-            atom_ctx = replace(ctx, tables=atom_tables, prefer_context_tables=True)
-            atom_batch, atom_norm = _run_parser("grid_standard", atom_ctx, plugin)
-            _attach_recovered_sources(
-                atom_batch,
-                recovered_evidence_atom_row_sources(ctx.parse_result),
-            )
-            atom_score, atom_coverage = _parser_score(atom_batch, atom_norm, plugin, atom_expected)
-            primary_comparable_score, primary_comparable_coverage = _parser_score(
-                transactions,
-                normalize_fn,
-                plugin,
-                atom_expected,
-            )
-            richer_equal_coverage = (
-                len(atom_batch) >= len(transactions)
-                and atom_coverage >= primary_comparable_coverage
-                and _batch_raw_width(atom_batch) > _batch_raw_width(transactions) + 1.0
-            )
-            if atom_score > primary_comparable_score or richer_equal_coverage:
-                transactions = atom_batch
-                normalize_fn = atom_norm
-                primary_score = atom_score
-                coverage = atom_coverage
-                expected = atom_expected
-                if ctx.reconstruction is not None:
-                    ctx.reconstruction = replace(
-                        ctx.reconstruction,
-                        source="canonical_evidence_table",
-                        expected_primary_rows=atom_expected,
-                        pipe_parse_failed=False,
-                    )
-                logger.info(
-                    "[BankStyleRegistry] canonical evidence table recovery rows=%d score=%.2f",
-                    len(atom_batch),
-                    atom_score,
-                )
-        if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
-            wide_tables = recover_wide_bank_tables(ctx.parse_result, ctx.full_text)
-            if wide_tables:
-                wide_ctx = replace(ctx, tables=wide_tables, prefer_context_tables=True)
-                wide_parser_id = "signed_amount" if detection.primary_style == "signed_amount" else "grid_standard"
-                wide_batch, wide_norm = _run_parser(wide_parser_id, wide_ctx, plugin)
-                wide_score, wide_coverage = _parser_score(wide_batch, wide_norm, plugin, expected)
-                if wide_score > primary_score:
-                    transactions = wide_batch
-                    normalize_fn = wide_norm
-                    primary_score = wide_score
-                    coverage = wide_coverage
-                    if ctx.reconstruction is not None:
-                        ctx.reconstruction = replace(
-                            ctx.reconstruction,
-                            source="native_wide_table",
-                            expected_primary_rows=expected,
-                            pipe_parse_failed=False,
-                        )
-                    logger.info(
-                        "[BankStyleRegistry] native wide table recovery rows=%d score=%.2f",
-                        len(wide_batch),
-                        wide_score,
-                    )
-        primary_score, coverage = _parser_score(transactions, normalize_fn, plugin, expected)
-        if primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD):
-            ocr_tables = recover_ocr_implicit_ledger_tables(ctx.parse_result, ctx.full_text)
-            if ocr_tables:
-                recovered_count = sum(max(len(table) - 1, 0) for table in ocr_tables)
-                ocr_expected = max(expected, recovered_count)
-                ocr_ctx = replace(ctx, tables=ocr_tables, prefer_context_tables=True)
-                ocr_batch, ocr_norm = _run_parser("grid_standard", ocr_ctx, plugin)
-                ocr_score, ocr_coverage = _parser_score(ocr_batch, ocr_norm, plugin, ocr_expected)
-                if ocr_score > primary_score:
-                    transactions = ocr_batch
-                    normalize_fn = ocr_norm
-                    primary_score = ocr_score
-                    coverage = ocr_coverage
-                    expected = ocr_expected
-                    if ctx.reconstruction is not None:
-                        ctx.reconstruction = replace(
-                            ctx.reconstruction,
-                            source="ocr_implicit_table",
-                            expected_primary_rows=expected,
-                            pipe_parse_failed=False,
-                        )
-                    logger.info(
-                        "[BankStyleRegistry] OCR implicit table recovery rows=%d score=%.2f",
-                        len(ocr_batch),
-                        ocr_score,
-                    )
-        needs_fallback = primary_score < _CAPS_THRESHOLD or (expected > 0 and coverage < _COVERAGE_THRESHOLD)
-        if needs_fallback:
-            best_batch = transactions
-            best_norm = normalize_fn
-            best_score = primary_score
-            for fallback_id in _FALLBACK_PARSER_IDS:
-                if fallback_id == primary_parser:
-                    continue
-                batch, norm = _run_parser(fallback_id, ctx, plugin)
-                score, _ = _parser_score(batch, norm, plugin, expected)
-                if score > best_score:
-                    logger.info(
-                        "[BankStyleRegistry] CAPS fallback parser=%s score=%.2f (was %.2f, %d rows)",
-                        fallback_id,
-                        score,
-                        best_score,
-                        len(best_batch),
-                    )
-                    best_batch = batch
-                    best_norm = norm
-                    best_score = score
-            transactions = best_batch
-            normalize_fn = best_norm
 
-        candidates = _collect_table_candidates(
-            detection,
-            ctx,
-            plugin,
-            legacy_transactions=transactions,
-            legacy_normalize_fn=normalize_fn,
-        )
+        candidates = _collect_table_candidates(detection, ctx, plugin)
         selected, diagnostics = _select_candidate(candidates)
         self.last_selection_diagnostics = diagnostics
+        transactions: list[dict[str, Any]] = []
+        normalize_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
         if selected is not None:
+            rejected = set(selected.rejected_row_indexes)
             transactions = selected.records
             normalize_fn = selected.normalize_fn
             selected_expected = selected.expected_rows
             if ctx.reconstruction is not None:
+                retained_evidence_source = ctx.reconstruction.expected_evidence_source
+                retained_evidence_confidence = ctx.reconstruction.expected_evidence_confidence
+                retained_expected_rows = ctx.reconstruction.expected_primary_rows
+                if retained_evidence_source in _ROW_PLANE_COUNT_SOURCES:
+                    retained_evidence_confidence = min(retained_evidence_confidence, 0.80)
+                    retained_expected_rows = 0
+                if (
+                    selected_expected is not None
+                    and selected_expected.source in _ROW_PLANE_COUNT_SOURCES
+                    and not retained_evidence_source
+                    and retained_expected_rows == selected_expected.count
+                ):
+                    retained_evidence_source = selected_expected.source
+                    retained_evidence_confidence = min(selected_expected.confidence, 0.80)
+                    retained_expected_rows = 0
                 ctx.reconstruction = replace(
                     ctx.reconstruction,
                     source=selected.source,
                     expected_primary_rows=(
                         selected_expected.count
                         if selected_expected is not None and selected_expected.confidence >= 0.85
-                        else ctx.reconstruction.expected_primary_rows
+                        else retained_expected_rows
                     ),
                     expected_evidence_source=(
                         selected_expected.source
                         if selected_expected is not None and selected_expected.confidence >= 0.85
-                        else ctx.reconstruction.expected_evidence_source
+                        else retained_evidence_source
                     ),
                     expected_evidence_confidence=(
                         selected_expected.confidence
                         if selected_expected is not None and selected_expected.confidence >= 0.85
-                        else ctx.reconstruction.expected_evidence_confidence
+                        else retained_evidence_confidence
                     ),
                     pipe_parse_failed=False,
                 )
             logger.info(
-                "[BankStyleRegistry] selected candidate=%s rows=%d reason=%s",
+                "[BankStyleRegistry] selected candidate=%s rows=%d rejected=%d reason=%s",
                 selected.candidate_id,
-                len(selected.records),
+                len(transactions),
+                len(rejected),
                 diagnostics["selection_reason"],
             )
 
-        if not transactions:
-            batch, norm = _run_parser("grid_standard", ctx, plugin)
-            transactions = batch
-            if norm is None:
-
-                def _grid_normalize(raw):
-                    return grid_standard.normalize_record(raw, plugin)
-
-                normalize_fn = _grid_normalize
-            else:
-                normalize_fn = norm
+        if not transactions and not candidates:
+            # Candidate collection already executes every route-eligible whole
+            # extraction strategy.  If candidates exist but semantic validation
+            # rejects all of them, rerunning a parser here would bypass those
+            # gates and emit the exact rows we just proved unreliable.
+            fallback_id = "borderless_ocr" if ctx.extraction_route is BankExtractionRoute.SCANNED else "grid_standard"
+            transactions, normalize_fn = _run_parser(fallback_id, ctx, plugin)
 
         if normalize_fn is None:
 
@@ -1151,6 +1637,11 @@ class BankStyleParserRegistry:
 
         def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
             normalized = normalize_fn(raw)
+            # ``amount_cny`` is not a second source business fact.  It is only
+            # valid when an actual FX conversion was evidenced, which none of
+            # the bank style normalizers performs.  Keep the source currency
+            # and amount, and do not manufacture a duplicate CNY column.
+            normalized.pop("amount_cny", None)
             return ensure_canonical_normalized(normalized, plugin.standard_fields)
 
         records = records_from_raw_transactions(
@@ -1169,7 +1660,7 @@ class BankStyleParserRegistry:
             detection.primary_style,
             detection.parser_chain,
             len(records),
-            expected,
+            _expected_rows(ctx),
         )
         return records, identity_fields
 

@@ -50,7 +50,7 @@ _OWNED_MONTH_GEOMETRIES = frozenset(
 )
 _TOP_LEFT_PDF_COORDINATES = "pdf_points_top_left"
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
-_DECIMAL_RE = re.compile(r"[+-]?\d+(?:,\d{3})*(?:\.\d+)?")
+_DECIMAL_RE = re.compile(r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?")
 
 
 def _owned_geometry_provenance(value: Any) -> str | None:

@@ -14,7 +14,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
     _apply_account_facts,
     _extract_employment_records,
     _extract_table_accounts,
+    _special_transaction_type,
 )
+from tests.unit.personal_detail_employment_test_support import employment_page
 
 
 def _table(table_id: str, *rows: list[str]) -> SimpleNamespace:
@@ -178,12 +180,17 @@ def test_collapsed_employment_rows_bind_only_unique_business_fields() -> None:
         ["编号工作单位单位性质单位地址单位电话"],
         ["1 福建海峡粮油购销有限公司 国有企业 鼓楼区鼓屏路60号13层 059100000000"],
         ["2 北方星河科技有限公司 国有企业 私营企业 海州市新城路8号 01012345678"],
+        ["3 甲私营企业有限公司 福建省福州市星河路8号 01087654321"],
     )
-    result = _result(table)
+    result = SimpleNamespace(
+        pages=[employment_page(table, logical_page=2, source_page=1)],
+        tables_continue=lambda _left, _right: False,
+        _personal_detail_extraction_issues=[],
+    )
 
     records = _extract_employment_records(result)
 
-    assert [record["sequence"] for record in records] == [1, 2]
+    assert [record["sequence"] for record in records] == [1, 2, 3]
     assert {
         field: records[0][field]
         for field in ("employer", "employer_type", "employer_address", "employer_phone")
@@ -207,6 +214,20 @@ def test_collapsed_employment_rows_bind_only_unique_business_fields() -> None:
         and issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
     }
     assert {"employer", "employer_type", "employer_address"} <= unresolved
+
+    nested = records[2]
+    assert nested["employer_phone"] == "01087654321"
+    assert all(
+        field not in nested
+        for field in ("employer", "employer_type", "employer_address")
+    )
+    nested_unresolved = {
+        issue.get("field_name")
+        for issue in result._personal_detail_extraction_issues
+        if issue.get("target_record_id") == nested["employment_record_id"]
+        and issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+    }
+    assert {"employer", "employer_type", "employer_address"} <= nested_unresolved
 
 
 def test_collapsed_account_terms_bind_typed_fields_without_column_order_guessing() -> None:
@@ -841,6 +862,97 @@ def test_ambiguous_special_transaction_reports_each_unresolved_slot() -> None:
         and issue.get("issue_code") == "candidate_b_account_event_slot_unresolved"
     }
     assert {"transaction_type", "changed_months", "amount", "details"} <= unresolved
+
+
+def test_exact_invalid_special_transaction_type_is_withheld_and_cell_reported() -> None:
+    table = _table(
+        "special-transaction-invalid-exact-cell",
+        ["特殊交易类型", "发生日期", "变更月数", "发生金额", "明细记录"],
+        ["提前结消", "2023.03.13", "0", "45,247", "提前还款"],
+    )
+    table.metadata.update(
+        {
+            "source_cell_bboxes": [
+                [[10 + 20 * column, 10, 28 + 20 * column, 20] for column in range(5)],
+                [[10 + 20 * column, 20, 28 + 20 * column, 30] for column in range(5)],
+            ],
+            "cell_evidence_ids": [
+                [[f"header-{column}"] for column in range(5)],
+                [[f"value-{column}"] for column in range(5)],
+            ],
+        }
+    )
+    page = _page(table)
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {"account_id": "credit_account:revolving_loan_subaccount:16"}
+
+    events = _account_events(result, account, page, table, table.metadata["raw_rows"])
+
+    assert len(events) == 1
+    event = events[0]
+    assert "transaction_type" not in event
+    assert event["canonical_raw"]["transaction_type"] == ["提前结消"]
+    issue = next(
+        row
+        for row in result._personal_detail_extraction_issues
+        if row.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+        and row.get("target_record_id") == event["account_event_id"]
+        and row.get("field_name") == "transaction_type"
+    )
+    assert issue["observed_value"] == ["提前结消"]
+    assert issue["source_refs"] == [
+        {
+            "source": "native_detail_table_cell",
+            "logical_page": 2,
+            "source_page": 1,
+            "table_id": "special-transaction-invalid-exact-cell",
+            "row": 1,
+            "column": 0,
+            "evidence_ids": ["value-0"],
+            "binding_quality": "canonical_header_column",
+            "binding": "canonical_field_slot",
+            "canonical_row": 1,
+            "canonical_column": 0,
+            "geometry_scope": "cell",
+            "bbox": [10, 20, 28, 30],
+            "field_name": "transaction_type",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "提前结清",
+        "提前还款",
+        "提前还款(全部)",
+        "提前还款（部分）",
+        "展期",
+        "展期（延期）",
+        "延期",
+        "担保人代还",
+        "以资抵债",
+        "其他",
+        "提前还款(全部),变更月数-55个月",
+    ],
+)
+def test_special_transaction_type_accepts_only_registered_business_forms(raw: str) -> None:
+    assert _special_transaction_type(raw) == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "提前结消",
+        "提前结算",
+        "提前结清备注",
+        "担保人代",
+        "随机交易",
+        "提前还款(全部),变更金额-55元",
+    ],
+)
+def test_special_transaction_type_rejects_unregistered_near_misses(raw: str) -> None:
+    assert _special_transaction_type(raw) is None
 
 
 @pytest.mark.parametrize(

@@ -59,6 +59,7 @@ def test_style_matrix_synthetic_signed_amount():
 def test_style_matrix_synthetic_borderless_ocr():
     from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
     from docmirror.plugins.bank_statement.context import StyleContext
+    from docmirror.plugins.bank_statement.extraction_dispatch import SCANNED_POLICY
     from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
     from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
     from tests.unit.test_bank_styles_borderless_ocr import OCR_BORDERLESS_TABLE
@@ -68,6 +69,8 @@ def test_style_matrix_synthetic_borderless_ocr():
         full_text="个人客户交易明细 中国工商银行",
         institution=None,
         page_count=1,
+        extraction_route=SCANNED_POLICY.route,
+        extraction_policy=SCANNED_POLICY,
     )
     detection = BankStyleDetector().detect(ctx)
     assert detection.primary_style == "borderless_ocr"

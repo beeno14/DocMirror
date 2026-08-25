@@ -209,6 +209,44 @@ def test_write_outputs_persists_enhanced_reading_without_private_reading_project
     assert result.model_dump(mode="python") == before
 
 
+def test_unrecognized_personal_brief_header_uses_generic_semantic_fallback() -> None:
+    result = _result()
+
+    projection = CreditReportPlugin().derive(result, result.full_text)
+
+    assert projection.domain_facts["report_subtype"] == "personal_brief"
+    assert (
+        projection.semantic["personal_brief_projection_mode"]
+        == "generic_unrecognized_header_fallback"
+    )
+    assert [row["normalized"]["sequence"] for row in projection.datasets["inquiry_records"]] == [
+        2,
+        3,
+        103,
+        1,
+    ]
+    assert projection.reason == (
+        "generic credit-report projection after canonical personal-brief header rejection"
+    )
+
+
+def test_recognized_personal_brief_header_keeps_canonical_projection() -> None:
+    result = _result()
+    header = (
+        "个人信用报告 报告编号：2026071900012345678901 "
+        "报告时间：2026-07-19 09:08:07 姓名：张三 "
+        "证件类型：身份证 证件号码：11010519491231002X"
+    )
+    result.document_flow.nodes[0].text = header
+    result.pages[0].texts[0].content = header
+
+    projection = CreditReportPlugin().derive(result, result.full_text)
+
+    assert projection.reason == "canonical personal brief IR schema projection"
+    assert "personal_brief_projection_mode" not in projection.semantic
+    assert projection.datasets["personal_report_metadata"]
+
+
 def test_reconstruction_fails_closed_without_geometry_and_preserves_fallback_row() -> None:
     result = _result()
     result.document_flow.nodes[3].bbox = None

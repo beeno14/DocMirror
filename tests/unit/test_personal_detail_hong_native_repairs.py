@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from docmirror.models.mirror.vnext import EvidenceAtom, EvidenceStore
 from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
 
 
@@ -35,6 +36,10 @@ def _page(
     template: str,
     texts: list[SimpleNamespace] | None = None,
 ) -> SimpleNamespace:
+    for table in tables:
+        metadata = getattr(table, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata.setdefault("canonical_template_id", template)
     return SimpleNamespace(
         page_number=logical_page,
         source_page_number=(logical_page + 1) // 2,
@@ -62,6 +67,7 @@ def _geometry(
     *,
     top: float,
     spanning_column: int | None = None,
+    evidence_prefix: str = "cell",
 ) -> dict:
     width = max((len(row) for row in rows), default=0)
     row_bands = [
@@ -100,7 +106,7 @@ def _geometry(
             )
             statuses.append("exact")
             evidence.append(
-                [f"cell:{row_index}:{column}"]
+                [f"{evidence_prefix}:{row_index}:{column}"]
                 if column < len(row) and str(row[column] or "")
                 else []
             )
@@ -124,6 +130,7 @@ def _geometry(
         "cell_bboxes": cell_bboxes,
         "cell_geometry_status": cell_status,
         "cell_evidence_ids": cell_evidence,
+        "cell_token_ids": deepcopy(cell_evidence),
         "cell_spans": spans,
     }
 
@@ -376,7 +383,7 @@ def _hong_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
             _page(
                 8,
                 [page_8_table],
-                template="credit_agreement",
+                template="annotations_and_inquiries",
                 texts=page_8_texts,
             ),
             _page(
@@ -461,7 +468,8 @@ def test_hong_mixed_inquiry_regions_emit_17_institution_and_3_personal(
     assert [row["reason"] for row in personal] == expected_raw_reasons
     assert [row["source_reason"] for row in personal] == expected_raw_reasons
     assert coverage["sequence_endpoints"] == {"institution": 17, "personal": 3}
-    assert coverage["expected_row_count"] == 20
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
 
 
 @pytest.mark.parametrize(
@@ -487,11 +495,13 @@ def test_hong_mixed_inquiry_repairs_fail_closed(
     institutional = [row for row in rows if row["inquiry_type"] == "institution"]
     personal = [row for row in rows if row["inquiry_type"] == "personal"]
 
-    if defect in {
-        "transposed_personal_header",
-        "unknown_wrapped_personal_channel",
-        "competing_personal_reason",
-    }:
+    if defect in {"unknown_wrapped_personal_channel", "competing_personal_reason"}:
+        assert [row["sequence"] for row in institutional] == list(range(1, 18))
+        assert personal == []
+    elif defect == "transposed_personal_header":
+        # The malformed local personal topology stays withheld, while the
+        # independently complete mixed-page institutional topology can prove
+        # its own ordinary PBOC role map without global-profile authority.
         assert [row["sequence"] for row in institutional] == list(range(1, 18))
         assert personal == []
     elif defect == "non_authoritative_order":
@@ -518,6 +528,1099 @@ def test_hong_terminal_inquiry_ordinal_requires_complete_line_population(
     }
     assert 16 in institutional_sequences
     assert 17 not in institutional_sequences
+
+
+def _collapsed_token_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
+    rows = [
+        ["编号", "查询日期", "查询机构", "查询原因"],
+        ["143", "2023.08.11", "招商银行股份有限公司", "贷后管理"],
+        [
+            "144 145",
+            "2023.08.11 2023.08.05",
+            "上海浦东发展银行股份有限公司 中国工商银行股份有限公司",
+            "贷款审批 贷后管理",
+        ],
+    ]
+    geometry = _geometry(rows, top=40.0)
+    token_specs = {
+        (2, 0): [("144", [50.0, 61.0, 70.0, 65.0]), ("145", [50.0, 66.0, 70.0, 70.0])],
+        (2, 1): [("2023.08.11", [140.0, 61.0, 205.0, 65.0]), ("2023.08.05", [140.0, 66.0, 205.0, 70.0])],
+        (2, 2): [
+            ("上海浦东发展银行股份有限公司", [230.0, 61.0, 300.0, 65.0]),
+            ("中国工商银行股份有限公司", [230.0, 66.0, 300.0, 70.0]),
+        ],
+        (2, 3): [("贷款审批", [320.0, 61.0, 360.0, 65.0]), ("贷后管理", [320.0, 66.0, 360.0, 70.0])],
+    }
+    atoms: list[EvidenceAtom] = []
+    geometry["cell_token_ids"] = deepcopy(geometry["cell_evidence_ids"])
+    for (row, column), specs in token_specs.items():
+        ids = [f"merged:{row}:{column}:{index}" for index in range(len(specs))]
+        geometry["cell_evidence_ids"][row][column] = ids
+        geometry["cell_token_ids"][row][column] = list(ids)
+        for token_id, (text, bbox) in zip(ids, specs, strict=True):
+            atoms.append(EvidenceAtom(id=token_id, text=text, bbox=bbox))
+    if defect == "foreign_evidence":
+        geometry["cell_token_ids"][2][3].append("foreign")
+    elif defect == "overlapping_token_rows":
+        atoms[-2].bbox = [320.0, 61.0, 360.0, 67.0]
+        atoms[-1].bbox = [320.0, 64.0, 360.0, 70.0]
+    elif defect == "nonconsecutive_ordinals":
+        atoms[1].text = "146"
+    elif defect == "ambiguous_reason":
+        atoms[-1].text = "未知用途"
+    elif defect == "duplicate_evidence_owner":
+        duplicate_id = geometry["cell_token_ids"][2][0][0]
+        replaced_id = geometry["cell_token_ids"][2][1][0]
+        geometry["cell_token_ids"][2][1][0] = duplicate_id
+        geometry["cell_evidence_ids"][2][1][0] = duplicate_id
+        atoms = [atom for atom in atoms if atom.id != replaced_id]
+    elif defect == "personal_reason_with_bank":
+        atoms[-2].text = "本人查询(自助查询机)"
+    elif defect == "mixed_inquiry_types":
+        atoms[-3].text = "本人"
+        atoms[-1].text = "本人查询(自助查询机)"
+
+    table = _table("pt_54_0", rows, top=40.0, geometry=geometry)
+    context = SimpleNamespace(
+        pages=[
+            _page(
+                54,
+                [table],
+                template="annotations_and_inquiries",
+            )
+        ],
+        evidence_plane=SimpleNamespace(evidence=EvidenceStore(text_atoms=atoms)),
+        reading_order_by_logical={54: 1},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [],
+        _personal_detail_extraction_issues=[],
+    )
+    return context
+
+
+def test_exact_token_rows_split_one_collapsed_inquiry_band() -> None:
+    rows = native_extraction._extract_inquiries(_collapsed_token_inquiry_context())
+
+    assert [(row["sequence"], row["institution"], row["reason"]) for row in rows] == [
+        (143, "招商银行股份有限公司", "贷后管理"),
+        (144, "上海浦东发展银行股份有限公司", "贷款审批"),
+        (145, "中国工商银行股份有限公司", "贷后管理"),
+    ]
+    for row in rows[1:]:
+        assert row["source"] == "native_detail_inquiry_token_rows"
+        assert row["source_refs"][0]["geometry_scope"] == "token_row"
+        assert len(row["source_refs"][0]["evidence_ids"]) == 4
+
+
+def test_inquiry_tables_are_consumed_top_to_bottom_before_schema_carry() -> None:
+    upper = _table("pt_54_0", [["144"]], top=40.0)
+    lower = _table("pt_54_1", [["缂栧彿"]], top=380.0)
+    unboxed_first = _table("unboxed-first", [["noise"]], top=0.0)
+    unboxed_first.bbox = None
+    unboxed_second = _table("unboxed-second", [["noise"]], top=0.0)
+    unboxed_second.bbox = None
+    page = _page(
+        54,
+        [lower, unboxed_first, upper, unboxed_second],
+        template="annotations_and_inquiries",
+    )
+
+    assert [
+        table.table_id
+        for table in native_extraction._inquiry_page_tables_in_physical_order(page)
+    ] == ["pt_54_0", "pt_54_1", "unboxed-first", "unboxed-second"]
+
+
+def _headerless_institution_tail_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    include_later_header: bool = True,
+    defect: str | None = None,
+    tail_count: int = 8,
+) -> SimpleNamespace:
+    tail_rows = [
+        [
+            str(sequence),
+            f"2024.01.{sequence - 121:02d}",
+            f"样例银行股份有限公司{sequence}",
+            "贷后管理",
+        ]
+        for sequence in range(122, 122 + tail_count)
+    ]
+    upper = _table(
+        "pt_54_0",
+        tail_rows,
+        top=40.0,
+        geometry=_geometry(tail_rows, top=40.0),
+    )
+    lower_rows = [
+        ["编号", "查询日期", "查询机构", "查询原因"],
+        ["1", "2025.05.07", "本人", "本人查询(自助查询机)"],
+    ]
+    lower = _table(
+        "pt_54_1",
+        lower_rows if include_later_header else [["noise"]],
+        top=380.0,
+        geometry=_geometry(
+            lower_rows if include_later_header else [["noise"]],
+            top=380.0,
+            evidence_prefix="lower",
+        ),
+    )
+    if defect == "nonconsecutive_ordinals":
+        upper.metadata["raw_rows"][4][0] = "127"
+    elif defect == "personal_marker":
+        upper.metadata["raw_rows"][4][2] = "本人"
+        upper.metadata["raw_rows"][4][3] = "本人查询(自助查询机)"
+    elif defect == "duplicate_evidence_owner":
+        geometry = upper.metadata["geometry"]
+        geometry["cell_evidence_ids"][4][0] = list(
+            geometry["cell_evidence_ids"][3][0]
+        )
+    elif defect == "lower_header_not_exact":
+        lower.metadata["geometry"]["cell_geometry_status"][0][2] = "derived"
+    elif defect == "lower_first_row_not_personal":
+        lower.metadata["raw_rows"][1][2] = "样例银行"
+        lower.metadata["raw_rows"][1][3] = "贷后管理"
+    elif defect == "overlapping_table_boxes":
+        upper.bbox[3] = lower.bbox[1] + 1.0
+    later_tables = [lower]
+    if defect in {"competing_lower_seal", "duplicate_lower_seal"}:
+        competing = deepcopy(lower)
+        competing.table_id = "pt_54_2" if defect == "competing_lower_seal" else lower.table_id
+        competing.bbox = [40.0, 470.0, 400.0, 490.0]
+        if defect == "competing_lower_seal":
+            competing.metadata["geometry"] = _geometry(
+                deepcopy(lower_rows),
+                top=470.0,
+                evidence_prefix="competing-lower",
+            )
+        later_tables.append(competing)
+    monkeypatch.setattr(native_extraction, "_canonical_inquiry_line_rows", lambda _context: [])
+    return SimpleNamespace(
+        pages=[
+            _page(
+                54,
+                # Deliberately reverse the reconstruction order.  Physical
+                # bbox order must put the headerless institutional tail first.
+                [*later_tables, upper],
+                template="annotations_and_inquiries",
+            )
+        ],
+        evidence_plane=SimpleNamespace(evidence=EvidenceStore(text_atoms=[])),
+        reading_order_by_logical={54: 1},
+        reading_order_resolution={"status": "ambiguous"},
+        corrected_evidence_pages=lambda: [],
+        _personal_detail_extraction_issues=[],
+    )
+
+
+def test_headerless_upper_inquiry_tail_bootstrap_consumes_first_data_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = native_extraction._extract_inquiries(
+        _headerless_institution_tail_context(monkeypatch)
+    )
+
+    institutional = sorted(
+        row["sequence"] for row in rows if row["inquiry_type"] == "institution"
+    )
+    assert institutional == list(range(122, 130))
+    assert any(
+        row["inquiry_type"] == "personal" and row["sequence"] == 1 for row in rows
+    )
+    coverage = native_extraction._inquiry_source_coverage(
+        _headerless_institution_tail_context(monkeypatch)
+    )
+    assert coverage["sequence_endpoints"] == {"institution": 129, "personal": 1}
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+    assert sorted(
+        int(sequence)
+        for sequence in coverage["ordinal_observations"]["institution"]
+    ) == list(range(122, 130))
+
+
+@pytest.mark.parametrize("tail_count", [2, 4, 8])
+def test_headerless_inquiry_bootstrap_uses_smallest_structurally_sealed_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tail_count: int,
+) -> None:
+    context = _headerless_institution_tail_context(monkeypatch, tail_count=tail_count)
+    page = context.pages[0]
+    upper = min(page.tables, key=lambda table: table.bbox[1])
+
+    descriptor = native_extraction._bounded_headerless_inquiry_table_bootstrap(
+        context,
+        page,
+        upper,
+        native_extraction._table_rows(upper),
+        slots={"sequence": 0, "inquiry_date": 1, "institution": 2, "reason": 3},
+        later_tables=[table for table in page.tables if table is not upper],
+    )
+
+    assert descriptor is not None
+    assert descriptor["first_sequence"] == 122
+    assert descriptor["last_sequence"] == 121 + tail_count
+
+
+@pytest.mark.parametrize(
+    ("tail_count", "defect"),
+    [(1, None), (2, "competing_lower_seal"), (2, "duplicate_lower_seal")],
+)
+def test_headerless_inquiry_bootstrap_rejects_ambiguous_or_singleton_tail(
+    monkeypatch: pytest.MonkeyPatch,
+    tail_count: int,
+    defect: str | None,
+) -> None:
+    context = _headerless_institution_tail_context(
+        monkeypatch,
+        tail_count=tail_count,
+        defect=defect,
+    )
+    page = context.pages[0]
+    upper = min(page.tables, key=lambda table: table.bbox[1])
+
+    assert (
+        native_extraction._bounded_headerless_inquiry_table_bootstrap(
+            context,
+            page,
+            upper,
+            native_extraction._table_rows(upper),
+            slots={"sequence": 0, "inquiry_date": 1, "institution": 2, "reason": 3},
+            later_tables=[table for table in page.tables if table is not upper],
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "no_later_header",
+        "nonconsecutive_ordinals",
+        "personal_marker",
+        "duplicate_evidence_owner",
+        "lower_header_not_exact",
+        "lower_first_row_not_personal",
+        "overlapping_table_boxes",
+    ],
+)
+def test_headerless_upper_inquiry_tail_bootstrap_requires_independent_seals(
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    context = _headerless_institution_tail_context(
+        monkeypatch,
+        include_later_header=defect != "no_later_header",
+        defect=defect,
+    )
+
+    rows = native_extraction._extract_inquiries(context)
+
+    institutional = {
+        row["sequence"] for row in rows if row["inquiry_type"] == "institution"
+    }
+    assert institutional == ({1} if defect == "lower_first_row_not_personal" else set())
+    coverage = native_extraction._inquiry_source_coverage(context)
+    assert coverage.get("sequence_endpoints", {}).get("institution") == (
+        1 if defect == "lower_first_row_not_personal" else None
+    )
+
+
+def _production_shaped_headerless_tail_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    expose_merged_business_tokens: bool = True,
+    expose_collapsed_business_tokens: bool = True,
+    include_prior_institution_group: bool = False,
+) -> SimpleNamespace:
+    tail_rows = [
+        [
+            str(sequence),
+            f"2024.01.{(sequence - 121):02d}",
+            f"样例银行股份有限公司{sequence}",
+            "贷后管理",
+        ]
+        for sequence in range(122, 144)
+    ]
+    # Population ownership must survive business-field OCR failures.  These
+    # fields remain subject to normal row validation and are not silently fixed.
+    tail_rows[3][3] = "信用审批"
+    tail_rows[9][1] = "2023.11.23 招商银行股份有限公司"
+    tail_rows[9][2] = ""
+    tail_rows[19][1] = "2023.09.05 中国建设银行股份有限公司"
+    tail_rows[19][2] = ""
+    tail_rows.append(
+        [
+            "144 145",
+            "2023.08.11 2023.08.05",
+            "上海浦东发展银行股份有限公司 中国工商银行股份有限公司",
+            "贷款审批 贷后管理",
+        ]
+    )
+    upper_geometry = _geometry(tail_rows, top=40.0)
+    token_specs = {
+        (22, 0): [("144", [50.0, 262.0, 70.0, 266.0]), ("145", [50.0, 267.0, 70.0, 271.0])],
+        (22, 1): [("2023.08.11", [140.0, 262.0, 205.0, 266.0]), ("2023.08.05", [140.0, 267.0, 205.0, 271.0])],
+        (22, 2): [("上海浦东发展银行股份有限公司", [230.0, 262.0, 300.0, 266.0]), ("中国工商银行股份有限公司", [230.0, 267.0, 300.0, 271.0])],
+        (22, 3): [("贷款审批", [320.0, 262.0, 390.0, 266.0]), ("贷后管理", [320.0, 267.0, 390.0, 271.0])],
+    }
+    atoms: list[EvidenceAtom] = []
+    upper_geometry["cell_token_ids"] = deepcopy(
+        upper_geometry["cell_evidence_ids"]
+    )
+    for row, date_text, institution_text in (
+        (9, "2023.11.23", "招商银行股份有限公司"),
+        (19, "2023.09.05", "中国建设银行股份有限公司"),
+    ):
+        y0 = 40.0 + row * 10.0
+        ids = [f"tail:{row}:span:date", f"tail:{row}:span:institution"]
+        upper_geometry["cell_bboxes"][row][1] = [130.0, y0, 310.0, y0 + 10.0]
+        upper_geometry["cell_evidence_ids"][row][1] = ids
+        upper_geometry["cell_token_ids"][row][1] = list(ids)
+        upper_geometry["cell_bboxes"][row][2] = None
+        upper_geometry["cell_geometry_status"][row][2] = "derived"
+        upper_geometry["cell_evidence_ids"][row][2] = []
+        upper_geometry["cell_token_ids"][row][2] = []
+        upper_geometry["cell_spans"].append(
+            {
+                "row": row,
+                "col": 1,
+                "row_span": 1,
+                "col_span": 2,
+                "bbox": upper_geometry["cell_bboxes"][row][1],
+            }
+        )
+        date_bbox = [140.0, y0 + 2.0, 205.0, y0 + 8.0]
+        institution_bbox = [230.0, y0 + 2.0, 300.0, y0 + 8.0]
+        if expose_merged_business_tokens:
+            atoms.extend(
+                [
+                    EvidenceAtom(id=ids[0], text=date_text, bbox=date_bbox),
+                    EvidenceAtom(id=ids[1], text=institution_text, bbox=institution_bbox),
+                ]
+            )
+    for (row, column), tokens in token_specs.items():
+        ids = [f"tail:{row}:{column}:{index}" for index in range(len(tokens))]
+        upper_geometry["cell_evidence_ids"][row][column] = ids
+        upper_geometry["cell_token_ids"][row][column] = list(ids)
+        if column != 0 and not expose_collapsed_business_tokens:
+            continue
+        for token_id, (text, bbox) in zip(ids, tokens, strict=True):
+            atoms.append(EvidenceAtom(id=token_id, text=text, bbox=bbox))
+    upper = _table(
+        "pt_54_0",
+        tail_rows,
+        top=40.0,
+        geometry=upper_geometry,
+    )
+    lower_rows = [
+        ["编号", "查询日期", "查询机构", "查询原因"],
+        ["1", "2025.05.07", "本人", "本人查询(自助查询机)"],
+    ]
+    lower = _table(
+        "pt_54_1",
+        lower_rows,
+        top=380.0,
+        geometry=_geometry(
+            lower_rows,
+            top=380.0,
+            evidence_prefix="lower",
+        ),
+    )
+    pages = [_page(54, [lower, upper], template="annotations_and_inquiries")]
+    reading_order = {54: 1}
+    reading_order_resolution = {"status": "ambiguous"}
+    if include_prior_institution_group:
+        prior_rows = [
+            ["缂栧彿", "鏌ヨ鏃ユ湡", "鏌ヨ鏈烘瀯", "鏌ヨ鍘熷洜"],
+            ["121", "2024.02.01", "鏍蜂緥閾惰121", "璐峰悗绠＄悊"],
+        ]
+        prior = _table(
+            "pt_53_0",
+            prior_rows,
+            top=300.0,
+            geometry=_geometry(
+                prior_rows,
+                top=300.0,
+                evidence_prefix="prior",
+            ),
+        )
+        pages.insert(
+            0,
+            _page(53, [prior], template="annotations_and_inquiries"),
+        )
+        reading_order = {53: 1, 54: 2}
+        reading_order_resolution = {
+            "resolved": True,
+            "authoritative": True,
+        }
+    monkeypatch.setattr(native_extraction, "_canonical_inquiry_line_rows", lambda _context: [])
+    return SimpleNamespace(
+        pages=pages,
+        evidence_plane=SimpleNamespace(evidence=EvidenceStore(text_atoms=atoms)),
+        reading_order_by_logical=reading_order,
+        reading_order_resolution=reading_order_resolution,
+        corrected_evidence_pages=lambda: [],
+        _personal_detail_extraction_issues=[],
+    )
+
+
+def _damaged_prior_schema_headerless_tail_context(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prior_token_defect: str | None = None,
+) -> SimpleNamespace:
+    context = _production_shaped_headerless_tail_context(monkeypatch)
+    upper = next(
+        table for table in context.pages[0].tables if table.table_id == "pt_54_0"
+    )
+    lower_rows = [
+        ["编号", "查询日期", "查询机构", "查询原因"],
+        *[
+            [
+                str(sequence),
+                f"2025.05.{8 - sequence:02d}",
+                "本人",
+                "本人查询(自助查询机)",
+            ]
+            for sequence in range(1, 7)
+        ],
+    ]
+    lower = _table(
+        "pt_54_1",
+        lower_rows,
+        top=380.0,
+        geometry=_geometry(lower_rows, top=380.0, evidence_prefix="lower-six"),
+    )
+    lower.metadata["canonical_template_id"] = "annotations_and_inquiries"
+    context.pages[0].tables = [lower, upper]
+
+    prior_rows = [
+        ["查询日期", "查询机构", "查询原因", ""],
+        ["119", "2024.02.01", "样例银行119", "贷后管理"],
+        [
+            "120 121",
+            "2024.02.07 2024.01.30",
+            "甲银行 乙银行",
+            "贷后管理 贷后管理",
+        ],
+    ]
+    prior_geometry = _geometry(
+        prior_rows,
+        top=300.0,
+        evidence_prefix="prior-damaged",
+    )
+    prior_geometry["cell_token_ids"] = deepcopy(
+        prior_geometry["cell_evidence_ids"]
+    )
+    token_texts = (
+        ("120", "122" if prior_token_defect == "nonconsecutive" else "121"),
+        ("2024.02.07", "2024.01.30"),
+        ("甲银行", "乙银行"),
+        ("贷后管理", "贷后管理"),
+    )
+    for column, texts in enumerate(token_texts):
+        ids = [f"prior-terminal:{column}:0", f"prior-terminal:{column}:1"]
+        prior_geometry["cell_evidence_ids"][2][column] = ids
+        prior_geometry["cell_token_ids"][2][column] = list(ids)
+        for index, (token_id, text) in enumerate(zip(ids, texts, strict=True)):
+            context.evidence_plane.evidence.text_atoms.append(
+                EvidenceAtom(
+                    id=token_id,
+                    text=text,
+                    bbox=[
+                        50.0 + column * 90.0,
+                        321.0 + index * 4.0,
+                        120.0 + column * 90.0,
+                        324.0 + index * 4.0,
+                    ],
+                )
+            )
+    prior = _table(
+        "pt_53_0",
+        prior_rows,
+        top=300.0,
+        geometry=prior_geometry,
+    )
+    context.pages.insert(
+        0,
+        _page(53, [prior], template="annotations_and_inquiries"),
+    )
+    context.reading_order_by_logical = {53: 1, 54: 2}
+    context.reading_order_resolution = {"resolved": True, "authoritative": True}
+    return context
+
+
+def test_headerless_population_coverage_bridges_exact_prior_terminal_token_band(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _damaged_prior_schema_headerless_tail_context(monkeypatch)
+
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert coverage["sequence_endpoints"] == {
+        "institution": 145,
+        "personal": 6,
+    }
+    # The bridge proves terminal ordinals, but the visible institution group
+    # starts at 119.  It cannot prove that both subsections restart at one.
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+    institutional = coverage["ordinal_observations"]["institution"]
+    assert {"120", "121", "122", "144", "145"} <= set(institutional)
+    assert institutional["120"]["source_refs"][0]["geometry_scope"] == "token_row"
+
+
+def test_headerless_population_coverage_rejects_nonconsecutive_prior_token_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _damaged_prior_schema_headerless_tail_context(
+        monkeypatch,
+        prior_token_defect="nonconsecutive",
+    )
+
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert coverage.get("sequence_endpoints", {}).get("institution") != 145
+    assert coverage.get("expected_row_count") != 151
+
+
+def test_production_shaped_headerless_tail_owns_122_through_145_without_promoting_bad_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _production_shaped_headerless_tail_context(monkeypatch)
+
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    institutional = {
+        row["sequence"]: row for row in rows if row["inquiry_type"] == "institution"
+    }
+    # The exact span witnesses prove that 131 and 141 exist, but do not
+    # silently promote merged business cells into emitted records.
+    assert set(institutional) == set(range(122, 146)) - {131, 141}
+    assert institutional[125]["reason"] is None
+    assert institutional[125]["extraction_status"] == "review"
+    assert "reason" in institutional[125]["_unresolved_fields"]
+    assert institutional[144]["institution"] == "上海浦东发展银行股份有限公司"
+    assert institutional[145]["institution"] == "中国工商银行股份有限公司"
+    assert coverage["sequence_endpoints"] == {"institution": 145, "personal": 1}
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+    assert "125" in coverage["ordinal_observations"]["institution"]
+    for sequence in (131, 141):
+        observation = coverage["ordinal_observations"]["institution"][str(sequence)]
+        assert {"inquiry_date", "institution"} <= set(
+            observation["printed_fields"]
+        )
+        assert all(
+            ref["geometry_scope"] == "token"
+            for field in ("inquiry_date", "institution")
+            for ref in observation["field_source_refs"][field]
+        )
+
+
+def test_production_shaped_headerless_population_survives_detached_business_token_plane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay the final pt54 topology when only ordinal tokens are resolvable.
+
+    The final repaired table can own exact cell/token IDs that are absent from
+    the sealed evidence store used by an earlier schema pass.  Exact span
+    geometry still proves rows 131/141, and the two sequence tokens still prove
+    144/145; none of their unresolved business fields may be invented.
+    """
+
+    context = _production_shaped_headerless_tail_context(
+        monkeypatch,
+        expose_merged_business_tokens=False,
+        expose_collapsed_business_tokens=False,
+    )
+
+    descriptor = native_extraction._bounded_headerless_inquiry_table_bootstrap(
+        context,
+        context.pages[0],
+        context.pages[0].tables[1],
+        native_extraction._table_rows(context.pages[0].tables[1]),
+        slots={
+            "sequence": 0,
+            "inquiry_date": 1,
+            "institution": 2,
+            "reason": 3,
+        },
+        later_tables=[context.pages[0].tables[0]],
+    )
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert descriptor is not None
+    assert descriptor["last_sequence"] == 145
+    assert coverage["sequence_endpoints"] == {"institution": 145, "personal": 1}
+    assert coverage["numbering_model"] == "unknown"
+    assert "expected_row_count" not in coverage
+    assert set(range(122, 146)) <= {
+        int(sequence)
+        for sequence in coverage["ordinal_observations"]["institution"]
+    }
+    institutional = {
+        row["sequence"]: row for row in rows if row["inquiry_type"] == "institution"
+    }
+    assert {131, 141, 144, 145}.isdisjoint(institutional)
+
+
+def _move_headerless_tail_atoms_to_page_bundle(
+    context: SimpleNamespace,
+    *,
+    defect: str | None = None,
+) -> None:
+    atoms = list(context.evidence_plane.evidence.text_atoms)
+    context.evidence_plane.evidence.text_atoms = []
+    tokens = [
+        {
+            "token_id": atom.id,
+            "evidence_ids": [atom.id],
+            "page": 54,
+            "text": atom.text,
+            "content": atom.text,
+            "bbox": list(atom.bbox or []),
+        }
+        for atom in atoms
+    ]
+    bundles = [{"page": 54, "tokens": tokens}]
+    if defect == "wrong_page":
+        bundles[0]["page"] = 53
+    elif defect == "duplicate_id":
+        duplicate = dict(next(token for token in tokens if token["token_id"] == "tail:22:0:0"))
+        bundles.append({"page": 54, "tokens": [duplicate]})
+    context.entities = SimpleNamespace(
+        domain_specific={"_page_evidence_bundles": bundles}
+    )
+
+
+def test_production_shaped_headerless_tail_resolves_exact_tokens_from_sealed_page_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _production_shaped_headerless_tail_context(
+        monkeypatch,
+        include_prior_institution_group=True,
+    )
+    _move_headerless_tail_atoms_to_page_bundle(context)
+
+    rows = native_extraction._extract_inquiries(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    institutional = {
+        row["sequence"] for row in rows if row["inquiry_type"] == "institution"
+    }
+    assert {122, 143, 144, 145} <= institutional
+    assert ledger["inquiry_sequence_endpoints"] == {
+        "institution": 145,
+        "personal": 1,
+    }
+    assert {"144", "145"} <= set(
+        ledger["inquiry_ordinal_observations"]["institution"]
+    )
+
+
+@pytest.mark.parametrize("defect", ["wrong_page", "duplicate_id"])
+def test_headerless_page_bundle_token_resolution_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    defect: str,
+) -> None:
+    context = _production_shaped_headerless_tail_context(
+        monkeypatch,
+        include_prior_institution_group=True,
+    )
+    _move_headerless_tail_atoms_to_page_bundle(context, defect=defect)
+
+    rows = native_extraction._extract_inquiries(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    institutional = {
+        row["sequence"] for row in rows if row["inquiry_type"] == "institution"
+    }
+    assert {144, 145}.isdisjoint(institutional)
+    assert ledger["inquiry_sequence_endpoints"].get("institution") != 145
+
+
+def test_production_shaped_headerless_tail_extends_active_institution_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay the real p53-to-p54 runtime state, not a cold p54 bootstrap."""
+
+    context = _production_shaped_headerless_tail_context(
+        monkeypatch,
+        include_prior_institution_group=True,
+    )
+
+    rows = native_extraction._extract_inquiries(context)
+    ledger = native_extraction._source_completeness_ledger(context)
+
+    institutional = {
+        row["sequence"] for row in rows if row["inquiry_type"] == "institution"
+    }
+    assert {122, 143, 144, 145} <= institutional
+    assert context._candidate_b_canonical_inquiry_line_sequences == {}
+    assert ledger["inquiry_sequence_endpoints"] == {
+        "institution": 145,
+        "personal": 1,
+    }
+    assert "inquiry_records" not in ledger
+    terminal = ledger["inquiry_ordinal_observations"]["institution"]
+    assert {"144", "145"} <= set(terminal)
+    assert all(
+        terminal[ordinal]["source_refs"][0]["binding"]
+        == "printed_inquiry_ordinal_token"
+        for ordinal in ("144", "145")
+    )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "foreign_evidence",
+        "overlapping_token_rows",
+        "nonconsecutive_ordinals",
+        "ambiguous_reason",
+        "duplicate_evidence_owner",
+        "personal_reason_with_bank",
+        "mixed_inquiry_types",
+    ],
+)
+def test_collapsed_inquiry_token_rows_fail_closed(defect: str) -> None:
+    rows = native_extraction._extract_inquiries(
+        _collapsed_token_inquiry_context(defect=defect)
+    )
+
+    assert [row["sequence"] for row in rows] == [143]
+
+
+def _merged_personal_inquiry_context(*, defect: str | None = None) -> SimpleNamespace:
+    rows = [
+        ["编号", "查询日期", "查询机构", "查询原因"],
+        ["1", "2025.05.07", "本人", "本人查询(自助查询机)"],
+        ["2", "本人 2025.02.11", "", "本人查询(自助查询机)"],
+    ]
+    geometry = _geometry(rows, top=40.0)
+    geometry["cell_bboxes"][2][1] = [130.0, 60.0, 310.0, 70.0]
+    geometry["cell_bboxes"][2][2] = None
+    geometry["cell_geometry_status"][2][2] = "derived"
+    geometry["cell_evidence_ids"][2][2] = []
+    geometry["cell_spans"] = [
+        {
+            "row": 2,
+            "col": 1,
+            "row_span": 1,
+            "col_span": 2,
+            "bbox": [130.0, 60.0, 310.0, 70.0],
+        }
+    ]
+    geometry["cell_token_ids"] = deepcopy(geometry["cell_evidence_ids"])
+    specs = {
+        (2, 0): [("2", [50.0, 62.0, 70.0, 67.0])],
+        (2, 1): [
+            ("2025.02.11", [140.0, 62.0, 190.0, 67.0]),
+            ("本人", [235.0, 62.0, 260.0, 67.0]),
+        ],
+        (2, 3): [("本人查询(自助查询机)", [320.0, 62.0, 390.0, 67.0])],
+    }
+    atoms: list[EvidenceAtom] = []
+    for (row, column), tokens in specs.items():
+        ids = [f"personal:{row}:{column}:{index}" for index in range(len(tokens))]
+        geometry["cell_evidence_ids"][row][column] = ids
+        geometry["cell_token_ids"][row][column] = list(ids)
+        for token_id, (text, bbox) in zip(ids, tokens, strict=True):
+            atoms.append(EvidenceAtom(id=token_id, text=text, bbox=bbox))
+    if defect == "institution_in_date_band":
+        next(atom for atom in atoms if atom.text == "本人").bbox = [180.0, 62.0, 200.0, 67.0]
+    elif defect == "extra_span_token":
+        token_id = "personal:2:1:extra"
+        geometry["cell_evidence_ids"][2][1].append(token_id)
+        geometry["cell_token_ids"][2][1].append(token_id)
+        atoms.append(EvidenceAtom(id=token_id, text="残", bbox=[270.0, 62.0, 280.0, 67.0]))
+    elif defect == "nonpersonal_institution":
+        next(atom for atom in atoms if atom.text == "本人").text = "某银行"
+    elif defect == "wrong_span":
+        geometry["cell_spans"][0]["col_span"] = 3
+    elif defect == "duplicate_evidence_owner":
+        sequence_id = geometry["cell_token_ids"][2][0][0]
+        reason_id = geometry["cell_token_ids"][2][3][0]
+        geometry["cell_token_ids"][2][3][0] = sequence_id
+        geometry["cell_evidence_ids"][2][3][0] = sequence_id
+        atoms = [atom for atom in atoms if atom.id != reason_id]
+    elif defect == "vertically_displaced_reason":
+        next(atom for atom in atoms if atom.id.startswith("personal:2:3:")).bbox = [
+            320.0,
+            68.5,
+            390.0,
+            69.5,
+        ]
+
+    table = _table("pt_54_1", rows, top=40.0, geometry=geometry)
+    return SimpleNamespace(
+        pages=[_page(54, [table], template="annotations_and_inquiries")],
+        evidence_plane=SimpleNamespace(evidence=EvidenceStore(text_atoms=atoms)),
+        reading_order_by_logical={54: 1},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [],
+        _personal_detail_extraction_issues=[],
+    )
+
+
+def test_exact_tokens_recover_personal_inquiry_from_date_institution_span() -> None:
+    rows = native_extraction._extract_inquiries(_merged_personal_inquiry_context())
+
+    assert [(row["sequence"], row["inquiry_date"], row["institution"]) for row in rows] == [
+        (1, "2025-05-07", "本人"),
+        (2, "2025-02-11", "本人"),
+    ]
+    assert rows[1]["source"] == "native_detail_inquiry_token_rows"
+    assert rows[1]["source_refs_by_field"]["institution"][0]["geometry_scope"] == "token"
+    assert rows[1]["reason"] == rows[1]["source_reason"]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "institution_in_date_band",
+        "extra_span_token",
+        "nonpersonal_institution",
+        "wrong_span",
+        "duplicate_evidence_owner",
+        "vertically_displaced_reason",
+    ],
+)
+def test_personal_date_institution_span_recovery_fails_closed(defect: str) -> None:
+    rows = native_extraction._extract_inquiries(
+        _merged_personal_inquiry_context(defect=defect)
+    )
+
+    assert [row["sequence"] for row in rows] == [1]
+
+
+def test_token_split_helpers_reject_duplicate_slot_ownership() -> None:
+    collapsed = _collapsed_token_inquiry_context()
+    collapsed_table = collapsed.pages[0].tables[0]
+    merged = _merged_personal_inquiry_context()
+    merged_table = merged.pages[0].tables[0]
+    duplicate_slots = {
+        "sequence": 0,
+        "inquiry_date": 1,
+        "institution": 1,
+        "reason": 3,
+    }
+
+    assert (
+        native_extraction._bounded_two_row_inquiry_cell_split(
+            collapsed,
+            collapsed_table,
+            row_index=2,
+            slots=duplicate_slots,
+        )
+        is None
+    )
+    assert (
+        native_extraction._bounded_personal_inquiry_merged_institution_row(
+            merged,
+            merged_table,
+            row_index=2,
+            slots=duplicate_slots,
+        )
+        is None
+    )
+
+
+def test_personal_token_recovery_preserves_raw_reason_channel() -> None:
+    rows = native_extraction._extract_inquiries(_merged_personal_inquiry_context())
+
+    assert rows[1]["reason"] == "本人查询(自助查询机)"
+    assert rows[1]["source_reason"] == "本人查询(自助查询机)"
+
+
+def test_exact_inquiry_field_ref_accepts_only_complete_token_contract() -> None:
+    exact_token_ref = {
+        "source": "native_detail_inquiry_token",
+        "geometry_scope": "token",
+        "binding": "canonical_header_column_token",
+        "binding_quality": "exact_token_in_canonical_cell",
+        "field_name": "inquiry_date",
+        "table_id": "pt_54_1",
+        "row": 2,
+        "column": 1,
+        "bbox": [140.0, 62.0, 190.0, 67.0],
+        "evidence_ids": ["token:1"],
+    }
+
+    assert native_extraction._exact_inquiry_field_ref(
+        exact_token_ref,
+        field_name="inquiry_date",
+    )
+    for field_name in ("source", "binding_quality", "field_name", "bbox", "evidence_ids"):
+        damaged = dict(exact_token_ref)
+        damaged.pop(field_name)
+        assert not native_extraction._exact_inquiry_field_ref(
+            damaged,
+            field_name="inquiry_date",
+        )
+    assert not native_extraction._exact_inquiry_field_ref(
+        {**exact_token_ref, "evidence_ids": ["token:1", "token:2"]},
+        field_name="inquiry_date",
+    )
+
+
+def test_personal_token_ordinals_enter_source_coverage_without_emission() -> None:
+    context = _merged_personal_inquiry_context(defect="extra_span_token")
+
+    rows = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert [row["sequence"] for row in rows] == [1]
+    assert coverage["sequence_endpoints"] == {"personal": 2}
+    assert coverage["observed_sequences"] == {"personal": [1, 2]}
+    omitted = coverage["ordinal_observations"]["personal"]["2"]
+    assert omitted["printed_fields"] == []
+    assert omitted["field_source_refs"] == {}
+    assert omitted["source_refs"][0]["binding"] == "printed_inquiry_ordinal_token"
+
+
+def _two_personal_ordinal_tokens_partition_record_identities_only() -> None:
+    context = _collapsed_token_inquiry_context()
+    table = context.pages[0].tables[0]
+    table.metadata["raw_rows"][1] = [
+        "1",
+        "2025.05.07",
+        "鏈汉",
+        "鏈汉鏌ヨ(鑷姪鏌ヨ鏈?",
+    ]
+    sequence_atoms = [
+        atom
+        for atom in context.evidence_plane.evidence.text_atoms
+        if atom.id.startswith("merged:2:0:")
+    ]
+    sequence_atoms[0].text = "2"
+    sequence_atoms[1].text = "3"
+    for atom in context.evidence_plane.evidence.text_atoms:
+        if atom.id.startswith("merged:2:2:"):
+            atom.text = "鏈汉"
+        elif atom.id.startswith("merged:2:3:"):
+            atom.text = "鏈汉鏌ヨ(鑷姪鏌ヨ鏈?"
+
+    observations = native_extraction._bounded_inquiry_token_ordinal_observations(
+        context,
+        context.pages[0],
+        table,
+        row_index=2,
+        slots={
+            "sequence": 0,
+            "inquiry_date": 1,
+            "institution": 2,
+            "reason": 3,
+        },
+    )
+
+    assert [observation["sequence"] for observation in observations] == [2, 3]
+    assert all(observation["inquiry_type"] == "personal" for observation in observations)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["duplicate_evidence_owner", "nonconsecutive_ordinals", "foreign_evidence"],
+)
+def test_token_ordinal_source_coverage_fails_closed(defect: str) -> None:
+    context = _collapsed_token_inquiry_context(defect=defect)
+    table = context.pages[0].tables[0]
+    table.metadata["raw_rows"][1] = [
+        "1",
+        "2025.05.07",
+        "鏈汉",
+        "鏈汉鏌ヨ(鑷姪鏌ヨ鏈?",
+    ]
+    for atom in context.evidence_plane.evidence.text_atoms:
+        if atom.id.startswith("merged:2:0:0"):
+            atom.text = "2"
+        elif atom.id.startswith("merged:2:0:1") and defect != "nonconsecutive_ordinals":
+            atom.text = "3"
+        elif atom.id.startswith("merged:2:2:"):
+            atom.text = "鏈汉"
+        elif atom.id.startswith("merged:2:3:"):
+            atom.text = "鏈汉鏌ヨ(鑷姪鏌ヨ鏈?"
+
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert coverage.get("sequence_endpoints") != {"personal": 3}
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        None,
+        "duplicate_evidence_owner",
+        "reversed_ordinals",
+        "nonconsecutive_ordinals",
+        "wrong_channel",
+        "foreign_table",
+    ],
+)
+def test_huang_personal_double_band_reports_identities_only(defect: str | None) -> None:
+    context = _collapsed_token_inquiry_context()
+    table = context.pages[0].tables[0]
+    table.table_id = "pt_54_1"
+    table.metadata["raw_rows"][0] = ["编号", "查询日期", "查询机构", "查询原因"]
+    table.metadata["raw_rows"][1] = ["1", "2025.05.07", "本人", "本人查询(自助查询机)"]
+    sequence_atoms = [
+        atom
+        for atom in context.evidence_plane.evidence.text_atoms
+        if atom.id.startswith("merged:2:0:")
+    ]
+    sequence_atoms[0].text = "3"
+    sequence_atoms[1].text = "4"
+    institution_atoms = [
+        atom
+        for atom in context.evidence_plane.evidence.text_atoms
+        if atom.id.startswith("merged:2:2:")
+    ]
+    institution_atoms[0].text = "本人"
+    institution_atoms[1].text = "本人"
+    reason_atoms = [
+        atom
+        for atom in context.evidence_plane.evidence.text_atoms
+        if atom.id.startswith("merged:2:3:")
+    ]
+    reason_atoms[0].text = "本人查询(自助查询机)"
+    reason_atoms[1].text = "银行)本人查询(商业银行网上"
+
+    if defect == "duplicate_evidence_owner":
+        duplicate_id = table.metadata["geometry"]["cell_token_ids"][2][0][0]
+        replaced_id = table.metadata["geometry"]["cell_token_ids"][2][1][0]
+        table.metadata["geometry"]["cell_token_ids"][2][1][0] = duplicate_id
+        table.metadata["geometry"]["cell_evidence_ids"][2][1][0] = duplicate_id
+        context.evidence_plane.evidence.text_atoms = [
+            atom
+            for atom in context.evidence_plane.evidence.text_atoms
+            if atom.id != replaced_id
+        ]
+    elif defect == "reversed_ordinals":
+        sequence_atoms[0].text, sequence_atoms[1].text = "4", "3"
+    elif defect == "nonconsecutive_ordinals":
+        sequence_atoms[1].text = "5"
+    elif defect == "wrong_channel":
+        reason_atoms[1].text = "贷款审批"
+    elif defect == "foreign_table":
+        context.pages[0].canonical_template_id = "credit_accounts"
+
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    if defect is None:
+        assert coverage["observed_sequences"]["personal"] == [1, 3, 4]
+        for ordinal in ("3", "4"):
+            observation = coverage["ordinal_observations"]["personal"][ordinal]
+            assert observation["printed_fields"] == []
+            assert observation["field_source_refs"] == {}
+            assert observation["source_refs"][0]["source_band_bbox"]
+    else:
+        assert not ({3, 4} <= set(coverage.get("observed_sequences", {}).get("personal", ())))
 
 
 def _account_anchor_ref() -> dict:
@@ -635,9 +1738,137 @@ def test_missing_account_table_reports_each_unrecovered_basic_slot(
         for issue in context._personal_detail_extraction_issues
         if issue.get("issue_code") == "candidate_b_account_basic_slot_unresolved"
     }
-    assert field_issues == {"account_identifier", "open_date"}
+    assert field_issues == {
+        "account_identifier",
+        "open_date",
+        "credit_limit",
+        "shared_credit_limit",
+        "business_type",
+        "guarantee_type",
+        "snapshot_date",
+        "account_state",
+    }
     assert any(
         issue.get("issue_code") == "candidate_b_account_table_missing"
         and issue.get("field_name") is None
         for issue in context._personal_detail_extraction_issues
     )
+
+
+def test_missing_loan_table_reports_both_printed_template_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skeleton = {
+        "account_id": "credit_account:non_revolving_loan:9",
+        "sequence": 9,
+        "category_sequence": 9,
+        "account_type": "non_revolving_loan",
+        "management_institution": "中国建设银行股份有限公司厦门市分行",
+        "source": "candidate_b_account_anchor",
+        "source_refs": [_account_anchor_ref()],
+        "_source_absent_fields": ["co_borrower_flag"],
+    }
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([], [], []),
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_account_anchor_skeletons",
+        lambda _context: [deepcopy(skeleton)],
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    field_issues = {
+        issue.get("field_name")
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code") == "candidate_b_account_basic_slot_unresolved"
+    }
+    assert field_issues == {
+        "account_identifier",
+        "open_date",
+        "due_date",
+        "loan_amount",
+        "account_currency",
+        "business_type",
+        "guarantee_type",
+        "repayment_periods",
+        "repayment_frequency",
+        "repayment_method",
+        "snapshot_date",
+        "account_state",
+    }
+
+
+def test_native_detail_account_reports_missing_template_fields_but_not_printed_absence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = {
+        "account_id": "credit_account:non_revolving_loan:4",
+        "sequence": 4,
+        "category_sequence": 4,
+        "account_type": "non_revolving_loan",
+        "management_institution": "中国银行股份有限公司厦门市分行",
+        "account_identifier": "D10111000H000000000000000000000004",
+        "open_date": "2024-01-01",
+        "currency": "CNY",
+        "account_currency": "CNY",
+        "account_state": "unknown",
+        "source": "native_detail_account_table",
+        "source_refs": [_account_anchor_ref()],
+        "_source_absent_fields": ["co_borrower_flag"],
+    }
+    skeleton = {
+        "account_id": "credit_account:non_revolving_loan:4",
+        "sequence": 4,
+        "category_sequence": 4,
+        "account_type": "non_revolving_loan",
+        "account_family_quality": "exact",
+        "_printed_ordinal_status": "printed_unique",
+        "source": "candidate_b_account_anchor",
+        "source_refs": [_account_anchor_ref()],
+        "_source_absent_fields": ["co_borrower_flag"],
+    }
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+    monkeypatch.setattr(
+        native_extraction,
+        "_extract_table_accounts",
+        lambda _context: ([deepcopy(account)], [], []),
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_account_anchor_skeletons",
+        lambda _context: [deepcopy(skeleton)],
+    )
+    monkeypatch.setattr(
+        native_extraction,
+        "_match_account_table_observations",
+        lambda _skeletons, _tables, *, parse_result=None: {0: 0},
+    )
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+
+    assert len(accounts) == 1
+    field_issues = {
+        issue.get("field_name")
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code")
+        == "candidate_b_account_required_field_unresolved"
+    }
+    assert field_issues == {
+        "due_date",
+        "loan_amount",
+        "business_type",
+        "guarantee_type",
+        "repayment_periods",
+        "repayment_frequency",
+        "repayment_method",
+        "snapshot_date",
+        "account_state",
+    }
+    assert "co_borrower_flag" not in field_issues
+    assert set(accounts[0]["_unresolved_fields"]) == field_issues

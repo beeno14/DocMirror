@@ -20,6 +20,7 @@ Dependencies: ``_base.base_table_parser``, ``bank_statement.extract_pipeline``, 
 from __future__ import annotations
 
 import calendar
+import copy
 import re
 import unicodedata
 from collections.abc import Sequence
@@ -28,21 +29,37 @@ from typing import Any
 from docmirror.plugins._base.base_table_parser import BaseTableParser
 from docmirror.plugins._base.column_registry import ColumnMapping
 from docmirror.plugins._base.projector import ProjectionData
+from docmirror.plugins._base.standardizer import normalize_timestamp
 from docmirror.plugins.bank_statement.canonical_quality import audit_amount_consistency, audit_row_accounting
-from docmirror.plugins.bank_statement.extract_pipeline import run_bank_statement_extract
-from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text
+from docmirror.plugins.bank_statement.extract_pipeline import (
+    authoritative_issuer_transaction_count_detail,
+    is_authoritative_issuer_row_count,
+    is_source_bound_issuer_detail,
+    run_bank_statement_extract,
+)
+from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text, normalize_header_cell
+from docmirror.plugins.bank_statement.statement_context import (
+    attach_statement_context,
+    build_statement_header_records,
+    page_texts_with_business_headers,
+    reconcile_source_unitemized_residuals,
+)
 from docmirror.plugins.bank_statement.wide_table_recovery import (
-    count_expected_rows_from_bank_footer,
     page_texts_from_parse_result,
+    resolve_row_count_evidence,
 )
 
 BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
     "序号": ColumnMapping(
         field="sequence_no",
-        aliases=["No.", "序列号", "日志号", "日 志 号", "交易流水号", "流水号"],
+        aliases=["序 号", "No.", "序列号", "日志号", "日 志 号", "交易序号", "Sequence"],
     ),
-    "交易日期": ColumnMapping(field="date", format_hint="date", aliases=["日期", "记账日期", "记账日", "Date"]),
-    "交易时间": ColumnMapping(field="timestamp", format_hint="datetime", aliases=["时间", "Time"]),
+    "交易日期": ColumnMapping(field="date", format_hint="date", aliases=["日期", "记账日", "Date"]),
+    "交易时间": ColumnMapping(
+        field="timestamp",
+        format_hint="datetime",
+        aliases=["时间", "日期时间", "交易日期时间", "Date Time", "Datetime", "Time"],
+    ),
     "收/支": ColumnMapping(
         field="direction",
         enum_map={
@@ -57,17 +74,19 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "贷": "income",
             "贷Cr": "income",
             "Cr": "income",
+            "收": "income",
             "借": "expense",
             "借Dr": "expense",
             "Dr": "expense",
+            "支": "expense",
         },
         aliases=[
             "收支",
             "方向",
             "交易方向",
             "交易类别",
-            "交易类型",
             "收入/支出",
+            "支/收",
             "月收/支",
             "月收支",
             "借贷",
@@ -76,13 +95,14 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "Dc Flg",
         ],
     ),
-    "摘要": ColumnMapping(field="summary", aliases=["摘要描述", "交易摘要", "备注", "Description", "Memo"]),
+    "摘要": ColumnMapping(field="summary", aliases=["摘要代码", "摘要描述", "交易摘要", "Description", "Memo"]),
     "交易金额": ColumnMapping(
         field="amount",
         unit="CNY",
         aliases=[
             "金额",
             "发生额",
+            "交易发生金额",
             "Amount",
             "借方发生额",
             "贷方发生额",
@@ -95,6 +115,9 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         ],
     ),
     "余额": ColumnMapping(field="balance", unit="CNY", aliases=["账户余额", "本次余额", "Balance"]),
+    "账号": ColumnMapping(field="own_account", aliases=["本方账号", "本方账户"]),
+    "储种": ColumnMapping(field="deposit_type", aliases=["存款种类"]),
+    "地区": ColumnMapping(field="region_code", aliases=["地区代码"]),
     "对方户名": ColumnMapping(
         field="counter_party",
         aliases=[
@@ -104,23 +127,48 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "对手信息",
             "对手名称",
             "交易对方",
+            "交易对手信息",
             "Counter party",
             "Counterparty Name",
-            "Remarks",
             "对方账号与户名",
         ],
     ),
     "对方账号": ColumnMapping(
         field="counter_account",
-        aliases=["收(付)方账号", "收（付）方账号", "对方账户", "Counter account"],
+        aliases=["收(付)方账号", "收（付）方账号", "对方账户", "对方账户/对方银行", "Counter account"],
     ),
     "对方行号": ColumnMapping(field="counter_bank_code", aliases=["对方银行行号"]),
     "对方行名": ColumnMapping(
         field="counter_bank_name",
         aliases=["对方开户行", "对方银行名称", "对手机构", "Counterparty Institution"],
     ),
-    "交易渠道": ColumnMapping(field="channel", aliases=["渠道", "交易方式", "交易地点"]),
-    "用途": ColumnMapping(field="purpose", aliases=["交易用途", "交易附言", "附言"]),
+    "交易渠道": ColumnMapping(field="channel", aliases=["渠道", "交易方式"]),
+    "用途": ColumnMapping(field="purpose", aliases=["交易用途"]),
+    "交易流水号": ColumnMapping(
+        field="reference",
+        aliases=["柜员流水号", "流水号", "电子回单编号", "Reference", "Reference No."],
+    ),
+    "交易附言": ColumnMapping(field="remittance_note", aliases=["附言"]),
+    "备注": ColumnMapping(field="note", aliases=["Remarks", "Notes"]),
+    "交易地点": ColumnMapping(field="transaction_location", aliases=["交易场所", "Trading Place"]),
+    "币种": ColumnMapping(field="currency", aliases=["币别", "货币", "Currency"]),
+    "子账号": ColumnMapping(field="sub_account", aliases=["子账户"]),
+    "钞汇": ColumnMapping(
+        field="cash_remittance",
+        aliases=["现/转", "现金/转账", "现转标志", "现金/转账标志"],
+    ),
+    "凭证种类": ColumnMapping(field="voucher_type", aliases=["凭证类型"]),
+    "凭证号": ColumnMapping(field="voucher_number", aliases=["凭证号码"]),
+    "交易代码": ColumnMapping(field="transaction_code", aliases=["业务代码"]),
+    "交易机构": ColumnMapping(field="transaction_institution", aliases=["经办机构"]),
+    "柜员号": ColumnMapping(field="teller_id", aliases=["柜员"]),
+    "记账日期": ColumnMapping(field="posting_date", format_hint="date", aliases=["会计日期", "Accounting Date"]),
+    "交易名称": ColumnMapping(field="transaction_name", aliases=["交易描述", "Transaction Name"]),
+    "起息日": ColumnMapping(field="value_date", format_hint="date", aliases=["起息日期", "Value Date"]),
+    "银行流水": ColumnMapping(field="bank_serial", aliases=["Bank Serial"]),
+    "业务明细": ColumnMapping(field="business_detail", aliases=["Business Detail"]),
+    "业务背景": ColumnMapping(field="business_context", aliases=["Business Context"]),
+    "业务系统参考号": ColumnMapping(field="business_system_reference", aliases=["System Reference"]),
 }
 
 BANK_STANDARD_FIELDS = [
@@ -130,6 +178,10 @@ BANK_STANDARD_FIELDS = [
     "direction",
     "amount",
     "balance",
+    "own_account",
+    "deposit_type",
+    "region_code",
+    "sub_account",
     "counter_party",
     "counter_account",
     "sequence_no",
@@ -138,6 +190,24 @@ BANK_STANDARD_FIELDS = [
     "channel",
     "purpose",
     "counterparty_status",
+    "cash_remittance",
+    "currency",
+    "note",
+    "posting_date",
+    "reference",
+    "remittance_note",
+    "teller_id",
+    "transaction_code",
+    "transaction_institution",
+    "transaction_location",
+    "transaction_name",
+    "value_date",
+    "bank_serial",
+    "business_detail",
+    "business_context",
+    "business_system_reference",
+    "voucher_number",
+    "voucher_type",
 ]
 
 BANK_DATA_DICTIONARY: dict[str, Any] = {
@@ -147,12 +217,54 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "subject_id": {"label": "账户标识", "type": "long_id", "sensitive": True, "display": "masked"},
         "account_holder": {"label": "账户名称", "type": "string"},
         "account_number": {"label": "账号", "type": "long_id", "sensitive": True, "display": "masked"},
+        "customer_number": {
+            "label": "客户号",
+            "type": "long_id",
+            "sensitive": True,
+            "display": "masked",
+        },
         "bank_name": {"label": "开户银行", "type": "string"},
+        "branch_name": {"label": "开户机构", "type": "string"},
+        "account_type": {"label": "账户类型", "type": "string"},
+        "deposit_type": {"label": "存款种类", "type": "string"},
+        "statement_number": {"label": "账单号", "type": "string"},
         "query_period": {"label": "查询期间", "type": "string"},
         "period_start": {"label": "账期开始", "type": "date"},
         "period_end": {"label": "账期结束", "type": "date"},
         "print_date": {"label": "打印日期", "type": "date"},
+        "document_date": {"label": "单据日期", "type": "date"},
         "total_transactions": {"label": "交易总笔数", "type": "integer"},
+        "total_amount": {"label": "交易总金额", "type": "money"},
+        "debit_count": {"label": "借方总笔数", "type": "integer"},
+        "debit_total": {"label": "借方总金额", "type": "money"},
+        "credit_count": {"label": "贷方总笔数", "type": "integer"},
+        "credit_total": {"label": "贷方总金额", "type": "money"},
+        "source_unitemized_debit_count": {
+            "label": "来源未逐笔列示借方笔数",
+            "type": "integer",
+            "definition": "来源借方汇总与可见逐笔交易之间、经跨页承前余额独立核对的笔数差额。",
+            "derived": True,
+        },
+        "source_unitemized_debit_amount": {
+            "label": "来源未逐笔列示借方金额",
+            "type": "money",
+            "definition": "来源借方汇总与可见逐笔交易之间、经跨页承前余额独立核对的金额差额。",
+            "derived": True,
+        },
+        "source_unitemized_credit_count": {
+            "label": "来源未逐笔列示贷方笔数",
+            "type": "integer",
+            "definition": "来源贷方汇总与可见逐笔交易之间、经跨页承前余额独立核对的笔数差额。",
+            "derived": True,
+        },
+        "source_unitemized_credit_amount": {
+            "label": "来源未逐笔列示贷方金额",
+            "type": "money",
+            "definition": "来源贷方汇总与可见逐笔交易之间、经跨页承前余额独立核对的金额差额。",
+            "derived": True,
+        },
+        "opening_balance": {"label": "期初余额", "type": "money"},
+        "closing_balance": {"label": "期末余额", "type": "money"},
         "currency": {"label": "币种", "type": "string"},
         "statement_title": {"label": "流水标题", "type": "string"},
         "style_id": {"label": "版式标识", "type": "string"},
@@ -172,16 +284,33 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "extract_status": {"label": "提取状态", "type": "string"},
         "blo_tables_parsed": {"label": "BLO 已解析表数", "type": "integer"},
         "blo_tables_skipped": {"label": "BLO 已跳过表数", "type": "integer"},
+        "extraction_route": {"label": "提取路线", "type": "string"},
         "source_reported_transaction_count": {"label": "原文报告交易笔数", "type": "integer"},
         "document_scene_refined": {"label": "修正文档场景", "type": "string"},
         "layout_profile_id_refined": {"label": "修正版式配置", "type": "string"},
         "layout_profile_refine_confidence": {"label": "版式修正置信度", "type": "number"},
     },
     "record_columns": {
+        "statement_header_id": {
+            "label": "流水表头记录ID",
+            "type": "string",
+            "definition": "关联 statement_header 数据集中的来源流水表头记录。",
+        },
+        "statement_title": {"label": "流水标题", "type": "string"},
+        "account_holder": {"label": "账户名称", "type": "string"},
+        "bank_name": {"label": "开户银行", "type": "string"},
+        "query_period": {"label": "查询期间", "type": "string"},
+        "period_start": {"label": "账期开始", "type": "date"},
+        "period_end": {"label": "账期结束", "type": "date"},
+        "print_date": {"label": "打印日期", "type": "date"},
+        "document_date": {"label": "单据日期", "type": "date"},
         "amount": {"label": "交易金额", "type": "money"},
-        "amount_cny": {"label": "折合人民币金额", "type": "money", "unit": "CNY"},
         "balance": {"label": "账户余额", "type": "money"},
         "channel": {"label": "交易渠道", "type": "string"},
+        "own_account": {"label": "本方账号", "type": "long_id"},
+        "deposit_type": {"label": "储种", "type": "string"},
+        "region_code": {"label": "地区代码", "type": "string"},
+        "sub_account": {"label": "子账号", "type": "long_id"},
         "counter_account": {"label": "对方账号", "type": "long_id"},
         "counter_bank_code": {"label": "对方银行代码", "type": "string"},
         "counter_bank_name": {"label": "对方银行名称", "type": "string"},
@@ -194,6 +323,140 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "sequence_no": {"label": "序号", "type": "long_id"},
         "summary": {"label": "摘要", "type": "string"},
         "timestamp": {"label": "交易时间", "type": "datetime"},
+        "cash_remittance": {"label": "钞汇/现转", "type": "string"},
+        "currency": {"label": "币种", "type": "string"},
+        "note": {"label": "备注", "type": "string"},
+        "posting_date": {"label": "记账日期", "type": "date"},
+        "remittance_note": {"label": "附言", "type": "string"},
+        "teller_id": {"label": "柜员号", "type": "string"},
+        "transaction_code": {"label": "交易代码", "type": "string"},
+        "transaction_institution": {"label": "交易机构", "type": "string"},
+        "transaction_location": {"label": "交易地点", "type": "string"},
+        "transaction_name": {"label": "交易名称", "type": "string"},
+        "value_date": {"label": "起息日", "type": "date"},
+        "bank_serial": {"label": "银行流水", "type": "string"},
+        "business_detail": {"label": "业务明细", "type": "string"},
+        "business_context": {"label": "业务背景", "type": "string"},
+        "business_system_reference": {"label": "业务系统参考号", "type": "string"},
+        "voucher_number": {"label": "凭证号", "type": "string"},
+        "voucher_type": {"label": "凭证种类", "type": "string"},
+    },
+    "datasets": {
+        "statement_header": {
+            "definition": "一行对应一个来源银行流水表头或账户账期范围。",
+            "columns": {
+                "statement_title": {"label": "流水标题", "type": "string"},
+                "bank_name": {"label": "开户银行", "type": "string"},
+                "account_holder": {"label": "账户名称", "type": "string"},
+                "account_number": {
+                    "label": "账号",
+                    "type": "long_id",
+                    "sensitive": True,
+                    "display": "masked",
+                },
+                "card_number": {
+                    "label": "卡号",
+                    "type": "long_id",
+                    "sensitive": True,
+                    "display": "masked",
+                },
+                "internal_account": {
+                    "label": "内部账号",
+                    "type": "long_id",
+                    "sensitive": True,
+                    "display": "masked",
+                },
+                "customer_number": {
+                    "label": "客户号",
+                    "type": "long_id",
+                    "sensitive": True,
+                    "display": "masked",
+                },
+                "branch_name": {"label": "开户机构", "type": "string"},
+                "transaction_institution": {"label": "交易机构", "type": "string"},
+                "accepting_branch": {"label": "受理机构", "type": "string"},
+                "account_type": {"label": "账户类型", "type": "string"},
+                "deposit_type": {"label": "存款种类", "type": "string"},
+                "cash_remittance": {"label": "钞汇/现转", "type": "string"},
+                "statement_number": {"label": "账单号", "type": "string"},
+                "statement_code": {"label": "账单代码", "type": "string"},
+                "statement_type": {"label": "账单类型", "type": "string"},
+                "list_number": {"label": "清单编号", "type": "string"},
+                "statement_month": {"label": "账单月份", "type": "string"},
+                "statement_year": {"label": "账单年份", "type": "integer"},
+                "statement_month_number": {"label": "账单月", "type": "integer"},
+                "electronic_serial": {"label": "电子流水号", "type": "string"},
+                "verification_code": {"label": "验证码", "type": "string"},
+                "proof_number": {"label": "证明编号", "type": "string"},
+                "wechat_id": {"label": "微信号", "type": "string"},
+                "id_type": {"label": "证件类型", "type": "string"},
+                "id_number": {
+                    "label": "证件号码",
+                    "type": "long_id",
+                    "sensitive": True,
+                    "display": "masked",
+                },
+                "amount_unit": {"label": "金额单位", "type": "string"},
+                "currency": {"label": "币种", "type": "string"},
+                "query_period": {"label": "查询期间", "type": "string"},
+                "statement_period": {"label": "账单统计期间", "type": "string"},
+                "statement_cutoff_date": {"label": "出单截至日期", "type": "date"},
+                "period_start": {"label": "账期开始", "type": "date"},
+                "period_end": {"label": "账期结束", "type": "date"},
+                "query_date": {"label": "查询日期", "type": "string"},
+                "print_date": {"label": "打印日期", "type": "date"},
+                "print_timestamp": {"label": "打印时间", "type": "datetime"},
+                "query_timestamp": {"label": "查询时间", "type": "datetime"},
+                "application_time": {"label": "申请时间", "type": "datetime"},
+                "issue_date": {"label": "开立日期", "type": "date"},
+                "issue_timestamp": {"label": "开立时间", "type": "datetime"},
+                "document_date": {"label": "单据日期", "type": "date"},
+                "filter_condition": {"label": "筛选条件", "type": "string"},
+                "direction_filter": {"label": "交易方向筛选", "type": "string"},
+                "sort_order": {"label": "排序方向", "type": "string"},
+                "print_channel": {"label": "打印渠道", "type": "string"},
+                "print_teller": {"label": "打印柜员", "type": "string"},
+                "print_count": {"label": "打印次数", "type": "integer"},
+                "print_method": {"label": "打印方式", "type": "string"},
+                "device_number": {"label": "设备编号", "type": "string"},
+                "query_teller": {"label": "查询柜员", "type": "string"},
+                "department": {"label": "部门", "type": "string"},
+                "customer_branch": {"label": "客户行", "type": "string"},
+                "total_transactions": {"label": "交易总笔数", "type": "integer"},
+                "total_amount": {"label": "交易总金额", "type": "money"},
+                "debit_count": {"label": "借方总笔数", "type": "integer"},
+                "debit_total": {"label": "借方总金额", "type": "money"},
+                "credit_count": {"label": "贷方总笔数", "type": "integer"},
+                "credit_total": {"label": "贷方总金额", "type": "money"},
+                "source_unitemized_debit_count": {
+                    "label": "来源未逐笔列示借方笔数",
+                    "type": "integer",
+                    "derived": True,
+                },
+                "source_unitemized_debit_amount": {
+                    "label": "来源未逐笔列示借方金额",
+                    "type": "money",
+                    "derived": True,
+                },
+                "source_unitemized_credit_count": {
+                    "label": "来源未逐笔列示贷方笔数",
+                    "type": "integer",
+                    "derived": True,
+                },
+                "source_unitemized_credit_amount": {
+                    "label": "来源未逐笔列示贷方金额",
+                    "type": "money",
+                    "derived": True,
+                },
+                "opening_balance": {"label": "期初余额", "type": "money"},
+                "closing_balance": {"label": "期末余额", "type": "money"},
+                "brought_forward_balance": {"label": "承前余额", "type": "money"},
+                "account_balance": {"label": "账户余额", "type": "money"},
+                "summary_code": {"label": "摘要代码", "type": "string"},
+                "amount_upper_limit": {"label": "金额上限", "type": "money"},
+                "amount_lower_limit": {"label": "金额下限", "type": "money"},
+            },
+        }
     },
     "enums": {
         "direction": {"income": "收入", "expense": "支出"},
@@ -222,12 +485,53 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
 BANK_IDENTITY_FIELDS: Sequence[tuple[str, Sequence[str]]] = (
     ("account_holder", ("Account holder", "Account name", "Card holder", "Customer name", "户名", "账户名")),
     ("account_number", ("Account number", "Card number", "Customer account number", "账号", "账户号", "卡号")),
-    ("bank_name", ("Bank name", "Bank branch", "银行名称")),
+    ("bank_name", ("Bank name", "Issuer bank", "银行名称")),
+    ("branch_name", ("Bank branch", "Opening branch", "开户银行", "开户行", "开户机构", "打印机构")),
     ("query_period", ("Query period", "From/to date", "Period", "查询时间段", "交易时段")),
     ("print_date", ("打印日期",)),
     ("total_transactions", ("总笔数", "总条数")),
     ("currency", ("Currency", "币种")),
 )
+
+
+def _exact_source_value(raw_txn: dict[str, Any], aliases: Sequence[str]) -> Any:
+    """Return an exact or stacked-header source value, never a fuzzy substring."""
+
+    def source_header_identity(value: Any) -> str:
+        # Canonical-raw mapping must retain the source field's exact semantic
+        # identity.  The layout registry intentionally collapses roles such as
+        # ``交易时间`` into ``交易日期`` for parser matching; using that profile
+        # here would falsely claim a date-only source cell as a timestamp.
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or ""))).casefold()
+
+    normalized_aliases = {source_header_identity(alias) for alias in aliases if str(alias or "").strip()}
+    if not normalized_aliases:
+        return ""
+    for raw_header, value in raw_txn.items():
+        if str(raw_header).startswith("_"):
+            continue
+        header = source_header_identity(raw_header)
+        parts = {source_header_identity(part) for part in str(raw_header or "").splitlines() if str(part).strip()}
+        if header in normalized_aliases or parts.intersection(normalized_aliases):
+            return value
+    return ""
+
+
+def _normalize_source_business_date(value: str) -> str:
+    compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(value or "")))
+    if match := re.fullmatch(r"(?P<year>\d{2})(?P<month>\d{2})(?P<day>\d{2})", compact):
+        year = 2000 + int(match.group("year"))
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        try:
+            calendar.monthrange(year, month)
+            if not 1 <= day <= calendar.monthrange(year, month)[1]:
+                return compact
+        except (ValueError, OverflowError):
+            return compact
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    parsed = normalize_timestamp(compact)
+    return parsed[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", parsed) else parsed
 
 
 def _is_explicit_account_identity_label(value: str) -> bool:
@@ -285,6 +589,49 @@ class BankStatementCommunityPlugin(BaseTableParser):
     def standard_fields(self) -> list[str]:
         return BANK_STANDARD_FIELDS
 
+    def _normalize(self, raw_txn: dict[str, str]) -> dict[str, Any]:
+        """Use the shared mapper without inventing an unevidenced FX field."""
+        normalized = super()._normalize(raw_txn)
+        normalized.pop("amount_cny", None)
+        # ICBC's electronic debit-account history uses the bare source headers
+        # ``账号`` / ``储种`` / ``地区`` for account-owned attributes.  The base
+        # mapper's intentionally permissive substring fallback can otherwise
+        # copy bare ``账号`` into ``对方账号``.  Exact source roles win, and an
+        # ICBC row with no counterparty header must not acquire one by inference.
+        deposit_type = _exact_source_value(raw_txn, ("储种",))
+        region_code = _exact_source_value(raw_txn, ("地区",))
+        source_headers = {
+            re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(header or "")))
+            for header in raw_txn
+            if not str(header).startswith("_")
+        }
+        source_owned_bare_account = {"账号", "储种", "地区"}.issubset(source_headers)
+        own_account = _exact_source_value(
+            raw_txn,
+            ("账号", "本方账号", "本方账户") if source_owned_bare_account else ("本方账号", "本方账户"),
+        )
+        if own_account not in (None, ""):
+            normalized["own_account"] = re.sub(r"\s+", "", str(own_account))
+        else:
+            # Adding the shorter canonical header ``账号`` must not make the
+            # base substring matcher copy an explicit ``对方账号`` into this
+            # source-owned role.
+            normalized["own_account"] = ""
+        if deposit_type not in (None, ""):
+            normalized["deposit_type"] = str(deposit_type).strip()
+        if region_code not in (None, ""):
+            normalized["region_code"] = re.sub(r"\s+", "", str(region_code))
+        if source_owned_bare_account:
+            normalized["sub_account"] = ""
+            normalized["counter_party"] = ""
+            normalized["counter_account"] = ""
+            normalized["counter_bank_name"] = ""
+            normalized["counter_bank_code"] = ""
+        value_date = _exact_source_value(raw_txn, ("起息日", "起息日期", "Value Date"))
+        if value_date not in (None, ""):
+            normalized["value_date"] = _normalize_source_business_date(str(value_date))
+        return normalized
+
     @property
     def identity_fields(self) -> Sequence[tuple[str, Sequence[str]]]:
         return BANK_IDENTITY_FIELDS
@@ -304,20 +651,162 @@ class BankStatementCommunityPlugin(BaseTableParser):
         raw_txn: dict[str, Any],
         normalized: dict[str, Any],
     ) -> dict[str, Any]:
-        """Keep distinct source summary and purpose columns in canonical raw facts."""
-        values = super()._canonical_raw_values(raw_txn, normalized)
-        summary = next(
-            (str(raw_txn.get(key) or "").strip() for key in ("摘要描述", "交易摘要", "摘要") if raw_txn.get(key)),
-            "",
+        """Map exact source cells to canonical roles without derived backfill."""
+        values: dict[str, Any] = {}
+        for canonical_name, mapping in self.column_registry.items():
+            value = _exact_source_value(raw_txn, (canonical_name, *(mapping.aliases or [])))
+            if value not in (None, ""):
+                values[mapping.field] = value
+
+        # These source columns deliberately combine multiple business roles.
+        # Preserve the original cell in ``raw`` and expose only deterministic
+        # source-backed substrings in ``canonical_raw``; never label the whole
+        # compound as both a party and an account.
+        compound_value = _exact_source_value(
+            raw_txn,
+            ("交易对手信息", "对方账号与户名", "对方户名/账号"),
         )
-        remark = next(
-            (str(raw_txn.get(key) or "").strip() for key in ("交易附言", "附言", "用途", "备注") if raw_txn.get(key)),
-            "",
+        if compound_value not in (None, ""):
+            from docmirror.plugins.bank_statement.styles.grid_standard import _decompose_compound_counterparty
+
+            values.pop("counter_party", None)
+            values.pop("counter_account", None)
+            values.pop("counter_bank_name", None)
+            values.pop("counter_bank_code", None)
+            values.update(_decompose_compound_counterparty(str(compound_value)))
+
+        account_bank_value = _exact_source_value(
+            raw_txn,
+            ("对方账户/对方银行", "对方账号/对方银行"),
         )
-        if summary:
-            values["summary"] = summary
-        if normalized.get("purpose") and remark:
-            values["purpose"] = remark
+        if account_bank_value not in (None, ""):
+            from docmirror.plugins.bank_statement.styles.grid_standard import _decompose_account_and_bank
+
+            values.pop("counter_account", None)
+            values.pop("counter_bank_name", None)
+            values.update(_decompose_account_and_bank(str(account_bank_value)))
+
+        exact_party_value = _exact_source_value(
+            raw_txn,
+            ("对方户名", "对方账户名", "对方名称", "对手信息", "对手名称", "交易对方"),
+        )
+        if exact_party_value not in (None, ""):
+            from docmirror.plugins.bank_statement.styles.grid_standard import _split_embedded_counter_account
+
+            exact_party, embedded_account = _split_embedded_counter_account(str(exact_party_value))
+            if embedded_account:
+                values["counter_party"] = exact_party
+                values["counter_account"] = embedded_account
+                if account_bank_value not in (None, "") and not _decompose_account_and_bank(
+                    str(account_bank_value)
+                ):
+                    # The exact party cell supplied the missing account suffix;
+                    # under the adjacent exact compound header the remaining
+                    # source cell is therefore the bank value, not an account.
+                    values["counter_bank_name"] = str(account_bank_value).strip()
+
+        source_headers = {
+            re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(header or "")))
+            for header in raw_txn
+            if not str(header).startswith("_")
+        }
+        if not {"账号", "储种", "地区"}.issubset(source_headers):
+            bare_account = _exact_source_value(raw_txn, ("账号",))
+            if bare_account not in (None, ""):
+                values.pop("own_account", None)
+        cscb_headers = {
+            "交易日期",
+            "交易金额",
+            "账户余额",
+            "对方户名",
+            "对方账号",
+            "摘要/备注",
+            "编号",
+        }
+        if cscb_headers.issubset(source_headers):
+            summary = _exact_source_value(raw_txn, ("摘要/备注",))
+            reference = _exact_source_value(raw_txn, ("编号",))
+            values.pop("note", None)
+            values.pop("timestamp", None)
+            if summary not in (None, ""):
+                values["summary"] = summary
+            if reference not in (None, ""):
+                values["reference"] = reference
+
+        boc_headers = {
+            "序号",
+            "记账日",
+            "起息日",
+            "交易类型",
+            "凭证",
+            "凭证号码/业务编号/用途/摘要",
+            "借方发生额",
+            "贷方发生额",
+            "余额",
+            "机构/柜员/流水",
+            "备注",
+        }
+        if boc_headers.issubset(source_headers):
+            from docmirror.plugins.bank_statement.styles.grid_standard import _decompose_boc_business_columns
+
+            values.pop("summary", None)
+            values.pop("posting_date", None)
+            values.pop("purpose", None)
+            values.pop("reference", None)
+            values.update(_decompose_boc_business_columns(raw_txn, normalize_values=False))
+
+        bojs_headers = {
+            "序号",
+            "摘要/附言",
+            "币别",
+            "交易日期",
+            "交易类型",
+            "交易金额",
+            "账户余额",
+            "对方账号",
+            "对方户名",
+        }
+        if bojs_headers.issubset(source_headers):
+            from docmirror.plugins.bank_statement.styles.grid_standard import _decompose_bojs_summary
+
+            values.pop("timestamp", None)
+            values.pop("summary", None)
+            values.pop("transaction_name", None)
+            values.pop("transaction_code", None)
+            values.pop("reference", None)
+            date = _exact_source_value(raw_txn, ("交易日期",))
+            direction = _exact_source_value(raw_txn, ("交易类型",))
+            currency = _exact_source_value(raw_txn, ("币别",))
+            if date not in (None, ""):
+                values["date"] = date
+            if direction not in (None, ""):
+                values["direction"] = direction
+            if currency not in (None, ""):
+                values["currency"] = currency
+            values.update(_decompose_bojs_summary(raw_txn, normalize_values=False))
+
+        if "business_system_reference" not in values:
+            from docmirror.plugins.bank_statement.styles.grid_standard import (
+                _pab_labelled_fund_transfer_reference,
+            )
+
+            if transfer_reference := _pab_labelled_fund_transfer_reference(raw_txn):
+                values["business_system_reference"] = transfer_reference
+
+        # Split debit/credit columns are two independent source facts. Choose
+        # the exact non-zero source cell only after its explicit direction was
+        # resolved; never repair this later from normalized output.
+        direction = str(normalized.get("direction") or "")
+        amount_aliases = (
+            ("收入", "收入金额", "贷方发生额", "贷方", "转入金额")
+            if direction == "income"
+            else ("支出", "支出金额", "借方发生额", "借方", "转出金额")
+            if direction == "expense"
+            else ()
+        )
+        source_amount = _exact_source_value(raw_txn, amount_aliases)
+        if source_amount not in (None, ""):
+            values["amount"] = source_amount
         return values
 
     def _recover_identity_from_evidence(self, parse_result) -> dict[str, dict[str, object]]:
@@ -358,10 +847,16 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 r"\s*[:：]\s*([0-9*＊-]+)",
             ),
             "currency": ("币种", r"币种\s*[:：]\s*([^\s]+)"),
-            "bank_name": (
+            "branch_name": (
                 "开户行",
                 r"开户行\s*(?:The Bank(?:\s+of Account Opening)?)?\s*"
                 r"([\u4e00-\u9fa5]{2,30}银行[\u4e00-\u9fa5]{0,30}?)(?=\s+(?:客户号|Customer Number|账号|Account Number))",
+            ),
+            "bank_name": (
+                "银行名称",
+                r"(?:银行名称|Bank Name)\s*[:：]?\s*"
+                r"([\u4e00-\u9fa5A-Za-z（）()·\s]{2,40}?(?:银行|Bank)[\u4e00-\u9fa5A-Za-z（）()·\s]{0,24}?)"
+                r"(?=\s+(?:客户号|Customer Number|账号|Account Number|户名|币种)|$)",
             ),
         }
         recovered: dict[str, dict[str, object]] = {}
@@ -411,12 +906,12 @@ class BankStatementCommunityPlugin(BaseTableParser):
             recovered["query_period"] = detail
 
         if "total_transactions" not in recovered:
-            expected_rows = count_expected_rows_from_bank_footer(text)
-            if expected_rows > 0:
+            expected_evidence = resolve_row_count_evidence(text)
+            if is_authoritative_issuer_row_count(expected_evidence):
                 recovered["total_transactions"] = self._evidence_identity_detail(
                     "total_transactions",
                     "directional_counts",
-                    str(expected_rows),
+                    str(expected_evidence.count),
                     page_id=page_id,
                 )
 
@@ -518,24 +1013,43 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 detail["normalized_value"] = "CNY"
             recovered["currency"] = detail
 
-        bank_atom = _right_nearby_value(
-            "开户行",
+        issuer_atom = _right_nearby_value(
+            "银行名称",
             lambda value: any(marker in value for marker in ("银行", "信用社", "信用合作联社")) and len(value) <= 40,
         )
-        if bank_atom is None:
-            bank_atom = _right_nearby_value(
-                "打印机构",
-                lambda value: (
-                    any(marker in value for marker in ("银行", "信用社", "信用合作联社")) and len(value) <= 40
-                ),
-            )
-        if bank_atom is not None:
+        if issuer_atom is not None:
             recovered["bank_name"] = self._evidence_identity_detail(
                 "bank_name",
-                "开户行",
-                str(bank_atom.get("text") or "").strip(),
+                "银行名称",
+                str(issuer_atom.get("text") or "").strip(),
                 page_id=page_id,
-                evidence_ids=[str(bank_atom.get("id") or "")],
+                evidence_ids=[str(issuer_atom.get("id") or "")],
+            )
+
+        branch_match = next(
+            (
+                (label, atom)
+                for label in ("开户行", "开户机构", "打印机构")
+                if (
+                    atom := _right_nearby_value(
+                        label,
+                        lambda value: (
+                            any(marker in value for marker in ("银行", "信用社", "信用合作联社"))
+                            and len(value) <= 40
+                        ),
+                    )
+                )
+            ),
+            None,
+        )
+        if branch_match is not None:
+            branch_label, branch_atom = branch_match
+            recovered["branch_name"] = self._evidence_identity_detail(
+                "branch_name",
+                branch_label,
+                str(branch_atom.get("text") or "").strip(),
+                page_id=page_id,
+                evidence_ids=[str(branch_atom.get("id") or "")],
             )
         count_atom = _right_nearby_value(
             "汇总交易笔数",
@@ -575,6 +1089,8 @@ class BankStatementCommunityPlugin(BaseTableParser):
     def derive(self, parse_result, text: str = "") -> ProjectionData:
         """Run the style-aware extractor and return projector-local facts."""
         result = run_bank_statement_extract(parse_result, text, self)
+        if not is_source_bound_issuer_detail(result.identity_fields.get("bank_name")):
+            result.identity_fields.pop("bank_name", None)
         records = _sanitize_bank_records(result.records)
         result.emitted_rows = len(records)
         accounting_warnings = audit_row_accounting(
@@ -608,6 +1124,9 @@ class BankStatementCommunityPlugin(BaseTableParser):
             if len(period_dates) >= 2:
                 period = {"start": period_dates[0], "end": period_dates[1]}
         extra_domain_facts = result.style_meta.to_properties()
+        extra_domain_facts.pop("institution_hint", None)
+        extra_domain_facts.pop("institution_authority", None)
+        extra_domain_facts["extraction_route"] = result.extraction_route.value
         extra_domain_facts["data_dictionary"] = BANK_DATA_DICTIONARY
         bank_detail = result.identity_fields.get("bank_name")
         if isinstance(bank_detail, dict):
@@ -622,12 +1141,33 @@ class BankStatementCommunityPlugin(BaseTableParser):
             if bank_value:
                 extra_domain_facts["institution_hint"] = bank_value
                 extra_domain_facts["institution_authority"] = "identity.bank_name"
-        source_reported_count = count_expected_rows_from_bank_footer(
+        source_reported_evidence = resolve_row_count_evidence(
             result.ctx.full_text,
-            page_texts=page_texts_from_parse_result(parse_result),
+            page_texts=page_texts_with_business_headers(
+                parse_result,
+                page_texts_from_parse_result(parse_result),
+            ),
         )
-        if source_reported_count > 0:
-            extra_domain_facts["source_reported_transaction_count"] = source_reported_count
+        # Defend the public projection boundary independently of the shared
+        # pipeline. Generic identity routes may observe a count label, but only
+        # issuer evidence may publish an exact transaction total.
+        result.identity_fields.pop("total_transactions", None)
+        issuer_count_detail = authoritative_issuer_transaction_count_detail(source_reported_evidence)
+        if issuer_count_detail is not None:
+            result.identity_fields["total_transactions"] = issuer_count_detail
+            extra_domain_facts["source_reported_transaction_count"] = source_reported_evidence.count
+        statement_header_records = build_statement_header_records(
+            parse_result,
+            result.identity_fields,
+        )
+        records = attach_statement_context(records, statement_header_records)
+        statement_header_records = reconcile_source_unitemized_residuals(
+            parse_result,
+            records,
+            statement_header_records,
+            source_route=result.extraction_route.value,
+            selected_source=str(getattr(result.ctx.reconstruction, "source", "") or ""),
+        )
         projection = self._projection_data_from_components(
             identity_fields=result.identity_fields,
             records=records,
@@ -664,9 +1204,17 @@ class BankStatementCommunityPlugin(BaseTableParser):
             )
             if identity_values.get(source)
         }
+        datasets: dict[str, list[dict[str, Any]]] = {}
+        if statement_header_records:
+            datasets["statement_header"] = statement_header_records
+        datasets.update(projection.datasets)
+        semantic = dict(projection.semantic)
+        semantic["dataset_document_order"] = ["statement_header", "transactions"]
         return projection.model_copy(
             update={
                 "entity_fields": entity_fields,
+                "semantic": semantic,
+                "datasets": datasets,
                 "content_markdown_override": _render_bank_statement_content_markdown(
                     records,
                     identity_values,
@@ -763,20 +1311,13 @@ def _parse_result_source_pages(parse_result) -> dict[int, str]:
 
 
 def _sanitize_bank_records(records: list[dict]) -> list[dict]:
-    """Remove page furniture accidentally captured in bank transaction fields."""
+    """Sanitize derived display fields while preserving both source layers."""
     sanitized: list[dict] = []
     for record in records:
-        copied = {
-            key: dict(value) if key in {"raw", "normalized", "canonical_raw"} and isinstance(value, dict) else value
-            for key, value in dict(record).items()
-        }
-        for pool_name in ("raw", "normalized", "canonical_raw"):
-            pool = copied.get(pool_name)
-            if not isinstance(pool, dict):
-                continue
-            _sanitize_bank_value_pool(pool)
-        _repair_split_amount_canonical_raw(copied)
-        _repair_counterparty_canonical_raw(copied)
+        copied = copy.deepcopy(dict(record))
+        normalized = copied.get("normalized")
+        if isinstance(normalized, dict):
+            _sanitize_bank_value_pool(normalized)
         sanitized.append(copied)
     counterparty_aliases = _stable_counterparty_aliases(sanitized)
     for record in sanitized:
@@ -890,7 +1431,7 @@ def _sanitize_record_counterparty(record: dict, aliases: dict[str, str]) -> None
     account = _record_counter_account(record)
     summary = _record_summary(record)
     alias = aliases.get(account, "") if account else ""
-    for pool_name in ("raw", "normalized", "canonical_raw"):
+    for pool_name in ("normalized",):
         pool = record.get(pool_name)
         if not isinstance(pool, dict):
             continue
@@ -900,12 +1441,15 @@ def _sanitize_record_counterparty(record: dict, aliases: dict[str, str]) -> None
                 continue
             cleaned = _clean_counterparty_text(value)
             polluted = _looks_like_counterparty_pollution(value) or _looks_like_counterparty_pollution(cleaned)
-            if alias and (not cleaned or polluted or _looks_like_counterparty_residue(cleaned)):
+            residue = _looks_like_counterparty_residue(cleaned)
+            if alias and cleaned and cleaned.startswith(alias):
+                # The alias only shortens a value that is already present in
+                # this source row.  It must never populate an empty/residual
+                # party from another transaction that happens to share the
+                # same counter-account.
                 cleaned = alias
-            elif polluted:
+            elif polluted or residue:
                 cleaned = ""
-            elif alias and cleaned.startswith(alias) and len(cleaned) > len(alias) + 1:
-                cleaned = alias
             if _is_fee_residue_counterparty(cleaned, summary):
                 cleaned = ""
             pool[key] = cleaned
@@ -960,6 +1504,8 @@ def _usable_counterparty_alias(value: str) -> bool:
 
 def _clean_counterparty_text(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if unicodedata.normalize("NFKC", text).casefold() == "null":
+        return ""
     text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff(（])", "", text)
     text = re.sub(r"(?<=[)）])\s+(?=[\u4e00-\u9fff])", "", text)
     if text in {"入", "收", "出", "支", "限公司", "有限公司", "代收）", "代收)"}:
@@ -1071,7 +1617,7 @@ def _bank_statement_header_lines(identity: dict[str, str], period: str | dict) -
     lines = [f"# {_markdown_cell(statement_title)}" if statement_title else "# 银行流水"]
     labels = [
         ("银行名称", identity.get("bank_name") or ""),
-        ("开户行/客户行", identity.get("bank_branch") or ""),
+        ("开户行/客户行", identity.get("branch_name") or identity.get("bank_branch") or ""),
         ("户名", identity.get("account_holder") or ""),
         ("账号", identity.get("account_number") or ""),
         ("币种", identity.get("currency") or ""),

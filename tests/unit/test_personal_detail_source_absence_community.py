@@ -654,6 +654,120 @@ def test_employment_and_agreement_absence_requires_direct_exact_dash_proof(
     } == expected_agreement_failures
 
 
+def test_cao_agreement_dash_pairs_do_not_survive_as_community_errors(
+    tmp_path: Path,
+) -> None:
+    cao_agreements = {
+        "credit_line:cao:1": "D10055840H0001LCNC536680000000381099220210922114917",
+        "credit_line:cao:2": "T10156530H0001573819102800057385",
+    }
+    stale_targets = {
+        ("credit_agreements", record_id, field_name)
+        for record_id in cao_agreements
+        for field_name in ("credit_limit", "limit_identifier")
+    }
+    control_id = "credit_line:non-dash-control"
+    control_targets = {
+        ("credit_agreements", control_id, field_name)
+        for field_name in ("credit_limit", "limit_identifier")
+    }
+    source: dict[str, list[dict[str, Any]]] = {
+        "credit_lines": [
+            *[
+                _record(
+                    record_id,
+                    credit_line_id=record_id,
+                    account_identifier=identifier,
+                    sequence=sequence,
+                    credit_limit=None,
+                    limit_identifier=None,
+                    _source_absent_fields=["credit_limit", "limit_identifier"],
+                    canonical_raw={
+                        "credit_limit": "--",
+                        "limit_identifier": "--",
+                    },
+                )
+                for sequence, (record_id, identifier) in enumerate(
+                    cao_agreements.items(), start=1
+                )
+            ],
+            _record(
+                control_id,
+                credit_line_id=control_id,
+                account_identifier="T10151210H0001NONABSENT00001",
+                sequence=3,
+                credit_limit=None,
+                limit_identifier=None,
+                _source_absent_fields=["credit_limit", "limit_identifier"],
+                canonical_raw={
+                    "credit_limit": ["--", "8500"],
+                    "limit_identifier": "**",
+                },
+            ),
+        ],
+        "personal_detail_extraction_issues": [
+            *[
+                _issue(
+                    f"issue:{record_id}:{field_name}",
+                    dataset="credit_lines",
+                    record_id=record_id,
+                    field_name=field_name,
+                    observed_value=["--"],
+                    issue_code="candidate_b_credit_agreement_required_field_unresolved",
+                )
+                for record_id in cao_agreements
+                for field_name in ("credit_limit", "limit_identifier")
+            ],
+            *[
+                _issue(
+                    f"issue:{control_id}:{field_name}",
+                    dataset="credit_lines",
+                    record_id=control_id,
+                    field_name=field_name,
+                    observed_value=(
+                        ["--", "8500"]
+                        if field_name == "credit_limit"
+                        else ["**"]
+                    ),
+                    issue_code="candidate_b_credit_agreement_required_field_unresolved",
+                )
+                for field_name in ("credit_limit", "limit_identifier")
+            ],
+        ],
+    }
+
+    payload = _community_payload(tmp_path, source)
+    datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
+    agreements = {
+        row["record_id"]: row
+        for row in datasets["credit_agreements"]["rows"]
+    }
+    issue_targets = {
+        (
+            row["normalized"].get("target_dataset"),
+            row["normalized"].get("target_record_id"),
+            row["normalized"].get("field_name"),
+        )
+        for row in datasets["extraction_issues"]["rows"]
+    }
+    observation_targets = {
+        (
+            row["normalized"].get("dataset_name"),
+            row["normalized"].get("business_record_id"),
+            row["normalized"].get("field_name"),
+        )
+        for row in datasets["field_observations"]["rows"]
+    }
+
+    for record_id in cao_agreements:
+        assert agreements[record_id]["normalized"]["credit_limit"] is None
+        assert agreements[record_id]["normalized"]["limit_identifier"] is None
+    assert stale_targets.isdisjoint(issue_targets)
+    assert stale_targets.isdisjoint(observation_targets)
+    assert control_targets <= issue_targets
+    assert control_targets <= observation_targets
+
+
 def _spouse_absence_status() -> dict[str, Any]:
     return _record(
         "status:spouse",
@@ -1030,8 +1144,8 @@ def test_community_never_publishes_cross_plane_or_terminal_status_conflicts(
         bbox=[10.0, 300.0, 590.0, 400.0],
         metadata={
             "raw_rows": [
-                ["物 账户状态 爱", "? 账户关闭日期"],
-                ["家 结清", "Q 2020.02.21"],
+                ["账户状态", "账户关闭日期"],
+                ["结清", "2020.02.21"],
             ]
         },
     )

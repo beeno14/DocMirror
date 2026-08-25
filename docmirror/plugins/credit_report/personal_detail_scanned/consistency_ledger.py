@@ -673,7 +673,19 @@ def _institution_observations(
     return observations
 
 
-def _institution_root_witnesses(datasets: Mapping[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def _institution_exact_value_witnesses(
+    datasets: Mapping[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Index clean institutions by their complete non-whitespace glyph sequence.
+
+    A shared legal root proves only an institution family.  It cannot prove
+    that a separated leading/trailing glyph belongs to a neighbouring cell, so
+    it must never authorize deletion or replacement of that glyph.  Exact
+    page-evidence correction is performed upstream against the same canonical
+    field/source cell; this document-local ledger permits only presentation-
+    whitespace collapse of an otherwise identical complete value.
+    """
+
     witnesses: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen: set[tuple[str, tuple[str, ...]]] = set()
     for dataset, field_names in _INSTITUTION_FIELDS.items():
@@ -691,18 +703,17 @@ def _institution_root_witnesses(datasets: Mapping[str, Any]) -> dict[str, list[d
                 compact = _compact(candidate)
                 if not _valid_complete_institution(compact):
                     continue
-                root = _legal_root(compact)
                 locator = _canonical_source_field_locator(refs) or (
                     "record",
                     dataset,
                     record_id,
                     field_name,
                 )
-                marker = (root or "", locator)
-                if not root or marker in seen:
+                marker = (compact, locator)
+                if marker in seen:
                     continue
                 seen.add(marker)
-                witnesses[root].append(
+                witnesses[compact].append(
                     {
                         "dataset": dataset,
                         "record_id": record_id,
@@ -720,7 +731,7 @@ def _repair_separated_institution_prefixes(
     datasets: MutableMapping[str, Any],
     audit: Counter[str],
 ) -> None:
-    witnesses_by_root = _institution_root_witnesses(datasets)
+    witnesses_by_exact_value = _institution_exact_value_witnesses(datasets)
     for dataset, field_names in _INSTITUTION_FIELDS.items():
         for index, raw_record in enumerate(datasets.get(dataset) or (), start=1):
             if not isinstance(raw_record, MutableMapping):
@@ -739,10 +750,14 @@ def _repair_separated_institution_prefixes(
                 if len(distinct) != 1:
                     continue
                 prefix, remainder = next(iter(distinct))
-                root = _legal_root(remainder)
+                raw = candidates[0][0]
+                complete_value = _compact(raw)
+                if complete_value != f"{prefix}{remainder}":
+                    continue
+                root = _legal_root(complete_value)
                 witnesses = [
                     witness
-                    for witness in witnesses_by_root.get(root or "", ())
+                    for witness in witnesses_by_exact_value.get(complete_value, ())
                     if not (
                         witness["dataset"] == dataset and witness["record_id"] == record_id
                     )
@@ -752,7 +767,6 @@ def _repair_separated_institution_prefixes(
                     for witness in witnesses
                 }
                 refs = _field_refs(raw_record, field_name)
-                raw = candidates[0][0]
                 if _has_active_withheld_field_issue(
                     context,
                     dataset=dataset,
@@ -766,18 +780,16 @@ def _repair_separated_institution_prefixes(
                 ):
                     # Final inquiry grouping has already compared the exact
                     # OCR planes and decided that the separated leading glyph
-                    # is not source-resolvable.  Document-local legal-root
-                    # witnesses prove only the institution family, not this
-                    # exact branch boundary, so they must not repopulate the
-                    # field behind the active withholding issue.
+                    # is not source-resolvable.  No document-local comparison
+                    # may repopulate the field behind that same-cell decision.
                     values.pop(field_name, None)
                     _preserve_raw(raw_record, field_name, raw)
                     _mark_uncertain(raw_record, field_name)
                     audit["institution_prefix_issue_reused"] += 1
                     audit["institution_prefix_unresolved"] += 1
                     continue
-                if root and len(witness_locators) >= 2:
-                    values[field_name] = remainder
+                if len(witness_locators) >= 2:
+                    values[field_name] = complete_value
                     _preserve_raw(raw_record, field_name, raw)
                     _clear_resolved_marker(raw_record, field_name)
                     _prune_stale_resolved_field_issues(
@@ -791,15 +803,16 @@ def _repair_separated_institution_prefixes(
                         category="ocr_cell_level_error",
                         issue_code="candidate_b_document_local_institution_prefix_resolved",
                         message=(
-                            "One separated OCR glyph was removed only because the remaining complete "
-                            "institution legal root had two independent source-bound witnesses in this report."
+                            "Presentation whitespace was collapsed only because the complete non-whitespace "
+                            "institution glyph sequence had two independent source-bound witnesses in this "
+                            "report; no institution glyph was deleted or replaced."
                         ),
                         dataset=dataset,
                         record_id=record_id,
                         field_name=field_name,
                         observed_value={"raw": raw, "separated_glyph": prefix},
                         candidate_value={
-                            "normalized_institution": remainder,
+                            "normalized_institution": complete_value,
                             "legal_root": root,
                             "independent_witness_count": len(witness_locators),
                         },
@@ -812,10 +825,10 @@ def _repair_separated_institution_prefixes(
                             ],
                         ],
                         reason_codes=(
-                            "single_separated_han_glyph_residue",
-                            "complete_institution_remainder",
-                            "document_local_legal_root_corroborated_twice",
-                            "professional_field_correction",
+                            "separated_han_whitespace_boundary",
+                            "complete_non_whitespace_glyph_sequence_preserved",
+                            "document_local_exact_institution_corroborated_twice",
+                            "whitespace_only_normalization",
                         ),
                         severity="info",
                         status="resolved",
@@ -837,22 +850,25 @@ def _repair_separated_institution_prefixes(
                         category="ocr_cell_level_error",
                         issue_code="candidate_b_document_local_institution_prefix_unresolved",
                         message=(
-                            "An institution field had a separated leading glyph, but the complete remainder "
-                            "lacked two independent document-local legal-root witnesses."
+                            "An institution field had a separated leading glyph, but its complete non-whitespace "
+                            "glyph sequence lacked two independent exact document-local witnesses; legal-root "
+                            "repetition alone is not correction proof."
                         ),
                         dataset=dataset,
                         record_id=record_id,
                         field_name=field_name,
                         observed_value={"raw": raw, "separated_glyph": prefix},
                         candidate_value={
+                            "withheld_complete_value": complete_value,
                             "withheld_remainder": remainder,
                             "legal_root": root,
                             "independent_witness_count": len(witness_locators),
                         },
                         source_refs=refs,
                         reason_codes=(
-                            "single_separated_han_glyph_residue",
-                            "document_local_legal_root_not_sufficiently_corroborated",
+                            "separated_han_glyph_boundary",
+                            "document_local_exact_institution_not_sufficiently_corroborated",
+                            "legal_root_repetition_not_correction_proof",
                             "normalized_value_withheld",
                         ),
                     )

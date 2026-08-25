@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from docmirror.plugins._base.semantic_solution import DomainSolution
@@ -32,7 +33,19 @@ _AMOUNT_RE = re.compile(r"(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}(?!\d)")
 _ACCOUNT_HOLDER_RE = re.compile(r"账户名称[:：]\s*(?P<value>[^\n\r]+)")
 _ACCOUNT_NUMBER_RE = re.compile(r"账号[:：]\s*(?P<value>[0-9*＊\s]{6,40})")
 _PERIOD_RE = re.compile(r"起始日期[:：]\s*(?P<start>\d{4}-\d{2}-\d{2})\s*终止日期[:：]\s*(?P<end>\d{4}-\d{2}-\d{2})")
-_BANK_RE = re.compile(r"(?P<bank>[\u4e00-\u9fa5]{2,20}银行)")
+_ISSUER_BANK_LABEL_RE = re.compile(
+    r"(?:银行名称|Bank Name)\s*[:：]?\s*(?P<bank>[\u4e00-\u9fa5A-Za-z（）()·\s]{2,40}?(?:银行|Bank))",
+    re.I,
+)
+_ISSUER_TITLE_RE = re.compile(
+    r"(?m)^\s*(?P<bank>[\u4e00-\u9fa5·]{2,24}?(?:银行|信用社|信用合作联社))"
+    r"(?=.{0,20}(?:账户|交易|明细|对账|流水|账单))"
+)
+_OPENING_BRANCH_RE = re.compile(
+    r"(?:开户行|开户机构|Bank Branch|Opening Branch)\s*[:：]?\s*"
+    r"(?P<branch>[\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)(?=\s{2,}|币种|年份|月份|账号|户名|\n|\r|$)",
+    re.I,
+)
 _NOISE_RE = re.compile(r"CPKYG[0-9A-Z]+|打印时间|回单专用章")
 _VERTICAL_NOISE_TOKENS = {"第", "页"}
 
@@ -122,8 +135,12 @@ def extract_identity(text: str) -> dict[str, str]:
         out["account_number"] = re.sub(r"\s+", " ", m.group("value")).strip()
     if m := _PERIOD_RE.search(text or ""):
         out["query_period"] = f"{m.group('start')} ~ {m.group('end')}"
-    if m := _BANK_RE.search(text or ""):
+    if m := _ISSUER_BANK_LABEL_RE.search(text or ""):
+        out["bank_name"] = m.group("bank").strip()
+    elif m := _ISSUER_TITLE_RE.search(text or ""):
         out["bank_name"] = m.group("bank")
+    if m := _OPENING_BRANCH_RE.search(text or ""):
+        out["branch_name"] = m.group("branch").strip()
     if "人民币" in (text or ""):
         out["currency"] = "CNY"
     return out
@@ -394,7 +411,7 @@ def _extract_counterparty(text: str) -> tuple[str, str]:
     account = ""
     for match in re.finditer(r"\b\d{10,30}\b", cleaned):
         value = match.group(0)
-        if value.startswith(("2022", "2023")):
+        if _has_compact_date_prefix(value):
             continue
         account = value
         break
@@ -410,6 +427,21 @@ def _extract_counterparty(text: str) -> tuple[str, str]:
         party = value
         break
     return account, party
+
+
+def _has_compact_date_prefix(value: str) -> bool:
+    """Recognize a calendar-valid YYYYMMDD prefix without corpus-year lists."""
+
+    if len(value) < 8 or not value[:8].isdigit():
+        return False
+    year, month, day = int(value[:4]), int(value[4:6]), int(value[6:8])
+    if not 1900 <= year <= 2100:
+        return False
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    return True
 
 
 def _money(value: str) -> float:

@@ -1621,7 +1621,12 @@ def _attach_page_coordinates(atom: EvidenceAtom, page: EvidencePage) -> None:
     bbox = _bbox(atom.bbox)
     inverse = transform.get("inverse_matrix")
     if bbox and _is_matrix3(inverse):
-        atom.source_bbox = _transform_bbox_with_matrix(inverse, bbox)
+        if transform.get("deskew_applied") is True:
+            source_quad = _transform_quad_with_matrix(inverse, bbox)
+            atom.source_bbox = _quad_bbox(source_quad)
+            atom.metadata["source_quad"] = source_quad
+        else:
+            atom.source_bbox = _transform_bbox_with_matrix(inverse, bbox)
     elif bbox:
         atom.source_bbox = list(bbox)
 
@@ -1631,13 +1636,21 @@ def _is_matrix3(value: Any) -> bool:
 
 
 def _transform_bbox_with_matrix(matrix: list[list[float]], bbox: list[float]) -> list[float]:
+    points = _transform_quad_with_matrix(matrix, bbox)
+    return _quad_bbox(points)
+
+
+def _transform_quad_with_matrix(matrix: list[list[float]], bbox: list[float]) -> list[list[float]]:
     x0, y0, x1, y1 = bbox
-    points = [
-        _apply_coordinate_matrix(matrix, x0, y0),
-        _apply_coordinate_matrix(matrix, x1, y0),
-        _apply_coordinate_matrix(matrix, x1, y1),
-        _apply_coordinate_matrix(matrix, x0, y1),
+    return [
+        [round(value, 4) for value in _apply_coordinate_matrix(matrix, x0, y0)],
+        [round(value, 4) for value in _apply_coordinate_matrix(matrix, x1, y0)],
+        [round(value, 4) for value in _apply_coordinate_matrix(matrix, x1, y1)],
+        [round(value, 4) for value in _apply_coordinate_matrix(matrix, x0, y1)],
     ]
+
+
+def _quad_bbox(points: list[list[float]]) -> list[float]:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     return [round(min(xs), 4), round(min(ys), 4), round(max(xs), 4), round(max(ys), 4)]

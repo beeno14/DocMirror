@@ -7,10 +7,16 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("docmirror_enterprise", reason="enterprise package is not available in OSS CI")
-
-from docmirror_enterprise.plugins.bank_statement.quality import compute_quality
-from docmirror_enterprise.plugins.bank_statement.validation import run_validation
+quality_module = pytest.importorskip(
+    "docmirror_enterprise.plugins.bank_statement.quality",
+    reason="enterprise bank-statement quality package is not available in OSS CI",
+)
+validation_module = pytest.importorskip(
+    "docmirror_enterprise.plugins.bank_statement.validation",
+    reason="enterprise bank-statement validation package is not available in OSS CI",
+)
+compute_quality = quality_module.compute_quality
+run_validation = validation_module.run_validation
 
 
 def test_run_validation_balance_chain_passes():

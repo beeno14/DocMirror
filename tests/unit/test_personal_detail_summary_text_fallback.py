@@ -65,6 +65,7 @@ def test_text_header_and_headerless_table_form_one_credit_overview() -> None:
     table = SimpleNamespace(
         table_id="overview-tail",
         metadata={
+            "canonical_template_id": "information_summary",
             "raw_rows": [
                 ["", "其他类贷款", "20", "2013.07"],
                 ["", "2 贷记卡 n", "22", "2007:01"],
@@ -75,7 +76,14 @@ def test_text_header_and_headerless_table_form_one_credit_overview() -> None:
         bbox=[20, 120, 580, 260],
     )
     context = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=3, source_page_number=2, tables=[table])],
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=2,
+                canonical_template_id="information_summary",
+                tables=[table],
+            )
+        ],
         corrected_evidence_pages=lambda: [
             {
                 "page": 3,
@@ -117,6 +125,7 @@ def test_corrected_text_row_does_not_duplicate_same_native_summary_row() -> None
     table = SimpleNamespace(
         table_id="overview-complete",
         metadata={
+            "canonical_template_id": "information_summary",
             "raw_rows": [
                 ["信用业务概要", "", "", ""],
                 ["", "业务类型", "账户数", "首笔业务发放月份"],
@@ -128,7 +137,14 @@ def test_corrected_text_row_does_not_duplicate_same_native_summary_row() -> None
         bbox=[20, 20, 580, 200],
     )
     context = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=3, source_page_number=2, tables=[table])],
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=2,
+                canonical_template_id="information_summary",
+                tables=[table],
+            )
+        ],
         corrected_evidence_pages=lambda: [
             {
                 "page": 3,
@@ -181,6 +197,7 @@ def test_summary_table_anchor_with_zero_usable_rows_is_reported() -> None:
     table = SimpleNamespace(
         table_id="overview-empty",
         metadata={
+            "canonical_template_id": "information_summary",
             "raw_rows": [
                 ["信用业务概要", "", "", ""],
                 ["", "业务类型", "账户数", "首笔业务发放月份"],
@@ -191,7 +208,14 @@ def test_summary_table_anchor_with_zero_usable_rows_is_reported() -> None:
         bbox=[20, 20, 580, 120],
     )
     context = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=3, source_page_number=2, tables=[table])],
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=2,
+                canonical_template_id="information_summary",
+                tables=[table],
+            )
+        ],
         corrected_evidence_pages=lambda: [],
         _personal_detail_extraction_issues=[],
     )
@@ -210,6 +234,7 @@ def test_summary_count_month_category_collision_withholds_category_without_dupli
     table = SimpleNamespace(
         table_id="overview-conflict",
         metadata={
+            "canonical_template_id": "information_summary",
             "raw_rows": [
                 ["信用业务概要", "", "", ""],
                 ["", "业务类型", "账户数", "首笔业务发放月份"],
@@ -221,7 +246,14 @@ def test_summary_count_month_category_collision_withholds_category_without_dupli
         bbox=[20, 20, 580, 200],
     )
     context = SimpleNamespace(
-        pages=[SimpleNamespace(page_number=3, source_page_number=2, tables=[table])],
+        pages=[
+            SimpleNamespace(
+                page_number=3,
+                source_page_number=2,
+                canonical_template_id="information_summary",
+                tables=[table],
+            )
+        ],
         corrected_evidence_pages=lambda: [
             {
                 "page": 3,

@@ -191,5 +191,9 @@ def test_compatibility_headers_share_multi_page_signed_ledger_rules(document_typ
     ]
     assert [record["source"]["source_page"] for record in result.records] == [1, 1, 2, 2]
     assert all(record["source"]["page_range"][0] == record["source"]["page_range"][1] for record in result.records)
-    assert result.style_meta.expected_primary_rows == 4
+    # The logical table proves what this candidate emitted, not that the source
+    # document has no omitted terminal rows. Completeness remains unknown until
+    # an issuer-provided denominator is independently established.
+    assert result.style_meta.expected_primary_rows == 0
     assert result.style_meta.canonical_extracted == 4
+    assert result.style_meta.extract_status == "degraded"

@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 from docmirror.evidence.repair import RepairCandidate
+from docmirror.plugins.credit_report.personal_detail_scanned import relations
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
+    _final_account_field_is_valid,
     _reconcile_final_account_field_issues,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
@@ -16,12 +18,16 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues i
     make_issue,
     record_issue,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
+    validate_pboc_field,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _account_institution,
     _apply_account_facts,
     _date,
     _flush_pending_account_institution_observations,
     _liability_date,
+    _number,
     _source_ref,
     reconcile_candidate_b_credit_lines,
 )
@@ -43,6 +49,164 @@ def _overlay(**kwargs) -> PersonalDetailOCRCorrectionOverlay:
     return PersonalDetailOCRCorrectionOverlay(SimpleNamespace(), **kwargs)
 
 
+def _one_shot_page_line(
+    text: str,
+    *,
+    bbox: list[float],
+    confidence: float = 0.99,
+    page_key: str = "test-page",
+    word_index: int = 0,
+    content: str | None = None,
+) -> dict[str, object]:
+    line: dict[str, object] = {
+        "text": text,
+        "confidence": confidence,
+        "bbox": bbox,
+        "evidence_ids": [f"personal_detail_page_reocr:{page_key}:w{word_index}"],
+        "source": "personal_detail_page_reocr_once",
+    }
+    if content is not None:
+        line["content"] = content
+    return line
+
+
+@pytest.mark.parametrize("raw", ("1,2", "1,,2", "1,23,456", "12,34"))
+def test_integer_parser_never_concatenates_malformed_grouping(raw: str) -> None:
+    assert _number(raw) is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    (("0", 0), ("-12", -12), ("1,234", 1234), ("12,345,678", 12_345_678)),
+)
+def test_integer_parser_accepts_only_plain_or_registered_thousands_groups(
+    raw: str,
+    expected: int,
+) -> None:
+    assert _number(raw) == expected
+
+
+@pytest.mark.parametrize("value", ("1,2", "1,,000", "1234,567", "$1,200", True))
+def test_relations_number_rejects_malformed_presentation(value: object) -> None:
+    assert relations._number(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("1,200", "1200"), ("12,345.67", "12345.67"), ("1234.5", "1234.5")),
+)
+def test_relations_number_accepts_registered_presentation(
+    value: object,
+    expected: str,
+) -> None:
+    assert relations._number(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "role"),
+    (
+        ("1,2", "amount"),
+        ("1,,2", "amount"),
+        ("1,23,456", "nonnegative_integer"),
+        ("$13800138007", "mobile_phone"),
+        ("010-12345678?", "phone"),
+        ("010--12345678", "phone"),
+        ("010-12-345-678", "phone"),
+        ("010))12345678", "phone"),
+        ("1-2-3-4-5", "phone"),
+        ("12345", "phone"),
+        ("010-12345678 ext 9", "phone"),
+        ("０１０－１２３４５６７８", "phone"),
+        ("010-\u200b12345678", "phone"),
+        ("１３８００１３８００７", "mobile_phone"),
+        ("138\u200b0013\u200b8007", "mobile_phone"),
+        ("138001380\u0660\u0667", "mobile_phone"),
+        ("０１０１２３４５６７８", "phone"),
+        ("\u0660\u0661\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668", "phone"),
+        ("1O0", "amount"),
+        ("B", "amount"),
+        ("I2", "nonnegative_integer"),
+        ("ABCD,1234", "account_identifier"),
+        ("X2024-01-02Y", "date"),
+        ("X20240102123456Y", "report_datetime"),
+        ("正常,", "account_state"),
+        ("正常；", "five_tier_class"),
+        ("个人住房贷款,", "summary_business_category"),
+        ("11O10519491231002X", "identity_document_number"),
+        ("110105-19491231-002X", "identity_document_number"),
+        ("110105 19491231 002X", "identity_document_number"),
+    ),
+)
+def test_typed_overlay_never_deletes_unregistered_punctuation(
+    raw: str,
+    role: str,
+) -> None:
+    overlay = _overlay()
+
+    normalized, decision = overlay.correct_text(raw, role=role)
+
+    assert normalized == raw
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    ("field_name", "raw"),
+    (
+        ("mobile_phone", "138\u200b0013\u200b8007"),
+        ("mobile_phone", "１３８００１３８００７"),
+        ("mobile_phone", "138001380\u0660\u0667"),
+        ("phone", "０１０１２３４５６７８"),
+        ("phone", "\u0660\u0661\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668"),
+        ("phone", "010--12345678"),
+    ),
+)
+def test_final_overlay_withholds_non_ascii_or_unregistered_phone_grammar(
+    field_name: str,
+    raw: str,
+) -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+
+    corrected = overlay.correct_business_candidates(
+        {"phone_records": [{"record_id": "phone:1", field_name: raw}]},
+        stage="candidate_b_final_validation",
+    )
+
+    record = corrected["phone_records"][0]
+    assert record[field_name] is None
+    assert record["canonical_raw"][field_name] == raw
+    assert any(
+        anomaly["field_name"] == field_name
+        and anomaly["normalized_value_withheld"] is True
+        for anomaly in overlay.audit()["cell_anomalies"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "role", "expected"),
+    (
+        ("1,234.50", "amount", "1234.50"),
+        ("12,345", "nonnegative_integer", "12345"),
+        ("+86 138-0013-8007", "mobile_phone", "13800138007"),
+        ("138 0013 8007", "mobile_phone", "13800138007"),
+        ("138 0013 8007", "phone", "13800138007"),
+        ("(010) 12345678", "phone", "01012345678"),
+        ("010-12345678", "phone", "01012345678"),
+        ("010 12345678", "phone", "01012345678"),
+    ),
+)
+def test_typed_overlay_accepts_only_registered_presentation_grammars(
+    raw: str,
+    role: str,
+    expected: str,
+) -> None:
+    overlay = _overlay()
+
+    normalized, decision = overlay.correct_text(raw, role=role)
+
+    assert normalized == expected
+    assert decision is not None
+
+
 def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
     overlay = _overlay()
 
@@ -61,20 +225,20 @@ def test_typed_correction_is_role_scoped_and_preserves_invalid_values() -> None:
     invalid, invalid_decision = overlay.correct_text("amount S", role="amount")
 
     assert report_time == "2024-03-13T11:05:32+08:00"
-    assert identity == "11010519491231002X"
-    assert amount == "100"
+    assert identity == "11010519491231002 X"
+    assert amount == "1O0"
     assert signed_amount == "500"
     assert birth_date == "1987-09-05"
     assert event_month == "2018-10"
     assert invalid == "amount S"
     assert (
         time_decision
-        and identity_decision
-        and amount_decision
         and signed_amount_decision
         and birth_date_decision
         and event_month_decision
     )
+    assert identity_decision is None
+    assert amount_decision is None
     assert invalid_decision is None
     assert all(decision.action == "applied" for decision in overlay.decisions)
 
@@ -212,6 +376,25 @@ def test_institution_correction_removes_debris_without_general_fuzzy_rewrite() -
     assert not institution_slot_is_unambiguous(contaminated)
 
 
+def test_pboc_institution_contract_covers_official_roles_without_near_match_repair() -> None:
+    for value in (
+        "中国人民银行营业管理部",
+        "某市住房公积金管理中心",
+        "某农村信用合作联社",
+        "本人",
+    ):
+        contract = validate_pboc_field(value, "institution_name")
+        assert contract.assessed and contract.valid
+
+    for value in (
+        "中国人民银行营业管理",
+        "营业管理部备注",
+        "任意机构名称残片",
+    ):
+        contract = validate_pboc_field(value, "institution_name")
+        assert contract.assessed and not contract.valid
+
+
 def test_institution_normalization_has_no_unconditional_business_name_aliases() -> None:
     assert normalize_institution_name("重庆蚂蚊消费金融有限公司") == "重庆蚂蚊消费金融有限公司"
     assert normalize_institution_name("某银行偏用卡中心") == "某银行偏用卡中心"
@@ -224,6 +407,27 @@ def test_institution_leading_han_is_never_deleted_by_scalar_normalization() -> N
     assert _account_institution("中 国银行股份有限公司") is None
     assert _account_institution("中 信银行股份有限公司") is None
     assert _account_institution("中国银行股份有限公司") == "中国银行股份有限公司"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "导中国银行股份有限公司",
+        "S 中国银行股份有限公司",
+        "中国银行股份有限公司 Ss",
+    ),
+)
+def test_final_account_gate_cannot_validate_a_glyph_deleting_institution(
+    raw: str,
+) -> None:
+    assert not _final_account_field_is_valid("management_institution", raw)
+
+
+def test_final_account_gate_accepts_a_lossless_whole_institution() -> None:
+    assert _final_account_field_is_valid(
+        "management_institution",
+        "中国银行股份有限公司",
+    )
 
 
 def test_final_overlay_withholds_uncorroborated_leading_han_business_names() -> None:
@@ -457,7 +661,7 @@ def test_native_scalar_dates_accept_exact_19xx_and_reject_ambiguity_or_invalid_d
     assert issue["observed_value"] == [raw]
 
 
-def test_typed_date_correction_accepts_only_bounded_ascii_residue() -> None:
+def test_typed_date_correction_requires_the_complete_field_value() -> None:
     overlay = _overlay()
 
     corrected, decision = overlay.correct_text("2022,09.15 A", role="date")
@@ -470,15 +674,15 @@ def test_typed_date_correction_accepts_only_bounded_ascii_residue() -> None:
         role="date",
     )
 
-    assert corrected == "2022-09-15"
-    assert decision is not None
+    assert corrected == "2022,09.15 A"
+    assert decision is None
     assert labeled == "2022.09.15 信息更新日期"
     assert labeled_decision is None
     assert ambiguous == "2022.09.15 2023.01.02"
     assert ambiguous_decision is None
 
 
-def test_institution_correction_removes_isolated_legal_suffix_debris() -> None:
+def test_institution_debris_diagnostic_does_not_authorize_business_value_deletion() -> None:
     assert normalize_institution_name("S 福建海峡粮油购销有限公司") == "福建海峡粮油购销有限公司"
     assert normalize_institution_name("限 福建省国资粮食发展有限公司") == "福建省国资粮食发展有限公司"
     overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
@@ -501,7 +705,14 @@ def test_institution_correction_removes_isolated_legal_suffix_debris() -> None:
         },
         stage="candidate_b_final_validation",
     )
-    assert corrected["public_records"][0]["employer"] == "福建省国资粮食发展有限公司"
+    record = corrected["public_records"][0]
+    assert record["employer"] is None
+    assert record["canonical_raw"]["employer"] == "限 福建省国资粮食发展有限公司"
+    assert any(
+        anomaly["field_name"] == "employer"
+        and anomaly["normalized_value_withheld"] is True
+        for anomaly in overlay.audit()["cell_anomalies"]
+    )
 
 
 def test_institution_correction_preserves_legitimate_leading_legal_name_glyphs() -> None:
@@ -1064,10 +1275,12 @@ def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issu
                 "source_page": 12,
                 "lines": [
                     {
-                        "text": raw_currency,
-                        "confidence": 0.96,
-                        "bbox": [12, 22, 48, 38],
-                        "evidence_ids": ["repair:currency:20"],
+                        **_one_shot_page_line(
+                            raw_currency,
+                            confidence=0.96,
+                            bbox=[12, 22, 48, 38],
+                            page_key="currency-card-20",
+                        ),
                     }
                 ],
             }
@@ -1088,7 +1301,7 @@ def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issu
     assert corrected_account["currency"] == "CNY"
     assert corrected_account["account_currency"] == "CNY"
     assert corrected_account["reporting_amount_currency"] == "CNY"
-    assert corrected_account["canonical_raw"]["currency"] == raw_currency
+    assert corrected_account["canonical_raw"]["currency"] == ["", raw_currency]
     assert corrected_account["canonical_raw"]["account_currency"] == raw_currency
     assert (
         corrected_account["canonical_raw"]["reporting_amount_currency"]
@@ -1101,13 +1314,24 @@ def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issu
     ]
     assert len(corrected_refs) == 1
     assert corrected_refs[0]["bbox"] == [12.0, 22.0, 48.0, 38.0]
-    assert corrected_refs[0]["evidence_ids"] == ["repair:currency:20"]
+    assert corrected_refs[0]["evidence_ids"] == [
+        "personal_detail_page_reocr:currency-card-20:w0"
+    ]
+    assert corrected_refs[0]["raw_text"] == raw_currency
+    assert corrected_refs[0]["producer_source"] == "personal_detail_page_reocr_once"
+    assert (
+        corrected_refs[0]["acquisition_id"]
+        == "personal_detail_page_reocr_once:currency-card-20"
+    )
     assert "table_id" not in corrected_refs[0]
     assert "row" not in corrected_refs[0]
     decisions = overlay.audit()["decisions"]
     assert any(
         decision["role"] == "currency"
         and decision["corrected"] == "CNY"
+        and decision["selected_raw"] == raw_currency
+        and decision["selected_acquisition"]
+        == "personal_detail_page_reocr_once:currency-card-20"
         and decision["method"]
         == "schema_bound_missing_account_currency_reparse"
         for decision in decisions
@@ -1122,6 +1346,89 @@ def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issu
         "_reported_invalid_fields",
     ):
         assert marker not in corrected_account
+
+
+def test_missing_currency_repair_resolves_target_ids_against_available_sealed_store() -> None:
+    context = SimpleNamespace(
+        evidence_plane=SimpleNamespace(
+            evidence=SimpleNamespace(
+                text_atoms=[
+                    {
+                        "id": "native:unrelated",
+                        "text": "unrelated",
+                        "bbox": [100, 100, 120, 110],
+                    }
+                ]
+            )
+        )
+    )
+    account = _blank_account_currency_observation(context)
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 23,
+                "source_page": 12,
+                "page_key": "currency-sealed-target",
+                "lines": [
+                    _one_shot_page_line(
+                        "人民币元",
+                        bbox=[12, 22, 48, 38],
+                        page_key="currency-sealed-target",
+                    )
+                ],
+            }
+        ],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [account]},
+        stage="candidate_b_final_validation",
+    )["credit_accounts"][0]
+
+    assert "currency" not in corrected
+    assert corrected["canonical_raw"]["currency"] == [""]
+    assert overlay.audit()["applied_count"] == 0
+
+
+@pytest.mark.parametrize("guard", ("conflict", "nonblank_raw"))
+def test_missing_currency_repair_never_overwrites_withheld_reporting_currency_history(
+    guard: str,
+) -> None:
+    context = SimpleNamespace()
+    account = _blank_account_currency_observation(context)
+    account["canonical_raw"]["reporting_amount_currency"] = ["USD", "CNY"]
+    if guard == "conflict":
+        account["_reported_field_conflicts"] = ["reporting_amount_currency"]
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 23,
+                "source_page": 12,
+                "page_key": "currency-reporting-conflict",
+                "lines": [
+                    _one_shot_page_line(
+                        "人民币元",
+                        bbox=[12, 22, 48, 38],
+                        page_key="currency-reporting-conflict",
+                    )
+                ],
+            }
+        ],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [account]},
+        stage="candidate_b_final_validation",
+    )["credit_accounts"][0]
+
+    assert "currency" not in corrected
+    assert corrected["canonical_raw"]["currency"] == [""]
+    assert corrected["canonical_raw"]["reporting_amount_currency"] == ["USD", "CNY"]
+    assert overlay.audit()["applied_count"] == 0
 
 
 @pytest.mark.parametrize(
@@ -1254,6 +1561,12 @@ def test_missing_account_currency_repair_remains_fail_closed(
     case: str,
     lines: list[dict[str, object]],
 ) -> None:
+    for word_index, line in enumerate(lines):
+        line["source"] = "personal_detail_page_reocr_once"
+        if line.get("evidence_ids"):
+            line["evidence_ids"] = [
+                f"personal_detail_page_reocr:currency-fail-{case}:w{word_index}"
+            ]
     context = SimpleNamespace()
     account = _blank_account_currency_observation(
         context,
@@ -1349,9 +1662,9 @@ def test_evidence_overlay_corrects_inquiry_lines_without_mutating_raw_evidence()
 
     assert raw_pages[0]["lines"][0]["text"] == "2 2024,02.16 中邮消费金融有限公司 费后管理"
     line = corrected[0]["lines"][0]
-    assert line["text"] == "2 2024.02.16 中邮消费金融有限公司 贷后管理"
-    assert line["ocr_original_text"] == raw_pages[0]["lines"][0]["text"]
-    assert line["ocr_correction"]["role"] == "inquiry_row"
+    assert line["text"] == raw_pages[0]["lines"][0]["text"]
+    assert "ocr_original_text" not in line
+    assert "ocr_correction" not in line
 
 
 def test_inquiry_row_correction_handles_typed_date_and_reason_confusions() -> None:
@@ -1375,13 +1688,28 @@ def test_inquiry_row_correction_handles_typed_date_and_reason_confusions() -> No
     )
 
     assert corrected == "12 2025.03.20 福鼎市农村信用合作联社 信用卡审批"
-    assert reason_corrected == "19 2020.12.12 深圳市中融小额贷款有限公司 贷款审批"
+    assert reason_corrected == "19 2020.12.12 深圳市中融小额贷款有限公司 资款审批"
     assert compact_date == "4 2022.12.14 平安普惠融资担保有限公司 担保资格审查"
-    assert financing == "101 2023.01.06 平安国际融资租赁(天津)有限公司 融资审批"
+    assert financing == "101 2023.01.06 平安国际融资租赁（天津）有限公司 磁资审批"
     assert decision is not None
-    assert reason_decision is not None
+    assert reason_decision is None
     assert compact_date_decision is not None
-    assert financing_decision is not None
+    assert financing_decision is None
+
+
+def test_inquiry_reason_ocr_alias_is_withheld_without_independent_authority() -> None:
+    overlay = _overlay()
+
+    reason, reason_decision = overlay.correct_text("资款审批", role="inquiry_reason")
+    institution_line, line_decision = overlay.correct_text(
+        "19 2020.12.12 某货后管理服务有限公司 贷款审批",
+        role="inquiry_row",
+    )
+
+    assert reason == "资款审批"
+    assert reason_decision is None
+    assert institution_line == "19 2020.12.12 某货后管理服务有限公司 贷款审批"
+    assert line_decision is None
 
 
 def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences() -> None:
@@ -1406,11 +1734,11 @@ def test_corrected_inquiry_extraction_recovers_rows_and_keeps_section_sequences(
 
     records = _extract_inquiries(parse_result)
 
-    assert len(records) == 5
-    assert [record["sequence"] for record in records if record["inquiry_type"] == "institution"] == [1, 2, 3, 4]
+    assert len(records) == 4
+    assert [record["sequence"] for record in records if record["inquiry_type"] == "institution"] == [1, 3, 4]
     assert [record["sequence"] for record in records if record["inquiry_type"] == "personal"] == [1]
     corrected = overlay.correct_business_candidates({"inquiry_records": records}, stage="test")
-    assert corrected["inquiry_records"][2]["institution"] == "重庆蚂蚊消费金融有限公司"
+    assert corrected["inquiry_records"][1]["institution"] == "重庆蚂蚊消费金融有限公司 Ss"
 
 
 def test_inquiry_extraction_reconstructs_full_page_ocr_cells_by_date_row() -> None:
@@ -1499,7 +1827,7 @@ def test_inquiry_sequences_preserve_gaps_but_repair_duplicate_ocr_ordinals() -> 
     ]
 
 
-def test_business_overlay_promotes_one_valid_account_identifier_and_preserves_raw_payload() -> None:
+def test_business_overlay_does_not_promote_unowned_identifier_candidates() -> None:
     payload = {
         "credit_accounts": [
             {
@@ -1518,10 +1846,11 @@ def test_business_overlay_promotes_one_valid_account_identifier_and_preserves_ra
 
     assert "account_identifier" not in payload["credit_accounts"][0]
     account = corrected["credit_accounts"][0]
-    assert account["management_institution"] == "重庆蚂蚊消费金融有限公司"
-    assert account["account_identifier"] == "ABCD12345678"
+    assert account["management_institution"] == "重庆蚂蚊消费金融有限公司 Ss"
+    assert "account_identifier" not in account
+    assert account["account_identifier_candidates"] == ["ABCD 1234 5678"]
     assert account["raw_detail_text"] == payload["credit_accounts"][0]["raw_detail_text"]
-    assert overlay.audit()["applied_count"] >= 2
+    assert overlay.audit()["applied_count"] == 0
 
 
 class _FakeResolver:
@@ -1579,20 +1908,26 @@ class _FakeCellRepairEngine:
         ]
 
 
+def _exact_identity_repair_target_ref() -> dict[str, object]:
+    return {
+        "source": "native_detail_table_cell",
+        "logical_page": 1,
+        "source_page": 9,
+        "bbox": [1, 1, 20, 10],
+        "evidence_ids": ["native:identity:1"],
+        "geometry_scope": "cell",
+        "geometry_status": "exact",
+        "binding": "canonical_field_slot",
+    }
+
+
 def test_schema_role_repair_does_not_fall_back_to_crop_ocr() -> None:
     overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
 
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
-        source_refs=(
-            {
-                "logical_page": 1,
-                "bbox": [1, 1, 20, 10],
-                "geometry_scope": "cell",
-                "binding": "canonical_field_slot",
-            },
-        ),
+        source_refs=(_exact_identity_repair_target_ref(),),
     )
 
     assert corrected == "1101051949123100?X"
@@ -1607,12 +1942,14 @@ def test_schema_assigned_field_uses_only_coordinator_installed_page_evidence() -
         [
             {
                 "page": 1,
+                "source_page": 9,
                 "lines": [
-                    {
-                        "text": "11010519491231002X",
-                        "confidence": 0.96,
-                        "bbox": [1, 1, 20, 10],
-                    }
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        confidence=0.96,
+                        bbox=[1, 1, 20, 10],
+                        page_key="identity-page-1",
+                    )
                 ],
             }
         ],
@@ -1622,21 +1959,666 @@ def test_schema_assigned_field_uses_only_coordinator_installed_page_evidence() -
     corrected, decision = overlay.correct_text(
         "1101051949123100?X",
         role="identity_document_number",
-        source_refs=(
-            {
-                "logical_page": 1,
-                "bbox": [1, 1, 20, 10],
-                "geometry_scope": "cell",
-                "binding": "canonical_field_slot",
-            },
-        ),
+        source_refs=(_exact_identity_repair_target_ref(),),
     )
 
     assert corrected == "11010519491231002X"
     assert decision is not None
     assert decision.method == "schema_bound_page_evidence_reparse"
+    assert decision.reason_codes[-2:] == (
+        "exact_repair_candidate_source_ref",
+        "unique_source_bound_candidate",
+    )
+    assert len(decision.source_refs) == 2
+    assert decision.source_refs[0] == _exact_identity_repair_target_ref()
+    candidate_ref = decision.source_refs[1]
+    assert candidate_ref == {
+        "source": "personal_detail_installed_page_evidence",
+        "logical_page": 1,
+        "source_page": 9,
+        "bbox": [1.0, 1.0, 20.0, 10.0],
+        "evidence_ids": ["personal_detail_page_reocr:identity-page-1:w0"],
+        "geometry_scope": "token_band",
+        "geometry_status": "exact",
+        "binding": "canonical_field_slot_repair_candidate",
+        "binding_quality": "exact_source_bound_candidate",
+        "raw_text": "11010519491231002X",
+        "producer_source": "personal_detail_page_reocr_once",
+        "acquisition_id": "personal_detail_page_reocr_once:identity-page-1",
+    }
+    assert overlay.audit()["decisions"][0]["source_refs"][1] == candidate_ref
+    assert overlay.audit()["decisions"][0]["selected_raw"] == "11010519491231002X"
+    assert (
+        overlay.audit()["decisions"][0]["selected_acquisition"]
+        == "personal_detail_page_reocr_once:identity-page-1"
+    )
     assert overlay.audit()["repair_evidence_reparse_attempt_count"] == 1
     assert overlay.audit()["ocr_started_by_correction_overlay"] is False
+
+
+def test_page_repair_rejects_destructive_normalization_of_candidate_text() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    _one_shot_page_line(
+                        "导 示例银行股份有限公司",
+                        bbox=[1, 1, 20, 10],
+                        page_key="institution-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "坏值",
+        role="institution_name",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "坏值"
+    assert decision is None
+    assert overlay.audit()["decisions"] == []
+
+
+def test_page_repair_resolves_target_ids_when_sealed_store_is_available() -> None:
+    target_ref = _exact_identity_repair_target_ref()
+    owner = SimpleNamespace(
+        evidence_plane=SimpleNamespace(
+            evidence=SimpleNamespace(
+                text_atoms=[
+                    {
+                        "id": "native:identity:1",
+                        "text": "1101051949123100?X",
+                        "bbox": [1, 1, 20, 10],
+                    }
+                ]
+            )
+        )
+    )
+    overlay = PersonalDetailOCRCorrectionOverlay(owner)
+    repair_page = {
+        "page": 1,
+        "source_page": 9,
+        "lines": [
+            _one_shot_page_line(
+                "11010519491231002X",
+                bbox=[1, 1, 20, 10],
+                page_key="identity-sealed-page-1",
+            )
+        ],
+    }
+    overlay.install_business_repair_evidence(
+        [repair_page],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+    assert corrected == "11010519491231002X"
+    assert decision is not None
+
+    owner.evidence_plane.evidence.text_atoms.clear()
+    second_overlay = PersonalDetailOCRCorrectionOverlay(owner)
+    second_overlay.install_business_repair_evidence(
+        [repair_page],
+        affected_pages={1},
+    )
+    rejected, rejected_decision = second_overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+    assert rejected == "1101051949123100?X"
+    assert rejected_decision is None
+
+
+def test_page_repair_rejects_target_ref_bound_to_another_field() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        bbox=[1, 1, 20, 10],
+                        page_key="identity-field-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+    target_ref = {**_exact_identity_repair_target_ref(), "field_name": "credit_limit"}
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        field_name="document_number",
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+def test_page_repair_rejects_conflicting_text_and_content() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        content="110105194912310011",
+                        bbox=[1, 1, 20, 10],
+                        page_key="identity-conflict-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+def test_page_repair_rejects_distinct_ids_from_same_one_shot_acquisition() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        bbox=[1, 1, 20, 10],
+                        page_key="same-acquisition",
+                        word_index=1,
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+    target_ref = {
+        **_exact_identity_repair_target_ref(),
+        "evidence_ids": ["personal_detail_page_reocr:same-acquisition:w0"],
+    }
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "caller_role_disagrees_with_field",
+        "conflicting_role_tags",
+    ),
+)
+def test_page_repair_requires_consistent_target_field_and_role_bindings(
+    case: str,
+) -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "page_key": "binding-page-1",
+                "lines": [
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        bbox=[1, 1, 20, 10],
+                        page_key="binding-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+    target_ref = _exact_identity_repair_target_ref()
+    if case == "caller_role_disagrees_with_field":
+        target_ref["field_name"] = "credit_limit"
+        field_name = "credit_limit"
+    else:
+        target_ref.update(
+            {
+                "field_name": "document_number",
+                "field_role": "identity_document_number",
+                "semantic_role": "amount",
+            }
+        )
+        field_name = "document_number"
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        field_name=field_name,
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "page_key_mismatch",
+        "logical_page_mismatch",
+        "candidate_acquisition_mismatch",
+        "mixed_target_ids",
+        "target_acquisition_mismatch",
+        "mixed_candidate_page_acquisitions",
+        "malformed_hidden_replay",
+    ),
+)
+def test_page_repair_rejects_contradictory_or_replayed_acquisition_planes(
+    case: str,
+) -> None:
+    target_ref = _exact_identity_repair_target_ref()
+    page_key = "candidate-page-1"
+    page: dict[str, object] = {
+        "page": 1,
+        "source_page": 9,
+        "page_key": page_key,
+        "lines": [
+            _one_shot_page_line(
+                "11010519491231002X",
+                bbox=[1, 1, 20, 10],
+                page_key=page_key,
+            )
+        ],
+    }
+    if case == "page_key_mismatch":
+        page["page_key"] = "different-page"
+    elif case == "logical_page_mismatch":
+        page["logical_page"] = 2
+    elif case == "candidate_acquisition_mismatch":
+        page["lines"][0]["acquisition_id"] = "personal_detail_page_reocr_once:different-page"
+    elif case == "mixed_target_ids":
+        target_ref.update(
+            {
+                "source": "personal_detail_page_reocr_once",
+                "evidence_ids": [
+                    "personal_detail_page_reocr:target-page:w0",
+                    "native:identity:mixed",
+                ],
+            }
+        )
+    elif case == "target_acquisition_mismatch":
+        target_ref.update(
+            {
+                "source": "personal_detail_page_reocr_once",
+                "evidence_ids": ["personal_detail_page_reocr:target-page:w0"],
+                "acquisition_id": "personal_detail_page_reocr_once:different-target-page",
+            }
+        )
+    elif case == "mixed_candidate_page_acquisitions":
+        page["lines"].append(
+            _one_shot_page_line(
+                "unrelated",
+                bbox=[100, 100, 120, 110],
+                page_key="different-page",
+            )
+        )
+    elif case == "malformed_hidden_replay":
+        replayed_id = "personal_detail_page_reocr:candidate-page-1:w0"
+        page["lines"].append(
+            {
+                "text": "unrelated",
+                "confidence": 0.9,
+                "bbox": [100, 100, 120, 110],
+                "evidence_ids": [replayed_id, replayed_id],
+                "source": "personal_detail_page_reocr_once",
+            }
+        )
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence([page], affected_pages={1})
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+def test_sealed_repair_plane_target_without_acquisition_cannot_authorize_repair() -> None:
+    owner = SimpleNamespace(
+        evidence_plane=SimpleNamespace(
+            evidence=SimpleNamespace(
+                text_atoms=[
+                    {
+                        "id": "sealed:repair-target",
+                        "text": "1101051949123100?X",
+                        "bbox": [1, 1, 20, 10],
+                    }
+                ]
+            )
+        )
+    )
+    overlay = PersonalDetailOCRCorrectionOverlay(owner)
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "page_key": "candidate-page-1",
+                "lines": [
+                    _one_shot_page_line(
+                        "11010519491231002X",
+                        bbox=[1, 1, 20, 10],
+                        page_key="candidate-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+    target_ref = {
+        **_exact_identity_repair_target_ref(),
+        "source": "personal_detail_installed_page_evidence",
+        "evidence_ids": ["sealed:repair-target"],
+    }
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+def test_final_walk_preserves_displaced_flat_scalar_for_applied_normalization() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "credit_lines": [
+                {
+                    "record_id": "credit_line:date",
+                    "effective_date": "2024.01.02",
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    record = corrected["credit_lines"][0]
+    assert record["effective_date"] == "2024-01-02"
+    assert record["canonical_raw"]["effective_date"] == "2024.01.02"
+
+
+def test_final_walk_preserves_displaced_nested_scalar_when_prior_raw_exists() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "credit_lines": [
+                {
+                    "record_id": "credit_line:nested-date",
+                    "effective_date": {
+                        "value": "2024.01.02",
+                        "raw": "OLDER_OBSERVATION",
+                    },
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    value = corrected["credit_lines"][0]["effective_date"]
+    assert value["value"] == "2024-01-02"
+    assert value["raw"] == "OLDER_OBSERVATION"
+    assert value["canonical_raw"]["value"] == "2024.01.02"
+
+
+def test_nested_correction_preserves_raw_when_existing_audit_container_is_malformed() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "credit_lines": [
+                {
+                    "record_id": "credit_line:nested-malformed-audit",
+                    "effective_date": {
+                        "value": "2024.01.02",
+                        "raw": "OLDER_OBSERVATION",
+                        "canonical_raw": "MALFORMED_BUT_PRESERVED",
+                    },
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    value = corrected["credit_lines"][0]["effective_date"]
+    assert value["value"] == "2024-01-02"
+    assert value["raw"] == "OLDER_OBSERVATION"
+    assert value["canonical_raw"] == "MALFORMED_BUT_PRESERVED"
+    assert value["_ocr_raw_history"] == ["2024.01.02"]
+
+
+def test_material_inquiry_reason_alias_is_withheld_and_raw_is_preserved() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+
+    corrected = overlay.correct_business_candidates(
+        {
+            "inquiry_records": [
+                {
+                    "record_id": "inquiry:1",
+                    "inquiry_date": "2024-01-02",
+                    "reason": "资款审批",
+                }
+            ]
+        },
+        stage="candidate_b_final_validation",
+    )
+
+    record = corrected["inquiry_records"][0]
+    assert record["reason"] is None
+    assert record["canonical_raw"]["reason"] == "资款审批"
+    assert any(
+        anomaly["record_id"] == "inquiry:1"
+        and anomaly["field_name"] == "reason"
+        and anomaly["normalized_value_withheld"] is True
+        for anomaly in overlay.audit()["cell_anomalies"]
+    )
+
+
+def test_account_line_label_alias_does_not_rewrite_business_value_substrings() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    source = "账户 1 管理机构 营理机构有限公司"
+
+    corrected, decision = overlay.correct_text(source, role="account_line")
+
+    assert corrected == source
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    "evidence_ids",
+    (
+        None,
+        [],
+        [""],
+        [" repair:identity:1"],
+        ["repair:identity:1", "repair:identity:1"],
+        [1],
+    ),
+)
+def test_schema_assigned_field_rejects_missing_or_malformed_candidate_evidence(
+    evidence_ids: object,
+) -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    line: dict[str, object] = {
+        "text": "11010519491231002X",
+        "confidence": 0.99,
+        "bbox": [1, 1, 20, 10],
+    }
+    if evidence_ids is not None:
+        line["evidence_ids"] = evidence_ids
+    overlay.install_business_repair_evidence(
+        [{"page": 1, "source_page": 9, "lines": [line]}],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+    assert overlay.audit()["decisions"] == []
+
+
+@pytest.mark.parametrize("target_evidence_ids", (None, [], ["native:identity:1", "native:identity:1"]))
+def test_schema_assigned_field_rejects_missing_or_replayed_target_evidence(
+    target_evidence_ids: object,
+) -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    {
+                        "text": "11010519491231002X",
+                        "confidence": 0.99,
+                        "bbox": [1, 1, 20, 10],
+                        "evidence_ids": ["repair:identity:1"],
+                    }
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+    target_ref = _exact_identity_repair_target_ref()
+    if target_evidence_ids is None:
+        target_ref.pop("evidence_ids")
+    else:
+        target_ref["evidence_ids"] = target_evidence_ids
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(target_ref,),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+@pytest.mark.parametrize("replay_scope", ("target", "page"))
+def test_schema_assigned_field_rejects_replayed_candidate_evidence(
+    replay_scope: str,
+) -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    candidate_id = (
+        "native:identity:1" if replay_scope == "target" else "repair:identity:replayed"
+    )
+    lines: list[dict[str, object]] = [
+        {
+            "text": "11010519491231002X",
+            "confidence": 0.99,
+            "bbox": [1, 1, 20, 10],
+            "evidence_ids": [candidate_id],
+        }
+    ]
+    if replay_scope == "page":
+        lines.append(
+            {
+                "text": "unrelated",
+                "confidence": 0.8,
+                "bbox": [100, 100, 120, 110],
+                "evidence_ids": [candidate_id],
+            }
+        )
+    overlay.install_business_repair_evidence(
+        [{"page": 1, "source_page": 9, "lines": lines}],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
+
+
+def test_schema_assigned_field_rejects_competing_exact_candidates_regardless_of_margin() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    {
+                        "text": "11010519491231002X",
+                        "confidence": 0.99,
+                        "bbox": [1, 1, 20, 4],
+                        "evidence_ids": ["repair:identity:a"],
+                    },
+                    {
+                        "text": "110105194912310011",
+                        "confidence": 0.75,
+                        "bbox": [1, 6, 20, 10],
+                        "evidence_ids": ["repair:identity:b"],
+                    },
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "1101051949123100?X",
+        role="identity_document_number",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "1101051949123100?X"
+    assert decision is None
 
 
 def test_damaged_inquiry_date_is_not_repaired_from_a_crop() -> None:

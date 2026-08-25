@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+    _decimal,
     apply_candidate_b_native_status_conflict_guard,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -533,6 +534,22 @@ def test_numeric_zero_forms_preserve_native_conflict_detection(zero: Any) -> Non
     assert "status" not in records[0]
     assert records[0]["overdue_amount"] == zero
     assert audit["conflicts_withheld"] == 1
+
+
+@pytest.mark.parametrize("value", ("1,2", "1,,000", "1234,567", "12,34.56"))
+def test_native_status_conflict_rejects_malformed_decimal_grouping(value: str) -> None:
+    assert _decimal(value) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (("1,234", Decimal("1234")), ("12,345.67", Decimal("12345.67")), ("1234.5", Decimal("1234.5"))),
+)
+def test_native_status_conflict_accepts_registered_decimal_grouping(
+    value: str,
+    expected: Decimal,
+) -> None:
+    assert _decimal(value) == expected
 
 
 def test_native_digit_with_zero_amount_cannot_override_symbolic_final_status() -> None:

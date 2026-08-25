@@ -11,11 +11,28 @@ import numpy as np
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned.document_glyph_bank import (
+    _explicit_zero,
+    _parse_year_month,
     apply_document_local_status_glyph_bank,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     project_personal_detail_datasets,
 )
+
+
+@pytest.mark.parametrize("value", ("0,0", "0,,000", "0000,000", "0,00.0"))
+def test_glyph_bank_zero_proof_rejects_malformed_grouping(value: str) -> None:
+    assert not _explicit_zero(value)
+
+
+@pytest.mark.parametrize("value", ("2024-01x", "2024.01.02", "2024/01/extra"))
+def test_glyph_bank_month_owner_requires_a_complete_month(value: str) -> None:
+    assert _parse_year_month(value) == ""
+
+
+def test_glyph_bank_accepts_registered_zero_and_month_presentations() -> None:
+    assert _explicit_zero("0,000.00")
+    assert _parse_year_month("2024.01") == "2024-01"
 
 
 def _glyph(label: str) -> np.ndarray:

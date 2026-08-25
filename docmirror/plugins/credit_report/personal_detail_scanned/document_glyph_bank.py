@@ -128,11 +128,14 @@ def _record_account_id(record: Mapping[str, Any]) -> str:
 def _explicit_zero(value: Any) -> bool:
     if value is None or isinstance(value, bool):
         return False
-    raw = str(value).strip().replace(",", "")
-    if not raw or not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw):
+    raw = str(value).strip().replace("，", ",")
+    if not re.fullmatch(
+        r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?",
+        raw,
+    ):
         return False
     try:
-        return Decimal(raw) == 0
+        return Decimal(raw.replace(",", "")) == 0
     except InvalidOperation:
         return False
 
@@ -321,7 +324,7 @@ def _account_id(account: Mapping[str, Any]) -> str:
 
 def _parse_year_month(value: Any) -> str:
     raw = str(value or "").strip().replace("/", "-").replace(".", "-")
-    match = re.match(r"^(20\d{2})-(\d{1,2})", raw)
+    match = re.fullmatch(r"(20\d{2})-(\d{1,2})", raw)
     if match is None:
         return ""
     month = int(match.group(2))

@@ -479,6 +479,38 @@ def test_bank_footer_count_can_verify_transaction_dataset_completeness() -> None
     assert payload["warnings"] == []
 
 
+def test_bank_zero_expected_count_means_unknown_not_mismatch() -> None:
+    result = ParseResult(entities=DocumentEntities(document_type="bank_statement"))
+    _PROJECTIONS[id(result)] = {
+        "projector_id": "bank_statement",
+        "document_type": "bank_statement",
+        "domain_facts": {
+            "source_reported_transaction_count": 0,
+            "expected_primary_rows": 0,
+            "extract_status": "degraded",
+        },
+        "datasets": {
+            "records": [
+                {"record_id": "transactions:r000001", "normalized": {"date": "2025-01-01"}},
+                {"record_id": "transactions:r000002", "normalized": {"date": "2025-01-02"}},
+            ]
+        },
+    }
+
+    payload = project_community_bundle(result, document_id="doc_bank_unknown_count").json_payload()
+    dataset = next(item for item in payload["datasets"] if item["name"] == "transactions")
+
+    assert dataset["completeness"] == {
+        "expected_row_count": 2,
+        "emitted_row_count": 2,
+        "omitted_row_count": 0,
+        "verified": False,
+        "basis": "emitted_records_only",
+    }
+    assert not any(warning["code"] == "DATASET_ROW_COUNT_MISMATCH" for warning in payload["warnings"])
+    assert any(warning["code"] == "DATASET_COMPLETENESS_UNVERIFIED" for warning in payload["warnings"])
+
+
 def test_bank_degraded_status_blocks_dataset_verification_even_when_row_count_matches() -> None:
     result = ParseResult(entities=DocumentEntities(document_type="bank_statement"))
     _PROJECTIONS[id(result)] = {

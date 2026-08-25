@@ -5,11 +5,20 @@
 
 from __future__ import annotations
 
+import math
 import re
+from collections import Counter
 from difflib import SequenceMatcher
 from types import SimpleNamespace
 from typing import Any
 
+from docmirror.plugins.credit_report.pboc_vocabularies import (
+    pboc_inquiry_reason_suffix,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.section_headings import (
+    canonical_account_family_heading,
+    canonical_registered_section_heading,
+)
 from docmirror.plugins.credit_report.value_utils import (
     compact_text as _compact,
 )
@@ -33,21 +42,6 @@ _PROFILE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("household_address", ("户籍地址",)),
 )
 
-_INQUIRY_REASONS = (
-    "本人查询",
-    "贷后管理",
-    "贷款审批",
-    "信用卡审批",
-    "担保资格审查",
-    "融资审批",
-    "保前审查",
-    "保后管理",
-    "客户准入资格审查",
-    "资信审查",
-    "法人代表、负责人、高管",
-    "实名审查",
-    "异议处理",
-)
 _INQUIRY_REASON_NORMALIZATION = {
     "费后管理": "贷后管理",
     "货后管理": "贷后管理",
@@ -83,9 +77,25 @@ _GENERIC_HEADER_LABELS = _KNOWN_PROFILE_LABELS | frozenset(
 
 
 def _normalize_inquiry_reason_text(value: str) -> str:
+    """Normalize only an exact inquiry-reason field or line-final field.
+
+    The finite aliases are OCR observations, not general Chinese-language
+    substitutions.  In particular, an institution name may legitimately
+    contain the same characters as one of those observations.  A whole OCR
+    line therefore authorizes an alias only when it occupies the final,
+    whitespace-delimited PBOC inquiry-reason slot.
+    """
+
     text = str(value or "")
+    leading = text[: len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()) :]
+    core = text.strip()
     for observed, canonical in _INQUIRY_REASON_NORMALIZATION.items():
-        text = text.replace(observed, canonical)
+        if core == observed:
+            return f"{leading}{canonical}{trailing}"
+        match = re.fullmatch(rf"(?P<prefix>.*\s){re.escape(observed)}", core)
+        if match is not None:
+            return f"{leading}{match.group('prefix')}{canonical}{trailing}"
     return text
 
 
@@ -167,6 +177,14 @@ _ACCOUNT_DETAIL_END_MARKERS: tuple[str, ...] = (
     "授信协议信息",
     "查询记录",
 )
+
+_SCANNED_ACCOUNT_FAMILY = {
+    "non_revolving_loan": "non_revolving_loan",
+    "revolving_loan_subaccount": "revolving_loan",
+    "revolving_loan_account": "revolving_loan",
+    "credit_card": "credit_card",
+    "quasi_credit_card": "quasi_credit_card",
+}
 
 
 def _plain_field(value: Any) -> Any:
@@ -665,11 +683,10 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 continue
             reconstructed = _reconstructed_inquiry_rows(evidence_page)
             reconstructed_has_inquiry = any(
-                _DATE_RE.search(_normalize_inquiry_reason_text(str(line.get("text") or "")))
-                and any(
-                    reason in _compact(_normalize_inquiry_reason_text(str(line.get("text") or "")))
-                    for reason in _INQUIRY_REASONS
+                _DATE_RE.search(
+                    normalized := _normalize_inquiry_reason_text(str(line.get("text") or ""))
                 )
+                and pboc_inquiry_reason_suffix(normalized) is not None
                 for line in reconstructed
             )
             selected_lines = reconstructed if reconstructed_has_inquiry else evidence_page["lines"]
@@ -710,11 +727,11 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
     for raw_line, logical_page, _source_page, confidence, ref in line_sources:
         line = _normalize_inquiry_reason_text(raw_line.strip())
         date_match = _DATE_RE.search(line)
-        reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in _compact(line)), "")
-        if not date_match or not reason:
+        reason_suffix = pboc_inquiry_reason_suffix(line)
+        if not date_match or reason_suffix is None:
             continue
-        reason_index = line.find(reason, date_match.end())
-        if reason_index < 0:
+        reason_form, reason, reason_index = reason_suffix
+        if reason_index < date_match.end():
             continue
         institution = line[date_match.end() : reason_index].strip()
         institution = re.sub(r"^[^\u3400-\u9fffA-Za-z]+", "", institution).strip()
@@ -786,9 +803,10 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                 cells = [str(value or "").strip() for value in row]
                 joined = _normalize_inquiry_reason_text(" ".join(value for value in cells if value))
                 date_match = _DATE_RE.search(joined)
-                reason = next((candidate for candidate in _INQUIRY_REASONS if candidate in _compact(joined)), "")
-                if not date_match or not reason:
+                reason_suffix = pboc_inquiry_reason_suffix(joined)
+                if not date_match or reason_suffix is None:
                     continue
+                _reason_form, reason, _reason_index = reason_suffix
                 inquiry_date = date_match.group(0).replace(".", "-").replace("/", "-")
                 candidates = [
                     value
@@ -912,6 +930,114 @@ def _evidence_pages(parse_result: Any) -> list[dict[str, Any]]:
                 }
             )
     return sorted(pages, key=lambda item: item["page"])
+
+
+def _account_evidence_pages(parse_result: Any) -> list[dict[str, Any]]:
+    """Use canonical account evidence as an authoritative closed world.
+
+    A personal-detail extraction context owns canonical registration.  Its
+    explicit empty result means that no source page was admitted for business
+    extraction; it must not be interpreted as permission to reopen raw page
+    bundles.  Lightweight inputs without that loader retain the exact sealed
+    bundle path validated below.
+    """
+
+    corrected_loader = getattr(parse_result, "corrected_evidence_pages", None)
+    if callable(corrected_loader):
+        corrected = corrected_loader()
+        return [dict(page) for page in corrected or () if isinstance(page, dict)]
+    return _evidence_pages(parse_result)
+
+
+def _sealed_scanned_account_line(line: Any) -> tuple[tuple[float, float, float, float], tuple[str, ...]] | None:
+    """Return one exact source-line owner for the legacy scanned projection.
+
+    Account identity is source population, so a line needs both bounded
+    geometry and an immutable, non-replayed evidence-ID set.  Text and page
+    order alone are deliberately insufficient.
+    """
+
+    if not isinstance(line, dict):
+        return None
+    raw_bbox = line.get("bbox")
+    raw_ids = line.get("evidence_ids")
+    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4 or not isinstance(raw_ids, list):
+        return None
+    try:
+        bbox = tuple(float(value) for value in raw_bbox)
+    except (TypeError, ValueError):
+        return None
+    evidence_ids = tuple(str(value).strip() for value in raw_ids if str(value or "").strip())
+    if (
+        not all(math.isfinite(value) for value in bbox)
+        or bbox[2] <= bbox[0]
+        or bbox[3] <= bbox[1]
+        or not evidence_ids
+        or len(evidence_ids) != len(raw_ids)
+        or len(evidence_ids) != len(set(evidence_ids))
+    ):
+        return None
+    return bbox, evidence_ids
+
+
+def _sealed_scanned_account_owners(
+    pages: list[dict[str, Any]],
+) -> tuple[dict[int, str], set[int]]:
+    """Bind exact PBOC account-family headings and anchors without replay.
+
+    A heading owns following anchors in evidence-page order until another
+    exact family heading or account-detail end marker.  Every accepted owner
+    must use a globally unique evidence atom; duplicated source IDs make all
+    of their observations ambiguous and therefore unavailable.
+    """
+
+    ordered_lines = [
+        line
+        for page in pages
+        for line in page.get("lines") or ()
+        if isinstance(line, dict)
+    ]
+    evidence_counts = Counter(
+        evidence_id
+        for line in ordered_lines
+        if (owner := _sealed_scanned_account_line(line)) is not None
+        for evidence_id in owner[1]
+    )
+    family_by_line: dict[int, str] = {}
+    accepted_anchors: set[int] = set()
+    active_family = ""
+    for line in ordered_lines:
+        owner = _sealed_scanned_account_line(line)
+        exact_owner = bool(
+            owner is not None
+            and all(evidence_counts[evidence_id] == 1 for evidence_id in owner[1])
+        )
+        text = str(line.get("text") or line.get("content") or "")
+        compact = _compact(text)
+        family = canonical_account_family_heading(compact)
+        section = canonical_registered_section_heading(compact)
+        if family is not None and not exact_owner:
+            # A recognizable but unsealed family heading is a hard ambiguity,
+            # not permission to retain a previous exact family.
+            active_family = ""
+            continue
+        if section is not None and section not in {
+            "信贷交易信息明细",
+            # Keep the exact repayment-responsibility heading inside the
+            # segment long enough for the established liability-boundary
+            # audit below to identify and suppress its numbered row.
+            "相关还款责任信息",
+        }:
+            active_family = ""
+            continue
+        if family is not None:
+            active_family = _SCANNED_ACCOUNT_FAMILY.get(family, "")
+            family_by_line[id(line)] = active_family
+            continue
+        family_by_line[id(line)] = active_family
+        if active_family and exact_owner and _ACCOUNT_LINE_RE.search(text) is not None:
+            accepted_anchors.add(id(line))
+    return family_by_line, accepted_anchors
 
 
 def _account_field_facts(detail_text: str, *, account_type: str) -> dict[str, Any]:
@@ -1098,25 +1224,18 @@ def _account_field_facts(detail_text: str, *, account_type: str) -> dict[str, An
 
 def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
     """Segment all explicit account cards, including cards spanning pages."""
+    evidence_pages = _account_evidence_pages(parse_result)
+    family_by_line, accepted_anchors = _sealed_scanned_account_owners(evidence_pages)
     flattened: list[dict[str, Any]] = []
-    current_type = ""
-    detail_ended = False
-    for page in _evidence_pages(parse_result):
+    for page in evidence_pages:
         for line_index, line in enumerate(page["lines"]):
-            text = str(line.get("text") or line.get("content") or "")
-            compact = re.sub(r"\s+", "", text)
-            if any(marker in compact for marker in _ACCOUNT_DETAIL_END_MARKERS) and current_type:
-                detail_ended = True
-            marker = next((value for label, value in _ACCOUNT_SECTION_MARKERS if label in compact), None)
-            if marker:
-                current_type = marker
-                detail_ended = False
             flattened.append(
                 {
                     **line,
                     "page": page["page"],
                     "source_page": page["source_page"],
-                    "account_type_context": "" if detail_ended else current_type,
+                    "account_type_context": family_by_line.get(id(line), ""),
+                    "_exact_account_anchor_owner": id(line) in accepted_anchors,
                     "_page_line_index": line_index,
                 }
             )
@@ -1124,7 +1243,11 @@ def extract_scanned_credit_accounts(parse_result: Any) -> list[dict[str, Any]]:
     starts: list[int] = []
     for index, line in enumerate(flattened):
         text = str(line.get("text") or line.get("content") or "")
-        if not line.get("account_type_context") or _ACCOUNT_LINE_RE.search(text) is None:
+        if (
+            not line.get("account_type_context")
+            or line.get("_exact_account_anchor_owner") is not True
+            or _ACCOUNT_LINE_RE.search(text) is None
+        ):
             continue
         starts.append(index)
 

@@ -15,8 +15,15 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
+from docmirror.plugins.credit_report.pboc_vocabularies import is_pboc_institution_name
+from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
+    exact_cell_visually_contains_dash_pair,
+    resolve_exact_page_token_atoms,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
     make_issue,
     record_issue,
@@ -52,7 +59,13 @@ _VOCAB_ROLES = {
     "education_level": "education_level",
     "degree": "degree",
 }
+_STRICT_PROFILE_SCALAR_FIELDS = frozenset(
+    {*_VOCAB_ROLES, "birth_date", "nationality"}
+)
 _PHONE_FIELDS = frozenset({"mobile_phone", "work_phone", "residence_phone"})
+_EXACT_PROFILE_TOKEN_FIELDS = frozenset(
+    {*_STRICT_PROFILE_SCALAR_FIELDS, *_PHONE_FIELDS, "email"}
+)
 _ADDRESS_FIELDS = frozenset({"mailing_address", "household_address"})
 _PROFILE_TEMPLATE_ID = "report_header_and_identity"
 _PROFILE_TABLE_ANCHORS = (
@@ -79,8 +92,28 @@ _NON_PROFILE_TABLE_ANCHOR_GROUPS = (
     ("工作单位", "职业"),
 )
 _DATE_RE = re.compile(r"(19|20)\d{2}[./年-]\d{1,2}[./月-]\d{1,2}日?")
-_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-_EMAIL_SEARCH_RE = re.compile(r"[^\s@]+@[^\s@]+\.[A-Za-z]{2,}")
+_EMAIL_RE = re.compile(
+    r"(?=.{3,254}\Z)"
+    r"(?=[^@]{1,64}@)"
+    r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+"
+    r"(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z]{2,63}"
+)
+_NONMOBILE_PHONE_RE = re.compile(
+    r"(?:"
+    r"\d{7,8}"
+    r"|0\d{2,3}\d{7,8}"
+    r"|0\d{2,3}-\d{7,8}"
+    r"|0\d{2,3} \d{7,8}"
+    r"|\(0\d{2,3}\)[ -]?\d{7,8}"
+    r"|(?:\+86|0086)[ -](?:"
+    r"0\d{2,3}-\d{7,8}"
+    r"|0\d{2,3} \d{7,8}"
+    r"|\(0\d{2,3}\)[ -]?\d{7,8}"
+    r")"
+    r")"
+)
 _ADDRESS_MARKER_RE = re.compile(r"[省市县区镇乡村路街道巷号栋室楼]")
 _SYMBOL_NOISE_RE = re.compile(r"[#=*<>]{2,}|[\"“”]{2,}")
 _PROVINCE_LEVEL_RE = re.compile(
@@ -104,6 +137,29 @@ _PROFILE_PROVIDER_SUFFIX_RE = re.compile(
     r"农村信用合作联社|农村信用社联合社|股份有限公司|"
     r"有限责任公司|有限公司|征信中心|信用卡中心|个人信贷部|管理中心)"
 )
+_HOUSEHOLD_ADDRESS_LABEL = "\u6237\u7c4d\u5730\u5740"
+
+
+@dataclass(frozen=True, slots=True)
+class _MergedHouseholdHeaderTrait:
+    """Source-owned proof that one merged header contains ``鎴风睄鍦板潃``."""
+
+    row: int
+    column: int
+    evidence_ids: tuple[str, ...]
+    bbox: tuple[float, float, float, float]
+
+
+def _finite_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(coordinate) for coordinate in value)
+    except (TypeError, ValueError):
+        return None
+    if not all(coordinate == coordinate and abs(coordinate) != float("inf") for coordinate in (left, top, right, bottom)):
+        return None
+    return (left, top, right, bottom) if right > left and bottom > top else None
 
 
 def _compact(value: Any) -> str:
@@ -159,6 +215,7 @@ def _profile_provider_evidence(value: str) -> dict[str, Any]:
     valid = bool(
         institution_slot_is_unambiguous(raw)
         and institution_slot_is_unambiguous(normalized)
+        and _compact(normalized) == _compact(raw)
         and _PROFILE_PROVIDER_SUFFIX_RE.fullmatch(_compact(normalized))
     )
     return {
@@ -235,11 +292,21 @@ def _is_profile_table(page: Any, table: Any, rows: list[list[str]]) -> bool:
 
 
 def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
+    metadata = getattr(table, "metadata", None) or {}
+    source_logical_page = (
+        int(metadata.get("source_logical_page") or 0)
+        if isinstance(metadata, Mapping)
+        else 0
+    )
+    source_page = int(metadata.get("source_page") or 0) if isinstance(metadata, Mapping) else 0
     ref: dict[str, Any] = {
         "source": "candidate_b_canonical_table",
-        "logical_page": int(getattr(page, "page_number", 0) or 0),
+        "logical_page": source_logical_page or int(getattr(page, "page_number", 0) or 0),
         "source_page": int(
-            getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0
+            source_page
+            or getattr(page, "source_page_number", 0)
+            or getattr(page, "page_number", 0)
+            or 0
         ),
         "table_id": str(getattr(table, "table_id", "") or ""),
         "row": row,
@@ -250,8 +317,8 @@ def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
         "binding_quality": "canonical_header_column",
         "geometry_scope": "canonical_field_slot",
     }
-    metadata = getattr(table, "metadata", None) or {}
     bbox = None
+    geometry_status = None
     if isinstance(metadata, Mapping):
         cell_bboxes = metadata.get("source_cell_bboxes") or metadata.get("cell_bboxes")
         if (
@@ -263,6 +330,14 @@ def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
             candidate = cell_bboxes[row][col]
             if isinstance(candidate, (list, tuple)) and len(candidate) == 4:
                 bbox = candidate
+        geometry_rows = metadata.get("cell_geometry_status")
+        if (
+            isinstance(geometry_rows, list)
+            and 0 <= row < len(geometry_rows)
+            and isinstance(geometry_rows[row], list)
+            and 0 <= col < len(geometry_rows[row])
+        ):
+            geometry_status = str(geometry_rows[row][col] or "")
         evidence_ids = metadata.get("cell_evidence_ids")
         if (
             isinstance(evidence_ids, list)
@@ -272,12 +347,18 @@ def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
             and isinstance(evidence_ids[row][col], list)
         ):
             ref["evidence_ids"] = [str(value) for value in evidence_ids[row][col] if value]
-    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+    if (
+        isinstance(bbox, (list, tuple))
+        and len(bbox) == 4
+        and geometry_status == "exact"
+    ):
         ref["bbox"] = list(bbox)
         ref["geometry_scope"] = "cell"
+        ref["geometry_status"] = geometry_status
+        ref["coordinate_system"] = "pdf_points_top_left"
     confidence = None
     if isinstance(metadata, Mapping):
-        confidence_rows = metadata.get("cell_confidences")
+        confidence_rows = metadata.get("cell_geometry_confidences") or metadata.get("cell_confidences")
         if (
             isinstance(confidence_rows, list)
             and 0 <= row < len(confidence_rows)
@@ -288,6 +369,357 @@ def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
     if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
         ref["confidence"] = max(0.0, min(1.0, float(confidence)))
     return ref
+
+
+def _exact_profile_cell(table: Any, row: int, col: int) -> Any | None:
+    """Return one evidence-sealed exact native cell behind a canonical slot."""
+
+    metadata = getattr(table, "metadata", None) or {}
+    if not isinstance(metadata, Mapping):
+        return None
+    native_cells = getattr(table, "source_cell_objects", None)
+    if (
+        not isinstance(native_cells, list)
+        or not (0 <= row < len(native_cells))
+        or not isinstance(native_cells[row], list)
+        or not (0 <= col < len(native_cells[row]))
+    ):
+        return None
+    cell = native_cells[row][col]
+    if (
+        cell is None
+        or str(getattr(cell, "geometry_status", "") or "") != "exact"
+        or not getattr(cell, "evidence_ids", None)
+    ):
+        return None
+    bbox = getattr(cell, "bbox", None)
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        left, top, right, bottom = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+    if not all(value == value and abs(value) != float("inf") for value in (left, top, right, bottom)):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return cell
+
+
+def _exact_profile_cell_tokens(
+    context: Any,
+    table: Any,
+    row: int,
+    col: int,
+    *,
+    logical_page: int | None,
+) -> tuple[tuple[str, tuple[float, float, float, float], str], ...] | None:
+    """Return the independently boxed tokens owned by one exact profile cell."""
+
+    cell = _exact_profile_cell(table, row, col)
+    if cell is None:
+        return None
+    evidence_ids = tuple(
+        str(value)
+        for value in getattr(cell, "evidence_ids", None) or ()
+        if str(value or "")
+    )
+    token_ids = tuple(
+        str(value)
+        for value in getattr(cell, "token_ids", None) or ()
+        if str(value or "")
+    )
+    if (
+        not token_ids
+        or len(token_ids) != len(set(token_ids))
+        or len(evidence_ids) != len(set(evidence_ids))
+        or set(token_ids) != set(evidence_ids)
+    ):
+        return None
+
+    resolved_tokens = resolve_exact_page_token_atoms(
+        context,
+        token_ids,
+        logical_page=logical_page,
+    )
+    if resolved_tokens is None:
+        return None
+
+    cell_bbox = tuple(float(value) for value in getattr(cell, "bbox"))
+    output: list[tuple[str, tuple[float, float, float, float], str]] = []
+    for text, bbox, token_id in resolved_tokens:
+        if (
+            bbox[0] < cell_bbox[0] - 1.0
+            or bbox[1] < cell_bbox[1] - 1.0
+            or bbox[2] > cell_bbox[2] + 1.0
+            or bbox[3] > cell_bbox[3] + 1.0
+        ):
+            return None
+        output.append((text, bbox, token_id))
+    return tuple(sorted(output, key=lambda item: (item[1][0], item[1][1], item[2])))
+
+
+def _profile_token_boxes_are_disjoint(
+    tokens: Iterable[tuple[str, tuple[float, float, float, float], str]],
+) -> bool:
+    boxes = [token[1] for token in tokens]
+    for index, left in enumerate(boxes):
+        for right in boxes[index + 1 :]:
+            if (
+                left[0] < right[2]
+                and right[0] < left[2]
+                and left[1] < right[3]
+                and right[1] < left[3]
+            ):
+                return False
+    return True
+
+
+def _profile_token_ids_have_unique_cell_owners(
+    context: Any,
+    token_ids: Iterable[str],
+) -> bool:
+    """Reject evidence IDs replayed by another physical source cell."""
+
+    required = frozenset(str(value) for value in token_ids if str(value or ""))
+    if not required:
+        return False
+    owner_counts = {token_id: 0 for token_id in required}
+    for page in getattr(context, "pages", None) or ():
+        for table in getattr(page, "tables", None) or ():
+            source_cells = getattr(table, "source_cell_objects", None)
+            if not isinstance(source_cells, list):
+                continue
+            for row in source_cells:
+                if not isinstance(row, list):
+                    continue
+                for cell in row:
+                    if cell is None:
+                        continue
+                    owned = {
+                        str(value)
+                        for attribute in ("evidence_ids", "token_ids")
+                        for value in getattr(cell, attribute, None) or ()
+                        if str(value or "")
+                    }
+                    for token_id in required & owned:
+                        owner_counts[token_id] += 1
+    return all(count == 1 for count in owner_counts.values())
+
+
+def _exact_profile_scalar_token_candidate(
+    context: Any,
+    page: Any,
+    table: Any,
+    *,
+    header_row: int,
+    header_column: int,
+    header_fields: Iterable[str],
+    value_row: int,
+    value_column: int,
+    raw: str,
+    field: str,
+) -> tuple[str, str, dict[str, Any]] | None:
+    """Bind one strict scalar to a closed, residue-free token partition.
+
+    This capability applies only when multiple registered scalar labels share
+    one exact header cell.  Every header and value token must have a distinct
+    immutable owner, every value token must type as exactly one registered
+    role, and the complete physical-cell text must be consumed.
+    """
+
+    observed_roles = tuple(str(role) for role in header_fields)
+    roles = tuple(dict.fromkeys(observed_roles))
+    if (
+        field not in roles
+        or len(roles) < 2
+        or len(roles) != len(observed_roles)
+        or any(role not in _EXACT_PROFILE_TOKEN_FIELDS for role in roles)
+    ):
+        return None
+    logical_page = int(getattr(page, "page_number", 0) or 0)
+    header_tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        header_row,
+        header_column,
+        logical_page=logical_page,
+    )
+    value_tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        value_row,
+        value_column,
+        logical_page=logical_page,
+    )
+    if (
+        header_tokens is None
+        or value_tokens is None
+        or len(header_tokens) != len(roles)
+        or len(value_tokens) != len(roles)
+        or not _profile_token_boxes_are_disjoint(header_tokens)
+        or not _profile_token_boxes_are_disjoint(value_tokens)
+        or not _profile_token_boxes_are_disjoint((*header_tokens, *value_tokens))
+    ):
+        return None
+
+    rows = _rows(table)
+    if not (
+        0 <= header_row < len(rows)
+        and 0 <= header_column < len(rows[header_row])
+    ):
+        return None
+    header_raw = str(rows[header_row][header_column] or "")
+    if (
+        re.sub(r"\s+", "", "".join(token[0] for token in header_tokens))
+        != re.sub(r"\s+", "", header_raw)
+        or re.sub(r"\s+", "", "".join(token[0] for token in value_tokens))
+        != re.sub(r"\s+", "", str(raw or ""))
+    ):
+        return None
+
+    header_token_roles = tuple(
+        _LABEL_TO_FIELD.get(_compact(text))
+        for text, _bbox, _token_id in header_tokens
+    )
+    if (
+        any(role is None for role in header_token_roles)
+        or len(set(header_token_roles)) != len(header_token_roles)
+        or set(header_token_roles) != set(roles)
+    ):
+        return None
+
+    assignments: dict[
+        str,
+        tuple[str, str, tuple[float, float, float, float], str],
+    ] = {}
+    for header_role, (token_text, token_bbox, token_id) in zip(
+        header_token_roles,
+        value_tokens,
+        strict=True,
+    ):
+        matches: list[tuple[str, str]] = []
+        for role in roles:
+            valid, normalized = _candidate_valid(role, token_text)
+            if valid and normalized is not None:
+                matches.append((role, str(normalized)))
+        if (
+            len(matches) != 1
+            or matches[0][0] != header_role
+            or header_role in assignments
+        ):
+            return None
+        assignments[header_role] = (
+            token_text,
+            matches[0][1],
+            token_bbox,
+            token_id,
+        )
+    if set(assignments) != set(roles):
+        return None
+
+    all_token_ids = tuple(
+        token_id
+        for _text, _bbox, token_id in (*header_tokens, *value_tokens)
+    )
+    if (
+        len(all_token_ids) != len(set(all_token_ids))
+        or not _profile_token_ids_have_unique_cell_owners(context, all_token_ids)
+    ):
+        return None
+    token_text, normalized, token_bbox, token_id = assignments[field]
+    ref = _source_ref(page, table, value_row, value_column)
+    ref.update(
+        {
+            "field_name": field,
+            "bbox": list(token_bbox),
+            "evidence_ids": [token_id],
+            "geometry_scope": "token",
+            "geometry_status": "exact",
+            "coordinate_system": "pdf_points_top_left",
+            "binding": "exact_profile_scalar_token_owner",
+            "binding_quality": "exact_profile_scalar_token_owner",
+        }
+    )
+    return token_text, normalized, ref
+
+
+def _bounded_profile_address_sequence_residue(
+    context: Any,
+    table: Any,
+    row: int,
+    col: int,
+    raw: str,
+    *,
+    logical_page: int | None,
+) -> str | None:
+    """Remove one independently owned row-number residue from an address slot.
+
+    A profile address has no sequence field.  A nearby provider-row ordinal may
+    nevertheless be pulled into its merged cell when a horizontal rule is faint.
+    Recovery is allowed only when the cell owns exactly two distinct OCR atoms:
+    one tiny left-edge integer and one complete region-led address.  The atoms'
+    boxes, IDs, order, and full raw concatenation must all agree.  This is not a
+    general leading-number heuristic.
+    """
+
+    cell = _exact_profile_cell(table, row, col)
+    tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        row,
+        col,
+        logical_page=logical_page,
+    )
+    if cell is None or tokens is None or len(tokens) != 2:
+        return None
+    row_span = getattr(cell, "row_span", 1)
+    col_span = getattr(cell, "col_span", 1)
+    if row_span != 1 or col_span != 2:
+        return None
+    ordinal_candidates = [token for token in tokens if re.fullmatch(r"[1-9]\d?", token[0])]
+    address_candidates = [token for token in tokens if token not in ordinal_candidates]
+    if len(ordinal_candidates) != 1 or len(address_candidates) != 1:
+        return None
+    ordinal = ordinal_candidates[0]
+    address = address_candidates[0]
+    address_text = address[0].strip()
+    if (
+        not re.match(r"^[\u3400-\u9fff]{1,12}(?:省|市|自治区|特别行政区)", address_text)
+        or not _address_candidate_valid(address_text)
+        or _compact(raw) != _compact(ordinal[0] + address_text)
+    ):
+        return None
+    cell_bbox = tuple(float(value) for value in getattr(cell, "bbox"))
+    cell_width = cell_bbox[2] - cell_bbox[0]
+    ordinal_width = ordinal[1][2] - ordinal[1][0]
+    address_width = address[1][2] - address[1][0]
+    if (
+        ordinal_width > cell_width * 0.12
+        or address_width < cell_width * 0.45
+        or abs(
+            ((ordinal[1][1] + ordinal[1][3]) / 2.0)
+            - ((address[1][1] + address[1][3]) / 2.0)
+        )
+        > max(3.0, (cell_bbox[3] - cell_bbox[1]) * 0.35)
+    ):
+        return None
+    edge_tolerance = max(1.0, cell_width * 0.02)
+    separated_at_left = ordinal[1][2] + edge_tolerance <= address[1][0]
+    separated_at_right = address[1][2] + edge_tolerance <= ordinal[1][0]
+    if not (separated_at_left or separated_at_right):
+        return None
+    return address_text
+
+
+def _bounded_visual_dash_only_cell(context: Any, table: Any, row: int, col: int) -> bool:
+    """Verify a printed ``--`` in one exact canonical profile cell."""
+    cell = _exact_profile_cell(table, row, col)
+    if cell is None:
+        return False
+    metadata = getattr(table, "metadata", None) or {}
+    logical_page = int(metadata.get("source_logical_page") or 0) if isinstance(metadata, Mapping) else 0
+    return exact_cell_visually_contains_dash_pair(context, cell, logical_page=logical_page)
 
 
 def _candidate_valid(field: str, value: str) -> tuple[bool, str | None]:
@@ -305,87 +737,313 @@ def _candidate_valid(field: str, value: str) -> tuple[bool, str | None]:
         contract = validate_pboc_field(text, role)
         return contract.valid, normalize_pboc_field(text, role) if contract.valid else None
     if field == "birth_date":
-        match = _DATE_RE.search(text)
+        match = _DATE_RE.fullmatch(text)
         if not match:
             return False, None
         parts = [int(value) for value in re.findall(r"\d+", match.group(0))[:3]]
-        if len(parts) != 3 or not 1 <= parts[1] <= 12 or not 1 <= parts[2] <= 31:
+        if len(parts) != 3:
             return False, None
-        return True, f"{parts[0]:04d}-{parts[1]:02d}-{parts[2]:02d}"
+        try:
+            parsed = date(parts[0], parts[1], parts[2])
+        except ValueError:
+            return False, None
+        return True, parsed.isoformat()
     if field == "mobile_phone":
-        if any(character.isalpha() for character in text):
+        match = re.fullmatch(
+            r"(?:(?:\+?86|0086)[ -]?)?(1[3-9]\d[ -]?\d{4}[ -]?\d{4})",
+            text,
+        )
+        if match is None:
             return False, None
-        digits = re.sub(r"\D", "", text)
-        return bool(re.fullmatch(r"1[3-9]\d{9}", digits)), digits if len(digits) == 11 else None
+        return True, re.sub(r"[ -]", "", match.group(1))
     if field in {"work_phone", "residence_phone"}:
-        if any(character.isalpha() for character in text):
-            return False, None
-        digits = re.sub(r"\D", "", text)
-        return 5 <= len(digits) <= 16, text if 5 <= len(digits) <= 16 else None
+        valid = _NONMOBILE_PHONE_RE.fullmatch(text) is not None
+        return valid, text if valid else None
     if field == "email":
         return bool(_EMAIL_RE.fullmatch(text)), text if _EMAIL_RE.fullmatch(text) else None
     if field in _ADDRESS_FIELDS:
         valid = _address_candidate_valid(text)
         return valid, text if valid else None
     if field == "nationality":
-        valid = bool(re.search(r"[\u3400-\u9fffA-Za-z]", compact)) and len(compact) <= 30
-        return valid, text if valid else None
+        contract = validate_pboc_field(text, "country_or_region_code")
+        valid = contract.valid and not is_pboc_institution_name(compact)
+        return valid, normalize_pboc_field(text, "country_or_region_code") if valid else None
     return True, text
 
 
+def canonical_profile_phone(field: str, value: Any) -> str | None:
+    """Return one canonical profile phone under the extraction grammar."""
+
+    if field not in _PHONE_FIELDS or isinstance(value, (Mapping, list, tuple, set)):
+        return None
+    valid, normalized = _candidate_valid(field, str(value or ""))
+    return str(normalized) if valid and normalized is not None else None
+
+
 def _label_fields(value: Any) -> list[str]:
-    """Return canonical roles printed in one possibly collapsed header cell."""
+    """Return roles only from a residue-free whole-cell alias grammar."""
 
     marker = _compact(value)
     exact = _LABEL_TO_FIELD.get(marker)
     if exact:
         return [exact]
-    located: list[tuple[int, int, str]] = []
-    for field, aliases in _ALIASES.items():
-        for alias in aliases:
-            compact_alias = _compact(alias)
-            position = marker.find(compact_alias)
-            if position >= 0:
-                located.append((position, -len(compact_alias), field))
-                break
-    ordered: list[str] = []
-    for _position, _negative_length, field in sorted(located):
-        if field not in ordered:
-            ordered.append(field)
-    return ordered
+    if not marker:
+        return []
+
+    alias_roles = tuple(
+        sorted(
+            {
+                (_compact(alias), field)
+                for field, aliases in _ALIASES.items()
+                for alias in aliases
+                if _compact(alias)
+            },
+            key=lambda item: (-len(item[0]), item[0], item[1]),
+        )
+    )
+    memo: dict[int, set[tuple[str, ...]]] = {}
+
+    def complete_covers(offset: int) -> set[tuple[str, ...]]:
+        if offset == len(marker):
+            return {()}
+        if offset in memo:
+            return memo[offset]
+        covers: set[tuple[str, ...]] = set()
+        for alias, field in alias_roles:
+            if not marker.startswith(alias, offset):
+                continue
+            for tail in complete_covers(offset + len(alias)):
+                candidate = (field, *tail)
+                if len(candidate) == len(set(candidate)):
+                    covers.add(candidate)
+        memo[offset] = covers
+        return covers
+
+    covers = complete_covers(0)
+    if len(covers) != 1:
+        return []
+    fields = next(iter(covers))
+    # Household-address repair still requires independently owned exact token
+    # geometry; a concatenated raw header is not sufficient authority.
+    if "household_address" in fields:
+        return []
+    return list(fields)
 
 
-def _row_label_fields(row: list[str]) -> list[tuple[int, str]]:
+def _merged_household_header_trait(
+    context: Any,
+    table: Any,
+    row_index: int,
+    column: int,
+) -> _MergedHouseholdHeaderTrait | None:
+    """Prove one merged household-address label from immutable token atoms.
+
+    The canonical raw string is not authority for a role repair.  The source
+    cell must be exact, must own a unique closed set of token IDs, and exactly
+    one of those independently boxed tokens must itself print ``鎴风睄鍦板潃``.
+    """
+
+    cell = _exact_profile_cell(table, row_index, column)
+    metadata = getattr(table, "metadata", None) or {}
+    logical_page = (
+        int(metadata.get("source_logical_page") or 0)
+        if isinstance(metadata, Mapping)
+        else 0
+    )
+    tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        row_index,
+        column,
+        logical_page=logical_page,
+    )
+    if cell is None or tokens is None or len(tokens) < 2:
+        return None
+    rows = _rows(table)
+    if not (
+        0 <= row_index < len(rows)
+        and 0 <= column < len(rows[row_index])
+        and _compact("".join(text for text, _bbox, _token_id in tokens))
+        == _compact(rows[row_index][column])
+        and _profile_token_boxes_are_disjoint(tokens)
+    ):
+        return None
+    token_roles = [_label_fields(text) for text, _bbox, _token_id in tokens]
+    if any(len(roles) != 1 for roles in token_roles):
+        return None
+    recognized_fields = [roles[0] for roles in token_roles]
+    if (
+        len(set(recognized_fields)) != len(recognized_fields)
+        or len(recognized_fields) < 2
+        or recognized_fields.count("household_address") != 1
+    ):
+        return None
+    evidence_ids = tuple(token_id for _text, _bbox, token_id in tokens)
+    if (
+        len(evidence_ids) != len(set(evidence_ids))
+        or not _profile_token_ids_have_unique_cell_owners(context, evidence_ids)
+    ):
+        return None
+    bbox = _finite_bbox(getattr(cell, "bbox", None))
+    if bbox is None:
+        return None
+    return _MergedHouseholdHeaderTrait(
+        row=row_index,
+        column=column,
+        evidence_ids=evidence_ids,
+        bbox=bbox,
+    )
+
+
+def _exact_clipped_nationality_column(
+    context: Any,
+    table: Any,
+    *,
+    header_row: int,
+    column: int,
+) -> bool:
+    """Prove the clipped ``国`` header and its adjacent nationality value."""
+
+    rows = _rows(table)
+    value_row = header_row + 1
+    if not (
+        0 <= header_row < len(rows)
+        and 0 <= value_row < len(rows)
+        and 0 <= column < len(rows[header_row])
+        and 0 <= column < len(rows[value_row])
+        and _compact(rows[header_row][column]) == "国"
+    ):
+        return False
+    valid, _normalized = _candidate_valid("nationality", rows[value_row][column])
+    if not valid:
+        return False
+
+    metadata = getattr(table, "metadata", None) or {}
+    logical_page = (
+        int(metadata.get("source_logical_page") or 0)
+        if isinstance(metadata, Mapping)
+        else 0
+    )
+    header_cell = _exact_profile_cell(table, header_row, column)
+    value_cell = _exact_profile_cell(table, value_row, column)
+    header_tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        header_row,
+        column,
+        logical_page=logical_page,
+    )
+    value_tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        value_row,
+        column,
+        logical_page=logical_page,
+    )
+    if (
+        header_cell is None
+        or value_cell is None
+        or header_tokens is None
+        or value_tokens is None
+        or len(header_tokens) != 1
+        or not value_tokens
+        or not _profile_token_boxes_are_disjoint(value_tokens)
+        or _compact(header_tokens[0][0]) != "国"
+        or _compact("".join(text for text, _bbox, _token_id in value_tokens))
+        != _compact(rows[value_row][column])
+    ):
+        return False
+
+    header_bbox = _finite_bbox(getattr(header_cell, "bbox", None))
+    value_bbox = _finite_bbox(getattr(value_cell, "bbox", None))
+    if header_bbox is None or value_bbox is None:
+        return False
+    horizontal_overlap = min(header_bbox[2], value_bbox[2]) - max(
+        header_bbox[0], value_bbox[0]
+    )
+    if horizontal_overlap <= 0:
+        return False
+
+    token_ids = tuple(
+        token_id
+        for _text, _bbox, token_id in (*header_tokens, *value_tokens)
+    )
+    return bool(
+        len(token_ids) == len(set(token_ids))
+        and _profile_token_ids_have_unique_cell_owners(context, token_ids)
+    )
+
+
+def _row_label_fields(
+    row: list[str],
+    *,
+    context: Any | None = None,
+    table: Any | None = None,
+    row_index: int | None = None,
+) -> list[tuple[int, str]]:
     """Apply the closed canonical identity-row signature to damaged headers."""
 
     by_column = {column: _label_fields(value) for column, value in enumerate(row)}
     observed = {field for fields in by_column.values() for field in fields}
-    if {"degree", "education_level", "email"} <= observed and "nationality" not in observed:
-        degree_column = next(
-            (column for column, fields in by_column.items() if {"degree", "education_level"} <= set(fields)),
-            None,
-        )
-        email_column = next(
-            (column for column, fields in by_column.items() if "email" in fields),
-            None,
-        )
-        if degree_column is not None and email_column is not None and email_column - degree_column == 2:
-            by_column.setdefault(degree_column + 1, []).append("nationality")
-    if "mailing_address" in observed and "household_address" not in observed:
-        mailing_column = next(
-            (column for column, fields in by_column.items() if "mailing_address" in fields),
-            None,
-        )
-        unknown_columns = [
-            column
-            for column, fields in by_column.items()
-            if mailing_column is not None
-            and column > mailing_column
-            and str(row[column] or "").strip()
-            and not fields
+    if "nationality" not in observed and len(row) == 4:
+        education_columns = [column for column, fields in by_column.items() if fields == ["education_level"]]
+        degree_columns = [column for column, fields in by_column.items() if fields == ["degree"]]
+        email_columns = [column for column, fields in by_column.items() if fields == ["email"]]
+        if (
+            education_columns == [0]
+            and degree_columns == [1]
+            and email_columns == [3]
+            and not by_column[2]
+            and _compact(row[2]) == "国"
+        ):
+            # Position is only a locator.  Material role authority comes from
+            # exact, uniquely owned header and value atoms in the same column.
+            if (
+                context is not None
+                and table is not None
+                and isinstance(row_index, int)
+                and _exact_clipped_nationality_column(
+                    context,
+                    table,
+                    header_row=row_index,
+                    column=2,
+                )
+            ):
+                by_column[2].append("nationality")
+    household_columns = [
+        column
+        for column, fields in by_column.items()
+        if "household_address" in fields
+    ]
+    if len(household_columns) > 1:
+        for column in household_columns:
+            by_column[column] = [
+                field
+                for field in by_column[column]
+                if field != "household_address"
+            ]
+    elif (
+        not household_columns
+        and context is not None
+        and table is not None
+        and isinstance(row_index, int)
+    ):
+        traits = [
+            trait
+            for column in range(len(row))
+            if (
+                trait := _merged_household_header_trait(
+                    context,
+                    table,
+                    row_index,
+                    column,
+                )
+            )
+            is not None
         ]
-        if len(unknown_columns) == 1:
-            by_column[unknown_columns[0]].append("household_address")
+        # Duplicate physical owners make the semantic column ambiguous.
+        if len(traits) == 1:
+            by_column[traits[0].column].append("household_address")
     return [
         (column, field)
         for column, fields in by_column.items()
@@ -396,15 +1054,12 @@ def _row_label_fields(row: list[str]) -> list[tuple[int, str]]:
 def _field_fragments(field: str, value: str) -> list[tuple[str, str]]:
     """Decode field-specific values from one OCR-collapsed canonical cell."""
 
-    from docmirror.plugins.credit_report.personal_detail_scanned.field_contracts import (
-        normalize_pboc_field,
-        pboc_controlled_vocabulary,
-        validate_pboc_field,
-    )
-
     text = str(value or "").strip()
     if not text:
         return []
+    if field in _EXACT_PROFILE_TOKEN_FIELDS:
+        valid, normalized = _candidate_valid(field, text)
+        return [(text, str(normalized))] if valid and normalized is not None else []
     business_text = (
         text
         if field in _ADDRESS_FIELDS
@@ -413,83 +1068,11 @@ def _field_fragments(field: str, value: str) -> list[tuple[str, str]]:
     if not business_text:
         return []
     text = business_text
-    role = _VOCAB_ROLES.get(field)
-    if role:
-        compact = _compact(text)
-        matches: list[tuple[int, int, str]] = []
-        for candidate in pboc_controlled_vocabulary(role):
-            marker = _compact(candidate)
-            position = compact.find(marker)
-            if position >= 0:
-                matches.append((position, -len(marker), candidate))
-        selected: list[str] = []
-        for _position, _negative_length, candidate in sorted(matches):
-            if any(_compact(candidate) in _compact(existing) for existing in selected):
-                continue
-            if any(_compact(existing) in _compact(candidate) for existing in selected):
-                selected = [existing for existing in selected if _compact(existing) not in _compact(candidate)]
-            if candidate not in selected:
-                selected.append(candidate)
-        if field == "education_level" and any(
-            candidate not in {"无", "未知", "其他"} for candidate in selected
-        ):
-            selected = [candidate for candidate in selected if candidate not in {"无", "未知", "其他"}]
-        decoded = [
-            (candidate, normalize_pboc_field(candidate, role))
-            for candidate in selected
-            if validate_pboc_field(candidate, role).valid
-        ]
-        if decoded:
-            return decoded
-        from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
-            normalize_role_candidate,
-        )
-
-        corrected_tokens: list[tuple[str, str]] = []
-        for token in re.split(r"\s+", text):
-            token = token.strip("：:，,；;()（）[]【】")
-            if not token:
-                continue
-            corrected = normalize_role_candidate(token, role)
-            if (
-                corrected != token
-                and validate_pboc_field(corrected, role).valid
-                and corrected not in {value for _raw, value in corrected_tokens}
-            ):
-                corrected_tokens.append((token, corrected))
-        return corrected_tokens
-    if field == "birth_date":
-        match = _DATE_RE.search(text)
-        if match:
-            valid, normalized = _candidate_valid(field, match.group(0))
-            return [(match.group(0), str(normalized))] if valid and normalized else []
-    if field == "email":
-        match = _EMAIL_SEARCH_RE.search(text)
-        if match:
-            valid, normalized = _candidate_valid(field, match.group(0))
-            return [(match.group(0), str(normalized))] if valid and normalized else []
-    if field == "mobile_phone":
-        if any(character.isalpha() for character in text):
-            return []
-        match = re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", text)
-        if match:
-            return [(match.group(0), match.group(0))]
-    if field in {"work_phone", "residence_phone"}:
-        if any(character.isalpha() for character in text):
-            return []
-        match = re.search(r"(?<!\d)(?:\d{3,4}[-—]?)?\d{5,12}(?!\d)", text)
-        if match:
-            valid, normalized = _candidate_valid(field, match.group(0))
-            return [(match.group(0), str(normalized))] if valid and normalized else []
-    if field == "nationality":
-        match = re.search(r"中国(?:[（(]含港澳台[）)])?", text)
-        if match:
-            return [(match.group(0), match.group(0))]
     valid, normalized = _candidate_valid(field, text)
     return [(text, str(normalized))] if valid and normalized is not None else []
 
 
-def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
+def _table_candidates(context: Any, pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
     candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for page in pages:
         for table in getattr(page, "tables", None) or ():
@@ -497,11 +1080,21 @@ def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
             if not _is_profile_table(page, table, rows):
                 continue
             for row_index, row in enumerate(rows):
-                labels = _row_label_fields(row)
+                labels = _row_label_fields(
+                    row,
+                    context=context,
+                    table=table,
+                    row_index=row_index,
+                )
                 fields_by_column: dict[int, set[str]] = defaultdict(set)
                 for label_column, label_field in labels:
                     fields_by_column[label_column].add(label_field)
                 for column, field in labels:
+                    header_fields = tuple(
+                        label_field
+                        for label_column, label_field in labels
+                        if label_column == column
+                    )
                     choices: list[tuple[str, int, int]] = []
                     next_label_column = next(
                         (candidate_column for candidate_column, _candidate_field in labels if candidate_column > column),
@@ -548,6 +1141,48 @@ def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
                             continue
                         ref = _source_ref(page, table, value_row, value_col)
                         ref["field_name"] = field
+                        address_without_residue = (
+                            _bounded_profile_address_sequence_residue(
+                                context,
+                                table,
+                                value_row,
+                                value_col,
+                                raw,
+                                logical_page=int(getattr(page, "page_number", 0) or 0),
+                            )
+                            if field == "mailing_address"
+                            else None
+                        )
+                        if address_without_residue is not None:
+                            candidates[field].append(
+                                {
+                                    "raw": raw.strip(),
+                                    "normalized": address_without_residue,
+                                    "valid": True,
+                                    "source_absent": False,
+                                    "source_refs": [ref],
+                                    "confidence": ref.get("confidence"),
+                                    "recognition_source": "exact_token_owned_sequence_residue",
+                                }
+                            )
+                            continue
+                        if (
+                            field in {"degree", "household_address"}
+                            and not is_explicit_source_absence(raw)
+                            and _bounded_visual_dash_only_cell(context, table, value_row, value_col)
+                        ):
+                            candidates[field].append(
+                                {
+                                    "raw": "--",
+                                    "normalized": None,
+                                    "valid": False,
+                                    "source_absent": True,
+                                    "source_refs": [ref],
+                                    "confidence": ref.get("confidence"),
+                                    "recognition_source": "static_visual_dash_shape",
+                                }
+                            )
+                            continue
                         address_split = (
                             _split_profile_address_provider(raw)
                             if field in _ADDRESS_FIELDS
@@ -569,8 +1204,46 @@ def _table_candidates(pages: Iterable[Any]) -> dict[str, list[dict[str, Any]]]:
                                 }
                             )
                             continue
-                        fragments = _field_fragments(field, raw)
-                        if not fragments:
+                        strict_multi_role = (
+                            field in _EXACT_PROFILE_TOKEN_FIELDS
+                            and len(header_fields) > 1
+                        )
+                        strict_token_candidate = (
+                            _exact_profile_scalar_token_candidate(
+                                context,
+                                page,
+                                table,
+                                header_row=row_index,
+                                header_column=column,
+                                header_fields=header_fields,
+                                value_row=value_row,
+                                value_column=value_col,
+                                raw=raw,
+                                field=field,
+                            )
+                            if strict_multi_role
+                            else None
+                        )
+                        if strict_token_candidate is not None:
+                            token_raw, token_normalized, token_ref = strict_token_candidate
+                            candidates[field].append(
+                                {
+                                    "raw": token_raw.strip(),
+                                    "normalized": token_normalized,
+                                    "valid": True,
+                                    "source_absent": False,
+                                    "source_refs": [token_ref],
+                                    "confidence": token_ref.get("confidence"),
+                                    "recognition_source": "exact_profile_scalar_token_owner",
+                                }
+                            )
+                            continue
+                        fragments = (
+                            []
+                            if strict_multi_role
+                            else _field_fragments(field, raw)
+                        )
+                        if not fragments and not strict_multi_role:
                             valid, normalized = _candidate_valid(field, raw)
                             fragments = [(raw.strip(), str(normalized))] if valid and normalized is not None else []
                         if not fragments:
@@ -623,7 +1296,7 @@ def _dedupe_candidates(values: Iterable[Mapping[str, Any]]) -> list[dict[str, An
 def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
     """Return one uncertainty-aware profile observation map."""
     result: dict[str, Any] = {}
-    candidates_by_field = _table_candidates(context.pages)
+    candidates_by_field = _table_candidates(context, context.pages)
     if not candidates_by_field:
         return result
     for field in _ALIASES:
@@ -743,4 +1416,4 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
     return result
 
 
-__all__ = ["extract_candidate_b_profile"]
+__all__ = ["canonical_profile_phone", "extract_candidate_b_profile"]
