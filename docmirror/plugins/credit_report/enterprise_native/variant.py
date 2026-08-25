@@ -88,8 +88,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
 
         dictionary = enterprise_credit_report_data_dictionary()
         fields = dictionary.setdefault("fields", {})
-        for field_name in ("subject_id", "id_number", "id_type", "marital_status"):
-            fields.pop(field_name, None)
         fields["subject_name"] = {"label": "企业名称", "type": "string"}
         fields["unified_social_credit_code"] = {
             "label": "统一社会信用代码",
@@ -1783,29 +1781,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "inactive": "非活动",
         }
         datasets = dictionary.setdefault("datasets", {})
-        datasets["enterprise_credit_accounts"]["definition"] = (
-            "一行对应企业报告信贷记录明细中的一个当前或已结清账户卡片。"
-        )
-        datasets["enterprise_credit_facilities"]["definition"] = (
-            "一行对应企业报告中的一份授信信息明细卡片；概要额度不作为记录导出。"
-        )
-        datasets["enterprise_credit_facilities"]["non_additive_with"] = [
-            "enterprise_credit_accounts",
-            "credit_summary.facility_summary",
-        ]
-        datasets["enterprise_repayment_responsibility_accounts"]["definition"] = (
-            "一行对应企业报告相关还款责任信息明细中的一个账户；跨页续表合并为同一行。"
-        )
         datasets["enterprise_profile"]["definition"] = (
             "一行对应一个企业基本信息快照；字段级状态明确区分源缺失值，"
             "每个业务字段的*_source_institution列保留报告中的信息来源机构。"
         )
-        datasets["enterprise_displayed_credit_summary"]["non_additive_with"] = [
-            "enterprise_credit_accounts",
-            "enterprise_attachment_credit_details",
-            "enterprise_current_credit_summary",
-            "enterprise_closed_credit_summary",
-        ]
         maturity_column = {
             "label": "到期日期",
             "type": "date",
@@ -1871,17 +1850,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         semantic["dataset_document_order"] = list(
             _ENTERPRISE_DOCUMENT_DATASET_ORDER
         )
-        policy = semantic.setdefault("presentation_policy", {})
-        policy["classification"] = "sensitive_enterprise_credit_data"
-        policy["enhanced_markdown_display"] = "full"
-        policy["mask_fields"] = [
-            "report_number",
-            "account_identifier",
-            "contract_number",
-            "limit_identifier",
-            "identity_number",
-            "business_registration_number",
-        ]
         semantic["dataset_relationships"] = {
             "enterprise_credit_facilities": {
                 "relationship": "independent_enterprise_facility_records",

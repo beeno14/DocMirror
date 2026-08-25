@@ -490,6 +490,79 @@ def _physical_logical_row_mismatch_warning(
     return f"BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:physical={physical_expected}:canonical={style_meta.canonical_extracted}"
 
 
+def _run_strategy_deployment(
+    context_builder: Any,
+    parse_result: Any,
+    full_text: str,
+    plugin: Any,
+    *,
+    adaptive: bool,
+) -> tuple[StyleContext, StyleDetectionResult, list[dict[str, Any]], dict[str, dict], Any]:
+    """Run one fresh BLO attempt with adaptive or exact eager deployment."""
+
+    ctx = context_builder(parse_result, full_text)
+    detection = BankStyleDetector().detect(ctx)
+    registry = BankStyleParserRegistry(adaptive=adaptive)
+    records, identity_fields, blo_meta = BankLedgerOrchestrator(registry).run(
+        detection,
+        ctx,
+        plugin,
+    )
+    return ctx, detection, records, identity_fields, blo_meta
+
+
+def _used_lazy_primary(blo_meta: Any) -> bool:
+    return any(
+        diagnostic.get("deployment_mode") == "lazy_primary"
+        and diagnostic.get("completion_state") == "proven"
+        for diagnostic in (getattr(blo_meta, "candidate_diagnostics", None) or [])
+        if isinstance(diagnostic, dict)
+    )
+
+
+def _row_accounting_view(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    parsed_rows = len(records)
+    direction_count = sum(
+        1 for record in records if (record.get("normalized") or {}).get("direction") in {"income", "expense"}
+    )
+    canonical_records = [
+        record for record in records if is_canonical_row(record.get("normalized") or {})
+    ]
+    sourced_count = sum(1 for record in canonical_records if _has_single_page_source(record))
+    return canonical_records, parsed_rows, direction_count, sourced_count
+
+
+def _lazy_final_gate_failures(
+    records: list[dict[str, Any]],
+    *,
+    parsed_rows: int,
+    direction_count: int,
+    sourced_count: int,
+    physical_expected: int,
+    source_reported_count: Any,
+    invariant_failures: list[str],
+) -> list[str]:
+    """Return reasons that invalidate a provisional lazy-primary result."""
+
+    failures: list[str] = []
+    canonical_rows = len(records)
+    if parsed_rows != canonical_rows:
+        failures.append("canonical_filter_changed_row_count")
+    if direction_count != parsed_rows:
+        failures.append("direction_coverage_incomplete")
+    if canonical_rows and sourced_count != canonical_rows:
+        failures.append("source_page_coverage_incomplete")
+    if is_authoritative_issuer_row_count(source_reported_count) and source_reported_count.count != canonical_rows:
+        failures.append("issuer_row_count_mismatch")
+    if physical_expected > 0 and physical_expected != canonical_rows:
+        failures.append("physical_row_count_mismatch")
+    if invariant_failures:
+        failures.append("final_invariant_audit_failed")
+    return failures
+
+
 def run_bank_statement_extract(
     parse_result: Any,
     full_text: str,
@@ -502,19 +575,77 @@ def run_bank_statement_extract(
         if extraction_route is BankExtractionRoute.DIGITAL
         else build_scanned_style_context
     )
-    ctx = context_builder(parse_result, full_text)
-    detection = BankStyleDetector().detect(ctx)
-    registry = BankStyleParserRegistry()
-    records, identity_fields, blo_meta = BankLedgerOrchestrator(registry).run(
-        detection,
-        ctx,
+    ctx, detection, raw_records, identity_fields, blo_meta = _run_strategy_deployment(
+        context_builder,
+        parse_result,
+        full_text,
         plugin,
+        adaptive=True,
     )
-    parsed_rows = len(records)
-    direction_count = sum(
-        1 for record in records if (record.get("normalized") or {}).get("direction") in {"income", "expense"}
+    page_texts = page_texts_with_business_headers(
+        parse_result,
+        page_texts_from_parse_result(parse_result),
     )
-    records = [record for record in records if is_canonical_row(record.get("normalized") or {})]
+    source_reported_count = resolve_row_count_evidence(
+        ctx.full_text,
+        page_texts=page_texts,
+    )
+    if source_reported_count.source in _ROW_PLANE_COUNT_SOURCES:
+        source_reported_count = replace(
+            source_reported_count,
+            confidence=min(source_reported_count.confidence, 0.80),
+        )
+    physical_expected = (
+        physical_transaction_row_estimate(parse_result)
+        if extraction_route is BankExtractionRoute.DIGITAL
+        else 0
+    )
+
+    records, parsed_rows, direction_count, sourced_count = _row_accounting_view(raw_records)
+    invariant_failures: list[str] | None = None
+    if _used_lazy_primary(blo_meta):
+        invariant_failures = audit_bank_statement_invariants(
+            records,
+            ctx.full_text,
+            page_texts=page_texts,
+            row_count_evidence=source_reported_count,
+        )
+        final_gate_failures = _lazy_final_gate_failures(
+            records,
+            parsed_rows=parsed_rows,
+            direction_count=direction_count,
+            sourced_count=sourced_count,
+            physical_expected=physical_expected,
+            source_reported_count=source_reported_count,
+            invariant_failures=invariant_failures,
+        )
+        if final_gate_failures:
+            prior_lazy_attempt = next(
+                (
+                    dict(diagnostic)
+                    for diagnostic in (getattr(blo_meta, "candidate_diagnostics", None) or [])
+                    if isinstance(diagnostic, dict)
+                    and diagnostic.get("deployment_mode") == "lazy_primary"
+                ),
+                None,
+            )
+            ctx, detection, raw_records, identity_fields, blo_meta = _run_strategy_deployment(
+                context_builder,
+                parse_result,
+                full_text,
+                plugin,
+                adaptive=False,
+            )
+            diagnostics = getattr(blo_meta, "candidate_diagnostics", None) or []
+            if diagnostics and isinstance(diagnostics[0], dict):
+                diagnostics[0]["deployment_mode"] = "eager_final_gate_fallback"
+                diagnostics[0]["completion_state"] = "unknown"
+                diagnostics[0]["completion_reason"] = ":".join(final_gate_failures)
+                if prior_lazy_attempt is not None:
+                    diagnostics[0]["prior_lazy_attempt"] = prior_lazy_attempt
+            records, parsed_rows, direction_count, sourced_count = _row_accounting_view(raw_records)
+            invariant_failures = None
+
     canonical_rows = len(records)
     emitted_rows = canonical_rows
     blocked_noncanonical_count = parsed_rows - canonical_rows
@@ -541,19 +672,6 @@ def run_bank_statement_extract(
             ):
                 identity_fields[field_name] = detail
     _drop_unbound_issuer(identity_fields)
-    page_texts = page_texts_with_business_headers(
-        parse_result,
-        page_texts_from_parse_result(parse_result),
-    )
-    source_reported_count = resolve_row_count_evidence(
-        ctx.full_text,
-        page_texts=page_texts,
-    )
-    if source_reported_count.source in _ROW_PLANE_COUNT_SOURCES:
-        source_reported_count = replace(
-            source_reported_count,
-            confidence=min(source_reported_count.confidence, 0.80),
-        )
     # Generic KV/text/atom identity recovery can observe a count label, but it
     # cannot prove that the label owns the complete statement. Fail closed and
     # publish this exact-looking field only from issuer-authoritative evidence.
@@ -569,11 +687,6 @@ def run_bank_statement_extract(
         source_reported_count=source_reported_count,
     )
     warnings = collect_extract_warnings(ctx, style_meta)
-    physical_expected = (
-        physical_transaction_row_estimate(parse_result)
-        if extraction_route is BankExtractionRoute.DIGITAL
-        else 0
-    )
     if mismatch_warning := _physical_logical_row_mismatch_warning(
         physical_expected,
         style_meta,
@@ -596,16 +709,16 @@ def run_bank_statement_extract(
         style_meta.extract_status = "degraded"
     if physical_expected > 0 and style_meta.canonical_extracted < physical_expected:
         style_meta.extract_status = "degraded"
-    sourced_count = sum(1 for record in records if _has_single_page_source(record))
     if records and sourced_count < len(records):
         warnings.append(f"BANK_SOURCE_PAGE_COVERAGE_LOW:sourced={sourced_count}:canonical={len(records)}")
         style_meta.extract_status = "degraded"
-    invariant_failures = audit_bank_statement_invariants(
-        records,
-        ctx.full_text,
-        page_texts=page_texts,
-        row_count_evidence=source_reported_count,
-    )
+    if invariant_failures is None:
+        invariant_failures = audit_bank_statement_invariants(
+            records,
+            ctx.full_text,
+            page_texts=page_texts,
+            row_count_evidence=source_reported_count,
+        )
     if invariant_failures:
         if any(warning.startswith("bank_invariant_failed:") for warning in invariant_failures):
             style_meta.extract_status = "degraded"

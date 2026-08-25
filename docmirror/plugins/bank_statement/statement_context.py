@@ -1590,6 +1590,24 @@ def _context_page_groups(parse_result: Any, facts_by_page: dict[int, list[_Heade
     return groups
 
 
+def statement_scope_count(parse_result: Any) -> int:
+    """Return the independently resolved number of statement/account scopes."""
+
+    if parse_result is None:
+        return 0
+    facts_by_page, _lines = _page_header_facts(parse_result)
+    if not any(
+        _fact_values(page_facts, key)
+        for page_facts in facts_by_page.values()
+        for key in _CONTEXT_SIGNATURE_FIELDS
+    ):
+        return 0
+    for page_facts in facts_by_page.values():
+        if any(len(_fact_values(page_facts, key)) > 1 for key in _CONTEXT_SIGNATURE_FIELDS):
+            return 2
+    return len(_context_page_groups(parse_result, facts_by_page))
+
+
 def _identity_facts(identity_fields: dict[str, dict[str, Any]], page: int = 1) -> list[_HeaderFact]:
     facts: list[_HeaderFact] = []
     for field_key, detail in identity_fields.items():
@@ -2424,4 +2442,5 @@ __all__ = [
     "build_statement_header_records",
     "page_texts_with_business_headers",
     "reconcile_source_unitemized_residuals",
+    "statement_scope_count",
 ]

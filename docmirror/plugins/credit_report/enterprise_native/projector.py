@@ -1307,7 +1307,6 @@ def derive_enterprise_projection(plugin: Any, parse_result: Any, full_text: str 
             "count_key": count_key,
             "public_basis": str(details.get("basis") or "canonical_source_component_count"),
         }
-    semantic["enterprise_dataset_completeness"] = semantic_document.dataset_completeness
     return ProjectionData(
         projector_id=plugin.projector_id,
         document_type=plugin.domain_name,

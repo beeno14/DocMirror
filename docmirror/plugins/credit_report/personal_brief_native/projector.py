@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
+from functools import lru_cache
+from types import MappingProxyType
 from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
@@ -17,6 +20,10 @@ from docmirror.plugins.credit_report.personal_brief_native.contracts import (
 )
 from docmirror.plugins.credit_report.personal_brief_native.pipeline import (
     run_personal_brief_pipeline,
+)
+from docmirror.plugins.credit_report.personal_brief_native.schema import (
+    _personal_brief_dataset_descriptors,
+    personal_brief_semantic_extensions,
 )
 from docmirror.plugins.credit_report.projection import (
     _account_structure_warnings,
@@ -293,13 +300,10 @@ _PUBLIC_COLUMN_TYPES = {
 }
 
 
-def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
-    """Return the closed-world personal-brief Community JSON contract."""
-
-    from docmirror.plugins.credit_report.personal_brief_native.schema import (
-        personal_brief_data_dictionary,
-        personal_brief_semantic_extensions,
-    )
+@lru_cache(maxsize=1)
+def _personal_brief_public_dataset_policy_template(
+) -> Mapping[str, tuple[str, ...] | None]:
+    """Validate and cache the package-private closed-world contract."""
 
     expected = list(personal_brief_semantic_extensions()["dataset_document_order"])
     policy: dict[str, tuple[str, ...] | None] = {
@@ -311,7 +315,7 @@ def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
     if missing or extra:
         raise RuntimeError(f"personal-brief public dataset policy is out of sync: missing={missing}, extra={extra}")
 
-    dictionary = personal_brief_data_dictionary().get("datasets") or {}
+    dictionary = _personal_brief_dataset_descriptors()
     declared_enum_fields: set[tuple[str, str]] = set()
     declared_money_fields: set[tuple[str, str]] = set()
     for dataset_name, fields in policy.items():
@@ -375,7 +379,13 @@ def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
                 f"{dataset_name}.{field_name}: unit={unit!r}, "
                 f"expected={PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT!r}"
             )
-    return {name: policy[name] for name in expected}
+    return MappingProxyType({name: policy[name] for name in expected})
+
+
+def personal_brief_public_dataset_policy() -> dict[str, tuple[str, ...] | None]:
+    """Return an isolated copy of the validated Community JSON contract."""
+
+    return dict(_personal_brief_public_dataset_policy_template())
 
 
 def _has_business_value(value: Any) -> bool:
@@ -492,14 +502,8 @@ def _validate_discarded_aliases(dataset_name: str, values: dict[str, Any]) -> No
 def _project_business_columns(
     dataset: dict[str, Any],
     field_order: tuple[str, ...],
+    descriptors: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    from docmirror.plugins.credit_report.personal_brief_native.schema import (
-        personal_brief_data_dictionary,
-    )
-
-    dataset_name = str(dataset.get("name") or "")
-    dictionary = personal_brief_data_dictionary().get("datasets") or {}
-    descriptors = (dictionary.get(dataset_name) or {}).get("columns") or {}
     originals = {
         str(column.get("key") or ""): column
         for column in dataset.get("columns") or []
@@ -533,8 +537,12 @@ def _project_business_columns(
 def _project_business_dataset(
     dataset: dict[str, Any],
     field_order: tuple[str, ...],
+    descriptors: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     dataset_name = str(dataset.get("name") or "")
+    if descriptors is None:
+        dataset_descriptors = _personal_brief_dataset_descriptors().get(dataset_name) or {}
+        descriptors = dataset_descriptors.get("columns") or {}
     allowed = set(field_order)
     classified = allowed | set(_NON_BUSINESS_FIELDS.get(dataset_name, ()))
     rows: list[dict[str, Any]] = []
@@ -604,7 +612,7 @@ def _project_business_dataset(
             "row_count": emitted,
             "primary_key": "record_id",
             "status": str(dataset.get("status") or ("complete" if rows else "empty")),
-            "columns": _project_business_columns(dataset, field_order),
+            "columns": _project_business_columns(dataset, field_order, descriptors),
             "completeness": completeness,
             "rows": rows,
         }
@@ -712,7 +720,8 @@ def project_personal_brief_community_json(payload: dict[str, Any]) -> dict[str, 
 
     projected = deepcopy(payload)
     _validate_public_record_aggregate(projected)
-    policy = personal_brief_public_dataset_policy()
+    policy = _personal_brief_public_dataset_policy_template()
+    descriptors = _personal_brief_dataset_descriptors()
     datasets: list[dict[str, Any]] = []
     for dataset in projected.get("datasets") or []:
         if not isinstance(dataset, dict):
@@ -723,7 +732,9 @@ def project_personal_brief_community_json(payload: dict[str, Any]) -> dict[str, 
         fields = policy[dataset_name]
         if fields is None:
             continue
-        datasets.append(_project_business_dataset(dataset, fields))
+        dataset_descriptors = descriptors.get(dataset_name) or {}
+        columns = dataset_descriptors.get("columns") or {}
+        datasets.append(_project_business_dataset(dataset, fields, columns))
     projected["datasets"] = datasets
     _clean_public_navigation(projected)
     return projected
@@ -742,7 +753,7 @@ def project_personal_brief_artifact_semantic(
         if isinstance(dataset, dict)
     }
     artifact_datasets = deepcopy(public_payload.get("datasets") or [])
-    policy = personal_brief_public_dataset_policy()
+    policy = _personal_brief_public_dataset_policy_template()
     for dataset in artifact_datasets:
         dataset_name = str(dataset.get("name") or "")
         field_order = policy.get(dataset_name) or ()

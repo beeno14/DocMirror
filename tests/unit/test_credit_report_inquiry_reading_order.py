@@ -185,6 +185,15 @@ def test_write_outputs_persists_enhanced_reading_without_private_reading_project
     monkeypatch,
 ) -> None:
     result = _result()
+    header = (
+        "个人信用报告 报告编号：2026071900012345678901 "
+        "报告时间：2026-07-19 09:08:07 姓名：张三 "
+        "证件类型：身份证 证件号码：11010519491231002X"
+    )
+    result.document_flow.nodes[0].text = header
+    result.pages[0].texts[0].content = header
+    result.document_flow.nodes[14].text = "本人查询"
+    result.pages[0].texts[14].content = "本人查询"
     before = copy.deepcopy(result.model_dump(mode="python"))
 
     def fail_if_called(*_args, **_kwargs):
@@ -209,24 +218,22 @@ def test_write_outputs_persists_enhanced_reading_without_private_reading_project
     assert result.model_dump(mode="python") == before
 
 
-def test_unrecognized_personal_brief_header_uses_generic_semantic_fallback() -> None:
+def test_unrecognized_personal_brief_header_fails_closed() -> None:
     result = _result()
 
     projection = CreditReportPlugin().derive(result, result.full_text)
 
     assert projection.domain_facts["report_subtype"] == "personal_brief"
-    assert (
-        projection.semantic["personal_brief_projection_mode"]
-        == "generic_unrecognized_header_fallback"
-    )
-    assert [row["normalized"]["sequence"] for row in projection.datasets["inquiry_records"]] == [
-        2,
-        3,
-        103,
-        1,
-    ]
-    assert projection.reason == (
-        "generic credit-report projection after canonical personal-brief header rejection"
+    assert projection.datasets == {}
+    assert "personal_brief_projection_mode" not in projection.semantic
+    assert projection.reason == "canonical personal brief IR schema projection"
+    extraction_report = projection.domain_facts["personal_brief_extraction_report"]
+    assert extraction_report["status"] == "incomplete"
+    assert extraction_report["business_record_count"] == 0
+    assert any(
+        failure["code"] == "PERSONAL_BRIEF_DOCUMENT_NOT_RECOGNIZED"
+        and failure["severity"] == "error"
+        for failure in extraction_report["failures"]
     )
 
 

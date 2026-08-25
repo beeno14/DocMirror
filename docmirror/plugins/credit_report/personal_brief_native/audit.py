@@ -303,11 +303,11 @@ def _collect_projection_conservation(
     public_datasets: Mapping[str, Mapping[str, Any]],
 ) -> list[PersonalBriefAuditFinding]:
     from docmirror.plugins.credit_report.personal_brief_native.projector import (
-        personal_brief_public_dataset_policy,
+        _personal_brief_public_dataset_policy_template,
     )
 
     findings: list[PersonalBriefAuditFinding] = []
-    policy = personal_brief_public_dataset_policy()
+    policy = _personal_brief_public_dataset_policy_template()
     retained = set(_DATASET_ORDER)
     for dataset_name in _DATASET_ORDER:
         semantic_dataset = semantic_datasets.get(dataset_name)
@@ -1509,16 +1509,14 @@ def build_personal_brief_observational_findings(
 ) -> tuple[PersonalBriefAuditFinding, ...]:
     """Return deterministic findings without mutating either input payload."""
 
-    semantic = deepcopy(dict(semantic_payload))
-    public = deepcopy(dict(public_payload))
-    semantic_datasets = _datasets(semantic)
-    public_datasets = _datasets(public)
+    semantic_datasets = _datasets(semantic_payload)
+    public_datasets = _datasets(public_payload)
     rich_rows = _rich_row_lookup(semantic_datasets)
     findings = [
         *_collect_projection_conservation(semantic_datasets, public_datasets),
         *_collect_dataset_envelopes(public_datasets),
         *_collect_provenance(public_datasets, rich_rows),
-        *_collect_extraction_report_consistency(semantic, public_datasets),
+        *_collect_extraction_report_consistency(semantic_payload, public_datasets),
         *_collect_enum_contract(public_datasets, rich_rows),
         *_collect_money_contract(public_datasets, rich_rows),
         *_collect_identity(public_datasets, rich_rows),
@@ -1526,7 +1524,7 @@ def build_personal_brief_observational_findings(
         *_collect_account_relations(public_datasets, rich_rows),
         *_collect_status_value_relations(public_datasets, rich_rows),
         *_collect_overdue_relations(public_datasets, rich_rows),
-        *_collect_section_status(public, public_datasets, semantic_datasets),
+        *_collect_section_status(public_payload, public_datasets, semantic_datasets),
     ]
     return _deduplicate_findings(findings)
 
@@ -1593,7 +1591,7 @@ def append_personal_brief_observational_warnings(
         )
         public_datasets = _datasets(output)
         warnings = [
-            deepcopy(warning)
+            warning
             for warning in (output.get("warnings") or ())
             if isinstance(warning, Mapping)
         ]
@@ -1610,10 +1608,9 @@ def append_personal_brief_observational_warnings(
         output["warnings"] = warnings
         return output
     except Exception as exc:  # pragma: no cover - behavior covered via fault injection
-        fallback = deepcopy(dict(public_payload))
         warnings = [
-            deepcopy(warning)
-            for warning in (fallback.get("warnings") or ())
+            warning
+            for warning in (output.get("warnings") or ())
             if isinstance(warning, Mapping)
         ]
         message = (
@@ -1632,8 +1629,8 @@ def append_personal_brief_observational_warnings(
                     "message": message,
                 }
             )
-        fallback["warnings"] = warnings
-        return fallback
+        output["warnings"] = warnings
+        return output
 
 
 __all__ = [

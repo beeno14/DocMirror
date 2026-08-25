@@ -1471,14 +1471,26 @@ class _CreditReportCommunityBundle(CommunityBundle):
     def _is_personal_brief_semantic(payload: dict[str, Any]) -> bool:
         domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
         facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
-        extensions = (
-            domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
-        )
-        return bool(
-            facts.get("report_subtype") == "personal_brief"
-            and extensions.get("personal_brief_projection_mode")
-            != "generic_unrecognized_header_fallback"
-        )
+        return facts.get("report_subtype") == "personal_brief"
+
+    def _cached_personal_brief_public_payload(
+        self,
+        semantic: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        cached_source = getattr(self, "_personal_brief_cached_source", None)
+        cached_payload = getattr(self, "_personal_brief_cached_public_payload", None)
+        if cached_source == semantic and isinstance(cached_payload, dict):
+            return deepcopy(cached_payload)
+        return None
+
+    def _cache_personal_brief_public_payload(
+        self,
+        semantic: dict[str, Any],
+        payload: dict[str, Any],
+    ) -> None:
+        self._personal_brief_cached_source = deepcopy(semantic)
+        self._personal_brief_cached_public_payload = deepcopy(payload)
+        self._personal_brief_cached_artifact_payload = None
 
     def semantic_payload(self) -> dict[str, Any]:
         payload = super().semantic_payload()
@@ -1496,7 +1508,6 @@ class _CreditReportCommunityBundle(CommunityBundle):
             if key.startswith("enterprise_expected_"):
                 facts.pop(key, None)
         extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
-        extensions.pop("enterprise_dataset_completeness", None)
         overrides = (
             extensions.get("community_projection_overrides")
             if isinstance(extensions.get("community_projection_overrides"), dict)
@@ -1512,10 +1523,7 @@ class _CreditReportCommunityBundle(CommunityBundle):
         return payload
 
     def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
-        from docmirror.plugins.credit_report.projection import _compact_public_datasets
-
         semantic_payload = semantic or self.semantic_payload()
-        payload = super().json_payload(semantic_payload)
         domain = (
             semantic_payload.get("domain")
             if isinstance(semantic_payload.get("domain"), dict)
@@ -1525,32 +1533,27 @@ class _CreditReportCommunityBundle(CommunityBundle):
         enterprise = facts.get("report_subtype") == "enterprise"
         personal_brief = self._is_personal_brief_semantic(semantic_payload)
         scanned_personal_detail = self._uses_scanned_personal_detail_public_projection(facts)
-        extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
-        enterprise_completeness = (
-            extensions.get("enterprise_dataset_completeness", {}) if enterprise else {}
-        )
-        for dataset in payload.get("datasets") or []:
-            if not isinstance(dataset, dict):
-                continue
-            dataset_id = str(dataset.get("id") or dataset.get("name") or "dataset")
-            records = [record for record in (dataset.get("rows") or []) if isinstance(record, dict)]
-            dataset["rows"] = _compact_public_datasets({dataset_id: records})[dataset_id]
-            if not enterprise:
-                continue
-            details = enterprise_completeness.get(str(dataset.get("name") or ""))
-            if not isinstance(details, dict):
-                continue
-            dataset["completeness"] = {
-                key: details[key]
-                for key in (
-                    "expected_row_count",
-                    "emitted_row_count",
-                    "omitted_row_count",
-                    "verified",
-                    "basis",
-                )
-                if key in details
-            }
+        if personal_brief:
+            cached_payload = self._cached_personal_brief_public_payload(semantic_payload)
+            if cached_payload is not None:
+                return cached_payload
+
+        payload = super().json_payload(semantic_payload)
+        if not personal_brief:
+            from docmirror.plugins.credit_report.projection import _compact_public_datasets
+
+            for dataset in payload.get("datasets") or []:
+                if not isinstance(dataset, dict):
+                    continue
+                dataset_id = str(dataset.get("id") or dataset.get("name") or "dataset")
+                records = [
+                    record
+                    for record in (dataset.get("rows") or [])
+                    if isinstance(record, dict)
+                ]
+                dataset["rows"] = _compact_public_datasets({dataset_id: records})[
+                    dataset_id
+                ]
         if enterprise:
             from docmirror.plugins.credit_report.enterprise_native.projector import (
                 project_enterprise_community_json,
@@ -1627,6 +1630,7 @@ class _CreditReportCommunityBundle(CommunityBundle):
                 semantic_payload,
                 payload,
             )
+            self._cache_personal_brief_public_payload(semantic_payload, payload)
         elif scanned_personal_detail:
             _compact_personal_detail_public_projection(
                 payload,
@@ -1685,10 +1689,17 @@ class _CreditReportCommunityBundle(CommunityBundle):
             project_personal_brief_artifact_semantic,
         )
 
-        return project_personal_brief_artifact_semantic(
+        cached_source = getattr(self, "_personal_brief_cached_source", None)
+        cached_payload = getattr(self, "_personal_brief_cached_artifact_payload", None)
+        if cached_source == semantic and isinstance(cached_payload, dict):
+            return deepcopy(cached_payload)
+
+        artifact = project_personal_brief_artifact_semantic(
             semantic,
             self.json_payload(semantic),
         )
+        self._personal_brief_cached_artifact_payload = deepcopy(artifact)
+        return artifact
 
     def render_dataset_csvs(self, semantic: dict[str, Any] | None = None) -> dict[str, str]:
         semantic_payload = semantic or self.semantic_payload()
@@ -1761,39 +1772,7 @@ class CreditReportPlugin(CommunityProjector):
                 derive_personal_brief_projection,
             )
 
-            derived = derive_personal_brief_projection(self, parse_result, text)
-            extraction_report = derived.domain_facts.get("personal_brief_extraction_report")
-            failures = (
-                extraction_report.get("failures")
-                if isinstance(extraction_report, Mapping)
-                else ()
-            )
-            unrecognized_header = any(
-                isinstance(failure, Mapping)
-                and failure.get("code") == "PERSONAL_BRIEF_DOCUMENT_NOT_RECOGNIZED"
-                for failure in failures or ()
-            )
-            if not derived.datasets and unrecognized_header:
-                from docmirror.plugins.credit_report.projection import (
-                    derive_credit_report_projection,
-                )
-
-                fallback = derive_credit_report_projection(self, parse_result, text)
-                if fallback.datasets:
-                    semantic = deepcopy(fallback.semantic)
-                    semantic["personal_brief_projection_mode"] = (
-                        "generic_unrecognized_header_fallback"
-                    )
-                    return fallback.model_copy(
-                        update={
-                            "semantic": semantic,
-                            "reason": (
-                                "generic credit-report projection after canonical "
-                                "personal-brief header rejection"
-                            ),
-                        }
-                    )
-            return derived
+            return derive_personal_brief_projection(self, parse_result, text)
         from docmirror.plugins.credit_report.projection import derive_credit_report_projection
 
         return derive_credit_report_projection(self, parse_result, text)
@@ -1864,24 +1843,5 @@ class CreditReportPlugin(CommunityProjector):
         if sealed.integrity_fingerprint != before or not sealed.verify_integrity():
             raise RuntimeError("Post-seal projector changed the sealed snapshot")
         return bundle
-
-    def reading_projection(self, parse_result):
-        from docmirror.plugins.credit_report.report_profile import (
-            detect_credit_report_content_mode,
-            detect_credit_report_subtype,
-        )
-        from docmirror.plugins.credit_report.variant_router import (
-            resolve_credit_report_variant,
-        )
-
-        text = str(parse_result.full_text or parse_result.raw_text or "")
-        report_subtype = detect_credit_report_subtype(parse_result, text)
-        content_mode = detect_credit_report_content_mode(parse_result)
-        variant = resolve_credit_report_variant(report_subtype, content_mode)
-        return variant.build_reading_projection(
-            parse_result,
-            content_mode=content_mode,
-        )
-
 
 plugin = CreditReportPlugin()
