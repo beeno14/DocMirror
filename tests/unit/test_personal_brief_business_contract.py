@@ -28,6 +28,19 @@ from docmirror.plugins.credit_report.personal_brief_native.schema import (
 )
 
 
+def test_cached_schema_and_policy_return_isolated_public_copies() -> None:
+    dictionary = personal_brief_data_dictionary()
+    policy = personal_brief_public_dataset_policy()
+
+    dictionary["datasets"]["credit_accounts"]["columns"]["account_id"]["label"] = "mutated"
+    policy["credit_accounts"] = None
+
+    fresh_dictionary = personal_brief_data_dictionary()
+    fresh_policy = personal_brief_public_dataset_policy()
+    assert fresh_dictionary["datasets"]["credit_accounts"]["columns"]["account_id"]["label"] != "mutated"
+    assert fresh_policy["credit_accounts"] == _PUBLIC_BUSINESS_FIELDS["credit_accounts"]
+
+
 def _valid_contract_values(dataset_name: str) -> dict[str, object]:
     values: dict[str, object] = {}
     if dataset_name == "personal_report_metadata":

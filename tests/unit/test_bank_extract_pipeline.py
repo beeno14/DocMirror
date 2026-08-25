@@ -9,10 +9,12 @@ from types import SimpleNamespace
 
 import pytest
 
+import docmirror.plugins.bank_statement.extract_pipeline as extract_pipeline
 from docmirror.plugins.bank_statement import community_plugin as community_module
 from docmirror.plugins.bank_statement.canonical import build_style_meta, records_from_raw_transactions
 from docmirror.plugins.bank_statement.canonical_quality import audit_row_accounting
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
+from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.extract_pipeline import (
     _apply_source_reported_transaction_count,
     _bank_spe_ltro_warnings,
@@ -21,7 +23,9 @@ from docmirror.plugins.bank_statement.extract_pipeline import (
     is_authoritative_issuer_row_count,
     run_bank_statement_extract,
 )
+from docmirror.plugins.bank_statement.extraction_dispatch import BankExtractionRoute
 from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
+from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
 from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence
 from tests.unit.test_pipe_text_table_builder import _synthetic_boc_text
 
@@ -89,6 +93,137 @@ def test_run_bank_statement_extract_pipe_text():
     assert result.style_meta.reconstruction_source == "pipe_text"
     assert result.style_meta.extracted_rows >= 1
     assert "account_holder" in result.identity_fields
+
+
+def test_lazy_final_gate_failure_forces_one_fresh_eager_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deployment_calls: list[bool] = []
+    audit_calls = 0
+
+    def record(day: int) -> dict:
+        return {
+            "normalized": {
+                "date": f"2024-01-{day:02d}",
+                "amount": float(day),
+                "direction": "income",
+            },
+            "raw": {"date": f"2024-01-{day:02d}", "amount": str(day)},
+            "source": {
+                "source_page": 1,
+                "page_range": [1, 1],
+                "table_id": "table:1",
+                "source_row_index": 0,
+            },
+        }
+
+    def deployment(_builder, _parse_result, _full_text, _plugin, *, adaptive):
+        deployment_calls.append(adaptive)
+        ctx = StyleContext(
+            tables=[],
+            full_text="交易总笔数：1",
+            institution=None,
+            page_count=1,
+            reconstruction=ReconstructionMeta(source="canonical_table"),
+        )
+        detection = StyleDetectionResult(
+            primary_style="grid_standard",
+            confidence=0.95,
+            parser_chain=["grid_standard"],
+        )
+        diagnostic = {
+            "selected_candidate": "parser:grid_standard",
+            "deployment_mode": "lazy_primary" if adaptive else "eager_forced",
+            "completion_state": "proven" if adaptive else "unknown",
+            "completion_reason": "provisional" if adaptive else "adaptive_deployment_disabled",
+            "attempted_strategies": ["parser:grid_standard"],
+            "skipped_strategies": ["native_wide_table"] if adaptive else [],
+        }
+        meta = SimpleNamespace(
+            tables_parsed=1,
+            tables_skipped=0,
+            candidate_diagnostics=[diagnostic],
+        )
+        return ctx, detection, [record(1 if adaptive else 2)], {}, meta
+
+    def audit(*_args, **_kwargs):
+        nonlocal audit_calls
+        audit_calls += 1
+        return ["bank_invariant_failed:provisional"] if audit_calls == 1 else []
+
+    monkeypatch.setattr(extract_pipeline, "resolve_bank_extraction_route", lambda _result: BankExtractionRoute.DIGITAL)
+    monkeypatch.setattr(extract_pipeline, "_run_strategy_deployment", deployment)
+    monkeypatch.setattr(extract_pipeline, "page_texts_from_parse_result", lambda _result: [])
+    monkeypatch.setattr(extract_pipeline, "page_texts_with_business_headers", lambda _result, texts: texts)
+    monkeypatch.setattr(
+        extract_pipeline,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(1, "header_total", 0.95),
+    )
+    monkeypatch.setattr(extract_pipeline, "physical_transaction_row_estimate", lambda _result: 0)
+    monkeypatch.setattr(extract_pipeline, "audit_bank_statement_invariants", audit)
+
+    result = run_bank_statement_extract(None, "", BankStatementCommunityPlugin())
+
+    assert deployment_calls == [True, False]
+    assert audit_calls == 2
+    assert result.records[0]["normalized"]["date"] == "2024-01-02"
+    assert "bank_invariant_failed:provisional" not in result.warnings
+    assert result.candidate_diagnostics[0]["deployment_mode"] == "eager_final_gate_fallback"
+    assert result.candidate_diagnostics[0]["completion_reason"] == "final_invariant_audit_failed"
+    assert result.candidate_diagnostics[0]["prior_lazy_attempt"]["deployment_mode"] == "lazy_primary"
+
+
+def test_strategy_deployment_builds_fresh_contexts_and_preserves_eager_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts: list[StyleContext] = []
+    registry_modes: list[bool] = []
+
+    def context_builder(_parse_result, full_text):
+        ctx = StyleContext(
+            tables=[],
+            full_text=full_text,
+            institution=None,
+            page_count=1,
+            reconstruction=ReconstructionMeta(source="canonical_table"),
+        )
+        contexts.append(ctx)
+        return ctx
+
+    class Registry:
+        def __init__(self, *, adaptive):
+            registry_modes.append(adaptive)
+
+    class Orchestrator:
+        def __init__(self, _registry):
+            pass
+
+        def run(self, _detection, _ctx, _plugin):
+            return [], {}, SimpleNamespace(candidate_diagnostics=[])
+
+    monkeypatch.setattr(extract_pipeline, "BankStyleParserRegistry", Registry)
+    monkeypatch.setattr(extract_pipeline, "BankLedgerOrchestrator", Orchestrator)
+
+    adaptive = extract_pipeline._run_strategy_deployment(
+        context_builder,
+        None,
+        "statement",
+        BankStatementCommunityPlugin(),
+        adaptive=True,
+    )
+    eager = extract_pipeline._run_strategy_deployment(
+        context_builder,
+        None,
+        "statement",
+        BankStatementCommunityPlugin(),
+        adaptive=False,
+    )
+
+    assert registry_modes == [True, False]
+    assert adaptive[0] is contexts[0]
+    assert eager[0] is contexts[1]
+    assert adaptive[0] is not eager[0]
 
 
 def test_internal_source_page_survives_canonical_record_materialization():

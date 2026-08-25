@@ -168,16 +168,6 @@ class CreditReportVariantAdapter:
         """Return whether copied supplemental rows relinquish section ownership."""
         return False
 
-    def build_reading_projection(
-        self,
-        parse_result: Any,
-        *,
-        content_mode: str,
-    ) -> Any | None:
-        """Return an optional source-reading transform."""
-        return None
-
-
 class UnknownCreditReportVariant(CreditReportVariantAdapter):
     """Compatibility fallback for unclassified credit reports."""
 

@@ -173,7 +173,6 @@ CANONICAL_ENTERPRISE_SECTIONS: tuple[CanonicalEnterpriseSectionSpec, ...] = (
     ),
 )
 
-_SPEC_BY_KEY = MappingProxyType({spec.key: spec for spec in CANONICAL_ENTERPRISE_SECTIONS})
 _SPEC_INDEX = MappingProxyType(
     {spec.key: index for index, spec in enumerate(CANONICAL_ENTERPRISE_SECTIONS)}
 )

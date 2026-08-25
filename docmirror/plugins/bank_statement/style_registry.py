@@ -4,9 +4,9 @@
 """Bank-statement table parser and candidate-selection registry.
 
 Maps detected style IDs to parser modules under ``bank_statement.styles`` and
-materializes the recovery candidates allowed by the pre-resolved acquisition
-policy.  All candidates are scored and selected once; source strategies are
-never invoked as a late cross-route fallback.
+deploys the recovery candidates allowed by the pre-resolved acquisition policy.
+A source-complete primary result can stop deployment early; otherwise the
+original eager candidate set is materialized and selected as one unit.
 
 Pipeline role: plugin-local dispatch between ``BankStyleDetector`` and record
 builders inside the post-seal bank-statement projector.
@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any, Callable
 
+from docmirror.plugins._runtime.evidence_access import evidence_payload
 from docmirror.plugins.bank_statement.canonical import ensure_canonical_normalized, records_from_raw_transactions
 from docmirror.plugins.bank_statement.canonical_quality import (
     canonical_expected_from_parse_result,
@@ -50,6 +51,7 @@ from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
     recovered_ocr_implicit_row_count,
     recovered_ocr_implicit_row_evidence,
 )
+from docmirror.plugins.bank_statement.statement_context import statement_scope_count
 from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
 from docmirror.plugins.bank_statement.styles import (
     borderless_ocr,
@@ -66,6 +68,7 @@ from docmirror.plugins.bank_statement.wide_table_recovery import (
     recover_wide_bank_tables,
     resolve_row_count_evidence,
 )
+from docmirror.tables.access import get_logical_tables
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +114,8 @@ _ROW_PLANE_COUNT_SOURCES = frozenset(
     }
 )
 _SOURCE_DATE_RE = re.compile(r"20\d{2}(?:[-/.]?\d{1,2}){2}")
+_SEALED_TIME_RE = re.compile(r"(?<![\d:])\d{1,2}:\d{2}:\d{2}(?![\d:])")
+_SEALED_MONEY_RE = re.compile(r"(?<!\d)[+-]?\d[\d,]*\.\d{2}(?!\d)")
 _SOURCE_DATE_HEADERS = frozenset(
     {
         "date",
@@ -373,6 +378,18 @@ class BankTableCandidate:
     source_role_swap_ratio: float = 0.0
     rejected_row_indexes: tuple[int, ...] = ()
     rejection_reason: str = ""
+
+
+@dataclass(frozen=True)
+class CandidateCompletionProof:
+    """Conservative sealed-document proof for stopping after the primary parser."""
+
+    state: str
+    reason: str
+
+    @property
+    def proven(self) -> bool:
+        return self.state == "proven"
 
 
 def _candidate_expected_rows(
@@ -1273,6 +1290,736 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
     }
 
 
+def _eligible_strategy_ids(detection: StyleDetectionResult, ctx: StyleContext) -> list[str]:
+    """Describe the existing strategy nodes eligible for this extraction scope."""
+
+    policy = ctx.extraction_policy
+    strategy_ids = [
+        f"parser:{parser_id}"
+        for parser_id in dict.fromkeys([*detection.parser_chain, *_PARSER_CANDIDATE_ORDER])
+        if parser_id != "kv_identity" and parser_id in _PARSERS and policy.allows_parser(parser_id)
+    ]
+    if ctx.prefer_context_tables:
+        return strategy_ids
+    if policy.allow_semantic_text:
+        strategy_ids.append("semantic_text")
+    if policy.allow_physical_tables:
+        strategy_ids.append("physical_table")
+    if policy.allow_positioned_records:
+        strategy_ids.append("positioned_record_block")
+    if policy.allow_evidence_atoms:
+        strategy_ids.append("evidence_atom")
+    if policy.allow_native_wide_tables:
+        strategy_ids.append("native_wide_table")
+    if policy.allow_ocr_implicit_tables:
+        strategy_ids.append("ocr_implicit_table")
+    return strategy_ids
+
+
+def _collect_primary_table_candidates(
+    detection: StyleDetectionResult,
+    ctx: StyleContext,
+    plugin: Any,
+) -> list[BankTableCandidate]:
+    """Run only the first route-allowed transaction parser.
+
+    This preflight intentionally does not invoke any reconstruction provider.
+    The unchanged eager collector below remains the fallback whenever the
+    primary result cannot prove document-scope completeness.
+    """
+
+    policy = ctx.extraction_policy
+    parser_id = next(
+        (
+            candidate_id
+            for candidate_id in detection.parser_chain
+            if candidate_id != "kv_identity"
+            and candidate_id in _PARSERS
+            and policy.allows_parser(candidate_id)
+        ),
+        None,
+    )
+    if parser_id is None:
+        return []
+
+    page_texts = [] if ctx.prefer_context_tables else page_texts_from_parse_result(ctx.parse_result)
+    source_evidence = (
+        RowCountEvidence.empty()
+        if ctx.prefer_context_tables
+        else resolve_row_count_evidence(ctx.full_text, page_texts=page_texts)
+    )
+    if source_evidence.source in _ROW_PLANE_COUNT_SOURCES:
+        source_evidence = replace(source_evidence, confidence=min(source_evidence.confidence, 0.80))
+
+    batch, normalize_fn = _run_parser(parser_id, ctx, plugin)
+    if not batch:
+        return []
+    expected = _candidate_row_count_evidence(
+        batch,
+        _candidate_expected_rows(source_evidence),
+        page_count=ctx.page_count,
+        page_texts=page_texts,
+    )
+    return [
+        _candidate_from_batch(
+            candidate_id=f"parser:{parser_id}",
+            transactions=batch,
+            normalize_fn=normalize_fn,
+            plugin=plugin,
+            source=(ctx.reconstruction.source if ctx.reconstruction is not None else "canonical_table"),
+            expected_rows=expected,
+            extraction_confidence=0.8,
+        )
+    ]
+
+
+def _candidate_row_source_identity(transaction: dict[str, Any]) -> tuple[Any, ...] | None:
+    source = transaction.get("_source")
+    if not isinstance(source, dict):
+        return None
+    try:
+        page = int(source.get("source_page") or 0)
+    except (TypeError, ValueError):
+        return None
+    page_range = source.get("page_range")
+    if (
+        page <= 0
+        or not isinstance(page_range, (list, tuple))
+        or len(page_range) != 2
+        or page_range[0] != page
+        or page_range[1] != page
+    ):
+        return None
+
+    table_id = str(source.get("table_id") or source.get("source_table_id") or "")
+    if table_id and "source_row_index" in source:
+        try:
+            row_index = int(source["source_row_index"])
+        except (TypeError, ValueError):
+            row_index = -1
+        if row_index >= 0:
+            return ("row", page, table_id, row_index)
+
+    bbox = _candidate_source_bbox(transaction)
+    if bbox is not None:
+        return ("bbox", page, *bbox)
+    return None
+
+
+def _source_cell_signature(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+
+def _source_row_signature(values: Any) -> tuple[str, ...] | None:
+    if not isinstance(values, list):
+        return None
+    return tuple(_source_cell_signature(value) for value in values)
+
+
+def _compact_source_cell(value: Any) -> str:
+    return re.sub(r"\s+", "", _source_cell_signature(value))
+
+
+def _physical_row_raw_indexes(row: Any) -> set[int] | None:
+    """Return explicit raw-row bindings, or ``None`` when none were supplied."""
+
+    refs = [
+        *(getattr(row, "source_cell_refs", None) or []),
+        *(
+            ref
+            for cell in (getattr(row, "cells", None) or [])
+            for ref in (getattr(cell, "source_cell_refs", None) or [])
+        ),
+    ]
+    indexes: set[int] = set()
+    saw_raw_row = False
+    for ref in refs:
+        if not isinstance(ref, dict) or ref.get("raw_row") is None:
+            continue
+        saw_raw_row = True
+        try:
+            raw_row = int(ref["raw_row"])
+        except (TypeError, ValueError):
+            return set()
+        if raw_row < 0:
+            return set()
+        indexes.add(raw_row)
+    return indexes if saw_raw_row else None
+
+
+def _physical_body_rows_match_raw_rows(
+    table: Any,
+    raw_rows: list[list[Any]],
+    *,
+    header_raw_row: int,
+    canonical_width: int,
+) -> bool:
+    """Bind the physical recovery plane to its raw matrix without guessing."""
+
+    represented: set[int] = set()
+    body_rows = list(getattr(table, "rows", None) or [])
+    for row_index, row in enumerate(body_rows):
+        cells = list(getattr(row, "cells", None) or [])
+        if len(cells) != canonical_width:
+            return False
+        values = [
+            getattr(cell, "cleaned", None) or getattr(cell, "text", "") or ""
+            for cell in cells
+        ]
+        explicit_indexes = _physical_row_raw_indexes(row)
+        if explicit_indexes is not None:
+            if len(explicit_indexes) != 1:
+                return False
+            raw_row_index = next(iter(explicit_indexes))
+        else:
+            raw_row_index = row_index + 1
+        if (
+            raw_row_index == header_raw_row
+            or raw_row_index < 0
+            or raw_row_index >= len(raw_rows)
+            or raw_row_index in represented
+            or tuple(_source_cell_signature(value) for value in values)
+            != tuple(_source_cell_signature(value) for value in raw_rows[raw_row_index])
+        ):
+            return False
+        represented.add(raw_row_index)
+
+    return represented == (set(range(len(raw_rows))) - {header_raw_row})
+
+
+def _sealed_bbox(value: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if x1 < x0 or y1 < y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _has_sealed_transaction_headers(values: list[str]) -> bool:
+    compact_values = [re.sub(r"\s+", "", _source_cell_signature(value)).casefold() for value in values]
+    has_date_header = any(
+        marker in value
+        for value in compact_values
+        for marker in ("交易日期", "记账日期", "交易时间", "日期", "transactiondate", "date")
+    )
+    has_amount_header = any(
+        marker in value
+        for value in compact_values
+        for marker in (
+            "交易金额",
+            "发生额",
+            "支出金额",
+            "收入金额",
+            "借方金额",
+            "贷方金额",
+            "transactionamount",
+            "amount",
+        )
+    )
+    return has_date_header and has_amount_header
+
+
+def _has_sealed_transaction_role_fact(values: list[str]) -> bool:
+    return any(
+        marker in re.sub(r"\s+", "", _source_cell_signature(value)).casefold()
+        for value in values
+        for marker in (
+            "对方账号",
+            "对方账户",
+            "对方户名",
+            "对方行名",
+            "对手名称",
+            "交易用途",
+            "交易摘要",
+            "交易流水号",
+            "交易渠道",
+            "counterparty",
+            "reference",
+        )
+    )
+
+
+def _looks_like_sealed_positioned_record(value: str) -> bool:
+    return (
+        len([line for line in str(value or "").splitlines() if line.strip()]) >= 4
+        and bool(_SOURCE_DATE_RE.search(value))
+        and len(_SEALED_MONEY_RE.findall(value)) >= 2
+    )
+
+
+def _sealed_alternative_planes_match_physical(
+    ctx: StyleContext,
+    physical_rows_by_position: dict[tuple[int, int], list[list[Any]]],
+    normalized_headers: tuple[str, ...],
+    canonical_width: int,
+) -> bool:
+    """Inventory sealed inputs consumed by skipped reconstruction strategies.
+
+    The evidence-plane table index must be a row/column-identical view of the
+    physical tables, and all positioned text inside those table bands must be
+    owned by their cell geometry.  Cheap structural checks also reject a richer
+    table advertised only by the semantic-text or positioned-atom planes.  No
+    reconstruction provider is invoked while building this certificate.
+    """
+
+    payload = evidence_payload(ctx.parse_result)
+    indexes = payload.get("indexes") if isinstance(payload, dict) else None
+    indexed_tables = indexes.get("table_candidates") if isinstance(indexes, dict) else None
+    text_atoms = payload.get("text_atoms") if isinstance(payload, dict) else None
+    if not isinstance(indexed_tables, list) or not indexed_tables or not isinstance(text_atoms, list):
+        return False
+
+    atoms_by_id: dict[str, dict[str, Any]] = {}
+    for atom in text_atoms:
+        if not isinstance(atom, dict):
+            return False
+        atom_id = str(atom.get("id") or "")
+        if not atom_id or atom_id in atoms_by_id:
+            return False
+        atoms_by_id[atom_id] = atom
+
+    positioned_blocks_by_page: dict[str, list[str]] = {}
+    for page in getattr(ctx.parse_result, "pages", None) or []:
+        try:
+            page_number = int(getattr(page, "page_number", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        if page_number <= 0:
+            return False
+        page_id = f"page:{page_number:04d}"
+        for block in getattr(page, "texts", None) or []:
+            content = str(getattr(block, "content", "") or "").strip()
+            bbox = getattr(block, "bbox", None)
+            if not content or not isinstance(bbox, list) or len(bbox) < 4:
+                continue
+            evidence_ids = [str(item or "") for item in (getattr(block, "evidence_ids", None) or [])]
+            if not evidence_ids or any(not item or item not in atoms_by_id for item in evidence_ids):
+                return False
+            atom_text = "".join(str(atoms_by_id[item].get("text") or "") for item in evidence_ids)
+            if _compact_source_cell(content) != _compact_source_cell(atom_text):
+                return False
+            positioned_blocks_by_page.setdefault(page_id, []).append(content)
+
+    for block_texts in positioned_blocks_by_page.values():
+        if (
+            _has_sealed_transaction_role_fact(block_texts)
+            or sum(_looks_like_sealed_positioned_record(text) for text in block_texts) >= 2
+        ):
+            return False
+        block_text = "\n".join(block_texts)
+        if (
+            _has_sealed_transaction_headers(block_texts)
+            and len(_SOURCE_DATE_RE.findall(block_text)) >= 2
+            and len(_SEALED_MONEY_RE.findall(block_text)) >= 2
+        ):
+            return False
+
+    candidates_by_position: dict[tuple[int, int], dict[str, Any]] = {}
+    for indexed_table in indexed_tables:
+        if not isinstance(indexed_table, dict):
+            return False
+        try:
+            key = (int(indexed_table.get("page_number") or 0), int(indexed_table["table_index"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if key[0] <= 0 or key in candidates_by_position:
+            return False
+        candidates_by_position[key] = indexed_table
+    if set(candidates_by_position) != set(physical_rows_by_position):
+        return False
+
+    table_bands: list[tuple[str, float, float, set[str]]] = []
+    for position, raw_rows in physical_rows_by_position.items():
+        indexed_table = candidates_by_position[position]
+        indexed_rows = indexed_table.get("rows")
+        if not isinstance(indexed_rows, list) or len(indexed_rows) != len(raw_rows):
+            return False
+        for indexed_row, raw_row in zip(indexed_rows, raw_rows, strict=True):
+            if (
+                _source_row_signature(indexed_row) is None
+                or len(indexed_row) != canonical_width
+                or _source_row_signature(indexed_row) != _source_row_signature(raw_row)
+            ):
+                return False
+
+        geometry = indexed_table.get("geometry")
+        cell_evidence = geometry.get("cell_evidence_ids") if isinstance(geometry, dict) else None
+        if (
+            not isinstance(cell_evidence, list)
+            or len(cell_evidence) != len(raw_rows)
+            or any(not isinstance(row, list) or len(row) != canonical_width for row in cell_evidence)
+        ):
+            return False
+
+        covered_ids: set[str] = set()
+        for row_index, (raw_row, evidence_row) in enumerate(
+            zip(raw_rows, cell_evidence, strict=True)
+        ):
+            is_canonical_header = _source_row_signature(raw_row) == normalized_headers
+            header_atom_ids: list[str] = []
+            for col_index, evidence_ids in enumerate(evidence_row):
+                if not isinstance(evidence_ids, list):
+                    return False
+                atom_texts: list[str] = []
+                for evidence_id in evidence_ids:
+                    atom_id = str(evidence_id or "")
+                    atom = atoms_by_id.get(atom_id)
+                    if not atom_id or atom is None:
+                        return False
+                    covered_ids.add(atom_id)
+                    if atom_id not in header_atom_ids:
+                        header_atom_ids.append(atom_id)
+                    atom_texts.append(str(atom.get("text") or ""))
+                # Merged source headers do not always have a one-cell/one-atom
+                # encoding.  Body rows, including promoted transaction headers,
+                # must retain exact text composition.
+                if not is_canonical_header and _compact_source_cell("".join(atom_texts)) != _compact_source_cell(
+                    raw_row[col_index]
+                ):
+                    return False
+            if is_canonical_header and _compact_source_cell(
+                "".join(str(atoms_by_id[atom_id].get("text") or "") for atom_id in header_atom_ids)
+            ) != _compact_source_cell("".join(str(value or "") for value in raw_row)):
+                return False
+
+        bbox = _sealed_bbox(indexed_table.get("bbox"))
+        page_id = str(indexed_table.get("page_id") or f"page:{position[0]:04d}")
+        if bbox is None or not page_id:
+            return False
+        table_bands.append((page_id, bbox[1], bbox[3], covered_ids))
+
+    outside_by_page: dict[str, list[str]] = {}
+    for atom_id, atom in atoms_by_id.items():
+        page_id = str(atom.get("page_id") or "")
+        bbox = _sealed_bbox(atom.get("bbox"))
+        matching_bands = [
+            covered
+            for band_page, y0, y1, covered in table_bands
+            if band_page == page_id and bbox is not None and y0 <= (bbox[1] + bbox[3]) / 2.0 <= y1
+        ]
+        if matching_bands:
+            if not any(atom_id in covered for covered in matching_bands):
+                return False
+            continue
+        outside_by_page.setdefault(page_id, []).append(str(atom.get("text") or ""))
+
+    # A second positioned ledger outside the known table bands is not safe to
+    # skip.  Requiring repeated date/time/amount anchors avoids treating ordinary
+    # statement identity and totals as a transaction plane.
+    for outside_texts in outside_by_page.values():
+        if (
+            _has_sealed_transaction_role_fact(outside_texts)
+            or sum(_looks_like_sealed_positioned_record(text) for text in outside_texts) >= 2
+        ):
+            return False
+        dates = sum(bool(_SOURCE_DATE_RE.search(text)) for text in outside_texts)
+        times = sum(bool(_SEALED_TIME_RE.search(text)) for text in outside_texts)
+        amounts = sum(bool(_SEALED_MONEY_RE.search(text)) for text in outside_texts)
+        if dates >= 2 and amounts >= 2 and (times >= 2 or _has_sealed_transaction_headers(outside_texts)):
+            return False
+
+    non_pipe_lines: list[str] = []
+    for line in str(ctx.full_text or "").splitlines():
+        if line.count("|") >= 2:
+            cells = line.strip().strip("|").split("|")
+            if len(cells) > canonical_width:
+                return False
+        else:
+            non_pipe_lines.append(line)
+    non_pipe_text = "\n".join(non_pipe_lines)
+    row_like_lines = sum(
+        bool(_SOURCE_DATE_RE.search(line) and len(_SEALED_MONEY_RE.findall(line)) >= 2)
+        for line in non_pipe_lines
+    )
+    if row_like_lines >= 2 or (
+        len(_SOURCE_DATE_RE.findall(non_pipe_text)) >= 2
+        and len(_SEALED_TIME_RE.findall(non_pipe_text)) >= 2
+        and len(_SEALED_MONEY_RE.findall(non_pipe_text)) >= 2
+    ):
+        return False
+    return True
+
+
+def _candidate_preserves_canonical_source_columns(
+    candidate: BankTableCandidate,
+    ctx: StyleContext,
+) -> bool:
+    """Prove a row/column/value bijection with the sealed physical source.
+
+    Core normalized fields cannot certify that an alternative would not retain
+    additional source business facts.  A primary candidate may stop deployment
+    only when every physical source column survives under its original canonical
+    header, every value matches its referenced source cell, and every non-header
+    physical row is represented exactly once.  This certificate is deliberately
+    bounded to the sealed ParseResult: source-PDF reopening remains a recovery
+    strategy for cases where that sealed evidence cannot establish completeness.
+    """
+
+    header_signatures: set[tuple[str, ...]] = set()
+    for table in ctx.tables:
+        if not table:
+            continue
+        headers = tuple(str(header or "") for header in table[0])
+        if (
+            len(headers) >= 3
+            and all(header and not header.startswith("_") for header in headers)
+            and len(set(headers)) == len(headers)
+        ):
+            header_signatures.add(headers)
+    if len(header_signatures) != 1:
+        return False
+    canonical_headers = next(iter(header_signatures))
+    canonical_width = len(canonical_headers)
+
+    normalized_headers = tuple(_source_cell_signature(header) for header in canonical_headers)
+    physical_tables: dict[tuple[int, str], Any] = {}
+    physical_rows_by_position: dict[tuple[int, int], list[list[Any]]] = {}
+    promoted_header_rows: set[tuple[int, str, int]] = set()
+    canonical_header_tables = 0
+    for page in getattr(ctx.parse_result, "pages", None) or []:
+        try:
+            page_number = int(
+                getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        if page_number <= 0:
+            return False
+        for table_index, table in enumerate(getattr(page, "tables", None) or []):
+            table_id = str(getattr(table, "table_id", "") or f"pt_{page_number}_{table_index}")
+            table_key = (page_number, table_id)
+            if table_key in physical_tables:
+                return False
+            metadata = getattr(table, "metadata", None) or {}
+            raw_rows = metadata.get("raw_rows") if isinstance(metadata, dict) else None
+            if not isinstance(raw_rows, list) or not raw_rows:
+                return False
+            if any(not isinstance(row, list) or len(row) != canonical_width for row in raw_rows):
+                return False
+            table_headers = tuple(str(header or "") for header in getattr(table, "headers", None) or [])
+            if len(table_headers) != canonical_width:
+                return False
+            geometry = metadata.get("geometry")
+            if isinstance(geometry, dict):
+                for plane_name in ("cell_bboxes", "cell_evidence_ids"):
+                    plane = geometry.get(plane_name)
+                    if plane is None:
+                        continue
+                    if (
+                        not isinstance(plane, list)
+                        or len(plane) != len(raw_rows)
+                        or any(not isinstance(row, list) or len(row) != canonical_width for row in plane)
+                    ):
+                        return False
+            normalized_table_headers = tuple(_source_cell_signature(header) for header in table_headers)
+            matching_header_rows = [
+                raw_row_index
+                for raw_row_index, raw_values in enumerate(raw_rows)
+                if tuple(_source_cell_signature(value) for value in raw_values)
+                == normalized_table_headers
+            ]
+            if len(matching_header_rows) != 1:
+                return False
+            header_raw_row = matching_header_rows[0]
+            if not _physical_body_rows_match_raw_rows(
+                table,
+                raw_rows,
+                header_raw_row=header_raw_row,
+                canonical_width=canonical_width,
+            ):
+                return False
+            if normalized_table_headers == normalized_headers:
+                canonical_header_tables += 1
+            else:
+                promoted_header_rows.add((page_number, table_id, header_raw_row))
+            physical_tables[table_key] = table
+            physical_rows_by_position[(page_number, table_index)] = raw_rows
+    if not physical_tables or canonical_header_tables <= 0:
+        return False
+    if not _sealed_alternative_planes_match_physical(
+        ctx,
+        physical_rows_by_position,
+        normalized_headers,
+        canonical_width,
+    ):
+        return False
+
+    represented_source_rows: set[tuple[int, str, int]] = set()
+    for transaction in candidate.records:
+        business_headers = tuple(str(key) for key in transaction if not str(key).startswith("_"))
+        if business_headers != canonical_headers:
+            return False
+        source = transaction.get("_source")
+        refs = source.get("source_cell_refs") if isinstance(source, dict) else None
+        if not isinstance(refs, list) or len(refs) != canonical_width:
+            return False
+        try:
+            source_page = int(source.get("source_page") or 0)
+            source_row = int(source["source_row_index"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        source_table = str(source.get("table_id") or source.get("source_table_id") or "")
+        if source_page <= 0 or source_row < 0 or not source_table:
+            return False
+        physical_table = physical_tables.get((source_page, source_table))
+        if physical_table is None:
+            return False
+        source_columns: dict[int, int] = {}
+        for ref in refs:
+            if not isinstance(ref, dict):
+                return False
+            try:
+                ref_page = int(ref.get("page") or ref.get("source_page") or 0)
+                ref_row = int(ref.get("row") if ref.get("row") is not None else ref.get("source_row_index"))
+                ref_raw_row = int(ref.get("raw_row")) if ref.get("raw_row") is not None else -1
+                ref_col = int(ref.get("col") if ref.get("col") is not None else ref.get("source_col_index"))
+            except (TypeError, ValueError):
+                return False
+            ref_table = str(ref.get("table_id") or ref.get("source_table_id") or "")
+            if (
+                ref_page != source_page
+                or ref_table != source_table
+                or source_row not in {ref_row, ref_raw_row}
+            ):
+                return False
+            if ref_col in source_columns or ref_raw_row < 0:
+                return False
+            source_columns[ref_col] = ref_raw_row
+        if set(source_columns) != set(range(canonical_width)):
+            return False
+
+        raw_row_indexes = set(source_columns.values())
+        if len(raw_row_indexes) != 1:
+            return False
+        raw_row_index = next(iter(raw_row_indexes))
+        source_identity = (source_page, source_table, raw_row_index)
+        if source_identity in represented_source_rows:
+            return False
+        represented_source_rows.add(source_identity)
+        raw_rows = physical_table.metadata.get("raw_rows")
+        if raw_row_index >= len(raw_rows):
+            return False
+        raw_values = raw_rows[raw_row_index]
+        if any(
+            _source_cell_signature(transaction.get(header)) != _source_cell_signature(raw_values[col_index])
+            for col_index, header in enumerate(canonical_headers)
+        ):
+            return False
+
+        geometry = physical_table.metadata.get("geometry")
+        cell_evidence = geometry.get("cell_evidence_ids") if isinstance(geometry, dict) else None
+        if isinstance(cell_evidence, list):
+            row_evidence = {
+                str(evidence_id)
+                for cell_ids in cell_evidence[raw_row_index]
+                if isinstance(cell_ids, list)
+                for evidence_id in cell_ids
+                if str(evidence_id)
+            }
+            candidate_evidence = {
+                str(item) for item in (source.get("evidence_ids") or []) if str(item)
+            }
+            if row_evidence and not row_evidence.issubset(candidate_evidence):
+                return False
+
+    if not promoted_header_rows.issubset(represented_source_rows):
+        return False
+    for (page_number, table_id), table in physical_tables.items():
+        for raw_row_index, raw_values in enumerate(table.metadata["raw_rows"]):
+            if (page_number, table_id, raw_row_index) in represented_source_rows:
+                continue
+            if tuple(_source_cell_signature(value) for value in raw_values) != normalized_headers:
+                return False
+    return True
+
+
+def _prove_primary_candidate_complete(
+    candidate: BankTableCandidate | None,
+    detection: StyleDetectionResult,
+    ctx: StyleContext,
+) -> CandidateCompletionProof:
+    """Fail closed unless the primary parser proves a complete canonical document."""
+
+    if candidate is None:
+        return CandidateCompletionProof("unknown", "primary_parser_returned_no_candidate")
+    if ctx.prefer_context_tables:
+        return CandidateCompletionProof("unknown", "local_context_cannot_prove_document_scope")
+    if ctx.extraction_route is not BankExtractionRoute.DIGITAL:
+        return CandidateCompletionProof("unknown", "scanned_route_requires_reconstruction_comparison")
+    reconstruction = ctx.reconstruction
+    if reconstruction is None or reconstruction.source != "canonical_table":
+        return CandidateCompletionProof("unknown", "primary_source_is_not_canonical_table")
+    if reconstruction.pipe_parse_failed:
+        return CandidateCompletionProof("unknown", "earlier_table_reconstruction_failed")
+    if detection.confidence < 0.75:
+        return CandidateCompletionProof("unknown", "style_detection_below_completion_threshold")
+
+    logical_tables = get_logical_tables(ctx.parse_result) if ctx.parse_result is not None else []
+    if len(logical_tables) > 1:
+        return CandidateCompletionProof("unknown", "multiple_logical_scopes_require_comparison")
+    if any(not getattr(table, "quality_passed", True) for table in logical_tables):
+        return CandidateCompletionProof("unknown", "logical_table_quality_not_proven")
+    if statement_scope_count(ctx.parse_result) != 1:
+        return CandidateCompletionProof("unknown", "single_statement_scope_not_proven")
+    if not _candidate_preserves_canonical_source_columns(candidate, ctx):
+        return CandidateCompletionProof("unknown", "canonical_source_columns_not_conserved")
+
+    evidence = candidate.expected_rows
+    if (
+        evidence is None
+        or evidence.count <= 0
+        or evidence.confidence < 0.85
+        or evidence.source not in _ISSUER_ROW_COUNT_SOURCES
+    ):
+        return CandidateCompletionProof("unknown", "issuer_row_count_is_not_authoritative")
+    row_count = len(candidate.records)
+    if not (
+        evidence.count
+        == row_count
+        == candidate.canonical_rows
+        == candidate.directional_rows
+    ):
+        return CandidateCompletionProof("unknown", "primary_rows_do_not_match_issuer_count")
+    if (
+        candidate.canonical_coverage < 0.999
+        or candidate.source_page_coverage < 0.999
+        or candidate.field_completeness < 0.999
+    ):
+        return CandidateCompletionProof("unknown", "primary_quality_coverage_is_incomplete")
+    if (
+        candidate.semantic_anomaly_rows
+        or candidate.rejected_row_indexes
+        or candidate.rejection_reason
+        or candidate.source_role_swap_ratio > 0.0
+    ):
+        return CandidateCompletionProof("unknown", "primary_rows_have_semantic_anomalies")
+
+    source_identities = [_candidate_row_source_identity(row) for row in candidate.records]
+    if any(identity is None for identity in source_identities):
+        return CandidateCompletionProof("unknown", "row_local_provenance_is_incomplete")
+    if len(set(source_identities)) != len(source_identities):
+        return CandidateCompletionProof("unknown", "duplicate_row_local_provenance")
+    if any(
+        _candidate_source_page_rewinds(previous, current)
+        for previous, current in zip(candidate.records, candidate.records[1:])
+    ):
+        return CandidateCompletionProof("unknown", "source_page_order_rewinds")
+
+    if ctx.extraction_route is BankExtractionRoute.DIGITAL and ctx.parse_result is not None:
+        physical_rows = physical_transaction_row_estimate(ctx.parse_result)
+        if physical_rows > 0 and physical_rows != row_count:
+            return CandidateCompletionProof("unknown", "physical_row_census_conflicts")
+
+    return CandidateCompletionProof(
+        "proven",
+        f"issuer_count={evidence.count}:canonical_rows={candidate.canonical_rows}:provenance=complete",
+    )
+
+
 def _collect_table_candidates(
     detection: StyleDetectionResult,
     ctx: StyleContext,
@@ -1541,7 +2288,8 @@ def _collect_table_candidates(
 class BankStyleParserRegistry:
     """Execute parser_chain and produce v2.0 records."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, adaptive: bool = True) -> None:
+        self._adaptive = adaptive
         self.last_selection_diagnostics: dict[str, Any] = {}
 
     def run(
@@ -1566,8 +2314,54 @@ class BankStyleParserRegistry:
                 plugin.identity_fields,
             )
 
-        candidates = _collect_table_candidates(detection, ctx, plugin)
+        eligible_strategies = _eligible_strategy_ids(detection, ctx)
+        completion = CandidateCompletionProof("unknown", "adaptive_deployment_disabled")
+        deployment_mode = "eager_forced"
+        attempted_strategies = list(eligible_strategies)
+        skipped_strategies: list[str] = []
+
+        if self._adaptive:
+            preflight_ctx = replace(
+                ctx,
+                reconstruction=(replace(ctx.reconstruction) if ctx.reconstruction is not None else None),
+            )
+            primary_candidates = _collect_primary_table_candidates(detection, preflight_ctx, plugin)
+            primary_candidate = primary_candidates[0] if primary_candidates else None
+            completion = _prove_primary_candidate_complete(primary_candidate, detection, preflight_ctx)
+            primary_strategy = (
+                primary_candidate.candidate_id
+                if primary_candidate is not None
+                else next((item for item in eligible_strategies if item.startswith("parser:")), "")
+            )
+            if completion.proven:
+                candidates = primary_candidates
+                ctx.reconstruction = preflight_ctx.reconstruction
+                deployment_mode = "lazy_primary"
+                attempted_strategies = [primary_strategy] if primary_strategy else []
+                skipped_strategies = [
+                    strategy_id for strategy_id in eligible_strategies if strategy_id != primary_strategy
+                ]
+            else:
+                # This is intentionally the pre-adaptive collector, invoked as
+                # one unit so UNKNOWN retains the existing candidate universe,
+                # scoring, and winning-record behavior.
+                candidates = _collect_table_candidates(detection, ctx, plugin)
+                deployment_mode = "eager_fallback"
+                attempted_strategies = list(dict.fromkeys([primary_strategy, *eligible_strategies]))
+                attempted_strategies = [item for item in attempted_strategies if item]
+        else:
+            candidates = _collect_table_candidates(detection, ctx, plugin)
+
         selected, diagnostics = _select_candidate(candidates)
+        diagnostics.update(
+            {
+                "deployment_mode": deployment_mode,
+                "completion_state": completion.state,
+                "completion_reason": completion.reason,
+                "attempted_strategies": attempted_strategies,
+                "skipped_strategies": skipped_strategies,
+            }
+        )
         self.last_selection_diagnostics = diagnostics
         transactions: list[dict[str, Any]] = []
         normalize_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None

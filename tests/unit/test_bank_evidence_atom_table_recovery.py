@@ -2244,7 +2244,11 @@ def test_registry_does_not_reemit_semantically_rejected_candidate_through_fallba
     ctx = StyleContext(tables=[], full_text="", institution=None, page_count=1, parse_result=None)
     detection = StyleDetectionResult(primary_style="grid_standard", parser_chain=["grid_standard"])
 
-    records, _identity = BankStyleParserRegistry().run(detection, ctx, BankStatementCommunityPlugin())
+    records, _identity = BankStyleParserRegistry(adaptive=False).run(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
 
     assert records == []
 

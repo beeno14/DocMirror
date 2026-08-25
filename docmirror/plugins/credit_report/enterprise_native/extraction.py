@@ -26,7 +26,6 @@ from docmirror.plugins.credit_report.enterprise_native.continuation import (
     CLOSED_SUMMARY_BODY_CONTRACT,
     FACILITY_VALUE_CONTRACT,
     EnterpriseContinuationResolver,
-    TableFragment,
 )
 from docmirror.plugins.credit_report.enterprise_native.ir import (
     CanonicalEnterpriseDocumentIR,

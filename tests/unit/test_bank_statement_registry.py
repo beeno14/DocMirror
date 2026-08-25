@@ -16,9 +16,12 @@ from docmirror.output.mirror_projector import project_mirror
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
 from docmirror.plugins.bank_statement.extraction_dispatch import (
+    DIGITAL_POLICY,
+    SCANNED_POLICY,
     BankExtractionPolicy,
     BankExtractionRoute,
 )
+from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import (
     BankStyleParserRegistry,
@@ -52,6 +55,139 @@ def _candidate_for_authority_test(
         extraction_confidence=0.9,
         source_column_width=5.0,
         sequence_continuity=1.0,
+    )
+
+
+def _complete_primary_candidate(rows: int = 2) -> BankTableCandidate:
+    raw_records = [
+        {
+            "date": f"2025-01-{index + 1:02d}",
+            "amount": f"{index + 1}.00",
+            "direction": "income",
+            "summary": f"row {index + 1}",
+            "_source": {
+                "source_page": 1,
+                "page_range": [1, 1],
+                "table_id": "table:1",
+                "source_row_index": index,
+                "source_cell_refs": [
+                    {"page": 1, "table_id": "table:1", "row": index, "raw_row": index + 1, "col": col}
+                    for col in range(4)
+                ],
+            },
+        }
+        for index in range(rows)
+    ]
+
+    def normalize(raw: dict[str, object]) -> dict[str, object]:
+        return {
+            "date": raw["date"],
+            "amount": float(str(raw["amount"])),
+            "direction": raw["direction"],
+            "summary": raw["summary"],
+        }
+
+    return BankTableCandidate(
+        candidate_id="parser:grid_standard",
+        records=raw_records,
+        source="canonical_table",
+        canonical_rows=rows,
+        directional_rows=rows,
+        source_page_rows=rows,
+        expected_rows=RowCountEvidence(rows, "header_total", 0.95),
+        balance_chain_score=1.0,
+        field_completeness=1.0,
+        score=1.0,
+        normalize_fn=normalize,
+        canonical_coverage=1.0,
+        source_page_coverage=1.0,
+        extraction_confidence=0.9,
+        source_column_width=4.0,
+        sequence_continuity=1.0,
+    )
+
+
+def _single_scope_parse_result(
+    headers: list[str] | None = None,
+    rows: list[list[str]] | None = None,
+) -> SimpleNamespace:
+    headers = headers or ["date", "amount", "direction", "summary"]
+    rows = rows or [
+        ["2025-01-01", "1.00", "income", "row 1"],
+        ["2025-01-02", "2.00", "income", "row 2"],
+    ]
+    raw_rows = [headers, *rows]
+    table_atoms: list[dict[str, object]] = []
+    cell_evidence_ids: list[list[list[str]]] = []
+    for row_index, row in enumerate(raw_rows):
+        evidence_row: list[list[str]] = []
+        for col_index, value in enumerate(row):
+            if not value:
+                evidence_row.append([])
+                continue
+            atom_id = f"table:r{row_index}:c{col_index}"
+            table_atoms.append(
+                {
+                    "id": atom_id,
+                    "page_id": "page:0001",
+                    "text": value,
+                    "bbox": [
+                        col_index * 100.0 + 5.0,
+                        row_index * 20.0 + 102.0,
+                        (col_index + 1) * 100.0 - 5.0,
+                        row_index * 20.0 + 118.0,
+                    ],
+                    "source_kind": "pdf_native",
+                }
+            )
+            evidence_row.append([atom_id])
+        cell_evidence_ids.append(evidence_row)
+    table = SimpleNamespace(
+        table_id="table:1",
+        headers=headers,
+        rows=[SimpleNamespace(cells=[SimpleNamespace(text=value) for value in row]) for row in rows],
+        metadata={"raw_rows": raw_rows},
+    )
+    page = SimpleNamespace(
+        page_number=1,
+        source_page_number=1,
+        tables=[table],
+        texts=[],
+        key_values=[],
+    )
+    return SimpleNamespace(
+        pages=[page],
+        logical_tables=[SimpleNamespace(quality_passed=True)],
+        evidence_plane=SimpleNamespace(
+            evidence={
+                "text_atoms": [
+                    {
+                        "id": "scope:account",
+                        "page_id": "page:0001",
+                        "text": "Account Number: 1234567890",
+                        "bbox": [10.0, 10.0, 200.0, 20.0],
+                        "source_kind": "parse_result_text",
+                    },
+                    *table_atoms,
+                ],
+                "indexes": {
+                    "table_candidates": [
+                        {
+                            "candidate_id": "table:1",
+                            "page_id": "page:0001",
+                            "page_number": 1,
+                            "table_index": 0,
+                            "bbox": [0.0, 100.0, len(headers) * 100.0, len(raw_rows) * 20.0 + 100.0],
+                            "rows": raw_rows,
+                            "geometry": {"cell_evidence_ids": cell_evidence_ids},
+                        }
+                    ]
+                },
+            }
+        ),
+        parser_info=None,
+        full_text="",
+        raw_text="",
     )
 
 
@@ -308,6 +444,861 @@ def test_issuer_count_remains_authoritative_for_candidate_selection(source: str,
     selected, _diagnostics = _select_candidate([complete, extra])
 
     assert selected is complete
+
+
+def test_primary_collector_invokes_only_first_allowed_detected_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = BankExtractionPolicy(
+        route=BankExtractionRoute.DIGITAL,
+        allowed_parser_ids=frozenset({"signed_amount", "grid_standard"}),
+        allow_semantic_text=True,
+        allow_physical_tables=True,
+        allow_positioned_records=True,
+        allow_evidence_atoms=True,
+        allow_native_wide_tables=True,
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=1,
+        prefer_context_tables=True,
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+    detection = StyleDetectionResult(
+        primary_style="signed_amount",
+        confidence=0.95,
+        parser_chain=["kv_identity", "compact_merged", "signed_amount", "grid_standard"],
+    )
+    calls: list[str] = []
+
+    def run_parser(parser_id, _ctx, _plugin):
+        calls.append(parser_id)
+        candidate = _complete_primary_candidate(1)
+        return candidate.records, candidate.normalize_fn
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a reconstruction provider ran during primary preflight")
+
+    monkeypatch.setattr(style_registry, "_run_parser", run_parser)
+    for name in (
+        "_semantic_text_table_candidates",
+        "collect_physical_tables_from_parse_result",
+        "recover_positioned_record_block_bank_tables",
+        "recover_evidence_atom_bank_tables",
+        "recover_wide_bank_tables",
+        "recover_ocr_implicit_ledger_tables",
+    ):
+        monkeypatch.setattr(style_registry, name, forbidden)
+
+    candidates = style_registry._collect_primary_table_candidates(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert calls == ["signed_amount"]
+    assert [candidate.candidate_id for candidate in candidates] == ["parser:signed_amount"]
+
+
+def test_proven_primary_skips_every_unused_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    candidate = _complete_primary_candidate()
+    page_scope = """
+    账户名称：测试企业 账号：1234567890123456 起止日期：2025-01-01 - 2025-12-31
+    交易日期 交易金额 余额 对方账号 摘要
+    交易总金额：3.00 借方累计金额：0.00 贷方累计金额：3.00 总笔数: 2
+    """
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text=page_scope,
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    parser_calls: list[str] = []
+
+    def run_parser(parser_id, _ctx, _plugin):
+        parser_calls.append(parser_id)
+        return candidate.records, candidate.normalize_fn
+
+    monkeypatch.setattr(style_registry, "_run_parser", run_parser)
+    monkeypatch.setattr(style_registry, "page_texts_from_parse_result", lambda _result: [(1, page_scope)])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("the eager collector ran after completion was proven")
+
+    monkeypatch.setattr(style_registry, "_collect_table_candidates", forbidden)
+
+    registry = BankStyleParserRegistry()
+    records, _identity = registry.run_parser_chain(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 2
+    assert registry.last_selection_diagnostics["selected_candidate"] == "parser:grid_standard"
+    assert registry.last_selection_diagnostics["deployment_mode"] == "lazy_primary"
+    assert registry.last_selection_diagnostics["completion_state"] == "proven"
+    assert registry.last_selection_diagnostics["attempted_strategies"] == ["parser:grid_standard"]
+    assert registry.last_selection_diagnostics["skipped_strategies"]
+    assert parser_calls == ["grid_standard"]
+
+
+def test_primary_core_fields_cannot_hide_unconserved_source_business_columns() -> None:
+    candidate = _complete_primary_candidate()
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary", "reference"],
+                ["2025-01-01", "1.00", "income", "row 1", "ref-1"],
+                ["2025-01-02", "2.00", "income", "row 2", "ref-2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_prove_complete_against_richer_sealed_physical_schema() -> None:
+    candidate = _complete_primary_candidate()
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(
+            headers=["date", "amount", "direction", "summary", "reference"],
+            rows=[
+                ["2025-01-01", "1.00", "income", "row 1", "ref-1"],
+                ["2025-01-02", "2.00", "income", "row 2", "ref-2"],
+            ],
+        ),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_prove_complete_when_source_cell_value_changed() -> None:
+    candidate = _complete_primary_candidate()
+    candidate.records[1]["summary"] = "altered row"
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+@pytest.mark.parametrize("changed_field", ["text", "cleaned"])
+def test_primary_cannot_prove_complete_when_physical_cell_plane_conflicts(
+    changed_field: str,
+) -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    cell = parse_result.pages[0].tables[0].rows[0].cells[3]
+    setattr(cell, changed_field, "different sealed value")
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_richer_sealed_evidence_table() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    indexed = parse_result.evidence_plane.evidence["indexes"]["table_candidates"][0]
+    indexed["rows"] = [
+        [*row, value]
+        for row, value in zip(indexed["rows"], ["reference", "ref-1", "ref-2"], strict=True)
+    ]
+    indexed["geometry"]["cell_evidence_ids"] = [
+        [*row, []] for row in indexed["geometry"]["cell_evidence_ids"]
+    ]
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_unowned_positioned_business_cell() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.evidence_plane.evidence["text_atoms"].append(
+        {
+            "id": "extra:reference:1",
+            "page_id": "page:0001",
+            "text": "ref-1",
+            "bbox": [405.0, 122.0, 455.0, 138.0],
+            "source_kind": "pdf_native",
+        }
+    )
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_prove_complete_when_sealed_header_atoms_conflict() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    header_atom = next(
+        atom
+        for atom in parse_result.evidence_plane.evidence["text_atoms"]
+        if atom["id"] == "table:r0:c3"
+    )
+    header_atom["text"] = "summary/reference"
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_second_positioned_ledger_without_time_column() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    for index, text in enumerate(
+        ["日期时间", "交易金额", "20250101000000", "1.00", "20250102000000", "2.00"]
+    ):
+        parse_result.evidence_plane.evidence["text_atoms"].append(
+            {
+                "id": f"second-ledger:{index}",
+                "page_id": "page:0001",
+                "text": text,
+                "bbox": [10.0 + index * 50.0, 200.0, 50.0 + index * 50.0, 215.0],
+                "source_kind": "pdf_native",
+            }
+        )
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_outside_band_transaction_role_fact() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.evidence_plane.evidence["text_atoms"].append(
+        {
+            "id": "wrapped:counterparty-account",
+            "page_id": "page:0001",
+            "text": "对方账号: 622200001111",
+            "bbox": [10.0, 200.0, 180.0, 215.0],
+            "source_kind": "pdf_native",
+        }
+    )
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_richer_positioned_page_text_blocks() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.pages[0].width = 600
+    parse_result.pages[0].height = 850
+    parse_result.pages[0].texts = [
+        SimpleNamespace(
+            content="序号\n摘要\n交易日期\n交易金额\n账户余额\n对方账号与户名",
+            bbox=[20.0, 200.0, 60.0, 215.0],
+            evidence_ids=[],
+        ),
+        SimpleNamespace(
+            content="1\n银联入账\n20250101\n1.00\n1.00\n6222020202020001/甲公司",
+            bbox=[20.0, 220.0, 60.0, 235.0],
+            evidence_ids=[],
+        ),
+        SimpleNamespace(
+            content="2\n转账支取\n20250102\n-2.00\n-1.00\n6222020202020002/乙公司",
+            bbox=[20.0, 240.0, 60.0, 255.0],
+            evidence_ids=[],
+        ),
+    ]
+    recovery = style_registry.recover_positioned_record_block_bank_tables(parse_result)
+    assert recovery.expected_rows == 2
+    assert len(recovery.tables[0][0]) > 4
+
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_bound_positioned_records_without_account_field() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.pages[0].width = 600
+    parse_result.pages[0].height = 850
+    blocks = []
+    for sequence in range(1, 4):
+        content = f"{sequence}\n转账收入\n2025-01-0{sequence}\n1.00\n{sequence}.00"
+        atom_id = f"positioned-record:{sequence}"
+        bbox = [20.0, 200.0 + sequence * 20.0, 60.0, 215.0 + sequence * 20.0]
+        parse_result.evidence_plane.evidence["text_atoms"].append(
+            {
+                "id": atom_id,
+                "page_id": "page:0001",
+                "text": content,
+                "bbox": bbox,
+                "source_kind": "pdf_native",
+            }
+        )
+        blocks.append(SimpleNamespace(content=content, bbox=bbox, evidence_ids=[atom_id]))
+    parse_result.pages[0].texts = blocks
+    recovery = style_registry.recover_positioned_record_block_bank_tables(parse_result)
+    assert recovery.expected_rows == 3
+
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_richer_semantic_text_table() -> None:
+    candidate = _complete_primary_candidate()
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text=(
+            "| date | amount | direction | summary | reference |\n"
+            "| 2025-01-01 | 1.00 | income | row 1 | ref-1 |\n"
+            "| 2025-01-02 | 2.00 | income | row 2 | ref-2 |"
+        ),
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_hide_richer_stacked_semantic_text_table() -> None:
+    headers = ["交易日期", "交易时间", "摘要", "交易金额", "余额", "对方户名"]
+    rows = [
+        ["2025-01-01", "10:00:00", "summary1", "+1.00", "100.00", "Alice"],
+        ["2025-01-02", "11:00:00", "summary2", "+2.00", "102.00", "Bob"],
+    ]
+    records = []
+    for row_index, row in enumerate(rows):
+        records.append(
+            {
+                **dict(zip(headers, row, strict=True)),
+                "_source": {
+                    "source_page": 1,
+                    "page_range": [1, 1],
+                    "table_id": "table:1",
+                    "source_row_index": row_index,
+                    "source_cell_refs": [
+                        {
+                            "page": 1,
+                            "table_id": "table:1",
+                            "row": row_index,
+                            "raw_row": row_index + 1,
+                            "col": col_index,
+                        }
+                        for col_index in range(len(headers))
+                    ],
+                },
+            }
+        )
+    candidate = replace(
+        _complete_primary_candidate(),
+        records=records,
+        source_column_width=float(len(headers)),
+    )
+    full_text = "\n".join(
+        [
+            "交易明细",
+            "对方户名",
+            "备注",
+            "余额",
+            "收入/支出金额",
+            "Alice",
+            "ref-1",
+            "100.00",
+            "/",
+            "2025-01-01",
+            "10:00:00 +1.00 summary1",
+            "Bob",
+            "ref-2",
+            "102.00",
+            "/",
+            "2025-01-02",
+            "11:00:00 +2.00 summary2",
+        ]
+    )
+    semantic = style_registry._semantic_text_table_candidates(full_text)
+    assert len(semantic) == 1
+    assert len(semantic[0][0]) == 7
+    assert [row[-1] for row in semantic[0][1:]] == ["ref-1", "ref-2"]
+
+    ctx = StyleContext(
+        tables=[[headers, *rows]],
+        full_text=full_text,
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(headers=headers, rows=rows),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_source_value_proof_preserves_internal_whitespace() -> None:
+    candidate = _complete_primary_candidate()
+    candidate.records[0]["summary"] = "row1"
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=_single_scope_parse_result(),
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_primary_cannot_prove_complete_when_physical_header_is_unbound() -> None:
+    candidate = _complete_primary_candidate()
+    parse_result = _single_scope_parse_result()
+    parse_result.pages[0].tables[0].headers = ["x-date", "x-amount", "x-direction", "x-summary"]
+    ctx = StyleContext(
+        tables=[
+            [
+                ["date", "amount", "direction", "summary"],
+                ["2025-01-01", "1.00", "income", "row 1"],
+                ["2025-01-02", "2.00", "income", "row 2"],
+            ]
+        ],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    proof = style_registry._prove_primary_candidate_complete(candidate, detection, ctx)
+
+    assert proof.state == "unknown"
+    assert proof.reason == "canonical_source_columns_not_conserved"
+
+
+def test_statement_scope_count_requires_explicit_context_fact() -> None:
+    parse_result = _single_scope_parse_result()
+    parse_result.evidence_plane = None
+
+    assert style_registry.statement_scope_count(parse_result) == 0
+
+
+def test_unknown_primary_reruns_exact_eager_collector_and_matches_forced_eager(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def run_parser(parser_id, _ctx, _plugin):
+        calls.append(parser_id)
+        candidate = _complete_primary_candidate(1)
+        return candidate.records, candidate.normalize_fn
+
+    monkeypatch.setattr(style_registry, "_run_parser", run_parser)
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+
+    def make_ctx() -> StyleContext:
+        return StyleContext(
+            tables=[],
+            full_text="",
+            institution=None,
+            page_count=1,
+            reconstruction=ReconstructionMeta(source="canonical_table"),
+            prefer_context_tables=True,
+        )
+
+    adaptive = BankStyleParserRegistry()
+    adaptive_records, _ = adaptive.run_parser_chain(
+        detection,
+        make_ctx(),
+        BankStatementCommunityPlugin(),
+    )
+    adaptive_calls = list(calls)
+    calls.clear()
+    eager = BankStyleParserRegistry(adaptive=False)
+    eager_records, _ = eager.run_parser_chain(
+        detection,
+        make_ctx(),
+        BankStatementCommunityPlugin(),
+    )
+
+    assert adaptive_records == eager_records
+    assert adaptive.last_selection_diagnostics["selected_candidate"] == eager.last_selection_diagnostics[
+        "selected_candidate"
+    ]
+    assert adaptive.last_selection_diagnostics["deployment_mode"] == "eager_fallback"
+    assert adaptive.last_selection_diagnostics["completion_state"] == "unknown"
+    assert adaptive.last_selection_diagnostics["candidate_counts"] == eager.last_selection_diagnostics[
+        "candidate_counts"
+    ]
+    assert adaptive_calls == ["grid_standard", "grid_standard", "signed_amount", "compact_merged"]
+    assert calls == ["grid_standard", "signed_amount", "compact_merged"]
+
+
+@pytest.mark.parametrize(
+    "policy,expected_candidate_ids",
+    [
+        (
+            DIGITAL_POLICY,
+            {
+                "parser:grid_standard",
+                "parser:signed_amount",
+                "parser:compact_merged",
+                "semantic_text:0",
+                "physical_table",
+                "positioned_record_block",
+                "evidence_atom",
+                "native_wide_table:0",
+            },
+        ),
+        (
+            SCANNED_POLICY,
+            {
+                "parser:grid_standard",
+                "parser:signed_amount",
+                "parser:borderless_ocr",
+                "evidence_atom",
+                "ocr_implicit_table",
+            },
+        ),
+    ],
+)
+def test_eager_collector_retains_all_existing_strategy_nodes(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: BankExtractionPolicy,
+    expected_candidate_ids: set[str],
+) -> None:
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+    table = [["date", "amount", "direction"], ["2025-01-01", "1.00", "income"]]
+    candidate = _complete_primary_candidate(1)
+    positioned = SimpleNamespace(tables=[table], row_sources=[], expected_rows=1)
+
+    monkeypatch.setattr(
+        style_registry,
+        "_run_parser",
+        lambda *_args, **_kwargs: (candidate.records, candidate.normalize_fn),
+    )
+    monkeypatch.setattr(style_registry, "page_texts_from_parse_result", lambda _result: [])
+    monkeypatch.setattr(
+        style_registry,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence.empty(),
+    )
+    monkeypatch.setattr(style_registry, "recovered_native_datetime_row_evidence", lambda *_args, **_kwargs: (0, "", 0.0))
+    monkeypatch.setattr(style_registry, "_semantic_text_table_candidates", lambda _text: [table])
+    monkeypatch.setattr(style_registry, "collect_physical_tables_from_parse_result", lambda _result: [table])
+    monkeypatch.setattr(style_registry, "collect_physical_table_row_sources_from_parse_result", lambda _result: [])
+    monkeypatch.setattr(style_registry, "physical_transaction_row_estimate", lambda _result: 1)
+    monkeypatch.setattr(
+        style_registry,
+        "recover_positioned_record_block_bank_tables",
+        lambda *_args, **_kwargs: positioned,
+    )
+    monkeypatch.setattr(style_registry, "recover_evidence_atom_bank_tables", lambda *_args, **_kwargs: [table])
+    monkeypatch.setattr(
+        style_registry,
+        "_evidence_atom_expected_rows",
+        lambda *_args, **_kwargs: RowCountEvidence(1, "candidate_rows", 0.55),
+    )
+    monkeypatch.setattr(style_registry, "recovered_evidence_atom_row_sources", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(style_registry, "recover_wide_bank_tables", lambda *_args, **_kwargs: [table])
+    monkeypatch.setattr(style_registry, "recover_ocr_implicit_ledger_tables", lambda *_args, **_kwargs: [table])
+    monkeypatch.setattr(style_registry, "recovered_ocr_implicit_row_evidence", lambda _result: (0, "", 0.0))
+
+    ctx = StyleContext(
+        tables=[table],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=SimpleNamespace(pages=[], logical_tables=[]),
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+    candidates = style_registry._collect_table_candidates(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert {item.candidate_id for item in candidates} == expected_candidate_ids
 
 
 def test_builtin_templates_registered():
