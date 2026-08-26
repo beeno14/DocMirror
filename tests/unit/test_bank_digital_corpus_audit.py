@@ -174,6 +174,27 @@ def test_corpus_audit_accepts_exact_source_unitemized_reconciliation(monkeypatch
     assert len(payload["datasets"][1]["rows"]) == 3
 
 
+def test_corpus_audit_rejects_normalized_opaque_identifier_corruption(monkeypatch, audit_module):
+    payload = _reconciled_payload(monkeypatch)
+    row = payload["datasets"][1]["rows"][0]
+    row["raw"]["日志号"] = "546276664"
+    row["canonical_raw"]["sequence_no"] = "546276664"
+    row["normalized"]["sequence_no"] = "2"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=3)
+
+    assert audit["status"] == "fail"
+    assert audit["finding_counts"]["source_identifier_contradiction"] == 1
+    [finding] = [
+        item for item in audit["findings"] if item["code"] == "source_identifier_contradiction"
+    ]
+    assert finding["detail"] == {
+        "field": "sequence_no",
+        "source": "546276664",
+        "normalized": "2",
+    }
+
+
 def test_corpus_audit_rejects_recoverable_physical_provenance_loss(monkeypatch, audit_module):
     payload = _reconciled_payload(monkeypatch)
     source = payload["datasets"][1]["rows"][0]["source"]

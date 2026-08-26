@@ -174,6 +174,45 @@ def test_lazy_final_gate_accumulates_every_reason_in_stable_order() -> None:
     ]
 
 
+def test_zero_amount_business_row_is_exempt_from_direction_coverage() -> None:
+    records = [
+        {
+            "normalized": {
+                "date": "2023-09-01",
+                "amount": 10.0,
+                "direction": "income",
+                "balance": 110.0,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "normalized": {
+                "date": "2023-09-02",
+                "amount": 0.0,
+                "direction": "",
+                "balance": 110.0,
+                "summary": "利息税",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+    ]
+
+    canonical, parsed, directional, applicable, sourced = extract_pipeline._row_accounting_view(records)
+    failures = extract_pipeline._lazy_final_gate_failures(
+        canonical,
+        parsed_rows=parsed,
+        direction_count=directional,
+        direction_expected_count=applicable,
+        sourced_count=sourced,
+        physical_expected=2,
+        source_reported_count=RowCountEvidence(2, "header_total", 0.95),
+        invariant_failures=[],
+    )
+
+    assert (len(canonical), parsed, directional, applicable, sourced) == (2, 2, 1, 1, 2)
+    assert "direction_coverage_incomplete" not in failures
+
+
 def test_lazy_final_gate_failure_forces_one_fresh_eager_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

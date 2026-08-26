@@ -1079,6 +1079,22 @@ def test_geometry_direction_repair_uses_summary_and_cross_page_balance() -> None
     assert second_page[0][0] == "支出"
 
 
+def test_geometry_sequence_repair_preserves_opaque_log_ids_from_business_rows() -> None:
+    rows = [["1"], ["546276664"], ["165612874"], [""]]
+
+    _repair_geometry_rows(rows, {"sequence_no": 0}, source_headers=["日志号"])
+
+    assert rows == [["1"], ["546276664"], ["165612874"], [""]]
+
+
+def test_geometry_sequence_repair_interpolates_only_blank_ordinal_cells() -> None:
+    rows = [["1"], [""], ["3"], ["opaque-source-id"], ["5"]]
+
+    _repair_geometry_rows(rows, {"sequence_no": 0}, source_headers=["序号"])
+
+    assert rows == [["1"], ["2"], ["3"], ["opaque-source-id"], ["5"]]
+
+
 def test_geometry_cell_spill_moves_bounded_summary_prefix_out_of_signed_amount() -> None:
     row = ["2023/04/08", "AppStore_Music", "Apple-19.00", "549.28"]
 

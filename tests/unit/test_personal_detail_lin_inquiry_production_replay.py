@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import pytest
 
+from docmirror.models.mirror.vnext import EvidenceAtom, EvidenceStore
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+    BusinessUncertaintyRepairCoordinator,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b_strategy import (
     CANDIDATE_B_STAGE_REGISTRY,
     INQUIRY_SECTION,
@@ -34,7 +39,11 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _extract_inquiries,
     _inquiry_source_coverage,
+    _sealed_raw_inquiry_population_census,
     _source_completeness_ledger,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+    PersonalDetailOCRCorrectionOverlay,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
     LogicalPageGeometry,
@@ -56,7 +65,6 @@ from docmirror.plugins.credit_report.shared.entity_decoder import (
     CreditReportUnit,
 )
 
-
 _FIXTURE = (
     Path(__file__).parent
     / "fixtures"
@@ -70,6 +78,60 @@ def _spec() -> dict[str, Any]:
     return json.loads(_FIXTURE.read_text(encoding="utf-8"))
 
 
+def _fixture_institution_rows(
+    spec: Mapping[str, Any],
+) -> dict[int, dict[str, Any]]:
+    """Index each institution source row by its sealed population position."""
+
+    indexed: dict[int, dict[str, Any]] = {}
+    for raw_page in spec["pages"]:
+        for raw_table in raw_page["tables"]:
+            if raw_table["table_id"] == "pt_28_1":
+                continue
+            start = int(raw_table["population_start"])
+            endpoint = int(raw_table["population_endpoint"])
+            row_offset = 1 if raw_table.get("include_header") is True else 0
+            for sequence in range(start, endpoint + 1):
+                indexed[sequence] = {
+                    "logical_page": int(raw_page["logical_page"]),
+                    "table_id": str(raw_table["table_id"]),
+                    "row": sequence - start + row_offset,
+                    "values": [
+                        str(value or "")
+                        for value in raw_table["row_overrides"][str(sequence)]
+                    ],
+                }
+    return indexed
+
+
+def _fixture_sequence_for_issue(
+    issue: Mapping[str, Any],
+    fixture_rows: Mapping[int, Mapping[str, Any]],
+) -> int | None:
+    positions = {
+        (
+            int(row["logical_page"]),
+            str(row["table_id"]),
+            int(row["row"]),
+        ): sequence
+        for sequence, row in fixture_rows.items()
+    }
+    matches = {
+        positions.get(
+            (
+                int(ref.get("logical_page") or 0),
+                str(ref.get("table_id") or ""),
+                int(ref.get("row") if ref.get("row") is not None else -1),
+            )
+        )
+        for ref in issue.get("source_refs") or ()
+        if isinstance(ref, Mapping)
+    }
+    matches.discard(None)
+    assert len(matches) <= 1
+    return next(iter(matches), None)
+
+
 def _line(raw: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "text": str(raw["text"]),
@@ -78,28 +140,21 @@ def _line(raw: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _default_inquiry_row(sequence: int) -> list[str]:
-    offset = sequence - 1
-    year = 2023 - offset // 336
-    month = (offset // 28) % 12 + 1
-    day = offset % 28 + 1
-    return [
-        str(sequence),
-        f"{year:04d}.{month:02d}.{day:02d}",
-        f"查询机构{sequence}",
-        "贷后管理" if sequence % 2 else "贷款审批",
-    ]
-
-
-def _table(raw: Mapping[str, Any]) -> SimpleNamespace:
+def _table(
+    raw: Mapping[str, Any],
+    *,
+    atom_sink: list[EvidenceAtom] | None = None,
+) -> SimpleNamespace:
     start = int(raw["population_start"])
     endpoint = int(raw["population_endpoint"])
     overrides = {
         int(sequence): [str(value or "") for value in values]
         for sequence, values in raw.get("row_overrides", {}).items()
     }
+    expected_sequences = set(range(start, endpoint + 1))
+    assert set(overrides) == expected_sequences
     body = [
-        overrides.get(sequence, _default_inquiry_row(sequence))
+        overrides[sequence]
         for sequence in range(start, endpoint + 1)
     ]
     include_header = raw.get("include_header") is True
@@ -118,15 +173,37 @@ def _table(raw: Mapping[str, Any]) -> SimpleNamespace:
         for row in range(len(rows))
     ]
     statuses = [["exact"] * 4 for _row in rows]
-    evidence_ids = [
-        [
-            [f"{raw['table_id']}:r{row}:c{column}"]
-            if str(rows[row][column]).strip()
-            else []
-            for column in range(4)
-        ]
-        for row in range(len(rows))
-    ]
+    evidence_ids: list[list[list[str]]] = []
+    token_ids: list[list[list[str]]] = []
+    for row in range(len(rows)):
+        evidence_line: list[list[str]] = []
+        token_line: list[list[str]] = []
+        for column in range(4):
+            text = str(rows[row][column]).strip()
+            ids = (
+                [f"{raw['table_id']}:r{row}:c{column}"]
+                if text
+                else []
+            )
+            evidence_line.append(list(ids))
+            token_line.append(list(ids))
+            if atom_sink is not None and ids:
+                bbox = cell_bboxes[row][column]
+                assert bbox is not None
+                atom_sink.append(
+                    EvidenceAtom(
+                        id=ids[0],
+                        text=text,
+                        bbox=[
+                            bbox[0] + 1.0,
+                            bbox[1] + 1.0,
+                            bbox[2] - 1.0,
+                            bbox[3] - 1.0,
+                        ],
+                    )
+                )
+        evidence_ids.append(evidence_line)
+        token_ids.append(token_line)
     for row, column in raw.get("derived_empty_cells", []):
         row = int(row)
         column = int(column)
@@ -134,6 +211,7 @@ def _table(raw: Mapping[str, Any]) -> SimpleNamespace:
         statuses[row][column] = "derived"
         cell_bboxes[row][column] = None
         evidence_ids[row][column] = []
+        token_ids[row][column] = []
     for row, column in raw.get("exact_empty_cells", []):
         row = int(row)
         column = int(column)
@@ -148,9 +226,22 @@ def _table(raw: Mapping[str, Any]) -> SimpleNamespace:
         metadata={
             "raw_rows": rows,
             "geometry": {
+                "row_bands": [
+                    {
+                        "index": row,
+                        "y0": horizontal[row],
+                        "y1": horizontal[row + 1],
+                    }
+                    for row in range(len(rows))
+                ],
+                "col_bands": [
+                    {"index": column, "x0": x0, "x1": x1}
+                    for column, (x0, x1) in enumerate(bands)
+                ],
                 "cell_bboxes": cell_bboxes,
                 "cell_geometry_status": statuses,
                 "cell_evidence_ids": evidence_ids,
+                "cell_token_ids": token_ids,
                 "cell_spans": [],
                 "coordinate_system": "pdf_points_top_left",
             },
@@ -160,6 +251,8 @@ def _table(raw: Mapping[str, Any]) -> SimpleNamespace:
 
 def _pages_and_evidence(
     spec: Mapping[str, Any],
+    *,
+    atom_sink: list[EvidenceAtom] | None = None,
 ) -> tuple[list[SimpleNamespace], list[dict[str, Any]]]:
     pages: list[SimpleNamespace] = []
     evidence: list[dict[str, Any]] = []
@@ -171,7 +264,10 @@ def _pages_and_evidence(
                 source_page_number=int(raw_page["source_page"]),
                 width=float(raw_page["width"]),
                 height=float(raw_page["height"]),
-                tables=[_table(value) for value in raw_page["tables"]],
+                tables=[
+                    _table(value, atom_sink=atom_sink)
+                    for value in raw_page["tables"]
+                ],
                 texts=[
                     SimpleNamespace(
                         content=value["text"],
@@ -194,6 +290,53 @@ def _pages_and_evidence(
     return pages, evidence
 
 
+def _frozen_raw_inquiry_plane(
+    spec: Mapping[str, Any],
+) -> tuple[dict[int, SimpleNamespace], list[EvidenceAtom], dict[int, int]]:
+    """Rebuild the sealed source plane independently of canonical mutation."""
+
+    atoms: list[EvidenceAtom] = []
+    pages, _evidence = _pages_and_evidence(spec, atom_sink=atoms)
+    raw_envelope = spec["raw_plane_envelope"]
+    start = raw_envelope["section_start"]
+    start_page = _page(pages, int(start["logical_page"]))
+    start_page.texts.insert(
+        0,
+        SimpleNamespace(
+            content=str(start["text"]),
+            bbox=[float(value) for value in start["bbox"]],
+            evidence_ids=[str(start["evidence_id"])],
+        ),
+    )
+
+    boundary = raw_envelope["section_boundary"]
+    pages.append(
+        SimpleNamespace(
+            page_number=int(boundary["logical_page"]),
+            source_page_number=int(boundary["source_page"]),
+            width=float(boundary["width"]),
+            height=float(boundary["height"]),
+            tables=[],
+            texts=[
+                SimpleNamespace(
+                    content=str(boundary["text"]),
+                    bbox=[float(value) for value in boundary["bbox"]],
+                    evidence_ids=[str(boundary["evidence_id"])],
+                )
+            ],
+        )
+    )
+    ordered = sorted(pages, key=lambda page: int(page.page_number))
+    return (
+        {int(page.page_number): page for page in ordered},
+        atoms,
+        {
+            int(page.page_number): position
+            for position, page in enumerate(ordered, start=1)
+        },
+    )
+
+
 class _ReplayTopology:
     def __init__(self, raw: Mapping[str, Any]) -> None:
         self._geometries = {
@@ -213,6 +356,13 @@ class _ReplayTopology:
             )
             for logical, value in raw["geometries"].items()
         }
+        self._logicals_by_source = {
+            int(source): tuple(int(logical) for logical in logical_pages)
+            for source, logical_pages in raw["logical_pages_by_source"].items()
+        }
+        self._invalid_sources = {
+            int(source) for source in raw.get("invalid_source_pages", ())
+        }
         self._audit = {
             "valid": raw["valid"] is True,
             "logical_pages_by_source": deepcopy(
@@ -227,6 +377,30 @@ class _ReplayTopology:
 
     def geometry(self, logical_page: int) -> LogicalPageGeometry | None:
         return self._geometries.get(int(logical_page))
+
+    def ordered_pair(
+        self,
+        logical_pages: Iterable[int],
+    ) -> tuple[int, int] | None:
+        requested = {int(page) for page in logical_pages if int(page) > 0}
+        if len(requested) != 2:
+            return None
+        sources = {
+            geometry.source_page
+            for logical in requested
+            if (geometry := self._geometries.get(logical)) is not None
+        }
+        if len(sources) != 1:
+            return None
+        source = next(iter(sources))
+        ordered = self._logicals_by_source.get(source, ())
+        if (
+            source in self._invalid_sources
+            or len(ordered) != 2
+            or set(ordered) != requested
+        ):
+            return None
+        return (ordered[0], ordered[1])
 
     def audit(self) -> dict[str, Any]:
         return deepcopy(self._audit)
@@ -346,6 +520,10 @@ def _entity_context(
 
 class _ReplayContext:
     tables_continue = PersonalDetailExtractionContext.tables_continue
+    candidate_b_planned_field_repair = (
+        PersonalDetailExtractionContext.candidate_b_planned_field_repair
+    )
+    candidate_b_field_repair = PersonalDetailExtractionContext.candidate_b_field_repair
 
     def __init__(
         self,
@@ -367,6 +545,9 @@ class _ReplayContext:
             "topology_frozen_before_reocr": True,
         }
         self.corrected_evidence_pages = lambda: deepcopy(evidence)
+        self._business_repair_plan = None
+        self._business_repair_active = False
+        self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(self)
 
 
 def _page(pages: list[SimpleNamespace], logical: int) -> SimpleNamespace:
@@ -547,14 +728,25 @@ def _consumer_context(
         )
         target["canonical_template_id"] = "annotations_and_inquiries"
         target["lines"].append(_line(raw))
-    return _ReplayContext(
+    frozen_pages, raw_atoms, frozen_order = _frozen_raw_inquiry_plane(spec)
+    assert {
+        logical: frozen_order[logical] for logical in reading_order
+    } == reading_order
+    consumer_resolution = deepcopy(resolution)
+    consumer_resolution["printed_page_by_logical"][29] = 29
+    context = _ReplayContext(
         pages=list(projection.pages),
         evidence=consumer_evidence,
         topology=topology,
-        resolution=deepcopy(resolution),
-        reading_order=deepcopy(reading_order),
+        resolution=consumer_resolution,
+        reading_order=frozen_order,
         entity_context=entities,
     )
+    context._frozen_logical_pages = frozen_pages
+    context.evidence_plane = SimpleNamespace(
+        evidence=EvidenceStore(text_atoms=raw_atoms)
+    )
+    return context
 
 
 def _projected_table(projection: Any, table_id: str) -> tuple[Any, Any]:
@@ -586,7 +778,10 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
             "林岚挺征信.semantic.json"
         ),
         "captured_at": "2026-08-26",
-        "scope": "logical pages 26-28 only; no PDF or OCR required",
+        "scope": (
+            "logical pages 26-28 inquiry tables plus page 29 section "
+            "boundary; no PDF or OCR required"
+        ),
         "artifact_observation": {
             "owned_tables": ["pt_26_3", "pt_28_1"],
             "withheld_headerless_tables": ["pt_27_0", "pt_28_0"],
@@ -613,11 +808,47 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
     }
     assert spec["expected"] == {
         "source_rows": 90,
-        "emitted_rows": 87,
+        "emitted_rows": 73,
+        "target_repaired_rows": 87,
         "institution_endpoint": 89,
         "personal_endpoint": 1,
-        "omitted_institution_sequences": [4, 66, 67],
-        "localized_omission_raw_dates": [
+        "omitted_institution_sequences": [
+            3,
+            4,
+            8,
+            9,
+            25,
+            26,
+            40,
+            41,
+            44,
+            59,
+            65,
+            66,
+            67,
+            79,
+            81,
+            83,
+            84,
+        ],
+        "deferred_repair_sequences": [
+            3,
+            8,
+            9,
+            25,
+            26,
+            40,
+            41,
+            44,
+            59,
+            65,
+            79,
+            81,
+            83,
+            84,
+        ],
+        "target_final_omitted_institution_sequences": [4, 66, 67],
+        "target_final_omission_raw_dates": [
             "2022.1214",
             "2021.09.30",
             "2021.09.03",
@@ -625,11 +856,22 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
         "generic_inferred_sequences": [27, 46, 87],
         "authority_mode": "schema_carry_only",
     }
+    expected = spec["expected"]
+    assert expected["emitted_rows"] == expected["source_rows"] - len(
+        expected["omitted_institution_sequences"]
+    )
+    assert expected["target_repaired_rows"] == expected["source_rows"] - len(
+        expected["target_final_omitted_institution_sequences"]
+    )
+    assert set(expected["deferred_repair_sequences"]) == set(
+        expected["omitted_institution_sequences"]
+    ) - set(expected["target_final_omitted_institution_sequences"])
 
 
-def test_lin_production_replay_reaches_87_of_90_with_only_localized_omissions() -> None:
+def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
     spec = _spec()
     expected = spec["expected"]
+    fixture_rows = _fixture_institution_rows(spec)
     projection, evidence, topology, resolution, order, entities = (
         _projection_case()
     )
@@ -641,6 +883,35 @@ def test_lin_production_replay_reaches_87_of_90_with_only_localized_omissions() 
         order,
         entities,
     )
+
+    raw_census = _sealed_raw_inquiry_population_census(context)
+    assert raw_census is not None
+    frozen_census = deepcopy(raw_census)
+    assert len(raw_census["raw_physical_positions"]) == expected["source_rows"]
+    assert len(
+        {
+            row["source_physical_row_id"]
+            for row in raw_census["raw_physical_positions"]
+        }
+    ) == expected["source_rows"]
+    assert all(
+        len(row["source_refs"]) == 1
+        and row["source_refs"][0].get("evidence_ids")
+        for row in raw_census["raw_physical_positions"]
+    )
+    assert Counter(
+        (
+            row["source_refs"][0]["logical_page"],
+            row["source_refs"][0]["table_id"],
+        )
+        for row in raw_census["raw_physical_positions"]
+    ) == {
+        (26, "pt_26_3"): 16,
+        (27, "pt_27_0"): 38,
+        (28, "pt_28_0"): 35,
+        (28, "pt_28_1"): 1,
+    }
+    assert context._frozen_logical_pages[26] is not _page(context.pages, 26)
 
     assert {
         table.table_id
@@ -685,6 +956,10 @@ def test_lin_production_replay_reaches_87_of_90_with_only_localized_omissions() 
         "institution": expected["institution_endpoint"],
         "personal": expected["personal_endpoint"],
     }
+    assert coverage["raw_physical_positions"] == raw_census[
+        "raw_physical_positions"
+    ]
+    assert _sealed_raw_inquiry_population_census(context) == frozen_census
 
     issues = context._personal_detail_extraction_issues
     assert {
@@ -698,36 +973,307 @@ def test_lin_production_replay_reaches_87_of_90_with_only_localized_omissions() 
         == "candidate_b_inquiry_sequence_owner_ordinal_corrected"
         for issue in issues
     )
-    emitted_business_rows = {
-        (row["inquiry_date"], row["institution"], row["reason"])
-        for row in records
-        if row["inquiry_type"] == "institution"
-    }
-    localized_omissions = [
-        issue
+    missing_sequences = set(expected["omitted_institution_sequences"])
+    deferred_sequences = set(expected["deferred_repair_sequences"])
+    final_omissions = set(
+        expected["target_final_omitted_institution_sequences"]
+    )
+    assert len(missing_sequences) == 17
+    assert len(deferred_sequences) == 14
+    assert len(final_omissions) == 3
+    assert deferred_sequences.isdisjoint(final_omissions)
+    assert deferred_sequences | final_omissions == missing_sequences
+
+    localized_by_sequence = {
+        sequence: issue
         for issue in issues
         if issue.get("issue_code")
-        == "candidate_b_inquiry_multiple_missing_sequences_unresolved"
+        in {
+            "candidate_b_inquiry_row_cells_unresolved",
+            "candidate_b_inquiry_multiple_missing_sequences_unresolved",
+        }
         and (
-            issue["observed_value"]["row"]["inquiry_date"],
-            issue["observed_value"]["row"]["institution"],
-            issue["observed_value"]["row"]["reason"],
-        )
-        not in emitted_business_rows
-    ]
+            sequence := _fixture_sequence_for_issue(issue, fixture_rows)
+        ) in missing_sequences
+    }
+    assert set(localized_by_sequence) == missing_sequences
+
+    deferred_date_repairs = deferred_sequences - {8, 9}
     assert {
-        issue["observed_value"]["row"]["raw_inquiry_date"]
-        for issue in localized_omissions
-    } == set(expected["localized_omission_raw_dates"])
+        sequence
+        for sequence, issue in localized_by_sequence.items()
+        if issue["issue_code"] == "candidate_b_inquiry_row_cells_unresolved"
+    } == deferred_date_repairs
     assert all(
-        issue["reason_codes"][-1] == "record_not_emitted"
-        for issue in localized_omissions
+        localized_by_sequence[sequence]["field_name"] == "inquiry_date"
+        and localized_by_sequence[sequence]["observed_value"]["row"]
+        == fixture_rows[sequence]["values"]
+        and localized_by_sequence[sequence].get("candidate_value")
+        == {"missing_fields": ["inquiry_date"]}
+        and localized_by_sequence[sequence]["reason_codes"][-1]
+        == "record_not_invented"
+        and len(
+            [
+                ref
+                for ref in localized_by_sequence[sequence]["source_refs"]
+                if ref.get("field_name") == "inquiry_date"
+                and ref.get("geometry_scope") == "cell"
+                and ref.get("evidence_ids")
+            ]
+        )
+        == 1
+        for sequence in deferred_date_repairs
     )
 
+    unresolved_ordinal_sequences = {4, 8, 9, 66, 67}
+    assert unresolved_ordinal_sequences == ({8, 9} | final_omissions)
+    assert {
+        sequence
+        for sequence, issue in localized_by_sequence.items()
+        if issue["issue_code"]
+        == "candidate_b_inquiry_multiple_missing_sequences_unresolved"
+    } == unresolved_ordinal_sequences
+    for sequence in unresolved_ordinal_sequences:
+        issue = localized_by_sequence[sequence]
+        observed_row = issue["observed_value"]["row"]
+        assert issue["field_name"] == "sequence"
+        assert observed_row["raw_sequence"] == fixture_rows[sequence]["values"][0]
+        assert observed_row["raw_inquiry_date"] == fixture_rows[sequence][
+            "values"
+        ][1]
+        assert "candidate_value" not in issue
+        assert issue["reason_codes"][-1] == "record_not_emitted"
+        assert len(issue["source_refs"]) == 2
+        assert any(
+            ref.get("geometry_scope") == "row" and ref.get("evidence_ids")
+            for ref in issue["source_refs"]
+        )
+        sequence_refs = [
+            ref
+            for ref in issue["source_refs"]
+            if ref.get("field_name") == "sequence"
+        ]
+        assert len(sequence_refs) == 1
+        assert sequence_refs[0]["geometry_scope"] in {
+            "cell",
+            "canonical_field_slot",
+        }
+        assert sequence_refs[0]["binding"] == "canonical_header_column"
+        assert sequence_refs[0]["column"] == 0
+    for sequence in {8, 9}:
+        exact_sequence_ref = next(
+            ref
+            for ref in localized_by_sequence[sequence]["source_refs"]
+            if ref.get("field_name") == "sequence"
+        )
+        assert exact_sequence_ref["geometry_scope"] == "cell"
+        assert exact_sequence_ref.get("bbox")
+        assert exact_sequence_ref.get("evidence_ids")
 
-def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
+    assert {
+        fixture_rows[sequence]["values"][1] for sequence in final_omissions
+    } == set(expected["target_final_omission_raw_dates"])
+
+
+def test_lin_field_repair_policy_reaches_target_without_replacing_pages() -> None:
     spec = _spec()
     expected = spec["expected"]
+    fixture_rows = _fixture_institution_rows(spec)
+    projection, evidence, topology, resolution, order, entities = (
+        _projection_case()
+    )
+    context = _consumer_context(
+        projection,
+        evidence,
+        topology,
+        resolution,
+        order,
+        entities,
+    )
+    discovery_records = _extract_inquiries(context)
+    discovery_issues = deepcopy(context._personal_detail_extraction_issues)
+    coordinator = BusinessUncertaintyRepairCoordinator(context)
+    plan = coordinator.plan(
+        {"inquiry_records": deepcopy(discovery_records)},
+        canonical_audit={"unresolved_pages": []},
+        extraction_issues=discovery_issues,
+    )
+    by_position = {
+        (
+            int(row["logical_page"]),
+            str(row["table_id"]),
+            int(row["row"]),
+        ): sequence
+        for sequence, row in fixture_rows.items()
+    }
+    clean_reocr_dates = {
+        3: "2023.01.03",
+        59: "2021.11.26",
+    }
+    assert {
+        sequence: fixture_rows[sequence]["values"][1]
+        for sequence in clean_reocr_dates
+    } == {
+        3: "2023.01.03 20",
+        59: "2021.11.26 22",
+    }
+    ocr_calls: list[tuple[set[int], str]] = []
+
+    def page_ocr_loader(pages: set[int], *, reason: str) -> list[dict[str, Any]]:
+        ocr_calls.append((set(pages), reason))
+        acquired: list[dict[str, Any]] = []
+        for logical_page in sorted(pages):
+            repairs = [
+                repair
+                for repair in plan.field_repairs
+                if repair.mode == "context_rich_reocr"
+                and any(
+                    int(ref.get("logical_page") or 0) == logical_page
+                    for ref in repair.source_refs
+                )
+            ]
+            assert repairs
+            source_page = int(repairs[0].source_refs[0]["source_page"])
+            page_key = f"lin-inquiry-{logical_page}"
+            lines: list[dict[str, Any]] = [
+                {
+                    "text": "四查询记录",
+                    "content": "四查询记录",
+                    "confidence": 0.99,
+                    "bbox": [1.0, 1.0, 20.0, 10.0],
+                    "evidence_ids": [
+                        f"personal_detail_page_reocr:{page_key}:w0"
+                    ],
+                    "source": "personal_detail_page_reocr_once",
+                }
+            ]
+            for repair in repairs:
+                ref = repair.source_refs[0]
+                position = (
+                    int(ref.get("logical_page") or 0),
+                    str(ref.get("table_id") or ""),
+                    int(ref.get("row") if ref.get("row") is not None else -1),
+                )
+                sequence = by_position.get(position)
+                if repair.field_name != "inquiry_date" or sequence not in clean_reocr_dates:
+                    continue
+                word_index = len(lines)
+                lines.append(
+                    {
+                        "text": clean_reocr_dates[sequence],
+                        "content": clean_reocr_dates[sequence],
+                        "confidence": 0.99,
+                        "bbox": list(ref["bbox"]),
+                        "evidence_ids": [
+                            f"personal_detail_page_reocr:{page_key}:w{word_index}"
+                        ],
+                        "source": "personal_detail_page_reocr_once",
+                    }
+                )
+            page: dict[str, Any] = {
+                "page": logical_page,
+                "logical_page": logical_page,
+                "source_page": source_page,
+                "page_key": page_key,
+                "lines": lines,
+            }
+            coordinate_system = str(
+                repairs[0].source_refs[0].get("coordinate_system") or ""
+            )
+            if coordinate_system:
+                page["coordinate_system"] = coordinate_system
+            acquired.append(page)
+        return acquired
+
+    coordinator.resolve_page_evidence(
+        plan,
+        source_pages=evidence,
+        page_ocr_loader=page_ocr_loader,
+    )
+    context._business_repair_plan = plan
+    context._business_repair_active = True
+    context._personal_detail_extraction_issues = []
+    context._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(context)
+    context._ocr_correction_overlay.install_business_repair_evidence(
+        plan.page_evidence.values(),
+        affected_pages=plan.affected_pages,
+        allowed_target_refs=(
+            {**dict(ref), "field_name": repair.field_name}
+            for repair in plan.field_repairs
+            for ref in repair.source_refs
+        ),
+    )
+
+    repaired_records = _extract_inquiries(context)
+    repaired_by_sequence = {
+        row["sequence"]: row
+        for row in repaired_records
+        if row["inquiry_type"] == "institution"
+    }
+    discovery_by_key = {
+        (row["inquiry_type"], row["sequence"]): row
+        for row in discovery_records
+    }
+    repaired_by_key = {
+        (row["inquiry_type"], row["sequence"]): row
+        for row in repaired_records
+    }
+
+    assert len(repaired_records) == expected["target_repaired_rows"]
+    assert set(range(1, expected["institution_endpoint"] + 1)).difference(
+        repaired_by_sequence
+    ) == set(expected["target_final_omitted_institution_sequences"])
+    assert plan.reconstruction_evidence == {}
+    expected_ocr_pages = {
+        int(ref["logical_page"])
+        for repair in plan.field_repairs
+        if repair.mode == "context_rich_reocr"
+        for ref in repair.source_refs
+    }
+    assert {page for pages, _reason in ocr_calls for page in pages} == expected_ocr_pages
+    assert all(
+        reason == "business_field_context_rich_reocr_required"
+        for _pages, reason in ocr_calls
+    )
+    assert all(
+        decision["page_reconstruction"] is False
+        for decision in plan.page_decisions
+        if decision["ocr_invocations"] == 1
+    )
+    for key, discovery in discovery_by_key.items():
+        repaired = repaired_by_key[key]
+        assert {
+            field_name: repaired[field_name]
+            for field_name in ("inquiry_date", "institution", "reason")
+        } == {
+            field_name: discovery[field_name]
+            for field_name in ("inquiry_date", "institution", "reason")
+        }
+
+    deferred_sequences = set(expected["deferred_repair_sequences"])
+    date_repair_sequences = deferred_sequences.difference({8, 9})
+    assert date_repair_sequences.issubset(repaired_by_sequence)
+    assert {8, 9}.issubset(repaired_by_sequence)
+    assert all(
+        repaired_by_sequence[sequence]["canonical_raw"]["inquiry_date"]
+        == fixture_rows[sequence]["values"][1]
+        for sequence in date_repair_sequences
+    )
+    decisions = context._ocr_correction_overlay.audit()["decisions"]
+    assert sum(
+        decision["method"] == "schema_bound_deterministic_field_repair"
+        for decision in decisions
+    ) == len(date_repair_sequences.difference(clean_reocr_dates))
+    assert sum(
+        decision["method"] == "schema_bound_page_evidence_reparse"
+        for decision in decisions
+    ) == len(clean_reocr_dates)
+
+
+def test_lin_strict_discovery_survives_source_and_public_projection() -> None:
+    spec = _spec()
+    expected = spec["expected"]
+    fixture_rows = _fixture_institution_rows(spec)
     projection, evidence, topology, resolution, order, entities = (
         _projection_case()
     )
@@ -742,6 +1288,7 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
 
     inquiry_records = _extract_inquiries(context)
     source_ledger = _source_completeness_ledger(context)
+    frozen_source_ledger = deepcopy(source_ledger)
     source_issues = collect_extraction_issues(context)
     prepared = prepare_personal_detail_source_collections(
         {
@@ -765,6 +1312,18 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
     assert len(source_ledger["inquiry_raw_physical_positions"]) == expected[
         "source_rows"
     ]
+    assert len(
+        {
+            row["source_physical_row_id"]
+            for row in source_ledger["inquiry_raw_physical_positions"]
+        }
+    ) == expected["source_rows"]
+    assert all(
+        len(row["source_refs"]) == 1
+        and row["source_refs"][0].get("evidence_ids")
+        for row in source_ledger["inquiry_raw_physical_positions"]
+    )
+    assert source_ledger == frozen_source_ledger
 
     public_rows = [
         row.get("normalized", row)
@@ -788,8 +1347,9 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         if row["inquiry_type"] == "personal"
     } == set(range(1, expected["personal_endpoint"] + 1))
     assert all(
-        row["inquiry_id"]
-        == f"credit_inquiry:{row['inquiry_type']}:{row['sequence']}"
+        isinstance(row.get("inquiry_id"), str)
+        and row["inquiry_id"].startswith("credit_inquiry:")
+        and len(row["inquiry_id"]) > len("credit_inquiry:")
         for row in public_rows
     )
 
@@ -798,9 +1358,14 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         for row in public["extraction_issues"]
         if isinstance(row, dict)
     ]
+    missing_sequences = set(expected["omitted_institution_sequences"])
+    anonymous_missing_sequences = {4, 8, 9, 66, 67}
+    exact_ordinal_missing_sequences = (
+        missing_sequences - anonymous_missing_sequences
+    )
     expected_omission_ids = {
         f"credit_inquiry:institution:{sequence}"
-        for sequence in expected["omitted_institution_sequences"]
+        for sequence in exact_ordinal_missing_sequences
     }
     canonical_omissions = [
         issue
@@ -812,11 +1377,17 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         issue["target_record_id"] for issue in canonical_omissions
     } == expected_omission_ids
     assert len(canonical_omissions) == len(expected_omission_ids)
+    assert all(
+        len(issue["source_refs"]) == 1
+        and issue["source_refs"][0].get("evidence_ids")
+        and _fixture_sequence_for_issue(issue, fixture_rows)
+        in exact_ordinal_missing_sequences
+        for issue in canonical_omissions
+    )
 
     forbidden_row_omission_codes = {
         "candidate_b_inquiry_boundary_sequence_unresolved",
         "candidate_b_inquiry_sequence_unresolved",
-        "source_inquiry_physical_record_omitted",
     }
     assert not any(
         issue.get("target_dataset") == "inquiries"
@@ -824,17 +1395,69 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         for issue in public_issues
     )
 
-    localized_omissions = [
+    physical_omissions = [
+        issue
+        for issue in public_issues
+        if issue.get("target_dataset") == "inquiries"
+        and issue.get("issue_code")
+        == "source_inquiry_physical_record_omitted"
+    ]
+    assert {
+        _fixture_sequence_for_issue(issue, fixture_rows)
+        for issue in physical_omissions
+    } == {4, 5, 8, 9, 66, 67}
+    assert all(
+        len(issue["source_refs"]) == 1
+        and issue["source_refs"][0].get("evidence_ids")
+        for issue in physical_omissions
+    )
+    assert 5 not in missing_sequences
+    assert any(
+        row["inquiry_type"] == "institution" and row["sequence"] == 5
+        for row in public_rows
+    )
+
+    localized_ordinal_issues = [
         issue
         for issue in public_issues
         if issue.get("target_dataset") == "inquiries"
         and issue.get("issue_code")
         == "candidate_b_inquiry_multiple_missing_sequences_unresolved"
     ]
-    assert len(localized_omissions) == len(expected_omission_ids)
+    assert {
+        _fixture_sequence_for_issue(issue, fixture_rows)
+        for issue in localized_ordinal_issues
+    } == {4, 5, 8, 9, 66, 67}
+    localized_omissions = [
+        issue
+        for issue in localized_ordinal_issues
+        if _fixture_sequence_for_issue(issue, fixture_rows)
+        in anonymous_missing_sequences
+    ]
+    assert len(localized_omissions) == len(anonymous_missing_sequences)
     assert len(
         {issue["target_record_id"] for issue in localized_omissions}
     ) == len(localized_omissions)
+    assert all(
+        len(issue["source_refs"]) == 2
+        and any(
+            ref.get("geometry_scope") == "row" and ref.get("evidence_ids")
+            for ref in issue["source_refs"]
+        )
+        and len(
+            [
+                ref
+                for ref in issue["source_refs"]
+                if ref.get("field_name") == "sequence"
+                and ref.get("geometry_scope")
+                in {"cell", "canonical_field_slot"}
+                and ref.get("binding") == "canonical_header_column"
+                and ref.get("column") == 0
+            ]
+        )
+        == 1
+        for issue in localized_omissions
+    )
 
     omission_issue_ids = {
         issue["extraction_issue_id"] for issue in localized_omissions
@@ -851,7 +1474,10 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         for row in omission_evidence
         if row.get("evidence_kind") == "observed"
         and row.get("evidence_path") == "row.raw_inquiry_date"
-    } == set(expected["localized_omission_raw_dates"])
+    } == {
+        fixture_rows[sequence]["values"][1]
+        for sequence in anonymous_missing_sequences
+    }
     assert not any(
         row.get("evidence_kind") == "candidate"
         for row in omission_evidence
@@ -862,6 +1488,7 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         for issue in public_issues
         if issue.get("target_dataset") == "inquiries"
         and issue.get("issue_code") == "source_inquiry_field_omitted"
+        and issue.get("target_record_id") in expected_omission_ids
     ]
     assert {
         issue["target_record_id"] for issue in field_omissions
@@ -875,6 +1502,37 @@ def test_lin_87_of_90_replay_survives_source_and_public_projection() -> None:
         }
         == {"inquiry_date", "institution", "reason"}
         for omission_id in expected_omission_ids
+    )
+    assert all(
+        len(issue["source_refs"]) == 1
+        and len(issue["source_refs"][0].get("evidence_ids") or ()) == 1
+        and issue["source_refs"][0].get("field_name")
+        == issue["field_name"]
+        and _fixture_sequence_for_issue(issue, fixture_rows)
+        in exact_ordinal_missing_sequences
+        for issue in field_omissions
+    )
+
+    localized_issue_ids = {
+        issue["extraction_issue_id"]
+        for issue in (
+            *canonical_omissions,
+            *field_omissions,
+            *localized_omissions,
+        )
+    }
+    localized_evidence = [
+        row.get("normalized", row)
+        for row in public["extraction_issue_evidence"]
+        if isinstance(row, dict)
+        and row.get("normalized", row).get("extraction_issue_id")
+        in localized_issue_ids
+    ]
+    assert not any(
+        row.get("evidence_kind") == "candidate"
+        and row.get("evidence_path")
+        in {"inquiry_date", "institution", "reason"}
+        for row in localized_evidence
     )
 
     population_gaps = [
@@ -972,6 +1630,14 @@ def test_lin_producer_mutations_cannot_authorize_first_headerless_table(
     assert _has_projected_table(baseline, "pt_27_0")
 
     mutant = _projection_case(defect=defect)[0]
+    if defect == "foreign_header":
+        assert _has_projected_table(mutant, "pt_27_0")
+        _page_owner, table = _projected_table(mutant, "pt_27_0")
+        owner = table.metadata.get("canonical_section_owner")
+        assert not isinstance(owner, Mapping) or owner.get("template_id") != (
+            "annotations_and_inquiries"
+        )
+        return
     assert not _has_projected_table(mutant, "pt_27_0")
 
 

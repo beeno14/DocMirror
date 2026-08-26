@@ -1512,48 +1512,123 @@ class PersonalDetailExtractionContext:
             page_ocr_loader=self.full_page_ocr_evidence,
         )
         self._business_repair_plan = plan
-        self._business_repair_evidence_by_page = deepcopy(plan.page_evidence)
+        reconstruction_evidence = getattr(
+            plan,
+            "reconstruction_evidence",
+            plan.page_evidence,
+        )
+        self._business_repair_evidence_by_page = deepcopy(reconstruction_evidence)
         if not plan.requires_second_pass:
             return False
 
-        # The first pass exists only to discover schema uncertainty.  Every
-        # extractor in the second pass observes the same repaired evidence.
+        # The first pass exists only to discover schema uncertainty.  A true
+        # template failure installs reconstructed pages for the affected stage;
+        # ordinary field repairs retain the discovery pages and consult their
+        # independent OCR acquisition only through the exact-field overlay.
         self._business_repair_active = True
         self._personal_detail_extraction_issues = deepcopy(
             self._initial_personal_detail_extraction_issues
         )
         self._cache.clear()
-        # Account anchors are cached directly on the context because several
-        # account/table consumers share the same source skeleton.  Unlike the
-        # ordinary extraction cache above, that attribute survives ``clear``.
-        # A repaired complete-page evidence plane can split or recover an
-        # anchor that was unreadable in the discovery pass, so the second pass
-        # must rebuild the skeleton from the repaired canonical pages.
-        discovery_account_skeletons = self.__dict__.get(
-            "_candidate_b_account_anchor_skeleton_cache"
-        )
-        if isinstance(discovery_account_skeletons, list):
-            self._candidate_b_pre_repair_account_anchor_inventory = tuple(
-                deepcopy(discovery_account_skeletons)
+        if reconstruction_evidence:
+            # Account anchors are cached directly on the context because
+            # several account/table consumers share the same source skeleton.
+            # A genuine template reconstruction can split or recover an anchor,
+            # so only that path invalidates the canonical page plane.  A
+            # field-only repair continues to use the discovery projection.
+            discovery_account_skeletons = self.__dict__.get(
+                "_candidate_b_account_anchor_skeleton_cache"
             )
-        self.__dict__.pop("_candidate_b_account_anchor_skeleton_cache", None)
-        self._canonical_layout_projection_cache = None
-        self._pboc_layout_profile_cache = None
-        self._canonical_entity_context_ready = False
+            if isinstance(discovery_account_skeletons, list):
+                self._candidate_b_pre_repair_account_anchor_inventory = tuple(
+                    deepcopy(discovery_account_skeletons)
+                )
+            self.__dict__.pop("_candidate_b_account_anchor_skeleton_cache", None)
+            self._canonical_layout_projection_cache = None
+            self._pboc_layout_profile_cache = None
+            self._canonical_entity_context_ready = False
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             PersonalDetailOCRCorrectionOverlay,
         )
 
         self._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(self.parse_result)
+        self._ocr_correction_overlay.install_business_repair_evidence(
+            plan.page_evidence.values(),
+            affected_pages=plan.affected_pages,
+            allowed_target_refs=(
+                {**dict(ref), "field_name": repair.field_name}
+                for repair in getattr(plan, "field_repairs", ())
+                for ref in repair.source_refs
+            ),
+        )
         return True
+
+    def candidate_b_planned_field_repair(
+        self,
+        *,
+        dataset_name: str,
+        record_id: str,
+        field_name: str,
+        observed_value: Any,
+        source_refs: Iterable[Mapping[str, Any]],
+        mode: str | None = None,
+    ) -> Any | None:
+        """Return the one coordinator directive bound to this exact field."""
+
+        plan = self._business_repair_plan
+        if not self._business_repair_active or plan is None:
+            return None
+        resolver = getattr(plan, "field_repair_for", None)
+        if not callable(resolver):
+            return None
+        return resolver(
+            dataset_name=str(dataset_name),
+            record_id=str(record_id or ""),
+            field_name=str(field_name),
+            observed_value=observed_value,
+            source_refs=source_refs,
+            mode=mode,
+        )
+
+    def candidate_b_field_repair(
+        self,
+        value: Any,
+        *,
+        dataset_name: str,
+        record_id: str,
+        field_name: str,
+        source_refs: Iterable[Mapping[str, Any]],
+    ) -> tuple[str, Any | None]:
+        """Apply one planned repair; acquisition and mutation scopes stay separate."""
+
+        refs = tuple(dict(ref) for ref in source_refs if isinstance(ref, Mapping))
+        repair = self.candidate_b_planned_field_repair(
+            dataset_name=dataset_name,
+            record_id=record_id,
+            field_name=field_name,
+            observed_value=value,
+            source_refs=refs,
+        )
+        if repair is None:
+            return str(value or ""), None
+        return self._ocr_correction_overlay.repair_planned_text(
+            value,
+            repair=repair,
+            source_refs=refs,
+        )
 
     def correct_candidate_b_datasets(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Correct and validate all final v2 source datasets exactly once."""
         plan = self._business_repair_plan
         if plan is not None and plan.affected_pages:
             self._ocr_correction_overlay.install_business_repair_evidence(
-                self.corrected_evidence_pages(),
+                plan.page_evidence.values(),
                 affected_pages=plan.affected_pages,
+                allowed_target_refs=(
+                    {**dict(ref), "field_name": repair.field_name}
+                    for repair in getattr(plan, "field_repairs", ())
+                    for ref in repair.source_refs
+                ),
             )
         return self._ocr_correction_overlay.correct_business_candidates(
             payload,
@@ -2749,7 +2824,7 @@ class PersonalDetailExtractionContext:
                 deepcopy(self.__dict__["_business_repair_plan"].audit())
                 if self.__dict__.get("_business_repair_plan") is not None
                 else {
-                    "architecture": "schema_triggered_page_repair_v1",
+                    "architecture": "schema_triggered_field_local_repair_v2",
                     "first_pass_uncertainty_count": 0,
                     "affected_pages": [],
                     "second_schema_pass_required": False,
@@ -3064,6 +3139,12 @@ class PersonalDetailExtractionContext:
         right_unit = units_by_id.get(right_unit_id)
         if left_unit is None or right_unit is None:
             return None
+        left = self.entity_context.entity_for_unit(left_unit_id)
+        right = self.entity_context.entity_for_unit(right_unit_id)
+        left_entity_id = str(getattr(left, "entity_id", "") or "")
+        right_entity_id = str(getattr(right, "entity_id", "") or "")
+        if not left_entity_id or not right_entity_id:
+            return None
         if left_unit.page != right_unit.page:
             if not _authoritative_reading_order(
                 getattr(self, "reading_order_resolution", None)
@@ -3075,9 +3156,7 @@ class PersonalDetailExtractionContext:
                 and right_unit.page == left_unit.page + 1
             ):
                 return False
-        left = self.entity_context.entity_for_unit(left_unit_id)
-        right = self.entity_context.entity_for_unit(right_unit_id)
-        return bool(left is not None and right is not None and left.entity_id == right.entity_id)
+        return left_entity_id == right_entity_id
 
     def pages_adjacent_in_reading_order(self, left_page: int, right_page: int) -> bool:
         if not _authoritative_reading_order(

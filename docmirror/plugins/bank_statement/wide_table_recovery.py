@@ -1618,6 +1618,11 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
 
 
 _NATIVE_STATEMENT_SCOPE_TITLES = ("中国建设银行个人活期账户收入交易明细",)
+_DIRECTION_FILTER_RE = re.compile(
+    r"(?:收支类别|借贷方向|借/贷标记|交易方向)[:：]?(?:收入|支出|贷方|借方)"
+    r"|direction[:：]?(?:income|expense|credit|debit)",
+    re.IGNORECASE,
+)
 
 
 def _native_statement_scope_title(page: Any) -> str:
@@ -1637,6 +1642,28 @@ def _stable_native_statement_scope_title(titles: list[str]) -> str:
     # Require every populated page to repeat the exact title when there is more
     # than one page.  A nearby prose mention cannot scope a whole document.
     return nonempty[0] if len(nonempty) == len(titles) else ""
+
+
+def _source_declares_direction_filter(
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None,
+    records: list[dict[str, Any]],
+) -> bool:
+    """Return whether the issuer explicitly scoped the export to one direction."""
+
+    sources = [
+        str(text or ""),
+        *(str(page_text or "") for _page, page_text in (page_texts or ())),
+        *(str(record.get("_document_scope_text") or "") for record in records),
+    ]
+    for source in sources:
+        compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", source))
+        if any(title in compact for title in _NATIVE_STATEMENT_SCOPE_TITLES):
+            return True
+        if _DIRECTION_FILTER_RE.search(compact):
+            return True
+    return False
 
 
 def _attach_private_table_column(table: list[list[str]], name: str, value: str) -> list[list[str]]:
@@ -3035,6 +3062,7 @@ def audit_bank_statement_invariants(
     row_count_evidence: RowCountEvidence | None = None,
 ) -> list[str]:
     """Hard semantic gates for bank ledger rows against source footer totals."""
+    page_texts = tuple(page_texts or ())
     failures: list[str] = []
     if page_gap_warning := _source_page_gap_warning(
         text,
@@ -3126,17 +3154,12 @@ def audit_bank_statement_invariants(
         if abs(actual_credit_total - credit_total) > 0.01 and not signed_totals_close:
             failures.append(f"bank_invariant_failed:credit_total:{actual_credit_total:.2f}/{credit_total:.2f}")
 
-    filtered_income_scope = any(
-        title
-        in re.sub(
-            r"\s+",
-            "",
-            unicodedata.normalize("NFKC", str(record.get("_document_scope_text") or "")),
-        )
-        for record in records
-        for title in _NATIVE_STATEMENT_SCOPE_TITLES
+    filtered_direction_scope = _source_declares_direction_filter(
+        text,
+        page_texts=page_texts,
+        records=records,
     )
-    if not filtered_income_scope:
+    if not filtered_direction_scope:
         breaks, checked = _best_balance_chain_breaks(normalized)
         if checked > 0 and breaks > 0:
             failures.append(f"bank_invariant_failed:balance_chain:{breaks}/{checked}")

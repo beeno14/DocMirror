@@ -56,7 +56,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.source_projection i
 )
 from docmirror.plugins.credit_report.value_utils import stable_record_id
 
-
 LIN_P10_GRID_0 = "mg_p10_repayment_0"
 LIN_P10_GRID_1 = "mg_p10_repayment_1"
 LIN_P10_GRID_2 = "mg_p10_repayment_2"
@@ -1422,10 +1421,27 @@ def test_lin_p13_july_n_with_explicit_ten_withholds_only_amount_and_conserves_ev
     conflict = conflicts[0]
     assert conflict["field_name"] == "status_amount"
     assert conflict["observed_value"] == "10"
-    assert "normalized_value_withheld" in conflict["reason_codes"]
+    conflict_evidence = [
+        evidence
+        for evidence in projected["extraction_issue_evidence"]
+        if evidence.get("extraction_issue_id")
+        == conflict["extraction_issue_id"]
+    ]
+    assert any(
+        evidence.get("evidence_kind") == "reason"
+        and evidence.get("string_value") == "normalized_value_withheld"
+        for evidence in conflict_evidence
+    )
     # There is no safe replacement amount: public output must not advertise a
-    # candidate zero merely because N normally pairs with zero.
-    assert conflict["candidate_value"] is None
+    # candidate merely because N normally pairs with zero.  Public v2 compacts
+    # structured candidate values into the child evidence relation, so absence
+    # must hold in both the compact parent row and its linked evidence.
+    assert "candidate_value" not in conflict
+    assert "candidate_value_type" not in conflict
+    assert not any(
+        evidence.get("evidence_kind") == "candidate"
+        for evidence in conflict_evidence
+    )
     assert {
         (ref["row"], ref["col"], tuple(ref["bbox"]))
         for ref in conflict["source_refs"]

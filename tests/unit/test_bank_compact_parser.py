@@ -9,10 +9,7 @@ from copy import deepcopy
 
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
-from docmirror.plugins.bank_statement.extraction_dispatch import (
-    BankExtractionPolicy,
-    BankExtractionRoute,
-)
+from docmirror.plugins.bank_statement.extraction_dispatch import DIGITAL_POLICY
 from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.styles.compact_merged import (
@@ -111,18 +108,14 @@ def _two_page_compact_source_tables() -> list[list[list[str]]]:
 
 
 def _run_isolated_compact_strategy(tables: list[list[list[str]]]) -> list[dict]:
-    policy = BankExtractionPolicy(
-        route=BankExtractionRoute.DIGITAL,
-        allowed_parser_ids=frozenset({"compact_merged"}),
-    )
     ctx = StyleContext(
         tables=tables,
         full_text="银座银行交易明细 第1/2页 第2/2页",
         institution=None,
         page_count=2,
         prefer_context_tables=True,
-        extraction_route=policy.route,
-        extraction_policy=policy,
+        extraction_route=DIGITAL_POLICY.route,
+        extraction_policy=DIGITAL_POLICY,
     )
     detection = StyleDetectionResult(
         primary_style="compact_merged_ledger",
@@ -200,7 +193,10 @@ def test_compact_strategy_conserves_two_page_raw_canonical_normalized_and_source
             "timestamp": "2025-10-27 16:36:24",
             "amount": 3_765_000.0,
             "balance": 3_765_306.09,
-            "direction": "expense",
+            # The cross-page balance chain is source arithmetic: 306.09 plus
+            # 3,765,000.00 equals 3,765,306.09, so it outranks the ambiguous
+            # two-amount summary heuristic.
+            "direction": "income",
             "counter_account": "01041560012000235",
             "counter_party": "重庆正大能科技有限公司",
             "summary": "电汇/服务费",

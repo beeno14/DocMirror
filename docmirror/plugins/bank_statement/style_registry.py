@@ -2438,10 +2438,15 @@ class BankStyleParserRegistry:
             normalized.pop("amount_cny", None)
             return ensure_canonical_normalized(normalized, plugin.standard_fields)
 
+        def _canonical_raw(raw: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
+            if normalize_fn is compact_merged.normalize_record:
+                return compact_merged.canonical_raw_values(raw, normalized, plugin)
+            return plugin._canonical_raw_values(raw, normalized)
+
         records = records_from_raw_transactions(
             transactions,
             normalize_fn=_normalize,
-            canonical_raw_fn=plugin._canonical_raw_values,
+            canonical_raw_fn=_canonical_raw,
             style_id=detection.primary_style,
         )
         grid_standard.refine_missing_directions_from_balance_chain(records)

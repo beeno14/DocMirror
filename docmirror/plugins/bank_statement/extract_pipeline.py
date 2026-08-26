@@ -553,16 +553,36 @@ def _used_lazy_primary(blo_meta: Any) -> bool:
 
 def _row_accounting_view(
     records: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], int, int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
     parsed_rows = len(records)
+    direction_applicable_records = [
+        record
+        for record in records
+        if not _zero_amount_direction_exempt(record)
+    ]
     direction_count = sum(
-        1 for record in records if (record.get("normalized") or {}).get("direction") in {"income", "expense"}
+        1
+        for record in direction_applicable_records
+        if (record.get("normalized") or {}).get("direction") in {"income", "expense"}
     )
+    direction_expected_count = len(direction_applicable_records)
     canonical_records = [
         record for record in records if is_canonical_row(record.get("normalized") or {})
     ]
     sourced_count = sum(1 for record in canonical_records if _has_single_page_source(record))
-    return canonical_records, parsed_rows, direction_count, sourced_count
+    return canonical_records, parsed_rows, direction_count, direction_expected_count, sourced_count
+
+
+def _zero_amount_direction_exempt(record: dict[str, Any]) -> bool:
+    """Return whether a source-backed zero value makes direction meaningless."""
+
+    value = (record.get("normalized") or {}).get("amount")
+    if value in (None, ""):
+        return False
+    try:
+        return float(str(value).replace(",", "").strip()) == 0.0
+    except (TypeError, ValueError):
+        return False
 
 
 def _lazy_final_gate_failures(
@@ -574,6 +594,7 @@ def _lazy_final_gate_failures(
     physical_expected: int,
     source_reported_count: Any,
     invariant_failures: list[str],
+    direction_expected_count: int | None = None,
 ) -> list[str]:
     """Return reasons that invalidate a provisional lazy-primary result."""
 
@@ -581,7 +602,8 @@ def _lazy_final_gate_failures(
     canonical_rows = len(records)
     if parsed_rows != canonical_rows:
         failures.append("canonical_filter_changed_row_count")
-    if direction_count != parsed_rows:
+    expected_directions = parsed_rows if direction_expected_count is None else direction_expected_count
+    if direction_count != expected_directions:
         failures.append("direction_coverage_incomplete")
     if canonical_rows and sourced_count != canonical_rows:
         failures.append("source_page_coverage_incomplete")
@@ -632,7 +654,7 @@ def run_bank_statement_extract(
         else 0
     )
 
-    records, parsed_rows, direction_count, sourced_count = _row_accounting_view(raw_records)
+    records, parsed_rows, direction_count, direction_expected_count, sourced_count = _row_accounting_view(raw_records)
     invariant_failures: list[str] | None = None
     if _used_lazy_primary(blo_meta):
         invariant_failures = audit_bank_statement_invariants(
@@ -645,6 +667,7 @@ def run_bank_statement_extract(
             records,
             parsed_rows=parsed_rows,
             direction_count=direction_count,
+            direction_expected_count=direction_expected_count,
             sourced_count=sourced_count,
             physical_expected=physical_expected,
             source_reported_count=source_reported_count,
@@ -674,7 +697,9 @@ def run_bank_statement_extract(
                 diagnostics[0]["completion_reason"] = ":".join(final_gate_failures)
                 if prior_lazy_attempt is not None:
                     diagnostics[0]["prior_lazy_attempt"] = prior_lazy_attempt
-            records, parsed_rows, direction_count, sourced_count = _row_accounting_view(raw_records)
+            records, parsed_rows, direction_count, direction_expected_count, sourced_count = _row_accounting_view(
+                raw_records
+            )
             invariant_failures = None
 
     canonical_rows = len(records)
@@ -720,8 +745,11 @@ def run_bank_statement_extract(
         )
         if style_meta.extract_status == "success":
             style_meta.extract_status = "degraded"
-    if parsed_rows > 0 and direction_count < parsed_rows:
-        warnings.append(f"BANK_DIRECTION_COVERAGE_LOW:directional={direction_count}:parsed={parsed_rows}")
+    if direction_expected_count > 0 and direction_count < direction_expected_count:
+        warnings.append(
+            "BANK_DIRECTION_COVERAGE_LOW:"
+            f"directional={direction_count}:applicable={direction_expected_count}:parsed={parsed_rows}"
+        )
         style_meta.extract_status = "degraded"
     if physical_expected > 0 and style_meta.canonical_extracted < physical_expected:
         style_meta.extract_status = "degraded"

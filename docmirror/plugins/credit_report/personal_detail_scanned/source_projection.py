@@ -4092,7 +4092,8 @@ def _apply_account_month_closure_ledger(
             str(values.get("category") or "") == "ocr_structure_correction"
             and str(values.get("issue_code") or "")
             == detached_alias_sibling_issue_code
-            and str(values.get("status") or "") == "requires_review"
+            and str(values.get("status") or "")
+            in {"requires_review", "resolved"}
             and str(values.get("parser_stage") or "")
             == "canonical_monthly_grid_materialization"
             and str(values.get("target_dataset") or "") == "repayment_records"
@@ -4205,7 +4206,7 @@ def _apply_account_month_closure_ledger(
         if validated_field == "performance_month":
             detached_alias_sibling_counts[(addressed_position, claim)] += 1
 
-    def exact_detached_alias_claim(
+    def exact_detached_alias_declaration(
         values: Mapping[str, Any],
         observed: Mapping[str, Any],
         refs: list[Mapping[str, Any]],
@@ -4213,8 +4214,8 @@ def _apply_account_month_closure_ledger(
         account_id: str,
         grid_id: str,
         performance_month: str,
-    ) -> tuple[tuple[str, str], tuple[str, str]] | None:
-        """Return one closed detached-alias claim or fail closed."""
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Return one exact, identity-scoped alias declaration or fail closed."""
 
         owner_basis = str(
             observed.get("account_month_owner_basis") or ""
@@ -4258,20 +4259,42 @@ def _apply_account_month_closure_ledger(
             alias=True,
         )
         position = (grid_id, performance_month)
+        identity = (account_id, performance_month)
+        alias_target = canonical_account_month_target(account_id, performance_month)
+        if locator is None or detached_alias_target_counts[alias_target] != 1:
+            return None
+        return position, identity, locator
+
+    def exact_detached_alias_claim(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str]] | None:
+        """Return an alias sealed by its complete detached diagnostic trio."""
+
+        declaration = exact_detached_alias_declaration(
+            values,
+            observed,
+            refs,
+            account_id=account_id,
+            grid_id=grid_id,
+            performance_month=performance_month,
+        )
+        if declaration is None:
+            return None
+        position, identity, locator = declaration
         sibling_target = f"{grid_id}:{performance_month}"
         sibling_field_counts = detached_alias_sibling_target_field_counts.get(
             sibling_target,
             Counter(),
         )
-        alias_target = canonical_account_month_target(account_id, performance_month)
         if (
-            locator is None
-            or detached_alias_target_counts[alias_target] != 1
-            or sibling_field_counts["performance_month"] != 1
-            or any(
-                field not in detached_sibling_target_fields or count != 1
-                for field, count in sibling_field_counts.items()
-            )
+            sibling_field_counts
+            != Counter({field: 1 for field in detached_sibling_target_fields})
             or detached_alias_sibling_field_observation_counts[
                 (position, "performance_month")
             ]
@@ -4279,11 +4302,14 @@ def _apply_account_month_closure_ledger(
             or detached_alias_sibling_counts[(position, locator)] != 1
         ):
             return None
-        return position, (account_id, performance_month)
+        return position, identity
 
     candidate_identities: set[tuple[str, str]] = set()
     bound_positions_by_identity: dict[
         tuple[str, str], set[tuple[str, str]]
+    ] = {}
+    fingerprints_by_bound_claim: dict[
+        tuple[tuple[str, str], tuple[str, str]], set[tuple[Any, ...]]
     ] = {}
     fingerprints_by_source_position: dict[
         tuple[str, str], set[tuple[Any, ...]]
@@ -4291,21 +4317,15 @@ def _apply_account_month_closure_ledger(
     raw_physical_fingerprints_by_source_position: dict[
         tuple[str, str], set[tuple[Any, ...]]
     ] = {}
-    trusted_physical_fingerprints_by_source_position: dict[
-        tuple[str, str], set[tuple[Any, ...]]
+    trusted_physical_claims_by_bound_claim: dict[
+        tuple[tuple[str, str], tuple[str, str]], set[tuple[Any, ...]]
     ] = {}
-    bridge_physical_fingerprints_by_source_position: dict[
-        tuple[str, str], set[tuple[Any, ...]]
+    bridge_physical_claims_by_bound_claim: dict[
+        tuple[tuple[str, str], tuple[str, str]], set[tuple[Any, ...]]
     ] = {}
-    physical_claims_by_source_position: dict[
-        tuple[str, str],
-        list[
-            tuple[
-                tuple[Any, ...],
-                tuple[str, str],
-                list[dict[str, Any]],
-            ]
-        ],
+    physical_claim_refs_by_bound_claim: dict[
+        tuple[tuple[str, str], tuple[str, str]],
+        dict[tuple[Any, ...], list[dict[str, Any]]],
     ] = {}
     for record in datasets.get("repayment_records") or ():
         values = _record_values(record)
@@ -4349,6 +4369,7 @@ def _apply_account_month_closure_ledger(
         if grid_id:
             source_position = (grid_id, performance_month)
             bound_positions_by_identity.setdefault(identity, set()).add(source_position)
+            bound_claim = (source_position, identity)
             fingerprints, physical_claim_refs = physical_position_fingerprints(
                 record_refs(record, values),
                 account_id=account_id,
@@ -4360,22 +4381,27 @@ def _apply_account_month_closure_ledger(
             raw_physical_fingerprints_by_source_position.setdefault(
                 source_position, set()
             ).update(physical_claim_refs)
-            trusted_physical_fingerprints_by_source_position.setdefault(
-                source_position, set()
+            fingerprints_by_bound_claim.setdefault(bound_claim, set()).update(
+                fingerprints
+            )
+            trusted_physical_claims_by_bound_claim.setdefault(
+                bound_claim, set()
             ).update(physical_claim_refs)
-            bridge_physical_fingerprints_by_source_position.setdefault(
-                source_position, set()
-            ).update(physical_claim_refs)
+            bridge_physical_claims_by_bound_claim.setdefault(bound_claim, set()).update(
+                physical_claim_refs
+            )
             for physical_claim, claim_refs in physical_claim_refs.items():
-                physical_claims_by_source_position.setdefault(source_position, []).append(
-                    (physical_claim, identity, claim_refs)
-                )
+                physical_claim_refs_by_bound_claim.setdefault(bound_claim, {}).setdefault(
+                    physical_claim, []
+                ).extend(claim_refs)
 
     localized_identities: set[tuple[str, str]] = set()
     raw_unresolved_source_positions: set[tuple[str, str]] = set()
     unlocalized_raw_positions: set[tuple[str, str]] = set()
     unlocalized_bound_identity_issues: set[tuple[str, str]] = set()
-    explicit_alias_positions: set[tuple[str, str]] = set()
+    explicit_alias_claims: set[
+        tuple[tuple[str, str], tuple[str, str]]
+    ] = set()
     detached_alias_observation_counts: Counter[
         tuple[tuple[str, str], tuple[str, str]]
     ] = Counter()
@@ -4451,20 +4477,21 @@ def _apply_account_month_closure_ledger(
             raw_physical_fingerprints_by_source_position.setdefault(
                 source_position, set()
             ).update(physical_claim_refs)
-            if account_id:
-                identity = (account_id, performance_month)
-                for physical_claim, claim_refs in physical_claim_refs.items():
-                    physical_claims_by_source_position.setdefault(
-                        source_position, []
-                    ).append((physical_claim, identity, claim_refs))
         if issue_code == alias_issue_code:
             if source_position_is_local and account_id:
-                explicit_alias_positions.add(source_position)
-                identity = (account_id, performance_month)
-                bound_positions_by_identity.setdefault(identity, set()).add(
-                    source_position
-                )
                 exact_refs = exact_issue_refs(issue, values)
+                alias_declaration = (
+                    exact_detached_alias_declaration(
+                        values,
+                        observed,
+                        exact_refs,
+                        account_id=account_id,
+                        grid_id=grid_id,
+                        performance_month=performance_month,
+                    )
+                    if exact_refs is not None
+                    else None
+                )
                 detached_alias_claim = (
                     exact_detached_alias_claim(
                         values,
@@ -4477,13 +4504,34 @@ def _apply_account_month_closure_ledger(
                     if exact_refs is not None
                     else None
                 )
-                if detached_alias_claim is not None:
+                if alias_declaration is not None:
+                    declared_position, declared_identity, _locator = alias_declaration
+                    bound_claim = (declared_position, declared_identity)
+                    explicit_alias_claims.add(bound_claim)
+                    bound_positions_by_identity.setdefault(
+                        declared_identity, set()
+                    ).add(declared_position)
+                    fingerprints_by_bound_claim.setdefault(bound_claim, set()).update(
+                        fingerprints
+                    )
+                else:
+                    # A malformed alias remains a physical source observation,
+                    # but cannot influence owner selection or physical counts.
+                    raw_unresolved_source_positions.add(source_position)
+                if detached_alias_claim is not None and alias_declaration is not None:
                     claimed_position, claimed_identity = detached_alias_claim
+                    bound_claim = (claimed_position, claimed_identity)
                     detached_alias_claims[(claimed_position, claimed_identity)] += 1
-                    trusted_physical_fingerprints_by_source_position.setdefault(
-                        claimed_position,
-                        set(),
+                    trusted_physical_claims_by_bound_claim.setdefault(
+                        bound_claim, set()
                     ).update(physical_claim_refs)
+                    bridge_physical_claims_by_bound_claim.setdefault(
+                        bound_claim, set()
+                    ).update(physical_claim_refs)
+                    for physical_claim, claim_refs in physical_claim_refs.items():
+                        physical_claim_refs_by_bound_claim.setdefault(
+                            bound_claim, {}
+                        ).setdefault(physical_claim, []).extend(claim_refs)
             elif source_position:
                 # An alias without an exact account owner is still a raw
                 # printed position, but it cannot be reconciled as bound.
@@ -4543,10 +4591,20 @@ def _apply_account_month_closure_ledger(
                     bound_positions_by_identity.setdefault(identity, set()).add(
                         source_position
                     )
-                    trusted_physical_fingerprints_by_source_position.setdefault(
-                        source_position,
-                        set(),
+                    bound_claim = (source_position, identity)
+                    fingerprints_by_bound_claim.setdefault(bound_claim, set()).update(
+                        fingerprints
+                    )
+                    trusted_physical_claims_by_bound_claim.setdefault(
+                        bound_claim, set()
                     ).update(physical_claim_refs)
+                    bridge_physical_claims_by_bound_claim.setdefault(
+                        bound_claim, set()
+                    ).update(physical_claim_refs)
+                    for physical_claim, claim_refs in physical_claim_refs.items():
+                        physical_claim_refs_by_bound_claim.setdefault(
+                            bound_claim, {}
+                        ).setdefault(physical_claim, []).extend(claim_refs)
             else:
                 # Do not promote an unlocalized diagnostic into the canonical
                 # denominator.  Keep it visible in the audit status instead.
@@ -4571,36 +4629,35 @@ def _apply_account_month_closure_ledger(
         for positions in bound_positions_by_identity.values()
         for position in positions
     }
-    identities_by_bound_position: dict[
-        tuple[str, str], set[tuple[str, str]]
-    ] = {}
+    all_bound_claims: set[tuple[tuple[str, str], tuple[str, str]]] = set()
     for identity, positions in bound_positions_by_identity.items():
         for position in positions:
-            identities_by_bound_position.setdefault(position, set()).add(identity)
+            all_bound_claims.add((position, identity))
+    non_explicit_bound_claims = all_bound_claims - explicit_alias_claims
+    positions_with_non_explicit_claim = {
+        position for position, _identity in non_explicit_bound_claims
+    }
     detached_audit_only_alias_positions: set[tuple[str, str]] = set()
     for (position, identity), claim_count in detached_alias_claims.items():
         if (
             claim_count != 1
             or detached_alias_observation_counts[(position, identity)] != 1
+            or (position, identity) not in explicit_alias_claims
         ):
             continue
-        if identities_by_bound_position.get(position) != {identity}:
-            # Never hide a source position claimed by more than one owner.
-            continue
-        non_alias_positions = (
-            bound_positions_by_identity.get(identity, set())
-            - explicit_alias_positions
-        )
-        if non_alias_positions:
+        non_alias_positions = {
+            candidate_position
+            for candidate_position in bound_positions_by_identity.get(identity, set())
+            if (candidate_position, identity) not in explicit_alias_claims
+        }
+        if non_alias_positions and position not in positions_with_non_explicit_claim:
             detached_audit_only_alias_positions.add(position)
     claims_by_physical_fingerprint: dict[
         tuple[Any, ...],
         list[tuple[tuple[str, str], tuple[str, str], list[dict[str, Any]]]],
     ] = {}
-    for source_position in all_bound_source_positions:
-        for physical_claim, identity, claim_refs in physical_claims_by_source_position.get(
-            source_position, ()
-        ):
+    for (source_position, identity), claims in physical_claim_refs_by_bound_claim.items():
+        for physical_claim, claim_refs in claims.items():
             claims_by_physical_fingerprint.setdefault(physical_claim, []).append(
                 (identity, source_position, claim_refs)
             )
@@ -4626,20 +4683,30 @@ def _apply_account_month_closure_ledger(
             for ref in refs
             if isinstance(ref, Mapping)
         )
-    alias_source_positions = set(explicit_alias_positions)
-    for source_positions in bound_positions_by_identity.values():
-        primary_candidates = sorted(source_positions - explicit_alias_positions)
-        if len(primary_candidates) > 1:
-            alias_source_positions.update(primary_candidates[1:])
-    inventoried_source_positions = all_bound_source_positions | alias_source_positions
-    inventoried_physical_fingerprints = {
-        fingerprint
-        for position in inventoried_source_positions
-        for fingerprint in trusted_physical_fingerprints_by_source_position.get(
-            position,
-            (),
+    alias_bound_claims = set(explicit_alias_claims)
+    for identity, source_positions in bound_positions_by_identity.items():
+        primary_candidates = sorted(
+            position
+            for position in source_positions
+            if (position, identity) not in explicit_alias_claims
         )
+        if len(primary_candidates) > 1:
+            alias_bound_claims.update(
+                (position, identity) for position in primary_candidates[1:]
+            )
+    alias_source_positions = {
+        position for position, _identity in alias_bound_claims
     }
+    inventoried_source_positions = all_bound_source_positions | alias_source_positions
+    inventoried_claim_owners: dict[
+        tuple[Any, ...],
+        set[tuple[tuple[str, str], tuple[str, str]]],
+    ] = {}
+    for bound_claim, physical_claims in trusted_physical_claims_by_bound_claim.items():
+        if bound_claim[0] not in inventoried_source_positions:
+            continue
+        for physical_claim in physical_claims:
+            inventoried_claim_owners.setdefault(physical_claim, set()).add(bound_claim)
 
     def complete_detached_sibling_claim(position: tuple[str, str]) -> bool:
         """Require all three diagnostics to seal the same physical cell pair."""
@@ -4747,14 +4814,16 @@ def _apply_account_month_closure_ledger(
         ):
             return False
 
-        matched_positions: set[tuple[str, str]] = set()
+        matched_bound_claims: set[
+            tuple[tuple[str, str], tuple[str, str]]
+        ] = set()
         matched_source_pages: set[int] = set()
-        for inventoried_position in inventoried_source_positions:
+        for bound_claim, physical_claims in bridge_physical_claims_by_bound_claim.items():
+            inventoried_position, _identity = bound_claim
+            if inventoried_position not in inventoried_source_positions:
+                continue
             inventoried_by_locator: dict[tuple[Any, ...], set[int | None]] = {}
-            for claim in bridge_physical_fingerprints_by_source_position.get(
-                inventoried_position,
-                (),
-            ):
+            for claim in physical_claims:
                 parsed = exact_cell_geometry_claim(claim)
                 if parsed is None:
                     continue
@@ -4788,18 +4857,33 @@ def _apply_account_month_closure_ledger(
                 )
             ):
                 continue
-            matched_positions.add(inventoried_position)
+            matched_bound_claims.add(bound_claim)
             matched_source_pages.update(inventoried_source_pages)
 
         matched_identities = {
-            identity
-            for matched_position in matched_positions
-            for identity in identities_by_bound_position.get(matched_position, ())
+            identity for _position, identity in matched_bound_claims
         }
         return bool(
-            matched_positions
+            matched_bound_claims
             and len(matched_source_pages) == 1
             and len(matched_identities) == 1
+        )
+
+    def raw_claims_match_unique_inventoried_identity(
+        position: tuple[str, str],
+    ) -> bool:
+        """Accept an exact physical replay only when it has one sealed owner."""
+
+        matched_bound_claims = {
+            bound_claim
+            for physical_claim in raw_physical_fingerprints_by_source_position.get(
+                position, set()
+            )
+            for bound_claim in inventoried_claim_owners.get(physical_claim, set())
+        }
+        return bool(
+            matched_bound_claims
+            and len({identity for _position, identity in matched_bound_claims}) == 1
         )
 
     reconciled_detached_diagnostic_positions = {
@@ -4810,9 +4894,7 @@ def _apply_account_month_closure_ledger(
         and (
             bool(
                 position not in exact_detached_diagnostic_positions
-                and
-                raw_physical_fingerprints_by_source_position.get(position, set())
-                & inventoried_physical_fingerprints
+                and raw_claims_match_unique_inventoried_identity(position)
             )
             or detached_diagnostic_replays_inventoried_cells(position)
         )
@@ -4845,9 +4927,34 @@ def _apply_account_month_closure_ledger(
     source_month_position_observations = len(
         all_bound_source_positions | raw_unresolved_source_positions
     )
+    counted_bound_positions = (
+        all_bound_source_positions - detached_audit_only_alias_positions
+    )
+    counting_fingerprints_by_source_position: dict[
+        tuple[str, str], set[tuple[Any, ...]]
+    ] = {}
+    for position in counted_bound_positions:
+        representative_claims = {
+            bound_claim
+            for bound_claim in non_explicit_bound_claims
+            if bound_claim[0] == position
+        }
+        if not representative_claims:
+            # An alias whose complete physical reconciliation failed remains a
+            # counted observation.  Its own identity-scoped fingerprints may
+            # prove equality, but cannot contaminate another owner's primary.
+            representative_claims = {
+                bound_claim
+                for bound_claim in all_bound_claims
+                if bound_claim[0] == position
+            }
+        for bound_claim in representative_claims:
+            counting_fingerprints_by_source_position.setdefault(
+                position, set()
+            ).update(fingerprints_by_bound_claim.get(bound_claim, set()))
     owner_bound_account_months = unique_physical_position_count(
-        all_bound_source_positions - detached_audit_only_alias_positions,
-        fingerprints_by_source_position,
+        counted_bound_positions,
+        counting_fingerprints_by_source_position,
     )
     owner_unresolved_positions = unique_physical_position_count(
         unresolved_source_positions,

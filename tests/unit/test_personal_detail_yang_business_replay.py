@@ -12,8 +12,8 @@ two exact monthly-status decisions that previously needed real-PDF diagnosis.
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -38,7 +38,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     project_personal_detail_datasets,
 )
-
 
 _FIXTURE_PATH = (
     Path(__file__).parent
@@ -388,8 +387,17 @@ def test_yang_month_conflict_guard_and_public_projection_are_exactly_local(
     )
 
     by_id = {str(row["repayment_id"]): row for row in records}
-    assert by_id["mg_p13_repayment_1:2023-05"]["status"] == "*"
-    assert "status" not in by_id["mg_p13_repayment_1:2019-08"]
+    issue_target_ids = {
+        str(issue["target_record_id"])
+        for issue in context._personal_detail_extraction_issues
+    }
+    for expected in replay_rows:
+        repayment_id = str(expected["repayment_id"])
+        if expected["expected_issue"]:
+            assert "status" not in by_id[repayment_id]
+        else:
+            assert by_id[repayment_id]["status"] == expected["corrected_status"]
+        assert (repayment_id in issue_target_ids) is expected["expected_issue"]
     assert audit == {
         "enabled": True,
         "records_checked": 2,
@@ -398,10 +406,7 @@ def test_yang_month_conflict_guard_and_public_projection_are_exactly_local(
         "agreements": 0,
         "conflicts_withheld": 1,
     }
-    assert {
-        issue["target_record_id"]
-        for issue in context._personal_detail_extraction_issues
-    } == {"mg_p13_repayment_1:2019-08"}
+    assert issue_target_ids == {"mg_p13_repayment_1:2019-08"}
 
     projected = project_personal_detail_datasets(
         {
@@ -421,16 +426,20 @@ def test_yang_month_conflict_guard_and_public_projection_are_exactly_local(
         str(_values(row)["monthly_performance_id"]): _values(row)
         for row in projected["credit_account_monthly_performance"]
     }
-    assert public_months["mg_p13_repayment_1:2023-05"]["status_code"] == "*"
-    assert public_months["mg_p13_repayment_1:2019-08"]["status_code"] is None
     public_issues = [
         _values(issue) for issue in projected["extraction_issues"]
     ]
-    assert any(
-        issue.get("target_record_id") == "mg_p13_repayment_1:2019-08"
-        and issue.get("field_name") == "status_code"
-        for issue in public_issues
-    )
+    for expected in replay_rows:
+        repayment_id = str(expected["repayment_id"])
+        assert public_months[repayment_id]["status_code"] == expected[
+            "expected_status_code"
+        ]
+        has_public_issue = any(
+            issue.get("target_record_id") == repayment_id
+            and issue.get("field_name") == "status_code"
+            for issue in public_issues
+        )
+        assert has_public_issue is expected["expected_issue"]
 
 
 def test_yang_document_shape_selects_only_account_liability_and_core_stages() -> None:

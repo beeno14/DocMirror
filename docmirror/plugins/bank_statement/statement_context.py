@@ -71,8 +71,14 @@ _TITLE_DISCLAIMER_MARKERS = (
     "不作为",
     "免责声明",
     "法律效力",
+    "for reference only",
+    "not legal proof",
+    "does not constitute legal proof",
 )
-_TITLE_DISCLAIMER_PREFIX_RE = re.compile(r"^\s*(?:说明|提示|注|声明)\s*[:：]", re.IGNORECASE)
+_TITLE_DISCLAIMER_PREFIX_RE = re.compile(
+    r"^\s*(?:说明|提示|注|声明|disclaimer|notice)\s*[:：]",
+    re.IGNORECASE,
+)
 _TRANSACTION_HEADER_MARKERS = {
     "序号",
     "交易日期",

@@ -6,6 +6,8 @@ from __future__ import annotations
 from calendar import monthrange
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.bank_statement.canonical_quality import audit_cqf
 from docmirror.plugins.bank_statement.extract_pipeline import enrich_identity_fields
 from docmirror.plugins.bank_statement.institution import detect_registered_institution
@@ -1792,6 +1794,44 @@ def test_balance_chain_gap_reports_review_only_missing_row_candidate() -> None:
         "action=manual_review:"
         "reason=missing_page_bbox"
     ) in failures
+
+
+@pytest.mark.parametrize(
+    ("text", "page_texts"),
+    [
+        ("账户交易明细\n收支类别：收入", None),
+        ("", [(1, "账户交易明细\n收支类别：收入")]),
+    ],
+    ids=["document-text", "page-business-header"],
+)
+def test_direction_filtered_export_does_not_report_balance_gap_as_missing_row(
+    text: str,
+    page_texts: list[tuple[int, str]] | None,
+) -> None:
+    records = [
+        {
+            "normalized": {
+                "date": "2023-10-02",
+                "amount": 23903.69,
+                "direction": "income",
+                "balance": 23903.69,
+            }
+        },
+        {
+            "normalized": {
+                "date": "2023-10-07",
+                "amount": 13610.09,
+                "direction": "income",
+                "balance": 13610.09,
+            }
+        },
+    ]
+
+    failures = audit_bank_statement_invariants(records, text, page_texts=page_texts)
+
+    assert not any(item.startswith("bank_invariant_failed:balance_chain") for item in failures)
+    assert not any(item.startswith("bank_review:balance_chain_gap") for item in failures)
+    assert not any(item.startswith("bank_review:missing_row_candidate") for item in failures)
 
 
 def test_balance_chain_skips_known_sequence_gap_and_reports_source_page_gap() -> None:

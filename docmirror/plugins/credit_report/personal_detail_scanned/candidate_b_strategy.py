@@ -998,13 +998,15 @@ def resolve_candidate_b_repair_scope(
     affected_pages: Iterable[int],
     repair_dataset_names: Iterable[str] = (),
 ) -> CandidateBRepairScope:
-    """Resolve page repair to dirty sections/stages, or require eager replay.
+    """Resolve a repair to safely reusable sections/stages, or replay eagerly.
 
     Reuse is allowed only when the complete semantic ownership fingerprint is
-    unchanged for every page.  A repaired page expands to its whole canonical
-    fragment group and dirties every section owned by that group.  Stage
-    dependents are included so, for example, an account change also rebuilds
-    monthly, overdue, and agreement reconciliation outputs.
+    unchanged for every page.  A repaired page still expands to its whole
+    canonical fragment group.  When the repair supplies explicit, unambiguous
+    dataset owners, however, only those canonical sections are dirtied; without
+    dataset owners the conservative page-wide section behaviour is preserved.
+    Source rows remain page-wide, and all dependents of the selected section
+    stages are rebuilt.
     """
 
     normalized_pages: list[int] = []
@@ -1092,25 +1094,17 @@ def resolve_candidate_b_repair_scope(
             reason="repair_fragment_ownership_incomplete",
         )
 
-    dirty_sections = {
+    page_owned_sections = {
         section_name
         for page in expanded_pages
         for section_name in discovery_by_page[page].sections
     }
-    if not dirty_sections:
+    if not page_owned_sections:
         return _repair_fallback(
             repaired.census,
             affected_pages=affected,
             reason="repair_page_has_no_owned_section",
         )
-
-    dirty_roots = set(
-        CANDIDATE_B_STAGE_REGISTRY.stages_for_sections(
-            dirty_sections.intersection(CANDIDATE_B_STAGE_REGISTRY.sections)
-        )
-    )
-    # Source rows are page-wide and therefore change for every admitted repair.
-    dirty_roots.add("source_rows")
 
     if isinstance(repair_dataset_names, (str, bytes, bytearray)):
         return _repair_fallback(
@@ -1118,7 +1112,19 @@ def resolve_candidate_b_repair_scope(
             affected_pages=affected,
             reason="repair_dataset_names_invalid",
         )
-    for raw_dataset_name in repair_dataset_names:
+    try:
+        repair_datasets = tuple(repair_dataset_names)
+    except Exception:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repair_dataset_names_invalid",
+        )
+    selected_sections: set[str] = set()
+    selected_stage_names: set[str] = set()
+    explicit_dataset_owner = False
+    for raw_dataset_name in repair_datasets:
+        explicit_dataset_owner = True
         dataset_name = str(raw_dataset_name or "").strip()
         if not dataset_name:
             return _repair_fallback(
@@ -1140,7 +1146,21 @@ def resolve_candidate_b_repair_scope(
                 reason=f"repair_dataset_unknown:{dataset_name}",
             )
         canonical_section = CANONICAL_DATASET_TO_SECTION.get(canonical_name)
-        if canonical_section is not None and canonical_section not in dirty_sections:
+        if canonical_section is None:
+            stage_sections = {
+                stage.section
+                for stage in CANDIDATE_B_STAGE_REGISTRY.stages
+                if stage.name in stage_names
+                if stage.section is not None
+            }
+            if len(stage_sections) != 1:
+                return _repair_fallback(
+                    repaired.census,
+                    affected_pages=affected,
+                    reason=f"repair_dataset_ownership_ambiguous:{dataset_name}",
+                )
+            canonical_section = next(iter(stage_sections))
+        if canonical_section not in page_owned_sections:
             return _repair_fallback(
                 repaired.census,
                 affected_pages=affected,
@@ -1149,7 +1169,27 @@ def resolve_candidate_b_repair_scope(
                     f"{dataset_name}:{canonical_section}"
                 ),
             )
-        dirty_roots.update(stage_names)
+        selected_sections.add(canonical_section)
+        selected_stage_names.update(stage_names)
+
+    dirty_sections = (
+        selected_sections if explicit_dataset_owner else page_owned_sections
+    )
+    if explicit_dataset_owner and not dirty_sections:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repair_dataset_ownership_missing",
+        )
+
+    dirty_roots = set(
+        CANDIDATE_B_STAGE_REGISTRY.stages_for_sections(
+            dirty_sections.intersection(CANDIDATE_B_STAGE_REGISTRY.sections)
+        )
+    )
+    dirty_roots.update(selected_stage_names)
+    # Source rows are page-wide and therefore change for every admitted repair.
+    dirty_roots.add("source_rows")
 
     dirty_stages = CANDIDATE_B_STAGE_REGISTRY.dependent_closure(dirty_roots)
     return CandidateBRepairScope(

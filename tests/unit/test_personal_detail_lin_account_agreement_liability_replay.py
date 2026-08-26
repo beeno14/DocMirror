@@ -19,17 +19,26 @@ from __future__ import annotations
 
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import pytest
 
 from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+    BusinessUncertaintyRepairCoordinator,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b_strategy import (
     CANDIDATE_B_STAGE_REGISTRY,
     stage_names_for_datasets,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+    PersonalDetailExtractionContext,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+    PersonalDetailOCRCorrectionOverlay,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     project_personal_detail_datasets,
@@ -38,7 +47,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.source_projection i
     prepare_personal_detail_source_collections,
 )
 from docmirror.plugins.credit_report.value_utils import stable_record_id
-
 
 LIN_ARTIFACT = (
     "artifacts/personal_detail_six_live_iteration_20260826_linfix4/"
@@ -175,6 +183,112 @@ def _context(
         tables_continue=lambda *_args, **_kwargs: False,
         _personal_detail_extraction_issues=[],
     )
+
+
+def _activate_field_repair(context: Any, plan: Any) -> None:
+    context._business_repair_plan = plan
+    context._business_repair_active = True
+    context._personal_detail_extraction_issues = []
+    context._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(context)
+    context.candidate_b_planned_field_repair = (
+        PersonalDetailExtractionContext.candidate_b_planned_field_repair.__get__(
+            context,
+            type(context),
+        )
+    )
+    context.candidate_b_field_repair = (
+        PersonalDetailExtractionContext.candidate_b_field_repair.__get__(
+            context,
+            type(context),
+        )
+    )
+    context._ocr_correction_overlay.install_business_repair_evidence(
+        plan.page_evidence.values(),
+        affected_pages=plan.affected_pages,
+        allowed_target_refs=(
+            {**dict(ref), "field_name": repair.field_name}
+            for repair in plan.field_repairs
+            for ref in repair.source_refs
+        ),
+    )
+
+
+def _resolve_with_simulated_page_ocr(
+    coordinator: BusinessUncertaintyRepairCoordinator,
+    plan: Any,
+    *,
+    source_pages: Iterable[Any],
+    candidate_for: Callable[[Any], str | None],
+) -> list[tuple[set[int], str]]:
+    calls: list[tuple[set[int], str]] = []
+
+    def page_ocr_loader(pages: set[int], *, reason: str) -> list[dict[str, Any]]:
+        calls.append((set(pages), reason))
+        acquired: list[dict[str, Any]] = []
+        for logical_page in sorted(pages):
+            repairs = [
+                repair
+                for repair in plan.field_repairs
+                if repair.mode == "context_rich_reocr"
+                and any(
+                    int(ref.get("logical_page") or 0) == logical_page
+                    for ref in repair.source_refs
+                )
+            ]
+            assert repairs
+            page_key = f"lin-business-{logical_page}"
+            source_page = int(repairs[0].source_refs[0]["source_page"])
+            lines: list[dict[str, Any]] = [
+                {
+                    "text": "征信业务明细",
+                    "content": "征信业务明细",
+                    "confidence": 0.99,
+                    "bbox": [1.0, 1.0, 20.0, 10.0],
+                    "evidence_ids": [
+                        f"personal_detail_page_reocr:{page_key}:w0"
+                    ],
+                    "source": "personal_detail_page_reocr_once",
+                }
+            ]
+            for repair in repairs:
+                candidate = candidate_for(repair)
+                if candidate is None:
+                    continue
+                ref = repair.source_refs[0]
+                word_index = len(lines)
+                lines.append(
+                    {
+                        "text": candidate,
+                        "content": candidate,
+                        "confidence": 0.99,
+                        "bbox": list(ref["bbox"]),
+                        "evidence_ids": [
+                            f"personal_detail_page_reocr:{page_key}:w{word_index}"
+                        ],
+                        "source": "personal_detail_page_reocr_once",
+                    }
+                )
+            page: dict[str, Any] = {
+                "page": logical_page,
+                "logical_page": logical_page,
+                "source_page": source_page,
+                "page_key": page_key,
+                "lines": lines,
+            }
+            coordinate_system = str(
+                repairs[0].source_refs[0].get("coordinate_system") or ""
+            )
+            if coordinate_system:
+                page["coordinate_system"] = coordinate_system
+            acquired.append(page)
+        return acquired
+
+    coordinator.resolve_page_evidence(
+        plan,
+        source_pages=source_pages,
+        page_ocr_loader=page_ocr_loader,
+    )
+    return calls
 
 
 # Exact canonical population and exact physical table ownership observed in Lin.
@@ -1183,6 +1297,27 @@ LIN_AGREEMENT_EXPECTED: dict[int, tuple[str, str, str]] = {
     ),
 }
 
+# These seven institution cells remain discovery observations, not business
+# values. The discovery strategy withholds them and preserves exact OCR text
+# plus cell-local evidence; the separately tested repair policy acts later.
+LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW: dict[int, str] = {
+    1: "浙江网商银行股份有限 公司 准",
+    2: "平安消费金融有限公司",
+    3: "上海浦东发展银行股份 有限公司信用卡中心 授信额度",
+    4: "公司度门市分行 中国工商银行股份有限",
+    5: "中国农业银行股份有限 公司",
+    8: "福州分行 广发银行股份有限公司",
+    9: "招商银行股份有限公司 信用卡中心",
+}
+LIN_AGREEMENT_FUTURE_INSTITUTION_REPAIR_TARGETS: dict[int, str] = {
+    sequence: LIN_AGREEMENT_EXPECTED[sequence][1]
+    for sequence in LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW
+}
+LIN_AGREEMENT_SAFE_PUBLISHED_INSTITUTIONS: dict[int, str] = {
+    sequence: LIN_AGREEMENT_EXPECTED[sequence][1]
+    for sequence in (6, 7, 10, 11)
+}
+
 
 def _agreement_pages() -> list[SimpleNamespace]:
     page24 = _page(
@@ -1263,14 +1398,25 @@ def _agreement_context() -> SimpleNamespace:
     return _context(_agreement_pages())
 
 
-def _assert_lin_agreement_contract(rows: list[dict[str, Any]]) -> None:
-    by_sequence = {int(row["_printed_sequence"]): row for row in rows}
+def _one_preserved_raw_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    assert isinstance(value, (list, tuple))
+    assert len(value) == 1
+    assert isinstance(value[0], str)
+    return value[0]
+
+
+def _assert_lin_agreement_contract(
+    rows: list[dict[str, Any]],
+    issues: list[dict[str, Any]],
+) -> None:
+    by_sequence = {int(row["sequence"]): row for row in rows}
     assert len(rows) == len(by_sequence) == 11
     assert set(by_sequence) == set(range(1, 12))
     for sequence, (identifier, institution, table_id) in LIN_AGREEMENT_EXPECTED.items():
         row = by_sequence[sequence]
         assert row["account_identifier"] == identifier
-        assert row["institution"] == institution
         assert {
             ref.get("table_id")
             for ref in row.get("source_refs") or ()
@@ -1279,11 +1425,54 @@ def _assert_lin_agreement_contract(rows: list[dict[str, Any]]) -> None:
         anchor_refs = [
             ref
             for ref in row.get("source_refs") or ()
-            if ref.get("binding") == "printed_credit_agreement_ordinal"
+            if ref.get("binding") == "canonical_card_anchor"
         ]
         assert len(anchor_refs) == 1
         assert anchor_refs[0]["sequence"] == sequence
-        assert anchor_refs[0]["geometry_scope"] == "line"
+        assert anchor_refs[0]["field_name"] == "sequence"
+        assert anchor_refs[0]["geometry_scope"] == "text"
+        assert (
+            anchor_refs[0]["binding_quality"]
+            == "printed_credit_agreement_ordinal"
+        )
+        assert anchor_refs[0]["evidence_ids"]
+
+        if sequence in LIN_AGREEMENT_SAFE_PUBLISHED_INSTITUTIONS:
+            assert row["institution"] == institution
+            continue
+
+        raw_institution = LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW[sequence]
+        assert row["institution"] is None
+        assert "institution" in set(row.get("_unresolved_fields") or ())
+        assert "institution" in set(row.get("_observed_fields") or ())
+        assert _one_preserved_raw_text(
+            row.get("canonical_raw", {}).get("institution")
+        ) == raw_institution
+        field_refs = row.get("source_refs_by_field", {}).get("institution") or ()
+        assert len(field_refs) == 1
+        assert field_refs[0]["table_id"] == table_id
+        assert field_refs[0]["geometry_scope"] == "cell"
+        assert field_refs[0]["evidence_ids"]
+
+        field_issues = [
+            issue
+            for issue in issues
+            if issue.get("target_record_id") == row["credit_line_id"]
+            and issue.get("target_dataset") == "credit_lines"
+            and issue.get("field_name") == "institution"
+        ]
+        assert field_issues, sequence
+        assert not any(issue.get("status") == "resolved" for issue in field_issues)
+        assert any(
+            _one_preserved_raw_text(issue.get("observed_value"))
+            == raw_institution
+            for issue in field_issues
+        )
+        for issue in field_issues:
+            refs = issue.get("source_refs") or ()
+            assert refs
+            assert {ref.get("table_id") for ref in refs} == {table_id}
+            assert all(ref.get("geometry_scope") == "cell" for ref in refs)
 
 
 def test_lin_agreement_census_conserves_all_eleven_printed_ordinals() -> None:
@@ -1307,7 +1496,7 @@ def test_lin_agreement_census_conserves_all_eleven_printed_ordinals() -> None:
     ] == ["ocr:sp0013:lp0025:0150"]
 
 
-def test_lin_credit_line_assembly_recovers_ordinals_3_5_9_and_institutions(
+def test_lin_credit_line_assembly_conserves_all_owners_and_defers_institution_repair(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _agreement_context()
@@ -1326,13 +1515,209 @@ def test_lin_credit_line_assembly_recovers_ordinals_3_5_9_and_institutions(
         native_extraction._extract_credit_lines(context),
     )
 
-    _assert_lin_agreement_contract(rows)
+    _assert_lin_agreement_contract(
+        rows,
+        context._personal_detail_extraction_issues,
+    )
+
+
+def test_lin_agreement_policy_repairs_only_deferred_institution_cells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _agreement_context()
+    monkeypatch.setattr(
+        PBOCPersonalDetailNativeParser,
+        "records",
+        lambda _parser, dataset: [] if dataset == "credit_lines" else [],
+    )
+    discovery_rows = native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        native_extraction._extract_credit_lines(context),
+    )
+    deferred_rows = [
+        row
+        for row in discovery_rows
+        if int(row["sequence"]) in LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW
+    ]
+    repair_payload = {
+        "credit_lines": [
+            {
+                "credit_line_id": row["credit_line_id"],
+                "institution": row.get("institution"),
+                "canonical_raw": {
+                    "institution": row["canonical_raw"]["institution"]
+                },
+                "source_refs_by_field": {
+                    "institution": deepcopy(
+                        row["source_refs_by_field"]["institution"]
+                    )
+                },
+            }
+            for row in deferred_rows
+        ]
+    }
+    repair_issues = [
+        deepcopy(issue)
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("status") != "resolved"
+        and issue.get("target_dataset") == "credit_lines"
+        and issue.get("field_name") == "institution"
+    ]
+    coordinator = BusinessUncertaintyRepairCoordinator(context)
+    plan = coordinator.plan(
+        repair_payload,
+        canonical_audit={"unresolved_pages": []},
+        extraction_issues=repair_issues,
+    )
+    sequence_by_record_id = {
+        str(row["credit_line_id"]): int(row["sequence"])
+        for row in deferred_rows
+    }
+    institution_repairs = [
+        repair
+        for repair in plan.field_repairs
+        if repair.dataset_name == "credit_lines"
+        and repair.field_name == "institution"
+    ]
+    by_sequence = {
+        sequence_by_record_id[repair.record_id]: repair
+        for repair in institution_repairs
+    }
+
+    assert set(by_sequence) == set(LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW)
+    assert by_sequence[3].mode == "deterministic"
+    assert by_sequence[3].candidate_value == (
+        LIN_AGREEMENT_FUTURE_INSTITUTION_REPAIR_TARGETS[3]
+    )
+    assert {
+        sequence
+        for sequence, repair in by_sequence.items()
+        if repair.mode == "context_rich_reocr"
+    } == {1, 2, 4, 5, 8, 9}
+
+    calls = _resolve_with_simulated_page_ocr(
+        coordinator,
+        plan,
+        source_pages=[
+            {
+                "page": int(page.page_number),
+                "source_page": int(page.source_page_number),
+                "lines": [],
+            }
+            for page in context.pages
+        ],
+        candidate_for=lambda repair: (
+            LIN_AGREEMENT_FUTURE_INSTITUTION_REPAIR_TARGETS[
+                sequence_by_record_id[repair.record_id]
+            ]
+            if repair.field_name == "institution"
+            and repair.mode == "context_rich_reocr"
+            else None
+        ),
+    )
+    _activate_field_repair(context, plan)
+    repaired_rows = native_extraction.reconcile_candidate_b_credit_lines(
+        context,
+        native_extraction._extract_credit_lines(context),
+    )
+    repaired_by_sequence = {
+        int(row["sequence"]): row for row in repaired_rows
+    }
+
+    assert len(repaired_rows) == 11
+    assert plan.reconstruction_evidence == {}
+    assert all(
+        reason == "business_field_context_rich_reocr_required"
+        for _pages, reason in calls
+    )
+    assert {
+        sequence: repaired_by_sequence[sequence]["institution"]
+        for sequence in LIN_AGREEMENT_EXPECTED
+    } == {
+        sequence: expected_row[1]
+        for sequence, expected_row in LIN_AGREEMENT_EXPECTED.items()
+    }
+    assert all(
+        _one_preserved_raw_text(
+            repaired_by_sequence[sequence]["canonical_raw"]["institution"]
+        )
+        == raw
+        for sequence, raw in LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW.items()
+    )
 
 
 def test_lin_cross_page_agreement_owner_requires_adjacent_source_topology() -> None:
     context = _agreement_context()
     context._frozen_logical_pages[25].source_page_number = 14
     context._frozen_logical_pages[25].source_page = 14
+
+    candidates = native_extraction._sealed_agreement_identity_table_candidates(
+        context
+    )
+
+    assert not any(
+        candidate.fields.get("__printed_sequence") in {"3", "9"}
+        for candidate in candidates
+    )
+
+
+def test_lin_cross_page_agreement_owner_fails_closed_on_invalid_marker_geometry() -> None:
+    context = _agreement_context()
+    invalid_marker = _text(
+        "授信协议4",
+        (56.0, 560.0, 88.0, 571.0),
+        "ocr:sp0012:lp0024:0999",
+    )
+    invalid_marker.bbox = None
+    context._frozen_logical_pages[24].texts.append(invalid_marker)
+
+    candidates = native_extraction._sealed_agreement_identity_table_candidates(
+        context
+    )
+
+    assert not any(
+        candidate.fields.get("__printed_sequence") == "3"
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("page_number", True),
+        ("source_page_number", 13.5),
+    ),
+)
+def test_lin_cross_page_agreement_owner_requires_native_integer_page_identity(
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    context = _agreement_context()
+    setattr(context._frozen_logical_pages[25], field_name, invalid_value)
+
+    candidates = native_extraction._sealed_agreement_identity_table_candidates(
+        context
+    )
+
+    assert not any(
+        candidate.fields.get("__printed_sequence") in {"3", "9"}
+        for candidate in candidates
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_order",
+    (
+        {24: 1, 25: True, 26: 3},
+        {24: 1, 25: 2.0, 26: 3},
+        {24: 1, "25": 2, 26: 3},
+    ),
+)
+def test_lin_cross_page_agreement_owner_requires_native_integer_reading_order(
+    invalid_order: Mapping[Any, Any],
+) -> None:
+    context = _agreement_context()
+    context.reading_order_by_logical = dict(invalid_order)
 
     candidates = native_extraction._sealed_agreement_identity_table_candidates(
         context
@@ -1449,6 +1834,25 @@ LIN_LIABILITY_EXPECTED = {
     "D10055840H0001DB20220228XS000000109": (2, "pt_24_0"),
     "70105501018BZYQ20220902XS0M00000460": (3, "pt_24_1"),
 }
+LIN_LIABILITY_ROW_2_CONTRACT = "D10055840H0001DB20220228XS000000109"
+LIN_LIABILITY_ROW_2_STRICT_DISCOVERY_VALUES = {
+    "business_type": "爱贷款",
+    "related_party_name": "密厦门雯明轩商贸有限公司",
+}
+LIN_LIABILITY_ROW_2_CANONICAL_RAW = {
+    "business_type": "爱 贷款",
+    "related_party_name": "密 厦门雯明轩商贸有限公司",
+}
+LIN_LIABILITY_ROW_2_INVALID_RAW = {
+    "due_date": "囍 2023.02.28",
+    "snapshot_date": "? 截至2022年12月31日 司",
+}
+# Approved field-repair targets. The discovery fixture above deliberately keeps
+# the damaged source text so both deterministic and independent-OCR paths run.
+LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS = {
+    "business_type": "贷款",
+    "related_party_name": "厦门雯玥轩商贸有限公司",
+}
 
 
 def _liability_context() -> SimpleNamespace:
@@ -1470,7 +1874,7 @@ def _liability_context() -> SimpleNamespace:
     return _context((page23, page24))
 
 
-def test_lin_liability_assembly_conserves_three_rows_and_normalizes_row_2_locally(
+def test_lin_liability_assembly_conserves_three_rows_and_defers_row_2_repairs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _liability_context()
@@ -1498,54 +1902,149 @@ def test_lin_liability_assembly_conserves_three_rows_and_normalizes_row_2_locall
             for ref in row.get("source_refs") or ()
         } == {table_id}
 
-    row2 = by_contract["D10055840H0001DB20220228XS000000109"]
-    assert row2["business_type"] == "贷款"
-    assert row2["related_party_name"] == "厦门雯玥轩商贸有限公司"
-    assert row2["canonical_raw"]["business_type"] == "爱 贷款"
-    assert row2["canonical_raw"]["related_party_name"] == (
-        "密 厦门雯明轩商贸有限公司"
-    )
+    row2 = by_contract[LIN_LIABILITY_ROW_2_CONTRACT]
+    for field_name, value in LIN_LIABILITY_ROW_2_STRICT_DISCOVERY_VALUES.items():
+        assert row2[field_name] == value
+    for field_name, value in LIN_LIABILITY_ROW_2_CANONICAL_RAW.items():
+        assert row2["canonical_raw"][field_name] == value
+    for field_name, value in LIN_LIABILITY_ROW_2_INVALID_RAW.items():
+        assert row2["canonical_raw"][field_name] == value
     assert row2["due_date"] is None
     assert row2["snapshot_date"] is None
-    assert {"due_date", "snapshot_date"}.issubset(row2["_unresolved_fields"])
+    assert set(LIN_LIABILITY_ROW_2_INVALID_RAW).issubset(
+        row2["_unresolved_fields"]
+    )
 
-    resolved = [
+    deferred_field_issues = [
         issue
         for issue in context._personal_detail_extraction_issues
-        if issue.get("status") == "resolved"
-        and issue.get("field_name") in {"business_type", "related_party_name"}
+        if issue.get("field_name") in LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS
         and issue.get("target_dataset") == "repayment_liability_records"
+        and issue.get("target_record_id") == row2["liability_id"]
     ]
-    assert {issue["field_name"] for issue in resolved} == {
-        "business_type",
-        "related_party_name",
-    }
-    for issue in resolved:
-        assert issue["source_refs"]
-        assert "pt_24_0" in {
-            ref.get("table_id") for ref in issue["source_refs"]
-        }
-        assert all(ref.get("geometry_scope") == "cell" for ref in issue["source_refs"])
+    assert not any(
+        issue.get("status") == "resolved" for issue in deferred_field_issues
+    )
 
     unresolved = [
         issue
         for issue in context._personal_detail_extraction_issues
         if issue.get("status") != "resolved"
-        and issue.get("field_name") in {"due_date", "snapshot_date"}
+        and issue.get("field_name") in LIN_LIABILITY_ROW_2_INVALID_RAW
         and issue.get("target_dataset") == "repayment_liability_records"
+        and issue.get("target_record_id") == row2["liability_id"]
     ]
-    assert {issue["field_name"] for issue in unresolved} == {
-        "due_date",
-        "snapshot_date",
-    }
+    assert {issue["field_name"] for issue in unresolved} == set(
+        LIN_LIABILITY_ROW_2_INVALID_RAW
+    )
     for issue in unresolved:
         assert issue["issue_code"] == "candidate_b_repayment_responsibility_field_invalid"
+        assert _one_preserved_raw_text(issue["observed_value"]) == (
+            LIN_LIABILITY_ROW_2_INVALID_RAW[issue["field_name"]]
+        )
         assert {
             ref.get("table_id") for ref in issue["source_refs"]
         } == {"pt_24_0"}
         assert all(ref.get("geometry_scope") == "cell" for ref in issue["source_refs"])
 
 
+def test_lin_liability_policy_uses_deterministic_type_and_context_rich_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _liability_context()
+    monkeypatch.setattr(
+        PBOCPersonalDetailNativeParser,
+        "records",
+        lambda _parser, dataset: []
+        if dataset == "repayment_liability_records"
+        else [],
+    )
+    discovery_rows = native_extraction._extract_liabilities(context)
+    discovery_by_contract = {
+        row["contract_number"]: row for row in discovery_rows
+    }
+    row2 = discovery_by_contract[LIN_LIABILITY_ROW_2_CONTRACT]
+    repair_payload = {
+        "repayment_liability_records": [
+            {
+                "liability_id": row2["liability_id"],
+                "business_type": row2["business_type"],
+                "related_party_name": row2["related_party_name"],
+                "canonical_raw": {
+                    field_name: row2["canonical_raw"][field_name]
+                    for field_name in LIN_LIABILITY_ROW_2_CANONICAL_RAW
+                },
+                "source_refs_by_field": {
+                    field_name: deepcopy(
+                        row2["source_refs_by_field"][field_name]
+                    )
+                    for field_name in LIN_LIABILITY_ROW_2_CANONICAL_RAW
+                },
+            }
+        ]
+    }
+    coordinator = BusinessUncertaintyRepairCoordinator(context)
+    plan = coordinator.plan(
+        repair_payload,
+        canonical_audit={"unresolved_pages": []},
+    )
+    field_repairs = {
+        repair.field_name: repair
+        for repair in plan.field_repairs
+        if repair.dataset_name == "repayment_liability_records"
+    }
+
+    assert set(field_repairs) == set(LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS)
+    assert field_repairs["business_type"].mode == "deterministic"
+    assert field_repairs["business_type"].candidate_value == "贷款"
+    assert field_repairs["related_party_name"].mode == "context_rich_reocr"
+    assert field_repairs["related_party_name"].candidate_value is None
+
+    calls = _resolve_with_simulated_page_ocr(
+        coordinator,
+        plan,
+        source_pages=[
+            {
+                "page": int(page.page_number),
+                "source_page": int(page.source_page_number),
+                "lines": [],
+            }
+            for page in context.pages
+        ],
+        candidate_for=lambda repair: (
+            LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS["related_party_name"]
+            if repair.field_name == "related_party_name"
+            else None
+        ),
+    )
+    _activate_field_repair(context, plan)
+    repaired_rows = native_extraction._extract_liabilities(context)
+    repaired_by_contract = {
+        row["contract_number"]: row for row in repaired_rows
+    }
+    repaired_row2 = repaired_by_contract[LIN_LIABILITY_ROW_2_CONTRACT]
+
+    assert len(repaired_rows) == 3
+    assert repaired_row2["business_type"] == "贷款"
+    assert repaired_row2["related_party_name"] == "厦门雯玥轩商贸有限公司"
+    assert {
+        field_name: repaired_row2["canonical_raw"][field_name]
+        for field_name in LIN_LIABILITY_ROW_2_CANONICAL_RAW
+    } == LIN_LIABILITY_ROW_2_CANONICAL_RAW
+    assert plan.reconstruction_evidence == {}
+    assert calls == [
+        ({24}, "business_field_context_rich_reocr_required")
+    ]
+    for contract in set(LIN_LIABILITY_EXPECTED).difference(
+        {LIN_LIABILITY_ROW_2_CONTRACT}
+    ):
+        assert {
+            field_name: repaired_by_contract[contract][field_name]
+            for field_name in ("business_type", "related_party_name")
+        } == {
+            field_name: discovery_by_contract[contract][field_name]
+            for field_name in ("business_type", "related_party_name")
+        }
 def _public_values(record: Mapping[str, Any]) -> dict[str, Any]:
     normalized = record.get("normalized")
     return dict(normalized) if isinstance(normalized, Mapping) else dict(record)
@@ -1557,6 +2056,27 @@ def _public_source_refs(record: Mapping[str, Any]) -> list[dict[str, Any]]:
         source = record.get("source")
         refs = source.get("source_refs") if isinstance(source, Mapping) else ()
     return [dict(ref) for ref in refs or () if isinstance(ref, Mapping)]
+
+
+def _public_issue_observed_strings(
+    values: Mapping[str, Any],
+    issue_evidence: list[dict[str, Any]],
+) -> set[str]:
+    observed = values.get("observed_value")
+    strings: set[str] = set()
+    if isinstance(observed, str):
+        strings.add(observed)
+    elif isinstance(observed, (list, tuple)):
+        strings.update(value for value in observed if isinstance(value, str))
+    issue_id = values.get("extraction_issue_id")
+    strings.update(
+        str(evidence["string_value"])
+        for evidence in issue_evidence
+        if evidence.get("extraction_issue_id") == issue_id
+        and evidence.get("evidence_kind") == "observed"
+        and evidence.get("string_value") not in (None, "")
+    )
+    return strings
 
 
 def _project_lin_collections(
@@ -1773,6 +2293,11 @@ def test_lin_agreement_producer_contract_survives_public_canonical_projection(
         for row in projected.get("extraction_issues") or ()
         if isinstance(row, Mapping)
     ]
+    public_issue_evidence = [
+        _public_values(row)
+        for row in projected.get("extraction_issue_evidence") or ()
+        if isinstance(row, Mapping)
+    ]
     for sequence in missing_sequences:
         omission = next(
             (
@@ -1802,7 +2327,6 @@ def test_lin_agreement_producer_contract_survives_public_canonical_projection(
             "credit_line", identifier
         )
         assert values["account_identifier"] == identifier
-        assert values["institution"] == institution
         assert {
             ref.get("table_id")
             for ref in _public_source_refs(record)
@@ -1811,16 +2335,56 @@ def test_lin_agreement_producer_contract_survives_public_canonical_projection(
         anchor_refs = [
             ref
             for ref in _public_source_refs(record)
-            if ref.get("binding") == "printed_credit_agreement_ordinal"
+            if ref.get("binding") == "canonical_card_anchor"
         ]
         assert len(anchor_refs) == 1
         assert anchor_refs[0]["sequence"] == sequence
+        assert anchor_refs[0]["field_name"] == "sequence"
+        assert anchor_refs[0]["geometry_scope"] == "text"
+        assert (
+            anchor_refs[0]["binding_quality"]
+            == "printed_credit_agreement_ordinal"
+        )
+        assert anchor_refs[0]["evidence_ids"]
+
+        if sequence in LIN_AGREEMENT_SAFE_PUBLISHED_INSTITUTIONS:
+            assert values["institution"] == institution
+            continue
+
+        raw_institution = LIN_AGREEMENT_DEFERRED_INSTITUTION_RAW[sequence]
+        assert values["institution"] is None
+        field_issues = [
+            (issue_values, issue_record)
+            for issue_values, issue_record in public_issues
+            if issue_values.get("target_record_id")
+            == values["credit_agreement_id"]
+            and issue_values.get("target_dataset") == "credit_agreements"
+            and issue_values.get("field_name") == "institution"
+        ]
+        assert field_issues, sequence
+        assert not any(
+            issue_values.get("status") == "resolved"
+            for issue_values, _record in field_issues
+        )
+        assert any(
+            raw_institution
+            in _public_issue_observed_strings(
+                issue_values,
+                public_issue_evidence,
+            )
+            for issue_values, _record in field_issues
+        )
+        for _issue_values, issue_record in field_issues:
+            refs = _public_source_refs(issue_record)
+            assert refs
+            assert {ref.get("table_id") for ref in refs} == {table_id}
+            assert all(ref.get("geometry_scope") == "cell" for ref in refs)
 
 
 def test_lin_liability_producer_contract_survives_public_canonical_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Preserve corrected values and only field-local unresolved omissions."""
+    """Preserve strict discovery values and field-local unresolved omissions."""
 
     context = _liability_context()
     monkeypatch.setattr(
@@ -1830,12 +2394,11 @@ def test_lin_liability_producer_contract_survives_public_canonical_projection(
     )
 
     liabilities = native_extraction._extract_liabilities(context)
-    native_resolved = [
+    native_deferred_field_issues = [
         issue
         for issue in context._personal_detail_extraction_issues
-        if issue.get("status") == "resolved"
-        and issue.get("target_dataset") == "repayment_liability_records"
-        and issue.get("field_name") in {"business_type", "related_party_name"}
+        if issue.get("target_dataset") == "repayment_liability_records"
+        and issue.get("field_name") in LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS
     ]
     projected = _project_lin_collections(
         {
@@ -1848,18 +2411,9 @@ def test_lin_liability_producer_contract_survives_public_canonical_projection(
             "repayment_liability_records": len(liabilities)
         },
     )
-    assert {issue["field_name"] for issue in native_resolved} == {
-        "business_type",
-        "related_party_name",
-    }
-    assert all(
-        {ref.get("table_id") for ref in issue.get("source_refs") or ()}
-        == {"pt_24_0"}
-        and all(
-            ref.get("geometry_scope") == "cell"
-            for ref in issue.get("source_refs") or ()
-        )
-        for issue in native_resolved
+    assert not any(
+        issue.get("status") == "resolved"
+        for issue in native_deferred_field_issues
     )
 
     public_rows = projected.get("repayment_responsibilities") or []
@@ -1880,16 +2434,16 @@ def test_lin_liability_producer_contract_survives_public_canonical_projection(
             ref.get("table_id") for ref in _public_source_refs(record)
         } == {table_id}
 
-    row2_record = by_contract["D10055840H0001DB20220228XS000000109"]
+    row2_record = by_contract[LIN_LIABILITY_ROW_2_CONTRACT]
     row2 = _public_values(row2_record)
-    assert row2["business_type"] == "贷款"
-    assert row2["related_party_name"] == "厦门雯玥轩商贸有限公司"
+    for field_name, value in LIN_LIABILITY_ROW_2_STRICT_DISCOVERY_VALUES.items():
+        assert row2[field_name] == value
     assert row2["due_date"] is None
     assert row2["snapshot_date"] is None
-    assert row2_record["canonical_raw"]["business_type"] == "爱 贷款"
-    assert row2_record["canonical_raw"]["related_party_name"] == (
-        "密 厦门雯明轩商贸有限公司"
-    )
+    for field_name, value in LIN_LIABILITY_ROW_2_CANONICAL_RAW.items():
+        assert row2_record["canonical_raw"][field_name] == value
+    for field_name, value in LIN_LIABILITY_ROW_2_INVALID_RAW.items():
+        assert row2_record["canonical_raw"][field_name] == value
 
     issue_rows = [
         (_public_values(record), record)
@@ -1904,34 +2458,31 @@ def test_lin_liability_producer_contract_survives_public_canonical_projection(
         == "candidate_b_repayment_responsibility_field_invalid"
         and values.get("target_dataset") == "repayment_responsibilities"
         and values.get("target_record_id") == row2_id
-        and values.get("field_name") in {"due_date", "snapshot_date"}
+        and values.get("field_name") in LIN_LIABILITY_ROW_2_INVALID_RAW
     ]
-    assert {values["field_name"] for values, _record in unresolved} == {
-        "due_date",
-        "snapshot_date",
-    }
+    assert {values["field_name"] for values, _record in unresolved} == set(
+        LIN_LIABILITY_ROW_2_INVALID_RAW
+    )
     issue_evidence = [
         _public_values(record)
         for record in projected.get("extraction_issue_evidence") or ()
         if isinstance(record, Mapping)
     ]
     for values, record in unresolved:
-        issue_id = values["extraction_issue_id"]
-        assert values.get("observed_value") not in (None, "") or any(
-            evidence.get("extraction_issue_id") == issue_id
-            and evidence.get("evidence_kind") == "observed"
-            for evidence in issue_evidence
+        assert (
+            LIN_LIABILITY_ROW_2_INVALID_RAW[values["field_name"]]
+            in _public_issue_observed_strings(values, issue_evidence)
         )
         refs = _public_source_refs(record)
         assert {ref.get("table_id") for ref in refs} == {"pt_24_0"}
         assert all(ref.get("geometry_scope") == "cell" for ref in refs)
 
-    # Resolved deterministic corrections remain semantic-only in public v2;
-    # their raw glyphs stay on the corrected business row above.
+    # Repair targets remain metadata during discovery. The extraction strategy
+    # must not report either field as repaired before the repair pass runs.
     assert not any(
         values.get("status") == "resolved"
         and values.get("target_dataset") == "repayment_responsibilities"
-        and values.get("field_name") in {"business_type", "related_party_name"}
+        and values.get("field_name") in LIN_LIABILITY_ROW_2_FUTURE_REPAIR_TARGETS
         for values, _record in issue_rows
     )
 

@@ -45,6 +45,7 @@ class _ParseResultStub:
     def __init__(self, extraction_method: ExtractionMethod):
         self.parser_info = ParserInfo(extraction_method=extraction_method)
         self.logical_tables = []
+        self.pages = []
 
 
 def test_strict_header_match_fails_on_ocr_aliases():

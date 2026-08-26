@@ -1404,6 +1404,27 @@ def test_english_disclaimer_is_source_business_text_but_never_a_statement_title(
     assert "statement_title" not in record["normalized"]
 
 
+@pytest.mark.parametrize(
+    "disclaimer_text",
+    [
+        "Disclaimer: Values shown below are unaudited.",
+        "This account statement is provided for reference only and is not legal proof.",
+    ],
+    ids=["explicit-prefix", "unprefixed-legal-reference-markers"],
+)
+def test_generic_english_disclaimer_prefix_and_markers_block_title_promotion(
+    disclaimer_text: str,
+) -> None:
+    rows = [[_atom(1, disclaimer_text, 40, 20, 540, 36, 1)]]
+
+    disclaimer = statement_context._statement_disclaimer_fact(rows, 1)
+
+    assert disclaimer is not None
+    assert disclaimer.raw_value == disclaimer_text
+    assert disclaimer.normalized_value == disclaimer_text
+    assert statement_context._title_fact(rows, 1) is None
+
+
 def test_first_page_title_wins_while_later_disclaimer_remains_raw():
     title = statement_context._HeaderFact(
         "statement_title",

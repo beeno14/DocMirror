@@ -2658,8 +2658,8 @@ def _headerless_inquiry_continuation_owner(
 
     if not callable(tables_continue):
         return None
-    previous_printed = _printed_identity(previous_evidence)
-    current_printed = _printed_identity(current_evidence)
+    previous_printed = _sealed_printed_identity(previous_evidence)
+    current_printed = _sealed_printed_identity(current_evidence)
     printed_adjacency = bool(
         previous_printed is not None
         and current_printed is not None
@@ -2780,7 +2780,12 @@ def _headerless_inquiry_continuation_owner(
         or not current_table_id
     ):
         return None
-    continuation_decision = tables_continue(previous_table_id, current_table_id)
+    try:
+        continuation_decision = tables_continue(previous_table_id, current_table_id)
+    except Exception:
+        # This callback is an authority boundary.  A broken or unavailable
+        # entity relation cannot authorize a headerless table.
+        return None
     if continuation_decision is not True and continuation_decision is not False:
         return None
 
@@ -5058,6 +5063,42 @@ def _printed_identity_candidates(
     return frozenset(
         (page, total) for page, total in matches if 1 <= page <= total
     )
+
+
+def _sealed_printed_identity(
+    evidence: Mapping[str, Any],
+) -> tuple[int, int] | None:
+    """Return one physically unique footer backed by unique source evidence."""
+
+    page_height = evidence.get("page_height") or evidence.get("height")
+    witnesses: list[tuple[int, int]] = []
+    for line in evidence.get("lines") or ():
+        if not isinstance(line, Mapping) or not _bottom_footer_geometry(
+            line,
+            page_height=page_height,
+        ):
+            continue
+        raw_ids = line.get("evidence_ids")
+        if isinstance(raw_ids, (str, bytes, bytearray)) or not isinstance(
+            raw_ids,
+            (list, tuple),
+        ):
+            continue
+        evidence_ids = tuple(str(value or "").strip() for value in raw_ids)
+        if (
+            not evidence_ids
+            or any(not value for value in evidence_ids)
+            or len(evidence_ids) != len(set(evidence_ids))
+        ):
+            continue
+        for match in _PRINTED_PAGE_RE.finditer(
+            str(line.get("text") or line.get("content") or "")
+        ):
+            page = int(match.group("page"))
+            total = int(match.group("total"))
+            if 1 <= page <= total:
+                witnesses.append((page, total))
+    return witnesses[0] if len(witnesses) == 1 else None
 
 
 def _printed_identity(evidence: Mapping[str, Any]) -> tuple[int, int] | None:

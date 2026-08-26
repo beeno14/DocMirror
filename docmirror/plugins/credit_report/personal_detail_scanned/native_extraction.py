@@ -324,6 +324,125 @@ def _exact_source_account_institution(
     return normalized
 
 
+def _candidate_b_planned_field_repair(
+    parse_result: Any,
+    value: Any,
+    *,
+    dataset_name: str,
+    record_id: str,
+    field_name: str,
+    source_refs: Iterable[Mapping[str, Any]],
+) -> tuple[str, Any | None]:
+    """Delegate only to the coordinator-owned, field-local repair boundary."""
+
+    repair = getattr(parse_result, "candidate_b_field_repair", None)
+    if not callable(repair):
+        return str(value or ""), None
+    return repair(
+        value,
+        dataset_name=dataset_name,
+        record_id=record_id,
+        field_name=field_name,
+        source_refs=source_refs,
+    )
+
+
+def _candidate_b_planned_deterministic_repair(
+    parse_result: Any,
+    value: Any,
+    *,
+    dataset_name: str,
+    record_id: str,
+    field_name: str,
+    source_refs: Iterable[Mapping[str, Any]],
+) -> Any | None:
+    resolver = getattr(parse_result, "candidate_b_planned_field_repair", None)
+    if not callable(resolver):
+        return None
+    return resolver(
+        dataset_name=dataset_name,
+        record_id=record_id,
+        field_name=field_name,
+        observed_value=value,
+        source_refs=source_refs,
+        mode="deterministic",
+    )
+
+
+def _planned_field_repair_refs(
+    decision: Any,
+    original_refs: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in (
+        *(dict(item) for item in original_refs if isinstance(item, Mapping)),
+        *(dict(item) for item in getattr(decision, "source_refs", ()) if isinstance(item, Mapping)),
+    ):
+        marker = json.dumps(ref, ensure_ascii=False, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        refs.append(ref)
+    return refs
+
+
+def _record_planned_field_repair(
+    parse_result: Any,
+    *,
+    dataset_name: str,
+    record_id: str,
+    field_name: str,
+    original: Any,
+    corrected: Any,
+    decision: Any,
+) -> None:
+    if decision is None or original == corrected:
+        return
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    deterministic = str(getattr(decision, "method", "")) == (
+        "schema_bound_deterministic_field_repair"
+    )
+    record_issue(
+        parse_result,
+        make_issue(
+            category="ocr_cell_level_error",
+            issue_code=(
+                "candidate_b_deterministic_field_repair_applied"
+                if deterministic
+                else "candidate_b_context_rich_reocr_field_repair_applied"
+            ),
+            message=(
+                "A unique deterministic candidate repaired one exact field without OCR."
+                if deterministic
+                else "One independent context-rich page OCR acquisition repaired only its exact target field."
+            ),
+            severity="info",
+            status="resolved",
+            parser_stage="candidate_b_business_field_repair",
+            target_dataset=dataset_name,
+            target_record_id=record_id or None,
+            field_name=field_name,
+            observed_value=original,
+            candidate_value=corrected,
+            source_refs=getattr(decision, "source_refs", ()) or (),
+            reason_codes=tuple(
+                dict.fromkeys(
+                    (
+                        *(str(code) for code in getattr(decision, "reason_codes", ()) or ()),
+                        "raw_value_preserved",
+                        "field_local_mutation",
+                    )
+                )
+            ),
+        ),
+    )
+
+
 def _identifier(value: Any) -> str | None:
     compact = re.sub(r"\s+", "", str(value or "")).strip()
     return compact if compact and compact != "--" else None
@@ -10662,6 +10781,76 @@ def _materialize_registered_account_population_skeletons(
         current,
         section_inventory,
     )
+
+    # The corrected registration plane is allowed to improve value decoding,
+    # but it is not allowed to shrink an independently sealed raw population.
+    # In particular, a complete-page repair can retain a dense card prefix while
+    # dropping the final printed anchors.  Merge only identity/owner rows that
+    # are absent from that lifecycle result; the raw census never contributes
+    # account business values.
+    raw_census = _sealed_raw_account_population_census(parse_result)
+    raw_population = (
+        (raw_census or {}).get("ordinal_observations")
+        if isinstance(raw_census, Mapping)
+        else None
+    )
+    raw_registered = (
+        _sealed_registered_account_population_observations(
+            {
+                str(family): family_observations
+                for family, family_observations in raw_population.items()
+                if str(family) in {"credit_card", "quasi_credit_card"}
+            }
+        )
+        if isinstance(raw_population, Mapping)
+        else None
+    )
+    if raw_registered is not None:
+        lifecycle = deepcopy(dict(observations)) if isinstance(observations, Mapping) else {}
+        merge_is_exact = True
+        for family, raw_family in raw_registered.items():
+            lifecycle_family = lifecycle.get(family)
+            if lifecycle_family is None:
+                lifecycle[family] = deepcopy(raw_family)
+                continue
+            if not isinstance(lifecycle_family, Mapping):
+                merge_is_exact = False
+                break
+            # A shared family/ordinal must still describe the same immutable
+            # physical line.  Evidence ids can differ across OCR planes, but the
+            # source page and exact geometry cannot.
+            for ordinal in set(lifecycle_family).intersection(raw_family):
+                lifecycle_owner = _exact_account_ordinal_owner_signature(
+                    lifecycle_family[ordinal],
+                    family=family,
+                    ordinal=ordinal,
+                )
+                raw_owner = _exact_account_ordinal_owner_signature(
+                    raw_family[ordinal],
+                    family=family,
+                    ordinal=ordinal,
+                )
+                if (
+                    lifecycle_owner is None
+                    or raw_owner is None
+                    or lifecycle_owner[:3] != raw_owner[:3]
+                ):
+                    merge_is_exact = False
+                    break
+            if not merge_is_exact:
+                break
+            merged_family = dict(lifecycle_family)
+            for ordinal, raw_observation in raw_family.items():
+                if ordinal not in merged_family:
+                    merged_family[ordinal] = deepcopy(raw_observation)
+            lifecycle[family] = merged_family
+        merged = (
+            _sealed_registered_account_population_observations(lifecycle)
+            if merge_is_exact and lifecycle
+            else None
+        )
+        if merged is not None:
+            observations = merged
     if not isinstance(observations, Mapping) or not observations:
         return cache_result(completed)
 
@@ -10860,6 +11049,17 @@ def _materialize_registered_account_population_skeletons(
         if not isinstance(raw_pages, list) or not raw_pages:
             # An identity-only retained skeleton has no continuation proof.  A
             # page-local interval is the strongest safe reconstruction.
+            return page_local_segment(identity, owner)
+        if (
+            len(raw_pages) == 1
+            and isinstance(raw_pages[0], int)
+            and not isinstance(raw_pages[0], bool)
+            and raw_pages[0] == owner[0]
+        ):
+            # The original anchor builder represents an identity-only segment as
+            # ``pages: [logical_page]``.  It proves no value continuation, so
+            # conservatively upgrade only its interval shape to the same
+            # page-local owner used for a newly materialized anchor.
             return page_local_segment(identity, owner)
 
         verified_pages: list[dict[str, Any]] = []
@@ -13935,6 +14135,252 @@ def _agreement_separated_identifier_prefix_residue(
     return raw, candidate_identifier
 
 
+def _sealed_agreement_adjacent_page_owner_windows(
+    parse_result: Any,
+    source_pages: Iterable[Any],
+    heading_refs: Mapping[int, Mapping[str, Any]],
+) -> dict[
+    int,
+    tuple[
+        int,
+        int,
+        tuple[float, float, float, float],
+        float,
+    ],
+]:
+    """Return exact trailing-heading/leading-table ownership windows.
+
+    Some printed agreement cards put their numbered heading and upper labels at
+    the bottom of one logical page while the fixed table body starts at the top
+    of the immediately following authoritative page.  This helper extends the
+    existing heading-to-table geometry proof across only that one sealed page
+    edge.  It does not interpret table values or relax the table grammar.
+    """
+
+    def native_positive_int(value: Any) -> int | None:
+        return (
+            value
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+            else None
+        )
+
+    pages = list(source_pages)
+    page_rows: list[tuple[int, int, Any]] = []
+    page_by_logical: dict[int, tuple[int, Any]] = {}
+    for page in pages:
+        logical_page = native_positive_int(
+            _agreement_source_member(
+                page,
+                "page_number",
+                _agreement_source_member(page, "page", None),
+            )
+        )
+        source_page = native_positive_int(
+            _agreement_source_member(
+                page,
+                "source_page_number",
+                _agreement_source_member(page, "source_page", None),
+            )
+        )
+        if (
+            logical_page is None
+            or source_page is None
+            or logical_page in page_by_logical
+        ):
+            return {}
+        page_rows.append((logical_page, source_page, page))
+        page_by_logical[logical_page] = (source_page, page)
+    if not page_rows:
+        return {}
+
+    resolution = getattr(parse_result, "reading_order_resolution", None)
+    raw_order = getattr(parse_result, "reading_order_by_logical", None)
+    if (
+        isinstance(resolution, Mapping)
+        and resolution.get("resolved") is True
+        and resolution.get("authoritative") is True
+        and isinstance(raw_order, Mapping)
+        and raw_order
+    ):
+        order: dict[int, int] = {}
+        for raw_logical, raw_position in raw_order.items():
+            logical_page = native_positive_int(raw_logical)
+            position = native_positive_int(raw_position)
+            if (
+                logical_page is None
+                or position is None
+                or logical_page in order
+            ):
+                return {}
+            order[logical_page] = position
+        if (
+            set(order) != set(page_by_logical)
+            or sorted(order.values()) != list(range(1, len(order) + 1))
+        ):
+            return {}
+    else:
+        local = _sealed_agreement_local_topology_keys(parse_result, page_rows)
+        if local is None:
+            return {}
+        local_keys, _complete_sources = local
+        ordered_logical = [
+            logical_page
+            for logical_page, _key in sorted(
+                local_keys.items(),
+                key=lambda item: item[1],
+            )
+        ]
+        order = {
+            logical_page: position
+            for position, logical_page in enumerate(ordered_logical, start=1)
+        }
+    logical_by_position = {position: logical for logical, position in order.items()}
+
+    def structural_markers(
+        page: Any,
+    ) -> list[tuple[str, tuple[float, float, float, float]]] | None:
+        markers: list[tuple[str, tuple[float, float, float, float]]] = []
+        for block in _agreement_source_member(page, "texts", ()) or ():
+            text = str(
+                _agreement_source_member(
+                    block,
+                    "content",
+                    _agreement_source_member(block, "text", ""),
+                )
+                or ""
+            )
+            card = canonical_credit_agreement_heading(text)
+            agreement_section = canonical_credit_agreement_section_heading(text)
+            registered_section = canonical_registered_section_heading(text)
+            registered_subsection = canonical_registered_subsection_heading(text)
+            is_boundary = bool(
+                agreement_section is not None
+                or (
+                    registered_section is not None
+                    and registered_section != "授信协议信息"
+                )
+                or (
+                    registered_subsection is not None
+                    and registered_subsection[0] != "credit_agreement"
+                )
+            )
+            if card is None and not is_boundary:
+                continue
+            bbox = _exact_geometry_bbox(_agreement_source_member(block, "bbox"))
+            if bbox is None:
+                # A recognized boundary/card with unreadable geometry can sit
+                # between the heading and candidate table.  Treat it as an
+                # invalid topology, not as evidence that no marker intervened.
+                return None
+            markers.append((card or "__boundary__", bbox))
+        markers.sort(key=lambda item: (item[1][1], item[1][0], item[1][3], item[1][2]))
+        return markers
+
+    windows: dict[
+        int,
+        tuple[int, int, tuple[float, float, float, float], float],
+    ] = {}
+    for sequence, heading_ref in heading_refs.items():
+        heading_logical = heading_ref.get("logical_page")
+        heading_source = heading_ref.get("source_page")
+        heading_bbox = _exact_geometry_bbox(heading_ref.get("bbox"))
+        if (
+            not isinstance(heading_logical, int)
+            or isinstance(heading_logical, bool)
+            or not isinstance(heading_source, int)
+            or isinstance(heading_source, bool)
+            or heading_bbox is None
+        ):
+            continue
+        heading_position = order.get(heading_logical)
+        target_logical = (
+            logical_by_position.get(heading_position + 1)
+            if heading_position is not None
+            else None
+        )
+        target_page_row = page_by_logical.get(target_logical) if target_logical is not None else None
+        owner_page_row = page_by_logical.get(heading_logical)
+        if target_page_row is None or owner_page_row is None:
+            continue
+        target_source, target_page = target_page_row
+        owner_source, owner_page = owner_page_row
+        if (
+            owner_source != heading_source
+            or target_source - owner_source not in {0, 1}
+        ):
+            continue
+
+        expected_heading = f"授信协议{sequence}"
+        intervening = False
+        owner_markers = structural_markers(owner_page)
+        if owner_markers is None:
+            continue
+        for marker, marker_bbox in owner_markers:
+            if marker == expected_heading and marker_bbox == heading_bbox:
+                continue
+            if marker_bbox[1] >= heading_bbox[3]:
+                intervening = True
+                break
+        if intervening:
+            continue
+
+        target_markers = structural_markers(target_page)
+        if target_markers is None or not target_markers:
+            continue
+        first_target_top = target_markers[0][1][1]
+        windows[sequence] = (
+            target_logical,
+            target_source,
+            heading_bbox,
+            first_target_top,
+        )
+    return windows
+
+
+def _sealed_agreement_table_heading_sequences(
+    heading_refs: Mapping[int, Mapping[str, Any]],
+    *,
+    logical_page: int,
+    source_page: int,
+    table_bbox: tuple[float, float, float, float],
+    adjacent_windows: Mapping[
+        int,
+        tuple[int, int, tuple[float, float, float, float], float],
+    ],
+) -> list[int]:
+    """Match one exact table geometry to same-page or sealed adjacent headings."""
+
+    eligible: list[int] = []
+    for sequence, heading_ref in heading_refs.items():
+        heading_bbox = _exact_geometry_bbox(heading_ref.get("bbox"))
+        if heading_bbox is None:
+            continue
+        horizontal_overlap = min(table_bbox[2], heading_bbox[2]) - max(
+            table_bbox[0], heading_bbox[0]
+        )
+        if horizontal_overlap <= 0.0:
+            continue
+        if (
+            int(heading_ref.get("logical_page") or 0) == logical_page
+            and int(heading_ref.get("source_page") or 0) == source_page
+            and table_bbox[1] - 24.0 <= heading_bbox[3] <= table_bbox[1] + 8.0
+        ):
+            eligible.append(sequence)
+            continue
+        adjacent = adjacent_windows.get(sequence)
+        if (
+            adjacent is not None
+            and adjacent[0] == logical_page
+            and adjacent[1] == source_page
+            and adjacent[2] == heading_bbox
+            and table_bbox[3] <= adjacent[3]
+        ):
+            eligible.append(sequence)
+    return eligible
+
+
 def _sealed_exact_agreement_table_candidates(
     parse_result: Any,
     *,
@@ -13993,6 +14439,12 @@ def _sealed_exact_agreement_table_candidates(
             return []
         heading_refs[sequence] = refs[0]
 
+    adjacent_windows = _sealed_agreement_adjacent_page_owner_windows(
+        parse_result,
+        source_pages,
+        heading_refs,
+    )
+
     source_page_keys: Counter[tuple[int, int]] = Counter()
     for page in source_pages:
         try:
@@ -14043,24 +14495,13 @@ def _sealed_exact_agreement_table_candidates(
                 or not PBOCPersonalDetailNativeParser._credit_agreement_table_schema(rows)
             ):
                 continue
-            eligible: list[int] = []
-            for sequence, heading_ref in heading_refs.items():
-                if (
-                    int(heading_ref.get("logical_page") or 0) != logical_page
-                    or int(heading_ref.get("source_page") or 0) != source_page
-                ):
-                    continue
-                heading_bbox = _exact_geometry_bbox(heading_ref.get("bbox"))
-                if heading_bbox is None:
-                    continue
-                horizontal_overlap = min(table_bbox[2], heading_bbox[2]) - max(
-                    table_bbox[0], heading_bbox[0]
-                )
-                if (
-                    horizontal_overlap > 0.0
-                    and table_bbox[1] - 24.0 <= heading_bbox[3] <= table_bbox[1] + 8.0
-                ):
-                    eligible.append(sequence)
+            eligible = _sealed_agreement_table_heading_sequences(
+                heading_refs,
+                logical_page=logical_page,
+                source_page=source_page,
+                table_bbox=table_bbox,
+                adjacent_windows=adjacent_windows,
+            )
             if len(eligible) != 1:
                 continue
             sequence = eligible[0]
@@ -14201,6 +14642,32 @@ def _sealed_exact_agreement_table_candidates(
         raw_identifier = fields.get("授信协议标识")
         if _agreement_separated_identifier_prefix_residue(raw_identifier) is not None:
             raw_observations["授信协议标识"] = raw_identifier
+
+        # The ordinary binder can reject a residue-bearing header even though
+        # the sealed card grammar has already proved its canonical label and
+        # physical column.  Conserve the institution cell as an unresolved raw
+        # observation; this authorizes neither normalization nor publication.
+        institution_label = "管理机构"
+        if (
+            institution_label in authorized_upper_labels
+            and institution_label not in fields
+        ):
+            institution_column = _CREDIT_AGREEMENT_UPPER_COLUMNS.index(
+                institution_label
+            )
+            raw_institution = rows[1][institution_column]
+            institution_ref = _agreement_exact_tolerant_cell_ref(
+                page,
+                table,
+                row=1,
+                column=institution_column,
+                field_name="institution",
+            )
+            if _compact(raw_institution) and institution_ref is not None:
+                raw_observations[institution_label] = raw_institution
+                unresolved.add(institution_label)
+                observed.add(institution_label)
+                unresolved_upper_value_refs[institution_label] = institution_ref
 
         # One exact merged header may span two adjacent fixed columns.  Bind
         # both values only when each physical value cell independently satisfies
@@ -14528,6 +14995,12 @@ def _sealed_agreement_identity_table_candidates(
             return []
         heading_refs[sequence] = refs[0]
 
+    adjacent_windows = _sealed_agreement_adjacent_page_owner_windows(
+        parse_result,
+        source_pages,
+        heading_refs,
+    )
+
     table_matches: list[
         tuple[int, Any, Any, list[list[str]], int, list[tuple[str, int, int]]]
     ] = []
@@ -14635,24 +15108,13 @@ def _sealed_agreement_identity_table_candidates(
             if identifier_ref is None or any(ref is None for ref in witness_refs):
                 continue
 
-            eligible: list[int] = []
-            for sequence, heading_ref in heading_refs.items():
-                if (
-                    int(heading_ref.get("logical_page") or 0) != logical_page
-                    or int(heading_ref.get("source_page") or 0) != source_page
-                ):
-                    continue
-                heading_bbox = _exact_geometry_bbox(heading_ref.get("bbox"))
-                if heading_bbox is None:
-                    continue
-                horizontal_overlap = min(table_bbox[2], heading_bbox[2]) - max(
-                    table_bbox[0], heading_bbox[0]
-                )
-                if (
-                    horizontal_overlap > 0.0
-                    and table_bbox[1] - 24.0 <= heading_bbox[3] <= table_bbox[1] + 8.0
-                ):
-                    eligible.append(sequence)
+            eligible = _sealed_agreement_table_heading_sequences(
+                heading_refs,
+                logical_page=logical_page,
+                source_page=source_page,
+                table_bbox=table_bbox,
+                adjacent_windows=adjacent_windows,
+            )
             if len(eligible) != 1:
                 continue
             sequence = eligible[0]
@@ -15034,6 +15496,34 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
             field_names[label] for label in getattr(candidate, "observed_labels", frozenset()) if label in field_names
         }
         raw_institution = _field(facts, "管理机构")
+        source_institution_raw = (
+            raw_institution
+            if raw_institution not in (None, "")
+            else source_absent_raw.get("institution")
+        )
+        institution_refs = list(source_refs_by_field.get("institution") or ())
+        repaired_institution, institution_repair_decision = (
+            _candidate_b_planned_field_repair(
+                parse_result,
+                source_institution_raw,
+                dataset_name="credit_lines",
+                record_id=credit_line_id,
+                field_name="institution",
+                source_refs=institution_refs,
+            )
+            if source_institution_raw not in (None, "")
+            else ("", None)
+        )
+        if institution_repair_decision is not None:
+            raw_institution = repaired_institution
+            source_absent_raw["institution"] = source_institution_raw
+            source_absent_fields.discard("institution")
+            unresolved_fields.discard("institution")
+            observed_fields.add("institution")
+            source_refs_by_field["institution"] = _planned_field_repair_refs(
+                institution_repair_decision,
+                institution_refs,
+            )
         raw_facility_type = _field(facts, "授信额度用途")
         from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
             institution_name_has_separated_leading_han,
@@ -15092,8 +15582,17 @@ def _extract_credit_lines(parse_result: Any) -> list[dict[str, Any]]:
             "_observed_fields": sorted(observed_fields),
             **({"_pending_institution_observation": pending_institution} if pending_institution is not None else {}),
         }
+        _record_planned_field_repair(
+            parse_result,
+            dataset_name="credit_lines",
+            record_id=credit_line_id,
+            field_name="institution",
+            original=source_institution_raw,
+            corrected=raw_institution,
+            decision=institution_repair_decision,
+        )
         for field_name, raw_value, converted in (
-            ("institution", raw_institution, institution),
+            ("institution", source_institution_raw, institution),
             ("effective_date", raw_effective_date, effective_date),
             ("due_date", due_raw, due_date),
         ):
@@ -16702,6 +17201,7 @@ def reconcile_candidate_b_credit_lines(
             reverse=True,
         )
         selected = dict(ranked[0])
+        source_identity_refs: list[dict[str, Any]] = []
         printed_sequences = {
             int(observation["_printed_sequence"])
             for observation in observations
@@ -16709,7 +17209,6 @@ def reconcile_candidate_b_credit_lines(
         }
         if len(printed_sequences) == 1:
             selected["sequence"] = next(iter(printed_sequences))
-            source_identity_refs: list[dict[str, Any]] = []
             source_identity_markers: set[str] = set()
             source_sequence = next(iter(printed_sequences))
             for observation in observations:
@@ -16765,6 +17264,22 @@ def reconcile_candidate_b_credit_lines(
                     selected[key] = deepcopy(value)
                 elif retained != value:
                     conflicts.add(key)
+
+        # The canonical ordinal anchor is durable source evidence for the
+        # published sequence, not merely a private reconciliation witness.
+        # Carry the exact refs alongside table refs while preserving both and
+        # suppressing replay duplicates by their complete serialized identity.
+        for ref in source_identity_refs:
+            marker = json.dumps(
+                ref,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if marker in seen_refs:
+                continue
+            seen_refs.add(marker)
+            merged_refs.append(dict(ref))
 
         selected_field_refs: dict[str, list[dict[str, Any]]] = {}
         selected_binding_quality: dict[str, str] = {}
@@ -18189,11 +18704,23 @@ def _sealed_liability_table_candidates(
             observed = set(observed_labels)
             unresolved = set(unresolved_labels)
             snapshot_raw = rows[4][0]
-            if _liability_date(snapshot_raw) is not None:
+            if _compact(snapshot_raw):
+                snapshot_ref = _agreement_exact_tolerant_cell_ref(
+                    page,
+                    table,
+                    row=4,
+                    column=0,
+                    field_name="snapshot_date",
+                )
+                if snapshot_ref is None:
+                    continue
                 fields["__snapshot_date"] = snapshot_raw
                 positions["__snapshot_date"] = (4, 0)
                 observed.add("__snapshot_date")
-                unresolved.discard("__snapshot_date")
+                if _liability_date(snapshot_raw) is None:
+                    unresolved.add("__snapshot_date")
+                else:
+                    unresolved.discard("__snapshot_date")
 
             contract = _liability_identifier(fields.get("保证合同编号"), contract=True)
             if contract is None:
@@ -18284,6 +18811,17 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     for candidate_index, candidate in enumerate(candidates, start=1):
         facts = candidate.fields
+        planned_contract = _liability_identifier(
+            facts.get("保证合同编号"),
+            contract=True,
+        )
+        planned_record_id = stable_record_id(
+            "repayment_liability",
+            planned_contract
+            or facts.get("__printed_sequence")
+            or candidate_index,
+        )
+        applied_field_repairs: list[tuple[str, Any, Any, Any]] = []
         observation: dict[str, Any] = {
             "_printed_sequence": facts.get("__printed_sequence"),
             "_party_category": facts.get("__party_category"),
@@ -18312,6 +18850,22 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
             raw_value = facts.get(label)
             if raw_value in (None, ""):
                 continue
+            raw_refs = tuple(
+                dict(ref)
+                for ref in candidate.source_refs_by_field.get(label) or ()
+                if isinstance(ref, Mapping)
+            )
+            repaired_value, repair_decision = _candidate_b_planned_field_repair(
+                parse_result,
+                raw_value,
+                dataset_name="repayment_liability_records",
+                record_id=planned_record_id,
+                field_name=field_name,
+                source_refs=raw_refs,
+            )
+            effective_value: Any = (
+                repaired_value if repair_decision is not None else raw_value
+            )
             observation["canonical_raw"][field_name] = raw_value
             if _liability_source_absent(raw_value):
                 source_absent_fields.add(field_name)
@@ -18319,18 +18873,24 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
             else:
                 converted = _liability_convert(
                     field_name,
-                    raw_value,
+                    effective_value,
                     related_party_id_type=observation.get("related_party_id_type"),
                 )
                 observation[field_name] = converted
                 if converted is None:
                     unresolved_fields.add(field_name)
                     observation["_invalid_raw_by_field"].setdefault(field_name, []).append(raw_value)
+                elif repair_decision is not None:
+                    unresolved_fields.discard(field_name)
+                    applied_field_repairs.append(
+                        (field_name, raw_value, effective_value, repair_decision)
+                    )
 
-            raw_refs = candidate.source_refs_by_field.get(label) or ()
             if raw_refs:
                 observation["source_refs_by_field"].setdefault(field_name, []).extend(
-                    dict(ref) for ref in raw_refs if isinstance(ref, Mapping)
+                    _planned_field_repair_refs(repair_decision, raw_refs)
+                    if repair_decision is not None
+                    else raw_refs
                 )
             binding = candidate.binding_quality_by_field.get(label)
             if binding:
@@ -18363,6 +18923,16 @@ def _extract_liabilities(parse_result: Any) -> list[dict[str, Any]]:
                 ),
             )
             continue
+        for field_name, original, corrected, decision in applied_field_repairs:
+            _record_planned_field_repair(
+                parse_result,
+                dataset_name="repayment_liability_records",
+                record_id=planned_record_id,
+                field_name=field_name,
+                original=original,
+                corrected=corrected,
+                decision=decision,
+            )
         for correction in (
             getattr(candidate, "liability_header_corrections", ()) or ()
         ):
@@ -18534,6 +19104,7 @@ def _document_local_inquiry_ordinals(
     raw_sequences: Iterable[int | None],
     *,
     noisy_candidates: Iterable[tuple[int, str] | None] | None = None,
+    repairable_noise_indices: Iterable[int] = (),
 ) -> list[tuple[int | None, str | None]]:
     """Normalize inquiry ordinals only from exact adjacent-row proof.
 
@@ -18555,6 +19126,11 @@ def _document_local_inquiry_ordinals(
     bounded_noise = list(noisy_candidates) if noisy_candidates is not None else [None for _value in observed]
     if len(bounded_noise) != len(observed):
         return [(value, None) for value in observed]
+    repairable = {
+        int(index)
+        for index in repairable_noise_indices
+        if isinstance(index, int) and not isinstance(index, bool) and index >= 0
+    }
     normalized: list[tuple[int | None, str | None]] = [(value, None) for value in observed]
     observed_values = {value for value in observed if value is not None}
     for index in range(1, len(observed) - 2):
@@ -18565,18 +19141,52 @@ def _document_local_inquiry_ordinals(
         expected_first = left + 1 if left is not None else None
         expected_second = left + 2 if left is not None else None
         first_noise = bounded_noise[index]
+        paired_noisy_run = bool(
+            index in repairable
+            and index + 1 in repairable
+            and first_noise is not None
+            and bounded_noise[index + 1] is not None
+            and first_noise[0] == expected_first
+            and bounded_noise[index + 1][0] == expected_second
+            and first_noise[1] in {"prefixed_noise", "suffix_noise"}
+            and bounded_noise[index + 1][1] in {
+                "prefixed_noise",
+                "suffix_noise",
+            }
+        )
+        legacy_paired_missing = bool(
+            first_noise == (expected_first, "suffix_noise")
+            and bounded_noise[index + 1] is None
+        )
         if (
             left is None
             or right != left + 3
             or first is not None
             or second is not None
-            or first_noise != (expected_first, "suffix_noise")
-            or bounded_noise[index + 1] is not None
+            or not (legacy_paired_missing or paired_noisy_run)
             or expected_first in observed_values
             or expected_second in observed_values
         ):
             continue
-        normalized[index] = (expected_first, "paired_suffix_noise")
+        if paired_noisy_run:
+            normalized[index] = (
+                expected_first,
+                (
+                    "paired_prefix_noise"
+                    if first_noise[1] == "prefixed_noise"
+                    else "paired_suffix_noise"
+                ),
+            )
+            normalized[index + 1] = (
+                expected_second,
+                (
+                    "paired_prefix_noise"
+                    if bounded_noise[index + 1][1] == "prefixed_noise"
+                    else "paired_suffix_noise"
+                ),
+            )
+        else:
+            normalized[index] = (expected_first, "paired_suffix_noise")
     for index in range(1, len(observed) - 1):
         previous = normalized[index - 1][0]
         current = normalized[index][0]
@@ -20891,7 +21501,11 @@ def _record_inquiry_ordinal_repair(
 
     inferred = repair_kind in {"missing", "paired_missing"}
     suffix_noise = repair_kind in {"suffix_noise", "paired_suffix_noise"}
-    paired = repair_kind in {"paired_suffix_noise", "paired_missing"}
+    paired = repair_kind in {
+        "paired_prefix_noise",
+        "paired_suffix_noise",
+        "paired_missing",
+    }
     record_issue(
         parse_result,
         make_issue(
@@ -20970,6 +21584,7 @@ def _record_inquiry_ordinal_unresolved(
     source_ref: Mapping[str, Any],
     observed_row: Any,
     repair_kind: str,
+    field_ref: Mapping[str, Any] | None = None,
 ) -> None:
     """Localize one withheld row with a truthful ordinal-gap diagnostic."""
 
@@ -21034,7 +21649,11 @@ def _record_inquiry_ordinal_unresolved(
             target_record_id=target_record_id,
             field_name="sequence",
             observed_value=observed_value,
-            source_refs=(dict(source_ref),),
+            source_refs=tuple(
+                dict(ref)
+                for ref in (source_ref, field_ref)
+                if isinstance(ref, Mapping)
+            ),
             reason_codes=(
                 "canonical_four_column_table",
                 (
@@ -22350,7 +22969,11 @@ def _record_owned_inquiry_sequence_resolution(
                 "raw_sequence": raw_sequence,
             },
             candidate_value={"normalized_sequence": expected_sequence},
-            source_refs=(dict(source_ref),),
+            source_refs=tuple(
+                dict(ref)
+                for ref in (source_ref, field_ref)
+                if isinstance(ref, Mapping)
+            ),
             reason_codes=(
                 "validated_canonical_population_owner",
                 "closed_physical_population_bounds",
@@ -22991,6 +23614,44 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             raw_sequence_cells = [_slot_value(cells, slots, "sequence") for _row_index, cells in table_rows]
             raw_sequences = [_inquiry_sequence_token(value) for value in raw_sequence_cells]
             noisy_sequences = [_bounded_inquiry_sequence_noise_candidate(value) for value in raw_sequence_cells]
+            sequence_field_refs = [
+                {
+                    **_source_ref(
+                        page,
+                        table,
+                        row=row_index,
+                        column=int(slots["sequence"]),
+                    ),
+                    "field_name": "sequence",
+                    "binding": "canonical_header_column",
+                }
+                for row_index, _cells in table_rows
+            ]
+            repairable_noise_indices = {
+                index
+                for index, (raw_value, noisy, field_ref) in enumerate(
+                    zip(
+                        raw_sequence_cells,
+                        noisy_sequences,
+                        sequence_field_refs,
+                        strict=True,
+                    )
+                )
+                if noisy is not None
+                and (
+                    directive := _candidate_b_planned_deterministic_repair(
+                        parse_result,
+                        raw_value,
+                        dataset_name="inquiry_records",
+                        record_id="",
+                        field_name="sequence",
+                        source_refs=(field_ref,),
+                    )
+                )
+                is not None
+                and str(getattr(directive, "candidate_value", "") or "")
+                == str(noisy[0])
+            }
             observed_sequence_values = {int(value) for value in raw_sequences if value is not None}
             for index, ((row_index, cells), raw_cell) in enumerate(zip(table_rows, raw_sequence_cells, strict=True)):
                 if raw_sequences[index] is not None or _compact(raw_cell):
@@ -23020,6 +23681,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             normalized_ordinals = _document_local_inquiry_ordinals(
                 raw_sequences,
                 noisy_candidates=noisy_sequences,
+                repairable_noise_indices=repairable_noise_indices,
             )
             if has_split_header and _bounded_split_personal_leading_ordinal(
                 table_rows,
@@ -23056,7 +23718,12 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
             )
             if trailing_sequence is not None:
                 normalized_ordinals[-1] = (trailing_sequence, "missing")
-            for (row_index, cells), (sequence, repair_kind) in zip(table_rows, normalized_ordinals, strict=True):
+            for (row_index, cells), (sequence, repair_kind), sequence_field_ref in zip(
+                table_rows,
+                normalized_ordinals,
+                sequence_field_refs,
+                strict=True,
+            ):
                 raw_sequence = _inquiry_sequence_token(_slot_value(cells, slots, "sequence"))
                 if sequence is None:
                     if repair_kind:
@@ -23091,12 +23758,58 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                                 "reason": unresolved_reason,
                             },
                             repair_kind=repair_kind,
+                            field_ref=sequence_field_ref,
                         )
                     continue
-                date_cell = _slot_value(cells, slots, "inquiry_date")
-                inquiry_date = _bounded_inquiry_date(date_cell)
-                institution = _slot_value(cells, slots, "institution")
-                source_reason = _slot_value(cells, slots, "reason")
+                source_values = {
+                    field_name: _slot_value(cells, slots, field_name)
+                    for field_name in ("inquiry_date", "institution", "reason")
+                }
+                field_refs = {
+                    field_name: {
+                        **_source_ref(
+                            page,
+                            table,
+                            row=row_index,
+                            column=int(slots[field_name]),
+                        ),
+                        "field_name": field_name,
+                        "binding": "canonical_header_column",
+                    }
+                    for field_name in ("inquiry_date", "institution", "reason")
+                }
+                source_inquiry_type = (
+                    "personal"
+                    if source_values["institution"] == "本人"
+                    or source_values["reason"].startswith("本人查询")
+                    else "institution"
+                )
+                planned_inquiry_id = stable_record_id(
+                    "credit_inquiry",
+                    source_inquiry_type,
+                    sequence,
+                )
+                effective_values: dict[str, str] = {}
+                field_repair_decisions: dict[str, Any] = {}
+                for field_name, source_value in source_values.items():
+                    repaired_value, repair_decision = _candidate_b_planned_field_repair(
+                        parse_result,
+                        source_value,
+                        dataset_name="inquiry_records",
+                        record_id=planned_inquiry_id,
+                        field_name=field_name,
+                        source_refs=(field_refs[field_name],),
+                    )
+                    effective_values[field_name] = (
+                        repaired_value if repair_decision is not None else source_value
+                    )
+                    if repair_decision is not None:
+                        field_repair_decisions[field_name] = repair_decision
+                inquiry_date = _bounded_inquiry_date(
+                    effective_values["inquiry_date"]
+                )
+                institution = effective_values["institution"]
+                source_reason = effective_values["reason"]
                 if not institution or not source_reason or inquiry_date is None:
                     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
                         make_issue,
@@ -23112,6 +23825,15 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                         )
                         if value in (None, "")
                     ]
+                    row_ref = _source_ref(page, table, row=row_index)
+                    unresolved_refs = (
+                        row_ref,
+                        *(
+                            field_refs[field_name]
+                            for field_name in missing_fields
+                            if field_refs[field_name].get("geometry_scope") == "cell"
+                        ),
+                    )
                     record_issue(
                         parse_result,
                         make_issue(
@@ -23123,7 +23845,7 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                             field_name=missing_fields[0] if len(missing_fields) == 1 else None,
                             observed_value={"sequence": sequence, "row": list(cells)},
                             candidate_value={"missing_fields": missing_fields},
-                            source_refs=(_source_ref(page, table, row=row_index),),
+                            source_refs=unresolved_refs,
                             reason_codes=(
                                 "printed_inquiry_sequence_observed",
                                 "exact_header_column_binding_failed",
@@ -23142,14 +23864,13 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     row_index=row_index,
                 ) or _source_ref(page, table, row=row_index)
                 refs_by_field = {
-                    field_name: [
-                        {
-                            **_source_ref(page, table, row=row_index, column=slots[field_name]),
-                            "field_name": field_name,
-                            "binding": "canonical_header_column",
-                        }
-                    ]
-                    for field_name in ("inquiry_date", "institution", "reason")
+                    field_name: _planned_field_repair_refs(
+                        field_repair_decisions[field_name],
+                        (field_ref,),
+                    )
+                    if field_name in field_repair_decisions
+                    else [field_ref]
+                    for field_name, field_ref in field_refs.items()
                 }
                 native_record = {
                     "inquiry_id": inquiry_id,
@@ -23164,8 +23885,28 @@ def _extract_inquiries(parse_result: Any) -> list[dict[str, Any]]:
                     "source_refs": [row_ref],
                     "source_refs_by_field": refs_by_field,
                     "confidence": float(getattr(table, "confidence", None) or 0.9),
+                    **(
+                        {
+                            "canonical_raw": {
+                                field_name: source_values[field_name]
+                                for field_name in field_repair_decisions
+                            }
+                        }
+                        if field_repair_decisions
+                        else {}
+                    ),
                 }
                 records.append(native_record)
+                for field_name, decision in field_repair_decisions.items():
+                    _record_planned_field_repair(
+                        parse_result,
+                        dataset_name="inquiry_records",
+                        record_id=inquiry_id,
+                        field_name=field_name,
+                        original=source_values[field_name],
+                        corrected=effective_values[field_name],
+                        decision=decision,
+                    )
                 if repair_kind is None and raw_sequence == sequence:
                     exact_native_ref = _exact_native_inquiry_row_ref(
                         page,

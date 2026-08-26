@@ -41,7 +41,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy
     LazyExtractionStrategy,
 )
 
-
 # Each deployed stage is tied to the exact public Candidate B boundary where a
 # business caller observes its unchanged strategy output.  This makes the
 # parity oracle fail if a stage is dispatched but its result is dropped,
