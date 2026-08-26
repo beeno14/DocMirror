@@ -59,6 +59,21 @@ def test_single_recovered_row_does_not_expose_internal_repair_metadata() -> None
     assert repaired[0][9] == ""
 
 
+def test_internal_ocr_sequence_becomes_canonical_sequence() -> None:
+    normalized = grid_standard.normalize_record(
+        {
+            "交易日期": "2023-03-09",
+            "收/支": "支出",
+            "交易金额": "4819.00",
+            "账户余额": "401143.31",
+            "_source_sequence_no": "1",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["sequence_no"] == "1"
+
+
 def test_recover_ocr_implicit_table_keeps_valid_rows_with_page_noise() -> None:
     parse_result = _table_result(
         [
@@ -428,6 +443,8 @@ def test_complete_paragraph_header_accepts_plain_date_and_signed_amount_column()
         ["2023-03-09", "支出", "13300.00", "387843.31", "备用金", "6226192011784154", "谢林华"],
         ["2023-03-10", "收入", "18400.00", "406243.31", "往来款", "6228480460934190410", "梁远述"],
     ]
+    assert tables[0][0][-1] == "_source_sequence_no"
+    assert [row[-1] for row in tables[0][1:]] == ["1", "2", "3"]
 
 
 def test_recover_native_corporate_detail_with_transaction_occurrence_amount_header() -> None:

@@ -1222,6 +1222,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
                     text,
                     document_type=str(getattr(parse_result.entities, "document_type", "") or ""),
                     source_pages=_parse_result_source_pages(parse_result),
+                    source_headers=_parse_result_source_table_headers(parse_result),
                 ),
             }
         )
@@ -1235,6 +1236,7 @@ def _render_bank_statement_content_markdown(
     *,
     document_type: str = "bank_statement",
     source_pages: dict[int, str] | None = None,
+    source_headers: list[str] | None = None,
 ) -> str:
     """Render a record-complete bank statement Markdown view from canonical plugin facts."""
     if not records:
@@ -1251,7 +1253,9 @@ def _render_bank_statement_content_markdown(
     parts = ['<!-- docmirror:markdown-profile version="1.0" -->']
     source_pages = source_pages or {}
     page_numbers = sorted(set(rows_by_page) | set(source_pages)) or [1]
-    raw_headers = _raw_statement_table_headers(records, source_text)
+    positioned_headers = source_headers or []
+    raw_headers = _raw_statement_table_headers(records, source_text, source_headers=positioned_headers)
+    use_positioned_source_values = bool(positioned_headers and positioned_headers == raw_headers)
     for page in page_numbers:
         parts.append(f'<!-- docmirror:page logical="{page}" source="{page}" -->')
         page_records = rows_by_page.get(page, [])
@@ -1272,7 +1276,13 @@ def _render_bank_statement_content_markdown(
                 header_lines.insert(0, statement_title)
             if header_lines:
                 parts.append("  \n".join(header_lines))
-            parts.append(_render_raw_statement_table(page_records, raw_headers))
+            parts.append(
+                _render_raw_statement_table(
+                    page_records,
+                    raw_headers,
+                    allow_semantic_fallback=use_positioned_source_values,
+                )
+            )
             after_table_lines = (
                 _source_statement_note_lines(page_source_text)
                 if not page_records
@@ -1308,6 +1318,21 @@ def _parse_result_source_pages(parse_result) -> dict[int, str]:
         if parts:
             page_texts[page_number] = "\n".join(parts)
     return page_texts
+
+
+def _parse_result_source_table_headers(parse_result) -> list[str]:
+    """Recover a signed-ledger header order from page-local OCR coordinates."""
+    entities = getattr(parse_result, "entities", None)
+    domain_specific = getattr(entities, "domain_specific", None)
+    if not isinstance(domain_specific, dict):
+        return []
+    for bundle in domain_specific.get("_page_evidence_bundles") or []:
+        local = bundle.get("local_structure_evidence") if isinstance(bundle, dict) else None
+        tokens = local.get("tokens") if isinstance(local, dict) else None
+        headers = _positioned_signed_source_headers(tokens or [])
+        if headers:
+            return headers
+    return []
 
 
 def _sanitize_bank_records(records: list[dict]) -> list[dict]:
@@ -1640,7 +1665,6 @@ _SOURCE_TABLE_HEADER_LAYOUTS = [
     ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额", "对手信息", "日志号", "交易渠道", "交易附言"],
 ]
 _RAW_REQUIRED_HEADERS = {"交易日期", "交易金额", "账户余额"}
-_SOURCE_REQUIRED_HEADERS = {"交易日期", "交易金额"}
 _RAW_TABLE_EXCLUDED_HEADERS = {"_style_id", "_source_page"}
 # Vocabulary used only to detect source table header lines. Raw Markdown columns
 # deliberately retain the insertion order of the source record.
@@ -1685,12 +1709,16 @@ _RAW_SPLIT_DIRECTION_KEYS = (
     "转出金额",
 )
 _HEADER_VALUE_KEYS = {
+    "序号": (("序号", "日志号", "交易流水号", "流水号"), ("sequence_no",)),
+    "日期": (("日期", "交易日期", "交易时间", "记账日期"), ("date",)),
     "交易日期": (("交易日期", "日期"), ("date",)),
     "交易时间": (("交易时间", "时间"), ("timestamp",)),
     "交易摘要": (("交易摘要", "摘要"), ("summary",)),
     "交易金额": (("交易金额", "金额"), ("amount",)),
+    "借/贷方发生额": (("借/贷方发生额", "借贷方发生额", "交易金额", "金额"), ("amount",)),
     "本次余额": (("本次余额", "账户余额", "余额"), ("balance",)),
     "账户余额": (("账户余额", "本次余额", "余额"), ("balance",)),
+    "余额": (("余额", "账户余额", "本次余额"), ("balance",)),
     "对手信息": (("对手信息", "对方户名", "对方账号"), ("counter_party", "counter_account")),
     "日志号": (("日志号", "日 志号", "序号", "交易流水号", "流水号"), ("sequence_no",)),
     "交易渠道": (("交易渠道", "渠道"), ("channel",)),
@@ -1698,19 +1726,68 @@ _HEADER_VALUE_KEYS = {
     "交易类别": (("交易类别", "交易类型", "收/支"), ("direction",)),
     "交易类型": (("交易类型", "交易类别", "收/支"), ("direction",)),
     "对方账号": (("对方账号", "对方账户"), ("counter_account",)),
+    "对方账户": (("对方账户", "对方账号"), ("counter_account",)),
     "对方户名": (("对方户名", "对方名称", "交易对手"), ("counter_party",)),
+    "传票号": (("传票号", "凭证号"), ("reference",)),
     "备注": (("备注", "摘要"), ("summary",)),
     "摘要/附言": (("摘要/附言", "摘要", "交易摘要", "备注"), ("summary",)),
     "币别": (("币别", "币种"), ("currency",)),
     "交易机构": (("交易机构", "机构"), ()),
 }
 
+_SIGNED_AMOUNT_HEADERS = ("借/贷方发生额", "借贷方发生额", "借贷发生额")
+_SIGNED_SOURCE_HEADER_GROUPS = (
+    ("序号", "流水号"),
+    ("交易日期", "记账日期", "日期"),
+    ("交易时间", "时间"),
+    _SIGNED_AMOUNT_HEADERS,
+    ("账户余额", "余额"),
+    ("对方户名", "对方名称", "交易对手"),
+    ("对方账户", "对方账号"),
+    ("传票号", "凭证号"),
+    ("交易摘要", "摘要"),
+)
 
-def _raw_statement_table_headers(records: list[dict], source_text: str = "") -> list[str]:
+
+def _positioned_signed_source_headers(tokens: list[dict]) -> list[str]:
+    """Return source headers ordered by their horizontal OCR positions."""
+    candidates: list[tuple[float, float, float, int, str]] = []
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        bbox = token.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        text = _compat_compact(token.get("text") or token.get("content"))
+        for group_index, aliases in enumerate(_SIGNED_SOURCE_HEADER_GROUPS):
+            matches = [alias for alias in aliases if alias in text]
+            if not matches:
+                continue
+            x0, y0, _x1, y1 = (float(value) for value in bbox[:4])
+            candidates.append((x0, (y0 + y1) / 2, max(y1 - y0, 1.0), group_index, max(matches, key=len)))
+            break
+
+    best: list[tuple[float, float, float, int, str]] = []
+    for candidate in candidates:
+        band = [other for other in candidates if abs(other[1] - candidate[1]) <= max(other[2], candidate[2])]
+        unique = {item[3]: item for item in sorted(band, key=lambda item: abs(item[1] - candidate[1]))}
+        positioned = sorted(unique.values(), key=lambda item: item[0])
+        groups = {item[3] for item in positioned}
+        if len(positioned) > len(best) and 3 in groups and 4 in groups and groups.intersection({1, 2}):
+            best = positioned
+    return [item[4] for item in best] if len(best) >= 5 else []
+
+
+def _raw_statement_table_headers(
+    records: list[dict],
+    source_text: str = "",
+    *,
+    source_headers: list[str] | None = None,
+) -> list[str]:
     """Return source-table headers when records carry a readable bank ledger shape."""
     if not records:
         return []
-    source_headers = _source_statement_table_headers(source_text)
+    source_headers = source_headers or _source_statement_table_headers(source_text)
     if source_headers and _records_support_source_headers(records, source_headers):
         return source_headers
 
@@ -1803,7 +1880,10 @@ def _source_statement_table_headers(source_text: str) -> list[str]:
 
 
 def _records_support_source_headers(records: list[dict], headers: list[str]) -> bool:
-    if not _SOURCE_REQUIRED_HEADERS.issubset(headers):
+    compact_headers = [_compat_compact(header) for header in headers]
+    if not any("日期" in header or "时间" in header for header in compact_headers):
+        return False
+    if not any("金额" in header or "发生额" in header for header in compact_headers):
         return False
     support = 0
     for record in records[:20]:
@@ -2258,16 +2338,48 @@ def _compat_text(value: object) -> str:
     return unicodedata.normalize("NFKC", str(value or ""))
 
 
-def _render_raw_statement_table(records: list[dict], headers: list[str]) -> str:
+def _render_raw_statement_table(
+    records: list[dict],
+    headers: list[str],
+    *,
+    allow_semantic_fallback: bool = False,
+) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     for record in records:
         raw = _record_raw(record)
-        values = [_raw_markdown_cell(_source_raw_header_value(raw, header)) for header in headers]
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        values = [
+            _raw_markdown_cell(
+                _source_markdown_value(raw, normalized, header, allow_semantic_fallback=allow_semantic_fallback)
+            )
+            for header in headers
+        ]
         lines.append("| " + " | ".join(values) + " |")
     return "\n".join(lines)
+
+
+def _source_markdown_value(
+    raw: dict,
+    normalized: dict,
+    header: str,
+    *,
+    allow_semantic_fallback: bool,
+) -> object:
+    value = _source_raw_header_value(raw, header)
+    if allow_semantic_fallback and _compat_compact(header) in _SIGNED_AMOUNT_HEADERS:
+        if value in (None, ""):
+            value = _source_header_value(raw, normalized, header)
+        text = str(value or "").strip()
+        if text and not text.startswith(("+", "-")):
+            direction = str(normalized.get("direction") or "")
+            text = ("+" if direction == "income" else "-" if direction == "expense" else "") + text
+        return text
+    if value not in (None, "") or not allow_semantic_fallback:
+        return value
+    return _source_header_value(raw, normalized, header)
 
 
 def _record_raw(record: dict) -> dict:

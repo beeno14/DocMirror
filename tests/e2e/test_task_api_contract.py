@@ -8,11 +8,31 @@ import json
 import time
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult, ResultStatus
 from docmirror.models.sealed import seal_parse_result
 from docmirror.server.api import app
+from docmirror.server.parse_admission_queue import (
+    ParseQueueFullError,
+    ParseQueueWaitTimeoutError,
+)
+from docmirror.server.parse_process_manager import (
+    get_parse_process_manager,
+)
+from docmirror.server.task_executor import execute_parse_task
+
+
+@pytest.fixture(autouse=True)
+def _execute_parses_inline(monkeypatch):
+    """Keep contract monkeypatches in-process; process isolation has dedicated tests."""
+    manager = get_parse_process_manager()
+
+    async def start(request, *, output_root, task_id):
+        return asyncio.create_task(execute_parse_task(request, output_root=output_root, task_id=task_id))
+
+    monkeypatch.setattr(manager, "start", start)
 
 
 def _mirror(document_type: str = "business_license") -> ParseResult:
@@ -114,9 +134,7 @@ def test_task_api_has_no_delivery_selection_parameters():
     schema = TestClient(app).get("/openapi.json").json()
     removed = {"formats", "editions", "geometry", "include_geometry", "include_text", "mirror_level"}
     for path in ("/v1/tasks", "/v1/tasks/batch"):
-        parameters = {
-            parameter["name"] for parameter in schema["paths"][path]["post"].get("parameters", [])
-        }
+        parameters = {parameter["name"] for parameter in schema["paths"][path]["post"].get("parameters", [])}
         assert not parameters & removed
 
 
@@ -222,6 +240,43 @@ def test_legacy_parse_route_returns_task_result_not_mirror(tmp_path: Path, monke
     assert payload["status"] == "success"
     assert "mirror" not in payload
     assert "mirror" not in payload["artifacts"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (
+            ParseQueueFullError(active=10, queued=50, max_queued=50),
+            "DOCMIRROR_QUEUE_FULL",
+        ),
+        (
+            ParseQueueWaitTimeoutError(wait_timeout_seconds=900),
+            "DOCMIRROR_QUEUE_WAIT_TIMEOUT",
+        ),
+    ],
+)
+def test_legacy_parse_route_returns_structured_queue_errors(
+    tmp_path: Path,
+    monkeypatch,
+    error: Exception,
+    expected_code: str,
+):
+    monkeypatch.setenv("DOCMIRROR_TASK_OUTPUT_DIR", str(tmp_path))
+    manager = get_parse_process_manager()
+
+    async def reject_start(_request, *, output_root, task_id):
+        raise error
+
+    monkeypatch.setattr(manager, "start", reject_start)
+    response = TestClient(app).post(
+        "/v1/parse",
+        files={"file": ("sample.pdf", b"PDF", "application/pdf")},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == expected_code
+    assert response.json()["detail"]["retryable"] is True
+    assert not any(tmp_path.iterdir())
 
 
 def test_task_api_unknown_task_is_not_found(tmp_path: Path, monkeypatch):

@@ -1054,6 +1054,30 @@ scene_keywords:
     - 税款缴纳
     - 扣缴税款
   tax_return:
+    filename_tokens: [纳税申报表]
+    text_signatures:
+    - scope: title
+      source: document_title
+      required_groups:
+      - [纳税申报表, 增值税申报表, 增值税及附加税费申报表]
+      signal_groups:
+      - [税款所属期, 税费所属期, 税款所属时间]
+      - [纳税人识别号, 纳税人名称]
+      - [应纳税额, 本期应补退税额, 销项税额]
+      - [附列资料, 一般纳税人适用, 小规模纳税人适用]
+      min_matches: 1
+      weight: 0.98
+    - scope: document
+      source: document_frame
+      required_groups:
+      - [纳税申报表, 增值税申报表, 增值税及附加税费申报表]
+      signal_groups:
+      - [税款所属期, 税费所属期, 税款所属时间]
+      - [纳税人识别号, 纳税人名称]
+      - [应纳税额, 本期应补退税额, 销项税额]
+      - [附列资料, 一般纳税人适用, 小规模纳税人适用]
+      min_matches: 2
+      weight: 0.90
     include:
     - 税务申报
     - 纳税申报

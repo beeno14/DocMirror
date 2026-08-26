@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 import pytest
 
@@ -144,11 +145,18 @@ def test_all_editions_share_one_post_seal_plugin_registry(monkeypatch) -> None:
 
     assert registry.list_domains() == {
         "alipay_payment": ["community"],
+        "balance_sheet": ["community"],
         "bank_reconciliation": ["community"],
         "bank_statement": ["community", "enterprise", "finance"],
         "business_license": ["community"],
+        "cash_flow_statement": ["community"],
         "credit_report": ["community"],
+        "financial_report": ["community"],
+        "financial_statement": ["community"],
         "generic": ["community"],
+        "income_statement": ["community"],
+        "owners_equity_changes": ["community"],
+        "tax_return": ["community"],
         "vat_invoice": ["community"],
         "wechat_payment": ["community"],
     }
@@ -227,3 +235,30 @@ def test_bundled_alias_projector_preserves_document_type_and_reuses_plugin() -> 
 )
 def test_pre_seal_plugin_bridges_are_retired(module: str) -> None:
     assert importlib.util.find_spec(module) is None
+
+
+def test_core_scanned_extraction_has_no_financial_or_tax_semantics() -> None:
+    root = Path(__file__).resolve().parents[2]
+    sources = [
+        root / "docmirror/input/extraction/extractor.py",
+        root / "docmirror/input/extraction/scanned_table_reconstructor.py",
+    ]
+    forbidden = (
+        "docmirror.plugins",
+        "financial_statement",
+        "tax_return",
+        "资产负债表",
+        "利润表",
+        "现金流量表",
+        "纳税申报",
+        "一般项目",
+        "即征即退",
+    )
+
+    for path in sources:
+        text = path.read_text(encoding="utf-8")
+        assert not any(marker in text for marker in forbidden), path
+
+    generic_adapter = (root / "docmirror/plugins/_base/generic_community_adapter.py").read_text(encoding="utf-8")
+    assert "_FINANCIAL_PERIOD_HEADER_RE" not in generic_adapter
+    assert "_trim_trailing_statement_noise" not in generic_adapter

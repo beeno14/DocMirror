@@ -29,6 +29,7 @@ _STANDARD_HEADER = [
     "柜员",
     "备注",
     "_source_page",
+    "_source_sequence_no",
 ]
 _DATE_RE = re.compile(r"(?<!\d)(20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2})(?!\d)")
 _DIRECTION_RE = re.compile(r"(收入|收人|支出|支山|支鼎|攴出)")
@@ -1120,8 +1121,13 @@ def _select_balance_chain_candidates(
 
 def _clear_repair_marker(row: list[str]) -> list[str]:
     cleaned = list(row)
+    sequence = _repair_meta(cleaned).get("sequence_no")
+    while len(cleaned) < len(_STANDARD_HEADER):
+        cleaned.append("")
     if len(cleaned) > 9 and str(cleaned[9]).startswith(_REPAIR_META_PREFIX):
         cleaned[9] = ""
+    if isinstance(sequence, int):
+        cleaned[11] = str(sequence)
     return cleaned
 
 
@@ -1334,6 +1340,8 @@ def _header_mapping(header: list[str]) -> dict[str, int]:
             mapping["teller"] = idx
         elif "备注" in key:
             mapping["remark"] = idx
+        elif key in {"序号", "流水号"}:
+            mapping["sequence"] = idx
     return mapping
 
 
@@ -1367,6 +1375,8 @@ def _normalize_row(row: list[str], mapping: dict[str, int]) -> list[str]:
         _value(row, mapping.get("institution")),
         _value(row, mapping.get("teller")),
         _value(row, mapping.get("remark")),
+        "",
+        _value(row, mapping.get("sequence")),
     ]
 
 

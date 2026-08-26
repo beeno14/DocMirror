@@ -31,9 +31,11 @@ from fastapi.responses import FileResponse
 from docmirror import __version__
 from docmirror.input.entry.options import normalize_parse_policy
 from docmirror.sdk.integration.request import InputRef, ParseRequest
+from docmirror.server.parse_admission_queue import ParseCapacityError
+from docmirror.server.parse_process_manager import get_parse_process_manager
 from docmirror.server.task_api import router as task_router
 from docmirror.server.task_api import submit_upload_task
-from docmirror.server.task_executor import execute_parse_task, task_output_root
+from docmirror.server.task_executor import task_output_root
 
 # Load .env from project root
 _env_root = Path(__file__).resolve().parent.parent.parent
@@ -66,27 +68,16 @@ async def _cleanup_stale_temp_files():
         logger.info(f"[Server] Cleaned {cleaned} stale temp file(s) on startup")
 
 
-async def _warmup_ocr_engine():
-    """Pre-load OCR ONNX model on startup to avoid cold-start latency.
-
-    First request otherwise pays ~500ms-2s for model loading.
-    """
-    try:
-        from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
-
-        engine = get_ocr_engine()
-        if engine:
-            logger.info("[Server] OCR engine warmed up on startup")
-    except Exception as e:
-        logger.debug(f"[Server] OCR warmup skipped: {e}")
-
-
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """Own process startup through FastAPI's non-deprecated lifespan API."""
     await _cleanup_stale_temp_files()
-    await _warmup_ocr_engine()
-    yield
+    manager = get_parse_process_manager()
+    await manager.startup()
+    try:
+        yield
+    finally:
+        await manager.shutdown()
 
 
 app = FastAPI(
@@ -242,12 +233,16 @@ async def parse_file_on_server(
             max_pages=max_pages,
             workers=workers,
         )
-        result = await execute_parse_task(
+        task_id = f"task_{uuid4().hex}"
+        background = await get_parse_process_manager().start(
             request,
             output_root=task_output_root(),
-            task_id=f"task_{uuid4().hex}",
+            task_id=task_id,
         )
+        result = await background
         return result.public_dict()
+    except ParseCapacityError as e:
+        raise HTTPException(status_code=503, detail="Document parser capacity is currently exhausted") from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

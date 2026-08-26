@@ -24,6 +24,8 @@ _BUNDLED_POST_SEAL_DOMAINS = (
     "vat_invoice",
     "business_license",
     "credit_report",
+    "financial_statement",
+    "tax_return",
     "generic",
 )
 

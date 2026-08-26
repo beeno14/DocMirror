@@ -36,6 +36,7 @@ def _infer_cell_value(
         return CellValue(
             text=text,
             data_type=DataType.EMPTY,
+            confidence=geometry_confidence if geometry_confidence is not None else 1.0,
             bbox=bbox,
             row_index=row_index,
             col_index=col_index,
@@ -52,6 +53,7 @@ def _infer_cell_value(
 
     def _with_geometry_kwargs(**kwargs):
         kwargs.update(
+            confidence=geometry_confidence if geometry_confidence is not None else 1.0,
             bbox=bbox,
             row_index=row_index,
             col_index=col_index,

@@ -226,6 +226,7 @@ def test_native_glyph_mapping_detector_ignores_isolated_legitimate_repetition():
 
 def test_vnext_extractor_suppresses_text_owned_by_scanned_table(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
+    import docmirror.input.extraction.scanned_table_reconstructor as scanned_table_module
 
     class FakeEvidencePlaneBuilder:
         def build(self, _path):
@@ -256,20 +257,22 @@ def test_vnext_extractor_suppresses_text_owned_by_scanned_table(monkeypatch):
             ),
         ]
 
-    def fake_reconstruct(blocks, *, page_number, page_width, page_height, start_order=0):
+    def fake_reconstruct(_image, blocks, *, page_number, page_width, page_height, start_order=0):
         _ = (blocks, page_width, page_height)
-        return Block(
-            block_id=f"scanned_table:p{page_number:04d}:0000",
-            block_type="table",
-            page=page_number,
-            reading_order=start_order,
-            raw_content=[["项目"], ["货币资金"]],
-            evidence_ids=(f"ocr:{page_number}:row0", f"ocr:{page_number}:row1"),
-        )
+        return [
+            Block(
+                block_id=f"scanned_table:p{page_number:04d}:0000",
+                block_type="table",
+                page=page_number,
+                reading_order=start_order,
+                raw_content=[["项目"], ["货币资金"]],
+                evidence_ids=(f"ocr:{page_number}:row0", f"ocr:{page_number}:row1"),
+            )
+        ]
 
     monkeypatch.setattr(evidence_plane_module, "EvidencePlaneBuilder", FakeEvidencePlaneBuilder)
     monkeypatch.setattr(extractor_module, "_ocr_blocks_for_pdf_page", fake_ocr)
-    monkeypatch.setattr(extractor_module, "reconstruct_scanned_statement_table", fake_reconstruct)
+    monkeypatch.setattr(scanned_table_module, "reconstruct_scanned_bordered_tables", fake_reconstruct)
 
     policy = normalize_parse_policy(pages="3", ocr="force")
     result = asyncio.run(CoreExtractor().extract_parse_result(Path("sample.pdf"), options={"parse_policy": policy}))
@@ -323,7 +326,7 @@ def test_vnext_extractor_expands_one_physical_page_to_two_logical_pages(monkeypa
     assert result.parser_info.options["selected_source_pages"] == [3]
 
 
-def test_ocr_orientation_metrics_trigger_probe_for_garbage_and_reward_early_title():
+def test_ocr_orientation_metrics_trigger_probe_for_garbage_and_reward_coherent_text():
     garbage = [(0, 0, 10, 10, "000000000", None, None, None, 0.9) for _ in range(6)]
     good = [
         (0, 0, 10, 10, "所有者权益变动表", None, None, None, 0.9),
@@ -335,5 +338,5 @@ def test_ocr_orientation_metrics_trigger_probe_for_garbage_and_reward_early_titl
     good_metrics = extractor_module._ocr_orientation_metrics(good)
 
     assert extractor_module._needs_orientation_probe(garbage_metrics) is True
-    assert good_metrics["early_keywords"] >= 1
+    assert good_metrics["early_coherent_text"] >= 1
     assert good_metrics["score"] > garbage_metrics["score"]
