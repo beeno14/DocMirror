@@ -52,6 +52,8 @@ _CONFUSION_MAP = {
     "x": "*",
 }
 
+_EMPTY_QUOTE_PAIRS = ("“”", "‘’", '""', "''")
+
 
 def normalize_allowlist_text(text: str, allowed_charset: Iterable[str], *, max_chars: int | None = None) -> str:
     """Normalize OCR text under a strict allowlist.
@@ -97,6 +99,7 @@ def recognize_micro_cell_from_image(
     page_height: float,
     allowed_charset: Iterable[str],
     max_chars: int | None = None,
+    isolate_glyph: bool = False,
     min_confidence: float = 0.35,
     reference_templates: dict[str, list[Any]] | None = None,
 ) -> CellRecognition:
@@ -106,13 +109,14 @@ def recognize_micro_cell_from_image(
         return CellRecognition("", 0.0, "unavailable", audit={"reason": "missing_page_image"})
 
     image_height, image_width = int(shape[0]), int(shape[1])
+    render_scale = max(image_width / max(page_width, 1.0), image_height / max(page_height, 1.0))
     region = pdf_bbox_to_image_region(
         bbox,
         page_width=page_width,
         page_height=page_height,
         image_width=image_width,
         image_height=image_height,
-        pad_px=0,
+        pad_px=max(2, min(5, int(round(render_scale)))),
     )
     if region[2] - region[0] < 3 or region[3] - region[1] < 3:
         return CellRecognition("", 0.0, "unavailable", audit={"reason": "empty_region", "region": region})
@@ -127,6 +131,9 @@ def recognize_micro_cell_from_image(
         if crop is None or getattr(crop, "size", 0) == 0:
             return CellRecognition("", 0.0, "unavailable", audit={"reason": "empty_crop", "region": region})
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if len(crop.shape) == 3 else crop.copy()
+        color = (
+            cv2.cvtColor(crop, cv2.COLOR_RGB2BGR) if len(crop.shape) == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        )
         border = max(1, int(round(min(gray.shape[:2]) * 0.07)))
         cleaned = gray.copy()
         cleaned[:border, :] = 255
@@ -151,18 +158,60 @@ def recognize_micro_cell_from_image(
         glyph_clean = _isolate_cell_glyph(otsu, np=np, cv2=cv2)
         glyph_template = _normalize_glyph_template(glyph_clean, np=np, cv2=cv2)
         variants = [
-            ("gray_2x", cv2.resize(cleaned, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)),
-            ("otsu_4x", cv2.resize(otsu, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)),
-            ("adaptive_4x", cv2.resize(adaptive, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)),
-            ("inverted_4x", cv2.resize(255 - otsu, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)),
-            ("glyph_clean_4x", cv2.resize(glyph_clean, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST)),
+            ("color_crop", color),
+            ("gray_crop", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)),
             (
-                "glyph_clean_6x",
-                cv2.GaussianBlur(
-                    cv2.resize(glyph_clean, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_CUBIC), (3, 3), 0
+                "gray_2x",
+                cv2.cvtColor(
+                    cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC),
+                    cv2.COLOR_GRAY2BGR,
+                ),
+            ),
+            (
+                "otsu_4x",
+                cv2.cvtColor(
+                    cv2.resize(otsu, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
+                ),
+            ),
+            (
+                "adaptive_4x",
+                cv2.cvtColor(
+                    cv2.resize(adaptive, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
+                ),
+            ),
+            (
+                "inverted_4x",
+                cv2.cvtColor(
+                    cv2.resize(255 - otsu, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
                 ),
             ),
         ]
+        if max_chars == 1 or isolate_glyph:
+            variants.extend(
+                [
+                    (
+                        "glyph_clean_4x",
+                        cv2.cvtColor(
+                            cv2.resize(glyph_clean, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_NEAREST),
+                            cv2.COLOR_GRAY2BGR,
+                        ),
+                    ),
+                    (
+                        "glyph_clean_6x",
+                        cv2.cvtColor(
+                            cv2.GaussianBlur(
+                                cv2.resize(glyph_clean, None, fx=6.0, fy=6.0, interpolation=cv2.INTER_CUBIC),
+                                (3, 3),
+                                0,
+                            ),
+                            cv2.COLOR_GRAY2BGR,
+                        ),
+                    ),
+                ]
+            )
         engine = get_ocr_engine()
         observations: list[dict[str, Any]] = []
         for variant_name, variant in variants:
@@ -204,6 +253,17 @@ def recognize_micro_cell_from_image(
                         "confidence": round(n_confidence, 4),
                     }
                 )
+        if max_chars == 1 and {"-", "—"}.intersection(set(allowed_charset)):
+            dash_confidence = _dash_shape_confidence(otsu, np=np, cv2=cv2)
+            if dash_confidence >= 0.8:
+                observations.append(
+                    {
+                        "variant": "glyph_shape_dash",
+                        "raw_text": "—",
+                        "text": "—",
+                        "confidence": round(dash_confidence, 4),
+                    }
+                )
         if max_chars == 1 and glyph_template is not None and reference_templates:
             template_vote = _match_reference_templates(glyph_template, reference_templates, np=np)
             if template_vote is not None:
@@ -231,14 +291,18 @@ def recognize_micro_cell_from_image(
     counts = Counter(str(item["text"]) for item in usable)
     text, vote_count = max(
         counts.items(),
-        key=lambda pair: (pair[1], max(float(item["confidence"]) for item in usable if item["text"] == pair[0])),
+        key=lambda pair: (
+            pair[1],
+            len(pair[0]),
+            max(float(item["confidence"]) for item in usable if item["text"] == pair[0]),
+        ),
     )
     agreeing = [item for item in usable if item["text"] == text]
     confidence = max(float(item["confidence"]) for item in agreeing)
     # A single OCR vote is insufficient for one-character status cells. This
     # protects legitimate overdue digits from star/digit OCR confusion.
     shape_confirmed = any(
-        item["variant"] in {"glyph_shape", "glyph_shape_n", "document_glyph_template"}
+        item["variant"] in {"glyph_shape", "glyph_shape_n", "glyph_shape_dash", "document_glyph_template"}
         and float(item["confidence"]) >= 0.8
         for item in agreeing
     )
@@ -258,6 +322,136 @@ def recognize_micro_cell_from_image(
         raw_text=str(best["raw_text"]),
         audit={"region": region, "votes": observations, "consensus_count": vote_count},
     )
+
+
+def recover_empty_quote_dash_from_image(
+    page_image: Any,
+    text: str,
+    bbox: BBox,
+    *,
+    page_width: float,
+    page_height: float,
+    min_shape_confidence: float = 0.8,
+    max_repairs: int = 2,
+) -> CellRecognition | None:
+    """Recover visually confirmed horizontal dashes omitted between adjacent quotes.
+
+    The detector is intentionally structural. It does not use document titles,
+    field labels, line numbers, or domain vocabularies. A repair is accepted only
+    when a centered horizontal glyph is present in the estimated missing-character
+    slot. Empty quotes without supporting pixels are left unchanged.
+
+    Args:
+        page_image: Rendered source page image.
+        text: OCR text associated with ``bbox``.
+        bbox: OCR token bounding box in PDF coordinates.
+        page_width: Source page width in PDF coordinates.
+        page_height: Source page height in PDF coordinates.
+        min_shape_confidence: Minimum visual dash-shape confidence.
+        max_repairs: Maximum number of quote gaps repaired in one token.
+
+    Returns:
+        A recognition containing repaired text and audit evidence, or ``None``
+        when no repair is supported by the image.
+    """
+
+    source_text = str(text or "")
+    if not source_text or not _supports_uniform_cjk_slot_estimation(source_text):
+        return None
+    quote_gaps = _empty_quote_gap_positions(source_text)
+    if not quote_gaps:
+        return None
+
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    selected_gaps = quote_gaps[: max(0, int(max_repairs))]
+    expected_length = len(source_text) + len(quote_gaps)
+    if expected_length <= 0:
+        return None
+    slot_width = (x1 - x0) / expected_length
+    if slot_width <= 0:
+        return None
+
+    accepted: list[dict[str, Any]] = []
+    for gap_ordinal, close_index in enumerate(selected_gaps):
+        expected_index = close_index + gap_ordinal
+        centre_x = x0 + (expected_index + 0.5) * slot_width
+        glyph_bbox: BBox = (
+            max(x0, centre_x - slot_width * 0.8),
+            y0,
+            min(x1, centre_x + slot_width * 0.8),
+            y1,
+        )
+        recognition = recognize_micro_cell_from_image(
+            page_image,
+            glyph_bbox,
+            page_width=page_width,
+            page_height=page_height,
+            allowed_charset={"-", "—", "−"},
+            max_chars=1,
+            isolate_glyph=True,
+            min_confidence=0.35,
+        )
+        shape_votes = [
+            vote
+            for vote in recognition.audit.get("votes", [])
+            if vote.get("variant") == "glyph_shape_dash"
+            and float(vote.get("confidence") or 0.0) >= min_shape_confidence
+        ]
+        if not shape_votes:
+            continue
+        accepted.append(
+            {
+                "close_index": close_index,
+                "glyph_bbox": list(glyph_bbox),
+                "confidence": max(float(vote["confidence"]) for vote in shape_votes),
+                "reason": "empty_quote_horizontal_dash_shape",
+                "recognition": recognition.to_dict(),
+            }
+        )
+
+    if not accepted:
+        return None
+    repaired = source_text
+    for item in sorted(accepted, key=lambda value: int(value["close_index"]), reverse=True):
+        close_index = int(item["close_index"])
+        repaired = f"{repaired[:close_index]}-{repaired[close_index:]}"
+    return CellRecognition(
+        repaired,
+        min(float(item["confidence"]) for item in accepted),
+        "empty_quote_dash_shape",
+        raw_text=source_text,
+        audit={"repairs": sorted(accepted, key=lambda value: int(value["close_index"]))},
+    )
+
+
+def _empty_quote_gap_positions(text: str) -> list[int]:
+    """Return closing-quote indexes for non-overlapping adjacent quote pairs."""
+
+    positions: list[int] = []
+    occupied: set[int] = set()
+    for pair in _EMPTY_QUOTE_PAIRS:
+        start = 0
+        while True:
+            index = text.find(pair, start)
+            if index < 0:
+                break
+            if index not in occupied and index + 1 not in occupied:
+                positions.append(index + 1)
+                occupied.update((index, index + 1))
+            start = index + len(pair)
+    return sorted(positions)
+
+
+def _supports_uniform_cjk_slot_estimation(text: str) -> bool:
+    """Return whether token geometry can conservatively approximate character slots."""
+
+    visible = [character for character in text if not character.isspace()]
+    if len(visible) < 5:
+        return False
+    cjk_count = sum("\u3400" <= character <= "\u9fff" for character in visible)
+    return cjk_count >= 3 and cjk_count / len(visible) >= 0.45
 
 
 def _star_shape_confidence(binary_white: Any, *, np: Any, cv2: Any) -> float:
@@ -319,6 +513,39 @@ def _n_shape_confidence(binary_white: Any, *, np: Any, cv2: Any) -> float:
         return 0.0
     compact = isolated[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1] < 128
     return 0.9 if _looks_like_n(compact, np=np) else 0.0
+
+
+def _dash_shape_confidence(binary_white: Any, *, np: Any, cv2: Any) -> float:
+    """Return conservative confidence for a centered horizontal dash glyph."""
+    ink = (binary_white < 128).astype(np.uint8)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    height, width = ink.shape[:2]
+    candidates: list[float] = []
+    for index in range(1, count):
+        x, y, component_width, component_height, area = (int(value) for value in stats[index])
+        aspect = component_width / max(component_height, 1)
+        if (
+            area < 4
+            or aspect < 3.0
+            or component_width < max(4, int(round(width * 0.04)))
+            or component_width > width * 0.72
+            or component_height > max(4, height * 0.24)
+            or x <= 0
+            or y <= 0
+            or x + component_width >= width
+            or y + component_height >= height
+        ):
+            continue
+        centre_x, centre_y = (float(value) for value in centroids[index])
+        if not width * 0.18 <= centre_x <= width * 0.82 or not height * 0.25 <= centre_y <= height * 0.75:
+            continue
+        component = labels == index
+        column_coverage = float(np.count_nonzero(component.any(axis=0))) / max(component_width, 1)
+        row_density = float(component.sum(axis=1).max()) / max(component_width, 1)
+        if column_coverage < 0.85 or row_density < 0.55:
+            continue
+        candidates.append(min(0.95, 0.78 + min(aspect, 8.0) * 0.02 + row_density * 0.03))
+    return max(candidates, default=0.0)
 
 
 def _looks_like_n(ink: Any, *, np: Any) -> bool:

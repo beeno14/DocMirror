@@ -28,6 +28,7 @@ from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
 )
 from docmirror.plugins.bank_statement.style_registry import (
     BankTableCandidate,
+    _candidate_expected_rows,
     _candidate_from_batch,
     _select_candidate,
 )
@@ -321,6 +322,79 @@ def test_candidate_selection_prefers_equal_quality_native_physical_cells() -> No
     assert selected is not None
     assert selected.candidate_id == "native_wide_table"
     assert diagnostics["selected_candidate"] == "native_wide_table"
+
+
+def test_candidate_selection_does_not_prefer_native_cells_with_suspicious_glyph_mapping() -> None:
+    evidence = RowCountEvidence(count=150, source="physical_rows", confidence=0.95)
+    selected, diagnostics = _select_candidate(
+        [
+            _candidate("ocr_implicit_table", rows=150, expected_rows=evidence, extraction_confidence=0.90),
+            _candidate(
+                "native_wide_table",
+                rows=150,
+                expected_rows=evidence,
+                extraction_confidence=0.85,
+                native_cell_coverage=1.0,
+            ),
+        ],
+        native_text_suspicious=True,
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "ocr_implicit_table"
+    assert diagnostics["selected_candidate"] == "ocr_implicit_table"
+
+
+def test_candidate_selection_replaces_native_legacy_with_equal_quality_ocr_when_glyphs_are_suspicious() -> None:
+    inferred_evidence = RowCountEvidence(count=10, source="page_transaction_anchors", confidence=0.93)
+    candidate_evidence = _candidate_expected_rows(inferred_evidence, count=150)
+    legacy = _candidate(
+        "legacy_primary",
+        rows=150,
+        expected_rows=candidate_evidence,
+        extraction_confidence=0.80,
+        source_column_width=9.0,
+        sequence_continuity=0.20,
+        native_cell_coverage=1.0,
+    )
+    legacy.source = "native_wide_table"
+    selected, diagnostics = _select_candidate(
+        [
+            legacy,
+            _candidate(
+                "native_wide_table",
+                rows=150,
+                expected_rows=candidate_evidence,
+                extraction_confidence=0.85,
+                source_column_width=8.0,
+                sequence_continuity=0.20,
+                native_cell_coverage=1.0,
+            ),
+            _candidate(
+                "ocr_implicit_table",
+                rows=150,
+                expected_rows=RowCountEvidence(
+                    count=150,
+                    source="positioned_date_anchors",
+                    confidence=0.95,
+                ),
+                extraction_confidence=0.70,
+                source_column_width=8.0,
+            ),
+        ],
+        native_text_suspicious=True,
+    )
+
+    assert selected is not None
+    assert selected.candidate_id == "ocr_implicit_table"
+    assert diagnostics["selection_reason"].startswith("native_text_suspicious:ocr_not_lower_quality:")
+
+
+def test_candidate_row_evidence_replaces_incomplete_inferred_anchor_count() -> None:
+    inferred = RowCountEvidence(count=10, source="page_transaction_anchors", confidence=0.93)
+    expected = _candidate_expected_rows(inferred, count=150)
+
+    assert expected == RowCountEvidence(count=150, source="candidate_rows", confidence=0.55)
 
 
 def test_candidate_derived_count_cannot_replace_full_native_candidate():

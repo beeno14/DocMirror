@@ -231,3 +231,42 @@ def test_native_wide_table_uses_independent_positioned_date_count(monkeypatch) -
     assert meta.expected_primary_rows == 8
     assert meta.canonical_extracted == 8
     assert meta.coverage_ratio == 1.0
+
+
+def test_ocr_implicit_table_uses_complete_positioned_date_count(monkeypatch) -> None:
+    import docmirror.plugins.bank_statement.canonical_quality as canonical_quality
+
+    monkeypatch.setattr(canonical_quality, "canonical_expected_from_parse_result", lambda _parse_result: 4)
+    records = [
+        {
+            "normalized": {
+                "date": f"2025-01-{index:02d}",
+                "amount": 1.0,
+                "direction": "income",
+            }
+        }
+        for index in range(1, 9)
+    ]
+    meta = build_style_meta(
+        SimpleNamespace(
+            primary_style="grid_standard",
+            confidence=1.0,
+            parser_chain=[],
+            institution_hint=None,
+            secondary_styles=[],
+            institution_authority="",
+        ),
+        reconstruction=ReconstructionMeta(
+            source="ocr_implicit_table",
+            expected_primary_rows=8,
+            expected_evidence_source="positioned_date_anchors",
+            expected_evidence_confidence=0.95,
+        ),
+        parse_result=SimpleNamespace(),
+        records=records,
+        record_count=8,
+    )
+
+    assert meta.expected_primary_rows == 8
+    assert meta.canonical_extracted == 8
+    assert meta.coverage_ratio == 1.0

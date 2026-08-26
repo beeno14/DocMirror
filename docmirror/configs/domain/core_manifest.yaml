@@ -86,7 +86,6 @@ domains:
       domain_contract: resources/generic/domain_contract.yaml
       layout_profiles: resources/generic/layout_profiles.yaml
       route_overrides: resources/generic/route_overrides.yaml
-      scanned_statement_profile: resources/generic/scanned_statement_profile.yaml
       classification_rules: resources/generic/classification_rules.yaml
       ocr_corrections: resources/generic/ocr_corrections.yaml
       ocr_corrections_financial: resources/generic/ocr_corrections_financial.yaml

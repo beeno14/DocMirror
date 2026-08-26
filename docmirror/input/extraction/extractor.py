@@ -51,7 +51,7 @@ from .page_splitter import (
     confirm_document_plan_rotation,
     split_or_passthrough,
 )
-from .scanned_table_reconstructor import reconstruct_scanned_statement_table
+from .scanned_table_reconstructor import needs_high_precision_grid_review
 from .table_postprocessor import process_page_tables
 
 logger = logging.getLogger(__name__)
@@ -185,7 +185,43 @@ def _ocr_blocks_for_pdf_page(
                 evidence_ids=(block_id,),
             )
         )
+    if needs_high_precision_grid_review(blocks):
+        review_image = _render_pdf_page_image(
+            file_path,
+            page_index,
+            zoom=3.0,
+            rotation=rotation,
+            np=np,
+            fitz=fitz,
+        )
+        if review_image is not None:
+            selected_image = review_image
     return blocks, selected_image
+
+
+def _render_pdf_page_image(
+    file_path: Path,
+    page_index: int,
+    *,
+    zoom: float,
+    rotation: int,
+    np: Any,
+    fitz: Any,
+) -> Any | None:
+    """Render one source page for downstream region review without rerunning page OCR."""
+
+    try:
+        with fitz.open(file_path) as doc:
+            if page_index < 0 or page_index >= len(doc):
+                return None
+            pix = doc[page_index].get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        if pix.n >= 3:
+            image = image[:, :, :3]
+        return _rotate_image(image, rotation)
+    except Exception as exc:
+        logger.debug("[DocMirror] high-precision table review render skipped: %s", exc)
+        return None
 
 
 def _select_ocr_orientation(
@@ -223,7 +259,7 @@ def _select_ocr_orientation(
 def _needs_orientation_probe(metrics: dict[str, Any]) -> bool:
     if float(metrics["score"]) < 260:
         return True
-    if int(metrics["keywords"]) == 0 and int(metrics["long_cjk"]) < 8 and int(metrics["garbage_zero9"]) >= 3:
+    if int(metrics["coherent_text"]) == 0 and int(metrics["long_cjk"]) < 8 and int(metrics["garbage_zero9"]) >= 3:
         return True
     return False
 
@@ -245,37 +281,26 @@ def _rotate_image(image: Any, rotation: int) -> Any:
 def _ocr_orientation_metrics(words: list[Any]) -> dict[str, Any]:
     import re
 
-    keywords = (
-        "个人信用报告",
-        "报告编号",
-        "查询请求时间",
-        "身份信息",
-        "信贷交易信息",
-        "资产负债表",
-        "利润表",
-        "现金流量表",
-        "所有者权益变动表",
-        "合并所有者权益变动表",
-        "本年发生额",
-        "上年发生额",
-        "所有者权益合计",
-        "实收资本",
-        "资本公积",
-        "未分配利润",
-    )
     texts = [str(word[4] or "").strip() for word in words if len(word) >= 5 and str(word[4] or "").strip()]
     joined = " ".join(texts)
-    early_joined = " ".join(texts[:20])
-    keyword_hits = sum(joined.count(keyword) for keyword in keywords)
-    early_keyword_hits = sum(early_joined.count(keyword) for keyword in keywords)
     number_count = sum(1 for text in texts if re.search(r"\d[\d,]*(?:\.\d+)?", text))
     cjk_count = sum(1 for text in texts if re.search(r"[\u4e00-\u9fff]", text))
     long_cjk = sum(1 for text in texts if len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2)
+    coherent_text = sum(
+        1
+        for text in texts
+        if len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2 or bool(re.search(r"[A-Za-z]{4,}", text))
+    )
+    early_coherent_text = sum(
+        1
+        for text in texts[:20]
+        if len(re.findall(r"[\u4e00-\u9fff]", text)) >= 2 or bool(re.search(r"[A-Za-z]{4,}", text))
+    )
     garbage_zero9 = sum(1 for text in texts if re.fullmatch(r"[0Oo9]{3,}", text))
     score = (
         len(joined)
-        + keyword_hits * 60
-        + early_keyword_hits * 90
+        + coherent_text * 12
+        + early_coherent_text * 18
         + long_cjk * 6
         + number_count * 2
         + cjk_count
@@ -285,8 +310,8 @@ def _ocr_orientation_metrics(words: list[Any]) -> dict[str, Any]:
         "score": round(float(score), 4),
         "word_count": len(texts),
         "char_count": len(joined),
-        "keywords": keyword_hits,
-        "early_keywords": early_keyword_hits,
+        "coherent_text": coherent_text,
+        "early_coherent_text": early_coherent_text,
         "numbers": number_count,
         "cjk_tokens": cjk_count,
         "long_cjk": long_cjk,
@@ -652,17 +677,6 @@ def _page_layout_from_blocks(
         for scanned_table in scanned_tables:
             blocks = _remove_table_owned_text_blocks(blocks, scanned_table)
         blocks.extend(scanned_tables)
-    else:
-        scanned_table = reconstruct_scanned_statement_table(
-            blocks,
-            page_number=logical_page_number,
-            page_width=width,
-            page_height=height,
-            start_order=len(blocks),
-        )
-        if scanned_table is not None:
-            blocks = _remove_table_owned_text_blocks(blocks, scanned_table)
-            blocks.append(scanned_table)
     return PageLayout(
         page_number=logical_page_number,
         width=width,

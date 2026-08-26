@@ -9,6 +9,39 @@ from typing import Any
 
 from docmirror.plugins._base.projector import ProjectionData
 
+_RECORD_METADATA_KEYS = {
+    "record_id",
+    "normalized",
+    "canonical_raw",
+    "raw",
+    "source",
+    "confidence",
+    "review",
+}
+def _source_columns(rows: list[dict[str, Any]]) -> list[str]:
+    """Return first-seen business columns from source records."""
+    ordered: list[str] = []
+    for row in rows:
+        raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else row.get("raw")
+        normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else None
+        record_pools = (raw, normalized) if isinstance(raw, dict) or isinstance(normalized, dict) else (row,)
+        pools = [pool for pool in record_pools if isinstance(pool, dict)]
+        for pool in pools:
+            for key in pool:
+                name = str(key)
+                if name not in _RECORD_METADATA_KEYS and name not in ordered:
+                    ordered.append(name)
+    return ordered
+
+
+def _dataset_column_semantic(datasets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    orders = {dataset_id: _source_columns(rows) for dataset_id, rows in datasets.items()}
+    orders = {dataset_id: columns for dataset_id, columns in orders.items() if columns}
+    return {
+        "dataset_column_order": orders,
+        "dataset_reading_columns": orders,
+    }
+
 
 def make_generic_projection(
     detected_type: str,
@@ -23,11 +56,23 @@ def make_generic_projection(
         if isinstance(descriptor, dict)
         and descriptor.get("value", descriptor.get("normalized_value")) not in (None, "")
     }
-    canonical_records = [
-        {**dict(record), "record_id": str(record.get("record_id") or f"records:r{index:06d}")}
-        for index, record in enumerate(records, start=1)
-        if isinstance(record, dict)
-    ]
+    raw_datasets = structured_data.get("datasets")
+    if not isinstance(raw_datasets, dict):
+        raw_datasets = {"records": records} if records else {}
+    canonical_datasets: dict[str, list[dict[str, Any]]] = {}
+    for dataset_id, dataset_rows in raw_datasets.items():
+        if not isinstance(dataset_rows, list):
+            continue
+        canonical_rows = [
+            {
+                **dict(record),
+                "record_id": str(record.get("record_id") or f"{dataset_id}:r{index:06d}"),
+            }
+            for index, record in enumerate(dataset_rows, start=1)
+            if isinstance(record, dict)
+        ]
+        if canonical_rows:
+            canonical_datasets[str(dataset_id)] = canonical_rows
     return ProjectionData(
         projector_id="generic",
         document_type=detected_type,
@@ -48,7 +93,8 @@ def make_generic_projection(
             "columns": structured_data.get("columns", {}),
             "identities": structured_data.get("identities", {}),
         },
-        datasets={"records": canonical_records} if canonical_records else {},
+        semantic=_dataset_column_semantic(canonical_datasets),
+        datasets=canonical_datasets,
         sections=tuple(dict(section) for section in structured_data["sections"]),
         warnings=tuple(warnings),
         reason="post-seal generic projection",

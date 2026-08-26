@@ -68,6 +68,7 @@ _FOOTER_MARKERS = (
 _COUNT_PATTERNS = (re.compile(r"(?:总条数|交易总笔数|总笔数|合计笔数)[:：]\s*(?P<count>\d+)"),)
 _PAGE_COUNT_PATTERN = re.compile(r"本页交易笔数\s*[:：]\s*(?P<count>\d+)")
 _SOURCE_PAGE_RE = re.compile(r"第\s*(?P<page>\d+)\s*页\s*(?:[/／-]\s*)?共\s*(?P<total>\d+)\s*页")
+SOURCE_REPORTED_ROW_COUNT_SOURCES = frozenset({"split_footer", "header_total", "page_footer"})
 _NATIVE_DATETIME_RE = re.compile(r"(?P<date>20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\s+(?P<time>\d{1,2}:\d{2}:\d{2})")
 _NATIVE_SIGNED_MONEY_RE = re.compile(r"[+-](?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}")
 _NATIVE_UNSIGNED_MONEY_RE = re.compile(r"(?<![\d,])(?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2}(?!\d)")
@@ -836,8 +837,9 @@ def count_expected_rows_from_bank_footer(
     *,
     page_texts: Iterable[tuple[int, str]] | None = None,
 ) -> int:
-    """Return the compatible integer form of :func:`resolve_row_count_evidence`."""
-    return resolve_row_count_evidence(text, page_texts=page_texts).count
+    """Return only a transaction total explicitly reported by the source document."""
+    evidence = resolve_row_count_evidence(text, page_texts=page_texts)
+    return evidence.count if evidence.source in SOURCE_REPORTED_ROW_COUNT_SOURCES else 0
 
 
 def audit_bank_statement_invariants(

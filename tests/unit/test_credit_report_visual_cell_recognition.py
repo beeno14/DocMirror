@@ -10,6 +10,7 @@ from docmirror.ocr.micro_grid.cell_recognition import (
     extract_micro_cell_glyph_template,
     normalize_allowlist_text,
     recognize_micro_cell_from_image,
+    recover_empty_quote_dash_from_image,
 )
 from docmirror.ocr.micro_grid.reconstruct import equal_col_bands
 from docmirror.plugins.credit_report.repayment_grid import _visual_month_col_bands
@@ -18,6 +19,14 @@ from docmirror.plugins.credit_report.repayment_grid import _visual_month_col_ban
 class _EmptyEngine:
     def force_recognize_regions(self, *_args, **_kwargs):
         return []
+
+
+class _ColorRecognitionEngine:
+    def force_recognize_regions(self, image, regions):
+        assert image.ndim == 3
+        assert image.shape[2] == 3
+        x0, y0, x1, y1 = regions[0]
+        return [(x0, y0, x1, y1, "12.34", 0.98)]
 
 
 def _cell_image(character: str, *, noise: bool = False):
@@ -55,6 +64,76 @@ def test_cell_shape_recognizes_star_without_ocr(monkeypatch):
     assert result.source == "cell_crop_consensus"
 
 
+def test_cell_shape_recognizes_centered_dash_without_ocr(monkeypatch):
+    import docmirror.ocr.vision.rapidocr_engine as rapidocr_engine
+
+    monkeypatch.setattr(rapidocr_engine, "get_ocr_engine", lambda: _EmptyEngine())
+    image = np.full((180, 240, 3), 255, dtype=np.uint8)
+    cv2.rectangle(image, (30, 35), (210, 145), (0, 0, 0), 2)
+    cv2.line(image, (98, 90), (142, 90), (0, 0, 0), 4)
+
+    result = recognize_micro_cell_from_image(
+        image,
+        (30, 35, 210, 145),
+        page_width=240,
+        page_height=180,
+        allowed_charset={"-", "—"},
+        max_chars=1,
+        isolate_glyph=True,
+    )
+
+    assert result.text == "—"
+    assert any(vote["variant"] == "glyph_shape_dash" for vote in result.audit["votes"])
+
+
+def test_empty_quote_dash_recovery_uses_visual_shape_not_business_text(monkeypatch):
+    import docmirror.ocr.vision.rapidocr_engine as rapidocr_engine
+
+    monkeypatch.setattr(rapidocr_engine, "get_ocr_engine", lambda: _EmptyEngine())
+    text = "说明：符号写作“”并保留"
+    image = np.full((90, 420, 3), 255, dtype=np.uint8)
+    slot = text.index("”")
+    unit = 380 / (len(text) + 1)
+    centre_x = round(20 + (slot + 0.5) * unit)
+    cv2.line(image, (centre_x - 6, 45), (centre_x + 6, 45), (0, 0, 0), 2)
+
+    result = recover_empty_quote_dash_from_image(
+        image,
+        text,
+        (20, 20, 400, 70),
+        page_width=420,
+        page_height=90,
+    )
+
+    assert result is not None
+    assert result.text == "说明：符号写作“-”并保留"
+    assert result.audit["repairs"][0]["reason"] == "empty_quote_horizontal_dash_shape"
+
+
+@pytest.mark.parametrize("vertical_position", (None, 64))
+def test_empty_quote_dash_recovery_does_not_invent_unsupported_punctuation(monkeypatch, vertical_position):
+    import docmirror.ocr.vision.rapidocr_engine as rapidocr_engine
+
+    monkeypatch.setattr(rapidocr_engine, "get_ocr_engine", lambda: _EmptyEngine())
+    text = "说明：符号写作“”并保留"
+    image = np.full((90, 420, 3), 255, dtype=np.uint8)
+    if vertical_position is not None:
+        slot = text.index("”")
+        unit = 380 / (len(text) + 1)
+        centre_x = round(20 + (slot + 0.5) * unit)
+        cv2.line(image, (centre_x - 6, vertical_position), (centre_x + 6, vertical_position), (0, 0, 0), 2)
+
+    result = recover_empty_quote_dash_from_image(
+        image,
+        text,
+        (20, 20, 400, 70),
+        page_width=420,
+        page_height=90,
+    )
+
+    assert result is None
+
+
 def test_document_template_and_shape_recognize_noisy_n(monkeypatch):
     import docmirror.ocr.vision.rapidocr_engine as rapidocr_engine
 
@@ -76,6 +155,22 @@ def test_document_template_and_shape_recognize_noisy_n(monkeypatch):
         reference_templates={"N": [reference]},
     )
     assert result.text == "N"
+
+
+def test_multi_character_crop_ocr_uses_bgr_variants_and_consensus(monkeypatch):
+    import docmirror.ocr.vision.rapidocr_engine as rapidocr_engine
+
+    monkeypatch.setattr(rapidocr_engine, "get_ocr_engine", lambda: _ColorRecognitionEngine())
+    result = recognize_micro_cell_from_image(
+        _cell_image("1"),
+        (30, 35, 210, 145),
+        page_width=240,
+        page_height=180,
+        allowed_charset="0123456789.-",
+    )
+
+    assert result.text == "12.34"
+    assert result.audit["consensus_count"] >= 2
 
 
 def test_visual_month_geometry_uses_table_rules_not_header_text_bbox():

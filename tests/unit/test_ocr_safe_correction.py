@@ -37,6 +37,24 @@ def test_chinese_finance_correction_is_context_scoped():
     assert negative.output_text == "畜牧收入"
 
 
+def test_common_chinese_header_correction_is_domain_independent():
+    decision = SafeOCRCorrector().correct("般项目", CorrectionContext(role="text_line"))
+
+    assert decision.output_text == "一般项目"
+    assert decision.rule_id == "common.general_project_header"
+
+
+def test_exact_correction_is_idempotent_inside_text_line():
+    corrector = SafeOCRCorrector()
+    context = CorrectionContext(role="text_line")
+
+    corrected = corrector.correct("项目 栏次 般项目 即征即退项目", context).output_text
+
+    assert corrected == "项目 栏次 一般项目 即征即退项目"
+    assert corrector.correct(corrected, context).output_text == corrected
+    assert corrector.correct("一般项目 般项目", context).output_text == "一般项目 一般项目"
+
+
 def test_labeled_line_uses_field_context_without_touching_value():
     decision = SafeOCRCorrector().correct(
         "注册资木:1000万元",

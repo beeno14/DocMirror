@@ -396,6 +396,7 @@ def test_borderless_anchor_count_excludes_query_period_dates_before_table_header
 
     assert evidence.count == 2
     assert evidence.source == "page_transaction_anchors"
+    assert count_expected_rows_from_bank_footer("", page_texts=[(1, page_text)]) == 0
 
 
 def test_page_footer_transaction_counts_are_summed_across_pages() -> None:

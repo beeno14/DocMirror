@@ -19,7 +19,9 @@ from docmirror.models.entities.parse_result import (
 from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.community_bundle import (
+    _dataset_completeness,
     _dataset_section_id,
+    _markdown_text,
     render_community_reading_markdown,
 )
 from docmirror.output.community_bundle import (
@@ -180,6 +182,40 @@ def test_public_json_has_reading_model_and_complete_dataset_rows() -> None:
         "community_semantic",
         duplicated_semantic,
     ).valid
+
+
+def test_section_item_projects_existing_field_provenance_and_quality() -> None:
+    candidate = _candidate()
+    candidate["data"]["field_details"]["subject_name"] = {
+        "raw": "洪晓鑫",
+        "source_page": 1,
+        "bbox": [10.0, 20.0, 80.0, 40.0],
+        "evidence_ids": ["ev:subject-name"],
+        "source_refs": [{"page": 1, "bbox": [10.0, 20.0, 80.0, 40.0]}],
+        "confidence": 0.78,
+        "review": "manual_optional",
+    }
+    result = _with_projection(
+        ParseResult(
+            pages=[PageContent(page_number=1)],
+            entities=DocumentEntities(document_type="credit_report"),
+        ),
+        candidate,
+    )
+
+    bundle = project_community_bundle(result, file_id="001", document_id="doc_field_source")
+    payload = bundle.json_payload(bundle.semantic_payload())
+    item = next(item for section in payload["sections"] for item in section["items"] if item["key"] == "subject_name")
+
+    assert item["source"] == {
+        "page_range": [1, 1],
+        "bbox": [10.0, 20.0, 80.0, 40.0],
+        "evidence_ids": ["ev:subject-name"],
+        "source_refs": [{"page": 1, "bbox": [10.0, 20.0, 80.0, 40.0]}],
+    }
+    assert item["confidence"] == 0.78
+    assert item["review"] == "manual_optional"
+    assert validate_projection_payload("community", payload).valid
 
 
 def test_dataset_section_fallback_uses_first_source_page() -> None:
@@ -368,6 +404,129 @@ def test_enhanced_markdown_hides_configured_datasets_and_empty_columns() -> None
     assert "空字段" in default_markdown
 
 
+def test_enhanced_markdown_can_select_normalized_fields_without_losing_source_format() -> None:
+    payload = {
+        "schema": {"name": "docmirror.community"},
+        "document": {"id": "doc_tax", "title": "纳税申报表", "type": "tax_return"},
+        "domain": {
+            "extensions": {
+                "enhanced_markdown": {
+                    "dataset_layouts": {
+                        "tax_return_main": {
+                            "prefer_canonical_raw": True,
+                            "prefer_normalized_fields": ["line_no"],
+                            "prefer_normalized_source_headers": True,
+                            "render_source_header_rows": True,
+                        }
+                    }
+                }
+            }
+        },
+        "sections": [
+            {
+                "id": "sec_tax",
+                "title": "纳税申报表",
+                "type": "tax_form",
+                "items": [],
+                "groups": [],
+                "dataset_refs": ["ds_tax"],
+            }
+        ],
+        "datasets": [
+            {
+                "id": "ds_tax",
+                "name": "tax_return_main",
+                "label": "纳税申报表",
+                "columns": [
+                    {"key": "line_no", "label": "栏次", "type": "string"},
+                    {
+                        "key": "amount",
+                        "label": "一般项目/本月数",
+                        "type": "decimal",
+                        "source_header_bands": [
+                            {
+                                "level": 1,
+                                "role": "label",
+                                "raw": "般项目",
+                                "value": "一般项目",
+                                "source": {"page": 1, "table_id": "pt_1_0", "row": 0, "col": 1},
+                            }
+                        ],
+                    },
+                ],
+                "rows": [
+                    {
+                        "normalized": {"line_no": "17=12+13-14-15+16", "amount": "1234.50"},
+                        "canonical_raw": {"line_no": "17-12-13-14-1516", "amount": "1,234.50"},
+                    }
+                ],
+            }
+        ],
+        "reading": {
+            "document_flow": [
+                {"order": 1, "kind": "document", "ref_id": "doc_tax"},
+                {"order": 2, "kind": "section", "ref_id": "sec_tax"},
+                {"order": 3, "kind": "dataset", "ref_id": "ds_tax"},
+            ],
+            "tables": [{"dataset_id": "ds_tax", "title": "纳税申报表", "column_keys": ["line_no", "amount"]}],
+        },
+    }
+
+    enhanced = render_community_reading_markdown(payload)
+
+    assert "17=12+13-14-15+16" in enhanced
+    assert "17-12-13-14-1516" not in enhanced
+    assert "1,234.50" in enhanced
+    assert "|  | 一般项目 |" in enhanced
+    assert "般项目" not in enhanced.replace("一般项目", "")
+
+
+def test_source_row_ledger_blocks_verification_when_a_record_requires_review() -> None:
+    source = {"page": 1, "table_id": "pt_1_0", "source_row_index": 1}
+    completeness = _dataset_completeness(
+        ParseResult(),
+        "tax_return_main",
+        [{"source": source, "review": {"required": True, "reasons": ["tax_line_no_invalid"]}}],
+        {
+            "completeness": {
+                "*": {
+                    "basis": "domain_source_row_ledger",
+                    "ledger_key": "dataset_source_row_refs",
+                }
+            }
+        },
+        {"dataset_source_row_refs": {"tax_return_main": [source]}},
+    )
+
+    assert completeness["expected_row_count"] == 1
+    assert completeness["emitted_row_count"] == 1
+    assert completeness["verified"] is False
+
+
+def test_source_row_ledger_honors_configured_document_level_blockers() -> None:
+    source = {"page": 1, "table_id": "pt_1_0", "source_row_index": 1}
+    completeness = _dataset_completeness(
+        ParseResult(),
+        "tax_return_main",
+        [{"source": source}],
+        {
+            "completeness": {
+                "*": {
+                    "basis": "domain_source_row_ledger",
+                    "ledger_key": "dataset_source_row_refs",
+                    "verification_blocker_key": "dataset_verification_blockers",
+                }
+            }
+        },
+        {
+            "dataset_source_row_refs": {"tax_return_main": [source]},
+            "dataset_verification_blockers": {"tax_return_main": ["low_ocr_confidence"]},
+        },
+    )
+
+    assert completeness["verified"] is False
+
+
 def test_semantic_extension_can_override_dataset_reading_columns() -> None:
     result = _with_projection(
         ParseResult(entities=DocumentEntities(document_type="credit_report")),
@@ -389,12 +548,109 @@ def test_semantic_extension_can_override_dataset_reading_columns() -> None:
 
     semantic = project_community_bundle(result).semantic_payload()
     reading_table = next(
-        table
-        for table in semantic["reading"]["tables"]
-        if table["dataset_id"] == "ds_repayment_records"
+        table for table in semantic["reading"]["tables"] if table["dataset_id"] == "ds_repayment_records"
     )
 
     assert reading_table["column_keys"] == ["status"]
+
+
+def test_semantic_source_column_metadata_controls_json_csv_and_reading_order() -> None:
+    candidate = _candidate()
+    candidate["data"]["financial_records"] = [
+        {
+            "项目": "销售额",
+            "项目_2": "按适用税率征税销售额",
+            "栏次": "1",
+            "一般项目/本月数": "22,614,609.92",
+            "一般项目/本年累计": "175,103,791.52",
+            "即征即退项目/本月数": "0.00",
+            "即征即退项目/本年累计": "0.00",
+        }
+    ]
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        candidate,
+    )
+    source_order = [
+        "项目",
+        "项目_2",
+        "栏次",
+        "一般项目/本月数",
+        "一般项目/本年累计",
+        "即征即退项目/本月数",
+        "即征即退项目/本年累计",
+    ]
+    _PROJECTIONS[id(result)]["semantic"] = {
+        "dataset_column_order": {"financial_records": source_order},
+        "dataset_reading_columns": {"financial_records": source_order},
+    }
+
+    bundle = project_community_bundle(result, file_id="001")
+    semantic = bundle.semantic_payload()
+    dataset = next(item for item in semantic["datasets"] if item["name"] == "financial_records")
+    reading_table = next(item for item in semantic["reading"]["tables"] if item["dataset_id"] == dataset["id"])
+    csv_content = bundle.render_dataset_csvs(semantic)[dataset["csv"]]
+    enhanced = bundle.render_enhanced_markdown(semantic)
+
+    assert [column["key"] for column in dataset["columns"]] == source_order
+    assert [column["label"] for column in dataset["columns"][:2]] == ["项目", "项目"]
+    assert list(dataset["rows"][0]["normalized"]) == source_order
+    assert reading_table["column_keys"] == source_order
+    assert next(csv.reader(io.StringIO(csv_content.lstrip("\ufeff")))) == [
+        "record_id",
+        "_page_start",
+        "_page_end",
+        *source_order,
+    ]
+    assert (
+        "| 项目 | 项目 | 栏次 | 一般项目/本月数 | 一般项目/本年累计 | 即征即退项目/本月数 | 即征即退项目/本年累计 |"
+    ) in enhanced
+
+
+def test_dataset_columns_keep_legacy_deterministic_order_without_semantic_override() -> None:
+    result = _with_projection(
+        ParseResult(entities=DocumentEntities(document_type="credit_report")),
+        _candidate([{"status": "N", "month": "2025-01"}]),
+    )
+
+    payload = project_community_bundle(result).json_payload()
+    dataset = next(item for item in payload["datasets"] if item["name"] == "repayment_records")
+
+    assert [column["key"] for column in dataset["columns"]] == ["month", "status"]
+
+
+def test_source_row_ledger_rejects_equal_count_with_wrong_record_order() -> None:
+    expected_refs = [
+        {"page": 1, "table_id": "pt_1_0", "source_row_index": 1},
+        {"page": 1, "table_id": "pt_1_0", "source_row_index": 2},
+    ]
+    rows = [
+        {"source": expected_refs[1]},
+        {"source": expected_refs[0]},
+    ]
+
+    completeness = _dataset_completeness(
+        ParseResult(),
+        "balance_sheet",
+        rows,
+        {
+            "completeness": {
+                "*": {
+                    "basis": "domain_source_row_ledger",
+                    "ledger_key": "dataset_source_row_refs",
+                }
+            }
+        },
+        {"dataset_source_row_refs": {"balance_sheet": expected_refs}},
+    )
+
+    assert completeness == {
+        "expected_row_count": 2,
+        "emitted_row_count": 2,
+        "omitted_row_count": 0,
+        "verified": False,
+        "basis": "source_row_ledger",
+    }
 
 
 def test_source_report_count_can_verify_dataset_completeness() -> None:
@@ -734,14 +990,8 @@ def test_community_page_range_prefers_nested_refs_over_stale_parent_range() -> N
     )
 
     payload = project_community_bundle(result, document_id="doc_source_pages").json_payload()
-    dataset = next(
-        dataset
-        for dataset in payload["datasets"]
-        if dataset["name"] == "repayment_records"
-    )
-    rows_by_month = {
-        row["normalized"]["month"]: row for row in dataset.get("rows") or []
-    }
+    dataset = next(dataset for dataset in payload["datasets"] if dataset["name"] == "repayment_records")
+    rows_by_month = {row["normalized"]["month"]: row for row in dataset.get("rows") or []}
 
     assert rows_by_month["2025-01"]["source"]["page_range"] == [19, 19]
     assert rows_by_month["2025-02"]["source"]["page_range"] == [10, 10]
@@ -840,9 +1090,7 @@ def test_enterprise_markdown_keeps_sensitive_identifiers_masked() -> None:
             }
         ]
     )
-    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"][
-        "account_identifier"
-    ] = {
+    candidate["data"]["data_dictionary"]["datasets"]["repayment_records"]["columns"]["account_identifier"] = {
         "label": "账户标识",
         "type": "long_id",
         "sensitive": True,
@@ -1199,9 +1447,7 @@ def test_partitioned_tables_prepend_only_joined_companion_rows() -> None:
     assert enhanced.count("| 1 | 发卡银行 | 2 |") == 1
     assert enhanced.count("| 1 | 贷款银行 | 3 |") == 1
     assert "### overdue records" not in enhanced
-    assert next(
-        dataset for dataset in payload["datasets"] if dataset["name"] == "overdue_records"
-    )["row_count"] == 2
+    assert next(dataset for dataset in payload["datasets"] if dataset["name"] == "overdue_records")["row_count"] == 2
 
     card_only, _payload = render([card_overdue])
     assert "#### 信用卡逾期记录" in card_only
@@ -1273,9 +1519,7 @@ def test_audit_reconciliation_can_render_in_appendix_and_audit_csv_only() -> Non
     assert "**源报告值:** 65.41" in enhanced
     assert "**明细计算值:** 65.42" in enhanced
     assert "不改写业务数据" in enhanced
-    reconciliation_rows = [
-        row for row in audit_rows if row["dataset_id"] == "_audit_reconciliations"
-    ]
+    reconciliation_rows = [row for row in audit_rows if row["dataset_id"] == "_audit_reconciliations"]
     assert {row["field_key"]: row["value"] for row in reconciliation_rows} == {
         "expected": "65.41",
         "actual": "65.42",
@@ -1378,9 +1622,7 @@ def test_bank_statement_enhanced_markdown_uses_chinese_labels_without_changing_k
 
     bundle = project_community_bundle(result, document_id="doc_bank_chinese_reading")
     enhanced = bundle.render_enhanced_markdown()
-    transaction_header = next(
-        line for line in enhanced.splitlines() if line.startswith("| ") and "交易金额" in line
-    )
+    transaction_header = next(line for line in enhanced.splitlines() if line.startswith("| ") and "交易金额" in line)
 
     assert "**文档类型:** 银行流水" in enhanced
     assert "**页数:** 0" in enhanced
@@ -1416,9 +1658,31 @@ def test_markdown_escapes_table_delimiters_but_preserves_content() -> None:
         ]
     )
     _with_projection(result, _candidate())
-    markdown = project_community_bundle(result, document_id="doc_test").render_markdown()
+    bundle = project_community_bundle(result, document_id="doc_test")
+    markdown = bundle.render_markdown()
     assert "A\\|B C" in markdown
     assert "<br>" not in markdown
+    assert _markdown_text("A|B\nC") == "A\\|B C"
+
+
+def test_public_bundle_filters_mirror_runtime_fields_by_prefix() -> None:
+    result = ParseResult(
+        entities=DocumentEntities(
+            document_type="credit_report",
+            domain_specific={
+                "mirror_ltqg_passed_tables": 3,
+                "mirror_future_runtime_field": "internal",
+                "公开字段": "保留",
+            },
+        )
+    )
+    _with_projection(result, _candidate([{"month": "2025-01", "status": "N"}]))
+
+    payload = project_community_bundle(result, document_id="doc_internal_filter").json_payload()
+    item_keys = {item["key"] for section in payload["sections"] for item in section.get("items", [])}
+
+    assert "公开字段" in item_keys
+    assert not any(key.startswith("mirror_") for key in item_keys)
 
 
 def test_markdown_renders_payment_record_promoted_to_header_as_data() -> None:

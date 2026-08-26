@@ -1318,6 +1318,9 @@ def _normalize_wrapped_temporal_fields(
     balance = _normalize_monetary_cell(_cell_value(raw_txn, "余额", "账户余额", "本次余额", "账面余额"))
     if balance is not None:
         out["balance"] = float(balance)
+    source_sequence = _internal_source_value(raw_txn, "_source_sequence_no")
+    if re.fullmatch(r"\d{1,9}", source_sequence):
+        out["sequence_no"] = source_sequence
     return out
 
 

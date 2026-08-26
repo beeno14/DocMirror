@@ -51,6 +51,7 @@ from docmirror.plugins.bank_statement.styles import (
 )
 from docmirror.plugins.bank_statement.text_table_builder import build_tables_from_stacked_bank_text
 from docmirror.plugins.bank_statement.wide_table_recovery import (
+    SOURCE_REPORTED_ROW_COUNT_SOURCES,
     RowCountEvidence,
     count_expected_rows_from_bank_footer,
     page_texts_from_parse_result,
@@ -319,7 +320,15 @@ def _candidate_expected_rows(
     source: str = "candidate_rows",
     confidence: float = 0.55,
 ) -> RowCountEvidence | None:
-    if source_evidence.count > 0 and source_evidence.confidence >= 0.85:
+    if (
+        source_evidence.count > 0
+        and source_evidence.confidence >= 0.85
+        and (
+            source_evidence.source in SOURCE_REPORTED_ROW_COUNT_SOURCES
+            or count <= 0
+            or source_evidence.count >= count
+        )
+    ):
         return source_evidence
     if count > 0:
         return RowCountEvidence(count=count, source=source, confidence=confidence)
@@ -521,7 +530,19 @@ def _candidate_reliable_count_coverage(candidate: BankTableCandidate) -> float |
     return max(0.0, 1.0 - abs(1.0 - ratio))
 
 
-def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCandidate | None, dict[str, Any]]:
+def _has_not_lower_reliable_count(candidate: BankTableCandidate, reference: BankTableCandidate) -> bool:
+    reference_coverage = _candidate_reliable_count_coverage(reference)
+    if reference_coverage is None:
+        return True
+    candidate_coverage = _candidate_reliable_count_coverage(candidate)
+    return candidate_coverage is not None and candidate_coverage >= reference_coverage - 0.01
+
+
+def _select_candidate(
+    candidates: list[BankTableCandidate],
+    *,
+    native_text_suspicious: bool = False,
+) -> tuple[BankTableCandidate | None, dict[str, Any]]:
     """Select a viable candidate without allowing raw row count to dominate quality."""
     viable = [candidate for candidate in candidates if candidate.canonical_rows > 0]
     candidate_counts = {candidate.candidate_id: len(candidate.records) for candidate in candidates}
@@ -550,6 +571,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
     # cannot win merely because it has more recovered rows: it must first
     # satisfy reliable count evidence and canonical validation.
     selected = max(viable, key=selection_key)
+    selection_note = ""
     source_faithful = [
         candidate
         for candidate in viable
@@ -571,6 +593,23 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
                 selection_key(candidate),
             ),
         )
+    if native_text_suspicious and (
+        selected.native_cell_coverage >= 0.99 or selected.source == "native_wide_table"
+    ):
+        ocr_candidates = [
+            candidate
+            for candidate in viable
+            if candidate.candidate_id == "ocr_implicit_table"
+            and candidate.canonical_rows >= selected.canonical_rows
+            and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
+            and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
+            and candidate.field_completeness >= selected.field_completeness - 0.01
+            and candidate.balance_chain_score >= selected.balance_chain_score - 0.01
+            and _has_not_lower_reliable_count(candidate, selected)
+        ]
+        if ocr_candidates:
+            selected = max(ocr_candidates, key=selection_key)
+            selection_note = "native_text_suspicious:ocr_not_lower_quality:"
     native_grid_candidates = [
         candidate
         for candidate in viable
@@ -583,16 +622,9 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         and candidate.field_completeness >= selected.field_completeness - 0.01
         and candidate.balance_chain_score >= selected.balance_chain_score - 0.01
         and candidate.source_column_width >= selected.source_column_width - 0.25
-        and (
-            _candidate_reliable_count_coverage(selected) is None
-            or (
-                _candidate_reliable_count_coverage(candidate) is not None
-                and _candidate_reliable_count_coverage(candidate)
-                >= (_candidate_reliable_count_coverage(selected) or 0.0) - 0.01
-            )
-        )
+        and _has_not_lower_reliable_count(candidate, selected)
     ]
-    if native_grid_candidates:
+    if native_grid_candidates and not native_text_suspicious:
         # When every semantic gate is equal, explicit native cell boundaries are
         # stronger evidence than a text reconstruction that may shift wrapped
         # fragments into the following transaction.
@@ -613,7 +645,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         # count evidence proves the smaller result is complete.
         selected = legacy
     reason = (
-        f"score={selected.score:.3f}:canonical_coverage={selected.canonical_coverage:.3f}:"
+        f"{selection_note}score={selected.score:.3f}:canonical_coverage={selected.canonical_coverage:.3f}:"
         f"sequence_continuity={selected.sequence_continuity:.3f}:"
         f"source_coverage={selected.source_page_coverage:.3f}:"
         f"balance_chain={selected.balance_chain_score:.3f}"
@@ -623,6 +655,12 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         "candidate_counts": candidate_counts,
         "selection_reason": reason,
     }
+
+
+def _has_suspicious_native_text(parse_result: Any) -> bool:
+    parser_info = getattr(parse_result, "parser_info", None)
+    warnings = getattr(parser_info, "warnings", ()) or ()
+    return "native_text_glyph_mapping_suspected" in warnings
 
 
 def _collect_table_candidates(
@@ -672,6 +710,10 @@ def _collect_table_candidates(
         legacy_transactions,
         legacy_normalize_fn,
         (ctx.reconstruction.source if ctx.reconstruction is not None else "canonical_table"),
+        _candidate_expected_rows(
+            source_evidence,
+            count=len(legacy_transactions),
+        ),
         confidence=0.8,
     )
     for parser_id in dict.fromkeys([*detection.parser_chain, *_FALLBACK_PARSER_IDS]):
@@ -785,6 +827,10 @@ def _collect_table_candidates(
     if ocr_tables:
         ocr_ctx = replace(ctx, tables=ocr_tables, prefer_context_tables=True)
         batch, normalize_fn = _run_parser("grid_standard", ocr_ctx, plugin)
+        recovered_count = sum(max(len(table) - 1, 0) for table in ocr_tables)
+        positioned_rows_complete = (
+            len(batch) == recovered_count and _candidate_source_page_coverage(batch) >= 0.99
+        )
         add(
             "ocr_implicit_table",
             batch,
@@ -792,9 +838,9 @@ def _collect_table_candidates(
             "ocr_implicit_table",
             _candidate_expected_rows(
                 source_evidence,
-                count=sum(max(len(table) - 1, 0) for table in ocr_tables),
-                source="ocr_recovered_rows",
-                confidence=0.70,
+                count=recovered_count,
+                source="positioned_date_anchors" if positioned_rows_complete else "ocr_recovered_rows",
+                confidence=0.95 if positioned_rows_complete else 0.70,
             ),
             confidence=0.70,
         )
@@ -1096,7 +1142,10 @@ class BankStyleParserRegistry:
             legacy_transactions=transactions,
             legacy_normalize_fn=normalize_fn,
         )
-        selected, diagnostics = _select_candidate(candidates)
+        selected, diagnostics = _select_candidate(
+            candidates,
+            native_text_suspicious=_has_suspicious_native_text(ctx.parse_result),
+        )
         self.last_selection_diagnostics = diagnostics
         if selected is not None:
             transactions = selected.records

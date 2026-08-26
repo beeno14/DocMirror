@@ -1,0 +1,39 @@
+schema_version: 1
+
+provider:
+  id: financial_statement
+  domain_name: financial_statement
+  version: community-1
+  implementation: docmirror.plugins.financial_statement.community_plugin:plugin
+
+classification:
+  aliases:
+    - financial_report
+    - balance_sheet
+    - income_statement
+    - cash_flow_statement
+    - owners_equity_changes
+
+projection:
+  dataset_labels:
+    balance_sheet: 资产负债表
+    income_statement: 利润表
+    cash_flow_statement: 现金流量表
+    owners_equity_changes: 所有者权益变动表
+  dataset_types:
+    balance_sheet: financial_statement
+    income_statement: financial_statement
+    cash_flow_statement: financial_statement
+    owners_equity_changes: financial_statement
+  internal_fields: [financial_projection, dataset_source_row_refs, dataset_verification_blockers]
+  completeness:
+    "*":
+      basis: domain_source_row_ledger
+      ledger_key: dataset_source_row_refs
+      public_basis: source_row_ledger
+      verification_blocker_key: dataset_verification_blockers
+
+projection_outputs:
+  document_type: financial_statement
+  datasets: [balance_sheet, income_statement, cash_flow_statement, owners_equity_changes]
+  domain_fact_prefix: financial_statement
