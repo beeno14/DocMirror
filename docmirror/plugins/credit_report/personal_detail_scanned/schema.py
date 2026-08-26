@@ -4246,10 +4246,6 @@ def _canonical_quality_gate(
                         target_record_id=record_id,
                         field_name="status_amount",
                         observed_value=observed,
-                        candidate_value={
-                            "performance_month": values.get("performance_month"),
-                            "status_code": status,
-                        },
                         source_refs=refs,
                         reason_codes=(
                             "canonical_zero_overdue_status",

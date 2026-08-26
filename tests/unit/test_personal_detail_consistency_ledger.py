@@ -1957,6 +1957,311 @@ def test_source_projection_reconciles_detached_month_diagnostic_by_physical_posi
     assert closure["source_position_balance_valid"] is True
 
 
+def _detached_source_page_replay_content(
+    *,
+    bound_source_pages: tuple[int, ...] = (5,),
+    geometry_state: str = "exact",
+) -> dict[str, object]:
+    account_id = "account:detached-source-page"
+    performance_month = "2020-10"
+    detached_grid_id = "grid:detached"
+    status_bbox = [316.375, 374.5, 341.4166666666667, 396.0]
+    amount_bbox = [316.375, 389.5, 341.4166666666667, 412.5]
+    if geometry_state == "ambiguous":
+        amount_bbox = [317.375, 389.5, 342.4166666666667, 412.5]
+
+    def cell_refs(
+        grid_id: str,
+        *,
+        source_page: int | None,
+    ) -> list[dict[str, object]]:
+        refs = [
+            {
+                "page": 10,
+                "logical_page": 10,
+                "geometry_scope": "cell",
+                "coordinate_system": "pdf_points_top_left",
+                "grid_id": grid_id,
+                "row": row,
+                "col": 10,
+                "field_name": "performance_month",
+                "source_field_name": source_field_name,
+                "performance_month": performance_month,
+                "bbox": bbox,
+            }
+            for row, source_field_name, bbox in (
+                (2, "status", status_bbox),
+                (3, "overdue_amount", amount_bbox),
+            )
+        ]
+        if source_page is not None:
+            for ref in refs:
+                ref["source_page"] = source_page
+        return refs
+
+    records: list[dict[str, object]] = []
+    for index, source_page in enumerate(bound_source_pages):
+        grid_id = f"grid:bound:{index}"
+        records.append(
+            {
+                "record_id": f"{grid_id}:{performance_month}",
+                "repayment_id": f"{grid_id}:{performance_month}",
+                "grid_id": grid_id,
+                "account_id": account_id,
+                "performance_month": performance_month,
+                "status": "N",
+                "_account_month_identity_proof": {
+                    "account_id": account_id,
+                    "performance_month": performance_month,
+                    "grid_id": grid_id,
+                    "owner_basis": "canonical_account_segment",
+                    "account_anchor_exact": True,
+                    "printed_month_range_exact": True,
+                    "grid_geometry_exact": True,
+                    "unique_owner": True,
+                },
+                "_account_month_identity_proof_status": "exact",
+                "source_cell_refs": cell_refs(
+                    grid_id,
+                    source_page=source_page,
+                ),
+            }
+        )
+
+    detached_refs = cell_refs(detached_grid_id, source_page=None)
+    performance_refs = detached_refs
+    if geometry_state == "incomplete":
+        performance_refs = detached_refs[:1]
+    common_issue = {
+        "category": "ocr_structure_correction",
+        "issue_code": "canonical_monthly_source_structure_missing_field",
+        "message": "A detached source structure replayed an inventoried month cell.",
+        "parser_stage": "canonical_monthly_grid_materialization",
+        "target_dataset": "repayment_records",
+        "target_record_id": f"{detached_grid_id}:{performance_month}",
+        "candidate_value": {"resolution": "withheld_pending_review"},
+        "reason_codes": (
+            "detached_source_structure_exact_key",
+            "canonical_deduplicated_key_missing",
+            "source_structure_is_audit_only",
+            "account_month_owner_reconciliation_pending",
+            "dataset_incomplete",
+            "exact_grid_month_source_position",
+            "normalized_value_withheld",
+            "owner_or_status_value_not_invented",
+        ),
+    }
+
+    def detached_issue(
+        field_name: str,
+        refs: list[dict[str, object]],
+        source_observations: list[object],
+    ) -> dict[str, object]:
+        return make_issue(
+            **common_issue,
+            field_name=field_name,
+            observed_value={
+                "grid_id": detached_grid_id,
+                "performance_month": performance_month,
+                "field_state": "source_position_withheld",
+                "source_observations": source_observations,
+                "source_structure_key_count": 1,
+            },
+            source_refs=refs,
+        )
+
+    status_ref = deepcopy(detached_refs[0])
+    status_ref["field_name"] = "status_code"
+    amount_ref = deepcopy(detached_refs[1])
+    amount_ref["field_name"] = "status_amount"
+    issues = [
+        detached_issue(
+            "performance_month",
+            deepcopy(performance_refs),
+            [performance_month],
+        ),
+        detached_issue("status_code", [status_ref], ["N"]),
+        detached_issue("status_amount", [amount_ref], [0]),
+    ]
+    return {
+        "facts": {},
+        "datasets": {
+            "repayment_records": records,
+            "personal_detail_extraction_issues": issues,
+        },
+    }
+
+
+def test_source_projection_reconciles_complete_detached_pair_when_only_source_page_is_missing() -> None:
+    closure = _month_closure(_detached_source_page_replay_content())
+
+    assert closure["source_month_position_observations"] == 2
+    assert closure["raw_source_month_positions"] == 1
+    assert closure["owner_bound_account_months"] == 1
+    assert closure["owner_unresolved_positions"] == 0
+    assert closure["reconciled_detached_diagnostic_positions"] == 1
+    assert closure["source_position_balance_valid"] is True
+
+
+def test_source_projection_does_not_bridge_detached_pair_across_conflicting_source_pages() -> None:
+    closure = _month_closure(
+        _detached_source_page_replay_content(bound_source_pages=(5, 6))
+    )
+
+    assert closure["source_month_position_observations"] == 3
+    assert closure["raw_source_month_positions"] == 3
+    assert closure["owner_bound_account_months"] == 2
+    assert closure["owner_unresolved_positions"] == 1
+    assert closure["reconciled_detached_diagnostic_positions"] == 0
+    assert closure["source_position_balance_valid"] is True
+
+
+def test_source_projection_does_not_bridge_incomplete_or_ambiguous_detached_geometry() -> None:
+    for geometry_state in ("incomplete", "ambiguous"):
+        closure = _month_closure(
+            _detached_source_page_replay_content(geometry_state=geometry_state)
+        )
+
+        assert closure["source_month_position_observations"] == 2, geometry_state
+        assert closure["raw_source_month_positions"] == 2, geometry_state
+        assert closure["owner_bound_account_months"] == 1, geometry_state
+        assert closure["owner_unresolved_positions"] == 1, geometry_state
+        assert closure["reconciled_detached_diagnostic_positions"] == 0, geometry_state
+        assert closure["source_position_balance_valid"] is True, geometry_state
+
+
+def test_source_projection_does_not_trust_unrelated_issue_geometry_for_bridge() -> None:
+    content = _detached_source_page_replay_content()
+    datasets = content["datasets"]
+    bound_record = datasets["repayment_records"][0]
+    for ref in bound_record["source_cell_refs"]:
+        left, top, right, bottom = ref["bbox"]
+        ref["bbox"] = [left + 100.0, top, right + 100.0, bottom]
+
+    detached_month_issue = next(
+        issue
+        for issue in datasets["personal_detail_extraction_issues"]
+        if issue["field_name"] == "performance_month"
+    )
+    probe_refs = deepcopy(detached_month_issue["source_refs"])
+    for ref in probe_refs:
+        ref["grid_id"] = "grid:bound:0"
+        ref["source_page"] = 5
+    datasets["personal_detail_extraction_issues"].append(
+        make_issue(
+            category="ocr_structure_correction",
+            issue_code="unrelated_probe",
+            message="An unrelated diagnostic must not supply owner inventory geometry.",
+            parser_stage="unrelated_probe",
+            target_dataset="repayment_records",
+            target_record_id="unrelated:probe",
+            field_name="performance_month",
+            observed_value={
+                "account_id": "account:detached-source-page",
+                "grid_id": "grid:bound:0",
+                "performance_month": "2020-10",
+            },
+            source_refs=probe_refs,
+        )
+    )
+
+    closure = _month_closure(content)
+
+    assert closure["reconciled_detached_diagnostic_positions"] == 0
+    assert closure["owner_unresolved_positions"] == 1
+    assert closure["status"] == "partial_owner_unresolved"
+
+
+def test_source_projection_does_not_build_bridge_pair_from_single_ref_claims() -> None:
+    content = _detached_source_page_replay_content()
+    datasets = content["datasets"]
+    bound_record = datasets["repayment_records"][0]
+    for ref in bound_record["source_cell_refs"]:
+        left, top, right, bottom = ref["bbox"]
+        ref["bbox"] = [left + 100.0, top, right + 100.0, bottom]
+
+    account_id = "account:detached-source-page"
+    performance_month = "2020-10"
+    owner_key = stable_record_id(
+        "source_account_month_owner",
+        account_id,
+    ).split(":", 1)[-1]
+    detached_month_issue = next(
+        issue
+        for issue in datasets["personal_detail_extraction_issues"]
+        if issue["field_name"] == "performance_month"
+    )
+    for source_ref in detached_month_issue["source_refs"]:
+        claim_ref = deepcopy(source_ref)
+        claim_ref.update(
+            {
+                "account_id": account_id,
+                "binding": "source_account_month_range",
+                "grid_id": "grid:bound:0",
+                "source_page": 5,
+            }
+        )
+        datasets["personal_detail_extraction_issues"].append(
+            make_issue(
+                category="ocr_structure_correction",
+                issue_code="candidate_b_monthly_account_range_missing_month",
+                message="One range claim cannot supply a complete bridge inventory.",
+                parser_stage="candidate_b_relationship_schema",
+                target_dataset="repayment_records",
+                target_record_id=(
+                    f"source_account_month:{owner_key}:{performance_month}"
+                ),
+                field_name="performance_month",
+                observed_value={
+                    "account_id": account_id,
+                    "grid_id": "grid:bound:0",
+                    "performance_month": performance_month,
+                    "source_identity_type": (
+                        "account_month_from_printed_repayment_range"
+                    ),
+                },
+                source_refs=[claim_ref],
+            )
+        )
+
+    closure = _month_closure(content)
+
+    assert closure["reconciled_detached_diagnostic_positions"] == 0
+    assert closure["owner_unresolved_positions"] == 1
+    assert closure["status"] == "partial_owner_unresolved"
+
+
+def test_source_projection_requires_source_page_on_each_inventoried_cell() -> None:
+    content = _detached_source_page_replay_content()
+    bound_record = content["datasets"]["repayment_records"][0]
+    bound_record["source_cell_refs"][1].pop("source_page")
+
+    closure = _month_closure(content)
+
+    assert closure["reconciled_detached_diagnostic_positions"] == 0
+    assert closure["owner_unresolved_positions"] == 1
+    assert closure["status"] == "partial_owner_unresolved"
+
+
+def test_source_projection_requires_every_detached_sibling_to_be_exact() -> None:
+    for field_name in ("status_code", "status_amount"):
+        content = _detached_source_page_replay_content()
+        issues = content["datasets"]["personal_detail_extraction_issues"]
+        sibling = next(issue for issue in issues if issue["field_name"] == field_name)
+        sibling["category"] = "unrelated_category"
+        sibling["status"] = "resolved"
+        sibling["parser_stage"] = "unrelated_stage"
+        sibling["candidate_value"] = {"resolution": "invented"}
+        sibling["reason_codes"] = ["unrelated_reason"]
+        sibling["source_refs"] = []
+
+        closure = _month_closure(content)
+
+        assert closure["reconciled_detached_diagnostic_positions"] == 0, field_name
+        assert closure["owner_unresolved_positions"] == 1, field_name
+        assert closure["status"] == "source_localization_invalid", field_name
+
+
 def test_source_projection_keeps_distinct_physical_cells_for_one_identity() -> None:
     performance_month = "2024-01"
 

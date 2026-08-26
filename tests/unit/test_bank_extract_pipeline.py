@@ -95,6 +95,124 @@ def test_run_bank_statement_extract_pipe_text():
     assert "account_holder" in result.identity_fields
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected_failures"),
+    [
+        ({}, []),
+        (
+            {"parsed_rows": 2, "direction_count": 2},
+            ["canonical_filter_changed_row_count"],
+        ),
+        (
+            {"direction_count": 0},
+            ["direction_coverage_incomplete"],
+        ),
+        (
+            {"sourced_count": 0},
+            ["source_page_coverage_incomplete"],
+        ),
+        (
+            {"source_reported_count": RowCountEvidence(2, "header_total", 0.95)},
+            ["issuer_row_count_mismatch"],
+        ),
+        (
+            {"physical_expected": 2},
+            ["physical_row_count_mismatch"],
+        ),
+        (
+            {"invariant_failures": ["bank_invariant_failed:test"]},
+            ["final_invariant_audit_failed"],
+        ),
+    ],
+    ids=[
+        "complete",
+        "canonical-filter",
+        "direction-coverage",
+        "source-page-coverage",
+        "issuer-row-count",
+        "physical-row-count",
+        "invariant-audit",
+    ],
+)
+def test_lazy_final_gate_failure_truth_table(
+    overrides: dict[str, object],
+    expected_failures: list[str],
+) -> None:
+    kwargs: dict[str, object] = {
+        "parsed_rows": 1,
+        "direction_count": 1,
+        "sourced_count": 1,
+        "physical_expected": 1,
+        "source_reported_count": RowCountEvidence(1, "header_total", 0.95),
+        "invariant_failures": [],
+    }
+    kwargs.update(overrides)
+
+    failures = extract_pipeline._lazy_final_gate_failures([{"normalized": {}}], **kwargs)
+
+    assert failures == expected_failures
+
+
+def test_lazy_final_gate_accumulates_every_reason_in_stable_order() -> None:
+    failures = extract_pipeline._lazy_final_gate_failures(
+        [{"normalized": {}}],
+        parsed_rows=2,
+        direction_count=0,
+        sourced_count=0,
+        physical_expected=2,
+        source_reported_count=RowCountEvidence(2, "header_total", 0.95),
+        invariant_failures=["bank_invariant_failed:case132-proof-gap"],
+    )
+
+    assert failures == [
+        "canonical_filter_changed_row_count",
+        "direction_coverage_incomplete",
+        "source_page_coverage_incomplete",
+        "issuer_row_count_mismatch",
+        "physical_row_count_mismatch",
+        "final_invariant_audit_failed",
+    ]
+
+
+def test_zero_amount_business_row_is_exempt_from_direction_coverage() -> None:
+    records = [
+        {
+            "normalized": {
+                "date": "2023-09-01",
+                "amount": 10.0,
+                "direction": "income",
+                "balance": 110.0,
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "normalized": {
+                "date": "2023-09-02",
+                "amount": 0.0,
+                "direction": "",
+                "balance": 110.0,
+                "summary": "利息税",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+    ]
+
+    canonical, parsed, directional, applicable, sourced = extract_pipeline._row_accounting_view(records)
+    failures = extract_pipeline._lazy_final_gate_failures(
+        canonical,
+        parsed_rows=parsed,
+        direction_count=directional,
+        direction_expected_count=applicable,
+        sourced_count=sourced,
+        physical_expected=2,
+        source_reported_count=RowCountEvidence(2, "header_total", 0.95),
+        invariant_failures=[],
+    )
+
+    assert (len(canonical), parsed, directional, applicable, sourced) == (2, 2, 1, 1, 2)
+    assert "direction_coverage_incomplete" not in failures
+
+
 def test_lazy_final_gate_failure_forces_one_fresh_eager_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -172,6 +290,195 @@ def test_lazy_final_gate_failure_forces_one_fresh_eager_attempt(
     assert result.candidate_diagnostics[0]["deployment_mode"] == "eager_final_gate_fallback"
     assert result.candidate_diagnostics[0]["completion_reason"] == "final_invariant_audit_failed"
     assert result.candidate_diagnostics[0]["prior_lazy_attempt"]["deployment_mode"] == "lazy_primary"
+
+
+def test_final_eager_failure_is_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    deployment_calls: list[bool] = []
+    audit_calls = 0
+
+    def record(day: int) -> dict:
+        return {
+            "normalized": {
+                "date": f"2024-01-{day:02d}",
+                "amount": float(day),
+                "direction": "income",
+            },
+            "raw": {"date": f"2024-01-{day:02d}", "amount": str(day)},
+            "source": {
+                "source_page": 1,
+                "page_range": [1, 1],
+                "table_id": "table:1",
+                "source_row_index": 0,
+            },
+        }
+
+    def deployment(_builder, _parse_result, _full_text, _plugin, *, adaptive):
+        deployment_calls.append(adaptive)
+        ctx = StyleContext(
+            tables=[],
+            full_text="交易总笔数：1",
+            institution=None,
+            page_count=1,
+            reconstruction=ReconstructionMeta(source="canonical_table"),
+        )
+        detection = StyleDetectionResult(
+            primary_style="grid_standard",
+            confidence=0.95,
+            parser_chain=["grid_standard"],
+        )
+        diagnostic = {
+            "selected_candidate": "parser:grid_standard",
+            "deployment_mode": "lazy_primary" if adaptive else "eager_forced",
+            "completion_state": "proven" if adaptive else "unknown",
+            "completion_reason": "provisional" if adaptive else "adaptive_deployment_disabled",
+            "attempted_strategies": ["parser:grid_standard"],
+            "skipped_strategies": ["native_wide_table"] if adaptive else [],
+        }
+        meta = SimpleNamespace(
+            tables_parsed=1,
+            tables_skipped=0,
+            candidate_diagnostics=[diagnostic],
+        )
+        return ctx, detection, [record(1 if adaptive else 2)], {}, meta
+
+    def audit(*_args, **_kwargs):
+        nonlocal audit_calls
+        audit_calls += 1
+        stage = "lazy" if audit_calls == 1 else "eager"
+        return [f"bank_invariant_failed:{stage}"]
+
+    monkeypatch.setattr(
+        extract_pipeline,
+        "resolve_bank_extraction_route",
+        lambda _result: BankExtractionRoute.DIGITAL,
+    )
+    monkeypatch.setattr(extract_pipeline, "_run_strategy_deployment", deployment)
+    monkeypatch.setattr(extract_pipeline, "page_texts_from_parse_result", lambda _result: [])
+    monkeypatch.setattr(extract_pipeline, "page_texts_with_business_headers", lambda _result, texts: texts)
+    monkeypatch.setattr(
+        extract_pipeline,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(1, "header_total", 0.95),
+    )
+    monkeypatch.setattr(extract_pipeline, "physical_transaction_row_estimate", lambda _result: 0)
+    monkeypatch.setattr(extract_pipeline, "audit_bank_statement_invariants", audit)
+
+    result = run_bank_statement_extract(None, "", BankStatementCommunityPlugin())
+
+    assert deployment_calls == [True, False]
+    assert audit_calls == 2
+    assert result.records[0]["normalized"]["date"] == "2024-01-02"
+    assert "bank_invariant_failed:lazy" not in result.warnings
+    assert "bank_invariant_failed:eager" in result.warnings
+    assert result.style_meta.extract_status == "degraded"
+    diagnostic = result.candidate_diagnostics[0]
+    assert diagnostic["deployment_mode"] == "eager_final_gate_fallback"
+    assert diagnostic["completion_reason"] == "final_invariant_audit_failed"
+    assert diagnostic["prior_lazy_attempt"]["deployment_mode"] == "lazy_primary"
+    assert diagnostic["prior_lazy_attempt"]["completion_state"] == "proven"
+
+
+@pytest.mark.parametrize(
+    ("deployment_mode", "completion_state", "completion_reason", "audit_failures"),
+    [
+        (
+            "lazy_primary",
+            "proven",
+            "issuer_count=1:canonical_rows=1:provenance=complete",
+            [],
+        ),
+        (
+            "eager_fallback",
+            "unknown",
+            "issuer_row_count_is_not_authoritative",
+            ["bank_invariant_failed:case132-proof-gap"],
+        ),
+    ],
+    ids=["clean-lazy-primary", "terminal-internal-eager-fallback"],
+)
+def test_top_level_deployment_terminal_paths_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    deployment_mode: str,
+    completion_state: str,
+    completion_reason: str,
+    audit_failures: list[str],
+) -> None:
+    deployment_calls: list[bool] = []
+    audit_calls = 0
+
+    record = {
+        "normalized": {
+            "date": "2024-01-01",
+            "amount": 1.0,
+            "direction": "income",
+        },
+        "raw": {"date": "2024-01-01", "amount": "1.00"},
+        "source": {
+            "source_page": 1,
+            "page_range": [1, 1],
+            "table_id": "table:complete",
+            "source_row_index": 0,
+        },
+    }
+
+    def deployment(_builder, _parse_result, _full_text, _plugin, *, adaptive):
+        deployment_calls.append(adaptive)
+        if len(deployment_calls) > 1:
+            raise AssertionError("a terminal deployment path started a fresh escalation")
+        ctx = StyleContext(
+            tables=[],
+            full_text="交易总笔数：1",
+            institution=None,
+            page_count=1,
+            reconstruction=ReconstructionMeta(source="canonical_table"),
+        )
+        detection = StyleDetectionResult(
+            primary_style="grid_standard",
+            confidence=0.95,
+            parser_chain=["grid_standard"],
+        )
+        diagnostic = {
+            "selected_candidate": "parser:grid_standard",
+            "deployment_mode": deployment_mode,
+            "completion_state": completion_state,
+            "completion_reason": completion_reason,
+            "attempted_strategies": ["parser:grid_standard"],
+            "skipped_strategies": [],
+        }
+        meta = SimpleNamespace(
+            tables_parsed=1,
+            tables_skipped=0,
+            candidate_diagnostics=[diagnostic],
+        )
+        return ctx, detection, [record], {}, meta
+
+    def audit(*_args, **_kwargs):
+        nonlocal audit_calls
+        audit_calls += 1
+        return list(audit_failures)
+
+    monkeypatch.setattr(extract_pipeline, "resolve_bank_extraction_route", lambda _result: BankExtractionRoute.DIGITAL)
+    monkeypatch.setattr(extract_pipeline, "_run_strategy_deployment", deployment)
+    monkeypatch.setattr(extract_pipeline, "page_texts_from_parse_result", lambda _result: [])
+    monkeypatch.setattr(extract_pipeline, "page_texts_with_business_headers", lambda _result, texts: texts)
+    monkeypatch.setattr(
+        extract_pipeline,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(1, "header_total", 0.95),
+    )
+    monkeypatch.setattr(extract_pipeline, "physical_transaction_row_estimate", lambda _result: 1)
+    monkeypatch.setattr(extract_pipeline, "audit_bank_statement_invariants", audit)
+
+    result = run_bank_statement_extract(None, "", BankStatementCommunityPlugin())
+
+    assert deployment_calls == [True]
+    assert audit_calls == 1
+    diagnostic = result.candidate_diagnostics[0]
+    assert diagnostic["deployment_mode"] == deployment_mode
+    assert diagnostic["completion_state"] == completion_state
+    assert diagnostic["completion_reason"] == completion_reason
+    assert "prior_lazy_attempt" not in diagnostic
+    assert all(warning in result.warnings for warning in audit_failures)
 
 
 def test_strategy_deployment_builds_fresh_contexts_and_preserves_eager_override(
@@ -658,3 +965,82 @@ def test_native_wide_table_does_not_publish_positioned_date_count() -> None:
     assert meta.canonical_extracted == 8
     assert meta.coverage_ratio == 0.0
     assert meta.extract_status == "degraded"
+
+
+def _period_detail(source: str, components: list[tuple[int, str, str]], *, evidence: bool) -> dict:
+    return {
+        "normalized_value": f"{components[0][1]} ~ {components[-1][2]}",
+        "source": source,
+        "derivation": "source_period_envelope",
+        "normalized_only": True,
+        "source_components": [
+            {
+                "source_page": page,
+                "page_id": f"page:{page:04d}",
+                "raw_start": start.replace("-", ""),
+                "raw_end": end.replace("-", ""),
+                "evidence_ids": [f"period:{page}:label", f"period:{page}:start", f"period:{page}:end"]
+                if evidence
+                else [],
+                "source": source,
+            }
+            for page, start, end in components
+        ],
+    }
+
+
+def test_canonical_period_evidence_replaces_compatible_page_header_detail() -> None:
+    components = [
+        (1, "2023-06-01", "2023-06-30"),
+        (2, "2023-07-01", "2023-07-31"),
+    ]
+    identity = {"query_period": _period_detail("page_headers", components, evidence=False)}
+    evidence = {"query_period": _period_detail("canonical_evidence_atoms", components, evidence=True)}
+
+    extract_pipeline._merge_evidence_identity_fields(identity, evidence)
+
+    assert identity["query_period"]["source"] == "canonical_evidence_atoms"
+    assert identity["query_period"]["source_components"][0]["evidence_ids"] == [
+        "period:1:label",
+        "period:1:start",
+        "period:1:end",
+    ]
+
+
+def test_canonical_period_evidence_replaces_compatible_source_less_kv_detail() -> None:
+    components = [(1, "2023-01-01", "2023-01-31")]
+    identity = {
+        "query_period": {
+            "raw_name": "账单所属期间",
+            "raw_value": "20230101 20230131",
+            "normalized_value": "2023-01-01 ~ 2023-01-31",
+        }
+    }
+    evidence = {"query_period": _period_detail("canonical_evidence_atoms", components, evidence=True)}
+
+    extract_pipeline._merge_evidence_identity_fields(identity, evidence)
+
+    assert identity["query_period"]["source"] == "canonical_evidence_atoms"
+    facts = extract_pipeline._query_period_component_signature(identity["query_period"])
+    assert facts == ((1, "2023-01-01", "2023-01-31"),)
+
+
+def test_conflicting_direct_period_planes_fail_closed() -> None:
+    identity = {
+        "query_period": _period_detail(
+            "page_headers",
+            [(1, "2023-06-01", "2023-06-30")],
+            evidence=False,
+        )
+    }
+    evidence = {
+        "query_period": _period_detail(
+            "canonical_evidence_atoms",
+            [(1, "2023-06-02", "2023-06-30")],
+            evidence=True,
+        )
+    }
+
+    extract_pipeline._merge_evidence_identity_fields(identity, evidence)
+
+    assert "query_period" not in identity

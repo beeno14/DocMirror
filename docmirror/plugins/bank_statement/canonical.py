@@ -45,6 +45,7 @@ _ISSUER_COUNT_SOURCES = frozenset(
 )
 
 _NATIVE_SOURCE_REPAIR_KIND = "adjacent_summary_signed_amount_spill"
+_BORDERLESS_HEADER_NORMALIZATION = "borderless_header_normalization"
 _NATIVE_SOURCE_REPAIR_KEYS = frozenset(
     {
         "kind",
@@ -333,10 +334,20 @@ def _canonical_raw_input_for_source_repair(
     source_public: dict[str, Any],
     working_public: dict[str, Any],
 ) -> dict[str, Any]:
-    """Choose repaired working cells only under an exact source-repair contract."""
-    if raw_txn.get("_canonical_raw_from_working") is not True:
-        return source_public
+    """Choose working cells only under an exact repair or header-normalization contract."""
+    canonical_mode = raw_txn.get("_canonical_raw_from_working")
     source_raw = raw_txn.get("_source_raw")
+    if canonical_mode == _BORDERLESS_HEADER_NORMALIZATION:
+        if (
+            not isinstance(source_raw, dict)
+            or source_public != source_raw
+            or len(source_public) != len(working_public)
+            or list(source_public.values()) != list(working_public.values())
+        ):
+            return source_public
+        return working_public
+    if canonical_mode is not True:
+        return source_public
     manifest = raw_txn.get("_source_repair_manifest")
     if (
         not isinstance(source_raw, dict)

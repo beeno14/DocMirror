@@ -25,7 +25,9 @@ _DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 from docmirror.plugins.bank_statement.styles.row_pair_merge import pair_ledger_rows
 
 _AMOUNT_RE = re.compile(r"\d+\.\d{2}")
+_LOOSE_DATE_PREFIX_RE = re.compile(r"^\d{4}(?:[-/.]\d{1,2}[-/.]\d{1,2}|\u5e74\d{1,2}\u6708\d{1,2}\u65e5)")
 _INCOME_KEYWORDS = ("结息", "利息", "入息", "转入", "收入")
+_SOURCE_LINEAGE_COLUMNS = ("_source_page", "_source_table_id", "_source_row_index")
 
 PARSER_ID = "compact_merged"
 STYLE_ID = "compact_merged_ledger"
@@ -103,6 +105,68 @@ def parse_counterparty_cell(text: str) -> tuple[str, str]:
     return "", text
 
 
+def _compact_table_layout(table: list[list[str]]) -> tuple[int, list[str], int, int, int] | None:
+    for row_index, row in enumerate(table[:12]):
+        headers = [str(cell or "") for cell in row]
+        if not is_compact_ledger_header(headers):
+            continue
+
+        col_ledger, col_cp, col_summary = 0, 1, 2
+        for col_index, header in enumerate(headers):
+            if "日期" in header or "余额" in header:
+                col_ledger = col_index
+            elif "对方" in header or "户名" in header:
+                col_cp = col_index
+            elif "摘要" in header or "附言" in header:
+                col_summary = col_index
+        return row_index, headers, col_ledger, col_cp, col_summary
+    return None
+
+
+def _compact_row_is_transaction_shaped(first_cell: str) -> bool:
+    compact = str(first_cell or "").strip()
+    return bool(_LOOSE_DATE_PREFIX_RE.match(compact) and _AMOUNT_RE.search(compact))
+
+
+def _compact_row_is_unproved(first_cell: str) -> bool:
+    compact = str(first_cell or "").strip()
+    if not _compact_row_is_transaction_shaped(compact):
+        return False
+    if _DATE_PREFIX_RE.match(compact) is None:
+        return True
+    # A compact transaction needs a source amount and a source balance. One
+    # monetary token proves only a balance/furniture row, not a transaction.
+    return len(_AMOUNT_RE.findall(compact[len("YYYY-MM-DD") :])) < 2
+
+
+def _attach_anchor_lineage(
+    transactions: list[dict[str, str]],
+    *,
+    table: list[list[str]],
+    header_index: int,
+    headers: list[str],
+    ledger_column: int,
+) -> None:
+    source_columns = {
+        name: headers.index(name)
+        for name in _SOURCE_LINEAGE_COLUMNS
+        if name in headers
+    }
+    if not source_columns:
+        return
+    anchor_rows = [
+        row
+        for row in table[header_index + 1 :]
+        if ledger_column < len(row) and _DATE_PREFIX_RE.match(str(row[ledger_column] or "").strip())
+    ]
+    if len(anchor_rows) != len(transactions):
+        return
+    for transaction, row in zip(transactions, anchor_rows, strict=True):
+        for name, column_index in source_columns.items():
+            if column_index < len(row):
+                transaction[name] = str(row[column_index] or "").strip()
+
+
 def normalize_compact_transaction(raw: dict[str, str]) -> dict[str, Any]:
     ledger = parse_compact_ledger_cell(raw.get("ledger_cell", ""))
     if not ledger:
@@ -133,33 +197,25 @@ def extract_compact_ledger_transactions(table: list[list[str]]) -> list[dict[str
     if not table:
         return []
 
-    header_idx = -1
-    headers: list[str] = []
-    for i, row in enumerate(table[:12]):
-        row_headers = [str(c or "") for c in row]
-        if is_compact_ledger_header(row_headers):
-            header_idx = i
-            headers = row_headers
-            break
-    if header_idx < 0:
+    layout = _compact_table_layout(table)
+    if layout is None:
         return []
-
-    col_ledger, col_cp, col_summary = 0, 1, 2
-    for i, header in enumerate(headers):
-        if "日期" in header or "余额" in header:
-            col_ledger = i
-        elif "对方" in header or "户名" in header:
-            col_cp = i
-        elif "摘要" in header or "附言" in header:
-            col_summary = i
-
-    return pair_ledger_rows(
+    header_idx, headers, col_ledger, col_cp, col_summary = layout
+    transactions = pair_ledger_rows(
         table,
         header_idx=header_idx,
         col_ledger=col_ledger,
         col_cp=col_cp,
         col_summary=col_summary,
     )
+    _attach_anchor_lineage(
+        transactions,
+        table=table,
+        header_index=header_idx,
+        headers=headers,
+        ledger_column=col_ledger,
+    )
+    return transactions
 
 
 def table_has_compact_ledger(tables: list[list[list[str]]]) -> bool:
@@ -171,19 +227,80 @@ def table_has_compact_ledger(tables: list[list[list[str]]]) -> bool:
 
 
 def extract_transactions(tables: list[list[list[str]]]) -> list[dict[str, str]]:
+    layouts = [_compact_table_layout(table) for table in tables]
+    if not any(layout is not None for layout in layouts):
+        return []
+
+    # Tables/pages in this source plane are atomic. A second compact-looking
+    # table whose transaction row does not satisfy the grammar is competing
+    # source evidence, not permission to emit a prefix from earlier pages.
+    for table, layout in zip(tables, layouts, strict=True):
+        if layout is None:
+            if any(row and _compact_row_is_transaction_shaped(str(row[0] or "")) for row in table):
+                return []
+            continue
+        header_index, _headers, ledger_column, _cp_column, _summary_column = layout
+        for row in table[header_index + 1 :]:
+            first_cell = str(row[ledger_column] or "") if ledger_column < len(row) else ""
+            if _compact_row_is_unproved(first_cell):
+                return []
+
     out: list[dict[str, str]] = []
     for tbl in tables:
         for raw in extract_compact_ledger_transactions(tbl):
-            out.append(
+            transaction = {
+                "日期支出收入余额": raw.get("ledger_cell", ""),
+                "对方账户对方户名": raw.get("counterparty_cell", ""),
+                "摘要/附言": raw.get("summary", ""),
+                "_compact": "1",
+                "_time_cell": raw.get("time_cell", ""),
+            }
+            transaction.update(
                 {
-                    "日期支出收入余额": raw.get("ledger_cell", ""),
-                    "对方账户对方户名": raw.get("counterparty_cell", ""),
-                    "摘要/附言": raw.get("summary", ""),
-                    "_compact": "1",
-                    "_time_cell": raw.get("time_cell", ""),
+                    name: raw[name]
+                    for name in _SOURCE_LINEAGE_COLUMNS
+                    if raw.get(name) not in (None, "")
                 }
             )
+            out.append(transaction)
     return out
+
+
+def canonical_raw_values(
+    raw_txn: dict[str, Any],
+    normalized: dict[str, Any],
+    plugin: Any,
+) -> dict[str, Any]:
+    """Expose only deterministic substrings of compact source business cells."""
+    values = dict(plugin._canonical_raw_values(raw_txn, normalized))
+    ledger_cell = str(raw_txn.get("日期支出收入余额") or "").strip()
+    date_match = _DATE_PREFIX_RE.match(ledger_cell)
+    if date_match is not None:
+        values["date"] = date_match.group(1)
+        amounts = _AMOUNT_RE.findall(ledger_cell[date_match.end() :])
+        if amounts:
+            values["balance"] = amounts[-1]
+        if len(amounts) == 2:
+            values["amount"] = amounts[0]
+        elif len(amounts) >= 3:
+            direction = str(normalized.get("direction") or "")
+            if direction == "expense":
+                values["amount"] = amounts[-3]
+            elif direction == "income":
+                values["amount"] = amounts[-2]
+
+    summary = str(raw_txn.get("摘要/附言") or "").strip()
+    if summary:
+        values["summary"] = summary
+
+    counterparty = str(raw_txn.get("对方账户对方户名") or "").strip()
+    if counterparty:
+        account, name = parse_counterparty_cell(counterparty)
+        if account:
+            values["counter_account"] = account
+        if name:
+            values["counter_party"] = name
+    return values
 
 
 def normalize_record(raw_txn: dict[str, str]) -> dict[str, Any]:

@@ -39,6 +39,7 @@ from docmirror.plugins.bank_statement.styles.grid_standard import (
     _normalize_direction_text,
     normalize_record,
     normalize_split_debit_credit,
+    source_owned_signed_directional_amount,
 )
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     _annotate_native_grid_matrix,
@@ -1375,6 +1376,78 @@ def test_explicit_direction_label_is_not_rewritten_for_negative_reversal() -> No
     refine_missing_directions_from_balance_chain(records)
 
     assert records[1]["normalized"]["direction"] == "expense"
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical_raw", "expected"),
+    [
+        (
+            {"借/贷": "借方", "交易金额": "-100.00"},
+            {"direction": "借方", "amount": "-100.00"},
+            ("expense", -100.0),
+        ),
+        (
+            {"收入": "", "支出": "-3,260.00"},
+            {"direction": "expense", "amount": "-3,260.00"},
+            ("expense", -3260.0),
+        ),
+    ],
+    ids=["dedicated-direction", "split-columns"],
+)
+def test_signed_reversal_aggregate_fact_requires_source_owned_direction(
+    raw: dict[str, str],
+    canonical_raw: dict[str, str],
+    expected: tuple[str, float],
+) -> None:
+    normalized = {"direction": "expense", "amount": abs(expected[1])}
+
+    assert source_owned_signed_directional_amount(raw, normalized, canonical_raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical_raw"),
+    [
+        (
+            {"交易金额": "-100.00"},
+            {"amount": "-100.00"},
+        ),
+        (
+            {"收入": "5.00", "支出": "-100.00"},
+            {"direction": "expense", "amount": "-100.00"},
+        ),
+        (
+            {"借/贷": "借方", "交易金额": "-100.00"},
+            {"direction": "借方", "amount": "-99.00"},
+        ),
+        (
+            {"借/贷": "借方", "交易金额": "-100.00"},
+            {"direction": "贷方", "amount": "-100.00"},
+        ),
+        (
+            {"借/贷": "借方", "交易金额": "-100.00"},
+            {"direction": "借方", "amount": "-100.0"},
+        ),
+        (
+            {"借/贷": "借方", "交易金额": "-100.00附言"},
+            {"direction": "借方", "amount": "-100.00附言"},
+        ),
+    ],
+    ids=[
+        "sign-only",
+        "both-split-sides",
+        "canonical-amount-mismatch",
+        "canonical-direction-mismatch",
+        "raw-canonical-text-mismatch",
+        "trailing-source-junk",
+    ],
+)
+def test_signed_reversal_aggregate_fact_fails_closed_without_complete_provenance(
+    raw: dict[str, str],
+    canonical_raw: dict[str, str],
+) -> None:
+    normalized = {"direction": "expense", "amount": 100.0}
+
+    assert source_owned_signed_directional_amount(raw, normalized, canonical_raw) is None
 
 
 def test_missing_source_direction_still_allows_unique_balance_inference() -> None:

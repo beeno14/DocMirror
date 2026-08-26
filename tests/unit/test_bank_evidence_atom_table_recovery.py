@@ -33,6 +33,7 @@ from docmirror.plugins.bank_statement.evidence_atom_table_recovery import (
     recovered_evidence_atom_row_sources,
     recovered_native_datetime_row_evidence,
 )
+from docmirror.plugins.bank_statement.statement_context import build_statement_header_records
 from docmirror.plugins.bank_statement.style_registry import (
     BankTableCandidate,
     _candidate_expected_rows,
@@ -1076,6 +1077,22 @@ def test_geometry_direction_repair_uses_summary_and_cross_page_balance() -> None
     assert previous_balance == 144.74
     assert first_page[0][0] == "支出"
     assert second_page[0][0] == "支出"
+
+
+def test_geometry_sequence_repair_preserves_opaque_log_ids_from_business_rows() -> None:
+    rows = [["1"], ["546276664"], ["165612874"], [""]]
+
+    _repair_geometry_rows(rows, {"sequence_no": 0}, source_headers=["日志号"])
+
+    assert rows == [["1"], ["546276664"], ["165612874"], [""]]
+
+
+def test_geometry_sequence_repair_interpolates_only_blank_ordinal_cells() -> None:
+    rows = [["1"], [""], ["3"], ["opaque-source-id"], ["5"]]
+
+    _repair_geometry_rows(rows, {"sequence_no": 0}, source_headers=["序号"])
+
+    assert rows == [["1"], ["2"], ["3"], ["opaque-source-id"], ["5"]]
 
 
 def test_geometry_cell_spill_moves_bounded_summary_prefix_out_of_signed_amount() -> None:
@@ -3464,6 +3481,21 @@ def test_evidence_identity_recovers_split_header_values_and_directional_totals()
     assert fields["currency"]["raw_value"] == "人民币"
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["query_period"]["normalized_value"] == "2025-07-01 至 2025-07-31"
+    assert "raw_value" not in fields["query_period"]
+    header = build_statement_header_records(_result(atoms), fields)[0]
+    assert header["normalized"]["statement_month"] == "2025-07"
+    assert header["normalized"]["query_period"] == "2025-07-01 ~ 2025-07-31"
+    assert header["normalized"]["period_start"] == "2025-07-01"
+    assert header["normalized"]["period_end"] == "2025-07-31"
+    assert header["canonical_raw"]["statement_year"] == "2025"
+    assert header["canonical_raw"]["statement_month_number"] == "07"
+    assert not {
+        "statement_month",
+        "query_period",
+        "period_start",
+        "period_end",
+    } & header["canonical_raw"].keys()
+    assert header["source"]["field_sources"]["query_period"]["derivation"] == "year_month_calendar"
     assert "total_transactions" not in fields
 
 
@@ -3489,6 +3521,49 @@ def test_evidence_identity_pairs_parallel_label_value_columns_by_geometry():
     assert fields["currency"]["normalized_value"] == "CNY"
     assert fields["branch_name"]["normalized_value"] == "富滇银行"
     assert "bank_name" not in fields
+
+
+def test_evidence_identity_keeps_cmb_holder_away_from_parallel_balance_furniture():
+    atoms = [
+        _atom("title", "账务明细清单", 250.0, 20.0, 340.0),
+        _atom("branch_label", "开户银行:", 31.5, 43.0, 72.8),
+        _atom("branch", "福州仓山支行", 74.1, 43.2, 131.7),
+        _atom("period_label", "账单所属期间:", 417.4, 43.0, 477.9),
+        _atom("period_start", "20231001", 481.6, 43.0, 520.3),
+        _atom("period_end", "20231031", 524.8, 43.0, 563.6),
+        _atom("account_label", "账号:", 31.5, 65.6, 53.5),
+        _atom("account", "591907551610902", 54.9, 65.6, 127.2),
+        _atom("currency_label", "货币:", 511.0, 65.6, 533.1),
+        _atom("currency", "人民币", 534.4, 66.0, 563.2),
+        _atom("holder_label", "账户名称:", 31.5, 84.8, 72.8),
+        _atom("holder", "福州北辰星汽车服务有限公司", 74.1, 85.2, 198.9),
+        _atom("last_balance_label", "上页余额:", 487.0, 84.8, 528.3),
+        _atom("last_balance", "1,572.50", 529.6, 84.8, 563.6),
+        _atom("date_header", "交易日期", 32.0, 107.0, 55.0),
+        _atom("amount_header", "借方/贷方金额", 329.0, 107.0, 378.0),
+        _atom("balance_header", "余额", 396.0, 107.0, 412.0),
+    ]
+
+    parse_result = _result(atoms)
+    fields = BankStatementCommunityPlugin()._recover_identity_from_evidence(parse_result)
+
+    assert fields["account_holder"]["normalized_value"] == "福州北辰星汽车服务有限公司"
+    assert fields["account_holder"]["evidence_ids"] == ["holder"]
+    assert fields["account_number"]["normalized_value"] == "591907551610902"
+    assert fields["currency"]["raw_name"] == "货币"
+    assert fields["currency"]["normalized_value"] == "CNY"
+    assert fields["branch_name"]["normalized_value"] == "福州仓山支行"
+    assert fields["query_period"]["normalized_value"] == "2023-10-01 至 2023-10-31"
+    assert fields["query_period"]["raw_name"] == "账单所属期间"
+    assert "bank_name" not in fields
+
+    header = build_statement_header_records(parse_result, fields)[0]
+    assert header["normalized"]["currency"] == "CNY"
+    assert header["normalized"]["query_period"] == "2023-10-01 ~ 2023-10-31"
+    assert header["normalized"]["period_start"] == "2023-10-01"
+    assert header["normalized"]["period_end"] == "2023-10-31"
+    assert header["normalized"]["brought_forward_balance"] == "1572.50"
+    assert header["normalized"]["statement_title"] == "账务明细清单"
 
 
 def test_evidence_identity_supports_hyphenated_account_and_chinese_date_range():

@@ -27,6 +27,10 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair_policy import (
+    liability_business_type_is_valid,
+    separated_leading_han_company_boundary,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
     resolve_exact_page_token_atoms,
 )
@@ -763,6 +767,18 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         return vocabulary is not None and value in vocabulary
     if role == "inquiry_row":
         return bool(_DATE_TOKEN_RE.search(value) and any(marker in value for marker in _VALID_INQUIRY_REASONS))
+    if role == "inquiry_sequence":
+        return bool(re.fullmatch(r"[1-9]\d{0,3}", value))
+    if role == "liability_business_type":
+        return liability_business_type_is_valid(value)
+    if role == "liability_related_party_name":
+        compact = re.sub(r"\s+", "", _plain_text(value))
+        return bool(
+            2 <= len(compact) <= 120
+            and re.search(r"[\u3400-\u9fffA-Za-z]", compact)
+            and re.search(r"[\"'?？]{2,}", compact) is None
+            and not separated_leading_han_company_boundary(value)
+        )
     return bool(value)
 
 
@@ -830,6 +846,12 @@ def _normalize_role(value: str, role: str) -> str:
     if role == "inquiry_reason":
         text = _field_local_inquiry_reason_alias(value)
         return _normalize_business_enum(text, _VALID_INQUIRY_REASONS)
+    if role in {
+        "inquiry_sequence",
+        "liability_business_type",
+        "liability_related_party_name",
+    }:
+        return re.sub(r"\s+", "", _plain_text(value))
     if role == "account_line":
         return _normalize_account_line(value)
     return text
@@ -1279,6 +1301,59 @@ def _exact_repair_target_ref(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _exact_repair_owner(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Return the immutable table-cell owner shared with a planned repair."""
+
+    logical_page = ref.get("logical_page") or ref.get("page")
+    source_page = ref.get("source_page")
+    table_id = str(ref.get("table_id") or "")
+    row = ref.get("row")
+    column = ref.get("column")
+    bbox = _exact_repair_bbox(ref.get("bbox"))
+    evidence_ids = _strict_repair_evidence_ids(ref.get("evidence_ids"))
+    if (
+        not isinstance(logical_page, int)
+        or isinstance(logical_page, bool)
+        or logical_page <= 0
+        or not isinstance(source_page, int)
+        or isinstance(source_page, bool)
+        or source_page <= 0
+        or not table_id
+        or not isinstance(row, int)
+        or isinstance(row, bool)
+        or row < 0
+        or not isinstance(column, int)
+        or isinstance(column, bool)
+        or column < 0
+        or bbox is None
+        or evidence_ids is None
+    ):
+        return None
+    return (
+        logical_page,
+        source_page,
+        table_id,
+        row,
+        column,
+        bbox,
+        evidence_ids,
+    )
+
+
+def _exact_repair_target_identity(
+    ref: Mapping[str, Any],
+    *,
+    field_name: str | None = None,
+) -> tuple[Any, ...] | None:
+    """Bind an immutable physical owner to one semantic field target."""
+
+    owner = _exact_repair_owner(ref)
+    semantic_field = str(field_name or ref.get("field_name") or "").strip()
+    if owner is None or not semantic_field:
+        return None
+    return (*owner, semantic_field)
+
+
 class PersonalDetailOCRCorrectionOverlay:
     """Schema-aware corrected view over one sealed personal report.
 
@@ -1293,6 +1368,7 @@ class PersonalDetailOCRCorrectionOverlay:
     ) -> None:
         self.parse_result = parse_result
         self._repair_evidence_by_page: dict[int, dict[str, Any]] = {}
+        self._repair_allowed_field_targets: set[tuple[Any, ...]] | None = None
         self._repair_evidence_reparse_attempts = 0
         self._decisions: list[PersonalDetailCorrectionDecision] = []
         self._decision_keys: set[tuple[str, str, str, str]] = set()
@@ -1313,6 +1389,11 @@ class PersonalDetailOCRCorrectionOverlay:
             "applied_count": counts.get("applied", 0),
             "suggested_count": counts.get("suggested", 0),
             "repair_evidence_page_count": len(self._repair_evidence_by_page),
+            "repair_evidence_target_count": (
+                None
+                if self._repair_allowed_field_targets is None
+                else len(self._repair_allowed_field_targets)
+            ),
             "repair_evidence_reparse_attempt_count": self._repair_evidence_reparse_attempts,
             "ocr_started_by_correction_overlay": False,
             "audited_cell_count": len(self._audited_cells),
@@ -1326,6 +1407,7 @@ class PersonalDetailOCRCorrectionOverlay:
         pages: Iterable[Mapping[str, Any]],
         *,
         affected_pages: Iterable[int],
+        allowed_target_refs: Iterable[Mapping[str, Any]] | None = None,
     ) -> None:
         """Install the coordinator's fixed evidence without acquiring any OCR."""
         allowed = {int(page) for page in affected_pages if int(page) > 0}
@@ -1335,6 +1417,16 @@ class PersonalDetailOCRCorrectionOverlay:
             if isinstance(page, Mapping)
             and int(page.get("page") or 0) in allowed
         }
+        self._repair_allowed_field_targets = (
+            None
+            if allowed_target_refs is None
+            else {
+                target
+                for ref in allowed_target_refs
+                if isinstance(ref, Mapping)
+                and (target := _exact_repair_target_identity(ref)) is not None
+            }
+        )
 
     def _audit_cell(
         self,
@@ -1465,6 +1557,76 @@ class PersonalDetailOCRCorrectionOverlay:
                 return repaired
         return original, None
 
+    def repair_planned_text(
+        self,
+        value: Any,
+        *,
+        repair: Any,
+        source_refs: Iterable[dict[str, Any]],
+    ) -> tuple[str, PersonalDetailCorrectionDecision | None]:
+        """Apply one coordinator-approved directive to its exact field only."""
+
+        original = str(value or "")
+        observed = str(getattr(repair, "observed_value", "") or "")
+        role = str(getattr(repair, "role", "") or "")
+        field_name = str(getattr(repair, "field_name", "") or "") or None
+        mode = str(getattr(repair, "mode", "") or "")
+        refs = _source_refs(source_refs)
+        if original != observed or not role:
+            return original, None
+        ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
+        planned_ref = _exact_repair_target_ref(
+            _source_refs(getattr(repair, "source_refs", ())),
+            role=role,
+            field_name=field_name,
+        )
+        if (
+            ref is None
+            or planned_ref is None
+            or _exact_repair_owner(ref) is None
+            or _exact_repair_owner(ref) != _exact_repair_owner(planned_ref)
+        ):
+            return original, None
+        logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
+        target_admissible, _sealed_target_resolved = self._sealed_target_resolution(
+            ref,
+            logical_page=logical_page,
+        )
+        if not target_admissible:
+            return original, None
+        if mode == "deterministic":
+            candidate = str(getattr(repair, "candidate_value", "") or "")
+            if not candidate or not _is_valid_for_role(candidate, role):
+                return original, None
+            return candidate, self._record(
+                role=role,
+                original=original,
+                corrected=candidate,
+                method="schema_bound_deterministic_field_repair",
+                reason_codes=tuple(
+                    dict.fromkeys(
+                        (
+                            *(str(code) for code in getattr(repair, "reason_codes", ()) or ()),
+                            "exact_owned_field_cell",
+                            "no_ocr_acquisition",
+                        )
+                    )
+                ),
+                confidence=1.0,
+                refs=(dict(ref),),
+                candidates=(candidate,),
+                selected_raw=original,
+            )
+        if mode != "context_rich_reocr":
+            return original, None
+        repaired = self._repair_from_installed_page_evidence(
+            original,
+            role=role,
+            field_name=field_name,
+            refs=refs,
+        )
+        return repaired if repaired is not None else (original, None)
+
     def _sealed_target_resolution(
         self,
         ref: Mapping[str, Any],
@@ -1502,6 +1664,15 @@ class PersonalDetailOCRCorrectionOverlay:
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
         if ref is None:
+            return None
+        target_identity = _exact_repair_target_identity(
+            ref,
+            field_name=field_name,
+        )
+        if (
+            self._repair_allowed_field_targets is not None
+            and target_identity not in self._repair_allowed_field_targets
+        ):
             return None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
         target_admissible, sealed_target_resolved = self._sealed_target_resolution(
@@ -1545,6 +1716,14 @@ class PersonalDetailOCRCorrectionOverlay:
         if selection is None:
             return None
         selected = str(selection["normalized"])
+        if (
+            role == "liability_related_party_name"
+            and selected == re.sub(r"\s+", "", _plain_text(original))
+        ):
+            # The proactive trigger is an ambiguous separated leading-Han
+            # boundary. Merely repeating the same glyphs without whitespace is
+            # not independent resolution and must leave the field unchanged.
+            return None
         selected_ref = selection.get("source_ref")
         if not isinstance(selected_ref, dict):
             return None

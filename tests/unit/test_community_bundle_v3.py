@@ -1399,7 +1399,6 @@ def test_bank_statement_enhanced_markdown_uses_chinese_labels_without_changing_k
             {
                 "normalized": {
                     "amount": "10.00",
-                    "amount_cny": "10.00",
                     "balance": "90.00",
                     "channel": "网银",
                     "counter_account": "001234",
@@ -1446,7 +1445,7 @@ def test_bank_statement_enhanced_markdown_uses_chinese_labels_without_changing_k
     assert "document scene refined" not in enhanced
     assert "layout profile id refined" not in enhanced
     assert "交易金额" in transaction_header
-    assert "折合人民币金额" in transaction_header
+    assert "amount cny" not in transaction_header
     assert "账户余额" in transaction_header
     assert "对方账号" in transaction_header
     assert "对方银行名称" in transaction_header
@@ -1454,7 +1453,10 @@ def test_bank_statement_enhanced_markdown_uses_chinese_labels_without_changing_k
     assert "交易时间" in transaction_header
     assert " amount " not in transaction_header
     assert " counter account " not in transaction_header
-    assert bundle.datasets[0].public["columns"][0]["key"] == "amount"
+    amount_column = next(
+        column for column in bundle.datasets[0].public["columns"] if column["key"] == "amount"
+    )
+    assert amount_column["label"] == "交易金额"
 
 
 def test_markdown_escapes_table_delimiters_but_preserves_content() -> None:

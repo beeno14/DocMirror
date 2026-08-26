@@ -307,6 +307,80 @@ def test_fuller_candidate_can_use_strict_source_page_superset_over_local_balance
     assert selected is fuller
 
 
+def test_complete_three_page_two_scope_candidate_beats_nonempty_partial_plane() -> None:
+    def transaction(page: int, scope: str, sequence: int) -> dict[str, object]:
+        return {
+            "normalized": {
+                "date": f"2025-0{page}-01",
+                "amount": float(sequence),
+                "direction": "income",
+                "sequence_no": str(sequence),
+                "statement_header_id": scope,
+            },
+            "_source": {
+                "source_page": page,
+                "page_range": [page, page],
+                "table_id": f"physical:page:{page}",
+                "source_row_index": sequence,
+                "bbox": [10.0, sequence * 20.0, 100.0, sequence * 20.0 + 8.0],
+            },
+        }
+
+    partial_records = [
+        transaction(1, "statement_header:scope-a", 1),
+        transaction(2, "statement_header:scope-a", 2),
+    ]
+    complete_records = [
+        *partial_records,
+        transaction(3, "statement_header:scope-b", 3),
+        transaction(3, "statement_header:scope-b", 4),
+    ]
+    partial = replace(
+        _candidate_for_authority_test(
+            "native_wide_table:partial",
+            2,
+            RowCountEvidence(2, "native_wide_rows", 0.70),
+        ),
+        records=partial_records,
+        balance_chain_score=0.98,
+        sequence_continuity=1.0,
+        score=0.98,
+    )
+    complete = replace(
+        _candidate_for_authority_test(
+            "evidence_atom:complete",
+            4,
+            RowCountEvidence(4, "positioned_date_anchors", 0.80),
+        ),
+        records=complete_records,
+        balance_chain_score=0.50,
+        sequence_continuity=0.95,
+        score=0.88,
+    )
+
+    selected, diagnostics = _select_candidate([partial, complete])
+
+    assert selected is complete
+    assert diagnostics["selected_candidate"] == "evidence_atom:complete"
+    assert diagnostics["candidate_counts"] == {
+        "native_wide_table:partial": 2,
+        "evidence_atom:complete": 4,
+    }
+    assert [
+        (
+            record["_source"]["source_page"],
+            record["normalized"]["statement_header_id"],
+            record["normalized"]["sequence_no"],
+        )
+        for record in selected.records
+    ] == [
+        (1, "statement_header:scope-a", "1"),
+        (2, "statement_header:scope-a", "2"),
+        (3, "statement_header:scope-b", "3"),
+        (3, "statement_header:scope-b", "4"),
+    ]
+
+
 def test_fuller_candidate_with_same_source_pages_still_needs_semantic_parity() -> None:
     short = replace(
         _candidate_for_authority_test(
@@ -446,6 +520,100 @@ def test_issuer_count_remains_authoritative_for_candidate_selection(source: str,
     assert selected is complete
 
 
+def test_competing_complete_planes_select_one_without_deduping_legitimate_repeats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = ["交易日期", "交易金额", "余额", "交易流水号"]
+    repeated_row = ["2025-01-01", "+1.00", "101.00", "same-reference"]
+    first_plane = [headers, repeated_row.copy(), repeated_row.copy()]
+    second_plane = [headers, repeated_row.copy(), repeated_row.copy()]
+    plane_sources = {
+        id(first_plane): ("native:plane:first", 0.0),
+        id(second_plane): ("native:plane:second", 0.4),
+    }
+
+    monkeypatch.setattr(
+        style_registry,
+        "recover_wide_bank_tables",
+        lambda *_args: [first_plane, second_plane],
+    )
+    monkeypatch.setattr(
+        style_registry,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence(2, "split_footer", 0.98),
+    )
+
+    def run_parser(_parser_id, parser_ctx, _plugin):
+        [table] = parser_ctx.tables
+        table_id, drift = plane_sources[id(table)]
+        records = []
+        for row_index, row in enumerate(table[1:]):
+            y0 = 100.0 + row_index * 20.0 + drift
+            records.append(
+                {
+                    "交易日期": row[0],
+                    "交易金额": row[1],
+                    "余额": row[2],
+                    "交易流水号": row[3],
+                    "_source": {
+                        "source_page": 1,
+                        "page_range": [1, 1],
+                        "table_id": table_id,
+                        "source_row_index": row_index,
+                        "bbox": [10.0, y0, 200.0, y0 + 10.0],
+                    },
+                }
+            )
+
+        return records, lambda raw: {
+            "date": raw["交易日期"],
+            "amount": abs(float(raw["交易金额"])),
+            "direction": "income",
+            "balance": float(raw["余额"]),
+            "reference": raw["交易流水号"],
+        }
+
+    monkeypatch.setattr(style_registry, "_run_parser", run_parser)
+    policy = BankExtractionPolicy(
+        route=BankExtractionRoute.DIGITAL,
+        allowed_parser_ids=frozenset(),
+        allow_native_wide_tables=True,
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=None,
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+    plugin = SimpleNamespace(
+        standard_fields=["date", "amount", "direction", "balance", "reference"],
+        _normalize=lambda raw: raw,
+    )
+
+    candidates = style_registry._collect_table_candidates(
+        StyleDetectionResult(primary_style="grid_standard", parser_chain=[]),
+        ctx,
+        plugin,
+    )
+    native = [candidate for candidate in candidates if candidate.candidate_id.startswith("native_wide_table")]
+    selected, diagnostics = _select_candidate(native)
+
+    assert [candidate.candidate_id for candidate in native] == [
+        "native_wide_table:0",
+        "native_wide_table:1",
+    ]
+    assert selected is native[0]
+    assert diagnostics["selected_candidate"] == "native_wide_table:0"
+    assert selected.expected_rows == RowCountEvidence(2, "split_footer", 0.98)
+    assert len(selected.records) == 2
+    assert {record["_source"]["table_id"] for record in selected.records} == {"native:plane:first"}
+    assert selected.records[0]["_source"]["bbox"] != selected.records[1]["_source"]["bbox"]
+    assert selected.normalize_fn(selected.records[0]) == selected.normalize_fn(selected.records[1])
+
+
 def test_primary_collector_invokes_only_first_allowed_detected_parser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -501,6 +669,59 @@ def test_primary_collector_invokes_only_first_allowed_detected_parser(
 
     assert calls == ["signed_amount"]
     assert [candidate.candidate_id for candidate in candidates] == ["parser:signed_amount"]
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected"),
+    [
+        (
+            DIGITAL_POLICY,
+            [
+                "parser:signed_amount",
+                "parser:grid_standard",
+                "parser:compact_merged",
+                "semantic_text",
+                "physical_table",
+                "positioned_record_block",
+                "evidence_atom",
+                "native_wide_table",
+            ],
+        ),
+        (
+            SCANNED_POLICY,
+            [
+                "parser:signed_amount",
+                "parser:borderless_ocr",
+                "parser:grid_standard",
+                "evidence_atom",
+                "ocr_implicit_table",
+            ],
+        ),
+    ],
+    ids=["digital", "scanned"],
+)
+def test_eligible_strategy_graph_has_deterministic_parser_and_provider_order(
+    policy: BankExtractionPolicy,
+    expected: list[str],
+) -> None:
+    detection = StyleDetectionResult(
+        primary_style="signed_amount",
+        confidence=0.95,
+        parser_chain=["kv_identity", "signed_amount", "signed_amount", "borderless_ocr"],
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=1,
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+
+    strategies = style_registry._eligible_strategy_ids(detection, ctx)
+
+    assert strategies == expected
+    assert len(strategies) == len(set(strategies))
 
 
 def test_proven_primary_skips_every_unused_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1207,6 +1428,175 @@ def test_unknown_primary_reruns_exact_eager_collector_and_matches_forced_eager(
     ]
     assert adaptive_calls == ["grid_standard", "grid_standard", "signed_amount", "compact_merged"]
     assert calls == ["grid_standard", "signed_amount", "compact_merged"]
+
+
+@pytest.mark.parametrize(
+    ("primary_state", "expected_reason"),
+    [
+        ("empty", "primary_parser_returned_no_candidate"),
+        ("partial", "primary_rows_do_not_match_issuer_count"),
+    ],
+)
+def test_empty_or_partial_primary_selects_one_complete_whole_document_alternate(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_state: str,
+    expected_reason: str,
+) -> None:
+    def candidate(
+        candidate_id: str,
+        rows: list[tuple[int, str, int]],
+        *,
+        expected_source: str,
+        expected_confidence: float,
+        balance_chain_score: float,
+        sequence_continuity: float,
+        score: float,
+    ) -> BankTableCandidate:
+        raw_records = [
+            {
+                "date": f"2025-0{page}-01",
+                "amount": f"{sequence}.00",
+                "direction": "income",
+                "balance": f"{100 + sequence}.00",
+                "sequence_no": str(sequence),
+                "statement_header_id": scope,
+                "_source": {
+                    "source_page": page,
+                    "page_range": [page, page],
+                    "table_id": f"{candidate_id}:plane",
+                    "source_row_index": row_index,
+                    "bbox": [10.0, row_index * 20.0, 200.0, row_index * 20.0 + 8.0],
+                },
+            }
+            for row_index, (page, scope, sequence) in enumerate(rows)
+        ]
+
+        def normalize(raw: dict[str, object]) -> dict[str, object]:
+            return {
+                "date": raw["date"],
+                "amount": float(str(raw["amount"])),
+                "direction": raw["direction"],
+                "balance": float(str(raw["balance"])),
+                "sequence_no": raw["sequence_no"],
+                "statement_header_id": raw["statement_header_id"],
+            }
+
+        return replace(
+            _candidate_for_authority_test(
+                candidate_id,
+                len(rows),
+                RowCountEvidence(len(rows), expected_source, expected_confidence),
+            ),
+            records=raw_records,
+            normalize_fn=normalize,
+            balance_chain_score=balance_chain_score,
+            sequence_continuity=sequence_continuity,
+            score=score,
+        )
+
+    partial = candidate(
+        "parser:grid_standard",
+        [
+            (1, "statement_header:scope-a", 1),
+            (2, "statement_header:scope-a", 2),
+        ],
+        expected_source="native_wide_rows",
+        expected_confidence=0.70,
+        balance_chain_score=0.98,
+        sequence_continuity=1.0,
+        score=0.98,
+    )
+    complete = candidate(
+        "evidence_atom:complete",
+        [
+            (1, "statement_header:scope-a", 1),
+            (2, "statement_header:scope-a", 2),
+            (3, "statement_header:scope-b", 3),
+            (3, "statement_header:scope-b", 4),
+        ],
+        expected_source="positioned_date_anchors",
+        expected_confidence=0.80,
+        balance_chain_score=0.50,
+        sequence_continuity=0.95,
+        score=0.88,
+    )
+    collector_calls: list[str] = []
+
+    def collect_primary(*_args, **_kwargs):
+        collector_calls.append("primary")
+        return [] if primary_state == "empty" else [partial]
+
+    def collect_eager(*_args, **_kwargs):
+        collector_calls.append("eager")
+        return [partial, complete]
+
+    def prove(primary_candidate, _detection, _ctx):
+        reason = (
+            "primary_parser_returned_no_candidate"
+            if primary_candidate is None
+            else "primary_rows_do_not_match_issuer_count"
+        )
+        return style_registry.CandidateCompletionProof("unknown", reason)
+
+    monkeypatch.setattr(style_registry, "_collect_primary_table_candidates", collect_primary)
+    monkeypatch.setattr(style_registry, "_collect_table_candidates", collect_eager)
+    monkeypatch.setattr(style_registry, "_prove_primary_candidate_complete", prove)
+
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=0.95,
+        parser_chain=["grid_standard"],
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=3,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    registry = BankStyleParserRegistry()
+
+    records, _identity = registry.run_parser_chain(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert collector_calls == ["primary", "eager"]
+    assert registry.last_selection_diagnostics["deployment_mode"] == "eager_fallback"
+    assert registry.last_selection_diagnostics["completion_state"] == "unknown"
+    assert registry.last_selection_diagnostics["completion_reason"] == expected_reason
+    assert registry.last_selection_diagnostics["attempted_strategies"] == [
+        "parser:grid_standard",
+        "parser:signed_amount",
+        "parser:compact_merged",
+        "semantic_text",
+        "physical_table",
+        "positioned_record_block",
+        "evidence_atom",
+        "native_wide_table",
+    ]
+    assert registry.last_selection_diagnostics["skipped_strategies"] == []
+    assert "prior_lazy_attempt" not in registry.last_selection_diagnostics
+    assert registry.last_selection_diagnostics["selected_candidate"] == "evidence_atom:complete"
+    assert registry.last_selection_diagnostics["candidate_counts"] == {
+        "parser:grid_standard": 2,
+        "evidence_atom:complete": 4,
+    }
+    assert [
+        (
+            record["source"]["source_page"],
+            record["normalized"]["statement_header_id"],
+            record["normalized"]["sequence_no"],
+            record["source"]["table_id"],
+        )
+        for record in records
+    ] == [
+        (1, "statement_header:scope-a", "1", "evidence_atom:complete:plane"),
+        (2, "statement_header:scope-a", "2", "evidence_atom:complete:plane"),
+        (3, "statement_header:scope-b", "3", "evidence_atom:complete:plane"),
+        (3, "statement_header:scope-b", "4", "evidence_atom:complete:plane"),
+    ]
 
 
 @pytest.mark.parametrize(

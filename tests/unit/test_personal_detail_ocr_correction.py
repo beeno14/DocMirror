@@ -9,6 +9,9 @@ import pytest
 
 from docmirror.evidence.repair import RepairCandidate
 from docmirror.plugins.credit_report.personal_detail_scanned import relations
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+    BusinessFieldRepair,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
     _final_account_field_is_valid,
     _reconcile_final_account_field_issues,
@@ -68,6 +71,246 @@ def _one_shot_page_line(
     if content is not None:
         line["content"] = content
     return line
+
+
+def _planned_repair_ref(
+    *,
+    field_name: str = "inquiry_date",
+    row: int = 1,
+    column: int = 1,
+    bbox: list[float] | None = None,
+) -> dict[str, object]:
+    return {
+        "source": "native_detail_table_cell",
+        "logical_page": 1,
+        "source_page": 1,
+        "table_id": "pt_1_0",
+        "row": row,
+        "column": column,
+        "bbox": bbox or [10, 10, 40, 30],
+        "evidence_ids": [f"native:{field_name}:{row}:{column}"],
+        "geometry_scope": "cell",
+        "field_name": field_name,
+        "binding": "canonical_header_column",
+    }
+
+
+def _planned_repair(
+    *,
+    mode: str,
+    observed: str,
+    candidate: str | None,
+    source_ref: dict[str, object],
+) -> BusinessFieldRepair:
+    return BusinessFieldRepair(
+        repair_id="repair:1",
+        uncertainty_id="uncertainty:1",
+        mode=mode,
+        dataset_name="inquiry_records",
+        record_id="credit_inquiry:institution:3",
+        field_name="inquiry_date",
+        role="date",
+        observed_value=observed,
+        candidate_value=candidate,
+        source_refs=(source_ref,),
+        reason_codes=("focused_policy_fixture",),
+    )
+
+
+def test_planned_deterministic_repair_mutates_only_its_exact_owned_field() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref()
+    repair = _planned_repair(
+        mode="deterministic",
+        observed="2022.06.16 广",
+        candidate="2022-06-16",
+        source_ref=target,
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "2022.06.16 广",
+        repair=repair,
+        source_refs=(target,),
+    )
+    wrong_owner, wrong_decision = overlay.repair_planned_text(
+        "2022.06.16 广",
+        repair=repair,
+        source_refs=(_planned_repair_ref(column=2),),
+    )
+
+    assert corrected == "2022-06-16"
+    assert decision is not None
+    assert decision.method == "schema_bound_deterministic_field_repair"
+    assert "no_ocr_acquisition" in decision.reason_codes
+    assert wrong_owner == "2022.06.16 广"
+    assert wrong_decision is None
+
+
+def test_planned_context_rich_reocr_uses_page_context_but_only_target_cell() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref()
+    repair = _planned_repair(
+        mode="context_rich_reocr",
+        observed="2023.01.03 20",
+        candidate=None,
+        source_ref=target,
+    )
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "inquiry-date-context",
+                "lines": [
+                    _one_shot_page_line(
+                        "2023.01.03",
+                        bbox=[10, 10, 40, 30],
+                        page_key="inquiry-date-context",
+                    ),
+                    _one_shot_page_line(
+                        "unrelated page context",
+                        bbox=[80, 80, 160, 95],
+                        page_key="inquiry-date-context",
+                        word_index=1,
+                    ),
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "2023.01.03 20",
+        repair=repair,
+        source_refs=(target,),
+    )
+
+    assert corrected == "2023-01-03"
+    assert decision is not None
+    assert decision.method == "schema_bound_page_evidence_reparse"
+    assert decision.selected_acquisition == (
+        "personal_detail_page_reocr_once:inquiry-date-context"
+    )
+    assert len(decision.source_refs) == 2
+    assert decision.source_refs[0]["geometry_scope"] == "cell"
+    assert decision.source_refs[1]["geometry_scope"] == "token_band"
+
+
+def test_installed_reocr_evidence_is_sealed_to_planned_target_cells() -> None:
+    overlay = _overlay()
+    allowed_target = _planned_repair_ref()
+    unrelated_target = _planned_repair_ref(
+        row=2,
+        bbox=[10, 40, 40, 60],
+    )
+    same_cell_other_field = {
+        **allowed_target,
+        "field_name": "birth_date",
+    }
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "target-seal",
+                "lines": [
+                    _one_shot_page_line(
+                        "2023.01.03",
+                        bbox=[10, 10, 40, 30],
+                        page_key="target-seal",
+                    ),
+                    _one_shot_page_line(
+                        "2023.01.04",
+                        bbox=[10, 40, 40, 60],
+                        page_key="target-seal",
+                        word_index=1,
+                    ),
+                ],
+            }
+        ],
+        affected_pages={1},
+        allowed_target_refs=(allowed_target,),
+    )
+
+    allowed, allowed_decision = overlay.correct_text(
+        "2023.01.03 20",
+        role="date",
+        field_name="inquiry_date",
+        source_refs=(allowed_target,),
+    )
+    unrelated, unrelated_decision = overlay.correct_text(
+        "2023.01.04 21",
+        role="date",
+        field_name="inquiry_date",
+        source_refs=(unrelated_target,),
+    )
+    same_cell, same_cell_decision = overlay.correct_text(
+        "2023.01.03 20",
+        role="date",
+        field_name="birth_date",
+        source_refs=(same_cell_other_field,),
+    )
+
+    assert allowed == "2023-01-03"
+    assert allowed_decision is not None
+    assert unrelated == "2023.01.04 21"
+    assert unrelated_decision is None
+    assert same_cell == "2023.01.03 20"
+    assert same_cell_decision is None
+    assert overlay.audit()["repair_evidence_target_count"] == 1
+
+
+def test_context_rich_reocr_does_not_treat_compacted_ambiguous_name_as_repair() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref(
+        field_name="related_party_name",
+        row=3,
+        column=0,
+        bbox=[10, 40, 90, 60],
+    )
+    repair = BusinessFieldRepair(
+        repair_id="repair:liability-name",
+        uncertainty_id="uncertainty:liability-name",
+        mode="context_rich_reocr",
+        dataset_name="repayment_liability_records",
+        record_id="repayment_liability:2",
+        field_name="related_party_name",
+        role="liability_related_party_name",
+        observed_value="密 厦门雯明轩商贸有限公司",
+        candidate_value=None,
+        source_refs=(target,),
+        reason_codes=("separated_leading_han_company_boundary",),
+    )
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "unchanged-liability-name",
+                "lines": [
+                    _one_shot_page_line(
+                        "密厦门雯明轩商贸有限公司",
+                        bbox=[10, 40, 90, 60],
+                        page_key="unchanged-liability-name",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+        allowed_target_refs=(target,),
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "密 厦门雯明轩商贸有限公司",
+        repair=repair,
+        source_refs=(target,),
+    )
+
+    assert corrected == "密 厦门雯明轩商贸有限公司"
+    assert decision is None
 
 
 @pytest.mark.parametrize("raw", ("1,2", "1,,2", "1,23,456", "12,34"))

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from math import isfinite
 from typing import Any
 
@@ -1551,14 +1553,304 @@ class CandidateBExtraction:
     audit: dict[str, Any]
 
 
+@dataclass
+class _StagePayload:
+    """Detached output and diagnostic effects of one source extraction stage."""
+
+    business: dict[str, Any] = dataclass_field(default_factory=dict)
+    datasets: dict[str, list[dict[str, Any]]] = dataclass_field(
+        default_factory=dict
+    )
+    profile: dict[str, Any] | None = None
+    status_glyph_observations: list[dict[str, Any]] = dataclass_field(
+        default_factory=list
+    )
+    context_cache_entries: dict[str, Any] = dataclass_field(
+        default_factory=dict
+    )
+    context_attributes: dict[str, Any] = dataclass_field(default_factory=dict)
+    removed_issue_ids: tuple[str, ...] = ()
+    upserted_issues: tuple[dict[str, Any], ...] = ()
+    removed_remap_edges: tuple[tuple[str, str], ...] = ()
+    added_remap_edges: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _SourcePassResult:
+    business: dict[str, Any]
+    datasets: dict[str, list[dict[str, Any]]]
+    profile: dict[str, Any]
+    status_glyph_observations: list[dict[str, Any]]
+    stage_payloads: dict[str, _StagePayload]
+    stage_snapshots: dict[str, Any]
+    derived_issue_ids: frozenset[str]
+
+
+def _issue_id(issue: Mapping[str, Any]) -> str:
+    return str(
+        issue.get("extraction_issue_id")
+        or issue.get("record_id")
+        or ""
+    ).strip()
+
+
+def _issue_rows(context: Any) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        deepcopy(dict(issue))
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+        if isinstance(issue, Mapping)
+    )
+
+
+def _remap_edges(context: Any) -> frozenset[tuple[str, str]]:
+    registry = getattr(context, "_personal_detail_issue_target_remaps", None)
+    if not isinstance(registry, Mapping):
+        return frozenset()
+    edges: set[tuple[str, str]] = set()
+    for source, raw_targets in registry.items():
+        source_id = str(source or "").strip()
+        targets = (raw_targets,) if isinstance(raw_targets, str) else raw_targets or ()
+        edges.update(
+            (source_id, str(target or "").strip())
+            for target in targets
+            if source_id and str(target or "").strip()
+        )
+    return frozenset(edges)
+
+
+def _remap_registry_from_edges(
+    edges: set[tuple[str, str]] | frozenset[tuple[str, str]],
+) -> dict[str, set[str]]:
+    registry: dict[str, set[str]] = {}
+    for source, target in sorted(edges):
+        registry.setdefault(source, set()).add(target)
+    return registry
+
+
+@contextmanager
+def _candidate_b_extraction_stage(context: Any, stage_name: str):
+    """Tag diagnostics without changing any extractor's call contract."""
+
+    attribute = "_candidate_b_active_extraction_stage"
+    marker = object()
+    previous = getattr(context, attribute, marker)
+    setattr(context, attribute, stage_name)
+    try:
+        yield
+    finally:
+        if previous is marker:
+            try:
+                delattr(context, attribute)
+            except AttributeError:
+                pass
+        else:
+            setattr(context, attribute, previous)
+
+
+def _stage_diagnostic_delta(
+    before_issues: tuple[dict[str, Any], ...],
+    before_edges: frozenset[tuple[str, str]],
+    context: Any,
+) -> tuple[
+    tuple[str, ...],
+    tuple[dict[str, Any], ...],
+    tuple[tuple[str, str], ...],
+    tuple[tuple[str, str], ...],
+]:
+    after_issues = _issue_rows(context)
+    before_by_id = {
+        issue_id: issue
+        for issue in before_issues
+        if (issue_id := _issue_id(issue))
+    }
+    after_by_id = {
+        issue_id: issue
+        for issue in after_issues
+        if (issue_id := _issue_id(issue))
+    }
+    removed = tuple(sorted(set(before_by_id).difference(after_by_id)))
+    upserted = tuple(
+        issue
+        for issue in after_issues
+        if (issue_id := _issue_id(issue))
+        and before_by_id.get(issue_id) != issue
+    )
+    after_edges = _remap_edges(context)
+    return (
+        removed,
+        upserted,
+        tuple(sorted(before_edges.difference(after_edges))),
+        tuple(sorted(after_edges.difference(before_edges))),
+    )
+
+
+def _mark_direct_stage_diagnostics(
+    context: Any,
+    stage_name: str,
+    payload: _StagePayload,
+) -> None:
+    issue_owners = getattr(context, "_candidate_b_issue_stage_owners", None)
+    if not isinstance(issue_owners, dict):
+        issue_owners = {}
+        context._candidate_b_issue_stage_owners = issue_owners
+    for issue in payload.upserted_issues:
+        if issue_id := _issue_id(issue):
+            owners = issue_owners.setdefault(issue_id, set())
+            if not isinstance(owners, set):
+                owners = set(owners or ())
+                issue_owners[issue_id] = owners
+            owners.add(stage_name)
+
+    remap_owners = getattr(context, "_candidate_b_remap_stage_owners", None)
+    if not isinstance(remap_owners, dict):
+        remap_owners = {}
+        context._candidate_b_remap_stage_owners = remap_owners
+    for edge in payload.added_remap_edges:
+        owners = remap_owners.setdefault(edge, set())
+        if not isinstance(owners, set):
+            owners = set(owners or ())
+            remap_owners[edge] = owners
+        owners.add(stage_name)
+
+
+def _merge_stage_diagnostic_delta(
+    payload: _StagePayload,
+    delta: tuple[
+        tuple[str, ...],
+        tuple[dict[str, Any], ...],
+        tuple[tuple[str, str], ...],
+        tuple[tuple[str, str], ...],
+    ],
+) -> None:
+    """Merge a later callback's effects into its reusable stage snapshot."""
+
+    removed_issue_ids = set(payload.removed_issue_ids)
+    upserted_issues = {
+        issue_id: issue
+        for issue in payload.upserted_issues
+        if (issue_id := _issue_id(issue))
+    }
+    for issue_id in delta[0]:
+        removed_issue_ids.add(issue_id)
+        upserted_issues.pop(issue_id, None)
+    for issue in delta[1]:
+        if issue_id := _issue_id(issue):
+            removed_issue_ids.discard(issue_id)
+            upserted_issues[issue_id] = issue
+    payload.removed_issue_ids = tuple(sorted(removed_issue_ids))
+    payload.upserted_issues = tuple(upserted_issues.values())
+
+    removed_edges = set(payload.removed_remap_edges)
+    added_edges = set(payload.added_remap_edges)
+    for edge in delta[2]:
+        removed_edges.add(edge)
+        added_edges.discard(edge)
+    for edge in delta[3]:
+        removed_edges.discard(edge)
+        added_edges.add(edge)
+    payload.removed_remap_edges = tuple(sorted(removed_edges))
+    payload.added_remap_edges = tuple(sorted(added_edges))
+
+
+def _apply_reused_stage_diagnostics(
+    context: Any,
+    stage_name: str,
+    payload: _StagePayload,
+    *,
+    discovery_issues: tuple[dict[str, Any], ...],
+    discovery_issue_owners: Mapping[str, Any],
+    discovery_remap_owners: Mapping[tuple[str, str], Any],
+) -> None:
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        record_issue,
+        register_issue_target_remap,
+    )
+
+    context_cache = getattr(context, "_cache", None)
+    if isinstance(context_cache, dict):
+        context_cache.update(deepcopy(payload.context_cache_entries))
+    for attribute_name, value in payload.context_attributes.items():
+        setattr(context, attribute_name, deepcopy(value))
+
+    removed_ids = set(payload.removed_issue_ids)
+    if removed_ids:
+        context._personal_detail_extraction_issues = [
+            issue
+            for issue in getattr(context, "_personal_detail_extraction_issues", ())
+            if not isinstance(issue, Mapping) or _issue_id(issue) not in removed_ids
+        ]
+
+    active_rows = getattr(context, "_personal_detail_extraction_issues", None)
+    if not isinstance(active_rows, list):
+        active_rows = []
+        context._personal_detail_extraction_issues = active_rows
+    index_by_id = {
+        issue_id: index
+        for index, issue in enumerate(active_rows)
+        if isinstance(issue, Mapping) and (issue_id := _issue_id(issue))
+    }
+    with _candidate_b_extraction_stage(context, stage_name):
+        for issue in payload.upserted_issues:
+            issue_id = _issue_id(issue)
+            if issue_id in index_by_id:
+                active_rows[index_by_id[issue_id]] = deepcopy(issue)
+            else:
+                record_issue(context, issue)
+                index_by_id[issue_id] = len(active_rows) - 1
+
+        # Duplicate suppression can make a stage's local delta empty even
+        # though it independently owns the diagnostic. Restore such rows from
+        # the detached final discovery ledger.
+        for issue in discovery_issues:
+            issue_id = _issue_id(issue)
+            owners = discovery_issue_owners.get(issue_id) or ()
+            if issue_id and stage_name in owners:
+                # ``record_issue`` records this stage as an owner before its
+                # duplicate check, so call it even when an earlier stage has
+                # already restored the shared row.
+                record_issue(context, issue)
+
+        edges = set(_remap_edges(context))
+        edges.difference_update(payload.removed_remap_edges)
+        context._personal_detail_issue_target_remaps = _remap_registry_from_edges(edges)
+        for source, target in payload.added_remap_edges:
+            register_issue_target_remap(context, source, target)
+        edges = set(_remap_edges(context))
+        for edge, owners in discovery_remap_owners.items():
+            if stage_name in (owners or ()):
+                # As with issues, the idempotent remap API also restores every
+                # emitting stage's private ownership sidecar.
+                register_issue_target_remap(context, *edge)
+                edges.add(edge)
+
+
 class CandidateBPipeline:
     """Extract registered canonical pages into the PBOC source schema once."""
 
-    def __init__(self, context: Any, full_text: str) -> None:
+    def __init__(
+        self,
+        context: Any,
+        full_text: str,
+        *,
+        extraction_strategy: Any | None = None,
+    ) -> None:
         self.context = context
         self.full_text = str(full_text or "")
+        if extraction_strategy is None:
+            from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy import (
+                LazyExtractionStrategy,
+            )
+
+            extraction_strategy = LazyExtractionStrategy()
+        self.extraction_strategy = extraction_strategy
 
     def run(self) -> CandidateBExtraction:
+        from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b_strategy import (
+            CANDIDATE_B_STAGE_REGISTRY,
+            candidate_b_repair_scope,
+            plan_candidate_b_initial_extraction,
+            section_census_from_canonical_audit,
+        )
         from docmirror.plugins.credit_report.personal_detail_scanned.consistency_ledger import (
             apply_document_consistency_ledger,
         )
@@ -1569,6 +1861,9 @@ class CandidateBPipeline:
             collect_extraction_issues,
             dataset_states_from_issues,
             register_final_liability_issue_records,
+        )
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy import (
+            StageSnapshot,
         )
         from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
             _enforce_employment_record_contracts,
@@ -1606,78 +1901,6 @@ class CandidateBPipeline:
             prepare_personal_detail_source_collections,
         )
 
-        def extract_source_pass() -> tuple[
-            dict[str, Any],
-            dict[str, list[dict[str, Any]]],
-            dict[str, Any],
-        ]:
-            # Registration and fragment joining use static ParseResult evidence
-            # only. No OCR can be started before business candidates exist.
-            canonical_pages = self.context.pages
-            del canonical_pages
-
-            accounts, _discarded_parallel_monthly_rows, account_events = self.context.account_collections()
-            repayments = self.context.corrected_repayment_records()
-            evidence_loader = getattr(self.context, "corrected_evidence_pages", None)
-            repayment_anchors = candidate_b_repayment_anchor_ledger(
-                evidence_loader() if callable(evidence_loader) else [],
-                accounts,
-            )
-            self.context._candidate_b_repayment_anchor_ledger = repayment_anchors
-            repayments = link_candidate_b_repayments(
-                repayments,
-                accounts,
-                self.context.corrected_repayment_micro_grids(),
-                reading_order_by_logical=dict(self.context.reading_order_by_logical),
-                issue_context=self.context,
-                repayment_anchors=repayment_anchors,
-            )
-            business: dict[str, Any] = {
-                "credit_accounts": accounts,
-                # Reconciliation is part of schema extraction, not a release-
-                # only cleanup.  Running it in the discovery pass exposes
-                # field conflicts/missing slots early enough to select the
-                # one permitted complete-page OCR repair.
-                "credit_lines": reconcile_candidate_b_credit_lines(
-                    self.context,
-                    _extract_credit_lines(self.context),
-                ),
-                "repayment_liability_records": _extract_liabilities(self.context),
-                "repayment_records": repayments,
-                "overdue_records": derive_candidate_b_overdue_records(accounts, repayments),
-                "inquiry_records": _extract_inquiries(self.context),
-                "public_records": _extract_public_records(self.context),
-            }
-            business["credit_summary"] = {
-                "source": "candidate_b_canonical_templates",
-                "reported_account_count": len(business["credit_accounts"]),
-                "projected_account_count": len(business["credit_accounts"]),
-                "repayment_liability_count": len(business["repayment_liability_records"]),
-                "inquiry_count": len(business["inquiry_records"]),
-                "account_population_comparable": False,
-            }
-            annotations, statements = _extract_personal_notes(self.context)
-            summary_records, summary_cells = _extract_summary_datasets(self.context)
-            datasets: dict[str, list[dict[str, Any]]] = {
-                **_extract_header_datasets(self.context, self.full_text),
-                **{name: list(business.get(name) or ()) for name in _CORE_BUSINESS_DATASETS},
-                "recovery_records": _extract_recovery_records(self.context),
-                "postpaid_records": _extract_postpaid_records(self.context),
-                "postpaid_payment_history": _extract_postpaid_payment_history(self.context),
-                "personal_detail_account_events": account_events,
-                "personal_detail_summary_records": summary_records,
-                "personal_detail_summary_cells": summary_cells,
-                "residence_records": _extract_residence_records(self.context),
-                "employment_records": _extract_employment_records(self.context),
-                "annotations": annotations,
-                "statements": statements,
-                "personal_detail_source_rows": _extract_source_rows(self.context),
-                **_extract_profile_detail_records(self.context),
-            }
-            profile = extract_candidate_b_profile(self.context)
-            _record_pre_repair_source_gaps(self.context, datasets)
-            return business, datasets, profile
-
         def status_glyph_observations() -> list[dict[str, Any]]:
             loader = getattr(
                 self.context,
@@ -1686,16 +1909,571 @@ class CandidateBPipeline:
             )
             return list(loader() or ()) if callable(loader) else []
 
-        first_business, first_datasets, first_profile = extract_source_pass()
-        first_status_glyph_observations = status_glyph_observations()
+        def materialize_stage(
+            stage_name: str,
+            payloads: Mapping[str, _StagePayload],
+        ) -> _StagePayload:
+            """Invoke one unchanged extractor behind its strategy stage."""
+
+            if stage_name == "account_inventory":
+                accounts, discarded, account_events = (
+                    self.context.account_collections()
+                )
+                account_context_attributes = {}
+                if hasattr(
+                    self.context,
+                    "_candidate_b_account_anchor_skeleton_cache",
+                ):
+                    account_context_attributes[
+                        "_candidate_b_account_anchor_skeleton_cache"
+                    ] = getattr(
+                        self.context,
+                        "_candidate_b_account_anchor_skeleton_cache",
+                    )
+                return _StagePayload(
+                    business={"credit_accounts": accounts},
+                    datasets={
+                        "personal_detail_account_events": account_events,
+                    },
+                    context_cache_entries={
+                        "account_collections": (
+                            accounts,
+                            discarded,
+                            account_events,
+                        )
+                    },
+                    context_attributes=account_context_attributes,
+                )
+            if stage_name == "monthly_repayments":
+                accounts = payloads["account_inventory"].business.get(
+                    "credit_accounts"
+                ) or []
+                repayments = self.context.corrected_repayment_records()
+                evidence_loader = getattr(
+                    self.context,
+                    "corrected_evidence_pages",
+                    None,
+                )
+                repayment_anchors = candidate_b_repayment_anchor_ledger(
+                    evidence_loader() if callable(evidence_loader) else [],
+                    accounts,
+                )
+                self.context._candidate_b_repayment_anchor_ledger = (
+                    repayment_anchors
+                )
+                repayments = link_candidate_b_repayments(
+                    repayments,
+                    accounts,
+                    self.context.corrected_repayment_micro_grids(),
+                    reading_order_by_logical=dict(
+                        self.context.reading_order_by_logical
+                    ),
+                    issue_context=self.context,
+                    repayment_anchors=repayment_anchors,
+                )
+                return _StagePayload(
+                    business={"repayment_records": repayments},
+                    context_attributes={
+                        "_candidate_b_repayment_anchor_ledger": (
+                            repayment_anchors
+                        )
+                    },
+                )
+            if stage_name == "overdue":
+                accounts = payloads["account_inventory"].business.get(
+                    "credit_accounts"
+                ) or ()
+                repayments = payloads["monthly_repayments"].business.get(
+                    "repayment_records"
+                ) or ()
+                return _StagePayload(
+                    business={
+                        "overdue_records": derive_candidate_b_overdue_records(
+                            accounts,
+                            repayments,
+                        )
+                    }
+                )
+            if stage_name == "credit_agreements":
+                # Reconciliation remains part of schema extraction.  Staging
+                # changes when it runs, never how candidates are extracted.
+                return _StagePayload(
+                    business={
+                        "credit_lines": reconcile_candidate_b_credit_lines(
+                            self.context,
+                            _extract_credit_lines(self.context),
+                        )
+                    }
+                )
+            if stage_name == "liabilities":
+                return _StagePayload(
+                    business={
+                        "repayment_liability_records": _extract_liabilities(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "inquiries":
+                return _StagePayload(
+                    business={
+                        "inquiry_records": _extract_inquiries(self.context)
+                    }
+                )
+            if stage_name == "public":
+                return _StagePayload(
+                    business={
+                        "public_records": _extract_public_records(self.context)
+                    }
+                )
+            if stage_name == "notes":
+                annotations, statements = _extract_personal_notes(self.context)
+                return _StagePayload(
+                    datasets={
+                        "annotations": annotations,
+                        "statements": statements,
+                    }
+                )
+            if stage_name == "summary":
+                summary_records, summary_cells = _extract_summary_datasets(
+                    self.context
+                )
+                return _StagePayload(
+                    datasets={
+                        "personal_detail_summary_records": summary_records,
+                        "personal_detail_summary_cells": summary_cells,
+                    }
+                )
+            if stage_name == "header":
+                return _StagePayload(
+                    datasets=_extract_header_datasets(
+                        self.context,
+                        self.full_text,
+                    )
+                )
+            if stage_name == "recovery":
+                return _StagePayload(
+                    datasets={
+                        "recovery_records": _extract_recovery_records(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "postpaid_records":
+                return _StagePayload(
+                    datasets={
+                        "postpaid_records": _extract_postpaid_records(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "postpaid_history":
+                return _StagePayload(
+                    datasets={
+                        "postpaid_payment_history": (
+                            _extract_postpaid_payment_history(self.context)
+                        )
+                    }
+                )
+            if stage_name == "residence":
+                return _StagePayload(
+                    datasets={
+                        "residence_records": _extract_residence_records(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "employment":
+                return _StagePayload(
+                    datasets={
+                        "employment_records": _extract_employment_records(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "source_rows":
+                return _StagePayload(
+                    datasets={
+                        "personal_detail_source_rows": _extract_source_rows(
+                            self.context
+                        )
+                    }
+                )
+            if stage_name == "profile_details":
+                return _StagePayload(
+                    datasets=_extract_profile_detail_records(self.context)
+                )
+            if stage_name == "profile":
+                return _StagePayload(
+                    profile=extract_candidate_b_profile(self.context)
+                )
+            raise RuntimeError(
+                f"Candidate B stage has no extractor callback: {stage_name}"
+            )
+
+        def record_count(payload: _StagePayload, output_name: str) -> int:
+            if output_name == "status_glyph_observations":
+                return len(payload.status_glyph_observations)
+            if output_name == "subject_profile":
+                return int(payload.profile is not None)
+            value = payload.business.get(output_name)
+            if value is None:
+                value = payload.datasets.get(output_name)
+            if isinstance(value, Mapping):
+                return 1
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return len(value)
+            return int(value is not None)
+
+        def extract_source_pass(
+            plan: Any,
+            *,
+            generation: int,
+            reusable_stage_payloads: Mapping[str, _StagePayload] | None = None,
+            reusable_stage_snapshots: Mapping[str, Any] | None = None,
+            discovery_issues: tuple[dict[str, Any], ...] = (),
+            discovery_issue_owners: Mapping[str, Any] | None = None,
+            discovery_remap_owners: Mapping[tuple[str, str], Any]
+            | None = None,
+        ) -> _SourcePassResult:
+            reusable_stage_payloads = reusable_stage_payloads or {}
+            reusable_stage_snapshots = reusable_stage_snapshots or {}
+            discovery_issue_owners = discovery_issue_owners or {}
+            discovery_remap_owners = discovery_remap_owners or {}
+            execute = set(plan.ordered_stage_names)
+            reuse = set(plan.reused_stage_names)
+            payloads: dict[str, _StagePayload] = {}
+
+            # Walk the full stable registry order so reused diagnostic effects
+            # are restored before any dependent dirty stage executes.
+            for stage_name in CANDIDATE_B_STAGE_REGISTRY.ordered():
+                if stage_name in reuse:
+                    if stage_name not in reusable_stage_payloads:
+                        raise RuntimeError(
+                            "Candidate B plan requested an unavailable stage "
+                            f"snapshot: {stage_name}"
+                        )
+                    payload = deepcopy(reusable_stage_payloads[stage_name])
+                    _apply_reused_stage_diagnostics(
+                        self.context,
+                        stage_name,
+                        payload,
+                        discovery_issues=discovery_issues,
+                        discovery_issue_owners=discovery_issue_owners,
+                        discovery_remap_owners=discovery_remap_owners,
+                    )
+                    payloads[stage_name] = payload
+                    continue
+                if stage_name not in execute:
+                    continue
+                before_issues = _issue_rows(self.context)
+                before_edges = _remap_edges(self.context)
+                with _candidate_b_extraction_stage(
+                    self.context,
+                    stage_name,
+                ):
+                    payload = materialize_stage(stage_name, payloads)
+                (
+                    payload.removed_issue_ids,
+                    payload.upserted_issues,
+                    payload.removed_remap_edges,
+                    payload.added_remap_edges,
+                ) = _stage_diagnostic_delta(
+                    before_issues,
+                    before_edges,
+                    self.context,
+                )
+                _mark_direct_stage_diagnostics(
+                    self.context,
+                    stage_name,
+                    payload,
+                )
+                payloads[stage_name] = payload
+
+            merged_business: dict[str, Any] = {}
+            merged_datasets: dict[str, list[dict[str, Any]]] = {}
+            profile: dict[str, Any] = {}
+            for stage_name in CANDIDATE_B_STAGE_REGISTRY.ordered():
+                payload = payloads.get(stage_name)
+                if payload is None:
+                    continue
+                merged_business.update(deepcopy(payload.business))
+                merged_datasets.update(deepcopy(payload.datasets))
+                if payload.profile is not None:
+                    profile = deepcopy(payload.profile)
+
+            business: dict[str, Any] = {
+                name: list(merged_business.get(name) or ())
+                for name in _CORE_BUSINESS_DATASETS
+            }
+            business["credit_summary"] = {
+                "source": "candidate_b_canonical_templates",
+                "reported_account_count": len(business["credit_accounts"]),
+                "projected_account_count": len(business["credit_accounts"]),
+                "repayment_liability_count": len(
+                    business["repayment_liability_records"]
+                ),
+                "inquiry_count": len(business["inquiry_records"]),
+                "account_population_comparable": False,
+            }
+
+            datasets: dict[str, list[dict[str, Any]]] = {}
+            header_payload = payloads.get("header")
+            if header_payload is not None:
+                datasets.update(deepcopy(header_payload.datasets))
+            datasets.update(
+                {
+                    name: list(business.get(name) or ())
+                    for name in _CORE_BUSINESS_DATASETS
+                }
+            )
+            for name in (
+                "recovery_records",
+                "postpaid_records",
+                "postpaid_payment_history",
+                "personal_detail_account_events",
+                "personal_detail_summary_records",
+                "personal_detail_summary_cells",
+                "residence_records",
+                "employment_records",
+                "annotations",
+                "statements",
+                "personal_detail_source_rows",
+            ):
+                datasets[name] = list(merged_datasets.get(name) or ())
+            profile_details_payload = payloads.get("profile_details")
+            if profile_details_payload is not None:
+                datasets.update(deepcopy(profile_details_payload.datasets))
+
+            issues_before_source_gaps = {
+                _issue_id(issue)
+                for issue in _issue_rows(self.context)
+                if _issue_id(issue)
+            }
+            _record_pre_repair_source_gaps(self.context, datasets)
+            issues_after_source_gaps = {
+                _issue_id(issue)
+                for issue in _issue_rows(self.context)
+                if _issue_id(issue)
+            }
+            derived_issue_ids = frozenset(
+                issues_after_source_gaps.difference(issues_before_source_gaps)
+            )
+
+            monthly_payload = payloads.get("monthly_repayments")
+            if monthly_payload is not None and "monthly_repayments" in execute:
+                before_status_issues = _issue_rows(self.context)
+                before_status_edges = _remap_edges(self.context)
+                with _candidate_b_extraction_stage(
+                    self.context,
+                    "monthly_repayments",
+                ):
+                    monthly_payload.status_glyph_observations = (
+                        status_glyph_observations()
+                    )
+                _merge_stage_diagnostic_delta(
+                    monthly_payload,
+                    _stage_diagnostic_delta(
+                        before_status_issues,
+                        before_status_edges,
+                        self.context,
+                    ),
+                )
+                _mark_direct_stage_diagnostics(
+                    self.context,
+                    "monthly_repayments",
+                    monthly_payload,
+                )
+            status_observations = (
+                list(monthly_payload.status_glyph_observations)
+                if monthly_payload is not None
+                else []
+            )
+
+            snapshots: dict[str, Any] = {}
+            for stage_name in CANDIDATE_B_STAGE_REGISTRY.ordered():
+                payload = payloads.get(stage_name)
+                if payload is None:
+                    continue
+                if stage_name in reuse and stage_name in reusable_stage_snapshots:
+                    snapshots[stage_name] = deepcopy(
+                        reusable_stage_snapshots[stage_name]
+                    )
+                    continue
+                stage = CANDIDATE_B_STAGE_REGISTRY.stage(stage_name)
+                snapshots[stage_name] = StageSnapshot(
+                    stage_name=stage_name,
+                    generation=generation,
+                    dependency_generations=tuple(
+                        (
+                            dependency,
+                            snapshots[dependency].generation,
+                        )
+                        for dependency in sorted(stage.dependencies)
+                    ),
+                    output_names=stage.output_names,
+                    record_counts=tuple(
+                        (
+                            output_name,
+                            record_count(payload, output_name),
+                        )
+                        for output_name in stage.output_names
+                    ),
+                )
+
+            return _SourcePassResult(
+                business=business,
+                datasets=datasets,
+                profile=profile,
+                status_glyph_observations=status_observations,
+                stage_payloads=payloads,
+                stage_snapshots=snapshots,
+                derived_issue_ids=derived_issue_ids,
+            )
+
+        baseline_issues = _issue_rows(self.context)
+        baseline_issue_ids = {
+            _issue_id(issue) for issue in baseline_issues if _issue_id(issue)
+        }
+        baseline_remap_edges = _remap_edges(self.context)
+        self.context._candidate_b_issue_stage_owners = {}
+        self.context._candidate_b_remap_stage_owners = {}
+
+        # Registration and fragment joining consume static ParseResult evidence
+        # only.  The detached audit is the section census for the lazy planner.
+        with _candidate_b_extraction_stage(
+            self.context,
+            "canonical_census",
+        ):
+            canonical_pages = self.context.pages
+            del canonical_pages
+            discovery_canonical_audit = deepcopy(
+                self.context.canonical_layout_audit()
+            )
+        discovery_census, discovery_plan = (
+            plan_candidate_b_initial_extraction(
+                discovery_canonical_audit,
+                strategy=self.extraction_strategy,
+            )
+        )
+        first_result = extract_source_pass(
+            discovery_plan,
+            generation=1,
+        )
+        first_business = first_result.business
+        first_datasets = first_result.datasets
+        first_profile = first_result.profile
+        first_status_glyph_observations = (
+            first_result.status_glyph_observations
+        )
+        discovery_issues = _issue_rows(self.context)
+        discovery_issue_owners = deepcopy(
+            getattr(self.context, "_candidate_b_issue_stage_owners", {})
+        )
+        discovery_remap_owners = deepcopy(
+            getattr(self.context, "_candidate_b_remap_stage_owners", {})
+        )
+        discovery_issue_ids = {
+            _issue_id(issue)
+            for issue in discovery_issues
+            if _issue_id(issue)
+        }
+        unowned_discovery_issue_ids = tuple(
+            sorted(
+                discovery_issue_ids.difference(baseline_issue_ids)
+                .difference(discovery_issue_owners)
+                .difference(first_result.derived_issue_ids)
+            )
+        )
+        unowned_discovery_remap_edges = tuple(
+            sorted(
+                _remap_edges(self.context)
+                .difference(baseline_remap_edges)
+                .difference(discovery_remap_owners)
+            )
+        )
         repair_payload = {
             "credit_summary": dict(first_business.get("credit_summary") or {}),
             **first_datasets,
         }
         repair_applied = self.context.prepare_candidate_b_business_repair(repair_payload)
+        repair_scope = None
+        repair_plan = None
+        repaired_census_audit = None
         if repair_applied:
-            source_business, source_datasets, source_profile = extract_source_pass()
-            source_status_glyph_observations = status_glyph_observations()
+            # ``prepare`` resets extraction caches and issues.  Remap edges are
+            # reset here as well so only clean-stage edges are rehydrated.
+            self.context._personal_detail_extraction_issues = list(
+                deepcopy(baseline_issues)
+            )
+            self.context._personal_detail_issue_target_remaps = (
+                _remap_registry_from_edges(baseline_remap_edges)
+            )
+            self.context._candidate_b_issue_stage_owners = {}
+            self.context._candidate_b_remap_stage_owners = {}
+            with _candidate_b_extraction_stage(
+                self.context,
+                "canonical_census",
+            ):
+                repaired_pages = self.context.pages
+                del repaired_pages
+                repaired_canonical_audit = deepcopy(
+                    self.context.canonical_layout_audit()
+                )
+            repaired_census_audit = section_census_from_canonical_audit(
+                repaired_canonical_audit
+            ).audit()
+            repair_scope = candidate_b_repair_scope(
+                getattr(self.context, "_business_repair_plan", None),
+                discovery_canonical_audit,
+                repaired_canonical_audit,
+            )
+            repair_request = repair_scope.extraction_request(
+                available_stage_names=first_result.stage_payloads,
+            )
+            if (
+                unowned_discovery_issue_ids
+                or unowned_discovery_remap_edges
+            ):
+                from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy import (
+                    ExtractionRequest,
+                )
+
+                repair_request = ExtractionRequest.repair(
+                    repair_scope.census,
+                    available_stage_names=first_result.stage_payloads,
+                    dirty_stage_names=repair_scope.dirty_stage_names,
+                    dirty_section_names=(
+                        section_name
+                        for section_name in repair_scope.dirty_sections
+                        if section_name
+                        in CANDIDATE_B_STAGE_REGISTRY.sections
+                    ),
+                    dependency_closure_known=False,
+                    force_eager_reason=(
+                        "issue_stage_ownership_unknown"
+                        if unowned_discovery_issue_ids
+                        else "remap_stage_ownership_unknown"
+                    ),
+                )
+            repair_plan = self.extraction_strategy.plan(
+                CANDIDATE_B_STAGE_REGISTRY,
+                repair_request,
+            )
+            repaired_result = extract_source_pass(
+                repair_plan,
+                generation=2,
+                reusable_stage_payloads=first_result.stage_payloads,
+                reusable_stage_snapshots=first_result.stage_snapshots,
+                discovery_issues=discovery_issues,
+                discovery_issue_owners=discovery_issue_owners,
+                discovery_remap_owners=discovery_remap_owners,
+            )
+            source_business = repaired_result.business
+            source_datasets = repaired_result.datasets
+            source_profile = repaired_result.profile
+            source_status_glyph_observations = (
+                repaired_result.status_glyph_observations
+            )
             source_datasets = _reconcile_candidate_b_header_lifecycle(
                 self.context,
                 first_datasets,
@@ -1707,6 +2485,7 @@ class CandidateBPipeline:
                 source_datasets,
             )
         else:
+            repaired_result = None
             source_business, source_datasets, source_profile = (
                 first_business,
                 first_datasets,
@@ -1869,6 +2648,64 @@ class CandidateBPipeline:
             "canonical_layout": canonical_layout_owner_census,
             "page_topology": self.context.page_topology_audit(),
             "ocr_correction": self.context.ocr_correction_audit(),
+            "source_extraction_strategy": {
+                "architecture": "candidate_b_stage_materialization_v1",
+                "canonical_census_mode": (
+                    "always_recomputed_before_stage_planning"
+                ),
+                "shared_release_gates": {
+                    "mode": "always_eager_once_after_source_materialization",
+                    "stages": [
+                        "final_dataset_correction",
+                        "employment_contract_enforcement",
+                        "credit_line_reconciliation",
+                        "document_consistency",
+                        "final_account_field_issue_reconciliation",
+                        "document_local_status_glyph_bank",
+                        "native_source_cell_status_guard",
+                        "final_liability_issue_registration",
+                        "source_completeness",
+                        "account_sequence_issue_reconciliation",
+                        "extraction_issue_collection",
+                        "source_projection",
+                    ],
+                },
+                "discovery": {
+                    "census": discovery_census.audit(),
+                    "plan": discovery_plan.audit().to_dict(),
+                    "stage_snapshots": [
+                        first_result.stage_snapshots[stage_name].to_audit_dict()
+                        for stage_name in CANDIDATE_B_STAGE_REGISTRY.ordered()
+                        if stage_name in first_result.stage_snapshots
+                    ],
+                },
+                "repair": (
+                    {
+                        "scope": repair_scope.audit(),
+                        "repaired_census": repaired_census_audit,
+                        "plan": repair_plan.audit().to_dict(),
+                        "stage_snapshots": [
+                            repaired_result.stage_snapshots[
+                                stage_name
+                            ].to_audit_dict()
+                            for stage_name in CANDIDATE_B_STAGE_REGISTRY.ordered()
+                            if stage_name in repaired_result.stage_snapshots
+                        ],
+                    }
+                    if repair_scope is not None
+                    and repair_plan is not None
+                    and repaired_result is not None
+                    else None
+                ),
+                "diagnostic_ownership": {
+                    "unowned_discovery_issue_ids": list(
+                        unowned_discovery_issue_ids
+                    ),
+                    "unowned_discovery_remap_edges": [
+                        list(edge) for edge in unowned_discovery_remap_edges
+                    ],
+                },
+            },
             "document_consistency": consistency_audit,
             "native_source_cell_status_guard": native_status_conflict_audit,
             "document_local_status_glyph_bank": status_glyph_bank_audit,

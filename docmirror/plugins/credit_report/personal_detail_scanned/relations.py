@@ -983,6 +983,159 @@ def report_localized_monthly_omissions(
     return emitted
 
 
+def _resolve_reconciled_monthly_source_diagnostics(
+    issue_context: Any,
+    *,
+    grid_id: str,
+    month_label: str,
+    alias_refs: Iterable[Mapping[str, Any]],
+) -> None:
+    """Close only the exact detached field trio covered by one alias proof."""
+
+    issues = getattr(issue_context, "_personal_detail_extraction_issues", None)
+    if not isinstance(issues, list):
+        return
+
+    def physical_signature(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        role = str(ref.get("source_field_name") or ref.get("field_name") or "")
+        bbox = ref.get("bbox")
+        page = ref.get("page")
+        logical_page = ref.get("logical_page")
+        row = ref.get("row")
+        column = ref.get("col")
+        if not (
+            role in {"status", "overdue_amount"}
+            and str(ref.get("grid_id") or "") == grid_id
+            and str(ref.get("performance_month") or "") == month_label
+            and isinstance(page, int)
+            and not isinstance(page, bool)
+            and page > 0
+            and logical_page == page
+            and isinstance(row, int)
+            and not isinstance(row, bool)
+            and row >= 0
+            and isinstance(column, int)
+            and not isinstance(column, bool)
+            and column == int(month_label[5:7])
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in bbox
+            )
+            and float(bbox[2]) > float(bbox[0])
+            and float(bbox[3]) > float(bbox[1])
+        ):
+            return None
+        return (
+            role,
+            page,
+            logical_page,
+            row,
+            column,
+            tuple(round(float(value), 6) for value in bbox),
+        )
+
+    raw_alias_refs = list(alias_refs)
+    parsed_alias_signatures = [
+        physical_signature(ref) if isinstance(ref, Mapping) else None
+        for ref in raw_alias_refs
+    ]
+    if len(raw_alias_refs) != 2 or any(
+        signature is None for signature in parsed_alias_signatures
+    ):
+        return
+    alias_signatures = {
+        signature
+        for signature in parsed_alias_signatures
+        if signature is not None
+    }
+    if len(alias_signatures) != 2 or {
+        signature[0] for signature in alias_signatures
+    } != {"status", "overdue_amount"}:
+        return
+
+    target_record_id = f"{grid_id}:{month_label}"
+    expected_roles = {
+        "performance_month": {"status", "overdue_amount"},
+        "status_code": {"status"},
+        "status_amount": {"overdue_amount"},
+    }
+    expected_reason_codes = frozenset(
+        {
+            "detached_source_structure_exact_key",
+            "canonical_deduplicated_key_missing",
+            "source_structure_is_audit_only",
+            "account_month_owner_reconciliation_pending",
+            "dataset_incomplete",
+            "exact_grid_month_source_position",
+            "normalized_value_withheld",
+            "owner_or_status_value_not_invented",
+        }
+    )
+    matching: dict[str, dict[str, Any]] = {}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        observed = issue.get("observed_value")
+        candidate = issue.get("candidate_value")
+        field_name = str(issue.get("field_name") or "")
+        reason_codes = issue.get("reason_codes")
+        source_refs = issue.get("source_refs")
+        expected_ref_count = 2 if field_name == "performance_month" else 1
+        if not (
+            str(issue.get("category") or "") == "ocr_structure_correction"
+            and issue.get("issue_code")
+            == "canonical_monthly_source_structure_missing_field"
+            and str(issue.get("status") or "") == "requires_review"
+            and str(issue.get("parser_stage") or "")
+            == "canonical_monthly_grid_materialization"
+            and str(issue.get("target_dataset") or "") == "repayment_records"
+            and str(issue.get("target_record_id") or "") == target_record_id
+            and field_name in expected_roles
+            and field_name not in matching
+            and isinstance(observed, Mapping)
+            and str(observed.get("grid_id") or "") == grid_id
+            and str(observed.get("performance_month") or "") == month_label
+            and str(observed.get("field_state") or "")
+            == "source_position_withheld"
+            and isinstance(candidate, Mapping)
+            and candidate == {"resolution": "withheld_pending_review"}
+            and isinstance(reason_codes, (list, tuple))
+            and len(reason_codes) == len(expected_reason_codes)
+            and frozenset(reason_codes) == expected_reason_codes
+            and isinstance(source_refs, (list, tuple))
+            and len(source_refs) == expected_ref_count
+        ):
+            continue
+        parsed_signatures = [
+            physical_signature(ref) if isinstance(ref, Mapping) else None
+            for ref in source_refs
+        ]
+        if any(signature is None for signature in parsed_signatures):
+            continue
+        signatures = {
+            signature for signature in parsed_signatures if signature is not None
+        }
+        if (
+            signatures
+            != {
+                signature
+                for signature in alias_signatures
+                if signature[0] in expected_roles[field_name]
+            }
+        ):
+            continue
+        matching[field_name] = issue
+
+    if set(matching) != set(expected_roles):
+        return
+    for issue in matching.values():
+        issue["status"] = "resolved"
+
+
 def _report_reconciled_monthly_source_alias(
     issue_context: Any,
     *,
@@ -1068,6 +1221,12 @@ def _report_reconciled_monthly_source_alias(
                 "source_position_audit_preserved",
             ),
         ),
+    )
+    _resolve_reconciled_monthly_source_diagnostics(
+        issue_context,
+        grid_id=grid_id,
+        month_label=month_label,
+        alias_refs=localized_refs,
     )
 
 

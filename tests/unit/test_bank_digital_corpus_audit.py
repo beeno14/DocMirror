@@ -174,6 +174,27 @@ def test_corpus_audit_accepts_exact_source_unitemized_reconciliation(monkeypatch
     assert len(payload["datasets"][1]["rows"]) == 3
 
 
+def test_corpus_audit_rejects_normalized_opaque_identifier_corruption(monkeypatch, audit_module):
+    payload = _reconciled_payload(monkeypatch)
+    row = payload["datasets"][1]["rows"][0]
+    row["raw"]["日志号"] = "546276664"
+    row["canonical_raw"]["sequence_no"] = "546276664"
+    row["normalized"]["sequence_no"] = "2"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=3)
+
+    assert audit["status"] == "fail"
+    assert audit["finding_counts"]["source_identifier_contradiction"] == 1
+    [finding] = [
+        item for item in audit["findings"] if item["code"] == "source_identifier_contradiction"
+    ]
+    assert finding["detail"] == {
+        "field": "sequence_no",
+        "source": "546276664",
+        "normalized": "2",
+    }
+
+
 def test_corpus_audit_rejects_recoverable_physical_provenance_loss(monkeypatch, audit_module):
     payload = _reconciled_payload(monkeypatch)
     source = payload["datasets"][1]["rows"][0]["source"]
@@ -1207,6 +1228,30 @@ def _direction_distribution_payload(
     }
 
 
+def _attach_signed_source_plane(
+    payload: dict,
+    source_amounts: list[str],
+    *,
+    split_columns: bool = False,
+) -> list[dict]:
+    rows = payload["datasets"][1]["rows"]
+    assert len(rows) == len(source_amounts)
+    for row, source_amount in zip(rows, source_amounts, strict=True):
+        direction = row["normalized"]["direction"]
+        if split_columns:
+            row["raw"] = {
+                "收入": source_amount if direction == "income" else "",
+                "支出": source_amount if direction == "expense" else "",
+            }
+            row["canonical_raw"]["direction"] = direction
+        else:
+            source_direction = "贷方" if direction == "income" else "借方"
+            row["raw"] = {"借/贷": source_direction, "交易金额": source_amount}
+            row["canonical_raw"]["direction"] = source_direction
+        row["canonical_raw"]["amount"] = source_amount
+    return rows
+
+
 @pytest.mark.parametrize(
     ("debit_count", "debit_total", "credit_count", "credit_total"),
     [
@@ -1285,6 +1330,115 @@ def test_header_direction_distribution_accepts_count_only_direct_mapping(audit_m
 
     assert audit["status"] == "pass"
     assert "header_direction_distribution_mismatch" not in audit["finding_counts"]
+
+
+@pytest.mark.parametrize(
+    (
+        "debit_count",
+        "debit_total",
+        "credit_count",
+        "credit_total",
+        "split_columns",
+        "expected",
+    ),
+    [
+        (2, "7.00", 1, "5.00", False, ("direct",)),
+        (1, "5.00", 2, "7.00", True, ("swapped",)),
+    ],
+    ids=["dedicated-direct", "split-swapped"],
+)
+def test_direction_distribution_accepts_complete_source_signed_reversal_plane(
+    audit_module,
+    debit_count,
+    debit_total,
+    credit_count,
+    credit_total,
+    split_columns,
+    expected,
+):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("expense", "3.00"), ("income", "5.00")],
+        debit_count=debit_count,
+        debit_total=debit_total,
+        credit_count=credit_count,
+        credit_total=credit_total,
+    )
+    rows = _attach_signed_source_plane(payload, ["10.00", "-3.00", "5.00"], split_columns=split_columns)
+
+    _, candidates = audit_module._direction_distribution_candidates(
+        rows,
+        declared_counts={"debit": debit_count, "credit": credit_count},
+        declared_amounts={"debit": Decimal(debit_total), "credit": Decimal(credit_total)},
+        residual_counts={"debit": 0, "credit": 0},
+        residual_amounts={"debit": Decimal("0"), "credit": Decimal("0")},
+    )
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert candidates == expected
+    assert audit["status"] == "pass"
+    assert "header_direction_distribution_mismatch" not in audit["finding_counts"]
+
+
+def test_direction_distribution_signed_plane_fails_closed_on_incomplete_provenance(audit_module):
+    def signed_rows(source_amounts: list[str]) -> list[dict]:
+        payload = _direction_distribution_payload(
+            [("expense", "10.00"), ("expense", "3.00"), ("income", "5.00")],
+            debit_count=2,
+            debit_total="7.00",
+            credit_count=1,
+            credit_total="5.00",
+        )
+        return _attach_signed_source_plane(payload, source_amounts)
+
+    missing_canonical = signed_rows(["10.00", "-3.00", "5.00"])
+    missing_canonical[1]["canonical_raw"].pop("amount")
+    magnitude_mismatch = signed_rows(["10.00", "-2.00", "5.00"])
+    direction_mismatch = signed_rows(["10.00", "-3.00", "5.00"])
+    direction_mismatch[1]["canonical_raw"]["direction"] = "贷方"
+    unowned_positive = signed_rows(["10.00", "-3.00", "5.00"])
+    contaminated_direction = "借方，以网点对账单为准。客服电话：95595"
+    unowned_positive[0]["raw"]["借/贷"] = contaminated_direction
+    unowned_positive[0]["canonical_raw"]["direction"] = contaminated_direction
+
+    common = {
+        "declared_counts": {"debit": 2, "credit": 1},
+        "residual_counts": {"debit": 0, "credit": 0},
+        "residual_amounts": {"debit": Decimal("0"), "credit": Decimal("0")},
+    }
+    _, missing_candidates = audit_module._direction_distribution_candidates(
+        missing_canonical,
+        declared_amounts={"debit": Decimal("7.00"), "credit": Decimal("5.00")},
+        **common,
+    )
+    _, magnitude_candidates = audit_module._direction_distribution_candidates(
+        magnitude_mismatch,
+        declared_amounts={"debit": Decimal("8.00"), "credit": Decimal("5.00")},
+        **common,
+    )
+    _, direction_candidates = audit_module._direction_distribution_candidates(
+        direction_mismatch,
+        declared_amounts={"debit": Decimal("7.00"), "credit": Decimal("5.00")},
+        **common,
+    )
+    _, unowned_positive_candidates = audit_module._direction_distribution_candidates(
+        unowned_positive,
+        declared_amounts={"debit": Decimal("7.00"), "credit": Decimal("5.00")},
+        **common,
+    )
+    residual_rows = signed_rows(["10.00", "-3.00", "5.00"])
+    _, residual_candidates = audit_module._direction_distribution_candidates(
+        residual_rows,
+        declared_counts={"debit": 3, "credit": 1},
+        declared_amounts={"debit": Decimal("8.00"), "credit": Decimal("5.00")},
+        residual_counts={"debit": 1, "credit": 0},
+        residual_amounts={"debit": Decimal("1.00"), "credit": Decimal("0")},
+    )
+
+    assert missing_candidates == ()
+    assert magnitude_candidates == ()
+    assert direction_candidates == ()
+    assert unowned_positive_candidates == ()
+    assert residual_candidates == ()
 
 
 def test_direction_distribution_accepts_swapped_mapping_with_declared_side_residual(audit_module):
@@ -1368,3 +1522,107 @@ def test_direction_distribution_candidate_truth_table(
     )
 
     assert candidates == expected
+
+
+def test_direction_distribution_accepts_source_bound_zero_amount_count_slack_without_inference(
+    audit_module,
+):
+    payload = _direction_distribution_payload(
+        [
+            ("expense", "10.00"),
+            ("expense", "20.00"),
+            ("income", "5.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+        ],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=5,
+        credit_total="5.00",
+    )
+    rows = payload["datasets"][1]["rows"]
+
+    visible, candidates = audit_module._direction_distribution_candidates(
+        rows,
+        declared_counts={"debit": 2, "credit": 5},
+        declared_amounts={"debit": Decimal("30.00"), "credit": Decimal("5.00")},
+        residual_counts={"debit": 0, "credit": 0},
+        residual_amounts={"debit": Decimal("0"), "credit": Decimal("0")},
+    )
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert candidates == ("direct",)
+    assert visible == {
+        "expense": {"count": 2, "amount": Decimal("30.00")},
+        "income": {"count": 1, "amount": Decimal("5.00")},
+    }
+    assert audit["status"] == "pass"
+    assert "header_direction_distribution_mismatch" not in audit["finding_counts"]
+    assert [
+        (row["normalized"]["direction"], row["canonical_raw"]["direction"])
+        for row in rows[3:]
+    ] == [("", "")] * 4
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        "directionless-nonzero",
+        "source-zero-missing",
+        "source-direction-present",
+        "totals-mismatch",
+        "count-only",
+        "row-count-mismatch",
+    ],
+)
+def test_direction_distribution_zero_amount_count_slack_fails_closed(
+    audit_module,
+    rejection,
+):
+    debit_total = None if rejection == "count-only" else "30.00"
+    credit_total = None if rejection == "count-only" else "5.00"
+    if rejection == "totals-mismatch":
+        credit_total = "6.00"
+    credit_count = 4 if rejection == "row-count-mismatch" else 5
+    payload = _direction_distribution_payload(
+        [
+            ("expense", "10.00"),
+            ("expense", "20.00"),
+            ("income", "5.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+            ("", "0.00"),
+        ],
+        debit_count=2,
+        debit_total=debit_total,
+        credit_count=credit_count,
+        credit_total=credit_total,
+    )
+    rows = payload["datasets"][1]["rows"]
+    if rejection == "directionless-nonzero":
+        rows[3]["normalized"]["amount"] = "1.00"
+        rows[3]["canonical_raw"]["amount"] = "1.00"
+    elif rejection == "source-zero-missing":
+        rows[3]["canonical_raw"].pop("amount")
+    elif rejection == "source-direction-present":
+        rows[3]["canonical_raw"]["direction"] = "income"
+
+    visible, candidates = audit_module._direction_distribution_candidates(
+        rows,
+        declared_counts={"debit": 2, "credit": credit_count},
+        declared_amounts={
+            "debit": Decimal(debit_total) if debit_total is not None else None,
+            "credit": Decimal(credit_total) if credit_total is not None else None,
+        },
+        residual_counts={"debit": 0, "credit": 0},
+        residual_amounts={"debit": Decimal("0"), "credit": Decimal("0")},
+    )
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert visible is not None
+    assert candidates == ()
+    assert audit["status"] == "fail"
+    assert audit["finding_counts"]["header_direction_distribution_mismatch"] == 1

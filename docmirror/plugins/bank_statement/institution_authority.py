@@ -145,14 +145,16 @@ def _transaction_header_start(text: str) -> int | None:
     """Return the start of a multi-line transaction header cluster."""
     role_patterns = {
         "sequence": re.compile(r"^(?:序号|Serial|Num)$", re.I),
-        "date": re.compile(r"^(?:交易日期|记账日期|Trans\s*Date)$", re.I),
+        "date": re.compile(r"^(?:交易日期|记账日期|日期|Trans\s*Date|Date)$", re.I),
         "amount": re.compile(
-            r"^(?:交易金额|发生额|借方(?:\s*[（(]出账[）)])?|贷方(?:\s*[（(]入账[）)])?|Trans\s*Amt|Amount)$",
+            r"^(?:交易金额|发生额|借方/贷方金额|借方(?:\s*[（(]出账[）)])?|"
+            r"贷方(?:\s*[（(]入账[）)])?|Trans\s*Amt|Debit/Credit\s*Amount|Amount)$",
             re.I,
         ),
         "balance": re.compile(r"^(?:余额(?:摘要)?|账户余额|Balance)$", re.I),
         "direction": re.compile(
-            r"^(?:借贷|借贷标志|借方(?:\s*[（(]出账[）)])?|贷方(?:\s*[（(]入账[）)])?|收/支|收入/支出|Dc\s*Flg)$",
+            r"^(?:借贷|借贷标志|借方/贷方金额|借方(?:\s*[（(]出账[）)])?|"
+            r"贷方(?:\s*[（(]入账[）)])?|收/支|收入/支出|Debit/Credit\s*Amount|Dc\s*Flg)$",
             re.I,
         ),
     }
@@ -328,7 +330,7 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
     lines = [line.strip() for line in header.splitlines() if line.strip()]
 
     m = re.search(
-        r"(?<![账客方])户名[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,80}?)"
+        r"(?<![账客方手])户名[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,80}?)"
         r"(?:\s{2,}|币种|年份|月份|交易|明细|账号|开户|$|\n)",
         header,
     )
@@ -352,7 +354,7 @@ def extract_identity_from_header(full_text: str) -> dict[str, str]:
 
     m = re.search(
         r"账户名称(?:\s*Account\s+Name)?[:：]?\s*([\u4e00-\u9fa5A-Za-z（）()·\s]{2,60}?)"
-        r"(?:\s{2,}|账号|开户行|Bank Name|Account No|借方笔数)",
+        r"(?:\s{2,}|账号|开户行|上页余额|Last\s+balance|Bank Name|Account No|借方笔数)",
         header,
         re.I,
     )
@@ -505,7 +507,17 @@ def _looks_like_holder_name(value: str) -> bool:
         return False
     if any(keyword in text for keyword in _IDENTITY_SKIP_KEYWORDS):
         return False
-    if text in {"机构", "柜员", "备注信息", "对方户名", "个人银行", "个人银行结算账户"}:
+    if text in {
+        "机构",
+        "柜员",
+        "备注信息",
+        "对方户名",
+        "个人银行",
+        "个人银行结算账户",
+        "Counterparty",
+        "Counterparty Account Name",
+        "Last balance",
+    }:
         return False
     if re.search(r"\d", text):
         return False

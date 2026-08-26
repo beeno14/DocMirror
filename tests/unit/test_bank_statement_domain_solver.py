@@ -6,6 +6,8 @@ from __future__ import annotations
 from calendar import monthrange
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.bank_statement.canonical_quality import audit_cqf
 from docmirror.plugins.bank_statement.extract_pipeline import enrich_identity_fields
 from docmirror.plugins.bank_statement.institution import detect_registered_institution
@@ -824,6 +826,92 @@ def test_column_major_direction_summary_keeps_counts_distinct_from_money_totals(
     assert evidence.count == 34
     assert evidence.source == "split_footer"
     assert not any("count" in failure or "total" in failure for failure in failures)
+
+
+def _signed_reversal_column_major_summary(debit_total: str) -> str:
+    return f"""
+    交易明细
+    账号：1234567890123456
+    企业名称：测试企业
+    数据时间范围：2024年01月01日-2024年01月31日
+    支出总笔数：
+    2
+    支出总金额：
+    收入总笔数：
+    {debit_total}
+    1
+    收入总金额：
+    5.00
+    交易日期 交易时间 收支标志 交易金额 对方户名 账户余额
+    """
+
+
+def _signed_reversal_invariant_records() -> list[dict]:
+    return [
+        {
+            "raw": {"借/贷": "借方", "交易金额": "10.00"},
+            "normalized": {"date": "2024-01-01", "direction": "expense", "amount": 10.0},
+            "canonical_raw": {"direction": "借方", "amount": "10.00"},
+        },
+        {
+            "raw": {"借/贷": "借方", "交易金额": "-3.00"},
+            "normalized": {"date": "2024-01-02", "direction": "expense", "amount": 3.0},
+            "canonical_raw": {"direction": "借方", "amount": "-3.00"},
+        },
+        {
+            "raw": {"借/贷": "贷方", "交易金额": "5.00"},
+            "normalized": {"date": "2024-01-03", "direction": "income", "amount": 5.0},
+            "canonical_raw": {"direction": "贷方", "amount": "5.00"},
+        },
+    ]
+
+
+def test_invariant_totals_accept_complete_source_signed_reversal_plane() -> None:
+    text = _signed_reversal_column_major_summary("7.00")
+    records = _signed_reversal_invariant_records()
+
+    evidence = resolve_row_count_evidence("", page_texts=[(1, text)])
+    failures = audit_bank_statement_invariants(records, "", page_texts=[(1, text)])
+
+    assert evidence == RowCountEvidence(3, "split_footer", 0.98, 1)
+    assert failures == []
+    assert records[1]["normalized"] == {
+        "date": "2024-01-02",
+        "direction": "expense",
+        "amount": 3.0,
+    }
+
+
+def test_invariant_signed_reversal_plane_fails_closed_on_provenance_gaps() -> None:
+    amount_mismatch = _signed_reversal_invariant_records()
+    amount_mismatch[1]["raw"]["交易金额"] = "-2.00"
+    amount_mismatch[1]["canonical_raw"]["amount"] = "-2.00"
+    sign_only = _signed_reversal_invariant_records()
+    sign_only[1]["raw"].pop("借/贷")
+    unowned_positive = _signed_reversal_invariant_records()
+    contaminated_direction = "借方，以网点对账单为准。客服电话：95595"
+    unowned_positive[0]["raw"]["借/贷"] = contaminated_direction
+    unowned_positive[0]["canonical_raw"]["direction"] = contaminated_direction
+
+    amount_failures = audit_bank_statement_invariants(
+        amount_mismatch,
+        "",
+        page_texts=[(1, _signed_reversal_column_major_summary("8.00"))],
+    )
+    sign_only_failures = audit_bank_statement_invariants(
+        sign_only,
+        "",
+        page_texts=[(1, _signed_reversal_column_major_summary("7.00"))],
+    )
+    unowned_positive_failures = audit_bank_statement_invariants(
+        unowned_positive,
+        "",
+        page_texts=[(1, _signed_reversal_column_major_summary("7.00"))],
+    )
+
+    assert "bank_invariant_failed:debit_total:13.00/8.00" in amount_failures
+    assert "bank_invariant_failed:debit_total:13.00/7.00" in sign_only_failures
+    assert "bank_invariant_failed:debit_total:13.00/7.00" in unowned_positive_failures
 
 
 def test_row_level_directions_outrank_contradictory_footer_counts_when_balance_chain_closes() -> None:
@@ -1706,6 +1794,44 @@ def test_balance_chain_gap_reports_review_only_missing_row_candidate() -> None:
         "action=manual_review:"
         "reason=missing_page_bbox"
     ) in failures
+
+
+@pytest.mark.parametrize(
+    ("text", "page_texts"),
+    [
+        ("账户交易明细\n收支类别：收入", None),
+        ("", [(1, "账户交易明细\n收支类别：收入")]),
+    ],
+    ids=["document-text", "page-business-header"],
+)
+def test_direction_filtered_export_does_not_report_balance_gap_as_missing_row(
+    text: str,
+    page_texts: list[tuple[int, str]] | None,
+) -> None:
+    records = [
+        {
+            "normalized": {
+                "date": "2023-10-02",
+                "amount": 23903.69,
+                "direction": "income",
+                "balance": 23903.69,
+            }
+        },
+        {
+            "normalized": {
+                "date": "2023-10-07",
+                "amount": 13610.09,
+                "direction": "income",
+                "balance": 13610.09,
+            }
+        },
+    ]
+
+    failures = audit_bank_statement_invariants(records, text, page_texts=page_texts)
+
+    assert not any(item.startswith("bank_invariant_failed:balance_chain") for item in failures)
+    assert not any(item.startswith("bank_review:balance_chain_gap") for item in failures)
+    assert not any(item.startswith("bank_review:missing_row_candidate") for item in failures)
 
 
 def test_balance_chain_skips_known_sequence_gap_and_reports_source_page_gap() -> None:
