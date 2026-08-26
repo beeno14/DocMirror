@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, replace
+from datetime import date as calendar_date
 from typing import Any
 
 from docmirror.plugins.bank_statement.blo import BankLedgerOrchestrator
@@ -166,15 +167,7 @@ def enrich_identity_fields(
         }
     explicit_page_period = _explicit_query_period_from_pages(parse_result)
     if explicit_page_period is not None:
-        period_value, source_refs = explicit_page_period
-        fields["query_period"] = {
-            "raw_name": "起始日期/截止日期",
-            "raw_value": period_value,
-            "normalized_value": period_value,
-            "data_type": "string",
-            "source": "page_headers",
-            "source_refs": source_refs,
-        }
+        fields["query_period"] = explicit_page_period
     if parse_result is not None:
         entities = getattr(parse_result, "entities", None)
         metadata = getattr(entities, "metadata", None) if entities is not None else None
@@ -232,39 +225,70 @@ def enrich_identity_fields(
     return fields
 
 
-def _explicit_query_period_from_pages(parse_result: Any) -> tuple[str, list[dict[str, Any]]] | None:
-    """Aggregate explicit issuer periods from every page header."""
+def _explicit_query_period_from_pages(parse_result: Any) -> dict[str, Any] | None:
+    """Aggregate explicit issuer periods without treating the envelope as raw."""
     if parse_result is None:
         return None
-    periods: list[tuple[str, str, int]] = []
+    components: list[dict[str, Any]] = []
     for page_number, page_text in page_texts_with_business_headers(
         parse_result,
         page_texts_from_parse_result(parse_result),
     ):
-        start_match = re.search(r"起始日期\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
-        end_match = re.search(r"(?:截止日期|终止日期)\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", page_text)
+        start_match = re.search(
+            r"(?P<label>起始日期)\s*[:：]\s*(?P<date>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})",
+            page_text,
+        )
+        end_match = re.search(
+            r"(?P<label>截止日期|终止日期)\s*[:：]\s*(?P<date>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})",
+            page_text,
+        )
         if start_match is None or end_match is None:
             continue
-        periods.append(
-            (
-                _normalize_period_date(start_match.group(1)),
-                _normalize_period_date(end_match.group(1)),
-                int(page_number),
-            )
-        )
-    if not periods:
-        return None
-    return (
-        f"{min(period[0] for period in periods)} ~ {max(period[1] for period in periods)}",
-        [
+        raw_start = start_match.group("date")
+        raw_end = end_match.group("date")
+        normalized_start = _normalize_period_date(raw_start)
+        normalized_end = _normalize_period_date(raw_end)
+        if not _valid_period_pair(normalized_start, normalized_end):
+            continue
+        components.append(
             {
-                "source": "page_header_text",
-                "source_page": period[2],
-                "page_range": [period[2], period[2]],
+                "source": "page_headers",
+                "source_page": int(page_number),
+                "page_id": f"page:{int(page_number):04d}",
+                "raw_name": f'{start_match.group("label")}/{end_match.group("label")}',
+                "raw_start_name": start_match.group("label"),
+                "raw_start": raw_start,
+                "raw_end_name": end_match.group("label"),
+                "raw_end": raw_end,
+                "normalized_start": normalized_start,
+                "normalized_end": normalized_end,
+                "evidence_ids": [],
             }
-            for period in periods
-        ],
-    )
+        )
+    if not components:
+        return None
+    source_refs = [
+        {
+            "source": "page_header_text",
+            "source_page": int(component["source_page"]),
+            "page_range": [int(component["source_page"]), int(component["source_page"])],
+        }
+        for component in components
+    ]
+    raw_names = list(dict.fromkeys(str(component["raw_name"]) for component in components))
+    return {
+        "raw_name": raw_names[0] if len(raw_names) == 1 else "source period components",
+        "normalized_value": (
+            f'{min(str(component["normalized_start"]) for component in components)} ~ '
+            f'{max(str(component["normalized_end"]) for component in components)}'
+        ),
+        "data_type": "string",
+        "source": "page_headers",
+        "source_refs": source_refs,
+        "derivation": "source_period_envelope",
+        "normalized_only": True,
+        "source_components": components,
+    }
 
 
 def _normalize_period_date(value: str) -> str:
@@ -272,6 +296,13 @@ def _normalize_period_date(value: str) -> str:
     if re.fullmatch(r"20\d{6}", text):
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
     return text
+
+
+def _valid_period_pair(start: str, end: str) -> bool:
+    try:
+        return calendar_date.fromisoformat(start) <= calendar_date.fromisoformat(end)
+    except ValueError:
+        return False
 
 
 def _currency_from_source_table(parse_result: Any) -> dict[str, Any]:
@@ -655,22 +686,7 @@ def run_bank_statement_extract(
     except Exception:
         evidence_identity = {}
     if evidence_identity:
-        for field_name, detail in evidence_identity.items():
-            current = identity_fields.get(field_name)
-            current_source = str(current.get("source") or "") if isinstance(current, dict) else ""
-            evidence_preferred = field_name in {
-                "account_holder",
-                "account_number",
-                "query_period",
-                "currency",
-                "total_transactions",
-            }
-            if (
-                field_name not in identity_fields
-                or field_name == "bank_name"
-                or (evidence_preferred and current_source in {"header.kv", "bank_statement.default"})
-            ):
-                identity_fields[field_name] = detail
+        _merge_evidence_identity_fields(identity_fields, evidence_identity)
     _drop_unbound_issuer(identity_fields)
     # Generic KV/text/atom identity recovery can observe a count label, but it
     # cannot prove that the label owns the complete statement. Fail closed and
@@ -747,6 +763,87 @@ def run_bank_statement_extract(
         candidate_diagnostics=list(getattr(blo_meta, "candidate_diagnostics", []) or []),
         extraction_route=extraction_route,
     )
+
+
+def _merge_evidence_identity_fields(
+    identity_fields: dict[str, dict[str, Any]],
+    evidence_identity: dict[str, dict[str, Any]],
+) -> None:
+    """Prefer exact atom identity only when it agrees with other direct planes."""
+    for field_name, detail in evidence_identity.items():
+        current = identity_fields.get(field_name)
+        current_source = str(current.get("source") or "") if isinstance(current, dict) else ""
+        if field_name == "query_period" and isinstance(current, dict):
+            current_has_period = _query_period_detail_has_signature(current)
+            evidence_has_period = _query_period_detail_has_signature(detail)
+            if evidence_has_period and (
+                not current_has_period or _query_period_details_compatible(current, detail)
+            ):
+                identity_fields[field_name] = detail
+            elif evidence_has_period and current_has_period:
+                identity_fields.pop(field_name, None)
+            continue
+        evidence_preferred = field_name in {
+            "account_holder",
+            "account_number",
+            "query_period",
+            "currency",
+            "total_transactions",
+        }
+        if (
+            field_name not in identity_fields
+            or field_name == "bank_name"
+            or (evidence_preferred and current_source in {"header.kv", "bank_statement.default"})
+        ):
+            identity_fields[field_name] = detail
+
+
+def _query_period_details_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_components = _query_period_component_signature(left)
+    right_components = _query_period_component_signature(right)
+    if left_components and right_components:
+        return left_components == right_components
+    return _query_period_envelope_signature(left) == _query_period_envelope_signature(right) != ()
+
+
+def _query_period_detail_has_signature(detail: dict[str, Any]) -> bool:
+    return bool(_query_period_component_signature(detail) or _query_period_envelope_signature(detail))
+
+
+def _query_period_component_signature(detail: dict[str, Any]) -> tuple[tuple[int, str, str], ...]:
+    signature: list[tuple[int, str, str]] = []
+    for component in detail.get("source_components") or []:
+        if not isinstance(component, dict):
+            return ()
+        try:
+            page = int(
+                component.get("source_page")
+                or component.get("page")
+                or str(component.get("page_id") or "").rsplit(":", 1)[-1]
+            )
+        except (TypeError, ValueError):
+            return ()
+        start = _normalize_period_date(str(component.get("raw_start") or ""))
+        end = _normalize_period_date(str(component.get("raw_end") or ""))
+        if not _valid_period_pair(start, end):
+            return ()
+        signature.append((page, start, end))
+    return tuple(sorted(signature))
+
+
+def _query_period_envelope_signature(detail: dict[str, Any]) -> tuple[str, str]:
+    value = next(
+        (
+            str(detail.get(candidate) or "")
+            for candidate in ("normalized_value", "value", "raw_value")
+            if detail.get(candidate) not in (None, "")
+        ),
+        "",
+    )
+    dates = re.findall(r"20\d{2}-\d{2}-\d{2}", value)
+    if len(dates) != 2 or not _valid_period_pair(dates[0], dates[1]):
+        return ()
+    return dates[0], dates[1]
 
 
 def _has_single_page_source(record: dict[str, Any]) -> bool:

@@ -204,11 +204,40 @@ def test_saved_pair_binds_source_schemas_counts_and_audit(tmp_path: Path) -> Non
         validate_saved_pair(tmp_path, case, schema_errors=lambda _name, _payload: [])
 
 
-def test_result_matrix_requires_exact_unique_seven_plus_eight() -> None:
+def test_reduced_contract_preserves_remaining_case_ids_and_hashes() -> None:
+    assert [case.case_id for case in EXPECTED_SOURCE_PDFS] == [
+        "01",
+        "02",
+        "03",
+        "04",
+        "05",
+        "07",
+    ]
+    assert [case.case_id for case in SAVED_CASES] == [
+        "08",
+        "09",
+        "10",
+        "11",
+        "12",
+        "13",
+        "15",
+    ]
+    assert {case.filename: case.sha256 for case in EXPECTED_SOURCE_PDFS} == {
+        "余泽熙7.15征信.pdf": "efbc80bd09546cb96de1d7da531596aada793f13c55fb07e5d09420f069caf0b",
+        "杨松林个人征信24.7.29.pdf": "42ff7181ea1594ae1fbe85bd997d23f77716c5b7a526e031d15e03eaf1a4e117",
+        "林岚挺征信.pdf": "a44515a83ae226d19008437ac6a757fa58dabc14d3f1fb5ac9a01c4441cdfdd2",
+        "叶永燕征信.pdf": "7c986d8f07021027836a9df27704afd4746b714ae3e40e7ecf4eace099ea5193",
+        "王根镇征信.pdf": "eb6e963fefab972c1d74147be4943741233d912c06f57e9d60d2316dd62aecd2",
+        "黄圣辉_个人详版征信报告.pdf": "8d5482f9e354d2d9b02614942283c0c62fce56b49228e8c5b3069e5aaf85f0a5",
+    }
+    assert all(case.slug != "saved-cao-population" for case in SAVED_CASES)
+
+
+def test_result_matrix_requires_exact_unique_six_plus_seven() -> None:
     records = _node_records()
     live, saved = validate_result_records(records)
-    assert len(live) == 7
-    assert len(saved) == 8
+    assert len(live) == 6
+    assert len(saved) == 7
 
     with pytest.raises(AuditError, match="catalog mismatch"):
         validate_result_records(records[:-1])
@@ -260,11 +289,13 @@ def test_completed_manifest_detects_artifact_tampering(tmp_path: Path) -> None:
     atomic_write_json(snapshots / "99-end.json", _snapshot())
     evidence = tmp_path / "evidence.txt"
     evidence.write_text("sealed", encoding="utf-8")
+    node_records = _node_records()
+    live_count = len(EXPECTED_SOURCE_PDFS)
     matrix = {
         "schema": MATRIX_SCHEMA,
         "complete": True,
-        "live_results": _node_records()[:7],
-        "saved_results": _node_records()[7:],
+        "live_results": node_records[:live_count],
+        "saved_results": node_records[live_count:],
     }
     atomic_write_json(tmp_path / "result-matrix.json", matrix)
     artifact_paths = [
@@ -285,10 +316,10 @@ def test_completed_manifest_detects_artifact_tampering(tmp_path: Path) -> None:
         "result_matrix_sha256": sha256_file(tmp_path / "result-matrix.json"),
         "baseline_composite_sha256": "a" * 64,
         "end_composite_sha256": "a" * 64,
-        "live_expected": 7,
-        "live_passed": 7,
-        "saved_expected": 8,
-        "saved_passed": 8,
+        "live_expected": len(EXPECTED_SOURCE_PDFS),
+        "live_passed": len(EXPECTED_SOURCE_PDFS),
+        "saved_expected": len(SAVED_CASES),
+        "saved_passed": len(SAVED_CASES),
     }
     atomic_write_json(tmp_path / "AUDIT_COMPLETE.json", marker)
 

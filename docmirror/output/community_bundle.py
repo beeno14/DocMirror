@@ -380,12 +380,13 @@ def _record_pools(row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         canonical_keys = []
         for key in keys:
             detail = field_sources.get(key)
+            normalized_only = bool(isinstance(detail, dict) and detail.get("normalized_only") is True)
             explicitly_derived = bool(
                 isinstance(detail, dict)
                 and str(detail.get("source") or "").startswith("derived.")
                 and str(detail.get("derivation") or "").strip()
             )
-            if key in raw or not explicitly_derived:
+            if key in raw or not (normalized_only or explicitly_derived):
                 canonical_keys.append(key)
         return (
             {str(key): normalized.get(key, raw.get(key)) for key in keys},

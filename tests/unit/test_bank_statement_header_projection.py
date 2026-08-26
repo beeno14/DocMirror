@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from docmirror.models.entities.parse_result import DocumentEntities, PageContent, ParseResult
@@ -116,6 +117,22 @@ def _synthetic_extract_result() -> BankExtractResult:
     )
 
 
+def _project_synthetic_result(monkeypatch, parse_result: ParseResult, result: BankExtractResult):
+    monkeypatch.setattr(community_module, "run_bank_statement_extract", lambda *_args: result)
+    monkeypatch.setattr(
+        community_module,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence.empty(),
+    )
+    projection = BankStatementCommunityPlugin().derive(parse_result, "")
+    bundle = project_community_bundle(
+        seal_parse_result(parse_result),
+        projection_data=projection.model_dump(mode="python"),
+        projection_policy=load_projection_policy("docmirror.plugins.bank_statement"),
+    )
+    return projection, bundle, bundle.json_payload()
+
+
 def test_community_json_orders_statement_header_before_transactions(monkeypatch) -> None:
     parse_result = _parse_result()
     monkeypatch.setattr(
@@ -187,6 +204,175 @@ def test_community_json_orders_statement_header_before_transactions(monkeypatch)
     assert transaction["period_start"] == "2023-02-23"
     assert transaction["period_end"] == "2023-05-22"
     assert transaction["print_date"] == "2023-08-24"
+    assert validate_projection_payload("community", payload).valid
+    assert bundle.conservation_issues(payload=payload) == []
+
+
+def test_normalized_only_source_period_envelope_preserves_exact_header_components(monkeypatch) -> None:
+    parse_result = ParseResult(
+        pages=[
+            PageContent(page_number=1, source_page_number=1),
+            PageContent(page_number=2, source_page_number=2),
+        ],
+        entities=DocumentEntities(document_type="bank_statement"),
+    )
+    result = _synthetic_extract_result()
+    result.identity_fields["query_period"] = {
+        "raw_name": "source period components",
+        "normalized_value": "2023-06-01 至 2023-07-31",
+        "data_type": "string",
+        "source": "canonical_evidence_atoms",
+        "source_refs": [
+            {"source": "canonical_evidence_atoms", "page_id": "page:0001"},
+            {"source": "canonical_evidence_atoms", "page_id": "page:0002"},
+        ],
+        "evidence_ids": ["p1-start", "p1-end", "p2-start", "p2-end"],
+        "field_name": "query_period",
+        "derivation": "source_period_envelope",
+        "normalized_only": True,
+        "source_components": [
+            {
+                "page_id": "page:0001",
+                "raw_name": "起始日期/截止日期",
+                "raw_start_name": "起始日期",
+                "raw_start": "20230601",
+                "raw_end_name": "截止日期",
+                "raw_end": "20230630",
+                "normalized_start": "2023-06-01",
+                "normalized_end": "2023-06-30",
+                "evidence_ids": ["p1-start", "p1-end"],
+                "source": "canonical_evidence_atoms",
+            },
+            {
+                "page_id": "page:0002",
+                "raw_name": "起始日期/截止日期",
+                "raw_start_name": "起始日期",
+                "raw_start": "20230701",
+                "raw_end_name": "截止日期",
+                "raw_end": "20230731",
+                "normalized_start": "2023-07-01",
+                "normalized_end": "2023-07-31",
+                "evidence_ids": ["p2-start", "p2-end"],
+                "source": "canonical_evidence_atoms",
+            },
+        ],
+    }
+
+    projection, bundle, payload = _project_synthetic_result(monkeypatch, parse_result, result)
+    projected_header = projection.datasets["statement_header"][0]
+    header = payload["datasets"][0]["rows"][0]
+
+    assert "query_period" not in projected_header["canonical_raw"]
+    assert "query_period" not in projected_header["raw"]
+    assert header["normalized"]["query_period"] == "2023-06-01 ~ 2023-07-31"
+    assert header["normalized"]["period_start"] == "2023-06-01"
+    assert header["normalized"]["period_end"] == "2023-07-31"
+    assert header["canonical_raw"]["period_start"] == "20230601"
+    assert header["canonical_raw"]["period_end"] == "20230731"
+    assert "query_period" not in header["canonical_raw"]
+    assert "query_period" not in header["raw"]
+    assert "source period components" not in header["raw"]
+    assert json.loads(header["raw"]["起始日期"]) == [
+        {"page": 1, "value": "20230601"},
+        {"page": 2, "value": "20230701"},
+    ]
+    assert json.loads(header["raw"]["截止日期"]) == [
+        {"page": 1, "value": "20230630"},
+        {"page": 2, "value": "20230731"},
+    ]
+    period_source = header["source"]["field_sources"]["query_period"]
+    assert period_source["source"] == "canonical_evidence_atoms"
+    assert period_source["derivation"] == "source_period_envelope"
+    assert period_source["normalized_only"] is True
+    assert period_source["component_count"] == 2
+    assert period_source["evidence_ids"] == ["p1-start", "p1-end", "p2-start", "p2-end"]
+    assert header["source"]["field_sources"]["period_start"]["evidence_ids"] == ["p1-start", "p1-end"]
+    assert header["source"]["field_sources"]["period_end"]["evidence_ids"] == ["p2-start", "p2-end"]
+    assert validate_projection_payload("community", payload).valid
+    assert bundle.conservation_issues(payload=payload) == []
+
+
+def test_promoted_signed_transaction_preserves_business_fields_and_source(monkeypatch) -> None:
+    parse_result = _parse_result()
+    result = _synthetic_extract_result()
+    source = {
+        "source": "promoted_data_row_table",
+        "source_page": 1,
+        "page_id": "page:0001",
+        "page_range": [1, 1],
+        "table_id": "geo_table_0",
+        "source_row_index": -1,
+        "source_row_role": "promoted_header",
+        "reconstructed_row_index": 0,
+        "header_source": "data_row",
+        "evidence_ids": ["ev:promoted-row"],
+        "source_refs": [
+            {
+                "source": "canonical_page_text",
+                "source_page": 1,
+                "page_range": [1, 1],
+                "bbox": [20.0, 120.0, 560.0, 138.0],
+                "evidence_ids": ["ev:promoted-row"],
+            }
+        ],
+    }
+    result.records = [
+        {
+            "record_id": "records:r000001",
+            "raw": {
+                "日期": "20231007",
+                "业务类型": "商户清算",
+                "票据号": "20231007C106320166",
+                "摘要": "清算入账",
+                "借方/贷方金额": "-25.00",
+                "余额": "1,547.50",
+                "对手户名": "上海测试科技有限公司",
+            },
+            "canonical_raw": {
+                "date": "20231007",
+                "transaction_name": "商户清算",
+                "voucher_number": "20231007C106320166",
+                "summary": "清算入账",
+                "amount": "-25.00",
+                "balance": "1,547.50",
+                "counter_party": "上海测试科技有限公司",
+            },
+            "normalized": {
+                "date": "2023-10-07",
+                "transaction_name": "商户清算",
+                "voucher_number": "20231007C106320166",
+                "summary": "清算入账",
+                "amount": 25.0,
+                "balance": 1547.5,
+                "direction": "expense",
+                "counter_party": "上海测试科技有限公司",
+            },
+            "source": source,
+        }
+    ]
+
+    projection, bundle, payload = _project_synthetic_result(monkeypatch, parse_result, result)
+    projected_transaction = projection.datasets["records"][0]
+    transaction = payload["datasets"][1]["rows"][0]
+
+    assert projected_transaction["normalized"]["amount"] == 25.0
+    assert projected_transaction["normalized"]["direction"] == "expense"
+    assert transaction["raw"]["业务类型"] == "商户清算"
+    assert transaction["raw"]["票据号"] == "20231007C106320166"
+    assert transaction["raw"]["借方/贷方金额"] == "-25.00"
+    assert transaction["raw"]["对手户名"] == "上海测试科技有限公司"
+    assert transaction["canonical_raw"]["transaction_name"] == "商户清算"
+    assert transaction["canonical_raw"]["voucher_number"] == "20231007C106320166"
+    assert transaction["canonical_raw"]["amount"] == "-25.00"
+    assert transaction["canonical_raw"]["counter_party"] == "上海测试科技有限公司"
+    assert transaction["normalized"]["transaction_name"] == "商户清算"
+    assert transaction["normalized"]["voucher_number"] == "20231007C106320166"
+    assert transaction["normalized"]["amount"] == "25.0"
+    assert transaction["normalized"]["direction"] == "expense"
+    assert transaction["normalized"]["counter_party"] == "上海测试科技有限公司"
+    for key, value in source.items():
+        assert projected_transaction["source"][key] == value
+        assert transaction["source"][key] == value
     assert validate_projection_payload("community", payload).valid
     assert bundle.conservation_issues(payload=payload) == []
 

@@ -9,6 +9,8 @@ overwriting row-local facts.
 
 from __future__ import annotations
 
+import calendar
+import math
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -33,6 +35,9 @@ _ANCHOR_DEPENDENT_SELECTED_SOURCES = {
 _DATE_TOKEN_RE = re.compile(r"(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日|20\d{6})")
 _MONTH_TOKEN_RE = re.compile(r"(?:20\d{2}[-/.年]\d{1,2}(?:月)?|20\d{4})")
 _MONEY_TOKEN_RE = re.compile(r"^[+-]?(?:[¥￥$]\s*)?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?$")
+_PAGE_LABEL_ATOM_RE = re.compile(r"(?:页码|page)\s*[:：]?", re.IGNORECASE)
+_PAGE_VALUE_ATOM_RE = re.compile(r"\d{1,5}\s*(?:[/／]|[-—])\s*\d{1,5}")
+_SEAL_CODE_RE = re.compile(r"(?=[A-Z0-9]{8,32}\Z)(?=.*[A-Z])(?=.*\d)[A-Z0-9]+")
 _LOCAL_FIRST_PAGE_RES = (
     re.compile(r"第\s*1\s*页\s*[,，/]?\s*(?:共|of)\s*\d+\s*页", re.I),
     re.compile(r"(?:页码|page)\s*[:：]?\s*1\s*[/／]\s*\d+", re.I),
@@ -40,6 +45,7 @@ _LOCAL_FIRST_PAGE_RES = (
     re.compile(r"page\s*1\s*(?:of|/)\s*\d+", re.I),
 )
 _TITLE_MARKERS = (
+    "账务明细清单",
     "账户明细",
     "账户交易",
     "交易明细",
@@ -58,6 +64,15 @@ _TITLE_MARKERS = (
     "客户交易清单",
     "account details",
 )
+_TITLE_DISCLAIMER_MARKERS = (
+    "仅供参考",
+    "数据缺失",
+    "可能导致",
+    "不作为",
+    "免责声明",
+    "法律效力",
+)
+_TITLE_DISCLAIMER_PREFIX_RE = re.compile(r"^\s*(?:说明|提示|注|声明)\s*[:：]", re.IGNORECASE)
 _TRANSACTION_HEADER_MARKERS = {
     "序号",
     "交易日期",
@@ -96,9 +111,20 @@ def _nfkc(value: Any) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip()
 
 
+def _source_atom_text(atom: dict[str, Any]) -> str:
+    source_text = atom.get("_source_text")
+    return str(atom.get("text") if source_text is None else source_text).strip()
+
+
 def _compact(value: Any) -> str:
     matching = normalize_bank_matching_text(_nfkc(value))
     return re.sub(r"[\s:：._()（）\[\]【】]+", "", matching).casefold()
+
+
+def _length_preserving_matching_text(value: Any) -> str:
+    source = _nfkc(value)
+    matching = normalize_bank_matching_text(source)
+    return matching if len(matching) == len(source) else ""
 
 
 def _page_number(page_id: Any) -> int:
@@ -216,12 +242,15 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "查询日期范围",
         "交易时段",
         "交易期间",
+        "交易明细对应时间段",
         "起止日期",
         "起讫日期",
         "时间范围",
         "日期范围",
         "对账周期",
+        "账单所属期间",
         "Statement Period",
+        "Statement Covered Period",
         "Query Period",
         "Start Time & End Time",
     ),
@@ -244,10 +273,12 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "account_number": (
         "账号",
+        "账户",
         "账户号",
         "银行账号",
         "客户账号",
         "账户代号",
+        "卡/账号",
         "卡号/账号",
         "账号/卡号",
         "Account No",
@@ -260,6 +291,7 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "internal_account": ("账户账号", "内部账号", "Internal Account"),
     "customer_number": ("客户号", "客户编号", "Customer Number", "Customer No"),
     "bank_name": ("银行名称", "Bank Name"),
+    "branch_number": ("网点号", "网点编号", "Branch Number", "Outlet Number"),
     "branch_name": (
         "开户银行",
         "开户行",
@@ -275,7 +307,7 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     ),
     "transaction_institution": ("交易机构", "经办机构", "Transaction Institution"),
     "accepting_branch": ("受理行", "Accepting Branch"),
-    "currency": ("币种", "账单币种", "币别", "Currency"),
+    "currency": ("币种", "幣種", "账单币种", "币别", "货币", "Currency"),
     "amount_unit": ("单位", "金额单位", "币种单位", "Amount Unit"),
     "account_type": ("账户类型", "账户类别", "Account Type"),
     "deposit_type": ("存款种类", "存款类型", "产品名称", "储种", "Deposit Type", "Product Name"),
@@ -288,20 +320,30 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "statement_year": ("年份", "Year"),
     "statement_month_number": ("月份", "Month"),
     "electronic_serial": ("电子流水号", "电子序列号", "Electronic Serial"),
-    "verification_code": ("验证码", "验证编号", "Verification Code"),
+    "verification_code": ("验证码", "验证编号", "核验编号", "Verification Code"),
     "proof_number": ("证明编号", "编号", "Proof Number"),
     "wechat_id": ("微信号", "WeChat ID"),
     "id_type": ("证件种类", "证件类型", "ID Type"),
     "id_number": ("证件号码", "身份证号", "身份证号码", "ID Number"),
     "filter_condition": ("筛选条件", "流水范围", "查询范围", "Filter", "Scope"),
-    "direction_filter": ("借贷方向", "借/贷标记", "交易方向", "Direction"),
+    "direction_filter": ("借贷方向", "借/贷标记", "交易方向", "收支类别", "Direction"),
+    "transaction_type_filter": ("交易类型",),
+    "transfer_amount_filter": ("转账金额区间",),
+    "counterparty_name_filter": ("对方户名",),
+    "counterparty_account_filter": ("对方账号",),
+    "purpose_note_filter": ("用途/备注",),
     "sort_order": ("排序方向", "排序方式", "Sort Order"),
     "print_channel": ("打印渠道", "Print Channel"),
     "print_teller": ("打印柜员", "柜员号", "Print Teller"),
     "print_count": ("已打印次数", "打印次数", "Print Count"),
     "print_method": ("打印方式", "Print Method"),
     "device_number": ("设备编号", "设备号", "Device Number"),
-    "query_teller": ("查询柜员", "Search Teller", "柜员 Search Teller"),
+    "query_teller": (
+        "查询柜员SearchTeller",
+        "查询柜员",
+        "Search Teller",
+        "柜员 Search Teller",
+    ),
     "query_timestamp": ("查询时间", "Query Time"),
     "department": ("部门", "Department"),
     "customer_branch": ("客户行", "Customer Branch"),
@@ -326,6 +368,7 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "支出总笔数",
         "支出笔数",
         "支出交易笔数",
+        "本页支出笔数",
     ),
     "debit_total": (
         "借方总金额",
@@ -339,6 +382,8 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "支出总额",
         "支出金额",
         "支出金额合计",
+        "本页支出算数合计",
+        "本页支出算术合计",
     ),
     "credit_count": (
         "贷方总笔数",
@@ -348,6 +393,7 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "收入总笔数",
         "收入笔数",
         "收入交易笔数",
+        "本页收入笔数",
     ),
     "credit_total": (
         "贷方总金额",
@@ -361,10 +407,19 @@ _FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "收入总额",
         "收入金额",
         "收入金额合计",
+        "本页收入算数合计",
+        "本页收入算术合计",
     ),
     "opening_balance": ("期初余额", "上期余额", "Opening Balance"),
     "closing_balance": ("期末余额", "Closing Balance"),
-    "brought_forward_balance": ("承前余额", "承前", "承上余额", "Brought Forward Balance"),
+    "brought_forward_balance": (
+        "承前余额",
+        "承前",
+        "承上余额",
+        "上页余额",
+        "Brought Forward Balance",
+        "Last balance",
+    ),
 }
 
 _NORMALIZED_ALIAS_TO_FIELD = {
@@ -374,6 +429,55 @@ _FIELD_ALIAS_PARTS = {
     field_name: {_compact(alias) for alias in aliases if _compact(alias)}
     for field_name, aliases in _FIELD_ALIASES.items()
 }
+_OPENING_BRANCH_ROW_LABELS = {
+    _compact(alias)
+    for alias in ("开户银行", "开户行", "开户机构", "开户网点", "Opening Branch", "Sub Branch")
+}
+_ISOLATED_CURRENCY_METADATA_FIELDS = {
+    "statement_year",
+    "statement_month_number",
+    "source_header_page_label",
+}
+_PAGE_LOCAL_DIRECTION_LABELS = {
+    "debit_count": {_compact("本页支出笔数")},
+    "debit_total": {_compact("本页支出算数合计"), _compact("本页支出算术合计")},
+    "credit_count": {_compact("本页收入笔数")},
+    "credit_total": {_compact("本页收入算数合计"), _compact("本页收入算术合计")},
+}
+_FILTER_CONTEXT_FIELDS = {
+    "direction_filter",
+    "transaction_type_filter",
+    "transfer_amount_filter",
+    "counterparty_name_filter",
+    "counterparty_account_filter",
+    "purpose_note_filter",
+}
+_INLINE_KV_ALIAS_RE = re.compile(
+    r"(?P<prefix>^|[\s/／,，;；(（])(?P<label>"
+    + "|".join(
+        sorted(
+            {
+                re.escape(matching_alias)
+                for aliases in _FIELD_ALIASES.values()
+                for alias in aliases
+                if (matching_alias := _length_preserving_matching_text(alias))
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\s*[:：]",
+    re.IGNORECASE,
+)
+_CERTIFICATE_SUBJECT_RE = re.compile(
+    r"^\s*兹证明\s*[:：]\s*"
+    r"(?P<holder>[\u4e00-\u9fffA-Za-z·•\s]{1,100}?)\s*"
+    r"[（(]\s*(?P<id_label>身份证(?:号|号码)?|证件号码)\s*[:：]\s*"
+    r"(?P<id_number>[A-Za-z0-9*]{6,30})\s*[)）]\s*[,，]?\s*"
+    r"在其微信号\s*[:：]\s*(?P<wechat_id>[A-Za-z0-9_.-]{3,80})\s*"
+    r"中的交易明细(?:信息)?如下\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
 _MAX_ALIAS_ATOMS = 5
 _COUNT_FIELDS = {"total_transactions", "debit_count", "credit_count", "print_count"}
 _MONEY_FIELDS = {
@@ -407,6 +511,7 @@ _SINGLE_ATOM_VALUE_FIELDS = (
         "card_number",
         "internal_account",
         "customer_number",
+        "branch_number",
         "statement_number",
         "statement_code",
         "electronic_serial",
@@ -459,6 +564,7 @@ _POSITIONED_FOOTER_FIELDS = {
 }
 _STABLE_CROSS_SCOPE_FIELDS = {
     "statement_title",
+    "statement_disclaimer",
     "bank_name",
     "account_holder",
     "account_number",
@@ -466,6 +572,7 @@ _STABLE_CROSS_SCOPE_FIELDS = {
     "internal_account",
     "customer_number",
     "branch_name",
+    "branch_number",
     "currency",
     "amount_unit",
 }
@@ -482,6 +589,8 @@ class _HeaderFact:
     bbox: tuple[float, float, float, float] | None
     evidence_ids: tuple[str, ...]
     source_kind: str = "canonical_evidence_atoms"
+    derivation: str = ""
+    source_detail: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -532,6 +641,7 @@ def _normalize_field_value(field_key: str, value: Any) -> Any:
         "card_number",
         "internal_account",
         "customer_number",
+        "branch_number",
         "statement_number",
         "statement_code",
         "electronic_serial",
@@ -570,6 +680,30 @@ def _clean_header_value(field_key: str, value: Any) -> str:
     return text
 
 
+def _bounded_explicit_filter_text(value: Any, *, maximum_length: int = 100) -> bool:
+    text = _nfkc(value)
+    return bool(
+        1 <= len(text) <= maximum_length
+        and re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text)
+        and not _INLINE_KV_ALIAS_RE.search(text)
+        and not _is_header_only_value(text)
+    )
+
+
+def _transfer_amount_filter_is_plausible(value: Any) -> bool:
+    text = _nfkc(value)
+    if _compact(text) in {"无", "全部", "不限"}:
+        return True
+    parts = [part.strip() for part in re.split(r"\s*(?:-|—|~|～|至|到)\s*", text) if part.strip()]
+    if len(parts) == 1:
+        return _strict_source_money(parts[0], nonnegative=True) is not None
+    if len(parts) != 2:
+        return False
+    lower = _strict_source_money(parts[0], nonnegative=True)
+    upper = _strict_source_money(parts[1], nonnegative=True)
+    return lower is not None and upper is not None and lower <= upper
+
+
 def _fact_value_is_plausible(field_key: str, value: Any) -> bool:
     """Reject ledger headings and neighbouring labels mistaken for values."""
     text = _nfkc(value)
@@ -606,11 +740,29 @@ def _fact_value_is_plausible(field_key: str, value: Any) -> bool:
             "日元",
             "jpy",
         }
+    if field_key == "amount_unit":
+        return compact in {"元", "角", "分", "千元", "万元", "百万元", "亿元"}
+    if field_key == "seal_code":
+        return bool(_SEAL_CODE_RE.fullmatch(text))
+    if field_key == "direction_filter":
+        return compact in {"全部", "收入", "支出", "收支", "借方", "贷方"}
+    if field_key == "transaction_type_filter":
+        return compact in {"无", "全部", "不限"} or _bounded_explicit_filter_text(text, maximum_length=80)
+    if field_key == "transfer_amount_filter":
+        return _transfer_amount_filter_is_plausible(text)
+    if field_key == "counterparty_name_filter":
+        return compact in {"无", "全部", "不限"} or _bounded_explicit_filter_text(text)
+    if field_key == "counterparty_account_filter":
+        token = re.sub(r"\s+", "", text)
+        return compact in {"无", "全部", "不限"} or bool(re.fullmatch(r"[A-Za-z0-9*_.\-/]{3,80}", token))
+    if field_key == "purpose_note_filter":
+        return compact in {"无", "全部", "不限"} or _bounded_explicit_filter_text(text)
     if field_key in {
         "account_number",
         "card_number",
         "internal_account",
         "customer_number",
+        "branch_number",
         "statement_number",
         "statement_code",
         "electronic_serial",
@@ -629,13 +781,27 @@ def _fact_value_is_plausible(field_key: str, value: Any) -> bool:
             len(text) <= 100
             and not _DATE_TOKEN_RE.search(text)
             and not re.search(
-                r"(?:用途|备注|对方|账号|账户余额|打印日期|查询日期)",
+                r"(?:用途|备注|对方|账号|账户余额|上页余额|打印日期|查询日期|Last\s+balance|Counterparty)",
                 text,
+                re.IGNORECASE,
             )
         )
     if field_key == "bank_name":
         return len(text) <= 100 and "银行" in text and not _DATE_TOKEN_RE.search(text)
     return not bool(_is_header_only_value(text))
+
+
+def _labelled_fact_value_is_plausible(field_key: str, raw_name: Any, value: Any) -> bool:
+    if not _fact_value_is_plausible(field_key, value):
+        return False
+    if field_key == "account_number" and _compact(raw_name) == _compact("账户"):
+        token = re.sub(r"\s+", "", _nfkc(value))
+        return bool(
+            6 <= len(token) <= 80
+            and re.search(r"\d", token)
+            and re.fullmatch(r"[A-Za-z0-9*_.\-/]+", token)
+        )
+    return True
 
 
 def _is_header_only_value(value: str) -> bool:
@@ -660,7 +826,8 @@ def _group_atoms(parse_result: Any) -> dict[int, list[dict[str, Any]]]:
         page_id = str(atom.get("page_id") or "")
         page = _page_number(page_id)
         bbox = atom.get("bbox")
-        text = _nfkc(atom.get("text"))
+        source_text = str(atom.get("text") or "").strip()
+        text = _nfkc(source_text)
         if page <= 0 or not text or not isinstance(bbox, list) or len(bbox) < 4:
             continue
         if selected_pages and page not in selected_pages:
@@ -679,6 +846,7 @@ def _group_atoms(parse_result: Any) -> dict[int, list[dict[str, Any]]]:
         grouped[page].append(
             {
                 **atom,
+                "_source_text": source_text,
                 "page_id": page_id,
                 "text": text,
                 "bbox": [float(value) for value in bbox[:4]],
@@ -695,7 +863,8 @@ def _group_atoms(parse_result: Any) -> dict[int, list[dict[str, Any]]]:
         if page <= 0 or page not in rejected_native_pages or (selected_pages and page not in selected_pages):
             continue
         for block_index, block in enumerate(getattr(page_content, "texts", None) or ()):
-            text = _nfkc(getattr(block, "content", ""))
+            source_text = str(getattr(block, "content", "") or "").strip()
+            text = _nfkc(source_text)
             bbox = getattr(block, "bbox", None)
             if not text or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
                 continue
@@ -707,6 +876,7 @@ def _group_atoms(parse_result: Any) -> dict[int, list[dict[str, Any]]]:
             grouped[page].append(
                 {
                     "id": evidence_ids[0] if evidence_ids else f"context:ocr:p{page:04d}:{block_index:06d}",
+                    "_source_text": source_text,
                     "page_id": f"page:{page:04d}",
                     "text": text,
                     "bbox": [float(value) for value in bbox[:4]],
@@ -823,6 +993,10 @@ def _is_transaction_header_row(row: Sequence[dict[str, Any]]) -> bool:
 
 def _header_rows(atoms: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     rows = _baseline_rows(atoms)
+    ledger_header_top = next(
+        (min(float(atom["bbox"][1]) for atom in row) for row in rows if _is_transaction_header_row(row)),
+        None,
+    )
     first_data_top = next(
         (min(float(atom["bbox"][1]) for atom in row) for row in rows if _is_transaction_data_row(row)),
         None,
@@ -835,6 +1009,8 @@ def _header_rows(atoms: Sequence[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         cutoff = page_top + max(120.0, (page_bottom - page_top) * 0.38)
     else:
         cutoff = first_data_top
+    if ledger_header_top is not None:
+        cutoff = min(cutoff, ledger_header_top)
     return [row for row in rows if min(float(atom["bbox"][1]) for atom in row) < cutoff]
 
 
@@ -883,9 +1059,12 @@ def _label_spans(row: Sequence[dict[str, Any]]) -> list[_LabelSpan]:
         span = _known_label_span(row, index)
         if span is None:
             raw = _nfkc(row[index].get("text"))
-            generic = re.fullmatch(r"([^:：]{1,40})[:：]\s*(.*)", raw)
-            if generic and re.search(r"[\u4e00-\u9fffA-Za-z]", generic.group(1)):
-                span = _LabelSpan(index, index, "", generic.group(1), generic.group(2), known=False)
+            if _PAGE_LABEL_ATOM_RE.fullmatch(raw):
+                span = _LabelSpan(index, index, "source_header_page_label", _source_atom_text(row[index]))
+            else:
+                generic = re.fullmatch(r"([^:：]{2,40})[:：]\s*(.*)", raw)
+                if generic and re.search(r"[\u4e00-\u9fffA-Za-z]", generic.group(1)):
+                    span = _LabelSpan(index, index, "", generic.group(1), generic.group(2), known=False)
         if span is None:
             index += 1
             continue
@@ -916,6 +1095,113 @@ def _join_value_atoms(atoms: Sequence[dict[str, Any]]) -> str:
     return " ".join(parts)
 
 
+def _bounded_page_value_atom(
+    label_atom: dict[str, Any],
+    value_atoms: Sequence[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return one source page token tightly bounded to an explicit page label."""
+
+    if not _PAGE_LABEL_ATOM_RE.fullmatch(_nfkc(label_atom.get("text"))):
+        return None
+    label_bbox = label_atom.get("bbox")
+    if not isinstance(label_bbox, (list, tuple)) or len(label_bbox) < 4:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for atom in value_atoms:
+        value = _nfkc(atom.get("text"))
+        bbox = atom.get("bbox")
+        if not _PAGE_VALUE_ATOM_RE.fullmatch(value) or not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            continue
+        horizontal_gap = float(bbox[0]) - float(label_bbox[2])
+        vertical_overlap = min(float(bbox[3]), float(label_bbox[3])) - max(
+            float(bbox[1]),
+            float(label_bbox[1]),
+        )
+        if -2.0 <= horizontal_gap <= 48.0 and vertical_overlap >= 1.0:
+            candidates.append(atom)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _isolated_currency_context(
+    row: Sequence[dict[str, Any]],
+    spans: Sequence[_LabelSpan],
+) -> tuple[
+    dict[str, Any],
+    _LabelSpan,
+    _LabelSpan,
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+] | None:
+    """Recognize a detached currency cell in a strictly structured metadata row."""
+
+    opening_spans = [
+        span
+        for span in spans
+        if span.field_key == "branch_name" and _compact(span.raw_name) in _OPENING_BRANCH_ROW_LABELS
+    ]
+    if len(opening_spans) != 1 or any(span.field_key == "currency" for span in spans):
+        return None
+    branch_span = opening_spans[0]
+    next_span = next((span for span in spans if span.start > branch_span.end), None)
+    if next_span is None or next_span.field_key not in _ISOLATED_CURRENCY_METADATA_FIELDS:
+        return None
+    between = list(row[branch_span.end + 1 : next_span.start])
+    if not between:
+        return None
+    currency_atom = between[-1]
+    if not _fact_value_is_plausible("currency", _nfkc(currency_atom.get("text"))):
+        return None
+    branch_value_atoms = between[:-1]
+    if not branch_span.inline_value and not branch_value_atoms:
+        return None
+    predecessor = branch_value_atoms[-1] if branch_value_atoms else row[branch_span.end]
+    separation = float(currency_atom["bbox"][0]) - float(predecessor["bbox"][2])
+    metadata_gap = float(row[next_span.start]["bbox"][0]) - float(currency_atom["bbox"][2])
+    if not 12.0 <= separation <= 180.0 or not -2.0 <= metadata_gap <= 180.0:
+        return None
+    supporting = [
+        currency_atom,
+        *row[branch_span.start : branch_span.end + 1],
+        *branch_value_atoms,
+        *row[next_span.start : next_span.end + 1],
+    ]
+    return currency_atom, branch_span, next_span, branch_value_atoms, supporting
+
+
+def _inline_header_transaction_time_period(
+    span: _LabelSpan,
+    row: Sequence[dict[str, Any]],
+    value_atoms: Sequence[dict[str, Any]],
+) -> str:
+    """Resolve only the explicit header form ``交易时间:<date>`` ``至`` ``<date>``."""
+    start = _nfkc(span.inline_value).strip()
+    if (
+        span.field_key
+        or _compact(span.raw_name) != _compact("交易时间")
+        or not _DATE_TOKEN_RE.fullmatch(start)
+        or len(_valid_date_tokens(start)) != 1
+        or len(value_atoms) != 2
+    ):
+        return ""
+    separator, end_atom = value_atoms
+    end = _nfkc(end_atom.get("text")).strip()
+    if (
+        _nfkc(separator.get("text")).strip() != "至"
+        or not _DATE_TOKEN_RE.fullmatch(end)
+        or len(_valid_date_tokens(end)) != 1
+    ):
+        return ""
+    try:
+        separator_gap = float(separator["bbox"][0]) - float(row[span.end]["bbox"][2])
+        end_gap = float(end_atom["bbox"][0]) - float(separator["bbox"][2])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return ""
+    candidate = f"{start} 至 {end}"
+    if not (-2.0 <= separator_gap <= 180.0 and -2.0 <= end_gap <= 180.0):
+        return ""
+    return candidate if _period_dates_are_valid(candidate, minimum=2) else ""
+
+
 def _bbox_union(atoms: Sequence[dict[str, Any]]) -> tuple[float, float, float, float] | None:
     boxes = [atom.get("bbox") for atom in atoms if isinstance(atom.get("bbox"), list) and len(atom["bbox"]) >= 4]
     if not boxes:
@@ -928,14 +1214,120 @@ def _bbox_union(atoms: Sequence[dict[str, Any]]) -> tuple[float, float, float, f
     )
 
 
+def _positioned_atom_fact(
+    atom: dict[str, Any],
+    page: int,
+    field_key: str,
+    raw_name: str,
+    raw_value: str,
+) -> _HeaderFact:
+    return _HeaderFact(
+        field_key=field_key,
+        raw_name=raw_name,
+        raw_value=raw_value,
+        normalized_value=_normalize_field_value(field_key, raw_value),
+        page=page,
+        page_id=str(atom.get("page_id") or f"page:{page:04d}"),
+        bbox=_bbox_union([atom]),
+        evidence_ids=tuple([str(atom.get("id"))] if str(atom.get("id") or "") else []),
+        source_kind=_context_source_kind([atom]),
+    )
+
+
+def _multi_inline_kv_facts(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFact]:
+    """Recover distinct explicit KVs printed inside one positioned text atom."""
+
+    facts: list[_HeaderFact] = []
+    for atom in row:
+        source_text = str(atom.get("text") or "").strip()
+        text = _nfkc(source_text)
+        matching_text = _length_preserving_matching_text(text)
+        # Match compatibility/Traditional label glyphs without losing the
+        # source-text offsets used to slice raw labels and values.  Should a
+        # future matching normalization expand or contract text, fail closed
+        # instead of attaching a value to the wrong source span.
+        if not matching_text:
+            continue
+        matches = list(_INLINE_KV_ALIAS_RE.finditer(matching_text))
+        if len(matches) < 2 or text[: matches[0].start("label")].strip():
+            continue
+        atom_facts: list[_HeaderFact] = []
+        valid = True
+        for index, match in enumerate(matches):
+            raw_label = text[match.start("label") : match.end("label")]
+            field_key = _field_for_label(raw_label)
+            value_end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            raw_value = text[match.end() : value_end].strip(" \t/／,，;；()（）")
+            if (
+                not field_key
+                or not raw_value
+                or len(raw_value) > 240
+                or re.search(r"[:：]", raw_value)
+                or not _labelled_fact_value_is_plausible(field_key, raw_label, raw_value)
+            ):
+                valid = False
+                break
+            atom_facts.append(
+                _positioned_atom_fact(
+                    atom,
+                    page,
+                    field_key,
+                    text[match.start("label") : match.end()].strip(),
+                    raw_value,
+                )
+            )
+        field_keys = {fact.field_key for fact in atom_facts}
+        mixed_filter_namespace = bool(field_keys & _FILTER_CONTEXT_FIELDS) and not field_keys <= _FILTER_CONTEXT_FIELDS
+        if valid and not mixed_filter_namespace and len(field_keys) >= 2:
+            facts.extend(atom_facts)
+    return facts
+
+
+def _certificate_subject_facts(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFact]:
+    """Promote the explicit subject identity of a payment-detail certificate."""
+
+    for atom in row:
+        match = _CERTIFICATE_SUBJECT_RE.fullmatch(_nfkc(atom.get("text")))
+        if match is None:
+            continue
+        values = {
+            "account_holder": match.group("holder").strip(),
+            "id_number": match.group("id_number").strip(),
+            "wechat_id": match.group("wechat_id").strip(),
+        }
+        chinese_id = values["id_number"]
+        if not re.fullmatch(r"(?:\d{15}|[0-9*]{17}[0-9Xx*])", chinese_id):
+            continue
+        if not all(_fact_value_is_plausible(field_key, value) for field_key, value in values.items()):
+            continue
+        return [
+            _positioned_atom_fact(atom, page, "account_holder", "兹证明:", values["account_holder"]),
+            _positioned_atom_fact(
+                atom,
+                page,
+                "id_number",
+                f"{match.group('id_label')}:",
+                values["id_number"],
+            ),
+            _positioned_atom_fact(atom, page, "wechat_id", "微信号:", values["wechat_id"]),
+        ]
+    return []
+
+
 def _facts_from_row(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFact]:
     if _is_transaction_header_row(row):
         return []
     spans = _label_spans(row)
+    isolated_currency = _isolated_currency_context(row, spans)
     facts: list[_HeaderFact] = []
     for position, span in enumerate(spans):
         value_atoms = list(row[span.end + 1 : spans[position + 1].start if position + 1 < len(spans) else len(row)])
         field_key = span.field_key
+        if isolated_currency is not None and span == isolated_currency[1]:
+            value_atoms = [atom for atom in value_atoms if atom is not isolated_currency[0]]
+        if not span.inline_value and field_key == "source_header_page_label":
+            page_value_atom = _bounded_page_value_atom(row[span.end], value_atoms)
+            value_atoms = [page_value_atom] if page_value_atom is not None else []
         if not span.inline_value and field_key in _DATETIME_FIELDS:
             date_position = next(
                 (
@@ -957,12 +1349,24 @@ def _facts_from_row(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFac
                 value_atoms = selected
         if not span.inline_value and field_key in _SINGLE_ATOM_VALUE_FIELDS:
             single_value_atom = next(
-                (atom for atom in value_atoms if _fact_value_is_plausible(field_key, _nfkc(atom.get("text")))),
+                (
+                    atom
+                    for atom in value_atoms
+                    if _labelled_fact_value_is_plausible(
+                        field_key,
+                        span.raw_name,
+                        _nfkc(atom.get("text")),
+                    )
+                ),
                 None,
             )
             if single_value_atom is not None:
                 value_atoms = [single_value_atom]
-        trailing_value = _join_value_atoms(value_atoms)
+        trailing_value = (
+            _source_atom_text(value_atoms[0])
+            if field_key == "source_header_page_label" and len(value_atoms) == 1
+            else _join_value_atoms(value_atoms)
+        )
         value = span.inline_value or trailing_value
         used_value_atoms = [] if span.inline_value else value_atoms
         if span.inline_value and field_key in {"query_period", "statement_period"}:
@@ -977,6 +1381,10 @@ def _facts_from_row(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFac
                 if -2.0 <= gap <= 180.0 and _period_dates_are_valid(candidate, minimum=2):
                     value = candidate
                     used_value_atoms = value_atoms
+        if header_transaction_period := _inline_header_transaction_time_period(span, row, value_atoms):
+            field_key = "query_period"
+            value = header_transaction_period
+            used_value_atoms = value_atoms
         if (
             span.inline_value
             and field_key in _DATETIME_FIELDS
@@ -999,7 +1407,7 @@ def _facts_from_row(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFac
             continue
         if len(value) > 240 or _compact(value) in _NORMALIZED_ALIAS_TO_FIELD:
             continue
-        if recognized_field and not _fact_value_is_plausible(field_key, value):
+        if recognized_field and not _labelled_fact_value_is_plausible(field_key, span.raw_name, value):
             continue
         supporting = [*row[span.start : span.end + 1], *used_value_atoms]
         page_id = str(row[span.start].get("page_id") or f"page:{page:04d}")
@@ -1031,7 +1439,67 @@ def _facts_from_row(row: Sequence[dict[str, Any]], page: int) -> list[_HeaderFac
                     source_kind=primary_fact.source_kind,
                 )
             )
-    return facts
+    if isolated_currency is not None:
+        currency_atom, branch_span, metadata_span, branch_value_atoms, supporting = isolated_currency
+        raw_value = _source_atom_text(currency_atom)
+        source_kind = _context_source_kind(supporting)
+        bbox = _bbox_union(supporting)
+        evidence_ids = tuple(
+            dict.fromkeys(str(atom.get("id") or "") for atom in supporting if str(atom.get("id") or ""))
+        )
+        facts.append(
+            _HeaderFact(
+                field_key="currency",
+                raw_name="unlabelled_currency",
+                raw_value=raw_value,
+                normalized_value=_normalize_field_value("currency", raw_value),
+                page=page,
+                page_id=str(currency_atom.get("page_id") or f"page:{page:04d}"),
+                bbox=bbox,
+                evidence_ids=evidence_ids,
+                source_kind=source_kind,
+                derivation="isolated_currency_in_opening_branch_metadata_row",
+                source_detail={
+                    "page": page,
+                    "raw_value": raw_value,
+                    "opening_branch_label": branch_span.raw_name,
+                    "branch_value_texts": [
+                        *([branch_span.inline_value] if branch_span.inline_value else []),
+                        *[_source_atom_text(atom) for atom in branch_value_atoms],
+                    ],
+                    "branch_value_evidence_ids": [
+                        str(atom.get("id") or "") for atom in branch_value_atoms if str(atom.get("id") or "")
+                    ],
+                    "metadata_label": metadata_span.raw_name,
+                    "value_evidence_id": str(currency_atom.get("id") or ""),
+                    "evidence_ids": list(evidence_ids),
+                    "bbox": list(bbox) if bbox else None,
+                    "source": source_kind,
+                    "normalized_only": False,
+                },
+            )
+        )
+    multi_inline_facts = _multi_inline_kv_facts(row, page)
+    multi_inline_candidate_evidence = {
+        str(atom.get("id"))
+        for atom in row
+        if str(atom.get("id") or "")
+        and (matching_text := _length_preserving_matching_text(atom.get("text")))
+        and len(list(_INLINE_KV_ALIAS_RE.finditer(matching_text))) >= 2
+    }
+    if multi_inline_candidate_evidence:
+        facts = [
+            fact
+            for fact in facts
+            if fact.field_key.startswith("source_header_")
+            or not multi_inline_candidate_evidence.intersection(fact.evidence_ids)
+        ]
+    facts.extend(multi_inline_facts)
+    facts.extend(_certificate_subject_facts(row, page))
+    unique: dict[tuple[str, str, str], _HeaderFact] = {}
+    for fact in facts:
+        unique.setdefault((fact.field_key, _nfkc(fact.raw_name), _nfkc(fact.raw_value)), fact)
+    return list(unique.values())
 
 
 def _paired_cumulative_direction_facts(
@@ -1039,18 +1507,19 @@ def _paired_cumulative_direction_facts(
     page: int,
 ) -> list[_HeaderFact]:
     """Recover a paired cumulative debit/credit footer whose right label wraps."""
-    debit_label: dict[str, Any] | None = None
-    credit_label: dict[str, Any] | None = None
-    suffix = ""
+    debit_labels: list[tuple[dict[str, Any], str]] = []
+    credit_labels: list[dict[str, Any]] = []
     for atom in row:
         compact = _compact(atom.get("text"))
         match = re.fullmatch(r"本月累计借方发生(?P<suffix>数|额)", compact)
         if match:
-            debit_label, suffix = atom, match.group("suffix")
+            debit_labels.append((atom, match.group("suffix")))
         elif compact == "本月累计贷方":
-            credit_label = atom
-    if debit_label is None or credit_label is None:
+            credit_labels.append(atom)
+    if len(debit_labels) != 1 or len(credit_labels) != 1:
         return []
+    debit_label, suffix = debit_labels[0]
+    credit_label = credit_labels[0]
     debit_field, credit_field = ("debit_count", "credit_count") if suffix == "数" else ("debit_total", "credit_total")
 
     def value_atom_after(label: dict[str, Any], field_key: str) -> dict[str, Any] | None:
@@ -1066,27 +1535,112 @@ def _paired_cumulative_direction_facts(
     credit_value = value_atom_after(credit_label, credit_field)
     if debit_value is None or credit_value is None or debit_value is credit_value:
         return []
-    facts: list[_HeaderFact] = []
-    for field_key, label, value in (
-        (debit_field, debit_label, debit_value),
-        (credit_field, credit_label, credit_value),
-    ):
-        supporting = [label, value]
-        raw_value = _nfkc(value.get("text"))
-        facts.append(
-            _HeaderFact(
-                field_key,
-                _nfkc(label.get("text")),
-                raw_value,
-                _normalize_field_value(field_key, raw_value),
-                page,
-                str(label.get("page_id") or f"page:{page:04d}"),
-                _bbox_union(supporting),
-                tuple(str(atom.get("id") or "") for atom in supporting if str(atom.get("id") or "")),
-                _context_source_kind(supporting),
-            )
+
+    def ordered_neighbour(
+        left: dict[str, Any],
+        right: dict[str, Any],
+        *,
+        max_gap: float,
+    ) -> bool:
+        left_bbox = left["bbox"]
+        right_bbox = right["bbox"]
+        gap = float(right_bbox[0]) - float(left_bbox[2])
+        vertical_overlap = min(float(left_bbox[3]), float(right_bbox[3])) - max(
+            float(left_bbox[1]),
+            float(right_bbox[1]),
         )
-    return facts
+        return -2.0 <= gap <= max_gap and vertical_overlap >= 1.0
+
+    if not (
+        ordered_neighbour(debit_label, debit_value, max_gap=80.0)
+        and ordered_neighbour(debit_value, credit_label, max_gap=250.0)
+        and ordered_neighbour(credit_label, credit_value, max_gap=80.0)
+    ):
+        return []
+    debit_supporting = [debit_label, debit_value]
+    debit_raw_value = _nfkc(debit_value.get("text"))
+    debit_fact = _HeaderFact(
+        debit_field,
+        _nfkc(debit_label.get("text")),
+        debit_raw_value,
+        _normalize_field_value(debit_field, debit_raw_value),
+        page,
+        str(debit_label.get("page_id") or f"page:{page:04d}"),
+        _bbox_union(debit_supporting),
+        tuple(str(atom.get("id") or "") for atom in debit_supporting if str(atom.get("id") or "")),
+        _context_source_kind(debit_supporting),
+    )
+
+    credit_raw_name = f"本月累计贷方发生{suffix}"
+    credit_supporting = [credit_label, debit_label, credit_value]
+    credit_raw_value = _nfkc(credit_value.get("text"))
+    credit_bbox = _bbox_union(credit_supporting)
+    credit_evidence_ids = tuple(
+        str(atom.get("id") or "") for atom in credit_supporting if str(atom.get("id") or "")
+    )
+    credit_source_kind = _context_source_kind(credit_supporting)
+    credit_fact = _HeaderFact(
+        credit_field,
+        credit_raw_name,
+        credit_raw_value,
+        _normalize_field_value(credit_field, credit_raw_value),
+        page,
+        str(credit_label.get("page_id") or f"page:{page:04d}"),
+        credit_bbox,
+        credit_evidence_ids,
+        credit_source_kind,
+        derivation="structural_pair_suffix_from_explicit_left_label",
+        source_detail={
+            "page": page,
+            "derived_raw_name": credit_raw_name,
+            "left_label": _nfkc(debit_label.get("text")),
+            "right_label": _nfkc(credit_label.get("text")),
+            "raw_value": credit_raw_value,
+            "value_evidence_id": str(credit_value.get("id") or ""),
+            "evidence_ids": list(credit_evidence_ids),
+            "bbox": list(credit_bbox) if credit_bbox else None,
+            "source": credit_source_kind,
+            "normalized_only": False,
+        },
+    )
+    return [debit_fact, credit_fact]
+
+
+def _is_statement_disclaimer(value: Any) -> bool:
+    text = _nfkc(value)
+    compact = _compact(text)
+    return _TITLE_DISCLAIMER_PREFIX_RE.search(text) is not None or any(
+        _compact(marker) in compact for marker in _TITLE_DISCLAIMER_MARKERS
+    )
+
+
+def _statement_disclaimer_fact(
+    header_rows: Sequence[Sequence[dict[str, Any]]],
+    page: int,
+) -> _HeaderFact | None:
+    candidates = [
+        atom
+        for row in header_rows
+        for atom in row
+        if _is_statement_disclaimer(atom.get("text"))
+    ]
+    values = {_nfkc(atom.get("text")) for atom in candidates if _nfkc(atom.get("text"))}
+    if len(values) != 1:
+        return None
+    value = next(iter(values))
+    atoms = [atom for atom in candidates if _nfkc(atom.get("text")) == value]
+    first = atoms[0]
+    return _HeaderFact(
+        "statement_disclaimer",
+        "document_disclaimer",
+        value,
+        value,
+        page,
+        str(first.get("page_id") or f"page:{page:04d}"),
+        _bbox_union(atoms),
+        tuple(dict.fromkeys(str(atom.get("id") or "") for atom in atoms if str(atom.get("id") or ""))),
+        _context_source_kind(atoms),
+    )
 
 
 def _title_fact(header_rows: Sequence[Sequence[dict[str, Any]]], page: int) -> _HeaderFact | None:
@@ -1106,6 +1660,8 @@ def _title_fact(header_rows: Sequence[Sequence[dict[str, Any]]], page: int) -> _
             if float(atom["bbox"][1]) >= ledger_header_top:
                 continue
             if not (4 <= len(compact) <= 120) or ":" in text or "：" in text:
+                continue
+            if _is_statement_disclaimer(text) or re.search(r"[。；;！？!?]", text):
                 continue
             if _field_for_label(text):
                 continue
@@ -1453,14 +2009,429 @@ def _unlabelled_holder_next_to_account_fact(
     )
 
 
+def _reconciliation_stamp_groups(
+    atoms: Sequence[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Return tightly contiguous source atoms spelling ``对账专用章``."""
+
+    target = _compact("对账专用章")
+    groups: list[list[dict[str, Any]]] = []
+    for row in _baseline_rows(atoms):
+        for start in range(len(row)):
+            assembled = ""
+            group: list[dict[str, Any]] = []
+            for atom in row[start:]:
+                segment = _compact(atom.get("text"))
+                if not segment or not target.startswith(f"{assembled}{segment}"):
+                    break
+                if group:
+                    previous_bbox = group[-1]["bbox"]
+                    bbox = atom["bbox"]
+                    horizontal_gap = float(bbox[0]) - float(previous_bbox[2])
+                    vertical_overlap = min(float(bbox[3]), float(previous_bbox[3])) - max(
+                        float(bbox[1]),
+                        float(previous_bbox[1]),
+                    )
+                    if not -3.0 <= horizontal_gap <= 12.0 or vertical_overlap < 1.0:
+                        break
+                assembled += segment
+                group.append(atom)
+                if assembled == target:
+                    groups.append(group)
+                    break
+    return groups
+
+
+def _seal_code_fact(atoms: Sequence[dict[str, Any]], page: int) -> _HeaderFact | None:
+    """Promote one strict code immediately below an explicit reconciliation stamp."""
+
+    pairs: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for stamp_atoms in _reconciliation_stamp_groups(atoms):
+        stamp_bbox = _bbox_union(stamp_atoms)
+        if stamp_bbox is None:
+            continue
+        for atom in atoms:
+            if atom in stamp_atoms or not _SEAL_CODE_RE.fullmatch(_source_atom_text(atom)):
+                continue
+            bbox = atom.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+                continue
+            vertical_gap = float(bbox[1]) - stamp_bbox[3]
+            horizontal_overlap = min(float(bbox[2]), stamp_bbox[2]) - max(float(bbox[0]), stamp_bbox[0])
+            code_width = max(0.0, float(bbox[2]) - float(bbox[0]))
+            code_center = (float(bbox[0]) + float(bbox[2])) / 2.0
+            if (
+                0.0 <= vertical_gap <= 18.0
+                and stamp_bbox[0] <= code_center <= stamp_bbox[2]
+                and horizontal_overlap >= max(4.0, code_width * 0.5)
+            ):
+                pairs.append((atom, stamp_atoms))
+    unique_pairs = {
+        (
+            str(code.get("id") or ""),
+            tuple(str(atom.get("id") or "") for atom in stamp_atoms),
+        ): (code, stamp_atoms)
+        for code, stamp_atoms in pairs
+    }
+    if len(unique_pairs) != 1:
+        return None
+    code, stamp_atoms = next(iter(unique_pairs.values()))
+    supporting = [code, *stamp_atoms]
+    raw_value = _source_atom_text(code)
+    bbox = _bbox_union(supporting)
+    evidence_ids = tuple(
+        dict.fromkeys(str(atom.get("id") or "") for atom in supporting if str(atom.get("id") or ""))
+    )
+    source_kind = _context_source_kind(supporting)
+    return _HeaderFact(
+        field_key="seal_code",
+        raw_name="对账专用章",
+        raw_value=raw_value,
+        normalized_value=raw_value,
+        page=page,
+        page_id=str(code.get("page_id") or f"page:{page:04d}"),
+        bbox=bbox,
+        evidence_ids=evidence_ids,
+        source_kind=source_kind,
+        derivation="seal_code_adjacent_to_explicit_reconciliation_stamp",
+        source_detail={
+            "page": page,
+            "stamp_texts": [_source_atom_text(atom) for atom in stamp_atoms],
+            "raw_value": raw_value,
+            "value_evidence_id": str(code.get("id") or ""),
+            "evidence_ids": list(evidence_ids),
+            "bbox": list(bbox) if bbox else None,
+            "source": source_kind,
+            "normalized_only": False,
+        },
+    )
+
+
+def _physical_split_ledger_schema(headers: Sequence[str]) -> dict[str, Any] | None:
+    compact_headers = [_compact(header) for header in headers]
+    date_columns = [
+        index
+        for index, header in enumerate(compact_headers)
+        if "日期" in header or header in {"交易时间", "入账时间", "记账时间", "timestamp"}
+    ]
+    debit_columns = [
+        index
+        for index, header in enumerate(compact_headers)
+        if "借方" in header or header in {"支出", "支出金额", "付款金额", "debit"}
+    ]
+    credit_columns = [
+        index
+        for index, header in enumerate(compact_headers)
+        if "贷方" in header or header in {"收入", "收入金额", "收款金额", "credit"}
+    ]
+    balance_columns = [
+        index for index, header in enumerate(compact_headers) if "余额" in header or header == "balance"
+    ]
+    if not date_columns or len(debit_columns) != 1 or len(credit_columns) != 1 or len(balance_columns) != 1:
+        return None
+    return {
+        "date_columns": date_columns,
+        "debit_column": debit_columns[0],
+        "credit_column": credit_columns[0],
+        "balance_column": balance_columns[0],
+    }
+
+
+def _source_owned_data_row_index(
+    row: Any,
+    *,
+    page_number: int,
+    table_id: str,
+) -> int | None:
+    row_type = getattr(row, "row_type", None)
+    row_type = getattr(row_type, "value", row_type)
+    try:
+        source_page = int(getattr(row, "source_page"))
+        source_row_index = int(getattr(row, "source_row_index"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (
+        str(row_type or "").casefold() != "data"
+        or source_page != page_number
+        or str(getattr(row, "source_physical_id", "") or "").strip() != table_id
+        or source_row_index < 0
+    ):
+        return None
+    return source_row_index
+
+
+def _strict_cell_bbox(cell: Any) -> tuple[float, float, float, float] | None:
+    bbox = getattr(cell, "bbox", None)
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        values = tuple(float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in values) or values[2] < values[0] or values[3] < values[1]:
+        return None
+    return values
+
+
+def _strict_physical_row_bbox(cells: Sequence[Any]) -> tuple[float, float, float, float] | None:
+    valid_boxes: list[tuple[float, float, float, float]] = []
+    for cell in cells:
+        box = _strict_cell_bbox(cell)
+        if box is not None:
+            valid_boxes.append(box)
+            continue
+        if str(getattr(cell, "text", "") or "").strip() or any(
+            str(evidence_id or "").strip()
+            for evidence_id in (getattr(cell, "evidence_ids", None) or [])
+        ):
+            return None
+    if not valid_boxes:
+        return None
+    return (
+        min(box[0] for box in valid_boxes),
+        min(box[1] for box in valid_boxes),
+        max(box[2] for box in valid_boxes),
+        max(box[3] for box in valid_boxes),
+    )
+
+
+def _strict_source_cell_ref(
+    cell: Any,
+    *,
+    page_number: int,
+    table_id: str,
+    source_row_index: int,
+    column: int,
+) -> dict[str, Any] | None:
+    refs = getattr(cell, "source_cell_refs", None)
+    if not isinstance(refs, (list, tuple)) or len(refs) != 1 or not isinstance(refs[0], dict):
+        return None
+    ref = refs[0]
+    try:
+        ref_page = int(ref.get("page") or ref.get("source_page") or 0)
+        ref_row = int(ref.get("row"))
+        raw_row = int(ref.get("raw_row"))
+        ref_column = int(ref.get("col"))
+    except (TypeError, ValueError):
+        return None
+    ref_source = str(ref.get("source") or "").strip()
+    if (
+        ref_source not in {"", "canonical_physical_table"}
+        or ref_page != page_number
+        or str(ref.get("table_id") or "").strip() != table_id
+        or ref_row != source_row_index
+        or raw_row < 0
+        or ref_column != column
+    ):
+        return None
+    return deepcopy(ref)
+
+
+def _strict_source_date(value: Any) -> str | None:
+    raw_value = _nfkc(value)
+    if not _DATE_TOKEN_RE.fullmatch(raw_value):
+        return None
+    normalized = _normalize_date(raw_value)
+    try:
+        calendar_date.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return normalized
+
+
+def _strict_source_money(value: Any, *, nonnegative: bool) -> Decimal | None:
+    raw_value = _nfkc(value)
+    if not _MONEY_TOKEN_RE.fullmatch(raw_value):
+        return None
+    parsed = _as_decimal(raw_value)
+    if parsed is None or (nonnegative and parsed < 0):
+        return None
+    return parsed
+
+
+def _physical_brought_forward_facts(parse_result: Any) -> dict[int, list[_HeaderFact]]:
+    """Recover source-owned carry balances from strict physical ledger rows."""
+
+    carry_aliases = {_compact(alias) for alias in _FIELD_ALIASES["brought_forward_balance"]}
+    facts_by_page: dict[int, list[_HeaderFact]] = defaultdict(list)
+    for page in getattr(parse_result, "pages", None) or []:
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+        if page_number <= 0:
+            continue
+        page_candidates: list[_HeaderFact] = []
+        for table in getattr(page, "tables", None) or []:
+            table_id = str(getattr(table, "table_id", "") or "").strip()
+            metadata = getattr(table, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            if (
+                not table_id
+                or metadata.get("header_source") == "data_row"
+                or metadata.get("preserve_headers") is False
+            ):
+                continue
+            raw_headers = [str(header or "") for header in (getattr(table, "headers", None) or [])]
+            schema = _physical_split_ledger_schema(raw_headers)
+            if schema is None:
+                continue
+            date_columns = schema["date_columns"]
+            debit_column = schema["debit_column"]
+            credit_column = schema["credit_column"]
+            balance_column = schema["balance_column"]
+            transaction_facts: list[dict[str, Any]] = []
+            carry_candidates: list[tuple[int, int, _HeaderFact]] = []
+            for row in getattr(table, "rows", None) or []:
+                source_row_index = _source_owned_data_row_index(
+                    row,
+                    page_number=page_number,
+                    table_id=table_id,
+                )
+                if source_row_index is None:
+                    continue
+                cells = list(getattr(row, "cells", None) or [])
+                if len(cells) != len(raw_headers):
+                    continue
+                values = [str(getattr(cell, "text", "") or "").strip() for cell in cells]
+                balance_value = _strict_source_money(values[balance_column], nonnegative=False)
+                transaction_fact = _physical_split_transaction_fact(
+                    row,
+                    page_number=page_number,
+                    table_id=table_id,
+                    headers=raw_headers,
+                    schema=schema,
+                )
+                if transaction_fact is not None:
+                    transaction_facts.append(transaction_fact)
+                carry_columns = [
+                    index for index, value in enumerate(values) if _compact(value) in carry_aliases
+                ]
+                if len(carry_columns) != 1 or balance_value is None:
+                    continue
+                carry_column = carry_columns[0]
+                if carry_column in {*date_columns, debit_column, credit_column, balance_column} or any(
+                    value for index, value in enumerate(values) if index not in {carry_column, balance_column}
+                ):
+                    continue
+                supporting_cells = [cells[carry_column], cells[balance_column]]
+                supporting_boxes = [_strict_cell_bbox(cell) for cell in supporting_cells]
+                supporting_id_groups = [
+                    tuple(
+                        dict.fromkeys(
+                            str(evidence_id)
+                            for evidence_id in (getattr(cell, "evidence_ids", None) or [])
+                            if str(evidence_id or "").strip()
+                        )
+                    )
+                    for cell in supporting_cells
+                ]
+                supporting_refs = [
+                    _strict_source_cell_ref(
+                        cell,
+                        page_number=page_number,
+                        table_id=table_id,
+                        source_row_index=source_row_index,
+                        column=column,
+                    )
+                    for cell, column in zip(
+                        supporting_cells,
+                        (carry_column, balance_column),
+                        strict=True,
+                    )
+                ]
+                if (
+                    any(ref is None for ref in supporting_refs)
+                    or any(not evidence_ids for evidence_ids in supporting_id_groups)
+                    or any(box is None for box in supporting_boxes)
+                ):
+                    continue
+                raw_rows = {int(ref["raw_row"]) for ref in supporting_refs if ref is not None}
+                if len(raw_rows) != 1:
+                    continue
+                raw_row = next(iter(raw_rows))
+                valid_boxes = [box for box in supporting_boxes if box is not None]
+                bbox = (
+                    min(box[0] for box in valid_boxes),
+                    min(box[1] for box in valid_boxes),
+                    max(box[2] for box in valid_boxes),
+                    max(box[3] for box in valid_boxes),
+                )
+                raw_value = values[balance_column]
+                evidence_ids = tuple(
+                    dict.fromkeys(evidence_id for group in supporting_id_groups for evidence_id in group)
+                )
+                source_ref = {
+                    "source": "canonical_physical_table",
+                    "source_page": page_number,
+                    "page_range": [page_number, page_number],
+                    "table_id": table_id,
+                    "source_row_index": source_row_index,
+                    "raw_row": raw_row,
+                    "bbox": list(bbox),
+                    "evidence_ids": list(evidence_ids),
+                    "source_cell_refs": [ref for ref in supporting_refs if ref is not None],
+                }
+                carry_candidates.append(
+                    (
+                        source_row_index,
+                        raw_row,
+                        _HeaderFact(
+                            field_key="brought_forward_balance",
+                            raw_name=values[carry_column],
+                            raw_value=raw_value,
+                            normalized_value=_normalized_money(balance_value),
+                            page=page_number,
+                            page_id=f"page:{page_number:04d}",
+                            bbox=bbox,
+                            evidence_ids=evidence_ids,
+                            source_kind="canonical_physical_table",
+                            derivation="physical_brought_forward_row",
+                            source_detail={
+                                "page": page_number,
+                                "raw_name": values[carry_column],
+                                "raw_value": raw_value,
+                                "source": "canonical_physical_table",
+                                "source_ref": source_ref,
+                                "normalized_only": False,
+                            },
+                        ),
+                    )
+                )
+            if (
+                len(carry_candidates) != 1
+                or not transaction_facts
+                or not _physical_row_order_is_consistent(transaction_facts)
+            ):
+                continue
+            carry_row_index, carry_raw_row, carry_fact = carry_candidates[0]
+            first_transaction = min(transaction_facts, key=lambda fact: int(fact["source_row_index"]))
+            first_transaction_index = int(first_transaction["source_row_index"])
+            first_transaction_raw_row = int(first_transaction["raw_row"])
+            first_transaction_bbox = first_transaction["bbox"]
+            if (
+                carry_row_index >= first_transaction_index
+                or carry_raw_row >= first_transaction_raw_row
+                or carry_raw_row - carry_row_index != first_transaction_raw_row - first_transaction_index
+                or carry_fact.bbox is None
+                or carry_fact.bbox[3] > first_transaction_bbox[1]
+            ):
+                continue
+            page_candidates.append(carry_fact)
+        if len(page_candidates) == 1:
+            facts_by_page[page_number].append(page_candidates[0])
+    return dict(facts_by_page)
+
+
 def _page_header_facts(parse_result: Any) -> tuple[dict[int, list[_HeaderFact]], dict[int, list[str]]]:
     facts_by_page: dict[int, list[_HeaderFact]] = {}
     lines_by_page: dict[int, list[str]] = {}
+    physical_carry_facts = _physical_brought_forward_facts(parse_result)
     for page, atoms in sorted(_group_atoms(parse_result).items()):
         rows = _header_rows(atoms)
         lines = [" ".join(_nfkc(atom.get("text")) for atom in row if _nfkc(atom.get("text"))) for row in rows]
         lines_by_page[page] = [line for line in lines if line]
-        facts = [fact for row in rows for fact in _facts_from_row(row, page)]
+        facts = [
+            *physical_carry_facts.get(page, []),
+            *(fact for row in rows for fact in _facts_from_row(row, page)),
+        ]
         header_bottom = max(
             (float(atom["bbox"][3]) for row in rows for atom in row),
             default=float("-inf"),
@@ -1481,11 +2452,15 @@ def _page_header_facts(parse_result: Any) -> tuple[dict[int, list[_HeaderFact]],
             for fact in _facts_from_row(row, page)
             if fact.field_key in _POSITIONED_FOOTER_FIELDS
         )
+        if seal_code := _seal_code_fact(atoms, page):
+            facts.append(seal_code)
         title = _title_fact(rows, page)
         if title:
             facts.append(title)
             if bank_name := _bank_name_from_title_fact(title):
                 facts.append(bank_name)
+        if disclaimer := _statement_disclaimer_fact(rows, page):
+            facts.append(disclaimer)
         if logo_bank := _bank_name_from_header_logo_fact(rows, title, page):
             facts.append(logo_bank)
         if bank_mark := _bank_name_from_mark_fact(atoms, page):
@@ -1614,6 +2589,12 @@ def _identity_facts(identity_fields: dict[str, dict[str, Any]], page: int = 1) -
         if field_key not in _FIELD_ALIASES and field_key not in {"statement_title", "document_date"}:
             continue
         mapping = detail if isinstance(detail, dict) else {"normalized_value": detail}
+        if field_key == "query_period" and mapping.get("derivation") == "source_period_envelope":
+            facts.extend(_source_period_envelope_facts(mapping, page))
+            continue
+        if field_key == "query_period" and mapping.get("derivation") == "source_year_month_period":
+            facts.extend(_source_year_month_period_facts(mapping, page))
+            continue
         raw_value = next(
             (
                 mapping.get(candidate)
@@ -1652,6 +2633,240 @@ def _identity_facts(identity_fields: dict[str, dict[str, Any]], page: int = 1) -
     return facts
 
 
+def _source_period_envelope_facts(mapping: dict[str, Any], default_page: int) -> list[_HeaderFact]:
+    """Materialize exact source pairs that share one normalized min/max envelope."""
+    components = [item for item in (mapping.get("source_components") or []) if isinstance(item, dict)]
+    if not components or mapping.get("raw_value") not in (None, ""):
+        return []
+    normalized_components: list[tuple[str, str, int, dict[str, Any]]] = []
+    for component in components:
+        raw_start = str(component.get("raw_start") or "").strip()
+        raw_end = str(component.get("raw_end") or "").strip()
+        raw_start_name = str(component.get("raw_start_name") or "").strip()
+        raw_end_name = str(component.get("raw_end_name") or "").strip()
+        normalized_start = _valid_date_tokens(raw_start)
+        normalized_end = _valid_date_tokens(raw_end)
+        if len(normalized_start) != 1 or len(normalized_end) != 1 or normalized_start[0] > normalized_end[0]:
+            return []
+        component_mapping = {
+            "source": component.get("source") or mapping.get("source"),
+            "source_refs": component.get("source_refs") or mapping.get("source_refs") or [],
+            "evidence_ids": component.get("evidence_ids") or [],
+        }
+        if (
+            str(component_mapping["source"] or "").casefold() == "canonical_evidence_atoms"
+            and not component_mapping["evidence_ids"]
+        ):
+            return []
+        same_period_label = raw_start_name == raw_end_name and _identity_detail_is_source_bound(
+            "query_period",
+            raw_start_name,
+            f"{raw_start} {raw_end}",
+            component_mapping,
+        )
+        separate_bounds = (
+            _identity_detail_is_source_bound("period_start", raw_start_name, raw_start, component_mapping)
+            and _identity_detail_is_source_bound("period_end", raw_end_name, raw_end, component_mapping)
+        )
+        if not same_period_label and not separate_bounds:
+            return []
+        try:
+            source_page = int(
+                component.get("source_page")
+                or component.get("page")
+                or _page_number(component.get("page_id"))
+                or default_page
+            )
+        except (TypeError, ValueError):
+            return []
+        if source_page < 1:
+            return []
+        normalized_components.append((normalized_start[0], normalized_end[0], source_page, component))
+    for previous, current in zip(normalized_components, normalized_components[1:]):
+        previous_end = calendar_date.fromisoformat(previous[1])
+        current_start = calendar_date.fromisoformat(current[0])
+        if current[2] <= previous[2] or current_start.toordinal() != previous_end.toordinal() + 1:
+            return []
+    expected_envelope = (
+        f"{min(start for start, _end, _page, _component in normalized_components)} ~ "
+        f"{max(end for _start, end, _page, _component in normalized_components)}"
+    )
+    if _normalize_field_value("query_period", mapping.get("normalized_value")) != expected_envelope:
+        return []
+    facts: list[_HeaderFact] = []
+    for _start, _end, source_page, component in normalized_components:
+        raw_start = str(component["raw_start"]).strip()
+        raw_end = str(component["raw_end"]).strip()
+        source_detail = {
+            "page": source_page,
+            "page_id": str(component.get("page_id") or f"page:{source_page:04d}"),
+            "raw_name": str(component.get("raw_name") or "source period pair"),
+            "raw_start_name": str(component["raw_start_name"]),
+            "raw_start": raw_start,
+            "raw_end_name": str(component["raw_end_name"]),
+            "raw_end": raw_end,
+            "evidence_ids": list(dict.fromkeys(str(item) for item in component.get("evidence_ids") or [] if str(item))),
+            "source": str(component.get("source") or mapping.get("source") or "identity_fields"),
+        }
+        facts.append(
+            _HeaderFact(
+                field_key="query_period",
+                raw_name=source_detail["raw_name"],
+                raw_value=f"{raw_start} {raw_end}",
+                normalized_value=f"{_start} ~ {_end}",
+                page=source_page,
+                page_id=source_detail["page_id"],
+                bbox=None,
+                evidence_ids=tuple(source_detail["evidence_ids"]),
+                source_kind=source_detail["source"],
+                derivation="source_period_envelope",
+                source_detail=source_detail,
+            )
+        )
+    return facts
+
+
+def _source_period_mapping_for_pages(
+    mapping: dict[str, Any],
+    pages: Sequence[int],
+) -> dict[str, Any] | None:
+    """Restrict a normalized-only period envelope to one resolved statement scope."""
+    page_set = {int(page) for page in pages if int(page) > 0}
+    components = []
+    normalized_bounds: list[tuple[str, str]] = []
+    for component in mapping.get("source_components") or []:
+        if not isinstance(component, dict):
+            continue
+        try:
+            source_page = int(
+                component.get("source_page")
+                or component.get("page")
+                or _page_number(component.get("page_id"))
+            )
+        except (TypeError, ValueError):
+            continue
+        if source_page not in page_set:
+            continue
+        components.append(deepcopy(component))
+        starts = _valid_date_tokens(component.get("raw_start"))
+        ends = _valid_date_tokens(component.get("raw_end"))
+        if len(starts) == 1 and len(ends) == 1:
+            normalized_bounds.append((starts[0], ends[0]))
+    if not components:
+        return None
+    scoped = deepcopy(mapping)
+    scoped["source_components"] = components
+    if len(normalized_bounds) == len(components):
+        scoped["normalized_value"] = (
+            f"{min(start for start, _end in normalized_bounds)} ~ "
+            f"{max(end for _start, end in normalized_bounds)}"
+        )
+    refs: list[dict[str, Any]] = []
+    for ref in mapping.get("source_refs") or []:
+        if not isinstance(ref, dict):
+            continue
+        try:
+            ref_page = int(
+                ref.get("source_page") or ref.get("page") or _page_number(ref.get("page_id")) or 0
+            )
+        except (TypeError, ValueError):
+            continue
+        if ref_page in page_set:
+            refs.append(deepcopy(ref))
+    if mapping.get("source_refs") is not None:
+        scoped["source_refs"] = refs
+    return scoped
+
+
+def _source_year_month_period_facts(mapping: dict[str, Any], default_page: int) -> list[_HeaderFact]:
+    """Retain exact year/month KVs that support a normalized calendar period."""
+    components = [item for item in (mapping.get("source_components") or []) if isinstance(item, dict)]
+    if not components or mapping.get("raw_value") not in (None, ""):
+        return []
+    resolved: list[tuple[int, int, dict[str, Any], dict[str, Any]]] = []
+    for component in components:
+        raw_year_name = str(component.get("raw_year_name") or "").strip()
+        raw_year = str(component.get("raw_year") or "").strip()
+        raw_month_name = str(component.get("raw_month_name") or "").strip()
+        raw_month = str(component.get("raw_month") or "").strip()
+        component_mapping = {
+            "source": component.get("source") or mapping.get("source"),
+            "source_refs": component.get("source_refs") or mapping.get("source_refs") or [],
+            "evidence_ids": component.get("evidence_ids") or [],
+        }
+        if (
+            str(component_mapping["source"] or "").casefold() == "canonical_evidence_atoms"
+            and not component_mapping["evidence_ids"]
+        ):
+            return []
+        if not _identity_detail_is_source_bound(
+            "statement_year", raw_year_name, raw_year, component_mapping
+        ) or not _identity_detail_is_source_bound(
+            "statement_month_number", raw_month_name, raw_month, component_mapping
+        ):
+            return []
+        if not re.fullmatch(r"20\d{2}", raw_year) or not re.fullmatch(r"\d{1,2}", raw_month):
+            return []
+        year = int(raw_year)
+        month = int(raw_month)
+        if not 1 <= month <= 12:
+            return []
+        resolved.append((year, month, component, component_mapping))
+    starts = [f"{year:04d}-{month:02d}-01" for year, month, _component, _mapping in resolved]
+    ends = [
+        f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"
+        for year, month, _component, _mapping in resolved
+    ]
+    expected_envelope = f"{min(starts)} ~ {max(ends)}"
+    if _normalize_field_value("query_period", mapping.get("normalized_value")) != expected_envelope:
+        return []
+    facts: list[_HeaderFact] = []
+    for year, month, component, component_mapping in resolved:
+        source_page = int(
+            component.get("source_page")
+            or component.get("page")
+            or _page_number(component.get("page_id"))
+            or default_page
+        )
+        page_id = str(component.get("page_id") or f"page:{source_page:04d}")
+        evidence_ids = tuple(
+            dict.fromkeys(str(item) for item in component.get("evidence_ids") or [] if str(item))
+        )
+        source_kind = str(component_mapping.get("source") or "identity_fields")
+        for field_key, raw_name, raw_value, normalized_value in (
+            ("statement_year", str(component["raw_year_name"]), str(component["raw_year"]), year),
+            (
+                "statement_month_number",
+                str(component["raw_month_name"]),
+                str(component["raw_month"]),
+                month,
+            ),
+        ):
+            facts.append(
+                _HeaderFact(
+                    field_key=field_key,
+                    raw_name=raw_name,
+                    raw_value=raw_value,
+                    normalized_value=normalized_value,
+                    page=source_page,
+                    page_id=page_id,
+                    bbox=None,
+                    evidence_ids=evidence_ids,
+                    source_kind=source_kind,
+                    derivation="source_year_month_period",
+                    source_detail={
+                        "page": source_page,
+                        "page_id": page_id,
+                        "raw_name": raw_name,
+                        "raw_value": raw_value,
+                        "evidence_ids": list(evidence_ids),
+                        "source": source_kind,
+                    },
+                )
+            )
+    return facts
+
+
 def _identity_detail_is_source_bound(
     field_key: str,
     raw_name: str,
@@ -1677,9 +2892,15 @@ def _identity_detail_is_source_bound(
     direct_source = source in direct_sources or source.startswith("statement_header") or direct_ref
     if not direct_source or _compact(raw_name) == _compact(field_key):
         return False
-    if _field_for_label(raw_name) != field_key:
+    resolved_field = _field_for_label(raw_name)
+    range_reclassified = (
+        field_key == "query_period"
+        and _compact(raw_name) == _compact("交易时间")
+        and _period_dates_are_valid(raw_value, minimum=2)
+    )
+    if resolved_field != field_key and not range_reclassified:
         return False
-    return _fact_value_is_plausible(field_key, raw_value)
+    return _labelled_fact_value_is_plausible(field_key, raw_name, raw_value)
 
 
 def _field_source(facts: Sequence[_HeaderFact]) -> dict[str, Any]:
@@ -1687,45 +2908,234 @@ def _field_source(facts: Sequence[_HeaderFact]) -> dict[str, Any]:
     evidence_ids: list[str] = []
     for fact in facts:
         ref: dict[str, Any] = {"source": fact.source_kind, "source_page": fact.page}
+        explicit_ref = (fact.source_detail or {}).get("source_ref")
+        if isinstance(explicit_ref, dict):
+            ref.update(deepcopy(explicit_ref))
+            ref["source"] = fact.source_kind
+            ref["source_page"] = fact.page
         if fact.bbox:
             ref["bbox"] = list(fact.bbox)
         refs.append(ref)
         evidence_ids.extend(fact.evidence_ids)
     first = facts[0]
-    return {
+    detail = {
         "raw_name": first.raw_name,
         "source": first.source_kind,
         "source_refs": list({repr(ref): ref for ref in refs}.values()),
         "evidence_ids": list(dict.fromkeys(evidence_ids)),
     }
+    derivations = list(dict.fromkeys(fact.derivation for fact in facts if fact.derivation))
+    if derivations:
+        detail["derivation"] = derivations[0] if len(derivations) == 1 else derivations
+        detail["normalized_only"] = all(
+            bool((fact.source_detail or {}).get("normalized_only", True))
+            for fact in facts
+            if fact.derivation
+        )
+        detail["components"] = [dict(fact.source_detail) for fact in facts if fact.source_detail]
+        detail["component_count"] = len(detail["components"])
+    return detail
 
 
 def _raw_header_map(facts: Sequence[_HeaderFact]) -> dict[str, Any]:
-    grouped: dict[str, list[_HeaderFact]] = defaultdict(list)
+    grouped: dict[str, list[tuple[int, str, bool]]] = defaultdict(list)
     for fact in facts:
-        grouped[fact.raw_name].append(fact)
+        if fact.derivation == "source_period_envelope" and fact.source_detail:
+            for name_key, value_key in (
+                ("raw_start_name", "raw_start"),
+                ("raw_end_name", "raw_end"),
+            ):
+                raw_name = _nfkc(fact.source_detail.get(name_key))
+                raw_value = _nfkc(fact.source_detail.get(value_key))
+                if raw_name and raw_value:
+                    grouped[raw_name].append((fact.page, raw_value, True))
+            continue
+        raw_value = str(fact.raw_value).strip() if fact.field_key == "source_header_page_label" else _nfkc(fact.raw_value)
+        grouped[fact.raw_name].append((fact.page, raw_value, False))
     out: dict[str, Any] = {}
-    for raw_name, raw_facts in grouped.items():
-        values = list(dict.fromkeys(_nfkc(fact.raw_value) for fact in raw_facts if _nfkc(fact.raw_value)))
-        if len(values) == 1:
+    for raw_name, raw_entries in grouped.items():
+        entries = list(dict.fromkeys(entry for entry in raw_entries if entry[1]))
+        values = list(dict.fromkeys(value for _page, value, _force_array in entries))
+        preserve_page_array = len(entries) > 1 and (
+            any(force_array for _page, _value, force_array in entries)
+            or any(_compact(raw_name) in aliases for aliases in _PAGE_LOCAL_DIRECTION_LABELS.values())
+        )
+        if preserve_page_array:
+            out[raw_name] = [{"page": page, "value": value} for page, value, _force_array in entries]
+        elif len(values) == 1:
             out[raw_name] = values[0]
         elif values:
-            out[raw_name] = [{"page": fact.page, "value": _nfkc(fact.raw_value)} for fact in raw_facts]
+            out[raw_name] = [{"page": page, "value": value} for page, value, _force_array in entries]
     return out
 
 
-def _record_from_facts(facts: Sequence[_HeaderFact], pages: Sequence[int], index: int) -> dict[str, Any]:
+def _explicit_page_direction_aggregates(
+    facts: Sequence[_HeaderFact],
+    pages: Sequence[int],
+) -> dict[str, tuple[Any, list[_HeaderFact]]]:
+    """Sum a complete source-explicit totals pair or quartet from every scope page."""
+
+    scope_pages = sorted({int(page) for page in pages if int(page) > 0})
+    if not scope_pages or scope_pages != list(range(scope_pages[0], scope_pages[-1] + 1)):
+        return {}
+    direction_fields = set(_PAGE_LOCAL_DIRECTION_LABELS)
+    direction_facts = [fact for fact in facts if fact.field_key in direction_fields]
+    if any(
+        _compact(fact.raw_name) not in _PAGE_LOCAL_DIRECTION_LABELS[fact.field_key]
+        or fact.page not in scope_pages
+        for fact in direction_facts
+    ):
+        return {}
+    by_field_page: dict[str, dict[int, list[_HeaderFact]]] = {
+        field_key: defaultdict(list) for field_key in direction_fields
+    }
+    for fact in direction_facts:
+        by_field_page[fact.field_key][fact.page].append(fact)
+    total_fields = ("debit_total", "credit_total")
+    count_fields = ("debit_count", "credit_count")
+    if any(
+        len(by_field_page[field_key].get(page, [])) != 1
+        for field_key in total_fields
+        for page in scope_pages
+    ):
+        return {}
+    count_fact_count = sum(
+        len(by_field_page[field_key].get(page, []))
+        for field_key in count_fields
+        for page in scope_pages
+    )
+    include_counts = count_fact_count > 0
+    if include_counts and any(
+        len(by_field_page[field_key].get(page, [])) != 1
+        for field_key in count_fields
+        for page in scope_pages
+    ):
+        return {}
+    aggregate_fields = (*count_fields, *total_fields) if include_counts else total_fields
+    components = {
+        field_key: [by_field_page[field_key][page][0] for page in scope_pages]
+        for field_key in aggregate_fields
+    }
+    count_values: dict[str, list[int]] = {}
+    if include_counts:
+        for field_key in count_fields:
+            parsed = [_as_exact_int(fact.normalized_value) for fact in components[field_key]]
+            if any(value is None or value < 0 for value in parsed):
+                return {}
+            count_values[field_key] = [int(value) for value in parsed if value is not None]
+    money_values: dict[str, list[Decimal]] = {}
+    for field_key in total_fields:
+        parsed = [_as_decimal(fact.normalized_value) for fact in components[field_key]]
+        if any(value is None for value in parsed):
+            return {}
+        money_values[field_key] = [value for value in parsed if value is not None]
+    debit_values = money_values["debit_total"]
+    if any(value > 0 for value in debit_values) and any(value < 0 for value in debit_values):
+        return {}
+    if any(value < 0 for value in money_values["credit_total"]):
+        return {}
+    aggregates: dict[str, tuple[Any, list[_HeaderFact]]] = {}
+    if include_counts:
+        aggregates.update(
+            {
+                "debit_count": (sum(count_values["debit_count"]), components["debit_count"]),
+                "credit_count": (sum(count_values["credit_count"]), components["credit_count"]),
+            }
+        )
+    aggregates.update(
+        {
+            "debit_total": (
+                _normalized_money(abs(sum(debit_values, Decimal("0")))),
+                components["debit_total"],
+            ),
+            "credit_total": (
+                _normalized_money(sum(money_values["credit_total"], Decimal("0"))),
+                components["credit_total"],
+            ),
+        }
+    )
+    return aggregates
+
+
+def _explicit_page_aggregate_source(field_key: str, facts: Sequence[_HeaderFact]) -> dict[str, Any]:
+    source = _field_source(facts)
+    source.update(
+        {
+            "source": "derived_explicit_page_aggregate",
+            "derivation": "sum_explicit_page_totals",
+            "components": [
+                {
+                    "page": fact.page,
+                    "raw_name": fact.raw_name,
+                    "raw_value": fact.raw_value,
+                    "normalized_value": fact.normalized_value,
+                    "bbox": list(fact.bbox) if fact.bbox else None,
+                    "evidence_ids": list(fact.evidence_ids),
+                    "source": fact.source_kind,
+                }
+                for fact in facts
+            ],
+        }
+    )
+    if field_key == "debit_total":
+        debit_values = [_as_decimal(fact.normalized_value) for fact in facts]
+        source["sign_normalization"] = (
+            "magnitude_from_nonpositive_expense_page_totals"
+            if any(value is not None and value < 0 for value in debit_values)
+            else "magnitude_from_nonnegative_expense_page_totals"
+        )
+    return source
+
+
+def _record_from_facts(
+    facts: Sequence[_HeaderFact],
+    pages: Sequence[int],
+    index: int,
+    *,
+    allow_page_direction_aggregates: bool = False,
+) -> dict[str, Any]:
     grouped: dict[str, list[_HeaderFact]] = defaultdict(list)
     for fact in facts:
         grouped[fact.field_key].append(fact)
     normalized: dict[str, Any] = {}
     canonical_raw: dict[str, Any] = {}
     field_sources: dict[str, Any] = {}
+    page_direction_aggregates = (
+        _explicit_page_direction_aggregates(facts, pages) if allow_page_direction_aggregates else {}
+    )
+    has_page_local_direction_facts = any(
+        fact.field_key in _PAGE_LOCAL_DIRECTION_LABELS
+        and _compact(fact.raw_name) in _PAGE_LOCAL_DIRECTION_LABELS[fact.field_key]
+        for fact in facts
+    )
     for field_key, field_facts in grouped.items():
         if field_key.startswith("source_header_"):
             continue
+        if field_key in page_direction_aggregates:
+            aggregate, component_facts = page_direction_aggregates[field_key]
+            normalized[field_key] = aggregate
+            field_sources[field_key] = _explicit_page_aggregate_source(field_key, component_facts)
+            continue
+        if has_page_local_direction_facts and field_key in _PAGE_LOCAL_DIRECTION_LABELS:
+            continue
+        if field_key == "query_period" and field_facts and all(
+            fact.derivation == "source_period_envelope" for fact in field_facts
+        ):
+            component_starts = [
+                _valid_date_tokens((fact.source_detail or {}).get("raw_start")) for fact in field_facts
+            ]
+            component_ends = [
+                _valid_date_tokens((fact.source_detail or {}).get("raw_end")) for fact in field_facts
+            ]
+            if all(len(values) == 1 for values in (*component_starts, *component_ends)):
+                normalized[field_key] = (
+                    f"{min(values[0] for values in component_starts)} ~ "
+                    f"{max(values[0] for values in component_ends)}"
+                )
+                field_sources[field_key] = _field_source(field_facts)
+            continue
         selected_facts = list(field_facts)
-        if field_key == "brought_forward_balance":
+        if field_key in {"brought_forward_balance", "statement_title"}:
             first_page = min(fact.page for fact in field_facts)
             selected_facts = [fact for fact in field_facts if fact.page == first_page]
         elif field_key == "statement_cutoff_date":
@@ -1747,7 +3157,8 @@ def _record_from_facts(facts: Sequence[_HeaderFact], pages: Sequence[int], index
         if len(normalized_values) != 1 or not raw_values:
             continue
         normalized[field_key] = normalized_values[0]
-        canonical_raw[field_key] = raw_values[0] if len(raw_values) == 1 else raw_values
+        if not all(fact.derivation == "source_period_envelope" for fact in selected_facts):
+            canonical_raw[field_key] = raw_values[0] if len(raw_values) == 1 else raw_values
         field_sources[field_key] = _field_source(selected_facts)
     if (
         "statement_month" not in normalized
@@ -1761,12 +3172,35 @@ def _record_from_facts(facts: Sequence[_HeaderFact], pages: Sequence[int], index
         month = int(normalized["statement_month_number"])
         if 1 <= month <= 12:
             normalized["statement_month"] = f"{year:04d}-{month:02d}"
-            canonical_raw["statement_month"] = (
-                f"{canonical_raw['statement_year']} {canonical_raw['statement_month_number']}"
-            )
             supporting = [fact for key in ("statement_year", "statement_month_number") for fact in grouped.get(key, [])]
             if supporting:
-                field_sources["statement_month"] = _field_source(supporting)
+                month_source = _field_source(supporting)
+                month_source.update(
+                    {
+                        "derivation": "year_month_calendar",
+                        "normalized_only": True,
+                    }
+                )
+                field_sources["statement_month"] = month_source
+            if not any(
+                len(_DATE_TOKEN_RE.findall(str(normalized.get(key) or ""))) >= 2
+                for key in ("query_period", "statement_period", "query_date")
+            ) and not ({"period_start", "period_end"} & normalized.keys()):
+                period_start = f"{year:04d}-{month:02d}-01"
+                period_end = f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"
+                normalized["period_start"] = period_start
+                normalized["period_end"] = period_end
+                normalized["query_period"] = f"{period_start} ~ {period_end}"
+                if supporting:
+                    period_source = _field_source(supporting)
+                    period_source.update(
+                        {
+                            "derivation": "year_month_calendar",
+                            "normalized_only": True,
+                        }
+                    )
+                    for field_key in ("period_start", "period_end", "query_period"):
+                        field_sources[field_key] = dict(period_source)
     period_source_key = next(
         (
             key
@@ -1778,12 +3212,33 @@ def _record_from_facts(facts: Sequence[_HeaderFact], pages: Sequence[int], index
     if period_source_key:
         dates = [_normalize_date(value) for value in _DATE_TOKEN_RE.findall(str(normalized[period_source_key]))]
         raw_period_dates = _DATE_TOKEN_RE.findall(str(canonical_raw.get(period_source_key) or ""))
+        if not raw_period_dates:
+            raw_period_dates = [
+                raw_date
+                for fact in grouped.get(period_source_key, [])
+                for raw_date in _DATE_TOKEN_RE.findall(fact.raw_value)
+            ]
         if len(dates) >= 2:
-            for position, (key, value) in enumerate((("period_start", dates[0]), ("period_end", dates[1]))):
+            for key, value in (("period_start", dates[0]), ("period_end", dates[1])):
                 normalized.setdefault(key, value)
-                if position < len(raw_period_dates):
-                    canonical_raw.setdefault(key, raw_period_dates[position])
-                field_sources.setdefault(key, dict(field_sources.get(period_source_key) or {}))
+                matching_raw = next(
+                    (raw_date for raw_date in raw_period_dates if _normalize_date(raw_date) == value),
+                    "",
+                )
+                if matching_raw:
+                    canonical_raw.setdefault(key, matching_raw)
+                matching_fact = next(
+                    (
+                        fact
+                        for fact in grouped.get(period_source_key, [])
+                        if any(_normalize_date(raw_date) == value for raw_date in _DATE_TOKEN_RE.findall(fact.raw_value))
+                    ),
+                    None,
+                )
+                if matching_fact is not None:
+                    field_sources.setdefault(key, _field_source([matching_fact]))
+                else:
+                    field_sources.setdefault(key, dict(field_sources.get(period_source_key) or {}))
     if "period_start" in normalized and "period_end" in normalized:
         normalized.setdefault("query_period", f"{normalized['period_start']} ~ {normalized['period_end']}")
     record_id = f"statement_header:r{index:06d}"
@@ -1800,8 +3255,49 @@ def _record_from_facts(facts: Sequence[_HeaderFact], pages: Sequence[int], index
             "source_refs": refs,
             "field_sources": field_sources,
         },
-        "confidence": 1.0 if any(fact.source_kind == "canonical_evidence_atoms" for fact in facts) else 0.85,
+        "confidence": (
+            1.0
+            if any(
+                fact.source_kind == "canonical_evidence_atoms" and (fact.evidence_ids or fact.bbox)
+                for fact in facts
+            )
+            else 0.85
+        ),
     }
+
+
+def _has_complete_source_page_selection(parse_result: Any) -> bool:
+    parser_info = getattr(parse_result, "parser_info", None)
+    options = getattr(parser_info, "options", None)
+    options = options if isinstance(options, dict) else {}
+    try:
+        source_page_count = int(options.get("source_page_count") or 0)
+    except (TypeError, ValueError):
+        source_page_count = 0
+    selected_pages = sorted(
+        {
+            int(page)
+            for page in (options.get("selected_source_pages") or [])
+            if str(page).isdigit() and int(page) > 0
+        }
+    )
+    parsed_pages = sorted(
+        {
+            int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+            for page in (getattr(parse_result, "pages", None) or [])
+            if int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0) > 0
+        }
+    )
+    if source_page_count > 0:
+        expected = list(range(1, source_page_count + 1))
+        return parsed_pages == expected and (not selected_pages or selected_pages == expected)
+    if selected_pages:
+        return False
+    try:
+        parser_page_count = int(getattr(parser_info, "page_count", 0) or 0)
+    except (TypeError, ValueError):
+        parser_page_count = 0
+    return parser_page_count > 0 and parsed_pages == list(range(1, parser_page_count + 1))
 
 
 def build_statement_header_records(
@@ -1811,25 +3307,49 @@ def build_statement_header_records(
     """Return one source-preserving header row per resolved statement scope."""
     facts_by_page, _lines = _page_header_facts(parse_result)
     groups = _context_page_groups(parse_result, facts_by_page)
-    global_identity = _identity_facts(dict(identity_fields or {}))
+    identity_mapping = dict(identity_fields or {})
+    global_identity = _identity_facts(identity_mapping)
+    source_period_mapping = identity_mapping.get("query_period")
+    has_source_period_envelope = bool(
+        isinstance(source_period_mapping, dict)
+        and source_period_mapping.get("derivation") == "source_period_envelope"
+    )
     stable_cross_scope = _stable_cross_scope_facts(facts_by_page, groups)
+    allow_page_direction_aggregates = _has_complete_source_page_selection(parse_result)
     records: list[dict[str, Any]] = []
     for index, pages in enumerate(groups, start=1):
         facts = [fact for page in pages for fact in facts_by_page.get(page, [])]
+        scoped_identity = global_identity
+        if has_source_period_envelope:
+            scoped_identity = [fact for fact in global_identity if fact.field_key != "query_period"]
+            scoped_mapping = _source_period_mapping_for_pages(source_period_mapping, pages)
+            if scoped_mapping is not None:
+                scoped_identity.extend(_source_period_envelope_facts(scoped_mapping, pages[0]))
         # Stable identity fields apply to every statement scope.  Period and
         # declared-count fields are document-global only when there is exactly
         # one scope; otherwise a segment must carry its own source fact.
-        for fact in global_identity:
+        for fact in scoped_identity:
             if len(groups) > 1 and fact.page not in pages:
                 continue
-            if not _fact_values(facts, fact.field_key):
+            existing_field_facts = [item for item in facts if item.field_key == fact.field_key]
+            if not existing_field_facts or (
+                fact.derivation == "source_period_envelope"
+                and all(item.derivation == "source_period_envelope" for item in existing_field_facts)
+            ):
                 facts.append(fact)
         for field_key, stable_facts in stable_cross_scope.items():
             if not _fact_values(facts, field_key):
                 facts.extend(stable_facts)
         if not facts:
             continue
-        records.append(_record_from_facts(facts, pages, index))
+        records.append(
+            _record_from_facts(
+                facts,
+                pages,
+                index,
+                allow_page_direction_aggregates=allow_page_direction_aggregates,
+            )
+        )
     if not records and global_identity:
         page_count = max(1, len(getattr(parse_result, "pages", None) or []))
         records.append(_record_from_facts(global_identity, list(range(1, page_count + 1)), 1))
@@ -1970,6 +3490,441 @@ def _cached_independent_row_anchor_evidence(
     }
 
 
+def _canonical_physical_lineage_key(
+    source: dict[str, Any],
+    *,
+    required_columns: set[int] | None = None,
+    required_raw_row: int | None = None,
+) -> tuple[int, str, int] | None:
+    """Return one exact physical-row key only when its source lineage is complete."""
+
+    if str(source.get("source") or "") != "canonical_physical_table":
+        return None
+    try:
+        page = int(source.get("source_page") or 0)
+        row_index = int(source.get("source_row_index"))
+    except (TypeError, ValueError):
+        return None
+    table_id = str(source.get("table_id") or "").strip()
+    page_range = source.get("page_range")
+    bbox = source.get("bbox")
+    evidence_ids = source.get("evidence_ids")
+    refs = source.get("source_cell_refs")
+    if (
+        page <= 0
+        or row_index < 0
+        or not table_id
+        or list(page_range or []) != [page, page]
+        or not isinstance(bbox, (list, tuple))
+        or len(bbox) != 4
+        or not isinstance(evidence_ids, (list, tuple))
+        or not evidence_ids
+        or not all(str(item or "").strip() for item in (evidence_ids or []))
+        or not isinstance(refs, list)
+        or not refs
+    ):
+        return None
+    try:
+        numeric_bbox = [float(value) for value in bbox]
+        if (
+            not all(math.isfinite(value) for value in numeric_bbox)
+            or numeric_bbox[2] < numeric_bbox[0]
+            or numeric_bbox[3] < numeric_bbox[1]
+        ):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    columns: set[int] = set()
+    raw_rows: set[int] = set()
+    for ref in refs:
+        if not isinstance(ref, dict):
+            return None
+        try:
+            ref_page = int(ref.get("page") or ref.get("source_page") or 0)
+            ref_row = int(ref.get("row"))
+            raw_row = int(ref.get("raw_row"))
+            column = int(ref.get("col"))
+        except (TypeError, ValueError):
+            return None
+        ref_source = str(ref.get("source") or "").strip()
+        if (
+            ref_source not in {"", "canonical_physical_table"}
+            or ref_page != page
+            or str(ref.get("table_id") or "").strip() != table_id
+            or ref_row != row_index
+            or raw_row < 0
+            or column < 0
+        ):
+            return None
+        raw_rows.add(raw_row)
+        columns.add(column)
+    if (
+        len(raw_rows) != 1
+        or len(columns) != len(refs)
+        or len(columns) < 3
+        or (required_columns and not required_columns <= columns)
+        or (required_raw_row is not None and raw_rows != {required_raw_row})
+    ):
+        return None
+    return page, table_id, row_index
+
+
+def _physical_split_transaction_fact(
+    row: Any,
+    *,
+    page_number: int,
+    table_id: str,
+    headers: Sequence[str],
+    schema: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return exact source semantics for one ordinary physical split-ledger row."""
+
+    source_row_index = _source_owned_data_row_index(
+        row,
+        page_number=page_number,
+        table_id=table_id,
+    )
+    cells = list(getattr(row, "cells", None) or [])
+    if source_row_index is None or len(cells) != len(headers):
+        return None
+    values = [str(getattr(cell, "text", "") or "").strip() for cell in cells]
+    populated_dates: list[tuple[int, str | None]] = [
+        (column, _strict_source_date(values[column]))
+        for column in schema["date_columns"]
+        if values[column]
+    ]
+    if not populated_dates or any(value is None for _column, value in populated_dates):
+        return None
+    date_column, source_date = populated_dates[0]
+    if source_date is None:
+        return None
+    debit_column = int(schema["debit_column"])
+    credit_column = int(schema["credit_column"])
+    debit_raw, credit_raw = values[debit_column], values[credit_column]
+    if bool(debit_raw) == bool(credit_raw):
+        return None
+    active_column = debit_column if debit_raw else credit_column
+    amount = _strict_source_money(values[active_column], nonnegative=True)
+    balance_column = int(schema["balance_column"])
+    balance = _strict_source_money(values[balance_column], nonnegative=False)
+    if amount is None or balance is None:
+        return None
+    required_columns = {date_column, active_column, balance_column}
+    required_refs: list[dict[str, Any]] = []
+    required_evidence_ids: list[str] = []
+    for column in sorted(required_columns):
+        cell = cells[column]
+        ref = _strict_source_cell_ref(
+            cell,
+            page_number=page_number,
+            table_id=table_id,
+            source_row_index=source_row_index,
+            column=column,
+        )
+        evidence_ids = tuple(
+            dict.fromkeys(
+                str(evidence_id)
+                for evidence_id in (getattr(cell, "evidence_ids", None) or [])
+                if str(evidence_id or "").strip()
+            )
+        )
+        if ref is None or not evidence_ids or _strict_cell_bbox(cell) is None:
+            return None
+        required_refs.append(ref)
+        required_evidence_ids.extend(evidence_ids)
+    raw_rows = {int(ref["raw_row"]) for ref in required_refs}
+    row_bbox = _strict_physical_row_bbox(cells)
+    if len(raw_rows) != 1 or row_bbox is None:
+        return None
+    raw_row = next(iter(raw_rows))
+    balance_ref = next(ref for ref in required_refs if int(ref["col"]) == balance_column)
+    direction = "expense" if debit_raw else "income"
+    header_roles = {
+        "date": {"column": date_column, "header": str(headers[date_column])},
+        "debit_amount": {"column": debit_column, "header": str(headers[debit_column])},
+        "credit_amount": {"column": credit_column, "header": str(headers[credit_column])},
+        "balance": {"column": balance_column, "header": str(headers[balance_column])},
+    }
+    source_roles = {
+        "date": deepcopy(header_roles["date"]),
+        "amount": {
+            "column": active_column,
+            "header": str(headers[active_column]),
+            "direction": direction,
+        },
+        "balance": deepcopy(header_roles["balance"]),
+    }
+    return {
+        "key": (page_number, table_id, source_row_index),
+        "source_page": page_number,
+        "table_id": table_id,
+        "source_row_index": source_row_index,
+        "raw_row": raw_row,
+        "date": source_date,
+        "direction": direction,
+        "amount": amount,
+        "balance": balance,
+        "active_column": active_column,
+        "balance_column": balance_column,
+        "required_columns": sorted(required_columns),
+        "required_evidence_ids": list(dict.fromkeys(required_evidence_ids)),
+        "required_source_cell_refs": required_refs,
+        "balance_source_cell_ref": balance_ref,
+        "bbox": row_bbox,
+        "source_headers": [str(header) for header in headers],
+        "header_roles": header_roles,
+        "source_roles": source_roles,
+        "active_amount_role": "debit_amount" if direction == "expense" else "credit_amount",
+    }
+
+
+def _physical_row_order_is_consistent(facts: Sequence[dict[str, Any]]) -> bool:
+    """Prove one physical table has a single row-index/raw-row/geometry order."""
+
+    if not facts:
+        return False
+    ordered: list[tuple[int, int, tuple[float, float, float, float]]] = []
+    table_keys: set[tuple[int, str]] = set()
+    try:
+        for fact in facts:
+            source_row_index = int(fact["source_row_index"])
+            raw_row = int(fact["raw_row"])
+            bbox = tuple(float(value) for value in fact["bbox"])
+            table_keys.add((int(fact["source_page"]), str(fact["table_id"])))
+            if (
+                source_row_index < 0
+                or raw_row < 0
+                or len(bbox) != 4
+                or not all(math.isfinite(value) for value in bbox)
+                or bbox[2] < bbox[0]
+                or bbox[3] < bbox[1]
+            ):
+                return False
+            ordered.append((source_row_index, raw_row, bbox))
+    except (KeyError, TypeError, ValueError):
+        return False
+    if (
+        len(table_keys) != 1
+        or len({item[0] for item in ordered}) != len(ordered)
+        or len({item[1] for item in ordered}) != len(ordered)
+        or len({item[1] - item[0] for item in ordered}) != 1
+    ):
+        return False
+    ordered.sort(key=lambda item: item[0])
+    return all(
+        previous[0] < current[0]
+        and previous[1] < current[1]
+        and previous[2][1] < current[2][1]
+        for previous, current in zip(ordered, ordered[1:])
+    )
+
+
+def _emitted_record_matches_physical_fact(record: dict[str, Any], fact: dict[str, Any]) -> bool:
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    required_columns = {int(column) for column in fact["required_columns"]}
+    if _canonical_physical_lineage_key(
+        source,
+        required_columns=required_columns,
+        required_raw_row=int(fact["raw_row"]),
+    ) != fact["key"]:
+        return False
+    try:
+        source_bbox = tuple(float(value) for value in source["bbox"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if any(abs(left - right) > 1e-6 for left, right in zip(source_bbox, fact["bbox"], strict=True)):
+        return False
+    emitted_evidence = {str(item) for item in source.get("evidence_ids") or [] if str(item)}
+    if not set(fact["required_evidence_ids"]) <= emitted_evidence:
+        return False
+    for layer_name in ("normalized", "canonical_raw"):
+        layer = record.get(layer_name) if isinstance(record.get(layer_name), dict) else {}
+        if (
+            _strict_source_date(layer.get("date")) != fact["date"]
+            or str(layer.get("direction") or "") != fact["direction"]
+            or _as_decimal(layer.get("amount")) != fact["amount"]
+            or _as_decimal(layer.get("balance")) != fact["balance"]
+        ):
+            return False
+    return True
+
+
+def _canonical_physical_row_census_evidence(
+    parse_result: Any,
+    records: Sequence[dict[str, Any]],
+    *,
+    source_route: str | None,
+    selected_source: str,
+) -> dict[str, Any]:
+    """Certify complete visible-row coverage from an exact physical-table census."""
+
+    if (
+        str(source_route or "") != "digital"
+        or str(selected_source or "") != "canonical_table"
+        or not records
+        or not _has_complete_source_page_selection(parse_result)
+    ):
+        return {}
+    parser_info = getattr(parse_result, "parser_info", None)
+    structure = getattr(parser_info, "structure", None)
+    structure = structure if isinstance(structure, dict) else {}
+    gate = structure.get("table_reconstruction_gate")
+    gate = gate if isinstance(gate, dict) else {}
+    try:
+        physical_count = int(structure.get("physical_table_count") or 0)
+        candidate_count = int(gate.get("candidate_count") or 0)
+        gate_physical_count = int(gate.get("physical_table_count") or 0)
+    except (TypeError, ValueError):
+        return {}
+    actual_table_count = sum(
+        len(getattr(page, "tables", None) or []) for page in (getattr(parse_result, "pages", None) or [])
+    )
+    if (
+        structure.get("table_extraction") != "full"
+        or gate.get("applicable") is not True
+        or gate.get("passed") is not True
+        or physical_count <= 0
+        or physical_count != candidate_count
+        or physical_count != gate_physical_count
+        or physical_count != actual_table_count
+    ):
+        return {}
+
+    table_keys: set[tuple[int, str]] = set()
+    physical_facts: dict[tuple[int, str, int], dict[str, Any]] = {}
+    transaction_tables: dict[int, set[str]] = defaultdict(set)
+    source_pages: set[int] = set()
+    table_pages: set[int] = set()
+    for page in getattr(parse_result, "pages", None) or []:
+        page_number = int(getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0)
+        if page_number <= 0 or page_number in source_pages:
+            return {}
+        source_pages.add(page_number)
+        for table in getattr(page, "tables", None) or []:
+            table_pages.add(page_number)
+            table_id = str(getattr(table, "table_id", "") or "").strip()
+            table_key = (page_number, table_id)
+            if not table_id or table_key in table_keys:
+                return {}
+            table_keys.add(table_key)
+            headers = [str(header or "") for header in (getattr(table, "headers", None) or [])]
+            schema = _physical_split_ledger_schema(headers)
+            metadata = getattr(table, "metadata", None)
+            metadata = metadata if isinstance(metadata, dict) else {}
+            promoted_table = metadata.get("header_source") == "data_row" or metadata.get("preserve_headers") is False
+            row_indices: set[int] = set()
+            table_facts: list[dict[str, Any]] = []
+            for row in getattr(table, "rows", None) or []:
+                source_row_index = _source_owned_data_row_index(
+                    row,
+                    page_number=page_number,
+                    table_id=table_id,
+                )
+                if source_row_index is None or source_row_index in row_indices:
+                    return {}
+                row_indices.add(source_row_index)
+                fact = (
+                    _physical_split_transaction_fact(
+                        row,
+                        page_number=page_number,
+                        table_id=table_id,
+                        headers=headers,
+                        schema=schema,
+                    )
+                    if schema is not None
+                    else None
+                )
+                if fact is None:
+                    continue
+                if promoted_table:
+                    return {}
+                table_facts.append(fact)
+            if table_facts:
+                if not _physical_row_order_is_consistent(table_facts):
+                    return {}
+                for fact in table_facts:
+                    if fact["key"] in physical_facts:
+                        return {}
+                    physical_facts[fact["key"]] = fact
+                transaction_tables[page_number].add(table_id)
+
+    if (
+        not source_pages
+        or not table_pages
+        or any(len(transaction_tables.get(page, set())) != 1 for page in table_pages)
+    ):
+        return {}
+
+    try:
+        from docmirror.plugins.bank_statement.canonical_quality import physical_transaction_row_estimate
+
+        physical_estimate = physical_transaction_row_estimate(parse_result)
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    census_keys = sorted(physical_facts)
+    emitted_by_key: dict[tuple[int, str, int], dict[str, Any]] = {}
+    for record in records:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        key = _canonical_physical_lineage_key(source)
+        if key is None or key in emitted_by_key or key not in physical_facts:
+            return {}
+        if not _emitted_record_matches_physical_fact(record, physical_facts[key]):
+            return {}
+        emitted_by_key[key] = record
+    if (
+        not census_keys
+        or int(physical_estimate or 0) != len(census_keys)
+        or set(census_keys) != set(emitted_by_key)
+    ):
+        return {}
+    page_counts = Counter(key[0] for key in census_keys)
+    row_sources = []
+    for key in census_keys:
+        fact = physical_facts[key]
+        row_sources.append(
+            {
+                "source_page": fact["source_page"],
+                "table_id": fact["table_id"],
+                "source_row_index": fact["source_row_index"],
+                "raw_row": fact["raw_row"],
+                "date": fact["date"],
+                "direction": fact["direction"],
+                "amount": _normalized_money(fact["amount"]),
+                "balance": _normalized_money(fact["balance"]),
+                "active_column": fact["active_column"],
+                "balance_column": fact["balance_column"],
+                "required_columns": list(fact["required_columns"]),
+                "required_evidence_ids": list(fact["required_evidence_ids"]),
+                "required_source_cell_refs": deepcopy(fact["required_source_cell_refs"]),
+                "source_cell_ref_owner": "canonical_physical_table",
+                "balance_source_cell_ref": deepcopy(fact["balance_source_cell_ref"]),
+                "bbox": list(fact["bbox"]),
+                "source_headers": list(fact["source_headers"]),
+                "header_roles": deepcopy(fact["header_roles"]),
+                "source_roles": deepcopy(fact["source_roles"]),
+                "active_amount_role": fact["active_amount_role"],
+            }
+        )
+    return {
+        "expected_rows": len(census_keys),
+        "source": "canonical_physical_table_row_census",
+        "confidence": 1.0,
+        "row_sources": row_sources,
+        "pages": [key[0] for key in census_keys],
+        "census": {
+            "exact_lineage_match": True,
+            "exact_semantic_match": True,
+            "consistent_physical_order": True,
+            "unique_transaction_table_per_page": True,
+            "physical_table_count": physical_count,
+            "transaction_row_count": len(census_keys),
+            "table_ids": sorted({key[1] for key in census_keys}),
+            "page_counts": {str(page): count for page, count in sorted(page_counts.items())},
+        },
+    }
+
+
 def _header_scope(header: dict[str, Any]) -> tuple[int, int] | None:
     source = header.get("source") if isinstance(header.get("source"), dict) else {}
     page_range = source.get("page_range")
@@ -2032,30 +3987,144 @@ def _carry_fact_value(facts: Sequence[_HeaderFact]) -> tuple[Decimal, list[_Head
     return value, [fact for fact in carry_facts if _as_decimal(fact.normalized_value) == value]
 
 
-def _previous_row_source(record: dict[str, Any], page: int) -> dict[str, Any]:
+def _source_lineage_triplet(source: dict[str, Any]) -> tuple[int, str, int] | None:
+    try:
+        page = int(source.get("source_page") or 0)
+        row_index = int(source.get("source_row_index"))
+    except (TypeError, ValueError):
+        return None
+    table_id = str(source.get("table_id") or source.get("source_table_id") or "").strip()
+    if page <= 0 or row_index < 0 or not table_id:
+        return None
+    return page, table_id, row_index
+
+
+def _terminal_visible_record(rows: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    lineaged: list[tuple[tuple[int, str, int], dict[str, Any]]] = []
+    for record in rows:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        key = _source_lineage_triplet(source)
+        if key is None:
+            lineaged = []
+            break
+        lineaged.append((key, record))
+    if lineaged:
+        if len({key for key, _record in lineaged}) != len(lineaged):
+            return None
+        table_keys = {(key[0], key[1]) for key, _record in lineaged}
+        if len(table_keys) != 1:
+            return None
+        if all(
+            str((record.get("source") or {}).get("source") or "") == "canonical_physical_table"
+            for _key, record in lineaged
+        ):
+            physical_order_facts = []
+            for key, record in lineaged:
+                source = record.get("source") if isinstance(record.get("source"), dict) else {}
+                if _canonical_physical_lineage_key(source) != key:
+                    return None
+                try:
+                    raw_rows = {int(ref["raw_row"]) for ref in source["source_cell_refs"]}
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if len(raw_rows) != 1:
+                    return None
+                physical_order_facts.append(
+                    {
+                        "source_page": key[0],
+                        "table_id": key[1],
+                        "source_row_index": key[2],
+                        "raw_row": next(iter(raw_rows)),
+                        "bbox": source.get("bbox"),
+                    }
+                )
+            if not _physical_row_order_is_consistent(physical_order_facts):
+                return None
+        return max(lineaged, key=lambda item: item[0][2])[1]
+
+    positioned: list[tuple[tuple[float, float], dict[str, Any]]] = []
+    for record in rows:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        bbox = source.get("bbox")
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return None
+        try:
+            numeric = tuple(float(value) for value in bbox)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not all(math.isfinite(value) for value in numeric)
+            or numeric[2] < numeric[0]
+            or numeric[3] < numeric[1]
+        ):
+            return None
+        positioned.append(((numeric[3], numeric[1]), record))
+    if not positioned:
+        return None
+    maximum = max(position for position, _record in positioned)
+    matches = [record for position, record in positioned if position == maximum]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _previous_row_source(
+    record: dict[str, Any],
+    page: int,
+    *,
+    anchor_row: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     source = record.get("source") if isinstance(record.get("source"), dict) else {}
     ref: dict[str, Any] = {
         "source": str(source.get("source") or "transaction_row"),
         "source_page": page,
     }
-    for key in ("bbox", "evidence_ids", "table_id", "source_table_id", "source_row_index"):
+    for key in (
+        "page_range",
+        "bbox",
+        "evidence_ids",
+        "table_id",
+        "source_table_id",
+        "source_row_index",
+        "source_cell_refs",
+    ):
         if source.get(key) not in (None, "", [], {}):
             ref[key] = deepcopy(source[key])
+    if anchor_row is not None:
+        balance_ref = anchor_row.get("balance_source_cell_ref")
+        if not isinstance(balance_ref, dict):
+            return None
+        source_refs = source.get("source_cell_refs")
+        if not isinstance(source_refs, list) or balance_ref not in source_refs:
+            return None
+        ref["source_cell_refs"] = [deepcopy(balance_ref)]
+        ref["balance_source_cell_ref"] = deepcopy(balance_ref)
     return ref
 
 
 def _carry_boundaries(
     facts_by_page: dict[int, list[_HeaderFact]],
     rows_by_page: dict[int, list[dict[str, Any]]],
+    *,
+    anchor_evidence: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     pages = sorted(rows_by_page)
     if len(pages) < 2:
         return None
+    exact_anchor_rows: dict[tuple[int, str, int], dict[str, Any]] = {}
+    if (anchor_evidence or {}).get("source") == "canonical_physical_table_row_census":
+        for item in (anchor_evidence or {}).get("row_sources") or []:
+            if not isinstance(item, dict):
+                return None
+            key = _source_lineage_triplet(item)
+            if key is None or key in exact_anchor_rows:
+                return None
+            exact_anchor_rows[key] = item
     boundaries: list[dict[str, Any]] = []
     for previous_page, next_page in zip(pages, pages[1:]):
         if next_page != previous_page + 1:
             return None
-        previous_record = rows_by_page[previous_page][-1]
+        previous_record = _terminal_visible_record(rows_by_page[previous_page])
+        if previous_record is None:
+            return None
         previous_normalized = (
             previous_record.get("normalized") if isinstance(previous_record.get("normalized"), dict) else {}
         )
@@ -2069,6 +4138,20 @@ def _carry_boundaries(
             continue
         direction = "income" if signed_gap > 0 else "expense"
         amount = abs(signed_gap)
+        previous_source = (
+            previous_record.get("source") if isinstance(previous_record.get("source"), dict) else {}
+        )
+        previous_key = _source_lineage_triplet(previous_source)
+        anchor_row = exact_anchor_rows.get(previous_key) if previous_key is not None else None
+        if exact_anchor_rows and anchor_row is None:
+            return None
+        previous_row_source = _previous_row_source(
+            previous_record,
+            previous_page,
+            anchor_row=anchor_row,
+        )
+        if previous_row_source is None:
+            return None
         boundaries.append(
             {
                 "from_source_page": previous_page,
@@ -2077,25 +4160,55 @@ def _carry_boundaries(
                 "brought_forward_balance": _normalized_money(brought_forward),
                 "direction": direction,
                 "amount": _normalized_money(amount),
-                "previous_row_source": _previous_row_source(previous_record, previous_page),
+                "previous_row_source": previous_row_source,
                 "brought_forward_source": _field_source(carry_facts),
             }
         )
     return boundaries
 
 
-def _source_ref_pages(detail: dict[str, Any]) -> set[int]:
-    pages: set[int] = set()
-    for ref in detail.get("source_refs") or []:
-        if not isinstance(ref, dict):
-            continue
+def _has_direct_positioned_terminal_source(detail: dict[str, Any], terminal_page: int) -> bool:
+    direct_sources = {
+        "canonical_evidence_atoms",
+        "canonical_physical_table",
+        "header.kv",
+        "page_headers",
+        "parse_result_ocr_text",
+    }
+    detail_source = str(detail.get("source") or "").casefold()
+    evidence_ids = detail.get("evidence_ids")
+    refs = detail.get("source_refs")
+    derivation = detail.get("derivation")
+    if (
+        detail_source not in direct_sources
+        or detail_source == "derived_explicit_page_aggregate"
+        or derivation == "sum_explicit_page_totals"
+        or (isinstance(derivation, (list, tuple)) and "sum_explicit_page_totals" in derivation)
+        or detail.get("normalized_only") is True
+        or not isinstance(evidence_ids, (list, tuple))
+        or not evidence_ids
+        or not all(str(evidence_id or "").strip() for evidence_id in evidence_ids)
+        or not isinstance(refs, (list, tuple))
+        or not refs
+    ):
+        return False
+    for ref in refs:
+        if not isinstance(ref, dict) or str(ref.get("source") or "").casefold() != detail_source:
+            return False
         try:
-            page = int(ref.get("source_page") or ref.get("page") or _page_number(ref.get("page_id")) or 0)
+            source_page = int(ref.get("source_page") or ref.get("page") or 0)
+            bbox = tuple(float(value) for value in ref.get("bbox") or ())
         except (TypeError, ValueError):
-            page = 0
-        if page > 0:
-            pages.add(page)
-    return pages
+            return False
+        if (
+            source_page != terminal_page
+            or len(bbox) != 4
+            or not all(math.isfinite(value) for value in bbox)
+            or bbox[2] < bbox[0]
+            or bbox[3] < bbox[1]
+        ):
+            return False
+    return True
 
 
 def _terminal_aggregate_sources(
@@ -2105,18 +4218,27 @@ def _terminal_aggregate_sources(
     total_field: str,
     terminal_page: int,
 ) -> dict[str, Any] | None:
+    normalized = header.get("normalized") if isinstance(header.get("normalized"), dict) else {}
     canonical_raw = header.get("canonical_raw") if isinstance(header.get("canonical_raw"), dict) else {}
     source = header.get("source") if isinstance(header.get("source"), dict) else {}
     field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
     count_source = field_sources.get(count_field)
     total_source = field_sources.get(total_field)
+    normalized_count = _as_exact_int(normalized.get(count_field))
+    canonical_count = _as_exact_int(canonical_raw.get(count_field))
+    normalized_total = _as_decimal(normalized.get(total_field))
+    canonical_total = _as_decimal(canonical_raw.get(total_field))
     if (
-        canonical_raw.get(count_field) in (None, "")
-        or canonical_raw.get(total_field) in (None, "")
+        normalized_count is None
+        or canonical_count is None
+        or normalized_count != canonical_count
+        or normalized_total is None
+        or canonical_total is None
+        or normalized_total != canonical_total
         or not isinstance(count_source, dict)
         or not isinstance(total_source, dict)
-        or terminal_page not in _source_ref_pages(count_source)
-        or terminal_page not in _source_ref_pages(total_source)
+        or not _has_direct_positioned_terminal_source(count_source, terminal_page)
+        or not _has_direct_positioned_terminal_source(total_source, terminal_page)
     ):
         return None
     return {count_field: deepcopy(count_source), total_field: deepcopy(total_source)}
@@ -2190,7 +4312,7 @@ def _scope_anchor_evidence(
     visible_counts = Counter({page: len(rows) for page, rows in rows_by_page.items()})
     if anchor_counts != visible_counts:
         return None
-    return {
+    scoped_evidence = {
         "source": anchor_evidence["source"],
         "confidence": anchor_evidence["confidence"],
         "document_expected_rows": anchor_evidence["expected_rows"],
@@ -2198,6 +4320,39 @@ def _scope_anchor_evidence(
         "scope_visible_rows": sum(visible_counts.values()),
         "page_counts": {str(page): count for page, count in sorted(anchor_counts.items())},
     }
+    if anchor_evidence.get("source") == "canonical_physical_table_row_census":
+        scoped_row_sources = []
+        for item in anchor_evidence.get("row_sources") or []:
+            if not isinstance(item, dict):
+                return None
+            try:
+                source_page = int(item.get("source_page") or 0)
+            except (TypeError, ValueError):
+                return None
+            if scope[0] <= source_page <= scope[1]:
+                scoped_row_sources.append(deepcopy(item))
+        anchor_keys = [_source_lineage_triplet(item) for item in scoped_row_sources]
+        visible_keys = [
+            _source_lineage_triplet(
+                record.get("source") if isinstance(record.get("source"), dict) else {}
+            )
+            for page_rows in rows_by_page.values()
+            for record in page_rows
+        ]
+        if (
+            any(key is None for key in anchor_keys)
+            or any(key is None for key in visible_keys)
+            or Counter(anchor_keys) != Counter(visible_keys)
+        ):
+            return None
+        scoped_evidence.update(
+            {
+                "exact_lineage_match": True,
+                "exact_semantic_match": True,
+                "row_sources": scoped_row_sources,
+            }
+        )
+    return scoped_evidence
 
 
 def _derived_source_refs(residual: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2267,6 +4422,13 @@ def reconcile_source_unitemized_residuals(
         return copied_headers
     anchor_evidence = _cached_independent_row_anchor_evidence(parse_result, source_route=source_route)
     if not anchor_evidence:
+        anchor_evidence = _canonical_physical_row_census_evidence(
+            parse_result,
+            records,
+            source_route=source_route,
+            selected_source=selected_source,
+        )
+    if not anchor_evidence:
         return copied_headers
     try:
         facts_by_page, _lines = _page_header_facts(parse_result)
@@ -2280,7 +4442,11 @@ def reconcile_source_unitemized_residuals(
         scoped_rows, rows_by_page = scoped
         scope_anchors = _scope_anchor_evidence(anchor_evidence, rows_by_page, scope)
         visible = _visible_direction_totals(scoped_rows)
-        boundaries = _carry_boundaries(facts_by_page, rows_by_page)
+        boundaries = _carry_boundaries(
+            facts_by_page,
+            rows_by_page,
+            anchor_evidence=scope_anchors,
+        )
         if scope_anchors is None or visible is None or boundaries is None:
             continue
         residuals = _direction_residuals(header, visible, boundaries, terminal_page=scope[1])

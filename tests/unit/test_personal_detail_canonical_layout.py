@@ -592,6 +592,176 @@ def test_explicit_summary_heading_outranks_repeated_account_category_names() -> 
     assert projection.registrations[0]["confidence"] >= 0.92
 
 
+def _information_summary_continuation_case(
+    defect: str = "",
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    first_rows = [[f"概要指标{index}", str(index)] for index in range(1, 25)]
+    second_rows = [[f"概要指标{index}", str(index)] for index in range(25, 48)]
+    first_rows[0][0] = "逾期(透支)信息汇总"
+    second_rows[0][0] = "最近1个月内的查询机构数和查询次数"
+    first_table = SimpleNamespace(
+        table_id="summary:违约",
+        bbox=[30.0, 100.0, 570.0, 285.0],
+        headers=[],
+        rows=[],
+        metadata={"raw_rows": first_rows},
+    )
+    second_table = SimpleNamespace(
+        table_id="summary:查询",
+        bbox=[30.0, 360.0, 570.0, 570.0],
+        headers=[],
+        rows=[],
+        metadata={"raw_rows": second_rows},
+    )
+    tables = [first_table, second_table]
+    if defect == "extra_unowned_table":
+        tables.append(
+            SimpleNamespace(
+                table_id="unowned:third",
+                bbox=[30.0, 610.0, 570.0, 680.0],
+                headers=[],
+                rows=[],
+                metadata={"raw_rows": [["任意字段", "任意值"]]},
+            )
+        )
+    elif defect == "extra_unheaded_summary_table":
+        tables.append(
+            SimpleNamespace(
+                table_id="unheaded:summary-shaped",
+                bbox=[30.0, 610.0, 570.0, 680.0],
+                headers=[],
+                rows=[],
+                metadata={
+                    "raw_rows": [
+                        ["最近1个月内的查询机构数", "3"],
+                        ["最近1个月内的查询次数", "8"],
+                    ]
+                },
+            )
+        )
+    elif defect == "independently_owned_table":
+        tables.append(
+            _exact_mixed_schema_table(
+                "owned:inquiry",
+                top=620.0,
+                header=("查询原因", "查询机构", "编号", "查询日期"),
+                values=("贷后管理", "机构乙", "1", "2025.04.03"),
+            )
+        )
+    pages = [
+        _page(2, source=1),
+        _page(3, source=2, tables=tables),
+    ]
+    evidence: list[dict[str, object]] = [
+        {
+            "page": 2,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("二信息概要", [210.0, 620.0, 330.0, 640.0]),
+                _line("第2页,共31页", [220.0, 760.0, 380.0, 785.0]),
+            ],
+        },
+        {
+            "page": 3,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line(
+                    "(二)信贷交易违约信息概要",
+                    [170.0, 80.0, 430.0, 100.0],
+                ),
+                # This exact account-family atom is legitimate summary-table
+                # content and reproduces the live false whole-page role.
+                _line("贷记卡账户", [80.0, 130.0, 190.0, 150.0]),
+                _line(
+                    "(四)查询记录概要",
+                    [190.0, 340.0, 410.0, 360.0],
+                ),
+                _line("第3页,共31页", [220.0, 760.0, 380.0, 785.0]),
+            ],
+        },
+    ]
+    if defect == "one_current_heading":
+        evidence[1]["lines"] = [line for line in evidence[1]["lines"] if line["text"] != "(四)查询记录概要"]
+    elif defect == "nonconsecutive_footer":
+        evidence[1]["lines"][-1]["text"] = "第4页,共31页"
+    elif defect == "conflicting_top_level":
+        evidence[1]["lines"].append(_line("公共信息明细", [180.0, 590.0, 420.0, 610.0]))
+    elif defect == "numbered_account_card":
+        evidence[1]["lines"].append(_line("账户12", [80.0, 180.0, 160.0, 200.0]))
+    elif defect == "account_family_outside_table":
+        evidence[1]["lines"][1]["bbox"] = [80.0, 305.0, 190.0, 325.0]
+    elif defect == "independently_owned_table":
+        evidence[1]["lines"].insert(
+            -1,
+            _line("(十一)查询记录", [180.0, 595.0, 360.0, 620.0]),
+        )
+    return SimpleNamespace(pages=pages), evidence
+
+
+def test_sealed_summary_continuation_preserves_all_47_metric_shaped_rows() -> None:
+    result, evidence = _information_summary_continuation_case()
+
+    projection = _assembler(result, evidence).build()
+
+    registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+    assert registration["template_id"] == "information_summary"
+    assert "multiple_exact_summary_subsection_headings" in registration["signals"]
+    current = next(page for page in projection.pages if page.page_number == 3)
+    assert current.canonical_template_id == "information_summary"
+    assert sum(len(table.metadata["raw_rows"]) for table in current.tables) == 47
+    assert all(table.metadata["canonical_template_id"] == "information_summary" for table in current.tables)
+
+
+def test_summary_continuation_fails_closed_without_every_local_proof() -> None:
+    for defect in (
+        "one_current_heading",
+        "nonconsecutive_footer",
+        "conflicting_top_level",
+        "account_family_outside_table",
+        "extra_unowned_table",
+        "extra_unheaded_summary_table",
+        "independently_owned_table",
+        "non_authoritative_identity",
+        "numbered_account_card",
+    ):
+        result, evidence = _information_summary_continuation_case(defect)
+        owner = (
+            SimpleNamespace(
+                reading_order_resolution={
+                    "resolved": False,
+                    "authoritative": False,
+                    "identity_fallback": True,
+                    "printed_total": 31,
+                    "printed_page_by_logical": {2: 2, 3: 3},
+                }
+            )
+            if defect == "non_authoritative_identity"
+            else None
+        )
+
+        projection = _assembler(result, evidence, owner=owner).build()
+
+        registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+        assert registration["template_id"] != "information_summary", defect
+
+
+def test_summary_page_with_independently_owned_table_stays_mixed() -> None:
+    result, evidence = _information_summary_continuation_case(
+        "independently_owned_table"
+    )
+
+    projection = _assembler(result, evidence).build()
+
+    registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+    assert registration["template_id"] == "mixed_pboc_sections"
+    current = next(page for page in projection.pages if page.page_number == 3)
+    assert [table.table_id for table in current.tables] == ["owned:inquiry"]
+
+
 def test_unanchored_table_page_does_not_inherit_previous_template_by_shape_alone() -> None:
     summary_table = SimpleNamespace(table_id="summary:1", metadata={"raw_rows": [["A", "B"]]}, bbox=[10, 80, 590, 300])
     unrelated_table = SimpleNamespace(table_id="unknown:2", metadata={"raw_rows": [["X", "Y"]]}, bbox=[10, 80, 590, 300])

@@ -2989,6 +2989,44 @@ def count_expected_rows_from_bank_footer(
     return resolve_row_count_evidence(text, page_texts=page_texts).count
 
 
+def _complete_source_signed_direction_totals(
+    records: list[dict[str, Any]],
+) -> tuple[float, float] | None:
+    """Return a complete source-sign plane with owned direction on every row.
+
+    Every amount must agree across raw, canonical_raw, and normalized magnitude.
+    Every component also needs an independent source-owned side; a normalized
+    direction alone cannot make the alternate reconciliation plane auditable.
+    """
+    from docmirror.plugins.bank_statement.styles.grid_standard import (
+        source_owned_signed_directional_amount,
+        source_provenanced_signed_amount,
+    )
+
+    totals = {"expense": 0.0, "income": 0.0}
+    saw_negative = False
+    if not records:
+        return None
+    for record in records:
+        raw = record.get("raw")
+        normalized = record.get("normalized")
+        canonical_raw = record.get("canonical_raw")
+        if not isinstance(raw, dict) or not isinstance(normalized, dict) or not isinstance(canonical_raw, dict):
+            return None
+        direction = str(normalized.get("direction") or "").strip()
+        signed_amount = source_provenanced_signed_amount(raw, normalized, canonical_raw)
+        if direction not in totals or signed_amount is None:
+            return None
+        owned_fact = source_owned_signed_directional_amount(raw, normalized, canonical_raw)
+        if owned_fact != (direction, signed_amount):
+            return None
+        totals[direction] += signed_amount
+        saw_negative = saw_negative or signed_amount < 0
+    if not saw_negative:
+        return None
+    return round(totals["expense"], 2), round(totals["income"], 2)
+
+
 def audit_bank_statement_invariants(
     records: list[dict[str, Any]],
     text: str,
@@ -3062,14 +3100,31 @@ def audit_bank_statement_invariants(
     paired_totals = _paired_direction_amount_totals(text) if aggregate_contract else None
     debit_total = column_major_totals[2] if column_major_totals else paired_totals[0] if paired_totals else None
     credit_total = column_major_totals[3] if column_major_totals else paired_totals[1] if paired_totals else None
+    actual_debit_total = round(sum(_float(row.get("amount")) for row in debit_rows), 2)
+    actual_credit_total = round(sum(_float(row.get("amount")) for row in credit_rows), 2)
+    signed_totals_close = False
+    # Signed reconciliation is an all-or-nothing alternate aggregate plane.  It
+    # cannot rescue a single side, an incomplete direction census, or a footer
+    # that lacks both counts and both totals.
+    if (
+        aggregate_contract
+        and reported_counts == (len(debit_rows), len(credit_rows))
+        and len(debit_rows) + len(credit_rows) == len(records)
+        and debit_total is not None
+        and credit_total is not None
+    ):
+        source_signed_totals = _complete_source_signed_direction_totals(records)
+        signed_totals_close = bool(
+            source_signed_totals is not None
+            and abs(source_signed_totals[0] - debit_total) <= 0.01
+            and abs(source_signed_totals[1] - credit_total) <= 0.01
+        )
     if debit_total is not None:
-        actual = round(sum(_float(row.get("amount")) for row in debit_rows), 2)
-        if abs(actual - debit_total) > 0.01:
-            failures.append(f"bank_invariant_failed:debit_total:{actual:.2f}/{debit_total:.2f}")
+        if abs(actual_debit_total - debit_total) > 0.01 and not signed_totals_close:
+            failures.append(f"bank_invariant_failed:debit_total:{actual_debit_total:.2f}/{debit_total:.2f}")
     if credit_total is not None:
-        actual = round(sum(_float(row.get("amount")) for row in credit_rows), 2)
-        if abs(actual - credit_total) > 0.01:
-            failures.append(f"bank_invariant_failed:credit_total:{actual:.2f}/{credit_total:.2f}")
+        if abs(actual_credit_total - credit_total) > 0.01 and not signed_totals_close:
+            failures.append(f"bank_invariant_failed:credit_total:{actual_credit_total:.2f}/{credit_total:.2f}")
 
     filtered_income_scope = any(
         title
