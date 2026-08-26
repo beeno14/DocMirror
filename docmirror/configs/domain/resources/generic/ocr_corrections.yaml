@@ -20,6 +20,10 @@ confusions:
   "村": [付]
 
 exact_rules:
+  - id: common.general_project_header
+    observed: 般项目
+    canonical: 一般项目
+    roles: [text_line, field_label, table_header, unknown]
   - id: finance.operating_revenue
     observed: 营业牧入
     canonical: 营业收入

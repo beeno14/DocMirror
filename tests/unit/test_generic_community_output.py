@@ -13,6 +13,7 @@ from docmirror.models.entities.parse_result import (
     ParseResult,
     ResultStatus,
     RowProvenance,
+    RowType,
     TableBlock,
     TableRow,
     TextBlock,
@@ -48,6 +49,7 @@ def build_generic_community_output(result, document_type, text=""):
         }
     }
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  _type_detect_column
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -70,16 +72,12 @@ class TestTypeDetectColumn:
         assert conf >= 0.6
 
     def test_detect_id_number(self):
-        col_type, conf = _type_detect_column(
-            ["110101199001011234", "32010219850706321X", "440305200112123456"]
-        )
+        col_type, conf = _type_detect_column(["110101199001011234", "32010219850706321X", "440305200112123456"])
         assert col_type == "id_number"
         assert conf >= 0.6
 
     def test_detect_email(self):
-        col_type, conf = _type_detect_column(
-            ["user@example.com", "test@company.cn", "admin@test.org"]
-        )
+        col_type, conf = _type_detect_column(["user@example.com", "test@company.cn", "admin@test.org"])
         assert col_type == "email"
         assert conf >= 0.6
 
@@ -89,16 +87,12 @@ class TestTypeDetectColumn:
         assert conf >= 0.6
 
     def test_text_fallback(self):
-        col_type, conf = _type_detect_column(
-            ["报销差旅费", "办公用品采购", "交通费", "餐费补贴"]
-        )
+        col_type, conf = _type_detect_column(["报销差旅费", "办公用品采购", "交通费", "餐费补贴"])
         assert col_type == "text"
 
     def test_mixed_column_fallback_to_text(self):
         """Mixed types (dates + amounts) should fall back to text."""
-        col_type, conf = _type_detect_column(
-            ["2024-01-01", "1,000.00", "摘要说明", "张三"]
-        )
+        col_type, conf = _type_detect_column(["2024-01-01", "1,000.00", "摘要说明", "张三"])
         assert col_type == "text"
         assert conf < 0.6
 
@@ -113,9 +107,7 @@ class TestTypeDetectColumn:
         assert conf >= 0.6
 
     def test_detect_account_number(self):
-        col_type, conf = _type_detect_column(
-            ["6222021234567890123", "6228480012345678901", "6217001234567890123"]
-        )
+        col_type, conf = _type_detect_column(["6222021234567890123", "6228480012345678901", "6217001234567890123"])
         assert col_type == "account"
         assert conf >= 0.6
 
@@ -188,7 +180,11 @@ class TestStandardizeValue:
 
     def test_amount_non_numeric(self):
         result = _standardize_value("N/A", "amount")
-        assert result == "N/A"  # raw pass-through
+        assert result is None
+
+    @pytest.mark.parametrize("placeholder", ["-", "—", "–", "--"])
+    def test_amount_placeholder_is_typed_null(self, placeholder):
+        assert _standardize_value(placeholder, "amount") is None
 
     def test_amount_repairs_unambiguous_scanned_thousands_separator(self):
         assert _standardize_value("127,500.000.00", "amount", currency_hint="CNY") == {
@@ -332,6 +328,696 @@ class TestBuildNormalizedRecord:
 
 
 class TestGenericTextAndTableRecovery:
+    def test_multiple_logical_tables_keep_independent_datasets(self):
+        result = ParseResult(
+            pages=[
+                PageContent(
+                    page_number=1,
+                    tables=[
+                        TableBlock(
+                            table_id="sales",
+                            headers=["项目", "本月数"],
+                            rows=[TableRow(cells=[CellValue(text="销售额"), CellValue(text="10.00")])],
+                        ),
+                        TableBlock(
+                            table_id="rates",
+                            headers=["税种", "税率"],
+                            rows=[TableRow(cells=[CellValue(text="增值税"), CellValue(text="13%")])],
+                        ),
+                    ],
+                )
+            ]
+        )
+
+        projection = derive_generic_projection(result, "tax_return")
+
+        assert list(projection.datasets) == ["table_001", "table_002"]
+        assert projection.datasets["table_001"][0]["raw"] == {"项目": "销售额", "本月数": "10.00"}
+        assert projection.datasets["table_002"][0]["raw"] == {"税种": "增值税", "税率": "13%"}
+
+    def test_generic_projection_splits_explicit_repeated_header_bands(self):
+        table = TableBlock(
+            table_id="combined_form",
+            headers=["表名", "附列资料", "", ""],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="序号"),
+                        CellValue(text="抵减项目"),
+                        CellValue(text="期初余额"),
+                        CellValue(text="本期发生额"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="1"),
+                        CellValue(text="销售额"),
+                        CellValue(text="10.00"),
+                        CellValue(text="1.00"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="序号"),
+                        CellValue(text="加计抵减项目"),
+                        CellValue(text="期初余额"),
+                        CellValue(text="本期可抵减额"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="2"),
+                        CellValue(text="当期计提"),
+                        CellValue(text="20.00"),
+                        CellValue(text="2.00"),
+                    ]
+                ),
+            ],
+        )
+
+        projection = derive_generic_projection(
+            ParseResult(pages=[PageContent(page_number=1, tables=[table])]), "tax_return"
+        )
+
+        assert list(projection.datasets) == ["table_001", "table_002"]
+        assert projection.datasets["table_001"][0]["raw"] == {
+            "序号": "1",
+            "抵减项目": "销售额",
+            "期初余额": "10.00",
+            "本期发生额": "1.00",
+        }
+        assert projection.datasets["table_002"][0]["raw"] == {
+            "序号": "2",
+            "加计抵减项目": "当期计提",
+            "期初余额": "20.00",
+            "本期可抵减额": "2.00",
+        }
+
+    def test_explicit_grouped_parent_headers_consume_textual_child_header_row(self):
+        table = TableBlock(
+            table_id="deferred_tax_liability",
+            headers=["项目", "期末余额", "", "期初余额", ""],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="使用权资产税会差异"),
+                        CellValue(text="775,858.27"),
+                        CellValue(text="116,378.74"),
+                        CellValue(text="67,014.02"),
+                        CellValue(text="16,753.50"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=39, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert [record["raw"] for record in records] == [
+            {
+                "项目": "使用权资产税会差异",
+                "期末余额/应纳税暂时性差异": "775,858.27",
+                "期末余额/递延所得税负债": "116,378.74",
+                "期初余额/应纳税暂时性差异": "67,014.02",
+                "期初余额/递延所得税负债": "16,753.50",
+            }
+        ]
+
+    def test_adjacent_grouped_table_replaces_child_labels_without_emitting_header_row(self):
+        table = TableBlock(
+            table_id="deferred_tax_tables",
+            headers=[
+                "项目",
+                "期末余额/可抵扣暂时性差异",
+                "期末余额/递延所得税资产",
+                "期初余额/可抵扣暂时性差异",
+                "期初余额/递延所得税资产",
+            ],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="信用减值准备"),
+                        CellValue(text="10,599,372.91"),
+                        CellValue(text="1,589,905.94"),
+                        CellValue(text="5,840,764.64"),
+                        CellValue(text="1,460,191.16"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="使用权资产税会差异"),
+                        CellValue(text="775,858.27"),
+                        CellValue(text="116,378.74"),
+                        CellValue(text="67,014.02"),
+                        CellValue(text="16,753.50"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=39, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert len(records) == 2
+        assert records[0]["raw"]["期末余额/递延所得税资产"] == "1,589,905.94"
+        assert records[1]["raw"] == {
+            "项目": "使用权资产税会差异",
+            "期末余额/应纳税暂时性差异": "775,858.27",
+            "期末余额/递延所得税负债": "116,378.74",
+            "期初余额/应纳税暂时性差异": "67,014.02",
+            "期初余额/递延所得税负债": "16,753.50",
+        }
+
+    def test_parent_only_source_headers_split_two_adjacent_grouped_child_schemas(self):
+        table = TableBlock(
+            table_id="deferred_tax_parent_only",
+            headers=["项目", "期末余额", "", "期初余额", ""],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(text="可抵扣暂时性差异"),
+                        CellValue(text="递延所得税资产"),
+                        CellValue(text="可抵扣暂时性差异"),
+                        CellValue(text="递延所得税资产"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="信用减值准备"),
+                        CellValue(text="10,599,372.91"),
+                        CellValue(text="1,589,905.94"),
+                        CellValue(text="5,840,764.64"),
+                        CellValue(text="1,460,191.16"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                        CellValue(text="应纳税暂时性差异"),
+                        CellValue(text="递延所得税负债"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="使用权资产税会差异"),
+                        CellValue(text="775,858.27"),
+                        CellValue(text="116,378.74"),
+                        CellValue(text="67,014.02"),
+                        CellValue(text="16,753.50"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=39, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert len(records) == 2
+        assert list(records[0]["raw"]) == [
+            "项目",
+            "期末余额/可抵扣暂时性差异",
+            "期末余额/递延所得税资产",
+            "期初余额/可抵扣暂时性差异",
+            "期初余额/递延所得税资产",
+        ]
+        assert list(records[1]["raw"]) == [
+            "项目",
+            "期末余额/应纳税暂时性差异",
+            "期末余额/递延所得税负债",
+            "期初余额/应纳税暂时性差异",
+            "期初余额/递延所得税负债",
+        ]
+
+        projection = derive_generic_projection(
+            ParseResult(pages=[PageContent(page_number=39, tables=[table])]), "audit_report"
+        )
+
+        assert projection.datasets["table_002"][0]["normalized"] == {
+            "项目": "使用权资产税会差异",
+            "期末余额/应纳税暂时性差异": {"value": 775858.27},
+            "期末余额/递延所得税负债": {"value": 116378.74},
+            "期初余额/应纳税暂时性差异": {"value": 67014.02},
+            "期初余额/递延所得税负债": {"value": 16753.5},
+        }
+
+    def test_explicit_deepest_headers_merge_with_stacked_parent_rows(self):
+        table = TableBlock(
+            table_id="equity_changes",
+            headers=["项目", "", "优先股", "永续债", "其他", "", "", "", "", "", "", ""],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="项目", row_span=3),
+                        CellValue(text="本期金额", col_span=11),
+                        *[CellValue() for _ in range(10)],
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(text="实收资本（或股本）", row_span=2),
+                        CellValue(text="其他权益工具", col_span=3),
+                        CellValue(),
+                        CellValue(),
+                        CellValue(text="资本公积", row_span=2),
+                        CellValue(text="减：库存股", row_span=2),
+                        CellValue(text="其他综合收益", row_span=2),
+                        CellValue(text="专项储备", row_span=2),
+                        CellValue(text="盈余公积", row_span=2),
+                        CellValue(text="未分配利润", row_span=2),
+                        CellValue(text="所有者权益合计", row_span=2),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(),
+                        CellValue(text="优先股"),
+                        CellValue(text="永续债"),
+                        CellValue(text="其他"),
+                        *[CellValue() for _ in range(7)],
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="一、上年期末余额"),
+                        CellValue(text="27,366,313.00"),
+                        CellValue(),
+                        CellValue(),
+                        CellValue(),
+                        CellValue(text="12,144,181.02"),
+                        CellValue(),
+                        CellValue(),
+                        CellValue(),
+                        CellValue(text="2,784,842.64"),
+                        CellValue(text="10,846,294.04"),
+                        CellValue(text="53,141,630.70"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=10, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert len(records) == 1
+        assert records[0]["raw"] == {
+            "项目": "一、上年期末余额",
+            "本期金额/实收资本(或股本)": "27,366,313.00",
+            "本期金额/其他权益工具/优先股": "",
+            "本期金额/其他权益工具/永续债": "",
+            "本期金额/其他权益工具/其他": "",
+            "本期金额/资本公积": "12,144,181.02",
+            "本期金额/减:库存股": "",
+            "本期金额/其他综合收益": "",
+            "本期金额/专项储备": "",
+            "本期金额/盈余公积": "2,784,842.64",
+            "本期金额/未分配利润": "10,846,294.04",
+            "本期金额/所有者权益合计": "53,141,630.70",
+        }
+
+    def test_embedded_header_scan_reaches_adjacent_table_after_twenty_rows(self):
+        first_rows = [
+            TableRow(
+                cells=[
+                    CellValue(text=f"项目{index}"),
+                    CellValue(text=f"{index}.00"),
+                    CellValue(text=f"{index + 1}.00"),
+                ]
+            )
+            for index in range(1, 22)
+        ]
+        table = TableBlock(
+            table_id="adjacent_tables",
+            headers=["项目", "期末余额", "期初余额"],
+            rows=first_rows
+            + [
+                TableRow(
+                    cells=[
+                        CellValue(text="项目"),
+                        CellValue(text="本期发生额"),
+                        CellValue(text="上期发生额"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="管理费用"),
+                        CellValue(text="10.00"),
+                        CellValue(text="9.00"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=43, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert len(records) == 22
+        assert records[20]["raw"] == {"项目": "项目21", "期末余额": "21.00", "期初余额": "22.00"}
+        assert records[21]["raw"] == {"项目": "管理费用", "本期发生额": "10.00", "上期发生额": "9.00"}
+
+    def test_generic_projection_uses_positional_columns_after_persistent_schema_drift(self):
+        table = TableBlock(
+            table_id="combined_form",
+            headers=["项目", "本期应纳税额", "本期已缴税额"],
+            rows=[
+                TableRow(cells=[CellValue(text="项目甲"), CellValue(text="10.00"), CellValue(text="1.00")]),
+                TableRow(cells=[CellValue(text="项目乙"), CellValue(text="20.00"), CellValue(text="2.00")]),
+                TableRow(cells=[CellValue(text="项目丙"), CellValue(text="30.00"), CellValue(text="3.00")]),
+                TableRow(cells=[CellValue(text="合计"), CellValue(text="60.00"), CellValue(text="6.00")]),
+                TableRow(
+                    cells=[CellValue(text="政策适用情况"), CellValue(text="当期新增投资额"), CellValue(text="0.00")]
+                ),
+                TableRow(cells=[CellValue(), CellValue(text="上期留抵可抵免金额"), CellValue(text="0.00")]),
+                TableRow(cells=[CellValue(), CellValue(text="结转下期可抵免金额"), CellValue(text="0.00")]),
+            ],
+        )
+
+        projection = derive_generic_projection(
+            ParseResult(pages=[PageContent(page_number=1, tables=[table])]), "tax_return"
+        )
+
+        assert list(projection.datasets) == ["table_001", "table_002"]
+        assert projection.datasets["table_001"][-1]["raw"] == {
+            "项目": "合计",
+            "本期应纳税额": "60.00",
+            "本期已缴税额": "6.00",
+        }
+        assert projection.datasets["table_002"][0]["raw"] == {
+            "col_0": "政策适用情况",
+            "col_1": "当期新增投资额",
+            "col_2": "0.00",
+        }
+
+    def test_formula_ordinals_do_not_trigger_schema_drift(self):
+        table = TableBlock(
+            table_id="return",
+            headers=["项目", "栏次", "本月数"],
+            rows=[
+                TableRow(cells=[CellValue(text=f"项目{index}"), CellValue(text=str(index)), CellValue(text="0.00")])
+                for index in range(1, 5)
+            ]
+            + [
+                TableRow(cells=[CellValue(text="期末余额"), CellValue(text="32=24+25-27"), CellValue(text="0.00")]),
+                TableRow(cells=[CellValue(text="欠缴税额"), CellValue(text="33=25+26-27"), CellValue(text="0.00")]),
+                TableRow(cells=[CellValue(text="应补税额"), CellValue(text="34＝24-28-29"), CellValue(text="0.00")]),
+            ],
+        )
+
+        projection = derive_generic_projection(
+            ParseResult(pages=[PageContent(page_number=1, tables=[table])]), "tax_return"
+        )
+
+        assert list(projection.datasets) == ["records"]
+        assert projection.datasets["records"][-1]["raw"]["栏次"] == "34＝24-28-29"
+
+    def test_projection_does_not_trim_rows_by_sequence_values(self):
+        table = TableBlock(
+            table_id="return",
+            headers=["项目", "栏次", "本月数"],
+            rows=[
+                TableRow(cells=[CellValue(text="纳税人信息"), CellValue(), CellValue()]),
+                TableRow(cells=[CellValue(text="销售额"), CellValue(text="1"), CellValue(text="10.00")]),
+                TableRow(cells=[CellValue(text="销项税额"), CellValue(text="2"), CellValue(text="1.30")]),
+                TableRow(cells=[CellValue(text="应纳税额"), CellValue(text="3"), CellValue(text="1.30")]),
+                TableRow(cells=[CellValue(text="其中甲项"), CellValue(text="3a"), CellValue(text="0.80")]),
+                TableRow(cells=[CellValue(text="其中乙项"), CellValue(text="3b"), CellValue(text="0.50")]),
+                TableRow(cells=[CellValue(text="合计"), CellValue(), CellValue(text="13.10")]),
+                TableRow(cells=[CellValue(text="经办人：张三"), CellValue(), CellValue()]),
+            ],
+        )
+
+        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+
+        assert records[0]["raw"]["项目"] == "纳税人信息"
+        assert records[-1]["raw"]["项目"] == "经办人：张三"
+
+    def test_projection_does_not_invent_an_isolated_sequence_value(self):
+        table = TableBlock(
+            table_id="return",
+            headers=["项目", "栏次", "金额"],
+            rows=[
+                TableRow(cells=[CellValue(text="项目一"), CellValue(), CellValue(text="10.00")]),
+                TableRow(cells=[CellValue(text="项目二"), CellValue(text="2"), CellValue(text="20.00")]),
+                TableRow(cells=[CellValue(text="项目三"), CellValue(text="3"), CellValue(text="30.00")]),
+            ],
+        )
+
+        projection = derive_generic_projection(
+            ParseResult(pages=[PageContent(page_number=1, tables=[table])]), "tax_return"
+        )
+
+        assert [row["raw"]["栏次"] for row in projection.datasets["records"]] == ["", "2", "3"]
+
+    def test_projection_does_not_replace_canonical_headers_from_embedded_rows(self):
+        table = TableBlock(
+            table_id="return",
+            headers=["纳税人名称", "测试公司", "法定代表人", "张三"],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="开户银行"),
+                        CellValue(text="测试银行"),
+                        CellValue(text="注册地址"),
+                        CellValue(text="上海"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="项目"),
+                        CellValue(text="栏次"),
+                        CellValue(text="本月数"),
+                        CellValue(text="本年累计"),
+                    ]
+                ),
+                TableRow(
+                    cells=[CellValue(text="销售额"), CellValue(), CellValue(text="10.00"), CellValue(text="20.00")]
+                ),
+                TableRow(
+                    cells=[CellValue(text="税额"), CellValue(text="2"), CellValue(text="1.30"), CellValue(text="2.60")]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="调整额"),
+                        CellValue(text="3"),
+                        CellValue(text="0.00"),
+                        CellValue(text="0.00"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="合计"),
+                        CellValue(text="4"),
+                        CellValue(text="11.30"),
+                        CellValue(text="22.60"),
+                    ]
+                ),
+                TableRow(cells=[CellValue(text="受理人"), CellValue(), CellValue(), CellValue()]),
+            ],
+        )
+
+        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+
+        assert list(records[0]["raw"]) == ["纳税人名称", "测试公司", "法定代表人", "张三"]
+        assert records[0]["raw"]["纳税人名称"] == "开户银行"
+        assert records[1]["raw"]["纳税人名称"] == "项目"
+
+    def test_section_title_after_header_is_preserved_as_first_record(self):
+        table = TableBlock(
+            table_id="cash_flow",
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="项目"),
+                        CellValue(text="行次"),
+                        CellValue(text="本月金额"),
+                        CellValue(text="本年累计金额"),
+                    ]
+                ),
+                TableRow(cells=[CellValue(text="一、经营活动产生的现金流量"), CellValue(), CellValue(), CellValue()]),
+                TableRow(
+                    cells=[
+                        CellValue(text="销售商品收到的现金"),
+                        CellValue(text="1"),
+                        CellValue(text="10.00"),
+                        CellValue(text="20.00"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+
+        assert records[0]["raw"] == {
+            "项目": "一、经营活动产生的现金流量",
+            "行次": "",
+            "本月金额": "",
+            "本年累计金额": "",
+        }
+
+    def test_adjacent_headerless_table_does_not_inherit_schema_without_merge_evidence(self):
+        first = TableBlock(
+            table_id="pt_1_0",
+            headers=["项目", "栏次", "金额"],
+            rows=[
+                TableRow(cells=[CellValue(text="销售额"), CellValue(text="1"), CellValue(text="10.00")]),
+                TableRow(cells=[CellValue(text="税额"), CellValue(text="2"), CellValue(text="1.30")]),
+                TableRow(cells=[CellValue(text="合计"), CellValue(text="3"), CellValue(text="11.30")]),
+            ],
+        )
+        continuation = TableBlock(
+            table_id="pt_2_0",
+            rows=[
+                TableRow(cells=[CellValue(text="附加税"), CellValue(text="4"), CellValue(text="0.50")]),
+                TableRow(cells=[CellValue(text="城建税"), CellValue(text="5"), CellValue(text="0.30")]),
+                TableRow(cells=[CellValue(text="教育费附加"), CellValue(text="6"), CellValue(text="0.20")]),
+            ],
+        )
+        result = ParseResult(
+            pages=[
+                PageContent(page_number=1, tables=[first]),
+                PageContent(page_number=2, tables=[continuation]),
+            ]
+        )
+
+        records = _collect_table_records(result)
+
+        assert {record["source"]["table_id"] for record in records} == {"pt_1_0", "pt_2_0"}
+        continuation_records = [record for record in records if record["source"]["table_id"] == "pt_2_0"]
+        assert continuation_records
+        assert "栏次" not in continuation_records[0]["raw"]
+
+    def test_source_text_does_not_guess_placeholder_headers(self):
+        table = TableBlock(
+            table_id="return",
+            headers=["项目", "col_1", "金额", "col_3"],
+            rows=[
+                TableRow(cells=[CellValue(text="销售额"), CellValue(text="1"), CellValue(text="10.00"), CellValue()]),
+                TableRow(cells=[CellValue(text="税额"), CellValue(text="2"), CellValue(text="1.30"), CellValue()]),
+                TableRow(cells=[CellValue(text="合计"), CellValue(text="3"), CellValue(text="11.30"), CellValue()]),
+            ],
+        )
+        result = ParseResult(
+            pages=[
+                PageContent(
+                    page_number=1,
+                    texts=[TextBlock(content="项目 栏次 金额")],
+                    tables=[table],
+                )
+            ]
+        )
+
+        projection = derive_generic_projection(result, "tax_return")
+
+        assert list(projection.datasets["records"][0]["raw"]) == ["项目", "col_1", "金额", "col_3"]
+
+    def test_explicit_non_data_row_types_do_not_become_records(self):
+        table = TableBlock(
+            table_id="typed_rows",
+            headers=["项目", "金额"],
+            rows=[
+                TableRow(
+                    row_type=RowType.HEADER,
+                    cells=[CellValue(text="项目"), CellValue(text="金额")],
+                ),
+                TableRow(cells=[CellValue(text="收入"), CellValue(text="10.00")]),
+                TableRow(row_type=RowType.SEPARATOR, cells=[CellValue(text="---"), CellValue()]),
+            ],
+        )
+
+        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+
+        assert [record["raw"] for record in records] == [{"项目": "收入", "金额": "10.00"}]
+
+    def test_column_ordinal_band_does_not_become_a_business_record(self):
+        table = TableBlock(
+            table_id="form",
+            headers=["序号", "抵减项目", "期初余额", "本期发生额", "期末余额"],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(),
+                        CellValue(),
+                        CellValue(text="1"),
+                        CellValue(text="2"),
+                        CellValue(text="3=1+2"),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="1"),
+                        CellValue(text="测试项目"),
+                        CellValue(text="10.00"),
+                        CellValue(text="2.00"),
+                        CellValue(text="12.00"),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+
+        assert len(records) == 1
+        assert records[0]["raw"]["序号"] == "1"
+
+    def test_generic_records_retain_cell_level_source_refs(self):
+        table = TableBlock(
+            table_id="pt_2_0",
+            headers=["项目", "金额"],
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(
+                            text="收入",
+                            source_cell_refs=[{"page": 2, "table_id": "pt_2_0", "row": 5, "col": 0}],
+                        ),
+                        CellValue(
+                            text="10.00",
+                            source_cell_refs=[{"page": 2, "table_id": "pt_2_0", "row": 5, "col": 1}],
+                        ),
+                    ]
+                )
+            ],
+        )
+
+        record = _collect_table_records(ParseResult(pages=[PageContent(page_number=2, tables=[table])]))[0]
+
+        assert record["source"]["source_cell_refs"] == [
+            {"page": 2, "table_id": "pt_2_0", "row": 5, "col": 0, "field_name": "项目"},
+            {"page": 2, "table_id": "pt_2_0", "row": 5, "col": 1, "field_name": "金额"},
+        ]
+
     @pytest.mark.parametrize("line", ("12:30", "08：45", "第1章：总则", "第十二条：付款条件"))
     def test_non_kv_lines_are_rejected(self, line: str):
         assert _collect_text_key_values(line) == {}
@@ -579,9 +1265,7 @@ class TestGenericTextAndTableRecovery:
 
         out = build_generic_community_output(result, "audit_report", "")
 
-        assert out["data"]["fields"]["经营范围"] == (
-            "一般项目:羽毛(绒)及制品制造;服装制造;服饰制造;电子产品销售。"
-        )
+        assert out["data"]["fields"]["经营范围"] == ("一般项目:羽毛(绒)及制品制造;服装制造;服饰制造;电子产品销售。")
         assert out["data"]["field_metadata"]["经营范围"]["page"] == 18
 
     def test_audit_report_number_is_recovered_without_replacing_qr_number(self):
@@ -604,12 +1288,49 @@ class TestGenericTextAndTableRecovery:
 
     def test_duplicate_and_empty_headers_preserve_every_cell(self):
         table = TableBlock(
-            table_id="dup_headers", headers=["金额", "金额", ""],
+            table_id="dup_headers",
+            headers=["金额", "金额", ""],
             rows=[TableRow(cells=[CellValue(text="1"), CellValue(text="2"), CellValue(text="3")])],
         )
-        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=1, tables=[table])]))
+        result = ParseResult(pages=[PageContent(page_number=1, tables=[table])])
+        records = _collect_table_records(result)
+        projection = derive_generic_projection(result, "tax_return")
+
         assert records[0]["raw"] == {"金额": "1", "金额_2": "2", "col_2": "3"}
         assert records[0]["source"]["header_repaired"] is True
+        assert projection.semantic["dataset_column_order"]["records"] == ["金额", "金额_2", "col_2"]
+
+    def test_empty_trailing_synthetic_column_is_not_projected(self):
+        table = TableBlock(
+            table_id="trailing_empty",
+            extraction_layer="scanned_image_line_grid",
+            metadata={"source": "scanned_bordered_table_reconstructor"},
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="项目"),
+                        CellValue(text="栏次"),
+                        CellValue(text="本月数"),
+                        CellValue(text=""),
+                    ]
+                ),
+                TableRow(
+                    cells=[
+                        CellValue(text="销售额"),
+                        CellValue(text="1"),
+                        CellValue(text="100.00"),
+                        CellValue(text=""),
+                    ]
+                ),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=1, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert records[0]["raw"] == {"项目": "销售额", "栏次": "1", "本月数": "100.00"}
 
     def test_layout_spacing_inside_chinese_headers_is_normalized_for_records(self):
         table = TableBlock(
@@ -686,6 +1407,53 @@ class TestGenericTextAndTableRecovery:
             "年末余额/账面价值",
         ]
         assert "header_repaired" not in out["data"]["tables"][0]
+
+    def test_scanned_investor_header_labels_are_not_projected_as_a_record(self):
+        table = TableBlock(
+            table_id="investors",
+            extraction_layer="scanned_image_line_grid",
+            metadata={"source": "scanned_bordered_table_reconstructor"},
+            rows=[
+                TableRow(
+                    cells=[
+                        CellValue(text="投资方"),
+                        CellValue(text="股份数(万股)"),
+                        CellValue(text="持股比例(%)"),
+                    ]
+                ),
+                TableRow(cells=[CellValue(text="甲公司"), CellValue(text="10.5000"), CellValue(text="0.38")]),
+            ],
+        )
+
+        records = _collect_table_records(
+            ParseResult(pages=[PageContent(page_number=11, tables=[table])]),
+            allow_embedded_headers=True,
+        )
+
+        assert [record["raw"]["投资方"] for record in records] == ["甲公司"]
+
+    def test_scanned_tax_header_uses_multi_rate_value_as_numeric_following_evidence(self):
+        table = TableBlock(
+            table_id="tax_rates",
+            extraction_layer="scanned_image_line_grid",
+            metadata={"source": "scanned_bordered_table_reconstructor"},
+            rows=[
+                TableRow(cells=[CellValue(text="税种"), CellValue(text="计税依据"), CellValue(text="税率(%)")]),
+                TableRow(cells=[CellValue(text="增值税"), CellValue(text="销售额扣除进项税"), CellValue(text="9、6")]),
+                TableRow(cells=[CellValue(text="城市维护建设税"), CellValue(text="应交流转税"), CellValue(text="5")]),
+                TableRow(cells=[CellValue(text="教育费附加"), CellValue(text="应交流转税"), CellValue(text="3")]),
+                TableRow(cells=[CellValue(text="地方教育附加"), CellValue(text="应交流转税"), CellValue(text="2")]),
+            ],
+        )
+
+        result = ParseResult(pages=[PageContent(page_number=32, tables=[table])])
+        records = _collect_table_records(
+            result,
+            allow_embedded_headers=True,
+        )
+
+        assert len(records) == 4
+        assert records[0]["raw"]["税率(%)"] == "9、6"
 
     def test_data_contaminated_first_row_is_not_promoted_to_header(self):
         table = TableBlock(
@@ -798,22 +1566,6 @@ class TestGenericTextAndTableRecovery:
             "年末余额/账面价值": "10.00",
         }
 
-    def test_statement_signature_rows_after_grand_total_are_removed(self):
-        table = TableBlock(
-            table_id="statement",
-            headers=["项目", "年末余额", "年初余额"],
-            rows=[
-                TableRow(cells=[CellValue(text="货币资金"), CellValue(text="10.00"), CellValue(text="9.00")]),
-                TableRow(cells=[CellValue(text="资产总计"), CellValue(text="10.00"), CellValue(text="9.00")]),
-                TableRow(cells=[CellValue(text="单位负责人 主管会计工作负责人"), CellValue(), CellValue()]),
-                TableRow(cells=[CellValue(text="均许 印水"), CellValue(), CellValue()]),
-            ],
-        )
-
-        records = _collect_table_records(ParseResult(pages=[PageContent(page_number=6, tables=[table])]))
-
-        assert [record["raw"]["项目"] for record in records] == ["货币资金", "资产总计"]
-
     def test_existing_heading_levels_use_monotonic_scope_and_table_recovery(self):
         result = ParseResult(
             pages=[
@@ -901,10 +1653,7 @@ class TestGenericTextAndTableRecovery:
             ]
         )
 
-        titles = [
-            section["title"]
-            for section in _collect_sections(result, document_type="audit_report")
-        ]
+        titles = [section["title"] for section in _collect_sections(result, document_type="audit_report")]
 
         assert "六、其他综合收益" not in titles
         assert "二、投资活动产生的现金流量" not in titles
@@ -1008,10 +1757,7 @@ class TestGenericTextAndTableRecovery:
             pages=[
                 PageContent(
                     page_number=1,
-                    texts=[
-                        TextBlock(content=f"附录标题{index}", level=TextLevel.H3)
-                        for index in range(205)
-                    ],
+                    texts=[TextBlock(content=f"附录标题{index}", level=TextLevel.H3) for index in range(205)],
                 ),
                 PageContent(
                     page_number=87,
@@ -1027,7 +1773,8 @@ class TestGenericTextAndTableRecovery:
 
     def test_exact_repeated_header_row_is_skipped(self):
         table = TableBlock(
-            table_id="repeated_header", headers=["日期", "金额"],
+            table_id="repeated_header",
+            headers=["日期", "金额"],
             rows=[
                 TableRow(cells=[CellValue(text="日期"), CellValue(text="金额")]),
                 TableRow(cells=[CellValue(text="2024-01-01"), CellValue(text="10.00")]),
@@ -1064,17 +1811,22 @@ class TestGenericTextAndTableRecovery:
 
     def test_low_confidence_non_contiguous_logical_table_uses_physical_tables(self):
         physical_1 = TableBlock(
-            table_id="pt_1_0", headers=["项目", "年末余额"],
+            table_id="pt_1_0",
+            headers=["项目", "年末余额"],
             rows=[TableRow(cells=[CellValue(text="银行存款"), CellValue(text="10.00")])],
         )
         physical_3 = TableBlock(
-            table_id="pt_3_0", headers=["项目", "年末余额"],
+            table_id="pt_3_0",
+            headers=["项目", "年末余额"],
             rows=[TableRow(cells=[CellValue(text="固定资产"), CellValue(text="20.00")])],
         )
         logical = LogicalTable(
-            table_id="lt_0", logical_id="lt_0", headers=["项目", "年末余额"],
+            table_id="lt_0",
+            logical_id="lt_0",
+            headers=["项目", "年末余额"],
             rows=[TableRow(cells=[CellValue(text="错误合并"), CellValue(text="30.00")])],
-            source_physical_ids=["pt_1_0", "pt_3_0"], source_pages=[1, 3],
+            source_physical_ids=["pt_1_0", "pt_3_0"],
+            source_pages=[1, 3],
             merge_confidence=0.62,
             provenance=[RowProvenance(source_page=1, source_table_id="pt_1_0")],
         )
@@ -1093,9 +1845,12 @@ class TestGenericTextAndTableRecovery:
 
     def test_high_confidence_contiguous_logical_table_is_preserved(self):
         logical = LogicalTable(
-            table_id="lt_0", logical_id="lt_0", headers=["项目", "年末余额"],
+            table_id="lt_0",
+            logical_id="lt_0",
+            headers=["项目", "年末余额"],
             rows=[TableRow(cells=[CellValue(text="银行存款"), CellValue(text="10.00")])],
-            source_pages=[1, 2], merge_confidence=0.9,
+            source_pages=[1, 2],
+            merge_confidence=0.9,
             provenance=[RowProvenance(source_page=1, source_table_id="pt_1_0")],
         )
         result = ParseResult(logical_tables=[logical])
@@ -1103,6 +1858,53 @@ class TestGenericTextAndTableRecovery:
         records = _collect_table_records(result)
 
         assert records[0]["source"]["table_id"] == "lt_0"
+
+    def test_uncovered_physical_table_is_not_hidden_by_other_logical_tables(self):
+        covered = TableBlock(
+            table_id="pt_1_0",
+            headers=["项目", "金额"],
+            rows=[TableRow(cells=[CellValue(text="销售额"), CellValue(text="10.00")])],
+        )
+        uncovered = TableBlock(
+            table_id="pt_2_0",
+            headers=["税种", "税额"],
+            rows=[TableRow(cells=[CellValue(text="增值税"), CellValue(text="1.30")])],
+        )
+        covered_late = TableBlock(
+            table_id="pt_3_0",
+            headers=["项目", "金额"],
+            rows=[TableRow(cells=[CellValue(text="利润总额"), CellValue(text="8.70")])],
+        )
+        logical = LogicalTable(
+            table_id="lt_0",
+            logical_id="lt_0",
+            headers=["项目", "金额"],
+            rows=covered.rows,
+            source_physical_ids=["pt_1_0"],
+            source_pages=[1],
+            provenance=[RowProvenance(source_page=1, source_table_id="pt_1_0")],
+        )
+        logical_late = LogicalTable(
+            table_id="lt_1",
+            logical_id="lt_1",
+            headers=["项目", "金额"],
+            rows=covered_late.rows,
+            source_physical_ids=["pt_3_0"],
+            source_pages=[3],
+            provenance=[RowProvenance(source_page=3, source_table_id="pt_3_0")],
+        )
+        result = ParseResult(
+            pages=[
+                PageContent(page_number=1, tables=[covered]),
+                PageContent(page_number=2, tables=[uncovered]),
+                PageContent(page_number=3, tables=[covered_late]),
+            ],
+            logical_tables=[logical, logical_late],
+        )
+
+        records = _collect_table_records(result)
+
+        assert [record["source"]["table_id"] for record in records] == ["lt_0", "pt_2_0", "lt_1"]
 
     def test_canonical_domain_collections_do_not_reenter_scalar_fields(self):
         result = ParseResult(

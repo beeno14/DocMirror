@@ -38,6 +38,7 @@ _EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 _ACCOUNT_RE = re.compile(r"^\d{15,19}$")
 _COMPACT_DATE_RE = re.compile(r"^(?:19|20)\d{6}$")
 _PERCENTAGE_RE = re.compile(r"^[-+]?\d+(?:\.\d+)?%$")
+_DECIMAL_PLACEHOLDER_RE = re.compile(r"^[-‐‑‒–—―−－]{1,3}$")
 _CHAPTER_LABEL_RE = re.compile(r"^第.{1,20}[章节条编款项]$")
 _PLACEHOLDER_HEADER_RE = re.compile(r"^(?:col(?:umn)?|字段|列)[_\s-]*\d+$", re.IGNORECASE)
 
@@ -475,7 +476,7 @@ def _standardize_value(
     col_type: str,
     *,
     currency_hint: str | None = None,
-) -> str | dict[str, Any]:
+) -> str | dict[str, Any] | None:
     """Standardize a single value based on its detected column type."""
     cleaned = _nfkc(raw)
     if not cleaned:
@@ -491,7 +492,11 @@ def _standardize_value(
             if currency:
                 value["currency"] = currency
             return value
-        return cleaned
+        # ``raw`` and ``canonical_raw`` retain the source token.  A typed
+        # decimal column must never repeat an unparseable glyph or a printed
+        # dash placeholder in ``normalized`` because that violates the public
+        # decimal contract and hides whether a number was actually recovered.
+        return None
 
     if col_type in ("date", "datetime"):
         normalized = _valid_normalized_timestamp(cleaned)
@@ -545,28 +550,34 @@ def _infer_column_types(
 
 def _infer_table_column_types(
     table_views: list[tuple[Any, list[int], str]],
+    *,
+    allow_embedded_headers: bool = True,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Infer columns per source table while keeping the public aggregate unchanged."""
+    """Infer columns per projected source-table segment."""
     result: dict[str, dict[str, dict[str, Any]]] = {}
     for table_index, (table, _source_pages, _table_kind) in enumerate(table_views):
-        table_id = str(getattr(table, "logical_id", "") or getattr(table, "table_id", "") or f"table_{table_index}")
-        headers, entries, _header_repaired = _project_table_rows(table)
-        values: dict[str, list[str]] = {header: [] for header in headers}
-        for _row_index, _row, cells in entries:
-            for header, cell in zip(headers, cells):
-                values.setdefault(header, []).append(str(cell or ""))
-        table_columns: dict[str, dict[str, Any]] = {}
-        for header, samples in values.items():
-            column_type, confidence = _infer_generic_type(header, samples)
-            table_columns[header] = {
-                "type": column_type,
-                "confidence": round(confidence, 3),
-                "null_ratio": round(
-                    sum(1 for value in samples if not value.strip()) / max(1, len(samples)),
-                    3,
-                ),
-            }
-        result[table_id] = table_columns
+        base_table_id = str(
+            getattr(table, "logical_id", "") or getattr(table, "table_id", "") or f"table_{table_index}"
+        )
+        segments = _project_table_segments(table, allow_embedded_headers=allow_embedded_headers)
+        for segment_index, (headers, entries, _header_repaired) in enumerate(segments, start=1):
+            table_id = base_table_id if len(segments) == 1 else f"{base_table_id}:segment_{segment_index}"
+            values: dict[str, list[str]] = {header: [] for header in headers}
+            for _row_index, _row, cells in entries:
+                for header, cell in zip(headers, cells):
+                    values.setdefault(header, []).append(str(cell or ""))
+            table_columns: dict[str, dict[str, Any]] = {}
+            for header, samples in values.items():
+                column_type, confidence = _infer_generic_type(header, samples)
+                table_columns[header] = {
+                    "type": column_type,
+                    "confidence": round(confidence, 3),
+                    "null_ratio": round(
+                        sum(1 for value in samples if not value.strip()) / max(1, len(samples)),
+                        3,
+                    ),
+                }
+            result[table_id] = table_columns
     return result
 
 
@@ -648,12 +659,15 @@ def _row_cell_texts(row: Any) -> list[str]:
 
 
 _TABLE_HEADER_LABEL_RE = re.compile(
-    r"项目|名称|序号|类别|类型|性质|账龄|比例|余额|金额|账面|年初|年末|期初|期末|"
-    r"本期|上期|本年|上年|数量|单价|日期|说明|备注|准备|增加|减少|计提|转回|核销|合计|"
+    r"项目|名称|附注|投资方|股份数|栏次|行次|序号|类别|类型|性质|账龄|比例|余额|金额|账面|"
+    r"年初|年末|期初|期末|"
+    r"本月|上月|本期|上期|本年|上年|数量|单价|日期|说明|备注|准备|增加|减少|计提|转回|核销|合计|"
     r"公司名称|注册地|经营地|业务性质|持股比例|表决权比例|直接|间接|取得方式|"
     r"关联方|关系|出租方|承租方|税种|税率|折旧方法|折旧年限|残值率|折旧率|"
     r"形成原因|折算汇率|外币余额|人民币余额|收入|成本"
 )
+_GROUPED_PARENT_HEADER_RE = re.compile(r"余额|金额|本期|上期|本年|上年|期初|期末|年初|年末")
+_NUMERIC_LIST_SAMPLE_RE = re.compile(r"^\d+(?:[、,，/]\d+)+%?$")
 
 
 def _embedded_amount_count(value: Any) -> int:
@@ -699,15 +713,32 @@ def _semantic_table_header_label(value: Any) -> str:
     return label if _TABLE_HEADER_LABEL_RE.search(label) else ""
 
 
-def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int) -> tuple[list[str], int]:
+def _semantic_header_labels(values: list[Any]) -> list[str]:
+    """Return semantic row-local labels."""
+
+    return [_semantic_table_header_label(value) for value in values]
+
+
+def _looks_like_header_numeric_sample(value: Any) -> bool:
+    cleaned = re.sub(r"\s+", "", _clean_label(value)).replace("，", ",")
+    return _normalize_amount_value(cleaned) is not None or bool(_NUMERIC_LIST_SAMPLE_RE.fullmatch(cleaned))
+
+
+def _infer_scanned_table_headers(
+    table: Any,
+    rows: list[Any],
+    column_count: int,
+    *,
+    trusted_start: bool = False,
+) -> tuple[list[str], int]:
     """Promote one to three label rows from OCR bordered grids into semantic headers."""
     metadata = getattr(table, "metadata", None) or {}
     source = str(metadata.get("source") or "")
     layer = str(getattr(table, "extraction_layer", "") or metadata.get("extraction_layer") or "")
     first_labels = [_clean_label(value) for value in (_row_cell_texts(rows[0]) if rows else []) if _clean_label(value)]
-    semantic_header_count = sum(bool(_semantic_table_header_label(value)) for value in first_labels)
+    semantic_header_count = sum(bool(value) for value in _semantic_header_labels(first_labels))
     second_semantic_header_count = sum(
-        bool(_semantic_table_header_label(value)) for value in (_row_cell_texts(rows[1]) if len(rows) > 1 else [])
+        bool(value) for value in _semantic_header_labels(_row_cell_texts(rows[1]) if len(rows) > 1 else [])
     )
     sparse_parent_then_headers = bool(
         semantic_header_count == 1
@@ -717,7 +748,7 @@ def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int)
     scanned_source = source == "scanned_bordered_table_reconstructor" or layer == "scanned_image_line_grid"
     # Logical-table assembly does not retain the physical OCR source metadata.
     # In that case require at least two explicit header labels before promotion.
-    if not scanned_source and semantic_header_count < 2 and not sparse_parent_then_headers:
+    if not trusted_start and not scanned_source and semantic_header_count < 2 and not sparse_parent_then_headers:
         return [], 0
 
     header_rows: list[list[str]] = []
@@ -732,15 +763,32 @@ def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int)
                 return [], 0
             break
         numeric_count = sum(
-            _normalize_amount_value(value) is not None
+            _looks_like_header_numeric_sample(value)
             or bool(re.search(r"(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d+\.\d{2,})(?!\d)", value))
             for value in nonempty
         )
-        semantic_labels = [_semantic_table_header_label(value) for value in values]
+        semantic_labels = _semantic_header_labels(values)
         semantic_count = sum(bool(value) for value in semantic_labels)
+        grouped_parent = bool(
+            header_rows and len({value for value in header_rows[0] if _GROUPED_PARENT_HEADER_RE.search(value)}) >= 2
+        )
+        if grouped_parent and not numeric_count and semantic_count < 2:
+            textual_children = [
+                _clean_label(value)
+                if _clean_label(value)
+                and len(_clean_label(value)) <= 30
+                and re.search(r"[A-Za-z\u3400-\u9fff]", _clean_label(value))
+                else ""
+                for value in values
+            ]
+            if sum(bool(value) for value in textual_children) >= 2:
+                semantic_labels = textual_children
+                semantic_count = sum(bool(value) for value in semantic_labels)
         # A numeric-looking last row is commonly a vertically merged
         # header+data row.  Promoting it would erase the table's only record.
         if numeric_count and header_row_index >= len(rows) - 1:
+            break
+        if trusted_start and header_rows and numeric_count >= 2:
             break
         if numeric_count and sum(bool(value) for value in semantic_labels) < 2:
             break
@@ -755,6 +803,8 @@ def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int)
         )
         if not header_rows and semantic_count < 2 and not sparse_group_parent:
             return [], 0
+        if header_rows and semantic_count == 0:
+            break
         expanded = ["" for _ in range(column_count)]
         for column, cell in enumerate(cells[:column_count]):
             label = semantic_labels[column]
@@ -772,15 +822,24 @@ def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int)
     if len(header_rows) >= 2:
         parent_row, child_row = header_rows[0], header_rows[1]
         child_columns = [index for index, value in enumerate(child_row) if value and value != "项目"]
-        for parent_column, parent in enumerate(parent_row):
-            if (
-                parent
-                and re.search(r"余额|金额|本期|上期|本年|上年|期初|期末|年初|年末", parent)
-                and len(child_columns) >= 2
-                and min(child_columns) <= parent_column <= max(child_columns)
-            ):
+        parent_anchors = [
+            (column, parent)
+            for column, parent in enumerate(parent_row)
+            if parent and (column == 0 or parent_row[column - 1] != parent)
+        ]
+        if len(parent_anchors) == 1 and len(child_columns) >= 2:
+            parent_column, parent = parent_anchors[0]
+            if re.search(r"余额|金额|本期|上期|本年|上年|期初|期末|年初|年末", parent) and min(
+                child_columns
+            ) <= parent_column <= max(child_columns):
                 for target in range(min(child_columns), max(child_columns) + 1):
                     parent_row[target] = parent
+        else:
+            for anchor_index, (parent_column, parent) in enumerate(parent_anchors):
+                end = parent_anchors[anchor_index + 1][0] if anchor_index + 1 < len(parent_anchors) else column_count
+                for target in range(parent_column, end):
+                    if child_row[target]:
+                        parent_row[target] = parent
 
     parts: list[list[str]] = [[] for _ in range(column_count)]
     for row in header_rows:
@@ -799,6 +858,346 @@ def _infer_scanned_table_headers(table: Any, rows: list[Any], column_count: int)
     if covered / max(1, column_count) < 0.5 or semantic < 2 or unique < 2:
         return [], 0
     return headers, len(header_rows)
+
+
+def _embedded_header_start(rows: list[Any]) -> int | None:
+    """Find an evidence-backed header band inside a full-page form grid."""
+    scan_limit = len(rows)
+    for index in range(scan_limit):
+        values = [_clean_label(value) for value in _row_cell_texts(rows[index])]
+        nonempty = [value for value in values if value]
+        semantic_count = sum(bool(value) for value in _semantic_header_labels(nonempty))
+        grouped_parent_count = sum(bool(_GROUPED_PARENT_HEADER_RE.search(value)) for value in nonempty)
+        sequence_label = any(re.search(r"栏次|行次|序号", value) for value in nonempty)
+        ordinal_follows = any(
+            _is_header_ordinal_row(_row_cell_texts(rows[next_index]))
+            for next_index in range(index + 1, min(index + 4, scan_limit))
+        )
+        next_semantic = 0
+        if index + 1 < scan_limit:
+            next_values = [_clean_label(value) for value in _row_cell_texts(rows[index + 1]) if _clean_label(value)]
+            next_semantic = sum(bool(value) for value in _semantic_header_labels(next_values))
+            next_numeric = sum(_looks_like_header_numeric_sample(value) for value in next_values)
+            next_textual = sum(
+                bool(re.search(r"[A-Za-z\u3400-\u9fff]", value)) and _normalize_amount_value(value) is None
+                for value in next_values
+            )
+        else:
+            next_numeric = 0
+            next_textual = 0
+        if semantic_count >= 2 and (
+            sequence_label
+            or ordinal_follows
+            or next_semantic >= 2
+            or next_numeric >= 1
+            or (grouped_parent_count >= 2 and next_textual >= 2)
+        ):
+            return index
+    return None
+
+
+def _complete_explicit_grouped_headers(
+    headers: list[str],
+    rows: list[Any],
+) -> tuple[list[str], int]:
+    """Combine an explicit grouped parent header with its first child row.
+
+    Native PDF table extractors commonly expose spanning parents such as
+    ``期末余额`` in ``TableBlock.headers`` while leaving the textual child
+    labels as row zero.  The repair is enabled only when placeholder columns,
+    at least two independent period groups, and a fully textual child band all
+    agree on the same column geometry.
+    """
+
+    if not rows or len(headers) < 3 or not any(_PLACEHOLDER_HEADER_RE.fullmatch(header) for header in headers):
+        return headers, 0
+
+    expanded_parents: list[str] = []
+    active_group = ""
+    repaired_placeholder_count = 0
+    for header in headers:
+        if _PLACEHOLDER_HEADER_RE.fullmatch(header):
+            expanded_parents.append(active_group)
+            repaired_placeholder_count += bool(active_group)
+            continue
+        expanded_parents.append(header)
+        active_group = header if _GROUPED_PARENT_HEADER_RE.search(header) else ""
+    grouped_columns = {
+        index for index, header in enumerate(expanded_parents) if _GROUPED_PARENT_HEADER_RE.search(header)
+    }
+    grouped_parents = {expanded_parents[index] for index in grouped_columns}
+    if repaired_placeholder_count == 0 or len(grouped_parents) < 2:
+        return headers, 0
+
+    values = [_clean_label(value) for value in _row_cell_texts(rows[0])]
+    values.extend("" for _ in range(len(headers) - len(values)))
+    values = values[: len(headers)]
+    nonempty_columns = {index for index, value in enumerate(values) if value}
+    child_columns = nonempty_columns.intersection(grouped_columns)
+    if len(child_columns) < 2 or nonempty_columns.difference(grouped_columns.union({0})):
+        return headers, 0
+    if any(
+        _normalize_amount_value(values[index]) is not None
+        or len(values[index]) > 30
+        or not re.search(r"[A-Za-z\u3400-\u9fff]", values[index])
+        for index in child_columns
+    ):
+        return headers, 0
+
+    completed: list[str] = []
+    for index, parent in enumerate(expanded_parents):
+        child = values[index]
+        if child and parent and child.casefold() != parent.casefold():
+            completed.append(f"{parent}/{child}")
+        else:
+            completed.append(child or parent)
+    normalized, _repaired = _normalize_headers(completed, len(headers))
+    return normalized, 1
+
+
+def _complete_explicit_stacked_headers(
+    headers: list[str],
+    rows: list[Any],
+) -> tuple[list[str], int]:
+    """Merge source child headers with two spanning parent rows at table start."""
+
+    width = len(headers)
+    placeholder_count = sum(bool(_PLACEHOLDER_HEADER_RE.fullmatch(header)) for header in headers)
+    if width < 4 or len(rows) < 3 or placeholder_count < max(2, width // 4):
+        return headers, 0
+
+    first_cells = list(getattr(rows[0], "cells", []) or [])
+    second_cells = list(getattr(rows[1], "cells", []) or [])
+    third_values = [_clean_label(value) for value in _row_cell_texts(rows[2])]
+    third_values.extend("" for _ in range(width - len(third_values)))
+    first_nonempty = [_clean_label(getattr(cell, "text", cell)) for cell in first_cells]
+    second_nonempty = [_clean_label(getattr(cell, "text", cell)) for cell in second_cells]
+    first_nonempty = [value for value in first_nonempty if value]
+    second_nonempty = [value for value in second_nonempty if value]
+    if (
+        not 2 <= len(first_nonempty) <= 3
+        or len(second_nonempty) < 3
+        or not any(int(getattr(cell, "col_span", 1) or 1) >= max(2, width // 2) for cell in first_cells)
+        or any(_normalize_amount_value(value) is not None for value in first_nonempty + second_nonempty)
+    ):
+        return headers, 0
+    explicit_matches = sum(
+        bool(value) and not _PLACEHOLDER_HEADER_RE.fullmatch(header) and value.casefold() == header.casefold()
+        for header, value in zip(headers, third_values)
+    )
+    if explicit_matches < 2:
+        return headers, 0
+
+    header_rows: list[list[str]] = []
+    for cells in (first_cells, second_cells):
+        expanded = ["" for _ in range(width)]
+        for column, cell in enumerate(cells[:width]):
+            label = _clean_label(getattr(cell, "text", cell))
+            if not label:
+                continue
+            span = max(1, int(getattr(cell, "col_span", 1) or 1))
+            for target in range(column, min(width, column + span)):
+                expanded[target] = label
+        header_rows.append(expanded)
+
+    completed: list[str] = []
+    for column, explicit in enumerate(headers):
+        parts = [row[column] for row in header_rows if row[column]]
+        if not _PLACEHOLDER_HEADER_RE.fullmatch(explicit):
+            parts.append(explicit)
+        completed.append("/".join(dict.fromkeys(parts)))
+    if sum(bool(value) for value in completed) / width < 0.75:
+        return headers, 0
+    return _normalize_headers(completed, width)[0], 3
+
+
+def _grouped_child_header_bands(
+    rows: list[Any],
+    headers: list[str],
+) -> list[tuple[int, list[str], int]]:
+    """Find an adjacent grouped table whose child labels replace the prior schema."""
+
+    if len(headers) < 3 or not any("/" in header for header in headers):
+        return []
+    parents = [header.split("/", 1)[0] for header in headers]
+    grouped_columns = {index for index, parent in enumerate(parents) if _GROUPED_PARENT_HEADER_RE.search(parent)}
+    grouped_parents = list(dict.fromkeys(parents[index] for index in sorted(grouped_columns)))
+    if len(grouped_parents) < 2:
+        return []
+
+    bands: list[tuple[int, list[str], int]] = []
+    for row_index, row in enumerate(rows[:-1]):
+        values = [_clean_label(value) for value in _row_cell_texts(row)]
+        values.extend("" for _ in range(len(headers) - len(values)))
+        values = values[: len(headers)]
+        if values[0] or any(values[index] for index in range(len(values)) if index not in grouped_columns):
+            continue
+        child_columns = {index for index in grouped_columns if values[index]}
+        if len(child_columns) < 2 or any(
+            _normalize_amount_value(values[index]) is not None
+            or len(values[index]) > 30
+            or not re.search(r"[A-Za-z\u3400-\u9fff]", values[index])
+            for index in child_columns
+        ):
+            continue
+        child_sequences = [
+            tuple(values[index] for index in sorted(grouped_columns) if parents[index] == parent and values[index])
+            for parent in grouped_parents
+        ]
+        if (
+            len(child_sequences) < 2
+            or len(child_sequences[0]) < 2
+            or any(sequence != child_sequences[0] for sequence in child_sequences[1:])
+        ):
+            continue
+        next_values = [_clean_label(value) for value in _row_cell_texts(rows[row_index + 1])]
+        next_values.extend("" for _ in range(len(headers) - len(next_values)))
+        if (
+            sum(
+                _normalize_amount_value(next_values[index]) is not None
+                for index in grouped_columns
+                if index < len(next_values)
+            )
+            < 2
+        ):
+            continue
+        derived = [
+            f"{parents[index]}/{values[index]}" if index in grouped_columns and values[index] else headers[index]
+            for index in range(len(headers))
+        ]
+        bands.append((row_index, _normalize_headers(derived, len(headers))[0], 1))
+    return bands
+
+
+def _is_header_ordinal_row(cells: list[str]) -> bool:
+    """Recognize column ordinals/formulas printed below a semantic header band."""
+    nonempty = [_clean_label(value) for value in cells if _clean_label(value)]
+    if len(nonempty) < 3 or all(_clean_label(value) for value in cells[:2]):
+        return False
+    ordinal = re.compile(r"^\d{1,3}(?:\s*[=+−≤≥<>-].{1,20})?$")
+    return sum(bool(ordinal.fullmatch(value)) for value in nonempty) / len(nonempty) >= 0.7
+
+
+_FORM_FOOTER_RE = re.compile(r"声明.*真实性|纳税人.*签章|经办人名称|受理税务机关|代理机构签章")
+_FORM_NUMBER_RE = re.compile(r"^(?:[-+−—一]?\d[\d,]*(?:\.\d+)?|[-−—一|]+)$")
+_FORM_ORDINAL_RE = re.compile(r"^\d{1,3}[A-Za-z]?(?:[=＝+−≤≥<>-].+)?$")
+
+
+def _is_form_footer_row(cells: list[str]) -> bool:
+    return bool(_FORM_FOOTER_RE.search(" ".join(_clean_label(value) for value in cells if _clean_label(value))))
+
+
+def _is_form_number(value: str) -> bool:
+    compact = re.sub(r"\s+", "", value).replace("，", ",")
+    return bool(_FORM_NUMBER_RE.fullmatch(compact) or _FORM_ORDINAL_RE.fullmatch(compact))
+
+
+def _split_at_persistent_schema_drift(
+    segment: tuple[list[str], list[tuple[int, Any, list[str]]], bool],
+) -> list[tuple[list[str], list[tuple[int, Any, list[str]]], bool]]:
+    """Fall back to positional columns when a numeric column persistently becomes text."""
+    headers, entries, repaired = segment
+    if len(entries) < 7:
+        return [segment]
+    width = len(headers)
+    drift_at: int | None = None
+    for column in range(width):
+        baseline = [
+            re.sub(r"\s+", "", cells[column]).replace("，", ",")
+            for _row_index, _row, cells in entries[:4]
+            if column < len(cells) and _clean_label(cells[column])
+        ]
+        if len(baseline) < 3 or sum(_is_form_number(value) for value in baseline) < 3:
+            continue
+        for index in range(4, len(entries) - 2):
+            values = [
+                _clean_label(cells[column]) if column < len(cells) else ""
+                for _row_index, _row, cells in entries[index : index + 3]
+            ]
+            if all(len(value) >= 4 and not _is_form_number(value) for value in values):
+                drift_at = index if drift_at is None else min(drift_at, index)
+                break
+    if drift_at is None:
+        return [segment]
+    positional = [f"col_{index}" for index in range(width)]
+    return [
+        (headers, entries[:drift_at], repaired),
+        (positional, entries[drift_at:], True),
+    ]
+
+
+def _project_table_segments(
+    table: Any,
+    *,
+    allow_embedded_headers: bool,
+) -> list[tuple[list[str], list[tuple[int, Any, list[str]]], bool]]:
+    """Project explicit embedded header bands without trimming rows by sequence values."""
+    if not allow_embedded_headers:
+        return [_project_table_rows(table)]
+    rows = list(getattr(table, "rows", []) or [])
+    column_count = max(
+        len(getattr(table, "headers", []) or []),
+        max((len(getattr(row, "cells", []) or []) for row in rows), default=0),
+    )
+    source_headers = _normalize_headers(list(getattr(table, "headers", []) or []), column_count)[0]
+    effective_headers, _initial_header_rows = _complete_explicit_stacked_headers(source_headers, rows)
+    if not _initial_header_rows:
+        effective_headers, _initial_header_rows = _complete_explicit_grouped_headers(source_headers, rows)
+    bands = _grouped_child_header_bands(rows, effective_headers)
+    cursor = 0
+    while cursor < len(rows):
+        relative_start = _embedded_header_start(rows[cursor:])
+        if relative_start is None:
+            break
+        start = cursor + relative_start
+        headers, header_rows = _infer_scanned_table_headers(
+            table,
+            rows[start:],
+            column_count,
+            trusted_start=True,
+        )
+        if headers and header_rows:
+            if not any(existing_start == start for existing_start, _headers, _rows in bands):
+                bands.append((start, _normalize_headers(headers, column_count)[0], header_rows))
+            cursor = start + header_rows
+        else:
+            cursor = start + 1
+    bands.sort(key=lambda band: band[0])
+    if not bands:
+        return _split_at_persistent_schema_drift(_project_table_rows(table))
+
+    segments: list[tuple[list[str], list[tuple[int, Any, list[str]]], bool]] = []
+    if bands[0][0] > 0 and getattr(table, "headers", None):
+        prefix_headers, prefix_entries, prefix_repaired = _project_table_rows(table)
+        prefix_entries = [entry for entry in prefix_entries if entry[0] < bands[0][0]]
+        if prefix_entries:
+            prefix_headers, _trimmed_columns = _trim_empty_trailing_projected_columns(
+                prefix_headers,
+                prefix_entries,
+            )
+            segments.append((prefix_headers, prefix_entries, prefix_repaired))
+    for index, (start, headers, header_rows) in enumerate(bands):
+        end = bands[index + 1][0] if index + 1 < len(bands) else len(rows)
+        entries: list[tuple[int, Any, list[str]]] = []
+        for row_index in range(start + header_rows, end):
+            row = rows[row_index]
+            row_type = str(getattr(getattr(row, "row_type", ""), "value", getattr(row, "row_type", ""))).lower()
+            cells = _row_cell_texts(row)
+            if _is_form_footer_row(cells):
+                break
+            if (
+                row_type in {"header", "separator"}
+                or not any(_clean_label(value) for value in cells)
+                or _is_header_ordinal_row(cells)
+                or _is_repeated_header_row(cells, headers)
+            ):
+                continue
+            entries.append((row_index, row, cells))
+        if entries:
+            headers, _trimmed_columns = _trim_empty_trailing_projected_columns(headers, entries)
+            segments.append((headers, entries, True))
+    projected = segments or [_project_table_rows(table)]
+    return [part for segment in projected for part in _split_at_persistent_schema_drift(segment)]
 
 
 def _infer_first_label_header(headers: list[str], entries: list[tuple[int, Any, list[str]]]) -> list[str]:
@@ -844,38 +1243,6 @@ def _infer_first_label_header(headers: list[str], entries: list[tuple[int, Any, 
     return repaired
 
 
-def _trim_trailing_statement_noise(
-    entries: list[tuple[int, Any, list[str]]], headers: list[str]
-) -> list[tuple[int, Any, list[str]]]:
-    """Remove signatures and seals captured below a completed financial statement."""
-    if "项目" not in headers or not any(
-        any(marker in header for marker in ("余额", "金额", "发生额")) for header in headers
-    ):
-        return entries
-    total_re = re.compile(r"^(?:资产总计|负债和所有者权益(?:或股东权益)?总计|期末现金及现金等价物余额)$")
-    total_index = next(
-        (
-            index
-            for index in range(len(entries) - 1, -1, -1)
-            if entries[index][2] and total_re.fullmatch(_clean_label(entries[index][2][0]))
-        ),
-        None,
-    )
-    if total_index is None or total_index == len(entries) - 1:
-        return entries
-    trailing = entries[total_index + 1 :]
-    has_amount = any(
-        _normalize_amount_value(value) is not None
-        for _row_index, _row, cells in trailing
-        for value in cells[1:]
-        if _clean_label(value)
-    )
-    trailing_text = " ".join(value for _index, _row, cells in trailing for value in cells)
-    if not has_amount and re.search(r"负责人|会计机构|主管会计|签名|签章|印章", trailing_text):
-        return entries[: total_index + 1]
-    return entries
-
-
 def _project_table_rows(table: Any) -> tuple[list[str], list[tuple[int, Any, list[str]]], bool]:
     rows = list(getattr(table, "rows", []) or [])
     source_headers = list(getattr(table, "headers", None) or [])
@@ -889,18 +1256,47 @@ def _project_table_rows(table: Any) -> tuple[list[str], list[tuple[int, Any, lis
         if inferred:
             source_headers = inferred
     headers, header_repaired = _normalize_headers(source_headers, column_count)
+    if source_headers:
+        completed_headers, completed_header_rows = _complete_explicit_stacked_headers(headers, rows)
+        if not completed_header_rows:
+            completed_headers, completed_header_rows = _complete_explicit_grouped_headers(headers, rows)
+        if completed_header_rows:
+            headers = completed_headers
+            inferred_header_rows = completed_header_rows
+            header_repaired = True
     entries: list[tuple[int, Any, list[str]]] = []
     for row_index, row in enumerate(rows):
         if row_index < inferred_header_rows:
             continue
+        row_type = str(getattr(getattr(row, "row_type", ""), "value", getattr(row, "row_type", ""))).lower()
+        if row_type in {"header", "separator"}:
+            continue
         cells = _row_cell_texts(row)
         if not any(value.strip() for value in cells):
+            continue
+        if _is_header_ordinal_row(cells):
             continue
         if _is_repeated_header_row(cells, headers) or _is_embedded_header_row(cells, headers):
             continue
         entries.append((row_index, row, cells))
     headers = _infer_first_label_header(headers, entries)
-    return headers, _trim_trailing_statement_noise(entries, headers), header_repaired
+    return headers, entries, header_repaired
+
+
+def _trim_empty_trailing_projected_columns(
+    headers: list[str],
+    entries: list[tuple[int, Any, list[str]]],
+) -> tuple[list[str], bool]:
+    trimmed = list(headers)
+    while (
+        trimmed
+        and _PLACEHOLDER_HEADER_RE.fullmatch(trimmed[-1])
+        and not any(
+            len(cells) >= len(trimmed) and _clean_label(cells[len(trimmed) - 1]) for _index, _row, cells in entries
+        )
+    ):
+        trimmed.pop()
+    return trimmed, len(trimmed) < len(headers)
 
 
 def _is_repeated_header_row(cells: list[str], headers: list[str]) -> bool:
@@ -933,7 +1329,7 @@ def _looks_like_typed_candidate(value: Any, column_type: str) -> bool:
     if not text:
         return False
     if column_type == "amount":
-        return bool(re.search(r"\d|[¥￥$€£]", text))
+        return not _DECIMAL_PLACEHOLDER_RE.fullmatch(re.sub(r"\s+", "", text))
     if column_type in {"date", "datetime", "percentage"}:
         return bool(re.search(r"\d", text) or (column_type == "percentage" and "%" in text))
     if column_type == "phone":
@@ -991,6 +1387,12 @@ def _looks_like_scalar_text_kv(key: str, value: str) -> bool:
     """Reject prose clauses and serialized table rows while preserving concise labels."""
     if not 2 <= len(key) <= 30 or key in _TEXT_KV_CLAUSE_KEYS:
         return False
+    if key.count("(") != key.count(")") or key.count("（") != key.count("）"):
+        return False
+    if re.search(r"[\t\r\n]", value) or (
+        not key.endswith(_OCR_LONG_VALUE_SUFFIXES) and re.search(r"[\u3400-\u9fff]{2,20}\s*[:：]", value)
+    ):
+        return False
     if "|" in key or "|" in value or re.search(r"[,，;；。！？?!]", key):
         return False
     if key.endswith(_TEXT_KV_CLAUSE_ENDINGS):
@@ -1014,6 +1416,8 @@ def _looks_like_ocr_field(key: str, value: Any) -> bool:
     if re.match(r"^[（(]?\d", key) or key.endswith(("其中", " 加", " 减", "加", "减")):
         return False
     if len(key) > 20 and not key.endswith(_OCR_LONG_VALUE_SUFFIXES):
+        return False
+    if key.endswith("名称") and len(re.sub(r"[^A-Za-z\u3400-\u9fff]", "", text)) < 4:
         return False
     hint = _generic_header_hint(key)
     strong_label = (
@@ -1708,7 +2112,17 @@ def _collect_entity_fields(parse_result: Any, *, ocr_precision: bool = False) ->
         for kv in getattr(page, "key_values", []) or []:
             key = _clean_label(getattr(kv, "key", None))
             val = _nfkc(getattr(kv, "value", None))
-            if key and val and key not in fields:
+            replace_invalid_name = bool(
+                key.endswith("名称")
+                and key in fields
+                and not _looks_like_ocr_field(key, fields[key])
+                and _looks_like_ocr_field(key, val)
+            )
+            if (
+                (key not in fields or replace_invalid_name)
+                and _is_public_field(key, val)
+                and _looks_like_scalar_text_kv(key, val)
+            ):
                 fields[key] = val
 
     if ocr_precision and _parse_result_has_ocr(parse_result):
@@ -1847,6 +2261,7 @@ def _select_generic_tables(parse_result: Any) -> list[tuple[Any, list[int], str]
 
     selected: list[tuple[Any, list[int], str]] = []
     used_physical: set[int] = set()
+    covered_physical: set[int] = set()
     for table in logical:
         source_pages = [int(page) for page in (getattr(table, "source_pages", []) or []) if int(page) > 0]
         source_ids = [str(value) for value in (getattr(table, "source_physical_ids", []) or []) if value]
@@ -1861,6 +2276,7 @@ def _select_generic_tables(parse_result: Any) -> list[tuple[Any, list[int], str]
         ]
         if not source_views and source_pages:
             source_views = [view for view in physical if view[1][0] in source_pages]
+        covered_physical.update(id(view[0]) for view in source_views)
 
         signatures = {
             tuple(_clean_label(header) for header in (getattr(view[0], "headers", []) or []))
@@ -1879,49 +2295,95 @@ def _select_generic_tables(parse_result: Any) -> list[tuple[Any, list[int], str]
                     selected.append(view)
             continue
         selected.append((table, source_pages, "logical_table"))
-    return _deduplicate_table_views(selected)
+    selected.extend(view for view in physical if id(view[0]) not in covered_physical)
+    deduplicated = _deduplicate_table_views(selected)
+    return sorted(deduplicated, key=lambda view: min(view[1]) if view[1] else 10**9)
+
+
+def _row_source_refs(row: Any, headers: list[str], source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return one physical source reference per projected cell."""
+    refs: list[dict[str, Any]] = []
+    row_refs = [ref for ref in (getattr(row, "source_cell_refs", []) or []) if isinstance(ref, dict)]
+    source_row = int(source.get("source_row_index", source["table_row_index"]))
+    for column, (header, cell) in enumerate(zip(headers, getattr(row, "cells", []) or [])):
+        cell_refs = [ref for ref in (getattr(cell, "source_cell_refs", []) or []) if isinstance(ref, dict)]
+        candidates = cell_refs or [ref for ref in row_refs if ref.get("col") in (None, "", column)]
+        if not candidates and source.get("physical_table_id") and source.get("page"):
+            candidates = [{}]
+        for candidate in candidates:
+            ref = dict(candidate)
+            ref.setdefault("page", source.get("page", 0))
+            ref.setdefault("table_id", source.get("physical_table_id") or source["table_id"])
+            ref.setdefault("row", source_row)
+            ref.setdefault("col", column)
+            ref.setdefault("field_name", header)
+            if int(getattr(cell, "row_span", 1) or 1) > 1:
+                ref.setdefault("row_span", int(getattr(cell, "row_span", 1)))
+            if int(getattr(cell, "col_span", 1) or 1) > 1:
+                ref.setdefault("col_span", int(getattr(cell, "col_span", 1)))
+            if ref not in refs:
+                refs.append(ref)
+    return refs
 
 
 def _collect_table_records(
     parse_result: Any,
     table_views: list[tuple[Any, list[int], str]] | None = None,
+    *,
+    allow_embedded_headers: bool = False,
 ) -> list[dict[str, Any]]:
     """Collect table records from ParseResult into raw rows."""
     records: list[dict[str, Any]] = []
     tables = table_views if table_views is not None else _select_generic_tables(parse_result)
-
-    row_index = 0
     for table_index, (table, source_pages, table_kind) in enumerate(tables):
-        table_id = str(getattr(table, "logical_id", "") or getattr(table, "table_id", "") or f"table_{table_index}")
+        base_table_id = str(
+            getattr(table, "logical_id", "") or getattr(table, "table_id", "") or f"table_{table_index}"
+        )
         provenance = list(getattr(table, "provenance", []) or [])
-        headers, entries, header_repaired = _project_table_rows(table)
-        for table_row_index, _row, cells in entries:
-            row_index += 1
-            raw = {str(h): str(c) for h, c in zip(headers, cells)}
-            source: dict[str, Any] = {"table_id": table_id, "table_row_index": table_row_index}
-            if header_repaired:
-                source["header_repaired"] = True
-            if table_row_index < len(provenance):
-                prov = provenance[table_row_index]
-                prov_page = int(getattr(prov, "source_page", 0) or 0)
-                if prov_page:
-                    source["page"] = prov_page
-                physical_id = str(getattr(prov, "source_table_id", "") or "")
-                if physical_id:
-                    source["physical_table_id"] = physical_id
-            elif table_kind == "physical_table" and source_pages:
-                source["page"] = source_pages[0]
-                source["physical_table_id"] = table_id
-            elif source_pages:
-                source["pages"] = source_pages
-            records.append(
-                {
-                    "row_index": row_index,
-                    "raw": raw,
-                    "normalized": {},
-                    "source": source,
-                }
-            )
+        segments = _project_table_segments(table, allow_embedded_headers=allow_embedded_headers)
+        for segment_index, (headers, entries, header_repaired) in enumerate(segments, start=1):
+            table_id = base_table_id if len(segments) == 1 else f"{base_table_id}:segment_{segment_index}"
+            semantic_headers = [header for header in headers if not _PLACEHOLDER_HEADER_RE.fullmatch(header)]
+            if not semantic_headers and (len(entries) < 2 or len(headers) < 2):
+                continue
+            for table_row_index, row, cells in entries:
+                source: dict[str, Any] = {"table_id": table_id, "table_row_index": table_row_index}
+                if header_repaired:
+                    source["header_repaired"] = True
+                if table_row_index < len(provenance):
+                    prov = provenance[table_row_index]
+                    source["page"] = int(getattr(prov, "source_page", 0) or 0)
+                    source["physical_table_id"] = str(getattr(prov, "source_table_id", "") or "")
+                    source["source_row_index"] = int(getattr(prov, "source_row_index", table_row_index))
+                elif table_kind == "physical_table" and source_pages:
+                    source.update(
+                        page=source_pages[0],
+                        physical_table_id=base_table_id,
+                        source_row_index=table_row_index,
+                    )
+                elif source_pages:
+                    source["pages"] = source_pages
+                refs = _row_source_refs(row, headers, source)
+                if refs:
+                    source["source_cell_refs"] = refs
+                evidence_ids = list(
+                    dict.fromkeys(
+                        str(value)
+                        for item in [row, *(getattr(row, "cells", []) or [])]
+                        for value in (getattr(item, "evidence_ids", []) or [])
+                        if value
+                    )
+                )
+                if evidence_ids:
+                    source["evidence_ids"] = evidence_ids
+                records.append(
+                    {
+                        "row_index": len(records) + 1,
+                        "raw": {str(header): str(cell) for header, cell in zip(headers, cells)},
+                        "normalized": {},
+                        "source": source,
+                    }
+                )
     return records
 
 
@@ -2368,8 +2830,8 @@ def _generic_precision_warnings(
             and _looks_like_typed_candidate((record.get("raw") or {}).get(key), column_type)
         ]
         failures = [pair for pair in pairs if not isinstance(pair[1], dict)]
-        if len(failures) >= 3 and len(failures) / max(1, len(pairs)) >= 0.1:
-            warnings.append(f"precision:generic_normalization_failed:{key}")
+        if failures:
+            warnings.append(f"precision:generic_normalization_failed:{key}:count={len(failures)}")
         if column_type == "amount":
             normalized_amounts = [normalized for _raw, normalized in pairs if isinstance(normalized, dict)]
             if normalized_amounts and any(not normalized.get("currency") for normalized in normalized_amounts):
@@ -2454,7 +2916,15 @@ def derive_generic_projection(
     fields = _drop_redundant_generic_fields(fields)
     accepted_text_metadata = {key: value for key, value in accepted_text_metadata.items() if key in fields}
     table_views = _select_generic_tables(parse_result)
-    records = _collect_table_records(parse_result, table_views)
+    records = _collect_table_records(
+        parse_result,
+        table_views,
+        allow_embedded_headers=True,
+    )
+    table_record_groups: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        table_record_groups.setdefault(str(source.get("table_id") or "records"), []).append(record)
     recovered_records: list[dict[str, Any]] = []
     recovered_columns: dict[str, dict[str, Any]] = {}
     recovered_table: dict[str, Any] | None = None
@@ -2477,6 +2947,20 @@ def derive_generic_projection(
                     },
                 }
             )
+
+    dataset_records: dict[str, list[dict[str, Any]]] = {}
+    if len(table_record_groups) == 1:
+        dataset_records["records"] = next(iter(table_record_groups.values()))
+    elif table_record_groups:
+        dataset_records.update(
+            {f"table_{index:03d}": group for index, group in enumerate(table_record_groups.values(), start=1)}
+        )
+    if recovered_records:
+        dataset_records.setdefault("records", []).extend(recovered_records)
+    if structure_records:
+        projected_rows = [record for record in records if record.get("record_type") == "structure_projection"]
+        target_dataset = "records" if not dataset_records else "structure_records"
+        dataset_records.setdefault(target_dataset, []).extend(projected_rows)
 
     # ── Heuristic column type detection ──
     all_tables = [table for table, _source_pages, _kind in table_views]
@@ -2572,6 +3056,7 @@ def derive_generic_projection(
 
     structured_data = {
         "records": records,
+        "datasets": dataset_records,
         "summary": summary,
         "sections": sections,
         "tables": table_descriptors,

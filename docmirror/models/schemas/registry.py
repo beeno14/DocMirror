@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -238,8 +237,8 @@ def validate_projection_payload(name: str, payload: dict[str, Any]) -> Projectio
     """Validate a projection payload against the registered JSON schema.
 
     Full JSON Schema validation is used when ``jsonschema`` is installed. In
-    minimal environments, this still verifies that the schema exists and all
-    top-level required keys are present.
+    minimal environments, this still verifies required top-level and simple
+    conditional consumer-contract keys.
     """
     schema = load_projection_schema_json(name)
     if schema is None:
@@ -254,8 +253,13 @@ def validate_projection_payload(name: str, payload: dict[str, Any]) -> Projectio
             errors = ()
         return ProjectionSchemaValidation(name=name, valid=not errors, errors=errors)
     except ImportError:
-        missing = [key for key in schema.get("required", []) if key not in payload]
-        errors = list(f"missing required key: {key}" for key in missing)
+        errors = list(_minimal_schema_required_errors(payload, schema))
+        if schema.get("additionalProperties") is False:
+            allowed = set((schema.get("properties") or {}).keys())
+            errors.extend(f"unexpected top-level key: {key}" for key in payload if key not in allowed)
+        forbidden_required = ((schema.get("not") or {}).get("required") or [])
+        if forbidden_required and all(key in payload for key in forbidden_required):
+            errors.append(f"forbidden top-level key set: {','.join(map(str, forbidden_required))}")
         if not errors:
             if name == "personal_credit_report_detailed":
                 errors.extend(_personal_detail_invariant_errors(payload))
@@ -266,6 +270,55 @@ def validate_projection_payload(name: str, payload: dict[str, Any]) -> Projectio
         )
     except Exception as exc:
         return ProjectionSchemaValidation(name=name, valid=False, errors=(str(exc),))
+
+
+def _minimal_schema_required_errors(payload: dict[str, Any], schema: dict[str, Any]) -> tuple[str, ...]:
+    """Validate required keys and the simple ``if``/``then`` form used by delivery schemas."""
+
+    errors = [f"missing required key: {key}" for key in schema.get("required", []) if key not in payload]
+    for clause in schema.get("allOf") or []:
+        condition = clause.get("if") if isinstance(clause, dict) else None
+        consequence = clause.get("then") if isinstance(clause, dict) else None
+        if not isinstance(condition, dict) or not isinstance(consequence, dict):
+            continue
+        if not _minimal_schema_condition_matches(payload, condition):
+            continue
+        errors.extend(
+            f"missing required key: {key}"
+            for key in consequence.get("required", [])
+            if key not in payload
+        )
+        for property_name, property_schema in (consequence.get("properties") or {}).items():
+            value = payload.get(property_name)
+            if not isinstance(value, dict) or not isinstance(property_schema, dict):
+                continue
+            errors.extend(
+                f"missing required key: {property_name}.{key}"
+                for key in property_schema.get("required", [])
+                if key not in value
+            )
+    return tuple(errors)
+
+
+def _minimal_schema_condition_matches(payload: dict[str, Any], condition: dict[str, Any]) -> bool:
+    for key in condition.get("required") or []:
+        if key not in payload:
+            return False
+    for key, expected in (condition.get("properties") or {}).items():
+        if key not in payload:
+            continue
+        if not isinstance(expected, dict):
+            continue
+        value = payload[key]
+        if "const" in expected and value != expected["const"]:
+            return False
+        if "enum" in expected and value not in expected["enum"]:
+            return False
+        if (expected.get("required") or expected.get("properties")) and (
+            not isinstance(value, dict) or not _minimal_schema_condition_matches(value, expected)
+        ):
+            return False
+    return True
 
 
 def projection_schema_manifest() -> dict[str, dict[str, str]]:

@@ -1,0 +1,52 @@
+schema_version: 1
+
+provider:
+  id: tax_return
+  domain_name: tax_return
+  version: community-1
+  implementation: docmirror.plugins.tax_return.community_plugin:plugin
+
+projection:
+  dataset_labels:
+    tax_return_main: 纳税申报主表
+    balance_sheet: 资产负债表
+    income_statement: 利润表
+    cash_flow_statement: 现金流量表
+  dataset_types:
+    tax_return_main: tax_return_records
+    balance_sheet: financial_statement
+    income_statement: financial_statement
+    cash_flow_statement: financial_statement
+  internal_fields: [tax_return_projection, dataset_source_row_refs, dataset_verification_blockers]
+  completeness:
+    "*":
+      basis: domain_source_row_ledger
+      ledger_key: dataset_source_row_refs
+      public_basis: source_row_ledger
+      verification_blocker_key: dataset_verification_blockers
+  form_profiles:
+    - id: cn_vat_general_return_2021
+      title_contains: 增值税及附加税费申报表
+      required_columns:
+        - item_name
+        - line_no
+        - general_current_month
+        - general_year_to_date
+        - immediate_refund_current_month
+        - immediate_refund_year_to_date
+      required_lines: [1, 17, 24, 27, 32, 38]
+      line_formulas:
+        17: 17=12+13-14-15+16
+        19: 19=11-18
+        20: 20=17-18
+        24: 24=19+21-23
+        27: 27=28+29+30+31
+        32: 32=24+25+26-27
+        33: 33=25+26-27
+        34: 34=24-28-29
+        38: 38=16+22+36-37
+
+projection_outputs:
+  document_type: tax_return
+  datasets: [tax_return_main]
+  domain_fact_prefix: tax_return

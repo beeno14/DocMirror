@@ -31,8 +31,7 @@ scripts pass `bash -n`, the deployment script has functional and safety errors:
 - The copy downloaded with it does not contain the required `start.sh` or
   `stop.sh`, so those scripts and their working-directory assumptions remain
   unverified.
-- The archive is not checksum-verified or checked for unsafe link targets
-  before extraction.
+- The archive is not checked for unsafe link targets before extraction.
 
 The downloaded `build.sh` also needs attention if its wheel is intended for a
 full deployment:
@@ -47,7 +46,7 @@ full deployment:
 - A failed wheel build leaves a partial timestamped directory under
   `/home/docmirror/builds`.
 - Its archive path checks do not inspect symlink or hard-link targets. Use it
-  only with an archive produced and checksum-verified through a trusted path.
+  only with an archive produced through a trusted path.
 
 ## 1. Package on the development machine
 
@@ -57,30 +56,35 @@ From the repository root, run:
 bash scripts/package_release.sh
 ```
 
-On this Windows checkout, Git Bash can be invoked from PowerShell if `bash` is
-not on `PATH`:
+On Windows, use the native PowerShell packager (no WSL or Git Bash required):
 
 ```powershell
-& 'D:\Program Files\Git\bin\bash.exe' scripts/package_release.sh
+.\scripts\package_release.ps1
 ```
+
+Pass `-Output` to choose a different archive path. The default is
+`docmirror-complete.tar.gz` in the repository root.
 
 The command creates:
 
 ```text
-dist/docmirror-complete.tar.gz
-dist/docmirror-complete.tar.gz.sha256
+docmirror-complete.tar.gz
 ```
 
+It validates the archive and prints its SHA-256 value without creating a
+separate checksum file. Compare that value with `sha256sum
+docmirror-complete.tar.gz` after uploading when transfer verification is
+required.
+
 The archive has exactly one top-level directory named `docmirror`. It includes
-the current source files from `docmirror`, `docmirror_enterprise`, and
-`docmirror_finance`, including current uncommitted source changes. It omits
-tests, output data, caches, bytecode, `.env`, credentials, and secrets.
+the current core source files from `docmirror`, including current uncommitted
+source changes. It omits tests, output data, caches, bytecode, `.env`,
+credentials, and secrets.
 
 Validate the result before transfer:
 
 ```bash
-(cd dist && sha256sum -c docmirror-complete.tar.gz.sha256)
-tar -tzf dist/docmirror-complete.tar.gz | head
+tar -tzf docmirror-complete.tar.gz | head
 ```
 
 The first archive member should be `docmirror/`; the package must also contain
@@ -92,20 +96,17 @@ Replace `TEST_HOST` with the SSH host name or address:
 
 ```bash
 ssh docmirror@TEST_HOST 'mkdir -p /home/docmirror/incoming'
-scp dist/docmirror-complete.tar.gz \
-  dist/docmirror-complete.tar.gz.sha256 \
-  docmirror@TEST_HOST:/home/docmirror/incoming/
+scp docmirror-complete.tar.gz docmirror@TEST_HOST:/home/docmirror/incoming/
 ```
 
 On the server, verify the upload before extracting it:
 
 ```bash
 cd /home/docmirror/incoming
-sha256sum -c docmirror-complete.tar.gz.sha256
 tar -tzf docmirror-complete.tar.gz >/dev/null
 ```
 
-Stop if either command fails.
+Stop if the archive validation command fails.
 
 ## 3. One-time testing-server configuration
 

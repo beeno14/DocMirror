@@ -134,7 +134,12 @@ class SafeOCRCorrector:
 
         for rule in lexicon.applicable_rules(domain=effective_context.domain, role=effective_context.role):
             if rule.observed in candidate:
-                candidate = candidate.replace(rule.observed, rule.canonical)
+                repaired = rule.canonical.join(
+                    part.replace(rule.observed, rule.canonical) for part in candidate.split(rule.canonical)
+                )
+                if repaired == candidate:
+                    continue
+                candidate = repaired
                 rule_id = rule.rule_id
                 pack_id = rule.pack_id
                 pack_version = rule.pack_version

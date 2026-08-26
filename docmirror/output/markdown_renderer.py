@@ -12,7 +12,9 @@ shaped output is DocMirror's own namespaced comments.
 from __future__ import annotations
 
 import html
+import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
@@ -460,8 +462,7 @@ def validate_markdown(markdown: str) -> list[str]:
 
 def _source_ids_are_contiguous(ordered: list[str], source_ids: list[str]) -> bool:
     return bool(source_ids) and any(
-        ordered[index : index + len(source_ids)] == source_ids
-        for index in range(0, len(ordered) - len(source_ids) + 1)
+        ordered[index : index + len(source_ids)] == source_ids for index in range(0, len(ordered) - len(source_ids) + 1)
     )
 
 
@@ -932,6 +933,180 @@ def render_enhanced_markdown(
     )
 
 
+def _semantic_source_table_overlays(semantic: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return unambiguous dataset replacements for physical source tables."""
+
+    structure = semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
+    physical_tables = {
+        str(table.get("id") or ""): table
+        for table in structure.get("source_tables") or []
+        if isinstance(table, dict) and table.get("id") and table.get("kind") != "logical_reconstruction"
+    }
+    datasets = {
+        str(dataset.get("id") or ""): dataset
+        for dataset in semantic.get("datasets") or []
+        if isinstance(dataset, dict) and dataset.get("id")
+    }
+    bound: dict[str, dict[str, set[str]]] = {}
+    for binding in semantic.get("bindings") or []:
+        if not isinstance(binding, dict):
+            continue
+        dataset_id = str(binding.get("dataset_id") or "")
+        record_id = str(binding.get("record_id") or "")
+        if dataset_id not in datasets or not record_id:
+            continue
+        for table_ref in binding.get("source_table_refs") or []:
+            table_id = str(table_ref or "")
+            if table_id in physical_tables:
+                bound.setdefault(dataset_id, {}).setdefault(table_id, set()).add(record_id)
+
+    overlays: dict[str, dict[str, Any]] = {}
+    conflicts: set[str] = set()
+    for dataset_id, dataset in datasets.items():
+        record_ids = {
+            str(row.get("record_id") or "")
+            for row in dataset.get("rows") or []
+            if isinstance(row, dict) and row.get("record_id")
+        }
+        if not record_ids:
+            continue
+        matches = [
+            table_id
+            for table_id, ids in bound.get(dataset_id, {}).items()
+            if ids == record_ids and len(dataset.get("rows") or []) == len(physical_tables[table_id].get("rows") or [])
+        ]
+        if len(matches) != 1:
+            continue
+        table_id = matches[0]
+        if table_id in overlays:
+            conflicts.add(table_id)
+        else:
+            overlays[table_id] = dataset
+    for table_id in conflicts:
+        overlays.pop(table_id, None)
+    return overlays
+
+
+def _semantic_heading_depth(block: dict[str, Any], text: str) -> int:
+    kind = str(block.get("kind") or "paragraph")
+    role = str(block.get("role") or "body")
+    level = str((block.get("extensions") or {}).get("level") or "").lower()
+    if kind == "heading" or role in {"heading", "title"}:
+        return {"h3": 3, "h4": 4, "h5": 5, "h6": 6}.get(level, 2)
+    normalized = re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+    if re.fullmatch(r"[一二三四五六七八九十百]+[、.．].{1,80}", normalized):
+        return 2
+    if re.fullmatch(r"(?:\d+[、.．]|[（(][一二三四五六七八九十百]+[）)]).{1,80}", normalized):
+        return 3
+    return 0
+
+
+def render_semantic_source_overlay_markdown(semantic: dict[str, Any]) -> str:
+    """Render source-ordered semantic blocks with verified dataset table overlays."""
+
+    def text(value: Any, *, single_line: bool = False) -> str:
+        if isinstance(value, (dict, list)):
+            value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        escaped = _inline_single_line(value) if single_line else _escape_inline_text(value)
+        return escaped.text.strip()
+
+    def table(headers: list[Any], rows: list[list[Any]]) -> str:
+        return _render_gfm_table(
+            [text(value, single_line=True) for value in headers],
+            [[text(value, single_line=True) for value in row] for row in rows],
+        )
+
+    structure = semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
+    document = semantic.get("document") if isinstance(semantic.get("document"), dict) else {}
+    source_tables = {
+        str(item.get("id") or ""): item
+        for item in structure.get("source_tables") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    overlays = _semantic_source_table_overlays(semantic)
+    blocks = [block for block in structure.get("blocks") or [] if isinstance(block, dict)]
+    blocks_by_id = {str(block.get("id") or ""): block for block in blocks if block.get("id")}
+    ordered = []
+    for flow in structure.get("reading_flows") or []:
+        if isinstance(flow, dict) and flow.get("node_ids"):
+            ordered = [blocks_by_id[str(node_id)] for node_id in flow["node_ids"] if str(node_id) in blocks_by_id]
+            if ordered:
+                break
+    if not ordered:
+        ordered = sorted(blocks, key=lambda block: (int(block.get("order") or 0), str(block.get("id") or "")))
+
+    title = text(document.get("title") or document.get("type") or "文档", single_line=True)
+    parts = [
+        MARKDOWN_PROFILE_MARKER,
+        '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->',
+        '<!-- docmirror:audit-reading strategy="source-overlay" -->',
+        f"# {title}",
+    ]
+    for label, value in (("文档类型", document.get("type")), ("页数", document.get("page_count"))):
+        if value not in (None, ""):
+            parts.append(f"**{label}:** {text(value, single_line=True)}")
+
+    current_page = 0
+    rendered_tables: set[str] = set()
+    for block in ordered:
+        page = max(1, int(block.get("page") or 1))
+        if page != current_page:
+            parts.append(_page_marker(page, page))
+            current_page = page
+        table_id = str(block.get("source_table_ref") or "")
+        if table_id:
+            if table_id in rendered_tables:
+                continue
+            rendered_tables.add(table_id)
+            dataset = overlays.get(table_id)
+            if dataset is not None:
+                columns = [
+                    column for column in dataset.get("columns") or [] if isinstance(column, dict) and column.get("key")
+                ]
+                keys = [str(column["key"]) for column in columns]
+                headers = [column.get("label") or column["key"] for column in columns]
+                rows = []
+                for row in dataset.get("rows") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+                    normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+                    rows.append([raw[key] if key in raw else normalized.get(key) for key in keys])
+                rendered = table(headers, rows)
+            else:
+                source_table = source_tables.get(table_id, {})
+                rendered = table(
+                    list(source_table.get("headers") or []),
+                    [list(row) for row in source_table.get("rows") or [] if isinstance(row, list)],
+                )
+            if rendered:
+                parts.append(rendered)
+            continue
+
+        kind = str(block.get("kind") or "paragraph")
+        if kind in {"image", "figure"}:
+            parts.append(_image_marker())
+            continue
+        if kind == "key_value":
+            key = text(block.get("key"), single_line=True)
+            value = text(block.get("value"), single_line=True)
+            if key or value:
+                parts.append(f"**{key}:** {value}" if key else value)
+            continue
+        raw_value = block.get("text")
+        value = text(raw_value)
+        if not value:
+            continue
+        depth = _semantic_heading_depth(block, str(raw_value or ""))
+        parts.append(f"{'#' * depth} {text(raw_value, single_line=True)}" if depth else value)
+
+    markdown = "\n\n".join(part for part in parts if part).rstrip() + "\n"
+    issues = validate_markdown(markdown)
+    if issues:
+        raise MarkdownContractError("; ".join(issues))
+    return markdown
+
+
 def render_markdown_from_vnext(mirror: dict[str, Any]) -> str:
     """Render a Mirror vNext mapping using DMP 1.0."""
     return DEFAULT_MARKDOWN_RENDERER.render_mirror_vnext(mirror)
@@ -947,5 +1122,6 @@ __all__ = [
     "render_enhanced_markdown",
     "render_markdown",
     "render_markdown_from_vnext",
+    "render_semantic_source_overlay_markdown",
     "validate_markdown",
 ]

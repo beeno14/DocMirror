@@ -11,6 +11,7 @@ from docmirror.models.entities.parse_result import DocumentEntities, ParseResult
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
     BANK_DATA_DICTIONARY,
+    _parse_result_source_table_headers,
     _raw_statement_after_table_lines,
     _raw_statement_header_lines,
     _render_bank_statement_content_markdown,
@@ -144,6 +145,73 @@ def test_bank_statement_summary_markdown_compacts_wrapped_numeric_counter_accoun
 
     assert "83010078801300000220" in markdown
     assert "830100788013000002 20" not in markdown
+
+
+def test_positioned_signed_amount_ocr_markdown_restores_source_column_order() -> None:
+    records = [
+        {
+            "raw": {
+                "交易时间": "2023-03-09",
+                "收/支": "支出",
+                "交易金额": "4819.00",
+                "账户余额": "401143.31",
+                "摘要": "备用金",
+                "对方账号": "6226192013864418",
+                "对方户名": "杨光",
+            },
+            "normalized": {
+                "sequence_no": "1",
+                "date": "2023-03-09",
+                "direction": "expense",
+                "amount": 4819.0,
+                "balance": 401143.31,
+                "counter_account": "6226192013864418",
+                "counter_party": "杨光",
+                "summary": "备用金",
+            },
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        }
+    ]
+    labels = [
+        ("承前余额：405,962.31", [1089, 162, 1293, 188]),
+        ("序号", [63, 206, 114, 237]),
+        ("对方账户", [1075, 206, 1168, 237]),
+        ("传票号", [1333, 206, 1405, 238]),
+        ("余额", [493, 207, 544, 237]),
+        ("摘要", [1442, 207, 1493, 237]),
+        ("日期", [161, 208, 208, 235]),
+        ("对方户名", [706, 208, 796, 236]),
+        ("借/贷方发生额", [280, 210, 424, 234]),
+    ]
+    parse_result = ParseResult(
+        entities=DocumentEntities(
+            domain_specific={
+                "_page_evidence_bundles": [
+                    {
+                        "page": 1,
+                        "local_structure_evidence": {"tokens": [{"text": text, "bbox": bbox} for text, bbox in labels]},
+                    }
+                ]
+            }
+        )
+    )
+    headers = _parse_result_source_table_headers(parse_result)
+    expected_headers = [
+        "序号",
+        "日期",
+        "借/贷方发生额",
+        "余额",
+        "对方户名",
+        "对方账户",
+        "传票号",
+        "摘要",
+    ]
+    markdown = _render_bank_statement_content_markdown(records, {}, {}, source_headers=headers)
+
+    assert headers == expected_headers
+    assert "| " + " | ".join(expected_headers) + " |" in markdown
+    assert "| 1 | 2023-03-09 | -4819.00 | 401143.31 | 杨光 | 6226192013864418 |  | 备用金 |" in markdown
+    assert "| 交易时间 | 收/支 |" not in markdown
 
 
 def test_source_markdown_keeps_dynamic_raw_columns_without_normalized_fallback() -> None:

@@ -139,8 +139,11 @@ def test_bundled_domains_are_post_seal_plugin_providers(monkeypatch):
     )
     registry = PluginRegistry()
 
-    assert {provider.provider_id for provider in registry.list_providers()} == {
-        f"bundled.{domain}" for domain in CANONICAL_DOMAIN_IDS
+    provider_ids = {provider.provider_id for provider in registry.list_providers()}
+    assert provider_ids == {
+        *(f"bundled.{domain}" for domain in CANONICAL_DOMAIN_IDS),
+        "bundled.financial_statement",
+        "bundled.tax_return",
     }
     assert set(CANONICAL_DOMAIN_IDS) == {
         "alipay_payment",
