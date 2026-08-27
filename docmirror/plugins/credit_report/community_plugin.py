@@ -70,14 +70,19 @@ def _personal_detail_source_rows(
 ) -> dict[str, list[dict[str, Any]]]:
     rows_by_name: dict[str, list[dict[str, Any]]] = {}
     for dataset in source_datasets:
-        public = getattr(dataset, "public", None)
+        public = dataset if isinstance(dataset, Mapping) else getattr(dataset, "public", None)
         if not isinstance(public, Mapping):
             continue
         name = str(public.get("name") or "")
         if not name:
             continue
+        source_rows = (
+            public.get("rows")
+            if isinstance(dataset, Mapping)
+            else getattr(dataset, "rows", None)
+        )
         rows_by_name[name] = [
-            row for row in (getattr(dataset, "rows", None) or ()) if isinstance(row, dict)
+            row for row in (source_rows or ()) if isinstance(row, dict)
         ]
     return rows_by_name
 
@@ -1049,7 +1054,15 @@ def _corrected_account_currency_refs(
 
     if dataset_name != "credit_accounts":
         return {}
-    candidates: list[Any] = list(source_row.get("source_refs") or ())
+    source_envelope = (
+        source_row.get("source")
+        if isinstance(source_row.get("source"), Mapping)
+        else {}
+    )
+    candidates: list[Any] = [
+        *(source_row.get("source_refs") or ()),
+        *(source_envelope.get("source_refs") or ()),
+    ]
     by_field: dict[str, list[dict[str, Any]]] = {}
     aliases = {
         "currency": "account_currency",
@@ -1442,7 +1455,12 @@ def _apply_personal_detail_dataset_status(payload: dict[str, Any]) -> None:
                 "basis": (
                     f"personal_detail_dataset_status:{presence}:expected_less_than_emitted"
                     if count_conflict
-                    else f"personal_detail_dataset_status:{presence}"
+                    else (
+                        f"personal_detail_dataset_status:{presence}:observed_only:population_unverified"
+                        if expected_raw is None
+                        and control.get("reason") == "account_month_source_position_population_unverified"
+                        else f"personal_detail_dataset_status:{presence}"
+                    )
                 ),
             }
         )
@@ -1632,9 +1650,18 @@ class _CreditReportCommunityBundle(CommunityBundle):
             )
             self._cache_personal_brief_public_payload(semantic_payload, payload)
         elif scanned_personal_detail:
+            semantic_datasets = semantic_payload.get("datasets")
             _compact_personal_detail_public_projection(
                 payload,
-                source_datasets=self.datasets,
+                # The semantic payload is the post-repair evidence plane.
+                # ``self.datasets`` can still hold the pre-repair rows used to
+                # construct the bundle; consulting it here silently discards
+                # valid field repairs during Community compaction.
+                source_datasets=(
+                    semantic_datasets
+                    if isinstance(semantic_datasets, list)
+                    else self.datasets
+                ),
             )
             _apply_personal_detail_dataset_status(payload)
         return payload

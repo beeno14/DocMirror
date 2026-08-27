@@ -1201,8 +1201,9 @@ def test_conserved_corrected_plane_survives_canonical_filter_and_repair_without_
     )
 
     class Coordinator:
-        def __init__(self, _parse_result: object) -> None:
-            pass
+        def __init__(self, _parse_result: object, *, monthly_context: object) -> None:
+            assert monthly_context is context
+            assert monthly_context.parse_result is _parse_result
 
         def plan(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
             return plan

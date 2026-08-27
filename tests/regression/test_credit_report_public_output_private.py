@@ -123,6 +123,7 @@ def test_credit_report_public_json_compacts_private_source_provenance(
     assert validate_community_artifacts(written["community"]) == []
 
     if subtype == "enterprise":
+        assert persisted["schema"]["version"] == "4.0.0"
         semantic_names = {dataset["name"] for dataset in semantic["datasets"]}
         public_names = {dataset["name"] for dataset in persisted["datasets"]}
         assert {"report_notes", "enterprise_section_presence"} <= semantic_names
@@ -133,18 +134,19 @@ def test_credit_report_public_json_compacts_private_source_provenance(
             for row in dataset["rows"]
         )
         assert all(
-            set(row["normalized"]) == set(row["canonical_raw"]) == set(row["raw"])
+            set(row) == {"record_id", "normalized", "source"}
             for dataset in persisted["datasets"]
             for row in dataset["rows"]
         )
         assert all(
-            column["raw_available"]
-            == any(
-                column["key"] in row["canonical_raw"] or column["key"] in row["raw"]
-                for row in dataset["rows"]
-            )
+            not column["raw_available"]
             for dataset in persisted["datasets"]
             for column in dataset["columns"]
+        )
+        assert all(
+            {"normalized", "canonical_raw", "raw"} <= set(row)
+            for dataset in semantic["datasets"]
+            for row in dataset["rows"]
         )
         csv_names = {
             path.stem
@@ -163,13 +165,18 @@ def test_credit_report_public_json_compacts_private_source_provenance(
             }
         assert audit_dataset_ids <= {dataset["id"] for dataset in persisted["datasets"]}
     elif subtype == "personal_brief":
+        assert public_payload["schema"]["version"] == persisted["schema"]["version"] == "4.0.0"
+        assert not {"raw", "canonical_raw"} & _keys(public_payload)
+        assert not {"raw", "canonical_raw"} & _keys(persisted)
+        assert {"raw", "canonical_raw"} <= _keys(semantic["datasets"])
+        assert {"raw", "canonical_raw"} <= _keys(rich_payload["datasets"])
         semantic_names = {dataset["name"] for dataset in semantic["datasets"]}
         public_names = {dataset["name"] for dataset in persisted["datasets"]}
         assert "report_notes" in semantic_names
         assert not {"repayment_records", "public_records", "report_notes"} & public_names
         assert all(
-            set(row) == {"record_id", "normalized", "canonical_raw", "raw", "source"}
-            and row["canonical_raw"] == row["raw"] == row["source"] == {}
+            set(row) == {"record_id", "normalized", "source"}
+            and row["source"] == {}
             for dataset in persisted["datasets"]
             for row in dataset["rows"]
         )

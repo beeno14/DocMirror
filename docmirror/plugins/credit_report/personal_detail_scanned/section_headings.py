@@ -44,6 +44,8 @@ ACCOUNT_FAMILY_BY_TITLE = {
 # section graph because official PBOC revisions can renumber or regroup these
 # subsections without changing their field semantics.
 REGISTERED_SUBSECTION_TEMPLATE_BY_TITLE = {
+    "居住信息": "report_header_and_identity",
+    "职业信息": "report_header_and_identity",
     "后付费记录": "postpaid_detail",
     "后付费记录账户": "postpaid_detail",
     "欠税记录": "public_information",

@@ -11,6 +11,7 @@ from functools import lru_cache
 from types import MappingProxyType
 from typing import Any
 
+from docmirror.output.normalized_records import strip_source_value_pools
 from docmirror.plugins._base.projector import ProjectionData
 from docmirror.plugins.credit_report.personal_brief_native.contracts import (
     PERSONAL_BRIEF_ENUM_CONTRACT,
@@ -570,11 +571,6 @@ def _project_business_dataset(
                     for key in field_order
                     if key in source_normalized and _has_business_value(source_normalized[key])
                 },
-                # Community v3 requires these record pools.  The rich semantic
-                # payload remains the evidence/raw source; the downstream JSON
-                # view deliberately avoids repeating it for every row.
-                "canonical_raw": {},
-                "raw": {},
                 "source": {},
             }
         )
@@ -716,7 +712,7 @@ def _clean_public_navigation(payload: dict[str, Any]) -> None:
 
 
 def project_personal_brief_community_json(payload: dict[str, Any]) -> dict[str, Any]:
-    """Project rich personal-brief semantic datasets to lean business JSON."""
+    """Project rich personal-brief semantic datasets to normalized-only v4 JSON."""
 
     projected = deepcopy(payload)
     _validate_public_record_aggregate(projected)
@@ -737,6 +733,9 @@ def project_personal_brief_community_json(payload: dict[str, Any]) -> dict[str, 
         datasets.append(_project_business_dataset(dataset, fields, columns))
     projected["datasets"] = datasets
     _clean_public_navigation(projected)
+    # Only the delivery view uses v4. Rich semantic and audit/CSV projections
+    # retain their source value pools independently of the public JSON.
+    strip_source_value_pools(projected)
     return projected
 
 

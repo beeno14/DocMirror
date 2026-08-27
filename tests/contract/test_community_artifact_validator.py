@@ -15,6 +15,7 @@ from docmirror.models.entities.parse_result import (
     TableBlock,
     TableRow,
 )
+from docmirror.output.normalized_records import strip_source_value_pools
 from docmirror.server.edition_outputs import write_outputs
 from scripts.validate.validate_community_artifacts import payment_direction_cells, validate_community_artifacts
 
@@ -80,6 +81,60 @@ def test_validator_accepts_complete_json_csv_markdown_bundle(tmp_path: Path) -> 
     community_path = _write_bundle(tmp_path, "complete_bundle")
 
     assert validate_community_artifacts(community_path) == []
+
+
+def test_validator_accepts_normalized_only_v4_bundle(tmp_path: Path) -> None:
+    community_path = _write_bundle(tmp_path, "normalized_only_bundle")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    strip_source_value_pools(payload)
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    assert payload["schema"]["version"] == "4.0.0"
+    assert validate_community_artifacts(community_path) == []
+
+
+@pytest.mark.parametrize("version", ["3.0.0", "4.0.0"])
+@pytest.mark.parametrize("block", ["record_id", "normalized", "source"])
+def test_validator_requires_business_record_blocks_in_both_versions(
+    tmp_path: Path, version: str, block: str
+) -> None:
+    community_path = _write_bundle(tmp_path, "required_record_block")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    if version == "4.0.0":
+        strip_source_value_pools(payload)
+    payload["datasets"][0]["rows"][0].pop(block)
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any(f"missing ['{block}']" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("pool", ["canonical_raw", "raw"])
+def test_validator_retains_v3_source_pool_requirements(tmp_path: Path, pool: str) -> None:
+    community_path = _write_bundle(tmp_path, "required_v3_source_pool")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    assert payload["schema"]["version"] == "3.0.0"
+    payload["datasets"][0]["rows"][0].pop(pool)
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any(f"missing ['{pool}']" in issue for issue in issues)
+    assert any(f".{pool}: must be an object" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("pool", ["canonical_raw", "raw"])
+def test_validator_rejects_source_pools_in_v4(tmp_path: Path, pool: str) -> None:
+    community_path = _write_bundle(tmp_path, "forbidden_v4_source_pool")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    strip_source_value_pools(payload)
+    payload["datasets"][0]["rows"][0][pool] = {}
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any(issue.startswith("schema:") for issue in issues)
 
 
 def test_validator_detects_json_row_loss(tmp_path: Path) -> None:

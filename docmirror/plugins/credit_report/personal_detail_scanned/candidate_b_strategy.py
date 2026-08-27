@@ -628,10 +628,15 @@ def build_candidate_b_section_census(
     )
     if len(unresolved_pages) != len(unresolved):
         return _incomplete_census("canonical_unresolved_pages_invalid")
-    if unresolved_pages:
-        return _incomplete_census(
-            "canonical_unresolved_pages:" + ",".join(map(str, sorted(unresolved_pages)))
-        )
+    if len(unresolved_pages) != len(set(unresolved_pages)):
+        return _incomplete_census("canonical_unresolved_pages_invalid")
+    unresolved_page_set = set(unresolved_pages)
+    unresolved_reason = (
+        "canonical_unresolved_pages:"
+        + ",".join(map(str, sorted(unresolved_pages)))
+        if unresolved_pages
+        else ""
+    )
 
     conserved_raw = _strict_sequence(corrected.get("conserved_logical_pages"))
     if conserved_raw is None:
@@ -674,6 +679,27 @@ def build_candidate_b_section_census(
                 f"canonical_registration_basis_missing:{logical_page}"
             )
 
+        if logical_page in unresolved_page_set or status == "unresolved":
+            if status not in {"registered", "unresolved"}:
+                return _incomplete_census(
+                    f"canonical_registration_unresolved:{logical_page}"
+                )
+            registration_rows[logical_page] = {
+                "logical_page": logical_page,
+                "source_page": source_page,
+                "template_id": "unresolved",
+                "basis": basis,
+                "sections": (),
+                "datasets": (),
+                "stage_names": (),
+                "table_owners": (),
+                "table_owner_contract_digests": (),
+                "printed_identity": None,
+                "blank": False,
+                "unresolved": True,
+            }
+            continue
+
         if status == "blank" and template_id == BLANK_SECTION:
             registration_rows[logical_page] = {
                 "logical_page": logical_page,
@@ -687,6 +713,7 @@ def build_candidate_b_section_census(
                 "table_owner_contract_digests": (),
                 "printed_identity": None,
                 "blank": True,
+                "unresolved": False,
             }
             continue
         if status != "registered":
@@ -805,11 +832,26 @@ def build_candidate_b_section_census(
             ),
             "printed_identity": printed_identity,
             "blank": False,
+            "unresolved": False,
         }
 
-    if set(registration_rows) != set(conserved_pages):
+    conserved_page_set = set(conserved_pages)
+    extra_registration_pages = set(registration_rows) - conserved_page_set
+    # Canonical repair can retain an explicit trailing blank fragment that has
+    # no corrected business evidence and therefore is intentionally absent
+    # from the conserved plane.  It is not a section owner and must not make
+    # every real page fall back to eager extraction.  Any extra non-blank page,
+    # or any conserved page without a registration, still fails closed.
+    if extra_registration_pages and all(
+        registration_rows[page]["blank"]
+        and not registration_rows[page]["unresolved"]
+        for page in extra_registration_pages
+    ):
+        for page in extra_registration_pages:
+            registration_rows.pop(page)
+    if set(registration_rows) != conserved_page_set:
         return _incomplete_census("canonical_registration_page_census_mismatch")
-    if REPORT_HEADER_SECTION not in observed_sections:
+    if not unresolved_pages and REPORT_HEADER_SECTION not in observed_sections:
         return _incomplete_census("required_header_section_not_observed")
 
     fragment_groups_raw = _strict_sequence(
@@ -819,6 +861,7 @@ def build_candidate_b_section_census(
         return _incomplete_census("canonical_fragment_groups_missing")
     fragment_by_page: dict[int, dict[str, Any]] = {}
     fragment_members_seen: set[int] = set()
+    non_reusable_fragment_pages: set[int] = set()
     for raw_group in fragment_groups_raw:
         if not isinstance(raw_group, Mapping):
             return _incomplete_census("canonical_fragment_group_invalid")
@@ -839,6 +882,12 @@ def build_candidate_b_section_census(
             return _incomplete_census("canonical_fragment_members_overlap")
         fragment_members_seen.update(logicals)
         group_rows = [registration_rows[page] for page in logicals]
+        if any(row["unresolved"] for row in group_rows):
+            # A fragment contract is atomic: if one member is unresolved, none
+            # of its members can safely be reused.  Unrelated, independently
+            # registered fragments remain available to repair planning.
+            non_reusable_fragment_pages.update(logicals)
+            continue
         if all(row["blank"] for row in group_rows):
             if str(raw_group.get("template_id") or "").strip() not in {
                 "",
@@ -880,7 +929,13 @@ def build_candidate_b_section_census(
             fragment_by_page[page] = group
 
     registered_pages = {
-        page for page, row in registration_rows.items() if not row["blank"]
+        page
+        for page, row in registration_rows.items()
+        if (
+            not row["blank"]
+            and not row["unresolved"]
+            and page not in non_reusable_fragment_pages
+        )
     }
     if set(fragment_by_page) != registered_pages:
         return _incomplete_census("canonical_fragment_page_census_mismatch")
@@ -888,6 +943,8 @@ def build_candidate_b_section_census(
     page_ownership: list[PageOwnershipFingerprint] = []
     for logical_page in sorted(registration_rows):
         row = registration_rows[logical_page]
+        if row["unresolved"] or logical_page in non_reusable_fragment_pages:
+            continue
         fragment = fragment_by_page.get(
             logical_page,
             {
@@ -934,13 +991,22 @@ def build_candidate_b_section_census(
         section_name: (
             SectionState.OBSERVED
             if section_name in observed_sections
-            else SectionState.ABSENT_PROVEN
+            else (
+                SectionState.UNRESOLVED
+                if unresolved_pages
+                else SectionState.ABSENT_PROVEN
+            )
         )
         for section_name in _SECTION_DATASETS
     }
     return CandidateBSectionCensus(
-        census=SectionCensus.from_mapping(states),
+        census=SectionCensus.from_mapping(
+            states,
+            complete=not unresolved_pages,
+            incomplete_reason=unresolved_reason,
+        ),
         page_ownership=tuple(page_ownership),
+        fallback_reason=unresolved_reason,
     )
 
 
@@ -1027,85 +1093,6 @@ def resolve_candidate_b_repair_scope(
             affected_pages=(),
             reason="repair_affected_pages_missing",
         )
-    if not discovery.complete:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            reason="discovery_census_incomplete:"
-            + (discovery.fallback_reason or "unknown"),
-        )
-    if not repaired.complete:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            reason="repaired_census_incomplete:"
-            + (repaired.fallback_reason or "unknown"),
-        )
-
-    discovery_by_page = discovery.fingerprint_by_page
-    repaired_by_page = repaired.fingerprint_by_page
-    if set(discovery_by_page) != set(repaired_by_page):
-        changed = sorted(set(discovery_by_page).symmetric_difference(repaired_by_page))
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            changed_pages=changed,
-            reason="repair_page_census_changed:" + ",".join(map(str, changed)),
-        )
-    missing_affected = sorted(set(affected).difference(discovery_by_page))
-    if missing_affected:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            reason="repair_page_ownership_missing:"
-            + ",".join(map(str, missing_affected)),
-        )
-
-    changed_pages = tuple(
-        page
-        for page in sorted(discovery_by_page)
-        if discovery_by_page[page].digest != repaired_by_page[page].digest
-    )
-    changed_outside = tuple(sorted(set(changed_pages).difference(affected)))
-    if changed_outside:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            changed_pages=changed_pages,
-            reason="repair_ownership_changed_outside_scope:"
-            + ",".join(map(str, changed_outside)),
-        )
-    if changed_pages:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            changed_pages=changed_pages,
-            reason="repair_affected_page_ownership_changed:"
-            + ",".join(map(str, changed_pages)),
-        )
-
-    expanded_pages = set(affected)
-    for page in affected:
-        expanded_pages.update(discovery_by_page[page].fragment_logical_pages)
-    if not expanded_pages.issubset(discovery_by_page):
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            reason="repair_fragment_ownership_incomplete",
-        )
-
-    page_owned_sections = {
-        section_name
-        for page in expanded_pages
-        for section_name in discovery_by_page[page].sections
-    }
-    if not page_owned_sections:
-        return _repair_fallback(
-            repaired.census,
-            affected_pages=affected,
-            reason="repair_page_has_no_owned_section",
-        )
-
     if isinstance(repair_dataset_names, (str, bytes, bytearray)):
         return _repair_fallback(
             repaired.census,
@@ -1120,6 +1107,99 @@ def resolve_candidate_b_repair_scope(
             affected_pages=affected,
             reason="repair_dataset_names_invalid",
         )
+
+    def ownership_is_usable(census: CandidateBSectionCensus) -> bool:
+        return census.complete or (
+            census.fallback_reason.startswith("canonical_unresolved_pages:")
+            and bool(census.page_ownership)
+        )
+
+    if not ownership_is_usable(discovery):
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="discovery_census_incomplete:"
+            + (discovery.fallback_reason or "unknown"),
+        )
+    if not ownership_is_usable(repaired):
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repaired_census_incomplete:"
+            + (repaired.fallback_reason or "unknown"),
+        )
+
+    discovery_by_page = discovery.fingerprint_by_page
+    repaired_by_page = repaired.fingerprint_by_page
+    membership_changed = set(discovery_by_page).symmetric_difference(repaired_by_page)
+    membership_changed_outside = sorted(membership_changed.difference(affected))
+    if membership_changed_outside:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            changed_pages=membership_changed_outside,
+            reason="repair_page_census_changed:"
+            + ",".join(map(str, membership_changed_outside)),
+        )
+    missing_affected = sorted(
+        set(affected).difference(set(discovery_by_page) | set(repaired_by_page))
+    )
+    if missing_affected and not repair_datasets:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repair_page_ownership_missing:"
+            + ",".join(map(str, missing_affected)),
+        )
+
+    changed_pages = tuple(
+        page
+        for page in sorted(set(discovery_by_page).intersection(repaired_by_page))
+        if discovery_by_page[page].digest != repaired_by_page[page].digest
+    )
+    changed_outside = tuple(sorted(set(changed_pages).difference(affected)))
+    if changed_outside:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            changed_pages=changed_pages,
+            reason="repair_ownership_changed_outside_scope:"
+            + ",".join(map(str, changed_outside)),
+        )
+    ownership_changed_pages = tuple(
+        sorted(set(changed_pages) | membership_changed.intersection(affected))
+    )
+
+    expanded_pages = set(affected)
+    for page in affected:
+        for ownership_by_page in (discovery_by_page, repaired_by_page):
+            owner = ownership_by_page.get(page)
+            if owner is not None:
+                expanded_pages.update(owner.fragment_logical_pages)
+    known_ownership_pages = set(discovery_by_page) | set(repaired_by_page)
+    unresolved_expanded_pages = expanded_pages.difference(known_ownership_pages)
+    if unresolved_expanded_pages.difference(affected):
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repair_fragment_ownership_incomplete",
+        )
+
+    page_owned_sections = {
+        section_name
+        for page in expanded_pages
+        for ownership_by_page in (discovery_by_page, repaired_by_page)
+        for owner in (ownership_by_page.get(page),)
+        if owner is not None
+        for section_name in owner.sections
+    }
+    if not page_owned_sections and not repair_datasets:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=affected,
+            reason="repair_page_has_no_owned_section",
+        )
+
     selected_sections: set[str] = set()
     selected_stage_names: set[str] = set()
     explicit_dataset_owner = False
@@ -1160,7 +1240,11 @@ def resolve_candidate_b_repair_scope(
                     reason=f"repair_dataset_ownership_ambiguous:{dataset_name}",
                 )
             canonical_section = next(iter(stage_sections))
-        if canonical_section not in page_owned_sections:
+        if (
+            canonical_section not in page_owned_sections
+            and not missing_affected
+            and not ownership_changed_pages
+        ):
             return _repair_fallback(
                 repaired.census,
                 affected_pages=affected,
@@ -1175,6 +1259,8 @@ def resolve_candidate_b_repair_scope(
     dirty_sections = (
         selected_sections if explicit_dataset_owner else page_owned_sections
     )
+    if ownership_changed_pages:
+        dirty_sections.update(page_owned_sections)
     if explicit_dataset_owner and not dirty_sections:
         return _repair_fallback(
             repaired.census,
@@ -1198,6 +1284,7 @@ def resolve_candidate_b_repair_scope(
         expanded_pages=tuple(sorted(expanded_pages)),
         dirty_sections=tuple(sorted(dirty_sections)),
         dirty_stage_names=CANDIDATE_B_STAGE_REGISTRY.ordered(dirty_stages),
+        ownership_changed_pages=ownership_changed_pages,
     )
 
 
@@ -1250,6 +1337,32 @@ def candidate_b_repair_scope(
         affected_pages.append(page)
     affected_set = set(affected_pages)
 
+    raw_reconstruction = _plan_value(plan, "reconstruction_evidence", None)
+    if raw_reconstruction is None:
+        # Compatibility for detached/legacy plans that predate the explicit
+        # reconstruction ledger: their affected pages remain page-replay scope.
+        materialization_pages = tuple(affected_pages)
+    elif isinstance(raw_reconstruction, Mapping):
+        parsed_reconstruction_pages = [
+            _strict_positive_int(raw_page) for raw_page in raw_reconstruction
+        ]
+        if any(page is None for page in parsed_reconstruction_pages):
+            return _repair_fallback(
+                repaired.census,
+                affected_pages=tuple(sorted(affected_pages)),
+                reason="repair_reconstruction_pages_invalid",
+            )
+        materialization_pages = tuple(
+            sorted({int(page) for page in parsed_reconstruction_pages if page is not None})
+        )
+    else:
+        return _repair_fallback(
+            repaired.census,
+            affected_pages=tuple(sorted(affected_pages)),
+            reason="repair_reconstruction_evidence_invalid",
+        )
+    materialization_set = set(materialization_pages)
+
     raw_uncertainties = _strict_sequence(
         _plan_value(plan, "uncertainties", ())
     )
@@ -1287,13 +1400,24 @@ def candidate_b_repair_scope(
         dataset_name = str(
             _plan_value(uncertainty, "dataset_name", "") or ""
         ).strip()
-        if dataset_name:
+        if dataset_name and logical_pages.intersection(materialization_set):
             repair_datasets.add(dataset_name)
+
+    if not materialization_pages:
+        # Field-local deterministic/context-rich overlays consume the discovery
+        # payload directly.  They must not invalidate any extraction stage.
+        return CandidateBRepairScope(
+            census=repaired.census,
+            affected_pages=tuple(sorted(affected_pages)),
+            expanded_pages=(),
+            dirty_sections=(),
+            dirty_stage_names=(),
+        )
 
     return resolve_candidate_b_repair_scope(
         discovery,
         repaired,
-        affected_pages=affected_pages,
+        affected_pages=materialization_pages,
         repair_dataset_names=repair_datasets,
     )
 

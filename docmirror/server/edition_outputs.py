@@ -95,7 +95,8 @@ def _write_community_bundle_files(
     obsolete_semantic_path = task_dir / f"{file_id}_community_semantic.json"
     if obsolete_semantic_path.is_file():
         obsolete_semantic_path.unlink()
-    writer.write_text(targets["community"].name, dumps_json(community_payload, ensure_ascii=False, indent=2))
+    json_options = {"separators": (",", ":")} if bundle.compact_output.get("minify_json") is True else {"indent": 2}
+    writer.write_text(targets["community"].name, dumps_json(community_payload, ensure_ascii=False, **json_options))
     writer.write_text(targets["content"].name, content)
     writer.write_text(targets["enhanced_reading"].name, enhanced_reading)
     for relative_path, csv_content in dataset_csvs.items():

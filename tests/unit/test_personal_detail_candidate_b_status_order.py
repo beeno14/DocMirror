@@ -218,6 +218,9 @@ def test_candidate_b_native_guard_runs_after_glyph_bank_on_final_statuses(
         "native_numeric_witnesses_rejected_for_nonpositive_amount": 1,
         "agreements": 1,
         "conflicts_withheld": 2,
+        "low_source_ocr_confidence_withheld": 0,
+        "independent_monthly_field_confirmations": 0,
+        "preserved_source_plane_conflicts": 0,
     }
     issues = context._personal_detail_extraction_issues
     assert {

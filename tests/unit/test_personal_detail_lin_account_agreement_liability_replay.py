@@ -847,6 +847,102 @@ def test_lin_materializer_replays_raw_cards_20_to_22_after_corrected_registratio
         ]
 
 
+def test_lin_materializer_uses_conserved_discovery_plane_when_repair_loses_card_tail() -> None:
+    context = _account_context()
+    conserved_pages = [
+        {
+            "page": int(page.page_number),
+            "source_page": int(page.source_page_number),
+            "lines": [
+                {
+                    "text": str(block.content),
+                    "content": str(block.content),
+                    "bbox": list(block.bbox),
+                    "page": int(page.page_number),
+                    "source_page": int(page.source_page_number),
+                    "evidence_ids": list(block.evidence_ids),
+                }
+                for block in page.texts
+            ],
+        }
+        for page in context.pages
+    ]
+    context.conserved_corrected_evidence_pages = lambda: deepcopy(conserved_pages)
+
+    # Recreate the production lifecycle seam: both the value/reconstruction
+    # plane and the frozen-page fallback stop at card 19.  Only the immutable
+    # discovery census still owns the exact trailing headings.
+    page23 = context._frozen_logical_pages[23]
+    page23.texts = [
+        block
+        for block in page23.texts
+        if str(block.content) not in {"账户20", "账户21"}
+        and not str(block.content).startswith("账户22(")
+    ]
+
+    rows = native_extraction._materialize_registered_account_population_skeletons(
+        context,
+        _account_skeletons_through_card_19(),
+    )
+
+    assert len(rows) == 45
+    assert {
+        row["account_id"]
+        for row in rows
+        if row["account_type"] == "credit_card"
+    } == {
+        f"credit_account:credit_card:{ordinal}" for ordinal in range(1, 23)
+    }
+
+
+def test_lin_materializer_uses_full_corrected_plane_when_conserved_plane_is_sparse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _account_context()
+    sparse_conserved_pages = context.corrected_evidence_pages()
+    full_corrected_pages = [
+        {
+            "page": int(page.page_number),
+            "source_page": int(page.source_page_number),
+            "lines": [
+                {
+                    "text": str(block.content),
+                    "content": str(block.content),
+                    "bbox": list(block.bbox),
+                    "page": int(page.page_number),
+                    "source_page": int(page.source_page_number),
+                    "evidence_ids": list(block.evidence_ids),
+                }
+                for block in page.texts
+            ],
+        }
+        for page in context.pages
+    ]
+    context.conserved_corrected_evidence_pages = lambda: deepcopy(
+        sparse_conserved_pages
+    )
+    context.corrected_evidence_pages = lambda: deepcopy(full_corrected_pages)
+    monkeypatch.setattr(
+        native_extraction,
+        "_sealed_raw_account_population_census",
+        lambda _context: None,
+    )
+
+    rows = native_extraction._materialize_registered_account_population_skeletons(
+        context,
+        _account_skeletons_through_card_19(),
+    )
+
+    assert len(rows) == 45
+    assert {
+        row["account_id"]
+        for row in rows
+        if row["account_type"] == "credit_card"
+    } == {
+        f"credit_account:credit_card:{ordinal}" for ordinal in range(1, 23)
+    }
+
+
 def test_lin_account_assembly_publishes_exact_ids_tables_currencies_and_units(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1271,7 +1367,7 @@ LIN_AGREEMENT_EXPECTED: dict[int, tuple[str, str, str]] = {
         "pt_25_3",
     ),
     7: (
-        "RB10711000H0001100000111111111498898000000",
+        "B10711000H0001100000111111111498898000000",
         "中国光大银行股份有限公司",
         "pt_25_4",
     ),

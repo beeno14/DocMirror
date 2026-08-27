@@ -6,9 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+    BusinessUncertaintyRepairCoordinator,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
     PBOCCanonicalTemplateAssembler,
     _sealed_account_card_continuation_proved,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.context import (
+    PersonalDetailExtractionContext,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _extract_inquiries,
@@ -16,6 +22,9 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
     PersonalDetailPageTopology,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
+    PersonalDetailOCRCorrectionOverlay,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.table_ownership import (
     INQUIRY_AUTHORITY_CLOSED_PHYSICAL_ORDINAL,
@@ -122,12 +131,19 @@ def _build(
     reading_order_resolution: dict[str, object] | None = None,
     entity_context: object | None = None,
     force_table_continuation_false: bool = False,
+    force_table_continuation_unknown: bool = False,
 ):
     topology = topology or SimpleNamespace(geometry=lambda _logical: None)
     owner = SimpleNamespace(
-        tables_continue=lambda left, right: False
-        if force_table_continuation_false
-        else (left, right) in (continuations or set()),
+        tables_continue=lambda left, right: (
+            None
+            if force_table_continuation_unknown
+            else (
+                False
+                if force_table_continuation_false
+                else (left, right) in (continuations or set())
+            )
+        ),
         reading_order_resolution=reading_order_resolution,
         page_topology=topology,
         page_topology_audit=(
@@ -620,6 +636,39 @@ def _ye_shaped_inquiry_registration_case(
         institution_second.metadata["raw_rows"][0][0] = "38"
     elif defect == "wrong_third_start":
         institution_third.metadata["raw_rows"][0][0] = "78"
+    elif defect == "merged_date_institution_tail":
+        # Production-shaped Ye tail: the final four institutional rows retain
+        # four physical columns, but the date cell spans the otherwise empty
+        # institution slot.  The source text remains lossless and the exact
+        # colspan is part of the immutable cell lattice.
+        geometry = institution_third.metadata["geometry"]
+        geometry["cell_spans"] = []
+        for row_index in range(16, 20):
+            row = institution_third.metadata["raw_rows"][row_index]
+            row[1] = f"{row[1]} {row[2]}"
+            row[2] = ""
+            left_box = geometry["cell_bboxes"][row_index][1]
+            right_box = geometry["cell_bboxes"][row_index][2]
+            merged_box = [left_box[0], left_box[1], right_box[2], left_box[3]]
+            merged_ids = [
+                *geometry["cell_evidence_ids"][row_index][1],
+                *geometry["cell_evidence_ids"][row_index][2],
+            ]
+            geometry["cell_bboxes"][row_index][1] = merged_box
+            geometry["cell_evidence_ids"][row_index][1] = merged_ids
+            geometry["cell_bboxes"][row_index][2] = None
+            geometry["cell_geometry_status"][row_index][2] = "derived"
+            geometry["cell_evidence_ids"][row_index][2] = []
+            geometry["cell_spans"].append(
+                {
+                    "row": row_index,
+                    "col": 1,
+                    "row_span": 1,
+                    "col_span": 2,
+                    "bbox": list(merged_box),
+                    "evidence_ids": list(merged_ids),
+                }
+            )
     topology = _ye_shaped_spread_topology(
         profile_mismatch=defect == "topology_profile_mismatch"
     )
@@ -1136,11 +1185,14 @@ def test_lin_production_shaped_replay_carries_all_headerless_rows() -> None:
         for row in records
         if row["inquiry_type"] == "institution"
     )
-    assert len(records) == 87
+    # Discovery conserves bounded sequence noise as field-local uncertainty;
+    # the deterministic repair pass materializes 8 and 9.  This test exercises
+    # schema carry only, so it must not bypass the agreed repair boundary.
+    assert len(records) == 85
     assert institution_sequences == [
         sequence
         for sequence in range(1, 90)
-        if sequence not in {4, 66, 67}
+        if sequence not in {4, 8, 9, 66, 67}
     ]
     assert [
         row["sequence"]
@@ -1167,8 +1219,6 @@ def test_lin_production_shaped_replay_carries_all_headerless_rows() -> None:
         "resolution_missing",
         "resolution_non_authoritative",
         "source_page",
-        "table_decision_none",
-        "table_decision_true",
     ),
 )
 def test_lin_production_schema_bridge_fails_closed_after_consumer_tamper(
@@ -1195,15 +1245,32 @@ def test_lin_production_schema_bridge_fails_closed_after_consumer_tamper(
         context.reading_order_resolution["authoritative"] = False
     elif defect == "source_page":
         page.source_page_number = 15
-    elif defect == "table_decision_none":
-        context.tables_continue = lambda _left, _right: None
-    elif defect == "table_decision_true":
-        context.tables_continue = lambda _left, _right: True
     else:  # pragma: no cover - parameter list is exhaustive
         raise AssertionError(defect)
 
     assert canonical_inquiry_population_metadata(context, page, table) is None
     assert canonical_table_role(context, page, table) is None
+
+
+@pytest.mark.parametrize("continuation_decision", [None, True])
+def test_lin_production_schema_bridge_ignores_entity_merge_vote(
+    continuation_decision: bool | None,
+) -> None:
+    projection, evidence, resolution = _lin_production_shaped_projection()
+    context = _lin_production_shaped_consumer_context(
+        projection,
+        evidence,
+        resolution,
+    )
+    page = next(page for page in context.pages if page.page_number == 27)
+    table = next(table for table in page.tables if table.table_id == "pt_27_0")
+    context.tables_continue = lambda _left, _right: continuation_decision
+
+    metadata = canonical_inquiry_population_metadata(context, page, table)
+
+    assert metadata is not None
+    assert metadata["authority_mode"] == INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY
+    assert canonical_table_role(context, page, table) == "annotations_and_inquiries"
 
 
 @pytest.mark.parametrize(
@@ -1459,6 +1526,359 @@ def test_ye_shaped_inquiry_chain_registers_all_112_physical_rows() -> None:
     )
 
 
+@pytest.mark.parametrize("continuation_decision", [False, None, True])
+def test_ye_shaped_exact_footer_chain_does_not_require_entity_merge(
+    continuation_decision: bool | None,
+) -> None:
+    pages, evidence, topology, _entity_context = (
+        _ye_shaped_inquiry_registration_case()
+    )
+
+    projection = _build(
+        pages,
+        evidence,
+        topology=topology,
+        reading_order_resolution={
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "printed_total": 31,
+            "printed_page_by_logical": {27: 27, 28: 28, 29: 29},
+        },
+        entity_context=None,
+        force_table_continuation_false=continuation_decision is False,
+        force_table_continuation_unknown=continuation_decision is None,
+    )
+
+    assert projection.unresolved_pages == ()
+    owners = {
+        table.table_id: table.metadata["canonical_section_owner"]
+        for page in projection.pages
+        for table in page.tables
+    }
+    assert owners["ye-inquiry:37-76"]["adjacency_proof"]["kind"] == (
+        "exact_printed_footer_schema_carry_bridge"
+    )
+    assert owners["ye-inquiry:77-96"]["adjacency_proof"]["kind"] == (
+        "exact_printed_footer_schema_carry_bridge"
+    )
+
+    context = _ye_shaped_consumer_context(projection, evidence, topology)
+    context.entity_context = None
+    context.tables_continue = lambda _left, _right: continuation_decision
+    continuation_tables = [
+        (page, table)
+        for page in context.pages
+        for table in page.tables
+        if table.table_id in {"ye-inquiry:37-76", "ye-inquiry:77-96"}
+    ]
+    assert all(
+        (metadata := canonical_inquiry_population_metadata(context, page, table))
+        is not None
+        and metadata["authority_mode"] == INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY
+        for page, table in continuation_tables
+    )
+    records = _extract_inquiries(context)
+    assert len(records) == 112
+    assert sorted(
+        row["sequence"]
+        for row in records
+        if row["inquiry_type"] == "institution"
+    ) == list(range(1, 97))
+    assert sorted(
+        row["sequence"]
+        for row in records
+        if row["inquiry_type"] == "personal"
+    ) == list(range(1, 17))
+
+
+def test_ye_shaped_institution_tail_accepts_exact_date_institution_colspans() -> None:
+    pages, evidence, topology, _entity_context = (
+        _ye_shaped_inquiry_registration_case("merged_date_institution_tail")
+    )
+
+    projection = _build(
+        pages,
+        evidence,
+        topology=topology,
+        reading_order_resolution={
+            "resolved": True,
+            "authoritative": True,
+            "identity_fallback": False,
+            "printed_total": 31,
+            "printed_page_by_logical": {27: 27, 28: 28, 29: 29},
+        },
+        entity_context=None,
+        force_table_continuation_false=True,
+    )
+
+    owners = {
+        table.table_id: table.metadata["canonical_section_owner"]
+        for page in projection.pages
+        for table in page.tables
+    }
+    assert projection.unresolved_pages == ()
+    assert owners["ye-inquiry:77-96"]["population_start"] == 77
+    assert owners["ye-inquiry:77-96"]["population_endpoint"] == 96
+    assert owners["ye-inquiry:77-96"]["physical_field_omission_rows"][-4:] == [
+        16,
+        17,
+        18,
+        19,
+    ]
+
+
+def test_ye_shaped_exact_collapsed_personal_header_is_consumable_without_profile_vote() -> None:
+    pages, evidence, topology, entity_context = _ye_shaped_inquiry_registration_case()
+    personal = next(
+        table
+        for table in pages[-1].tables
+        if table.table_id == "ye-inquiry:personal-1-16"
+    )
+    personal.metadata["raw_rows"][0] = [
+        "编号 查询日期",
+        "",
+        "查询机构",
+        "查询原因",
+    ]
+    geometry = personal.metadata["geometry"]
+    left_box = geometry["cell_bboxes"][0][0]
+    right_box = geometry["cell_bboxes"][0][1]
+    merged_box = [left_box[0], left_box[1], right_box[2], left_box[3]]
+    merged_ids = [
+        *geometry["cell_evidence_ids"][0][0],
+        *geometry["cell_evidence_ids"][0][1],
+    ]
+    geometry["cell_bboxes"][0][0] = merged_box
+    geometry["cell_evidence_ids"][0][0] = merged_ids
+    geometry["cell_bboxes"][0][1] = None
+    geometry["cell_geometry_status"][0][1] = "derived"
+    geometry["cell_evidence_ids"][0][1] = []
+    geometry["cell_spans"] = [
+        {
+            "row": 0,
+            "col": 0,
+            "row_span": 1,
+            "col_span": 2,
+            "bbox": list(merged_box),
+            "evidence_ids": list(merged_ids),
+        }
+    ]
+    dates = [
+        "2024.01.15",
+        "2023.10.28",
+        "2023.09.22",
+        "2023.08.28",
+        "2023.07.20",
+        "2023.06.16",
+        "离 2023.04.25",
+        "2023.03.26",
+        "2023.02.17",
+        "2023.01.04",
+        "2022.12.11",
+        "2022.10.11",
+        "2022.07.21",
+        "2022.07.05",
+        "2022.05.30",
+        "2022.04.27",
+    ]
+    institutions = ["本人"] * 16
+    institutions[11:14] = ["您 本人 业", "真 本人", "苏 本人 6"]
+    for sequence, (date, institution) in enumerate(
+        zip(dates, institutions, strict=True),
+        start=1,
+    ):
+        row = personal.metadata["raw_rows"][sequence]
+        row[0] = "8 囍" if sequence == 8 else "版" if sequence == 9 else str(sequence)
+        row[1] = date
+        row[2] = institution
+        row[3] = "本人查询(自助查询机)"
+
+    projection = _build(
+        pages,
+        evidence,
+        topology=topology,
+        entity_context=entity_context,
+        force_table_continuation_false=True,
+    )
+    context = _ye_shaped_consumer_context(projection, evidence, topology)
+    page = next(page for page in context.pages if page.page_number == 29)
+    table = next(
+        table
+        for table in page.tables
+        if table.table_id == "ye-inquiry:personal-1-16"
+    )
+
+    metadata = canonical_inquiry_population_metadata(context, page, table)
+    discovery_records = _extract_inquiries(context)
+    discovery_issues = deepcopy(context._personal_detail_extraction_issues)
+
+    assert table.metadata["canonical_section_owner"]["header_binding"] == (
+        "exact_collapsed_colspan_header_lattice"
+    )
+    assert metadata is not None
+    assert metadata["authority_mode"] == INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY
+    assert canonical_table_role(context, page, table) == "annotations_and_inquiries"
+    assert len(discovery_records) == 112
+    unresolved_date_row = next(
+        row
+        for row in discovery_records
+        if row["inquiry_type"] == "personal" and row["sequence"] == 7
+    )
+    assert unresolved_date_row["inquiry_date"] is None
+    assert unresolved_date_row["institution"] == "本人"
+    assert unresolved_date_row["extraction_status"] == "review"
+    assert unresolved_date_row["_unresolved_fields"] == ["inquiry_date"]
+    unresolved_date_issue = next(
+        issue
+        for issue in discovery_issues
+        if issue.get("issue_code") == "candidate_b_inquiry_row_cells_unresolved"
+        and issue.get("observed_value", {}).get("sequence") == 7
+        and issue.get("field_name") == "inquiry_date"
+    )
+    assert unresolved_date_issue["target_record_id"] == unresolved_date_row["inquiry_id"]
+    assert unresolved_date_issue["reason_codes"][-2:] == [
+        "physical_record_identity_conserved",
+        "field_local_value_withheld",
+    ]
+
+    coordinator = BusinessUncertaintyRepairCoordinator(context)
+    plan = coordinator.plan(
+        {"inquiry_records": deepcopy(discovery_records)},
+        canonical_audit={"unresolved_pages": []},
+        extraction_issues=discovery_issues,
+    )
+    date_repair = next(
+        repair
+        for repair in plan.field_repairs
+        if repair.field_name == "inquiry_date"
+        and repair.observed_value == "离 2023.04.25"
+    )
+    assert date_repair.mode == "deterministic"
+    assert date_repair.candidate_value == "2023-04-25"
+    institution_repairs = [
+        repair
+        for repair in plan.field_repairs
+        if repair.field_name == "institution"
+        and repair.observed_value in {"您 本人 业", "真 本人", "苏 本人 6"}
+    ]
+    assert len(institution_repairs) == 3
+    assert {repair.mode for repair in institution_repairs} == {
+        "context_rich_reocr"
+    }
+
+    ocr_calls: list[tuple[set[int], str]] = []
+
+    def page_ocr_loader(
+        logical_pages: set[int],
+        *,
+        reason: str,
+    ) -> list[dict[str, object]]:
+        ocr_calls.append((set(logical_pages), reason))
+        acquired: list[dict[str, object]] = []
+        for logical_page in sorted(logical_pages):
+            repairs = [
+                repair
+                for repair in institution_repairs
+                if any(
+                    int(ref.get("logical_page") or 0) == logical_page
+                    for ref in repair.source_refs
+                )
+            ]
+            if not repairs:
+                continue
+            source_page = int(repairs[0].source_refs[0]["source_page"])
+            lines = [
+                {
+                    "text": "本人查询记录明细",
+                    "content": "本人查询记录明细",
+                    "confidence": 0.99,
+                    "bbox": [190.0, 575.0, 370.0, 600.0],
+                    "evidence_ids": [
+                        f"personal_detail_page_reocr:ye-{logical_page}:w0"
+                    ],
+                    "source": "personal_detail_page_reocr_once",
+                }
+            ]
+            for index, repair in enumerate(repairs, start=1):
+                ref = repair.source_refs[0]
+                lines.append(
+                    {
+                        "text": "本人",
+                        "content": "本人",
+                        "confidence": 0.99,
+                        "bbox": list(ref["bbox"]),
+                        "evidence_ids": [
+                            f"personal_detail_page_reocr:ye-{logical_page}:w{index}"
+                        ],
+                        "source": "personal_detail_page_reocr_once",
+                    }
+                )
+            acquired.append(
+                {
+                    "page": logical_page,
+                    "logical_page": logical_page,
+                    "source_page": source_page,
+                    "page_key": f"ye-{logical_page}",
+                    "lines": lines,
+                }
+            )
+        return acquired
+
+    coordinator.resolve_page_evidence(
+        plan,
+        source_pages=evidence,
+        page_ocr_loader=page_ocr_loader,
+    )
+    context._business_repair_plan = plan
+    context._business_repair_active = True
+    context._personal_detail_extraction_issues = []
+    context._ocr_correction_overlay = PersonalDetailOCRCorrectionOverlay(context)
+    context.candidate_b_planned_field_repair = (
+        PersonalDetailExtractionContext.candidate_b_planned_field_repair.__get__(
+            context,
+            type(context),
+        )
+    )
+    context.candidate_b_field_repair = (
+        PersonalDetailExtractionContext.candidate_b_field_repair.__get__(
+            context,
+            type(context),
+        )
+    )
+    context._ocr_correction_overlay.install_business_repair_evidence(
+        plan.page_evidence.values(),
+        affected_pages=plan.affected_pages,
+        allowed_target_refs=(
+            {**dict(ref), "field_name": repair.field_name}
+            for repair in plan.field_repairs
+            for ref in repair.source_refs
+        ),
+    )
+
+    records = _extract_inquiries(context)
+
+    assert ({29}, "business_field_context_rich_reocr_required") in ocr_calls
+    assert all(
+        reason == "business_field_context_rich_reocr_required"
+        for _pages, reason in ocr_calls
+    )
+    assert len(records) == 112
+    assert sorted(
+        row["sequence"]
+        for row in records
+        if row["inquiry_type"] == "personal"
+    ) == list(range(1, 17))
+    personal_records = sorted(
+        (row for row in records if row["inquiry_type"] == "personal"),
+        key=lambda row: row["sequence"],
+    )
+    assert [row["inquiry_date"] for row in personal_records] == [
+        date.replace("离 ", "").replace(".", "-") for date in dates
+    ]
+    assert {row["institution"] for row in personal_records} == {"本人"}
+
+
 def test_ye_shaped_owned_populations_emit_all_112_rows_with_local_sequence_repairs() -> None:
     pages, evidence, topology, entity_context = _ye_shaped_inquiry_registration_case()
     projection = _build(
@@ -1539,6 +1959,13 @@ def test_ye_shaped_owned_populations_emit_all_112_rows_with_local_sequence_repai
         issue["candidate_value"]["normalized_sequence"]
         for issue in repaired_issues
     } == set(repaired)
+    assert all(
+        len(issue["source_refs"]) == 2
+        and issue["source_refs"][1]["field_name"] == "sequence"
+        and issue["source_refs"][1]["binding"]
+        == "validated_canonical_population_column"
+        for issue in repaired_issues
+    )
     unresolved_dates = {
         row["sequence"]: row["canonical_raw"]["inquiry_date"]
         for row in records

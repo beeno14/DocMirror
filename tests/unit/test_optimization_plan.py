@@ -56,8 +56,10 @@ def test_projection_schema_registry():
     assert "community" in registry
     assert "community_semantic" in registry
     assert get_projection_schema("mirror").version == "1.1"
-    assert get_projection_schema("community").version == "3.0.0"
-    assert get_projection_schema("community").compatibility == "current-major; explicit-v2-exporter-required"
+    assert get_projection_schema("community").version == "5.0.0"
+    assert get_projection_schema("community").compatibility == (
+        "v3-v4-supported; digital-bank-business-v5; explicit-v2-exporter-required"
+    )
     assert get_projection_schema("community_v2").version == "2.2"
 
 

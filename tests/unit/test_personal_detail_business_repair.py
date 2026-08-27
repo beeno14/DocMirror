@@ -442,8 +442,8 @@ def test_second_source_pass_invalidates_discovery_account_anchor_skeleton(
     )
 
     class _Coordinator:
-        def __init__(self, _parse_result: object) -> None:
-            pass
+        def __init__(self, _parse_result: object, *, monthly_context: object) -> None:
+            assert monthly_context.parse_result is _parse_result
 
         def plan(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
             return plan
@@ -501,8 +501,8 @@ def test_field_only_repair_keeps_discovery_projection_and_account_skeleton(
     )
 
     class _Coordinator:
-        def __init__(self, _parse_result: object) -> None:
-            pass
+        def __init__(self, _parse_result: object, *, monthly_context: object) -> None:
+            assert monthly_context.parse_result is _parse_result
 
         def plan(self, *_args: object, **_kwargs: object) -> SimpleNamespace:
             return plan

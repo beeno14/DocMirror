@@ -25,6 +25,9 @@ from docmirror.plugins.credit_report.community_plugin import (
     _compact_personal_detail_public_projection,
     _CreditReportCommunityBundle,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+    make_issue,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _extract_header_datasets,
 )
@@ -3089,6 +3092,53 @@ def test_account_currency_ref_promotion_accepts_wrapped_live_envelope() -> None:
     } == {"account_currency", "reporting_amount_currency"}
 
 
+def test_account_currency_ref_promotion_accepts_live_blank_slot_without_evidence_ids() -> None:
+    """The native producer omits an empty evidence-id list on a blank cell."""
+
+    record_id = "credit_account:credit_card:20"
+    native_ref = _lin_card_20_native_currency_slot_ref()
+    native_ref.pop("evidence_ids")
+    source_row = project_personal_detail_datasets(
+        {
+            "credit_accounts": [
+                {
+                    "record_id": record_id,
+                    "account_id": record_id,
+                    "account_type": "credit_card",
+                    "account_currency": "CNY",
+                    "reporting_amount_currency": "CNY",
+                    "canonical_raw": {
+                        "account_currency": "人民币元",
+                        "reporting_amount_currency": "人民币元",
+                    },
+                    "source_refs_by_field": {
+                        "currency": [
+                            native_ref,
+                            _lin_card_20_corrected_currency_ref("currency"),
+                        ],
+                        "account_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "account_currency"
+                            )
+                        ],
+                        "reporting_amount_currency": [
+                            _lin_card_20_corrected_currency_ref(
+                                "reporting_amount_currency"
+                            )
+                        ],
+                    },
+                }
+            ]
+        }
+    )["credit_accounts"][0]
+
+    assert {
+        ref["field_name"]
+        for ref in source_row["source_refs"]
+        if ref.get("source") == "personal_detail_corrected_page_cell"
+    } == {"account_currency", "reporting_amount_currency"}
+
+
 def test_account_currency_raw_alias_survives_schema_and_community_compaction(
     tmp_path: Path,
 ) -> None:
@@ -3132,7 +3182,7 @@ def test_account_currency_raw_alias_survives_schema_and_community_compaction(
         projection_data=projection,
         projection_policy=dict(semantic["community_projection_overrides"]),
     )
-    payload = _CreditReportCommunityBundle(
+    bundle = _CreditReportCommunityBundle(
         schema=projected_bundle.schema,
         document=projected_bundle.document,
         sections=projected_bundle.sections,
@@ -3146,7 +3196,30 @@ def test_account_currency_raw_alias_survives_schema_and_community_compaction(
         domain=projected_bundle.domain,
         diagnostics=projected_bundle.diagnostics,
         content_markdown_override=projected_bundle.content_markdown_override,
-    ).json_payload()
+    )
+    semantic_payload = bundle.semantic_payload()
+    semantic_account = next(
+        row
+        for dataset in semantic_payload["datasets"]
+        if dataset["name"] == "credit_accounts"
+        for row in dataset["rows"]
+        if row["record_id"] == record_id
+    )
+    assert semantic_account["canonical_raw"]["account_currency"] == "人民币元"
+
+    # Reproduce the live deployment lifecycle: the bundle's construction-time
+    # dataset can predate the repaired semantic row. Community compaction must
+    # consume the supplied post-repair semantic payload, not this stale copy.
+    stale_dataset = next(
+        dataset
+        for dataset in bundle.datasets
+        if dataset.public.get("name") == "credit_accounts"
+    )
+    stale_dataset.rows[0]["canonical_raw"] = {}
+    stale_dataset.rows[0]["raw"] = {}
+    stale_dataset.rows[0]["source_refs"] = []
+
+    payload = bundle.json_payload(semantic_payload)
 
     assert validate_projection_payload("community", payload).valid
     datasets = {dataset["name"]: dataset for dataset in payload["datasets"]}
@@ -3875,6 +3948,50 @@ def test_v2_credit_agreement_raw_alias_cannot_reenter_normalized_business_data()
     assert row["raw"]["facility_limit"] == invalid_limit
     assert "total_limit" not in row["canonical_raw"]
     assert "total_limit" not in row["raw"]
+
+
+def test_v2_agreement_omission_issue_never_targets_nonexistent_business_row() -> None:
+    issue = make_issue(
+        category="schema_incompleteness",
+        issue_code="source_credit_agreement_record_omitted",
+        message="A source-proven ordinal was not emitted.",
+        parser_stage="source_completeness_ledger",
+        target_dataset="credit_lines",
+        target_record_id="credit_agreement:1",
+        field_name="credit_line_id",
+        observed_value={"credit_agreement_sequence": 1},
+        reason_codes=("missing_business_record",),
+    )
+    projected = project_personal_detail_datasets(
+        {
+            "credit_lines": [
+                _record(
+                    "credit-line:3",
+                    credit_line_id="credit-line:3",
+                    sequence=3,
+                    institution="示例银行",
+                    facility_type="信用卡共享额度",
+                    effective_date="2024-01-01",
+                )
+            ],
+            "personal_detail_extraction_issues": [issue],
+        }
+    )
+
+    omission = next(
+        row
+        for row in projected["extraction_issues"]
+        if row.get("issue_code") == "source_credit_agreement_record_omitted"
+    )
+    assert omission["target_dataset"] == "credit_agreements"
+    assert omission.get("target_record_id") is None
+    assert any(
+        evidence.get("extraction_issue_id") == omission["extraction_issue_id"]
+        and evidence.get("evidence_kind") == "observed"
+        and evidence.get("evidence_path") == "credit_agreement_sequence"
+        and evidence.get("integer_value") == 1
+        for evidence in projected["extraction_issue_evidence"]
+    )
 
 
 def test_v2_keeps_facility_limit_and_credit_limit_as_distinct_business_fields() -> None:

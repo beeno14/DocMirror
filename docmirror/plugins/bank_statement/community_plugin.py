@@ -39,6 +39,7 @@ from docmirror.plugins.bank_statement.extract_pipeline import (
 )
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text, normalize_header_cell
 from docmirror.plugins.bank_statement.statement_context import (
+    _FIELD_ALIASES,
     attach_statement_context,
     build_statement_header_records,
     page_texts_with_business_headers,
@@ -1225,6 +1226,26 @@ class BankStatementCommunityPlugin(BaseTableParser):
         datasets.update(projection.datasets)
         semantic = dict(projection.semantic)
         semantic["dataset_document_order"] = ["statement_header", "transactions"]
+        if result.extraction_route.value == "digital":
+            # Presentation policy only: reuse existing source-label mappings;
+            # do not change normalized records or any extraction decision.
+            semantic["enhanced_markdown"] = {
+                **(semantic.get("enhanced_markdown") or {}),
+                "privacy_mode": "full",
+            }
+            semantic["compact_output"] = {
+                "omit_absent_fields": True,
+                "minify_json": True,
+                "normalized_only": True,
+                "business_view": True,
+                "source_aliases": {
+                    "statement_header": {key: list(aliases) for key, aliases in _FIELD_ALIASES.items()},
+                    "transactions": {
+                        mapping.field: [name, *(mapping.aliases or [])]
+                        for name, mapping in self.column_registry.items()
+                    },
+                },
+            }
         return projection.model_copy(
             update={
                 "entity_fields": entity_fields,

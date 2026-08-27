@@ -104,6 +104,15 @@ def _date_range_only_grid(
                 "end_month": end_month,
             },
         }
+    printed_anchor_identity = (
+        anchor.get("printed_anchor_identity")
+        if isinstance(anchor, Mapping)
+        else getattr(anchor, "printed_anchor_identity", None)
+    )
+    if isinstance(printed_anchor_identity, Mapping):
+        # A printed range remains identifiable when its month-cell geometry
+        # is unresolved. This is opaque provenance, never a value/slot proof.
+        audit["printed_anchor_provenance"] = deepcopy(dict(printed_anchor_identity))
     return {
         "grid_id": f"mg_p{page}_repayment_{grid_index}",
         "structure_kind": "micro_grid",
@@ -157,12 +166,16 @@ def augment_credit_repayment_evidence_bundles(
         if not any(_RANGE_ANCHOR_CANDIDATE_RE.search(re.sub(r"\s+", "", _text(line))) for line in lines):
             continue
         leading: list[dict[str, Any]] = []
+        continuation_boundary_top: float | None = None
         for line in next_evidence.get("lines") or []:
             if not isinstance(line, dict):
                 continue
             text = _text(line)
             compact = re.sub(r"\s+", "", text)
             if _RANGE_ANCHOR_CANDIDATE_RE.search(compact) or _CONTINUATION_BOUNDARY_RE.search(text):
+                boundary_bbox = _bbox(line)
+                if boundary_bbox[3] > boundary_bbox[1]:
+                    continuation_boundary_top = boundary_bbox[1]
                 break
             leading.append(dict(line))
         if not leading:
@@ -180,7 +193,42 @@ def augment_credit_repayment_evidence_bundles(
                     "coordinate_status": "cross_page_y_shift",
                 }
             )
+        leading_bottom = max(_bbox(line)[3] for line in leading)
+        token_limit = (
+            min(leading_bottom, continuation_boundary_top)
+            if continuation_boundary_top is not None
+            else leading_bottom
+        )
+        shifted_tokens: list[dict[str, Any]] = []
+        for token in next_evidence.get("tokens") or []:
+            if not isinstance(token, dict):
+                continue
+            bbox = _bbox(token)
+            if (
+                bbox[2] <= bbox[0]
+                or bbox[3] <= bbox[1]
+                or (bbox[1] + bbox[3]) / 2.0 > token_limit
+            ):
+                continue
+            shifted_tokens.append(
+                {
+                    **deepcopy(token),
+                    "bbox": [
+                        bbox[0],
+                        bbox[1] + shift,
+                        bbox[2],
+                        bbox[3] + shift,
+                    ],
+                    "source_logical_page": next_page,
+                    "coordinate_status": "cross_page_y_shift",
+                }
+            )
         evidence["lines"] = [*lines, *shifted]
+        if shifted_tokens:
+            evidence["tokens"] = [
+                *list(evidence.get("tokens") or []),
+                *shifted_tokens,
+            ]
         evidence["credit_cross_page_augmented"] = True
         evidence["continuation_logical_pages"] = [next_page]
         continuation_geometry = evidence.setdefault(

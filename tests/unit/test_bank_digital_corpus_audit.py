@@ -23,14 +23,147 @@ def audit_module() -> ModuleType:
     return module
 
 
-def _terminal_source(field: str) -> dict:
+def _manifest_payload(audit_module: ModuleType, corpus: Path) -> dict:
+    entry = {
+        "case_number": 1,
+        "filename": "case_0001_fixture.pdf",
+        "relative_path": "case_0001_fixture.pdf",
+        "source_sha256": "a" * 64,
+        "source_bytes": 1,
+        "effective_page_count": 1,
+        "effective_page_count_basis": "focused_fixture",
+        "page_count_candidates": {"focused_fixture": 1},
+        "page_count_disagreement": False,
+        "content_group_size": 1,
+    }
+    return {
+        "schema": audit_module.MANIFEST_SCHEMA,
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "corpus_root": str(corpus.resolve()),
+        "file_count": 1,
+        "unique_sha256_count": 1,
+        "effective_page_count": 1,
+        "page_count_disagreement_count": 0,
+        "entries_fingerprint": audit_module._fingerprint([entry]),
+        "entries": [entry],
+    }
+
+
+def test_harness_derives_manifest_from_work_root(tmp_path, audit_module):
+    corpus = tmp_path / "Primary"
+    corpus.mkdir()
+    work_root = tmp_path / "work"
+    manifest_path = work_root / "manifest.json"
+    audit_module._atomic_write_json(manifest_path, _manifest_payload(audit_module, corpus))
+    args = audit_module._parser().parse_args(["reproject", "--work-root", str(work_root)])
+
+    manifest = audit_module._load_or_build_manifest(args)
+
+    assert Path(args.manifest) == manifest_path.resolve()
+    assert Path(args.corpus) == corpus.resolve()
+    assert manifest["file_count"] == 1
+
+
+def test_projection_fingerprint_covers_shared_export_code(audit_module):
+    _fingerprint, files = audit_module._bank_code_fingerprint()
+    assert "docmirror/output/community_bundle.py" in files
+    assert "docmirror/server/edition_outputs.py" in files
+    assert "docmirror/output/normalized_records.py" in files
+    assert "docmirror/output/bank_business_view.py" in files
+    assert "docmirror/models/schemas/registry.py" in files
+
+
+def test_export_validation_options_do_not_enable_pdf_perception(audit_module):
+    args = audit_module._parser().parse_args(
+        ["reproject", "--validate-exports", "--baseline-report", "prior.json"]
+    )
+    assert args.validate_exports is True
+    assert args.baseline_report == "prior.json"
+    assert args.refresh is False
+    assert args.command == "reproject"
+
+
+def test_harness_rejects_manifest_corpus_mismatch_before_processing(tmp_path, audit_module):
+    corpus = tmp_path / "Primary"
+    other_corpus = tmp_path / "All"
+    corpus.mkdir()
+    other_corpus.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    audit_module._atomic_write_json(manifest_path, _manifest_payload(audit_module, corpus))
+    args = audit_module._parser().parse_args(
+        [
+            "reproject",
+            "--work-root",
+            str(tmp_path / "work"),
+            "--manifest",
+            str(manifest_path),
+            "--corpus",
+            str(other_corpus),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="manifest corpus_root does not match --corpus"):
+        audit_module._load_or_build_manifest(args)
+
+
+def test_harness_cli_stops_before_projection_on_manifest_corpus_mismatch(
+    tmp_path,
+    audit_module,
+    monkeypatch,
+    capsys,
+):
+    corpus = tmp_path / "Primary"
+    other_corpus = tmp_path / "All"
+    corpus.mkdir()
+    other_corpus.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    audit_module._atomic_write_json(manifest_path, _manifest_payload(audit_module, corpus))
+    projected = False
+
+    def unexpected_projection(*_args, **_kwargs):
+        nonlocal projected
+        projected = True
+        raise AssertionError("projection must not run")
+
+    monkeypatch.setattr(audit_module, "_reproject_selected", unexpected_projection)
+
+    status = audit_module.main(
+        [
+            "reproject",
+            "--manifest",
+            str(manifest_path),
+            "--corpus",
+            str(other_corpus),
+        ]
+    )
+
+    assert status == 2
+    assert projected is False
+    assert "Manifest configuration error" in capsys.readouterr().err
+
+
+def test_harness_rejects_manifest_entry_that_escapes_corpus(tmp_path, audit_module):
+    corpus = tmp_path / "Primary"
+    corpus.mkdir()
+    manifest = _manifest_payload(audit_module, corpus)
+    manifest["entries"][0]["relative_path"] = "../outside.pdf"
+    manifest["entries_fingerprint"] = audit_module._fingerprint(manifest["entries"])
+    manifest_path = tmp_path / "manifest.json"
+    audit_module._atomic_write_json(manifest_path, manifest)
+    args = audit_module._parser().parse_args(["report", "--manifest", str(manifest_path)])
+
+    with pytest.raises(ValueError, match="unsafe relative_path"):
+        audit_module._load_or_build_manifest(args)
+
+
+def _terminal_source(field: str, *, page: int = 3) -> dict:
     return {
         "raw_name": f"issuer_{field}",
         "source": "canonical_evidence_atoms",
         "source_refs": [
             {
                 "source": "canonical_evidence_atoms",
-                "source_page": 3,
+                "source_page": page,
                 "bbox": [10.0, 500.0, 100.0, 515.0],
             }
         ],
@@ -185,9 +318,7 @@ def test_corpus_audit_rejects_normalized_opaque_identifier_corruption(monkeypatc
 
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["source_identifier_contradiction"] == 1
-    [finding] = [
-        item for item in audit["findings"] if item["code"] == "source_identifier_contradiction"
-    ]
+    [finding] = [item for item in audit["findings"] if item["code"] == "source_identifier_contradiction"]
     assert finding["detail"] == {
         "field": "sequence_no",
         "source": "546276664",
@@ -536,9 +667,7 @@ def _period_payload(
     source_only: bool = False,
 ) -> dict:
     period_fields = {
-        field: value
-        for field in ("period_start", "period_end")
-        if (value := header_normalized.get(field))
+        field: value for field in ("period_start", "period_end") if (value := header_normalized.get(field))
     }
     header_field_sources = {field: _period_source(field) for field in period_fields}
     header = {
@@ -556,20 +685,13 @@ def _period_payload(
     transactions = []
     for index, values in enumerate(transaction_normalized, start=1):
         normalized = {"statement_header_id": header["record_id"], **values}
-        canonical = {
-            field: values[field]
-            for field in ("period_start", "period_end")
-            if field in values
-        }
+        canonical = {field: values[field] for field in ("period_start", "period_end") if field in values}
         field_sources = {}
         if propagate and not source_only:
             normalized.update(period_fields)
             canonical.update(period_fields)
         if propagate or source_only:
-            field_sources = {
-                field: dict(header_field_sources[field])
-                for field in period_fields
-            }
+            field_sources = {field: dict(header_field_sources[field]) for field in period_fields}
         transactions.append(
             {
                 "record_id": f"bank:r{index:06d}",
@@ -853,11 +975,7 @@ def test_balance_source_role_gate_rejects_normalized_mismatch(audit_module):
 
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["transaction_balance_source_role_mismatch"] == 1
-    [finding] = [
-        item
-        for item in audit["findings"]
-        if item["code"] == "transaction_balance_source_role_mismatch"
-    ]
+    [finding] = [item for item in audit["findings"] if item["code"] == "transaction_balance_source_role_mismatch"]
     assert finding["path"] == "datasets.transactions.rows.0.normalized.balance"
     assert finding["detail"]["reasons"] == ["normalized_value_mismatch"]
     assert finding["detail"]["source_balance"]["evidence_id"] == "row:balance"
@@ -898,11 +1016,7 @@ def test_balance_source_role_gate_rejects_cross_column_canonical_residue(audit_m
 
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["transaction_balance_source_role_mismatch"] == 1
-    [finding] = [
-        item
-        for item in audit["findings"]
-        if item["code"] == "transaction_balance_source_role_mismatch"
-    ]
+    [finding] = [item for item in audit["findings"] if item["code"] == "transaction_balance_source_role_mismatch"]
     assert finding["path"] == "datasets.transactions.rows.0.canonical_raw.balance"
     assert finding["detail"]["reasons"] == ["cross_column_residue"]
     assert finding["detail"]["cross_column_sources"] == [
@@ -1081,9 +1195,7 @@ def test_fused_direction_amount_header_does_not_widen_balance_band(audit_module)
             "evidence_ids": [amount_atom.id, fused_balance.id],
         }
     )
-    typed, serialized = _evidence_store_parse_results(
-        [*header_atoms, amount_atom, fused_balance]
-    )
+    typed, serialized = _evidence_store_parse_results([*header_atoms, amount_atom, fused_balance])
 
     typed_audit = audit_module.audit_community_payload(
         payload,
@@ -1116,9 +1228,7 @@ def _cross_row_role_parse_result(*, include_crossing_account: bool = True) -> Si
         _native_text_atom("row:following:account", "支付宝(中国)网络技术有限公司", [469.0, 152.0, 565.0, 160.0]),
     ]
     if include_crossing_account:
-        atoms.append(
-            _native_text_atom("row:previous:account", "215500690", [469.0, 140.0, 518.0, 148.0])
-        )
+        atoms.append(_native_text_atom("row:previous:account", "215500690", [469.0, 140.0, 518.0, 148.0]))
     return SimpleNamespace(
         pages=[SimpleNamespace(page_number=1, source_page_number=1, tables=[])],
         evidence_plane=SimpleNamespace(evidence=[SimpleNamespace(text_atoms=atoms)]),
@@ -1191,6 +1301,9 @@ def _direction_distribution_payload(
             "source": "statement_header_scope",
             "source_page": 1,
             "page_range": [1, 1],
+            "field_sources": {
+                key: _terminal_source(key, page=1) for key, value in terminal.items() if value is not None
+            },
         },
     }
     transactions = []
@@ -1226,6 +1339,538 @@ def _direction_distribution_payload(
             {"name": "transactions", "rows": transactions},
         ]
     }
+
+
+def _drop_header_fields(payload: dict, *fields: str) -> None:
+    header = payload["datasets"][0]["rows"][0]
+    for field in fields:
+        header["normalized"].pop(field, None)
+        header["canonical_raw"].pop(field, None)
+        header["source"]["field_sources"].pop(field, None)
+
+
+def _set_source_bound_header_field(payload: dict, field: str, value: str) -> None:
+    header = payload["datasets"][0]["rows"][0]
+    header["normalized"][field] = value
+    header["canonical_raw"][field] = value
+    header["source"]["field_sources"][field] = _terminal_source(field, page=1)
+
+
+def _set_derived_page_total(
+    payload: dict,
+    field: str,
+    raw_name: str,
+    page_values: list[str],
+    *,
+    declared_value: str | None = None,
+    sign_normalization: str | None = None,
+) -> None:
+    header = payload["datasets"][0]["rows"][0]
+    total = sum((Decimal(value) for value in page_values), Decimal("0"))
+    total_text = declared_value if declared_value is not None else format(total, "f")
+    header["normalized"][field] = total_text
+    header["canonical_raw"][field] = total_text
+    header["source"]["page_range"] = [1, len(page_values)]
+    field_source = {
+        "raw_name": raw_name,
+        "source": "derived_explicit_page_aggregate",
+        "derivation": "sum_explicit_page_totals",
+        "components": [
+            {
+                "page": page,
+                "raw_name": raw_name,
+                "raw_value": value,
+                "normalized_value": value,
+                "bbox": [10.0, 500.0, 150.0, 515.0],
+                "evidence_ids": [f"page-total:{field}:{page}"],
+                "source": "canonical_evidence_atoms",
+            }
+            for page, value in enumerate(page_values, start=1)
+        ],
+    }
+    if sign_normalization is not None:
+        field_source["sign_normalization"] = sign_normalization
+    header["source"]["field_sources"][field] = field_source
+
+
+def _icbc_page_total_payload() -> dict:
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _drop_header_fields(payload, "total_transactions", "debit_count", "credit_count")
+    _set_derived_page_total(payload, "debit_total", "本页支出算术合计:", ["10.00", "20.00"])
+    _set_derived_page_total(payload, "credit_total", "本页收入算术合计:", ["2.00", "3.00"])
+    return payload
+
+
+def test_completion_checker_marks_authoritative_count_and_totals_complete(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert audit["completion_status_counts"] == {"complete": 1}
+    [check] = audit["completion_checks"]
+    assert check["status"] == "complete"
+    assert check["accounted_transactions"] == 3
+    assert check["accepted_direction_mappings"] == ["direct"]
+
+
+def test_completion_checker_accepts_issuer_count_unit_in_canonical_value(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    header = payload["datasets"][0]["rows"][0]
+    header["canonical_raw"]["debit_count"] = "２ 笔"
+    header["canonical_raw"]["credit_count"] = "1笔"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert "header_aggregate_provenance_invalid" not in audit["finding_counts"]
+
+
+@pytest.mark.parametrize(
+    "canonical_value",
+    [
+        "2页",
+        "共2笔",
+        "2.5笔",
+        "-2笔",
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        float("nan"),
+        float("inf"),
+    ],
+)
+def test_completion_checker_rejects_noncanonical_count_unit_values(audit_module, canonical_value):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    payload["datasets"][0]["rows"][0]["canonical_raw"]["debit_count"] = canonical_value
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_aggregate_provenance_invalid"] == 1
+
+
+@pytest.mark.parametrize("canonical_value", ["NaN", "Infinity", "-Infinity"])
+def test_completion_checker_rejects_nonfinite_aggregate_values(audit_module, canonical_value):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    payload["datasets"][0]["rows"][0]["canonical_raw"]["debit_total"] = canonical_value
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_aggregate_provenance_invalid"] == 1
+
+
+def test_completion_checker_marks_unproven_header_aggregates_unverified(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    payload["datasets"][0]["rows"][0]["source"]["field_sources"] = {}
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "unverified"
+    [check] = audit["completion_checks"]
+    assert check["authoritative_fields"] == []
+    assert check["ignored_fields"]["total_transactions"] == "source_missing"
+    assert "authoritative_transaction_count_missing" in check["reasons"]
+
+
+def test_completion_checker_accepts_issuer_row_count_evidence_contract(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _drop_header_fields(payload, "debit_count", "debit_total", "credit_count", "credit_total")
+    header = payload["datasets"][0]["rows"][0]
+    header["source"]["field_sources"]["total_transactions"] = {
+        "raw_name": "split_footer_transaction_count",
+        "source": "row_count_evidence.split_footer",
+        "raw_value": "2",
+        "normalized_value": "2",
+    }
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert audit["completion_checks"][0]["authoritative_fields"] == ["total_transactions"]
+
+
+def test_completion_checker_rejects_aggregate_cross_layer_contradiction(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    payload["datasets"][0]["rows"][0]["canonical_raw"]["total_transactions"] = "3"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_aggregate_provenance_invalid"] == 1
+
+
+def test_completion_checker_marks_authoritative_count_mismatch_inconsistent(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _drop_header_fields(payload, "debit_count", "debit_total", "credit_count", "credit_total")
+    header = payload["datasets"][0]["rows"][0]
+    header["normalized"]["total_transactions"] = 3
+    header["canonical_raw"]["total_transactions"] = "3"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_transaction_count_mismatch"] == 1
+
+
+def test_completion_checker_applies_declared_amount_unit_with_decimal_math(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="0.003",
+        credit_count=1,
+        credit_total="0.0005",
+    )
+    _set_source_bound_header_field(payload, "amount_unit", "万元")
+    _set_source_bound_header_field(payload, "currency", "CNY")
+    for row in payload["datasets"][1]["rows"]:
+        row["normalized"]["currency"] = "CNY"
+        row["canonical_raw"]["currency"] = "CNY"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert audit["completion_checks"][0]["accepted_direction_mappings"] == ["direct"]
+
+
+def test_completion_checker_rejects_currency_scope_contradiction(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _set_source_bound_header_field(payload, "currency", "CNY")
+    for row in payload["datasets"][1]["rows"]:
+        row["normalized"]["currency"] = "USD"
+        row["canonical_raw"]["currency"] = "USD"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_transaction_currency_mismatch"] == 1
+
+
+def test_completion_checker_accepts_source_bound_filtered_scope(audit_module):
+    payload = _direction_distribution_payload(
+        [("income", "10.00"), ("income", "5.00")],
+        debit_count=0,
+        debit_total="0.00",
+        credit_count=2,
+        credit_total="15.00",
+    )
+    _set_source_bound_header_field(payload, "direction_filter", "收入")
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+
+
+def test_completion_checker_rejects_transaction_outside_filtered_scope(audit_module):
+    payload = _direction_distribution_payload(
+        [("income", "10.00"), ("expense", "5.00")],
+        debit_count=1,
+        debit_total="5.00",
+        credit_count=1,
+        credit_total="10.00",
+    )
+    _set_source_bound_header_field(payload, "direction_filter", "收入")
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_filter_scope_mismatch"] == 1
+
+
+def test_completion_checker_does_not_treat_amount_only_contract_as_row_complete(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _drop_header_fields(payload, "total_transactions", "debit_count", "credit_count")
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "unverified"
+    assert "authoritative_amounts_without_authoritative_direction_counts" in audit["completion_checks"][0]["reasons"]
+
+
+def test_completion_checker_accepts_evidenced_icbc_page_arithmetic_totals(audit_module):
+    payload = _icbc_page_total_payload()
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=2)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "unverified"
+    [check] = audit["completion_checks"]
+    assert check["authoritative_fields"] == ["credit_total", "debit_total"]
+    assert check["ignored_fields"] == {}
+    assert "authoritative_amounts_without_authoritative_direction_counts" in check["reasons"]
+    assert "authoritative_transaction_count_missing" in check["reasons"]
+
+
+def test_completion_checker_accepts_icbc_page_totals_with_issuer_spelling_and_signed_debits(
+    audit_module,
+):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _set_derived_page_total(
+        payload,
+        "debit_total",
+        "本页支出算数合计:",
+        ["-10.00", "-20.00"],
+        declared_value="30.00",
+        sign_normalization="magnitude_from_nonpositive_expense_page_totals",
+    )
+    _set_derived_page_total(
+        payload,
+        "credit_total",
+        "本页收入算数合计:",
+        ["2.00", "3.00"],
+    )
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=2)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert audit["completion_checks"][0]["accepted_direction_mappings"] == ["direct"]
+
+
+def test_completion_checker_accepts_nonnegative_expense_page_total_magnitude_contract(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _set_derived_page_total(
+        payload,
+        "debit_total",
+        "本页支出算术合计:",
+        ["10.00", "20.00"],
+        declared_value="30.00",
+        sign_normalization="magnitude_from_nonnegative_expense_page_totals",
+    )
+    _set_derived_page_total(
+        payload,
+        "credit_total",
+        "本页收入算术合计:",
+        ["5.00", "0.00"],
+    )
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=2)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "complete"
+    assert audit["completion_checks"][0]["accepted_direction_mappings"] == ["direct"]
+
+
+@pytest.mark.parametrize(
+    ("field", "page_values", "declared_value", "sign_normalization"),
+    [
+        ("debit_total", ["-10.00", "-20.00"], "30.00", None),
+        (
+            "debit_total",
+            ["10.00", "20.00"],
+            "30.00",
+            "magnitude_from_nonpositive_expense_page_totals",
+        ),
+        (
+            "debit_total",
+            ["-10.00", "-20.00"],
+            "30.00",
+            "unsupported_sign_contract",
+        ),
+        (
+            "credit_total",
+            ["-2.00", "-3.00"],
+            "5.00",
+            "magnitude_from_nonpositive_expense_page_totals",
+        ),
+        (
+            "debit_total",
+            ["-10.00", "-20.00"],
+            "30.00",
+            "magnitude_from_nonnegative_expense_page_totals",
+        ),
+        (
+            "credit_total",
+            ["2.00", "3.00"],
+            "5.00",
+            "magnitude_from_nonnegative_expense_page_totals",
+        ),
+    ],
+)
+def test_completion_checker_rejects_uncontracted_or_invalid_page_total_sign_normalization(
+    audit_module,
+    field,
+    page_values,
+    declared_value,
+    sign_normalization,
+):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00"), ("expense", "20.00")],
+        debit_count=2,
+        debit_total="30.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    raw_name = "本页支出算数合计:" if field == "debit_total" else "本页收入算数合计:"
+    _set_derived_page_total(
+        payload,
+        field,
+        raw_name,
+        page_values,
+        declared_value=declared_value,
+        sign_normalization=sign_normalization,
+    )
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=2)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_aggregate_provenance_invalid"] == 1
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing-page", "component-sum", "raw-mismatch", "inferred-source", "duplicate-page"],
+)
+def test_completion_checker_rejects_incomplete_derived_page_total_provenance(audit_module, damage):
+    payload = _icbc_page_total_payload()
+    header = payload["datasets"][0]["rows"][0]
+    debit_source = header["source"]["field_sources"]["debit_total"]
+    if damage == "missing-page":
+        debit_source["components"].pop()
+    elif damage == "component-sum":
+        debit_source["components"][1]["normalized_value"] = "19.99"
+    elif damage == "raw-mismatch":
+        debit_source["components"][1]["raw_value"] = "19.99"
+    elif damage == "inferred-source":
+        debit_source["components"][1]["source"] = "inferred_page_total"
+    else:
+        debit_source["components"][1]["page"] = 1
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=2)
+
+    assert audit["status"] == "fail"
+    assert audit["completion_status"] == "inconsistent"
+    assert audit["finding_counts"]["header_aggregate_provenance_invalid"] == 1
+
+
+def test_completion_checker_does_not_promote_page_total_label_without_page_derivation(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=0,
+        credit_total=None,
+    )
+    _drop_header_fields(payload, "total_transactions", "debit_count", "credit_count", "credit_total")
+    header = payload["datasets"][0]["rows"][0]
+    header["source"]["field_sources"]["debit_total"]["raw_name"] = "本页支出算术合计:"
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "unverified"
+    [check] = audit["completion_checks"]
+    assert check["authoritative_fields"] == []
+    assert check["ignored_fields"]["debit_total"] == "aggregate_label_not_authoritative"
+
+
+def test_completion_checker_fails_closed_on_unknown_amount_unit(audit_module):
+    payload = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1,
+        debit_total="10.00",
+        credit_count=1,
+        credit_total="5.00",
+    )
+    _set_source_bound_header_field(payload, "amount_unit", "袋")
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=1)
+
+    assert audit["status"] == "pass"
+    assert audit["completion_status"] == "unverified"
+    assert "amount_unit_semantics_unverified" in audit["completion_checks"][0]["reasons"]
 
 
 def _attach_signed_source_plane(
@@ -1294,9 +1939,7 @@ def test_header_direction_distribution_rejects_when_neither_mapping_reconciles(a
 
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["header_direction_distribution_mismatch"] == 1
-    [finding] = [
-        item for item in audit["findings"] if item["code"] == "header_direction_distribution_mismatch"
-    ]
+    [finding] = [item for item in audit["findings"] if item["code"] == "header_direction_distribution_mismatch"]
     assert finding["detail"]["accepted_mappings"] == []
     assert finding["detail"]["actual_expense_total"] == "30.00"
     assert finding["detail"]["actual_income_total"] == "5.00"
@@ -1560,10 +2203,7 @@ def test_direction_distribution_accepts_source_bound_zero_amount_count_slack_wit
     }
     assert audit["status"] == "pass"
     assert "header_direction_distribution_mismatch" not in audit["finding_counts"]
-    assert [
-        (row["normalized"]["direction"], row["canonical_raw"]["direction"])
-        for row in rows[3:]
-    ] == [("", "")] * 4
+    assert [(row["normalized"]["direction"], row["canonical_raw"]["direction"]) for row in rows[3:]] == [("", "")] * 4
 
 
 @pytest.mark.parametrize(
@@ -1626,3 +2266,47 @@ def test_direction_distribution_zero_amount_count_slack_fails_closed(
     assert candidates == ()
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["header_direction_distribution_mismatch"] == 1
+
+
+@pytest.mark.parametrize("evidence_state", ["retained", "missing", "different_normalized"])
+def test_normalized_delivery_is_audited_against_retained_internal_evidence(audit_module, evidence_state):
+    import copy
+
+    evidence = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1, debit_total="10.00", credit_count=1, credit_total="5.00",
+    )
+    payload = copy.deepcopy(evidence)
+    payload["schema"] = {"version": "4.0.0"}
+    for dataset in payload["datasets"]:
+        for row in dataset["rows"]:
+            row.pop("raw")
+            row.pop("canonical_raw")
+    if evidence_state == "different_normalized":
+        payload["datasets"][1]["rows"][0]["normalized"]["amount"] = "999.00"
+    result = audit_module.audit_community_payload(
+        payload, effective_page_count=1,
+        evidence_payload=None if evidence_state == "missing" else evidence,
+    )
+    if evidence_state == "retained":
+        assert result["status"] == "pass"
+    elif evidence_state == "missing":
+        assert result["finding_counts"]["internal_evidence_required_for_normalized_export"] == 1
+    else:
+        assert result["finding_counts"]["internal_evidence_mismatch"] == 1
+
+
+def test_normalized_projection_cache_requires_hash_checked_evidence(tmp_path, audit_module):
+    payload_path = tmp_path / "sample.community.json"
+    meta_path = tmp_path / "sample.meta.json"
+    evidence_path = payload_path.with_suffix(".evidence.json")
+    audit_module._atomic_write_json(payload_path, {"schema": {"version": "4.0.0"}})
+    meta = {"community_sha256": audit_module._sha256_file(payload_path)}
+    audit_module._atomic_write_json(meta_path, meta)
+    assert not audit_module._projection_payload_is_valid(payload_path, meta_path, {})
+    audit_module._atomic_write_json(evidence_path, {"datasets": []})
+    meta["evidence_sha256"] = audit_module._sha256_file(evidence_path)
+    audit_module._atomic_write_json(meta_path, meta)
+    assert audit_module._projection_payload_is_valid(payload_path, meta_path, {})
+    audit_module._atomic_write_json(evidence_path, {"datasets": ["changed"]})
+    assert not audit_module._projection_payload_is_valid(payload_path, meta_path, {})

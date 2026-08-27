@@ -43,9 +43,9 @@ def _builtin_specs() -> dict[str, ProjectionSchemaSpec]:
         ProjectionSchemaSpec(
             name="community",
             path=_SCHEMAS_DIR / "community_bundle.schema.json",
-            version="3.0.0",
-            description="Self-contained Community JSON API with complete dataset records",
-            compatibility="current-major; explicit-v2-exporter-required",
+            version="5.0.0",
+            description="Community JSON API: business-facing digital-bank v5, normalized v4, and evidence-backed v3",
+            compatibility="v3-v4-supported; digital-bank-business-v5; explicit-v2-exporter-required",
         ),
         ProjectionSchemaSpec(
             name="community_semantic",

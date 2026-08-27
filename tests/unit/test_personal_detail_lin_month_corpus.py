@@ -17,10 +17,16 @@ preserves the production-only topology that helper-style alias tests miss:
 * retained canonical refs have rejected geometry, while the detached alias has
   exact cell boxes and no ``source_page``.
 
+The deficient original remains a fail-closed case: the signed four-row oracle
+does not itself supply the missing physical evidence to the pipeline.  A
+separate, explicitly simulated full-provenance variant supplies four complete
+status/amount pairs.  It retains the detached cell boxes above, adds a simulated
+pair for pt_10_0, and aligns the account/grid bounds to that coordinate plane.
+The values are held constant to isolate ownership and population, not to assert
+OCR accuracy for those cells.
+
 The tests enter through the real orchestration planner, relationship producer,
-source-projection ledger, and final schema projector.  They are intentionally
-stronger than helper-only consumer fixtures and may remain red while production
-source changes are frozen.
+source-projection ledger, and final schema projector without running a PDF.
 """
 
 from __future__ import annotations
@@ -46,6 +52,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_status_confl
     apply_candidate_b_native_status_conflict_guard,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+    _native_month_lattice_from_exact_ref,
     link_candidate_b_repayments,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -210,6 +217,43 @@ def _lin_p10_detached_cell_refs(
     raise AssertionError((grid_id, performance_month))
 
 
+def _lin_p10_complete_cell_refs(
+    table_id: str,
+    grid_id: str,
+    performance_month: str,
+    *,
+    source: str,
+) -> list[dict[str, object]]:
+    """Supply a declared full-provenance simulation, not repaired saved output."""
+
+    assert performance_month in LIN_P10_SIGNED_SOURCE_TABLE_MONTHS[table_id]
+    if table_id == "pt_10_0":
+        # No exact month cell for this table survived in the minimized corpus.
+        # This pair is deliberately simulated one table above the retained
+        # pt_10_1 cells, rather than presented as an observed real-PDF repair.
+        refs = _lin_exact_cell_refs(
+            grid_id,
+            performance_month=performance_month,
+            status_bbox=[291.3333333333333, 274.5, 316.375, 296.0],
+            amount_bbox=[291.3333333333333, 289.5, 316.375, 312.5],
+        )
+    else:
+        detector_id = LIN_P10_GRID_0 if table_id == "pt_10_1" else LIN_P10_GRID_1
+        refs = _lin_p10_detached_cell_refs(detector_id, performance_month)
+    for ref in refs:
+        ref.update(
+            {
+                "grid_id": grid_id,
+                "source_page": 5,
+                "source_logical_page": 10,
+                "table_id": table_id,
+                "geometry_status": "exact",
+                "source": source,
+            }
+        )
+    return refs
+
+
 def _lin_rejected_canonical_ref(
     grid_id: str,
     performance_month: str,
@@ -272,10 +316,19 @@ def _lin_source_structure_month_row(
     }
 
 
-def _lin_detached_issue_trio() -> list[dict[str, object]]:
+def _lin_detached_issue_trio(
+    *,
+    fully_sourced: bool = False,
+) -> list[dict[str, object]]:
     grid_id = LIN_P10_GRID_0
     performance_month = "2020-10"
-    raw_refs = _lin_p10_detached_cell_refs(grid_id, performance_month)
+    raw_refs = (
+        _lin_p10_complete_cell_refs(
+            "pt_10_1", grid_id, performance_month, source="source_table_geometry"
+        )
+        if fully_sourced
+        else _lin_p10_detached_cell_refs(grid_id, performance_month)
+    )
 
     def localized_ref(index: int, field_name: str) -> dict[str, object]:
         ref = deepcopy(raw_refs[index])
@@ -329,7 +382,7 @@ def _lin_detached_issue_trio() -> list[dict[str, object]]:
     ]
 
 
-def _lin_p10_producer_result() -> tuple[
+def _lin_p10_producer_result(*, fully_sourced: bool = False) -> tuple[
     list[dict[str, object]], SimpleNamespace
 ]:
     accounts = [
@@ -385,8 +438,39 @@ def _lin_p10_producer_result() -> tuple[
         _lin_source_structure_month_row(LIN_P10_GRID_0, "2020-10"),
         _lin_source_structure_month_row(LIN_P10_GRID_1, "2020-10"),
     ]
+    if fully_sourced:
+        accounts = [
+            _lin_account(LIN_ACCOUNT_16, minimum=200.0, maximum=330.0),
+            _lin_account(LIN_ACCOUNT_17, minimum=330.0, maximum=430.0),
+            _lin_account(LIN_ACCOUNT_18, minimum=430.0, maximum=540.0),
+        ]
+        canonical_tables = {
+            LIN_P10_GRID_0: "pt_10_0",
+            LIN_P10_GRID_1: "pt_10_1",
+            LIN_P10_GRID_2: "pt_10_2",
+        }
+        detached_tables = {
+            LIN_P10_GRID_0: "pt_10_1",
+            LIN_P10_GRID_1: "pt_10_2",
+        }
+        table_tops = {"pt_10_0": 254.5, "pt_10_1": 354.5, "pt_10_2": 454.5}
+        for grids, rows, tables, source in (
+            (canonical_grids, canonical_rows, canonical_tables, "repayment_grid"),
+            (detached_grids, detached_rows, detached_tables, "source_table_geometry"),
+        ):
+            for grid in grids:
+                top = table_tops[tables[grid["grid_id"]]]
+                grid["bbox"] = [42.0, top, 397.5, top + 62.0]
+            for row in rows:
+                grid_id = row["grid_id"]
+                performance_month = f"{int(row['year']):04d}-{int(row['month']):02d}"
+                row["source_cell_refs"] = _lin_p10_complete_cell_refs(
+                    tables[grid_id], grid_id, performance_month, source=source
+                )
     context = SimpleNamespace(
-        _personal_detail_extraction_issues=_lin_detached_issue_trio(),
+        _personal_detail_extraction_issues=_lin_detached_issue_trio(
+            fully_sourced=fully_sourced
+        ),
         _candidate_b_monthly_source_structure_grids=detached_grids,
         _candidate_b_monthly_source_structure_records=detached_rows,
     )
@@ -400,8 +484,8 @@ def _lin_p10_producer_result() -> tuple[
     return linked, context
 
 
-def _lin_p10_content() -> dict[str, object]:
-    linked, context = _lin_p10_producer_result()
+def _lin_p10_content(*, fully_sourced: bool = False) -> dict[str, object]:
+    linked, context = _lin_p10_producer_result(fully_sourced=fully_sourced)
     return {
         "facts": {},
         "datasets": {
@@ -443,8 +527,8 @@ def _lin_p10_detached_siblings(
     ]
 
 
-def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_rows() -> None:
-    content = _lin_p10_content()
+def test_lin_p10_fully_sourced_topology_conserves_four_physical_rows_and_four_business_rows() -> None:
+    content = _lin_p10_content(fully_sourced=True)
     datasets = content["datasets"]
     linked = datasets["repayment_records"]
     issues = datasets["personal_detail_extraction_issues"]
@@ -492,7 +576,9 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
     assert all(
         ref["geometry_scope"] == "cell"
         and "bbox" in ref
-        and "source_page" not in ref
+        and ref["source_page"] == 5
+        and ref["source_logical_page"] == 10
+        and ref["table_id"] == "pt_10_1"
         for ref in exact_alias["source_refs"]
     )
     retained_october = next(
@@ -501,24 +587,34 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
         if row["account_id"] == LIN_ACCOUNT_17 and row["month"] == 10
     )
     assert retained_october["grid_id"] == LIN_P10_GRID_1
-    assert retained_october["source_cell_refs"][0]["geometry_scope"] == "logical_page"
-    assert retained_october["source_cell_refs"][0]["geometry_status"] == "unresolved"
-    assert "bbox" not in retained_october["source_cell_refs"][0]
+    assert len(retained_october["source_cell_refs"]) == 2
+    assert all(
+        ref["geometry_scope"] == "cell"
+        and ref["geometry_status"] == "exact"
+        and ref["table_id"] == "pt_10_1"
+        for ref in retained_october["source_cell_refs"]
+    )
 
     prepared = prepare_personal_detail_source_collections(content)
     closure = prepared["facts"]["personal_detail_account_month_closure"]
     assert closure["candidate_identity_count"] == 4
     assert closure["expected_identity_count"] == 4
-    assert closure["source_month_position_observations"] == 5
+    # Reused detector IDs yield seven (detector position, physical pair)
+    # observations, not five unique detector keys and not seven real rows.
+    assert closure["source_month_position_observations"] == 7
     assert closure["raw_source_month_positions"] == 4
     assert closure["unique_physical_source_month_positions"] == 4
     assert closure["owner_bound_account_months"] == 4
     assert closure["owner_unresolved_positions"] == 0
     assert closure["alias_source_month_positions"] == 3
-    assert closure["physical_alias_source_month_observations"] == 1
+    assert closure["physical_alias_source_month_observations"] == 3
     assert closure["physical_owner_conflict_free"] is True
     assert closure["source_position_balance_valid"] is True
     assert closure["status"] == "identity_closed"
+    proof_rows = prepared["datasets"]["_personal_detail_account_month_closure_proof"]
+    assert len(proof_rows) == 1
+    assert proof_rows[0]["expected_identity_count"] == 4
+    assert proof_rows[0]["expected_source_position_count"] == 4
     assert prepared["facts"]["personal_detail_dataset_states"][
         "repayment_records"
     ] == {
@@ -542,6 +638,30 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
     )
 
 
+def test_lin_p10_deficient_excerpt_cannot_claim_the_signed_physical_closure() -> None:
+    content = _lin_p10_content()
+    rows = content["datasets"]["repayment_records"]
+    assert len(rows) == sum(
+        len(months) for months in LIN_P10_SIGNED_SOURCE_TABLE_MONTHS.values()
+    ) == 4
+    assert all(
+        ref["geometry_status"] == "unresolved" and "bbox" not in ref
+        for row in rows
+        for ref in row["source_cell_refs"]
+    )
+
+    prepared = prepare_personal_detail_source_collections(content)
+    closure = prepared["facts"]["personal_detail_account_month_closure"]
+    assert closure["candidate_identity_count"] == 4
+    assert closure["physical_alias_source_month_observations"] == 0
+    assert closure["status"] != "identity_closed"
+    assert closure["source_position_balance_valid"] is True
+    assert "_personal_detail_account_month_closure_proof" not in prepared["datasets"]
+    # Missing provenance cannot establish which reused detector key denotes
+    # which physical table.  A conservative conflict here is not a signed
+    # assertion that the real document itself has conflicting ownership.
+
+
 def test_lin_p10_producer_does_not_leave_resolved_alias_as_active_business_omission() -> None:
     _linked, context = _lin_p10_producer_result()
     active = [
@@ -554,13 +674,13 @@ def test_lin_p10_producer_does_not_leave_resolved_alias_as_active_business_omiss
 
     # Once the same producer emits an exact account/month alias, the earlier
     # detached trio may remain as audit history but must no longer claim that a
-    # business month is missing.  This is expected to be red until the producer
-    # and consumer contracts are changed together.
+    # business month is missing.  This is distinct from proving physical
+    # deduplication across the deficient canonical and detached source planes.
     assert active == []
 
 
 def test_lin_p10_geometry_fallback_survives_when_exact_alias_issue_is_absent() -> None:
-    content = _lin_p10_content()
+    content = _lin_p10_content(fully_sourced=True)
     datasets = content["datasets"]
     issues = datasets["personal_detail_extraction_issues"]
     issues[:] = [
@@ -575,29 +695,17 @@ def test_lin_p10_geometry_fallback_survives_when_exact_alias_issue_is_absent() -
             == "2020-10"
         )
     ]
-    retained = next(
-        row
-        for row in datasets["repayment_records"]
-        if row["account_id"] == LIN_ACCOUNT_17 and row["month"] == 10
-    )
-    retained_refs = _lin_p10_detached_cell_refs(
-        LIN_P10_GRID_0, "2020-10"
-    )
-    for ref in retained_refs:
-        ref["grid_id"] = LIN_P10_GRID_1
-        ref["source_page"] = 5
-    retained["source_cell_refs"] = retained_refs
-
     prepared = prepare_personal_detail_source_collections(content)
     closure = prepared["facts"]["personal_detail_account_month_closure"]
-    assert closure["source_month_position_observations"] == 5
+    assert closure["source_month_position_observations"] == 7
     assert closure["raw_source_month_positions"] == 4
     assert closure["owner_bound_account_months"] == 4
     assert closure["owner_unresolved_positions"] == 0
     assert closure["alias_source_month_positions"] == 2
     assert closure["reconciled_detached_diagnostic_positions"] == 1
-    assert closure["physical_alias_source_month_observations"] == 1
+    assert closure["physical_alias_source_month_observations"] == 3
     assert closure["source_position_balance_valid"] is True
+    assert closure["status"] == "identity_closed"
 
 
 @pytest.mark.parametrize(
@@ -699,7 +807,7 @@ def test_lin_p10_competing_physical_owner_fails_closed_and_withholds_proof() -> 
     assert closure["cross_owner_physical_conflict_count"] >= 1
     assert closure["status"] == "physical_owner_conflict"
     assert closure["source_position_balance_valid"] is True
-    assert "personal_detail_account_month_closure_proof" not in prepared["datasets"]
+    assert "_personal_detail_account_month_closure_proof" not in prepared["datasets"]
     assert any(
         issue.get("issue_code") == "account_month_physical_owner_conflict"
         for issue in prepared["datasets"]["personal_detail_extraction_issues"]
@@ -1078,6 +1186,15 @@ def _lin_p19_native_cell(
         geometry_source="scanned_image_line_grid",
         evidence_ids=evidence_ids,
         token_ids=list(evidence_ids),
+        source_cell_refs=[
+            {
+                "page": 19,
+                "table_id": "pt_19_0",
+                "row": row,
+                "raw_row": row,
+                "col": col,
+            }
+        ],
     )
 
 
@@ -1179,7 +1296,8 @@ def _lin_p19_native_table() -> SimpleNamespace:
         table_id="pt_19_0",
         bbox=[x_edges[0], y_edges[0], x_edges[-1], y_edges[-1]],
         extraction_layer="scanned_image_line_grid",
-        metadata={"geometry": geometry},
+        metadata={"geometry": geometry, "preserve_headers": False},
+        headers=[],
         rows=[
             *leading_rows,
             SimpleNamespace(cells=header_cells),
@@ -1310,6 +1428,484 @@ def test_lin_p19_august_m_vs_native_n_withholds_status_but_retains_zero() -> Non
     )
     assert projected_conflict["target_record_id"] == record_id
     assert projected_conflict["field_name"] == "status_code"
+
+
+def test_lin_p19_exact_owned_table_survives_repaired_segment_page_dropout() -> None:
+    """The native table owner is sufficient when only the segment page drops."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [_lin_p19_grid()],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    august = next(
+        row for row in records if row["record_id"] == f"{LIN_P19_GRID}:2022-08"
+    )
+    assert august["_account_month_identity_proof"] == {
+        "account_id": LIN_P19_ACCOUNT_11,
+        "performance_month": "2022-08",
+        "grid_id": LIN_P19_GRID,
+        "owner_basis": "exact_source_table_account_owner",
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in august
+    assert august["overdue_amount"] == "0"
+    assert audit["conflicts_withheld"] == 1
+
+
+def test_lin_p19_complete_native_lattice_supersedes_damaged_derived_bands() -> None:
+    """Exact native cells remain authoritative over broken repaired metadata."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    # This mirrors the real extraction: only one month retains exact cell
+    # refs, while the other rows retain grid-scope observations.  The native
+    # physical table, not copied values, proves the complete month lattice.
+    rows = _lin_p19_rows()
+
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all(
+        row["_account_month_identity_proof"]["owner_basis"]
+        == "exact_source_table_account_owner"
+        for row in records
+    )
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_complete_exact_cells_supersede_misaligned_derived_bands() -> None:
+    """A complete exact cell plane may replace internally valid stale bands."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    rows = _lin_p19_rows()
+    x_edges = [45.0, 73.0, *[100.0 + 27.0 * index for index in range(12)]]
+    for row in rows:
+        month = int(row["month"])
+        performance_month = f"{int(row['year']):04d}-{month:02d}"
+        row["performance_month"] = performance_month
+        provenance = _lin_p19_geometry_provenance()
+        row["source_cell_refs"] = [
+            {
+                "page": 19,
+                "logical_page": 19,
+                "geometry_scope": "cell",
+                "geometry_status": "exact",
+                "coordinate_system": "pdf_points_top_left",
+                "grid_id": LIN_P19_GRID,
+                "row": source_row,
+                "col": month,
+                "field_name": field_name,
+                "geometry_provenance": deepcopy(provenance),
+                "bbox": [
+                    x_edges[month],
+                    y0,
+                    x_edges[month + 1],
+                    y1,
+                ],
+                "performance_month": performance_month,
+            }
+            for source_row, field_name, y0, y1 in (
+                (2, "status", 170.5, 183.5),
+                (3, "overdue_amount", 183.5, 196.5),
+            )
+        ]
+
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            # These bands are valid and ordered, but are a stale half-point
+            # derivative rather than the exact source-table cell boundaries.
+            "bbox": [
+                x_edges[month] + 0.5,
+                150.0,
+                x_edges[month + 1] + 0.5,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44, [
+        issue.get("observed_value")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())[:1]
+    ]
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all(
+        row["_account_month_identity_proof"]["owner_basis"]
+        == "exact_source_table_account_owner"
+        for row in records
+    )
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+@pytest.mark.parametrize(
+    "derived_grid_bbox",
+    (
+        [45.05555555555556, 35.52983193277311, 399.49259259259264, 195.0],
+        [40.0, 30.0, 405.0, 280.0],
+    ),
+    ids=("undershoots_exact_cells", "overshoots_exact_owner_table"),
+)
+def test_lin_p19_exact_cells_supersede_damaged_derived_grid_extent(
+    derived_grid_bbox: list[float],
+) -> None:
+    """Exact cell/table ownership supersedes a damaged derived grid extent."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    grid = _lin_p19_grid()
+    grid["bbox"] = list(derived_grid_bbox)
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=19,
+                    source_page_number=10,
+                    tables=[_lin_p19_native_table()],
+                )
+            ]
+        ),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_native_lattice_uses_registered_logical_pages() -> None:
+    """A split logical page must not be looked up in the physical PDF plane."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    logical_page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        # The sealed PDF plane owns source page 10 and deliberately has no
+        # logical-page-19 table.  Candidate-B's registered page plane does.
+        parse_result=SimpleNamespace(
+            pages=[SimpleNamespace(page_number=10, tables=[])]
+        ),
+        pages=[logical_page],
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_table_owner_withholds_unowned_candidate_identifier() -> None:
+    """A monthly-row identifier cannot veto its unique account-table owner."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    rows = _lin_p19_rows()
+    for row in rows:
+        row["account_identifier"] = "B10611000H0001811132137961001"
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all("account_identifier" not in row for row in records)
+
+
+def test_lin_p19_native_lattice_proof_rejects_duplicate_physical_table() -> None:
+    table = _lin_p19_native_table()
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[table, deepcopy(table)],
+    )
+    context = SimpleNamespace(parse_result=SimpleNamespace(pages=[page]))
+
+    assert (
+        _native_month_lattice_from_exact_ref(
+            context,
+            _lin_p19_source_refs()[0],
+            expected_year=2022,
+            expected_month=8,
+        )
+        is None
+    )
 
 
 def _lin_p13_source_refs() -> list[dict[str, object]]:

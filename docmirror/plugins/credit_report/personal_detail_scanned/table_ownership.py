@@ -51,6 +51,13 @@ _INQUIRY_ROLE_COLUMNS = {
     "institution": 2,
     "reason": 3,
 }
+_RESIDENCE_HEADER_LABELS = (
+    "编号",
+    "居住地址",
+    "住宅电话",
+    "居住状况",
+    "信息更新日期",
+)
 _PRINTED_PAGE_RE = re.compile(r"^第\s*\d+\s*页\s*[，,]\s*共\s*\d+\s*页$")
 _PRINTED_PAGE_CAPTURE_RE = re.compile(
     r"^第\s*(?P<page>\d+)\s*页\s*[，,]\s*共\s*(?P<total>\d+)\s*页$"
@@ -185,6 +192,24 @@ def _schema_owner_is_consistent(table: Any, owner: Mapping[str, Any]) -> bool:
         for column, value in enumerate(rows[header_index])
         if _compact(value)
     ]
+    if owner.get("header_binding") == "bounded_residence_address_ascii_residue":
+        raw_header = rows[header_index]
+        if (
+            header_index != 0
+            or len(raw_header) != len(_RESIDENCE_HEADER_LABELS)
+            or any(
+                _compact(raw_header[column]) != expected
+                for column, expected in enumerate(_RESIDENCE_HEADER_LABELS)
+                if column != 1
+            )
+            or re.fullmatch(
+                r"居住地址[ \t]+[A-Za-z]",
+                str(raw_header[1] or "").strip(),
+            )
+            is None
+        ):
+            return False
+        populated = list(enumerate(_RESIDENCE_HEADER_LABELS))
     labels = tuple(value for _column, value in populated)
     owner_labels = owner.get("header_labels")
     if (
@@ -1087,21 +1112,23 @@ def _inquiry_continuation_adjacency_is_consistent(
         )
     except (AttributeError, TypeError, ValueError):
         return False
-    if continuation_decision is not True and continuation_decision is not False:
+    if (
+        continuation_decision is not True
+        and continuation_decision is not False
+        and not (
+            kind == _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF
+            and continuation_decision is None
+        )
+    ):
         return False
     if (
         kind == "exact_printed_footer_table_edge"
         and continuation_decision is not True
     ) or (
         # The entity graph may truthfully keep consecutive physical tables
-        # separate.  That false edge can carry only the already validated
-        # ordinary schema; it cannot be upgraded to physical ordinal closure.
-        kind == _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF
-        and (
-            continuation_decision is not False
-            or prior_authority_mode != INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY
-        )
-    ) or (
+        # separate.  That false/unknown edge may carry only the validated
+        # four-role schema; the caller explicitly downgrades the resulting
+        # owner so physical ordinal closure can never cross this bridge.
         kind == "local_paired_topology_entity_edge"
         and identity_kind == "exact_footer_pair"
         and continuation_decision is not False
@@ -1349,10 +1376,18 @@ def _validated_inquiry_population_owner(
         )
     ):
         return None
+    proof = owner.get("adjacency_proof")
+    authority_mode = (
+        INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY
+        if isinstance(proof, Mapping)
+        and str(proof.get("kind") or "")
+        == _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF
+        else prior_validated["authority_mode"]
+    )
     return {
         "template_id": "annotations_and_inquiries",
         "binding": _INQUIRY_CONTINUATION_BINDING,
-        "authority_mode": prior_validated["authority_mode"],
+        "authority_mode": authority_mode,
         "body_start": 0,
         "population_start": population_start,
         "population_endpoint": population_endpoint,
@@ -1365,6 +1400,102 @@ def _validated_inquiry_population_owner(
             if prior_validated.get("inquiry_type") in {"institution", "personal"}
             else {}
         ),
+    }
+
+
+def _collapsed_same_page_inquiry_schema_authority(
+    page: Any,
+    table: Any,
+    owner: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Replay one exact left-collapsed inquiry header as schema authority.
+
+    The canonical assembler has already proved the same-page subsection and
+    the physical colspan.  The consumer independently replays that proof here
+    so a document-wide layout-profile vote cannot discard a valid local table.
+    This grants only the four column roles; row ordinals and field repairs stay
+    with the ordinary inquiry extractor.
+    """
+
+    rows = _raw_rows(table)
+    roles = _owner_role_columns(owner)
+    lattice = _exact_owner_cell_lattice(table)
+    if (
+        owner.get("binding") != _SAME_PAGE_SECTION_BINDING
+        or owner.get("header_binding")
+        != "exact_collapsed_colspan_header_lattice"
+        or owner.get("header_row") != 0
+        or owner.get("header_rows") != [0]
+        or owner.get("population_witness_row") != 1
+        or any(
+            key in owner
+            for key in ("authority_mode", "inquiry_authority_mode")
+        )
+        or roles is None
+        or lattice is None
+        or len(rows) < 2
+        or any(len(row) != 4 for row in rows)
+        or tuple(_compact(value) for value in rows[0])
+        != ("编号查询日期", "", "查询机构", "查询原因")
+        or any(not _compact(rows[1][roles[role]]) for role in roles)
+        or not _same_page_owner_is_consistent(
+            page,
+            owner,
+            role="annotations_and_inquiries",
+        )
+    ):
+        return None
+
+    exact_evidence, boxes, statuses = lattice
+    covered = _derived_span_coverage(table, exact_evidence, boxes, statuses)
+    selected_cells = [
+        (0, 0),
+        (0, 2),
+        (0, 3),
+        *((1, column) for column in range(4)),
+    ]
+    if (
+        covered is None
+        or (0, 1) not in covered
+        or statuses.get((0, 1)) != "derived"
+        or (0, 1) in boxes
+        or (0, 1) in exact_evidence
+        or any(
+            statuses.get(cell) != "exact"
+            or cell not in boxes
+            or cell not in exact_evidence
+            for cell in selected_cells
+        )
+        or not _owner_evidence_is_complete(
+            owner,
+            exact_evidence,
+            selected_cells,
+        )
+    ):
+        return None
+
+    heading_title = _compact(owner.get("heading_title"))
+    inquiry_type = (
+        "personal"
+        if heading_title == "本人查询记录明细"
+        else "institution"
+        if heading_title in {
+            "机构查询记录明细",
+            "查询记录机构查询记录明细",
+        }
+        else ""
+    )
+    if not inquiry_type:
+        return None
+    return {
+        "template_id": "annotations_and_inquiries",
+        "binding": _SAME_PAGE_SECTION_BINDING,
+        "header_binding": "exact_collapsed_colspan_header_lattice",
+        "authority_mode": INQUIRY_AUTHORITY_SCHEMA_CARRY_ONLY,
+        "body_start": 1,
+        "inquiry_role_columns": roles,
+        "inquiry_type": inquiry_type,
+        "evidence_ids": list(owner["evidence_ids"]),
     }
 
 
@@ -1391,7 +1522,10 @@ def canonical_inquiry_population_metadata(
         != str(getattr(table, "table_id", "") or "")
     ):
         return None
-    return _validated_inquiry_population_owner(context, page, table, owner)
+    validated = _validated_inquiry_population_owner(context, page, table, owner)
+    if validated is not None:
+        return validated
+    return _collapsed_same_page_inquiry_schema_authority(page, table, owner)
 
 
 def canonical_table_role(context: Any, page: Any, table: Any) -> str | None:
@@ -1444,7 +1578,16 @@ def canonical_table_role(context: Any, page: Any, table: Any) -> str | None:
             else None
         )
     if not _schema_owner_is_consistent(table, owner):
-        return None
+        if not (
+            table_role == "annotations_and_inquiries"
+            and _collapsed_same_page_inquiry_schema_authority(
+                page,
+                table,
+                owner,
+            )
+            is not None
+        ):
+            return None
     if binding == _SAME_PAGE_SECTION_BINDING:
         return table_role if _same_page_owner_is_consistent(page, owner, role=table_role) else None
     if binding == _CROSS_PAGE_AGREEMENT_BINDING:
