@@ -2488,7 +2488,13 @@ class CommunityBundle:
         return {key: value for key, value in section.items() if not key.startswith("_")}
 
     def render_markdown(self) -> str:
-        """Render the source-complete reading projection using DMP 1.0."""
+        """Render the consumer reading view; only digital bank opts into v5."""
+        if self.compact_output.get("business_view") is True:
+            return self.render_enhanced_markdown()
+        return self.render_source_markdown()
+
+    def render_source_markdown(self) -> str:
+        """Keep the source-complete DMP projection available for internal audit."""
         if self.content_markdown_override.strip():
             return self.content_markdown_override.rstrip() + "\n"
         markdown = render_markdown(self.result)
@@ -2504,8 +2510,15 @@ class CommunityBundle:
             )
         return markdown
 
-    def render_enhanced_markdown(self, semantic: dict[str, Any] | None = None) -> str:
+    def render_enhanced_markdown(
+        self,
+        semantic: dict[str, Any] | None = None,
+        *,
+        public_payload: dict[str, Any] | None = None,
+    ) -> str:
         """Transcribe the public Community reading model."""
+        if public_payload is not None and self.compact_output.get("business_view") is True:
+            return render_business_markdown(public_payload)
         semantic_payload = semantic or self.semantic_payload()
         domain = semantic_payload.get("domain") if isinstance(semantic_payload.get("domain"), dict) else {}
         extensions = domain.get("extensions") if isinstance(domain.get("extensions"), dict) else {}
@@ -2516,12 +2529,17 @@ class CommunityBundle:
             return render_semantic_source_overlay_markdown(semantic_payload)
         return render_community_reading_markdown(semantic_payload)
 
-    def render_dataset_csvs(self, semantic: dict[str, Any] | None = None) -> dict[str, str]:
+    def render_dataset_csvs(
+        self,
+        semantic: dict[str, Any] | None = None,
+        *,
+        public_payload: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
         """Render dataset CSVs directly from the public semantic source."""
         rendered: dict[str, str] = {}
         payload = semantic or self.semantic_payload()
         if self.compact_output.get("business_view") is True:
-            payload = restore_business_records(self.json_payload(payload))
+            payload = restore_business_records(public_payload if public_payload is not None else self.json_payload(payload))
         for public in payload.get("datasets") or []:
             relative_path = str(public["csv"])
             columns = list(public.get("columns") or [])

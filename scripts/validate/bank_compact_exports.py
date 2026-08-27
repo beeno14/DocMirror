@@ -250,7 +250,8 @@ def validate_and_write_bank_exports(
         actual = (output_dir / relative_path).read_text(encoding="utf-8")
         if business_only:
             dataset = next(item for item in compact["datasets"] if item["csv"] == relative_path)
-            assert_business_csv_conservation(content, actual, dataset)
+            original_dataset = next(item for item in dense["datasets"] if item["csv"] == relative_path)
+            assert_business_csv_conservation(content, actual, dataset, original_dataset=original_dataset)
             continue
         original_rows = list(csv.DictReader(io.StringIO(content.lstrip("\ufeff"))))
         actual_rows = list(csv.DictReader(io.StringIO(actual.lstrip("\ufeff"))))
@@ -265,7 +266,14 @@ def validate_and_write_bank_exports(
         actual_audit = [row for row in actual_audit if row["field_key"] != "additional_fields"]
     if _first_difference(original_audit, actual_audit):
         raise AssertionError("audit CSV changed")
-    if paths["content"].read_bytes() != dense_bundle.render_markdown().encode("utf-8"):
+    source_markdown = dense_bundle.render_markdown().encode("utf-8")
+    if business_only:
+        assert_business_markdown_values(compact, paths["content"].read_text(encoding="utf-8"))
+        if paths["content"].read_bytes() != paths["enhanced_reading"].read_bytes():
+            raise AssertionError("consumer Markdown views disagree")
+        if bundle.render_source_markdown().encode("utf-8") != source_markdown:
+            raise AssertionError("internal source-faithful Markdown changed")
+    elif paths["content"].read_bytes() != source_markdown:
         raise AssertionError("source-faithful Markdown changed")
 
     dense_markdown = dense_bundle.render_enhanced_markdown(dense_semantic)
@@ -279,7 +287,8 @@ def validate_and_write_bank_exports(
         "existing_csv_fields_unchanged": not business_only,
         "existing_csv_business_fields_unchanged": True,
         "existing_audit_cells_unchanged": True,
-        "source_markdown_unchanged": True,
+        "source_markdown_unchanged": not business_only,
+        "internal_source_markdown_unchanged": True,
         "normalized_only": normalized_only,
         "business_view": business_only,
         "artifact_contract_checked": business_only,
@@ -509,14 +518,18 @@ def refresh_bank_markdown_report(report_path: Path, output_dir: Path, *, busines
                 previous_bytes = (artifact_path.parent / relative).read_bytes()
                 if business_only and relative != "001_datasets/_audit_cells.csv":
                     dataset = next(item for item in payload["datasets"] if item["csv"] == relative)
-                    assert_business_csv_conservation(previous_bytes.decode("utf-8"), content, dataset)
+                    original_dataset = next(item for item in previous["datasets"] if item["csv"] == relative)
+                    assert_business_csv_conservation(
+                        previous_bytes.decode("utf-8"), content, dataset, original_dataset=original_dataset
+                    )
                 elif previous_bytes != content.encode("utf-8"):
                     raise AssertionError("presentation refresh changed CSV business values or evidence")
             writer = ArtifactWriter(case_dir)
             paths = {
                 "community": writer.write_text("001_community.json", dumps_json(payload, ensure_ascii=False, separators=(",", ":"))),
                 "enhanced_reading": writer.write_text("001_enhanced_reading.md", render_community_reading_markdown(evidence)),
-                "content": writer.write_text("001_content.md", Path(validation["artifacts"]["content"]).read_bytes().decode("utf-8")),
+                "content": writer.write_text("001_content.md", render_community_reading_markdown(evidence) if business_only
+                                             else Path(validation["artifacts"]["content"]).read_bytes().decode("utf-8")),
                 "datasets": case_dir / "001_datasets",
             }
             for relative, content in csvs.items():
@@ -545,6 +558,7 @@ def refresh_bank_markdown_report(report_path: Path, output_dir: Path, *, busines
                 artifact_contract_checked=business_only,
                 existing_csv_fields_unchanged=not business_only and validation.get("existing_csv_fields_unchanged", False),
                 existing_csv_business_fields_unchanged=True,
+                source_markdown_unchanged=not business_only,
             )
             outcome.update(status="presentation_refreshed", community=str(refreshed_cache))
         except Exception as exc:

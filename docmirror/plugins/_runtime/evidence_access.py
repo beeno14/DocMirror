@@ -19,7 +19,17 @@ def evidence_payload(parse_result: Any) -> dict[str, Any]:
 
 
 def text_atoms(parse_result: Any) -> list[dict[str, Any]]:
-    atoms = evidence_payload(parse_result).get("text_atoms") or []
+    from docmirror.models.mirror.vnext import EvidenceStore
+
+    evidence = getattr(getattr(parse_result, "evidence_plane", None), "evidence", None)
+    if type(evidence) is EvidenceStore:
+        # Serializing the entire store also serializes every table's geometry
+        # and vector/image indexes, although this consumer needs only text.
+        # Field selection retains the store's declared atom schema (including
+        # subclass serialization rules), unlike dumping each atom separately.
+        atoms = evidence.model_dump(mode="json", exclude_none=True, include={"text_atoms"}).get("text_atoms") or []
+    else:
+        atoms = evidence_payload(parse_result).get("text_atoms") or []
     return [item for item in atoms if isinstance(item, dict)]
 
 

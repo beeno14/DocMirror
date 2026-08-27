@@ -622,7 +622,21 @@ def run_bank_statement_extract(
     plugin: Any,
 ) -> BankExtractResult:
     """Run the canonical bank-statement extract pipeline."""
-    extraction_route = resolve_bank_extraction_route(parse_result)
+    from docmirror.plugins.bank_statement.work_cache import bank_work_session
+
+    route = resolve_bank_extraction_route(parse_result)
+    with bank_work_session(parse_result, enabled=route is BankExtractionRoute.DIGITAL):
+        return _run_bank_statement_extract(parse_result, full_text, plugin, extraction_route=route)
+
+
+def _run_bank_statement_extract(
+    parse_result: Any,
+    full_text: str,
+    plugin: Any,
+    *,
+    extraction_route: BankExtractionRoute,
+) -> BankExtractResult:
+    """Original deployment and acceptance rules, inside one reuse boundary."""
     context_builder = (
         build_digital_style_context
         if extraction_route is BankExtractionRoute.DIGITAL

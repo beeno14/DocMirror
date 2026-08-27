@@ -12,7 +12,7 @@ import re
 from collections import defaultdict
 from typing import Any
 
-from docmirror.output.normalized_records import _same
+from docmirror.output.normalized_records import _label, _same
 
 BUSINESS_VIEW_VERSION = "5.0.0"
 
@@ -27,8 +27,24 @@ EXTRACTION_FIELDS = frozenset({
     "mirror_expected_data_rows", "mirror_ltqg_enabled", "mirror_ltqg_export_tables",
     "mirror_ltqg_passed_tables", "mirror_ltqg_raw_max_rows", "mirror_ltqg_skipped_tables",
     "mirror_quarantined_logical_count", "mirror_quarantined_physical_count",
+    "counterparty_status", "source_header_page_label",
 })
 INTERNAL_ROW_FIELDS = EXTRACTION_FIELDS | {"statement_header_id", "additional_fields"}
+INTERNAL_COLUMN_FIELDS = frozenset({"raw_available", "evidence_available"})
+INTERNAL_DATASET_FIELDS = frozenset({"storage_role", "record_path"})
+
+# Page-local header summaries are audit evidence, not statement totals. Match
+# complete labels only, and only in statement headers; never inspect cell text
+# or discard transaction income/expense columns because of their names.
+PAGE_SUMMARY_LABELS = frozenset(_label(name) for name in (
+    "本页支出笔数", "本页收入笔数", "本页借方笔数", "本页贷方笔数", "本页交易笔数",
+    "本页支出算数合计", "本页支出算术合计", "本页收入算数合计", "本页收入算术合计",
+    "本页支出合计", "本页收入合计", "本页借方合计", "本页贷方合计",
+    "本页支出金额合计", "本页收入金额合计", "本页借方金额合计", "本页贷方金额合计",
+    "Page Debit Total", "Page Credit Total", "Page Expense Total", "Page Income Total",
+    "Page Debit Count", "Page Credit Count", "Page Expense Count", "Page Income Count",
+    "Page Transaction Count", "页码", "页号", "Page Number", "source_header_page_label",
+))
 CONTEXT_FIELDS = frozenset({
     "account_holder", "own_account", "bank_name", "statement_title", "currency",
     "query_period", "period_start", "period_end", "print_date", "document_date",
@@ -123,14 +139,52 @@ def compact_row_extraction(row: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
+def _hidden_field(dataset_name: str, key: str, descriptor: dict[str, Any]) -> bool:
+    if key in INTERNAL_ROW_FIELDS:
+        return True
+    return dataset_name == "statement_header" and any(
+        _label(name) in PAGE_SUMMARY_LABELS
+        for name in (key, descriptor.get("source_header", ""), descriptor.get("label", ""))
+    )
+
+
+def _clean_business_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Clean a fresh v5 view, including previously saved v5 deliveries."""
+    for dataset in result.get("datasets") or []:
+        name = dataset.get("name", "")
+        declared = {column["key"]: column for column in dataset.get("columns") or []}
+        hidden = {key for key, column in declared.items() if _hidden_field(name, key, column)}
+        hidden.update(key for row in dataset.get("rows") or [] for key in row["normalized"]
+                      if _hidden_field(name, key, declared.get(key, {})))
+        dataset["columns"] = [
+            {key: value for key, value in column.items() if key not in INTERNAL_COLUMN_FIELDS}
+            for column in declared.values() if column["key"] not in hidden
+        ]
+        for row in dataset.get("rows") or []:
+            row["normalized"] = {key: value for key, value in row["normalized"].items() if key not in hidden}
+        for key in INTERNAL_DATASET_FIELDS:
+            dataset.pop(key, None)
+    for section in result.get("sections") or []:
+        section["items"] = [item for item in section.get("items") or []
+                            if not _hidden_field("statement_header", item["key"], item)]
+        for group in section.get("groups") or []:
+            group["items"] = [item for item in group.get("items") or []
+                              if not _hidden_field("statement_header", item["key"], item)]
+        section["groups"] = [group for group in section.get("groups") or [] if group["items"]]
+    by_id = {dataset["id"]: dataset for dataset in result.get("datasets") or []}
+    for table in result.get("reading", {}).get("tables", []):
+        table["column_keys"] = [column["key"] for column in by_id[table["dataset_id"]]["columns"]]
+    return result
+
+
 def business_view(payload: dict[str, Any]) -> dict[str, Any]:
     """Return a fresh v5 delivery projection of an evidence-accounted v4 view."""
-    if is_business_view(payload):
-        return copy.deepcopy(payload)
-    if (payload.get("schema") or {}).get("version") != "4.0.0":
-        raise ValueError("business bank view requires an evidence-accounted normalized v4 source")
     if (payload.get("schema") or {}).get("domain") != "bank_statement":
         raise ValueError("business bank view must not be applied to another provider")
+    if is_business_view(payload):
+        return _clean_business_view(copy.deepcopy(payload))
+    if (payload.get("schema") or {}).get("version") != "4.0.0":
+        raise ValueError("business bank view requires an evidence-accounted normalized v4 source")
     result = copy.deepcopy(payload)
     result["schema"]["version"] = BUSINESS_VIEW_VERSION
     for dataset in result.get("datasets") or []:
@@ -151,25 +205,17 @@ def business_view(payload: dict[str, Any]) -> dict[str, Any]:
                                    for key in relation.get("columns") or []]
             relation["reference_columns"] = ["extraction.record_id" if key == "record_id" else key
                                              for key in relation.get("reference_columns") or []]
-    for section in result.get("sections") or []:
-        section["items"] = [item for item in section.get("items") or [] if item["key"] not in EXTRACTION_FIELDS]
-        for group in section.get("groups") or []:
-            group["items"] = [item for item in group.get("items") or [] if item["key"] not in EXTRACTION_FIELDS]
-        section["groups"] = [group for group in section.get("groups") or [] if group["items"]]
-    by_id = {dataset["id"]: dataset for dataset in result.get("datasets") or []}
-    for table in result.get("reading", {}).get("tables", []):
-        table["column_keys"] = [column["key"] for column in by_id[table["dataset_id"]]["columns"]]
     result["reading"]["privacy_mode"] = "full"
     result["reading"]["presentation"] = "bank_business"
     result["extraction"] = {"route": "digital", "warnings": result.pop("warnings", [])}
-    return result
+    return _clean_business_view(result)
 
 
 def restore_business_records(payload: dict[str, Any]) -> dict[str, Any]:
     """Restore renderer-compatible identities, not deliberately withheld evidence."""
-    result = copy.deepcopy(payload)
-    if not is_business_view(result):
-        return result
+    if not is_business_view(payload):
+        return copy.deepcopy(payload)
+    result = business_view(payload)
     for dataset in result.get("datasets") or []:
         dataset["primary_key"] = "record_id"
         for row in dataset.get("rows") or []:

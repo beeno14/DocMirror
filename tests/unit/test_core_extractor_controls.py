@@ -9,6 +9,12 @@ from docmirror.input.extraction.page_splitter import DocumentSpreadPlan, PageSpl
 from docmirror.models.entities.domain import Block, PageLayout, TextSpan
 
 
+class _ConfiguredEvidencePlaneBuilder:
+    def __init__(self, *, max_page_workers):
+        assert max_page_workers >= 1
+        self.execution_stats = {"workers": max_page_workers}
+
+
 def _fake_plane():
     pages = [
         SimpleNamespace(
@@ -74,7 +80,7 @@ def test_content_acquisition_modes_keep_real_hybrid_content() -> None:
 def test_vnext_extractor_respects_page_selection_and_auto_ocr(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return _fake_plane()
 
@@ -107,7 +113,7 @@ def test_vnext_extractor_respects_page_selection_and_auto_ocr(monkeypatch):
 def test_vnext_extractor_reports_selected_page_completion(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return _fake_plane()
 
@@ -115,8 +121,9 @@ def test_vnext_extractor_reports_selected_page_completion(monkeypatch):
     events: list[tuple[str, float, str]] = []
     policy = normalize_parse_policy(pages="2-3", ocr="off")
 
+    extractor = CoreExtractor(max_page_concurrency=2)
     asyncio.run(
-        CoreExtractor().extract_parse_result(
+        extractor.extract_parse_result(
             Path("sample.pdf"),
             options={
                 "parse_policy": policy,
@@ -131,12 +138,13 @@ def test_vnext_extractor_reports_selected_page_completion(monkeypatch):
         ("page_extraction", 50.0, "Extracted page 1/2"),
         ("page_extraction", 100.0, "Extracted page 2/2"),
     ]
+    assert extractor.native_page_execution_stats == {"workers": 2}
 
 
 def test_vnext_extractor_force_ocr_runs_even_with_native_text(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return _fake_plane()
 
@@ -185,7 +193,7 @@ def test_vnext_extractor_auto_ocr_replaces_suspicious_native_glyph_mapping(monke
         for index, text in enumerate(suspicious)
     ]
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return plane
 
@@ -228,7 +236,7 @@ def test_vnext_extractor_suppresses_text_owned_by_scanned_table(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
     import docmirror.input.extraction.scanned_table_reconstructor as scanned_table_module
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return _fake_plane()
 
@@ -287,7 +295,7 @@ def test_vnext_extractor_suppresses_text_owned_by_scanned_table(monkeypatch):
 def test_vnext_extractor_expands_one_physical_page_to_two_logical_pages(monkeypatch):
     import docmirror.evidence.plane as evidence_plane_module
 
-    class FakeEvidencePlaneBuilder:
+    class FakeEvidencePlaneBuilder(_ConfiguredEvidencePlaneBuilder):
         def build(self, _path):
             return _fake_plane()
 

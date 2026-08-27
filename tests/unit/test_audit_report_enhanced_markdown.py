@@ -178,6 +178,9 @@ def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
     audit_semantic = audit_bundle.semantic_payload()
     audit_json = audit_bundle.json_payload(audit_semantic)
     assert 'docmirror:audit-reading strategy="source-overlay"' in audit_bundle.render_enhanced_markdown(audit_semantic)
+    assert audit_bundle.render_enhanced_markdown(audit_semantic, public_payload=audit_json) == (
+        audit_bundle.render_enhanced_markdown(audit_semantic)
+    )
     assert audit_bundle.json_payload(audit_semantic) == audit_json
 
     financial_bundle = plugin.project_bundle(
@@ -189,3 +192,6 @@ def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
     assert financial_bundle.render_enhanced_markdown(financial_semantic) == render_community_reading_markdown(
         financial_semantic
     )
+    assert financial_bundle.render_enhanced_markdown(
+        financial_semantic, public_payload=financial_bundle.json_payload(financial_semantic)
+    ) == render_community_reading_markdown(financial_semantic)

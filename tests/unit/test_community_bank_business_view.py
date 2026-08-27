@@ -153,7 +153,8 @@ def test_business_production_writer_checks_dense_frozen_values_and_internal_audi
     assert report["artifact_contract_checked"] is True
     assert report["existing_csv_business_fields_unchanged"] is True
     assert report["existing_audit_cells_unchanged"] is True
-    assert report["source_markdown_unchanged"] is True
+    assert report["source_markdown_unchanged"] is False
+    assert report["internal_source_markdown_unchanged"] is True
     assert report["compact_json_bytes"] < report["dense_json_bytes"]
     assert payload["extraction"]["warnings"] == baseline["warnings"]
 
