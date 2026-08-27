@@ -1771,6 +1771,49 @@ def _dense_endpoint_is_credible(
     return bool(credible) and max(credible) == endpoint
 
 
+def _credible_typed_inquiry_endpoint_total(
+    ledger: Mapping[str, Any],
+) -> int:
+    """Sum independently dense typed inquiry populations from source proof."""
+
+    endpoints = ledger.get("inquiry_sequence_endpoints")
+    observed = ledger.get("inquiry_observed_sequences")
+    outliers = ledger.get("inquiry_sequence_outliers")
+    ordinal_observations = ledger.get("inquiry_ordinal_observations")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (endpoints, observed, ordinal_observations)
+    ):
+        return 0
+    outlier_map = outliers if isinstance(outliers, Mapping) else {}
+    admitted: list[int] = []
+    for inquiry_type, raw_endpoint in endpoints.items():
+        endpoint = _positive_int(raw_endpoint)
+        if (
+            str(inquiry_type) not in _INQUIRY_POPULATION_TYPES
+            or endpoint is None
+            or not _dense_endpoint_is_credible(
+                endpoint,
+                observed.get(inquiry_type),
+                outlier_map.get(inquiry_type),
+            )
+        ):
+            return 0
+        typed_observations = ordinal_observations.get(inquiry_type)
+        if not isinstance(typed_observations, Mapping) or any(
+            not (
+                isinstance(observation := typed_observations.get(str(sequence), typed_observations.get(sequence)), Mapping)
+                and observation.get("sequence") == sequence
+                and observation.get("inquiry_type") == str(inquiry_type)
+                and bool(_local_ordinal_source_refs(observation))
+            )
+            for sequence in range(1, endpoint + 1)
+        ):
+            return 0
+        admitted.append(endpoint)
+    return sum(admitted) if admitted else 0
+
+
 def _append_population_issue(
     issues: list[dict[str, Any]],
     existing_ids: set[str],
@@ -3200,6 +3243,7 @@ def _apply_source_completeness_ledger(
         int(source_inquiry_expected)
         if isinstance(source_inquiry_expected, int) and not isinstance(source_inquiry_expected, bool)
         else 0,
+        _credible_typed_inquiry_endpoint_total(ledger_map),
     )
     checks["inquiry_records"] = (inquiry_observed, inquiry_expected, inquiry_contiguous)
 
@@ -3600,21 +3644,10 @@ def _apply_account_month_closure_ledger(
                 continue
             coordinate_system = ref.get("coordinate_system")
             bbox = exact_bbox(ref.get("bbox"))
-            table_id = ""
             if (
-                geometry_scope == "grid"
+                geometry_scope == "cell"
                 and coordinate_system == "pdf_points_top_left"
-                and ref.get("source") == "candidate_b_monthly_grid_omission"
-                and ref.get("binding") == "source_account_month_alias"
-                and ref.get("binding_quality") == "source_account_month_alias"
-                and "page" in ref
-                and "logical_page" in ref
-                and bbox is not None
-                and isinstance(ref.get("table_id"), str)
-                and bool(ref["table_id"].strip())
             ):
-                table_id = ref["table_id"].strip()
-            elif geometry_scope == "cell" and coordinate_system == "pdf_points_top_left":
                 provenance = ref.get("geometry_provenance")
                 identity = exact_source_table_cell_identity(
                     ref,
@@ -3624,18 +3657,6 @@ def _apply_account_month_closure_ledger(
                 )
                 if identity is not None:
                     source_page = identity[1]
-                    table_id = identity[2]
-            if account_id and table_id:
-                fingerprints.add(
-                    (
-                        "physical_account_month_source_table_lattice",
-                        account_id,
-                        performance_month,
-                        page,
-                        source_page,
-                        table_id,
-                    )
-                )
             raw_evidence_ids = ref.get("evidence_ids")
             evidence_ids: tuple[str, ...] = ()
             if isinstance(raw_evidence_ids, (list, tuple)) and raw_evidence_ids:
@@ -4064,6 +4085,9 @@ def _apply_account_month_closure_ledger(
     detached_alias_sibling_validated_claims: dict[
         tuple[str, str], dict[str, list[tuple[Any, ...]]]
     ] = {}
+    detached_alias_sibling_validated_statuses: dict[
+        tuple[str, str], dict[str, list[str]]
+    ] = {}
 
     def exact_detached_sibling_claim(
         issue: Any,
@@ -4203,8 +4227,47 @@ def _apply_account_month_closure_ledger(
             addressed_position,
             {},
         ).setdefault(validated_field, []).append(claim)
+        detached_alias_sibling_validated_statuses.setdefault(
+            addressed_position,
+            {},
+        ).setdefault(validated_field, []).append(
+            str(values.get("status") or "")
+        )
         if validated_field == "performance_month":
             detached_alias_sibling_counts[(addressed_position, claim)] += 1
+
+    def complete_detached_alias_sibling_claim(
+        position: tuple[str, str],
+    ) -> bool:
+        """Validate the optional status/amount siblings as one exact pair."""
+
+        claims_by_field = detached_alias_sibling_validated_claims.get(position, {})
+        if set(claims_by_field) != detached_sibling_target_fields or any(
+            len(claims_by_field[field]) != 1
+            for field in detached_sibling_target_fields
+        ):
+            return False
+        performance_claim = claims_by_field["performance_month"][0]
+        if len(performance_claim) != 5 or not isinstance(
+            performance_claim[-1], tuple
+        ):
+            return False
+        pair_locator = performance_claim[:-1]
+        pair_fingerprints = set(performance_claim[-1])
+        expected_sibling_roles = {
+            "status_code": "status",
+            "status_amount": "overdue_amount",
+        }
+        return all(
+            len(sibling_claim) == 2
+            and sibling_claim[0] == pair_locator
+            and isinstance(sibling_claim[1], tuple)
+            and bool(sibling_claim[1])
+            and sibling_claim[1][0] == expected_role
+            and sibling_claim[1] in pair_fingerprints
+            for field_name, expected_role in expected_sibling_roles.items()
+            for sibling_claim in (claims_by_field[field_name][0],)
+        )
 
     def exact_detached_alias_declaration(
         values: Mapping[str, Any],
@@ -4292,17 +4355,216 @@ def _apply_account_month_closure_ledger(
             sibling_target,
             Counter(),
         )
+        minimal_sibling_counts = Counter({"performance_month": 1})
+        complete_sibling_counts = Counter(
+            {field: 1 for field in detached_sibling_target_fields}
+        )
+        statuses_by_field = detached_alias_sibling_validated_statuses.get(
+            position,
+            {},
+        )
+        status_family_is_exact = (
+            sibling_field_counts == minimal_sibling_counts
+            and statuses_by_field == {"performance_month": ["requires_review"]}
+        ) or (
+            sibling_field_counts == complete_sibling_counts
+            and set(statuses_by_field) == detached_sibling_target_fields
+            and all(len(statuses_by_field[field]) == 1 for field in statuses_by_field)
+            and len(
+                {
+                    statuses_by_field[field][0]
+                    for field in detached_sibling_target_fields
+                }
+            )
+            == 1
+        )
         if (
             sibling_field_counts
-            != Counter({field: 1 for field in detached_sibling_target_fields})
+            not in (minimal_sibling_counts, complete_sibling_counts)
+            or not status_family_is_exact
             or detached_alias_sibling_field_observation_counts[
                 (position, "performance_month")
             ]
             != 1
             or detached_alias_sibling_counts[(position, locator)] != 1
+            or (
+                sibling_field_counts == complete_sibling_counts
+                and not complete_detached_alias_sibling_claim(position)
+            )
         ):
             return None
         return position, identity
+
+    def exact_grid_alias_declaration(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Validate the relationship stage's exact one-grid alias grammar."""
+
+        owner_basis = str(
+            observed.get("account_month_owner_basis") or ""
+        ).strip()
+        candidate = values.get("candidate_value")
+        if not (
+            str(values.get("category") or "") == "ocr_structure_correction"
+            and str(values.get("issue_code") or "") == alias_issue_code
+            and str(values.get("severity") or "") == "info"
+            and str(values.get("status") or "") in {"informational", "resolved"}
+            and str(values.get("parser_stage") or "")
+            == "candidate_b_relationship_schema"
+            and str(values.get("target_dataset") or "") == "repayment_records"
+            and str(values.get("field_name") or "") == "performance_month"
+            and str(values.get("target_record_id") or "")
+            == canonical_account_month_target(account_id, performance_month)
+            and set(observed)
+            == {
+                "account_id",
+                "grid_id",
+                "performance_month",
+                "source_position_state",
+                "account_month_owner_basis",
+            }
+            and str(observed.get("source_position_state") or "")
+            == "owner_bound_alias"
+            and owner_basis in allowed_account_month_owner_bases
+            and isinstance(candidate, Mapping)
+            and set(candidate) == {"resolution"}
+            and str(candidate.get("resolution") or "")
+            == "reconciled_to_existing_account_month_identity"
+            and exact_reason_code_set(values, detached_alias_reason_codes)
+            and len(refs) == 1
+        ):
+            return None
+        ref = refs[0]
+        page = ref.get("page")
+        logical_page = ref.get("logical_page")
+        bbox = ref.get("bbox")
+        source_page = ref.get("source_page")
+        if not (
+            str(ref.get("source") or "") == "candidate_b_monthly_grid_omission"
+            and str(ref.get("binding") or "") == "source_account_month_alias"
+            and str(ref.get("binding_quality") or "")
+            == "source_account_month_alias"
+            and str(ref.get("account_id") or "") == account_id
+            and str(ref.get("grid_id") or "") == grid_id
+            and str(ref.get("performance_month") or "") == performance_month
+            and str(ref.get("field_name") or "") == "performance_month"
+            and str(ref.get("geometry_scope") or "") == "grid"
+            and str(ref.get("coordinate_system") or "")
+            == "pdf_points_top_left"
+            and isinstance(page, int)
+            and not isinstance(page, bool)
+            and page > 0
+            and logical_page == page
+            and (
+                source_page is None
+                or (
+                    isinstance(source_page, int)
+                    and not isinstance(source_page, bool)
+                    and source_page > 0
+                )
+            )
+            and isinstance(ref.get("table_id"), str)
+            and bool(str(ref.get("table_id") or "").strip())
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in bbox
+            )
+            and float(bbox[2]) > float(bbox[0])
+            and float(bbox[3]) > float(bbox[1])
+        ):
+            return None
+        return (
+            (grid_id, performance_month),
+            (account_id, performance_month),
+            ("relationship_grid_alias", page, source_page, ref["table_id"]),
+        )
+
+    def legacy_alias_declaration(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Read the former one-ref producer grammar without weakening v2 claims."""
+
+        identity = (account_id, performance_month)
+        target_record_id = str(values.get("target_record_id") or "")
+        if not (
+            set(observed)
+            == {
+                "account_id",
+                "grid_id",
+                "performance_month",
+                "source_position_state",
+            }
+            and str(observed.get("source_position_state") or "")
+            == "owner_bound_alias"
+            and identity in candidate_identities
+            and target_record_id.endswith(f":{performance_month}")
+            and str(values.get("category") or "") == "ocr_structure_correction"
+            and str(values.get("issue_code") or "") == alias_issue_code
+            and str(values.get("severity") or "") == "info"
+            and str(values.get("status") or "") in {"informational", "resolved"}
+            and str(values.get("parser_stage") or "")
+            == "candidate_b_relationship_schema"
+            and str(values.get("target_dataset") or "") == "repayment_records"
+            and str(values.get("field_name") or "") == "performance_month"
+            and len(refs) == 1
+        ):
+            return None
+        ref = refs[0]
+        logical_page = ref.get("logical_page") or ref.get("page")
+        bbox = ref.get("bbox")
+        raw_evidence_ids = ref.get("evidence_ids")
+        if not (
+            isinstance(logical_page, int)
+            and not isinstance(logical_page, bool)
+            and logical_page > 0
+            and str(ref.get("grid_id") or "") == grid_id
+            and str(ref.get("performance_month") or "") == performance_month
+            and str(ref.get("geometry_scope") or "") in {"cell", "grid"}
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in bbox
+            )
+            and float(bbox[2]) > float(bbox[0])
+            and float(bbox[3]) > float(bbox[1])
+            and (
+                raw_evidence_ids is None
+                or (
+                    isinstance(raw_evidence_ids, (list, tuple))
+                    and bool(raw_evidence_ids)
+                    and all(
+                        isinstance(value, str) and bool(value.strip())
+                        for value in raw_evidence_ids
+                    )
+                    and len(raw_evidence_ids) == len(set(raw_evidence_ids))
+                )
+            )
+        ):
+            return None
+        return (
+            (grid_id, performance_month),
+            identity,
+            ("legacy_relationship_alias", logical_page),
+        )
 
     candidate_identities: set[tuple[str, str]] = set()
     bound_positions_by_identity: dict[
@@ -4402,37 +4664,6 @@ def _apply_account_month_closure_ledger(
     explicit_alias_claims: set[
         tuple[tuple[str, str], tuple[str, str]]
     ] = set()
-    detached_alias_observation_counts: Counter[
-        tuple[tuple[str, str], tuple[str, str]]
-    ] = Counter()
-    for issue in source_issues:
-        values = _record_values(issue)
-        if str(values.get("issue_code") or "") != alias_issue_code:
-            continue
-        observed = values.get("observed_value")
-        observed = observed if isinstance(observed, Mapping) else {}
-        account_id = str(observed.get("account_id") or "").strip()
-        grid_id = str(observed.get("grid_id") or "").strip()
-        performance_month = str(observed.get("performance_month") or "").strip()
-        addressed_claims: set[
-            tuple[tuple[str, str], tuple[str, str]]
-        ] = set()
-        if account_id and grid_id and month_pattern.fullmatch(performance_month):
-            addressed_claims.add(
-                ((grid_id, performance_month), (account_id, performance_month))
-            )
-        recovered_address = exact_detached_ref_address(
-            issue,
-            values,
-            alias=True,
-        )
-        if recovered_address is not None and recovered_address[1] is not None:
-            addressed_claims.add((recovered_address[0], recovered_address[1]))
-        for addressed_claim in addressed_claims:
-            detached_alias_observation_counts[addressed_claim] += 1
-    detached_alias_claims: Counter[
-        tuple[tuple[str, str], tuple[str, str]]
-    ] = Counter()
     for issue in source_issues:
         values = _record_values(issue)
         observed = values.get("observed_value")
@@ -4480,7 +4711,7 @@ def _apply_account_month_closure_ledger(
         if issue_code == alias_issue_code:
             if source_position_is_local and account_id:
                 exact_refs = exact_issue_refs(issue, values)
-                alias_declaration = (
+                detached_alias_declaration = (
                     exact_detached_alias_declaration(
                         values,
                         observed,
@@ -4491,6 +4722,34 @@ def _apply_account_month_closure_ledger(
                     )
                     if exact_refs is not None
                     else None
+                )
+                grid_alias_declaration = exact_grid_alias_declaration(
+                    values,
+                    observed,
+                    refs,
+                    account_id=account_id,
+                    grid_id=grid_id,
+                    performance_month=performance_month,
+                )
+                legacy_declaration = legacy_alias_declaration(
+                    values,
+                    observed,
+                    refs,
+                    account_id=account_id,
+                    grid_id=grid_id,
+                    performance_month=performance_month,
+                )
+                declarations = [
+                    (kind, declaration)
+                    for kind, declaration in (
+                        ("detached", detached_alias_declaration),
+                        ("grid", grid_alias_declaration),
+                        ("legacy", legacy_declaration),
+                    )
+                    if declaration is not None
+                ]
+                declaration_kind, alias_declaration = (
+                    declarations[0] if len(declarations) == 1 else ("", None)
                 )
                 detached_alias_claim = (
                     exact_detached_alias_claim(
@@ -4511,9 +4770,23 @@ def _apply_account_month_closure_ledger(
                     bound_positions_by_identity.setdefault(
                         declared_identity, set()
                     ).add(declared_position)
-                    fingerprints_by_bound_claim.setdefault(bound_claim, set()).update(
-                        fingerprints
-                    )
+                    if declaration_kind != "grid":
+                        fingerprints_by_bound_claim.setdefault(
+                            bound_claim,
+                            set(),
+                        ).update(fingerprints)
+                    if declaration_kind == "legacy":
+                        trusted_physical_claims_by_bound_claim.setdefault(
+                            bound_claim, set()
+                        ).update(physical_claim_refs)
+                        for physical_claim, claim_refs in physical_claim_refs.items():
+                            physical_claim_refs_by_bound_claim.setdefault(
+                                bound_claim, {}
+                            ).setdefault(physical_claim, []).extend(claim_refs)
+                    # A relationship-stage grid envelope proves the alias's
+                    # account/month owner, but not one physical month cell.
+                    # Several account grids may share a source table and month;
+                    # only exact cell evidence may collapse their denominator.
                 else:
                     # A malformed alias remains a physical source observation,
                     # but cannot influence owner selection or physical counts.
@@ -4521,7 +4794,6 @@ def _apply_account_month_closure_ledger(
                 if detached_alias_claim is not None and alias_declaration is not None:
                     claimed_position, claimed_identity = detached_alias_claim
                     bound_claim = (claimed_position, claimed_identity)
-                    detached_alias_claims[(claimed_position, claimed_identity)] += 1
                     trusted_physical_claims_by_bound_claim.setdefault(
                         bound_claim, set()
                     ).update(physical_claim_refs)
@@ -4598,9 +4870,10 @@ def _apply_account_month_closure_ledger(
                     trusted_physical_claims_by_bound_claim.setdefault(
                         bound_claim, set()
                     ).update(physical_claim_refs)
-                    bridge_physical_claims_by_bound_claim.setdefault(
-                        bound_claim, set()
-                    ).update(physical_claim_refs)
+                    # A field-local missing-range issue proves an identity,
+                    # not a complete physical status/amount pair.  It may
+                    # contribute audit ownership, but never bridge a detached
+                    # two-cell diagnostic by assembling singleton claims.
                     for physical_claim, claim_refs in physical_claim_refs.items():
                         physical_claim_refs_by_bound_claim.setdefault(
                             bound_claim, {}
@@ -4634,24 +4907,6 @@ def _apply_account_month_closure_ledger(
         for position in positions:
             all_bound_claims.add((position, identity))
     non_explicit_bound_claims = all_bound_claims - explicit_alias_claims
-    positions_with_non_explicit_claim = {
-        position for position, _identity in non_explicit_bound_claims
-    }
-    detached_audit_only_alias_positions: set[tuple[str, str]] = set()
-    for (position, identity), claim_count in detached_alias_claims.items():
-        if (
-            claim_count != 1
-            or detached_alias_observation_counts[(position, identity)] != 1
-            or (position, identity) not in explicit_alias_claims
-        ):
-            continue
-        non_alias_positions = {
-            candidate_position
-            for candidate_position in bound_positions_by_identity.get(identity, set())
-            if (candidate_position, identity) not in explicit_alias_claims
-        }
-        if non_alias_positions and position not in positions_with_non_explicit_claim:
-            detached_audit_only_alias_positions.add(position)
     claims_by_physical_fingerprint: dict[
         tuple[Any, ...],
         list[tuple[tuple[str, str], tuple[str, str], list[dict[str, Any]]]],
@@ -4927,9 +5182,13 @@ def _apply_account_month_closure_ledger(
     source_month_position_observations = len(
         all_bound_source_positions | raw_unresolved_source_positions
     )
-    counted_bound_positions = (
-        all_bound_source_positions - detached_audit_only_alias_positions
-    )
+    # An identity alias is not automatically a physical alias.  The same
+    # account/month can be printed in two distinct grids (Ye page 12 is the
+    # production example).  Count every source position here and let exact
+    # evidence/geometry fingerprints collapse only proven re-observations of
+    # the same physical cells.  Canonical account/month identities remain
+    # independently set-deduplicated in ``closure`` above.
+    counted_bound_positions = all_bound_source_positions
     counting_fingerprints_by_source_position: dict[
         tuple[str, str], set[tuple[Any, ...]]
     ] = {}
@@ -4952,6 +5211,39 @@ def _apply_account_month_closure_ledger(
             counting_fingerprints_by_source_position.setdefault(
                 position, set()
             ).update(fingerprints_by_bound_claim.get(bound_claim, set()))
+
+    # A retained canonical row can have deliberately unresolved geometry while
+    # one fully sealed detached alias supplies its only exact physical cells.
+    # In that case the alias is the physical representative of the canonical
+    # identity, not proof of a second printed position.  Bridge only one exact
+    # alias into one geometry-less primary claim.  If the primary already has
+    # exact geometry (the Ye page-12 topology), differing alias geometry stays
+    # a separately counted printed position.
+    for identity, source_positions in bound_positions_by_identity.items():
+        primary_claims = [
+            (position, identity)
+            for position in source_positions
+            if (position, identity) in non_explicit_bound_claims
+        ]
+        if len(primary_claims) != 1:
+            continue
+        primary_claim = primary_claims[0]
+        if fingerprints_by_bound_claim.get(primary_claim):
+            continue
+        exact_alias_claims = [
+            (position, identity)
+            for position in source_positions
+            if (position, identity) in explicit_alias_claims
+            and trusted_physical_claims_by_bound_claim.get((position, identity))
+            and fingerprints_by_bound_claim.get((position, identity))
+        ]
+        if len(exact_alias_claims) != 1:
+            continue
+        counting_fingerprints_by_source_position.setdefault(
+            primary_claim[0], set()
+        ).update(
+            fingerprints_by_bound_claim[exact_alias_claims[0]]
+        )
     owner_bound_account_months = unique_physical_position_count(
         counted_bound_positions,
         counting_fingerprints_by_source_position,
@@ -4986,6 +5278,7 @@ def _apply_account_month_closure_ledger(
         ),
         "expected_identity_count": len(closure),
         "canonical_account_month_identity_count": len(closure),
+        "expected_source_position_count": raw_source_month_positions,
         "source_month_position_observations": source_month_position_observations,
         "raw_source_month_positions": raw_source_month_positions,
         "unique_physical_source_month_positions": raw_source_month_positions,
@@ -5031,6 +5324,10 @@ def _apply_account_month_closure_ledger(
                 "identity_fields": ["account_id", "performance_month"],
                 "proof_basis": "exact_source_account_month_identity_set",
                 "expected_identity_count": len(closure),
+                "expected_source_position_count": raw_source_month_positions,
+                "owner_bound_source_position_count": owner_bound_account_months,
+                "owner_unresolved_source_position_count": owner_unresolved_positions,
+                "source_position_balance_valid": balance_valid,
                 "identity_sha256": identity_sha256,
             }
         ]
@@ -5113,6 +5410,7 @@ def _apply_account_month_closure_ledger(
             or unlocalized_bound_identity_issues
             or unlocalized_unresolved_positions
             or physical_owner_conflict_groups
+            or raw_source_month_positions > len(candidate_identities)
             else "present"
         ),
         "reason": (
@@ -5122,14 +5420,22 @@ def _apply_account_month_closure_ledger(
                 "account_month_source_localization_invalid"
                 if unlocalized_bound_identity_issues or unlocalized_unresolved_positions
                 else (
-                    "account_month_identity_partial_owner_unresolved"
+                    "account_month_source_position_partial_owner_unresolved"
                     if unresolved_source_positions
-                    else "account_month_identity_closure"
+                    else (
+                        "account_month_source_position_closure"
+                        if raw_source_month_positions != len(closure)
+                        else "account_month_identity_closure"
+                    )
                 )
             )
         ),
         "observed_row_count": len(candidate_identities),
-        **({"expected_row_count": len(closure)} if closure else {}),
+        **(
+            {"expected_row_count": raw_source_month_positions}
+            if raw_source_month_positions
+            else {}
+        ),
     }
 
 

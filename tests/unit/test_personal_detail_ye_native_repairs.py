@@ -4430,6 +4430,60 @@ def test_account_business_repair_unions_exact_discovery_and_repaired_identities(
     )
 
 
+def test_ye_repair_dropout_still_deploys_complete_typed_account_population() -> None:
+    context = _ye_family_population_context()
+    conserved = deepcopy(context.corrected_evidence_pages())
+    discovery = native_extraction._account_anchor_skeletons(context)
+    context._candidate_b_pre_repair_account_anchor_inventory = tuple(
+        deepcopy(discovery)
+    )
+    context.__dict__.pop("_candidate_b_account_anchor_skeleton_cache", None)
+
+    # Model the production repair seam that previously lost the final three R1
+    # headings and the card tail while retaining their physical base tables.
+    repaired = deepcopy(conserved)
+    dropped = {
+        13: {"账户4：", "账户5："},
+        14: {"账户6："},
+        17: {f"账户{ordinal}：" for ordinal in range(7, 13)},
+    }
+    for page in repaired:
+        page_number = int(page["page"])
+        page["lines"] = [
+            line
+            for line in page["lines"]
+            if str(line["text"]).replace(" ", "")
+            not in dropped.get(page_number, set())
+        ]
+    context.corrected_evidence_pages = lambda: deepcopy(repaired)
+    context.conserved_corrected_evidence_pages = lambda: deepcopy(conserved)
+    context._business_repair_active = True
+    context._personal_detail_extraction_issues = []
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    family_counts: dict[str, int] = {}
+    for account in accounts:
+        family = str(account["account_type"])
+        family_counts[family] = family_counts.get(family, 0) + 1
+
+    assert family_counts == {
+        "non_revolving_loan": 18,
+        "revolving_loan_subaccount": 6,
+        "revolving_loan_account": 6,
+        "credit_card": 12,
+    }
+    assert not any("provisional" in str(account["account_id"]) for account in accounts)
+    r1_by_sequence = {
+        int(account["category_sequence"]): account
+        for account in accounts
+        if account["account_type"] == "revolving_loan_subaccount"
+    }
+    for ordinal in (4, 5, 6):
+        assert f"r1-{ordinal}" in {
+            ref.get("table_id") for ref in r1_by_sequence[ordinal].get("source_refs") or ()
+        }
+
+
 def test_account_business_repair_rejects_duplicate_family_ordinal_in_one_plane() -> None:
     context = _ye_family_population_context()
     discovery = native_extraction._account_anchor_skeletons(context)
@@ -4932,6 +4986,168 @@ def _exact_sparse_card8_table(*, left: float = 52.5) -> SimpleNamespace:
     )
 
 
+def _lin_exact_two_cell_card16_table() -> SimpleNamespace:
+    rows = [
+        [
+            "账户标识 发卡机构 开立日期 账户授信额度",
+            "共享授信额度 币种 业务种类 担保方式",
+        ],
+        [
+            (
+                "B10111000H 就 中国工商银行 00014100000 股份有限公司 "
+                "2021.05.31 44,905 02100474560 厦门市分行 福 38"
+            ),
+            "欧元 贷记卡 信用/免担保",
+        ],
+    ]
+    column_bands = [
+        {"index": 0, "x0": 30.5, "x1": 208.5},
+        {"index": 1, "x0": 208.5, "x1": 386.5},
+    ]
+    row_bands = [
+        {"index": 0, "y0": 322.5, "y1": 342.5},
+        {"index": 1, "y0": 342.5, "y1": 520.0},
+    ]
+    geometry = {
+        "coordinate_system": "pdf_points_top_left",
+        "cell_bboxes": [
+            [
+                [band["x0"], row["y0"], band["x1"], row["y1"]]
+                for band in column_bands
+            ]
+            for row in row_bands
+        ],
+        "cell_geometry_status": [["exact", "exact"], ["exact", "exact"]],
+        "cell_evidence_ids": [
+            [[f"lin-card16:r{row}:c{column}"] for column in range(2)]
+            for row in range(2)
+        ],
+        "cell_spans": [],
+        "row_bands": row_bands,
+        "col_bands": column_bands,
+    }
+    return SimpleNamespace(
+        table_id="pt_21_2",
+        metadata={"raw_rows": rows, "geometry": geometry},
+        headers=[],
+        rows=[],
+        bbox=[30.5, 322.5, 386.5, 520.0],
+        confidence=0.99,
+    )
+
+
+def _lin_exact_headerless_card17_table() -> SimpleNamespace:
+    table = _exact_sparse_card8_table(left=52.5)
+    table.table_id = "pt_22_0"
+    table.bbox = [52.5, 43.5, 403.5, 228.5]
+    values = table.metadata["raw_rows"][0]
+    values[0] = "中国工商银行 股份有限公司 厦门市分行"
+    values[2] = "B10111000H 00014100000 02100474560 13"
+    values[4] = "2021.05.31"
+    values[5] = "50,817 公"
+    values[7] = ""
+    values[8] = "香港元"
+    values[10] = "贷记卡"
+    values[12] = "信用/免担保"
+    geometry = table.metadata["geometry"]
+    geometry["row_bands"] = [{"index": 0, "y0": 43.5, "y1": 228.5}]
+    geometry["cell_bboxes"][0] = [
+        [band["x0"], 43.5, band["x1"], 228.5]
+        for band in geometry["col_bands"]
+    ]
+    geometry["cell_evidence_ids"][0] = [
+        [f"lin-card17:value:{column}"] if values[column] else []
+        for column in range(13)
+    ]
+    return table
+
+
+def _lin_two_cell_then_headerless_card_context() -> SimpleNamespace:
+    previous = _lin_exact_two_cell_card16_table()
+    candidate = _lin_exact_headerless_card17_table()
+    following = _table(
+        "pt_22_1",
+        [
+            _CARD_HEADER,
+            _card_values(
+                "B10512900H00010720141130006378381",
+                institution="交通银行股份有限公司",
+            ),
+        ],
+        top=260.0,
+    )
+    header_boxes = (
+        (39.5, 544.5, 67.5, 555.5),
+        (84.0, 545.0, 112.0, 556.0),
+        (127.5, 546.0, 155.0, 555.5),
+        (164.5, 545.5, 206.5, 556.0),
+        (209.0, 545.5, 250.5, 556.5),
+        (267.0, 546.0, 282.0, 556.5),
+        (304.5, 546.0, 332.5, 557.0),
+        (347.0, 545.5, 376.5, 558.0),
+    )
+    evidence = [
+        {
+            "page": 21,
+            "source_page": 11,
+            "lines": [
+                {
+                    "text": "(三)贷记卡账户",
+                    "bbox": [176.0, 68.5, 244.5, 84.5],
+                    "evidence_ids": ["lin-card-family"],
+                },
+                {
+                    "text": "账户16",
+                    "bbox": [34.0, 312.5, 68.0, 322.0],
+                    "evidence_ids": ["lin-card16-anchor"],
+                },
+                {
+                    "text": (
+                        "账户17(授信协议标识:"
+                        "B10111000H000141000000530059989)(卡片尾号:5248)"
+                    ),
+                    "bbox": [33.0, 531.5, 271.5, 543.5],
+                    "evidence_ids": ["lin-card17-anchor"],
+                },
+                *[
+                    {
+                        "text": label,
+                        "bbox": list(box),
+                        "evidence_ids": [f"lin-card17-header:{index}"],
+                    }
+                    for index, (label, box) in enumerate(
+                        zip(_CARD_HEADER, header_boxes, strict=True)
+                    )
+                ],
+            ],
+        },
+        {
+            "page": 22,
+            "source_page": 11,
+            "lines": [
+                {
+                    "text": "账户18",
+                    "bbox": [34.0, 239.0, 68.0, 250.0],
+                    "evidence_ids": ["lin-card18-anchor"],
+                }
+            ],
+        },
+    ]
+    return SimpleNamespace(
+        pages=[_page(21, [previous]), _page(22, [candidate, following])],
+        reading_order_by_logical={21: 1, 22: 2},
+        reading_order_resolution={
+            "resolved": True,
+            "authoritative": True,
+            "basis": "printed_page_identity",
+        },
+        corrected_evidence_pages=lambda: deepcopy(evidence),
+        tables_continue=lambda _left, _right: None,
+        allows_scanned_line_transition=lambda *_args: False,
+        _personal_detail_extraction_issues=[],
+    )
+
+
 def _real_headerless_card8_context(
     *,
     header_defect: str = "",
@@ -5056,6 +5272,31 @@ def test_real_anchor_header_lattice_splits_card8_from_card7(
         issue.get("issue_code") == "candidate_b_headerless_account_owner_resolved"
         and issue.get("observed_value", {}).get("ownership_basis")
         == "printed_anchor_header_lattice"
+        for issue in context._personal_detail_extraction_issues
+    )
+
+
+def test_lin_two_cell_card_and_next_page_headerless_card_keep_exact_currencies() -> None:
+    context = _lin_two_cell_then_headerless_card_context()
+
+    accounts, _repayments, _events = native_extraction._extract_accounts(context)
+    by_sequence = {
+        int(account["category_sequence"]): account
+        for account in accounts
+        if account.get("account_type") == "credit_card"
+    }
+
+    assert by_sequence[16]["account_currency"] == "EUR"
+    assert by_sequence[17]["account_currency"] == "HKD"
+    assert by_sequence[17]["account_identifier"] == (
+        "B10111000H000141000000210047456013"
+    )
+    assert "pt_22_0" in {
+        ref.get("table_id") for ref in by_sequence[17].get("source_refs") or ()
+    }
+    assert any(
+        issue.get("issue_code") == "candidate_b_headerless_account_owner_resolved"
+        and issue.get("target_record_id") == "credit_account:credit_card:17"
         for issue in context._personal_detail_extraction_issues
     )
 
@@ -5737,6 +5978,244 @@ def test_clean_collapsed_inquiry_planes_preserve_the_complete_population() -> No
     ) == list(range(1, 97))
 
 
+def test_ye_k69_context_line_reaches_same_row_institution_conflict() -> None:
+    """The native ordinal context must retain the clean same-row OCR plane."""
+
+    context = _full_clean_collapsed_inquiry_context()
+    page28 = next(page for page in context.pages if page.page_number == 28)
+    page28.tables[0].metadata["raw_rows"][69 - 37] = [
+        "K69",
+        "2022.10.11",
+        "守 中信银行股份有限公司个人信贷部",
+        "贷后管理",
+    ]
+    row_index = 69 - 37
+    geometry = page28.tables[0].metadata["geometry"]
+    geometry["row_bands"][row_index] = {
+        "index": row_index,
+        "y0": 469.5,
+        "y1": 482.5,
+    }
+    column_edges = [51.5, 90.5, 168.5, 322.5, 401.0]
+    geometry["col_bands"] = [
+        {"index": column, "x0": column_edges[column], "x1": column_edges[column + 1]}
+        for column in range(4)
+    ]
+    for current_row, row_band in enumerate(geometry["row_bands"]):
+        geometry["cell_bboxes"][current_row] = [
+            [
+                column_edges[column],
+                row_band["y0"],
+                column_edges[column + 1],
+                row_band["y1"],
+            ]
+            for column in range(4)
+        ]
+    page28.tables[0].bbox = [51.5, 54.5, 401.0, 574.0]
+    evidence = context.corrected_evidence_pages()
+    evidence.append(
+        {
+            "page": 28,
+            "source_page": 28,
+            "fragment_logical_pages": [28],
+            "canonical_template_id": "mixed_pboc_sections",
+            "lines": [
+                {
+                    "text": "168 2022.10.12 页面内非异常机构 贷后管理",
+                    "bbox": [55.0, 450.0, 395.0, 460.0],
+                    "source_bbox": [55.0, 450.0, 395.0, 460.0],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:ordinary-row:must-stay-closed"],
+                    "confidence": 0.99,
+                },
+                {
+                    "text": "69",
+                    "bbox": [57.333, 467.405, 78.667, 483.396],
+                    "source_bbox": [57.333, 467.405, 78.667, 483.396],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:69:sequence"],
+                    "confidence": 0.884,
+                },
+                {
+                    "text": "2022.10.11",
+                    "bbox": [113.587, 472.941, 144.973, 480.139],
+                    "source_bbox": [113.587, 472.941, 144.973, 480.139],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:69:date"],
+                    "confidence": 0.9993,
+                },
+                {
+                    "text": "中信银行股份有限公司个人信贷部",
+                    "bbox": [199.0, 471.403, 292.333, 481.397],
+                    "source_bbox": [199.0, 471.403, 292.333, 481.397],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:69:institution"],
+                    "confidence": 0.9983,
+                },
+                {
+                    "text": "贷后管理",
+                    "bbox": [347.667, 471.403, 375.0, 480.398],
+                    "source_bbox": [347.667, 471.403, 375.0, 480.398],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:69:reason"],
+                    "confidence": 0.9998,
+                },
+                {
+                    "text": "K69 2022.10.11 页面外机构 贷后管理",
+                    "bbox": [410.0, 471.0, 435.0, 482.0],
+                    "source_bbox": [410.0, 471.0, 435.0, 482.0],
+                    "source_logical_page": 28,
+                    "evidence_ids": ["line:69:outside-inquiry-table"],
+                    "confidence": 0.99,
+                },
+            ],
+        }
+    )
+    context.corrected_evidence_pages = lambda: evidence
+    context.canonical_layout_audit = lambda: {
+        "registrations": [
+            {
+                "logical_page": 28,
+                "template_id": "mixed_pboc_sections",
+                "status": "registered",
+                "section_table_owners": {
+                    "pt_28_0": {
+                        "template_id": "annotations_and_inquiries",
+                        "table_bbox": [51.5, 54.5, 401.0, 574.0],
+                        "binding": "authoritative_prior_inquiry_table_continuation",
+                        "sequence_field_anomalies": [
+                            {
+                                "row": 32,
+                                "expected_sequence": 69,
+                                "raw_sequence": "K69",
+                                "status": "unparsed_raw_sequence",
+                            }
+                        ],
+                    }
+                },
+            }
+        ]
+    }
+
+    line_rows = native_extraction._canonical_inquiry_line_rows(context)
+    assert any(
+        row.get("sequence") == 69
+        and row.get("institution") == "中信银行股份有限公司个人信贷部"
+        for row in line_rows
+    ), line_rows
+    records = native_extraction._extract_inquiries(context)
+    assert sorted(
+        int(row["sequence"])
+        for row in records
+        if row.get("inquiry_type") == "institution"
+    ) == list(range(1, 97))
+    record = next(
+        row
+        for row in records
+        if row.get("inquiry_type") == "institution"
+        and row.get("sequence") == 69
+    )
+    active = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("target_record_id") == record["inquiry_id"]
+        and issue.get("field_name") == "institution"
+        and issue.get("status") == "requires_review"
+    ]
+
+    assert record["institution"] is None
+    assert record["extraction_status"] == "review"
+    assert len(active) == 1
+    assert active[0]["issue_code"] == "candidate_b_inquiry_field_conflict"
+    assert active[0]["parser_stage"] == "candidate_b_inquiry_schema"
+    assert active[0]["category"] == "ocr_structure_correction"
+    assert active[0]["observed_value"] == [
+        "守 中信银行股份有限公司个人信贷部",
+        "中信银行股份有限公司个人信贷部",
+    ]
+    assert active[0]["reason_codes"] == [
+        "same_printed_inquiry_row",
+        "equal_field_provenance",
+        "conflicting_values_withheld",
+    ]
+
+
+def test_ye_shaped_noisy_inquiry_cells_conserve_rows_for_field_local_repair() -> None:
+    context = _full_clean_collapsed_inquiry_context()
+    page28 = next(page for page in context.pages if page.page_number == 28)
+    rows28 = page28.tables[0].metadata["raw_rows"]
+    noisy_dates = {
+        59: "2022.11.26 i",
+        61: "2022.11.11 福",
+        62: "? 2022.11.02",
+        66: "¥ 2022.10.21",
+    }
+    for sequence, raw_date in noisy_dates.items():
+        rows28[sequence - 37][1] = raw_date
+
+    page29 = next(page for page in context.pages if page.page_number == 29)
+    rows29 = page29.tables[0].metadata["raw_rows"]
+    merged_institutions = {
+        93: "兴业消费金融股份公司",
+        94: "中信银行股份有限公司",
+        95: "广州市网商小额贷款有限责任公司",
+        96: "中国民生银行股份有限公司信用卡中心",
+    }
+    for sequence, institution in merged_institutions.items():
+        row = rows29[sequence - 77]
+        row[1] = f"{row[1]} {institution}"
+        row[2] = ""
+        page29.tables[0].metadata["geometry"]["cell_evidence_ids"][
+            sequence - 77
+        ][2] = []
+
+    records = native_extraction._extract_inquiries(context)
+    institution_records = {
+        int(record["sequence"]): record
+        for record in records
+        if record.get("inquiry_type") == "institution"
+    }
+
+    assert sorted(institution_records) == list(range(1, 97))
+    assert all(
+        institution_records[sequence]["inquiry_date"] is None
+        and institution_records[sequence]["extraction_status"] == "review"
+        for sequence in noisy_dates
+    )
+    assert all(
+        institution_records[sequence]["inquiry_date"] is None
+        and institution_records[sequence]["institution"] is None
+        for sequence in merged_institutions
+    )
+    issues = context._personal_detail_extraction_issues
+    localized = {
+        (
+            issue.get("observed_value", {}).get("sequence"),
+            issue.get("field_name"),
+        )
+        for issue in issues
+        if issue.get("issue_code")
+        == "candidate_b_inquiry_row_cells_unresolved"
+    }
+    assert all(
+        (sequence, "inquiry_date") in localized
+        for sequence in {*noisy_dates, *merged_institutions}
+    )
+    assert all(
+        (sequence, "institution") in localized
+        for sequence in merged_institutions
+    )
+    assert all(
+        issue.get("target_record_id")
+        == institution_records[issue["observed_value"]["sequence"]]["inquiry_id"]
+        for issue in issues
+        if issue.get("issue_code")
+        == "candidate_b_inquiry_row_cells_unresolved"
+        and issue.get("observed_value", {}).get("sequence")
+        in {*noisy_dates, *merged_institutions}
+    )
+
+
 def test_inquiry_line_witness_rejects_duplicate_fingerprint_on_different_row() -> None:
     rows = [
         ["缂栧彿", "? 鏌ヨ鏃ユ湡 鏌ヨ鏈烘瀯 X", "", "鏌ヨ鍘熷洜"],
@@ -5980,6 +6459,68 @@ def test_headerless_exact_native_rows_correct_huang_line_ordinals() -> None:
         )
         for issue in corrections
     } == {(896, 89), (1129, 129)}
+
+
+def test_reconciled_exact_native_inquiry_rows_enter_source_ordinal_ledger() -> None:
+    """Repaired ordinals retain their unique native row owners in the ledger."""
+
+    exact_rows = [
+        ["1", "2024.09.03", "中国银行股份有限公司福建省分行", "贷后管理"],
+        ["2", "2023.11.28", "招商银行股份有限公司", "贷款审批"],
+    ]
+    tables = [
+        _exact_headerless_inquiry_table("pt_53_0", [exact_rows[0]], top=125.0),
+        _exact_headerless_inquiry_table("pt_54_0", [exact_rows[1]], top=130.5),
+    ]
+    context = SimpleNamespace(
+        pages=[
+            _page(53, [tables[0]], template="annotations_and_inquiries"),
+            _page(54, [tables[1]], template="annotations_and_inquiries"),
+        ],
+        reading_order_by_logical={53: 1, 54: 2},
+        reading_order_resolution={"resolved": True, "authoritative": True},
+        corrected_evidence_pages=lambda: [
+            {
+                "page": 53,
+                "source_page": 53,
+                "canonical_template_id": "annotations_and_inquiries",
+                "lines": [
+                    {
+                        "text": "18 2024.09.03 中国银行股份有限公司福建省分行 贷后管理",
+                        "bbox": [44.5, 125.0, 395.0, 138.0],
+                        "evidence_ids": ["line:18"],
+                        "confidence": 0.99,
+                    }
+                ],
+            },
+            {
+                "page": 54,
+                "source_page": 54,
+                "canonical_template_id": "annotations_and_inquiries",
+                "lines": [
+                    {
+                        "text": "29 2023.11.28 招商银行股份有限公司 贷款审批",
+                        "bbox": [44.5, 130.5, 395.0, 143.5],
+                        "evidence_ids": ["line:29"],
+                        "confidence": 0.99,
+                    }
+                ],
+            },
+        ],
+    )
+
+    records = native_extraction._extract_inquiries(context)
+    coverage = native_extraction._inquiry_source_coverage(context)
+
+    assert [row["sequence"] for row in records] == [1, 2]
+    assert coverage["expected_row_count"] == 2
+    observations = coverage["ordinal_observations"]["institution"]
+    assert set(observations) == {"1", "2"}
+    assert all(
+        observation["source_refs"][0]["binding"]
+        == "canonical_header_row"
+        for observation in observations.values()
+    )
 
 
 def test_headerless_exact_native_witness_does_not_rewrite_legitimate_high_ordinal() -> None:

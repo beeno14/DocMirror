@@ -46,6 +46,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_status_confl
     apply_candidate_b_native_status_conflict_guard,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+    _native_month_lattice_from_exact_ref,
     link_candidate_b_repayments,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
@@ -1310,6 +1311,484 @@ def test_lin_p19_august_m_vs_native_n_withholds_status_but_retains_zero() -> Non
     )
     assert projected_conflict["target_record_id"] == record_id
     assert projected_conflict["field_name"] == "status_code"
+
+
+def test_lin_p19_exact_owned_table_survives_repaired_segment_page_dropout() -> None:
+    """The native table owner is sufficient when only the segment page drops."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [_lin_p19_grid()],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    august = next(
+        row for row in records if row["record_id"] == f"{LIN_P19_GRID}:2022-08"
+    )
+    assert august["_account_month_identity_proof"] == {
+        "account_id": LIN_P19_ACCOUNT_11,
+        "performance_month": "2022-08",
+        "grid_id": LIN_P19_GRID,
+        "owner_basis": "exact_source_table_account_owner",
+        "account_anchor_exact": True,
+        "printed_month_range_exact": True,
+        "grid_geometry_exact": True,
+        "unique_owner": True,
+    }
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in august
+    assert august["overdue_amount"] == "0"
+    assert audit["conflicts_withheld"] == 1
+
+
+def test_lin_p19_complete_native_lattice_supersedes_damaged_derived_bands() -> None:
+    """Exact native cells remain authoritative over broken repaired metadata."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    # This mirrors the real extraction: only one month retains exact cell
+    # refs, while the other rows retain grid-scope observations.  The native
+    # physical table, not copied values, proves the complete month lattice.
+    rows = _lin_p19_rows()
+
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all(
+        row["_account_month_identity_proof"]["owner_basis"]
+        == "exact_source_table_account_owner"
+        for row in records
+    )
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_complete_exact_cells_supersede_misaligned_derived_bands() -> None:
+    """A complete exact cell plane may replace internally valid stale bands."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    rows = _lin_p19_rows()
+    x_edges = [45.0, 73.0, *[100.0 + 27.0 * index for index in range(12)]]
+    for row in rows:
+        month = int(row["month"])
+        performance_month = f"{int(row['year']):04d}-{month:02d}"
+        row["performance_month"] = performance_month
+        provenance = _lin_p19_geometry_provenance()
+        row["source_cell_refs"] = [
+            {
+                "page": 19,
+                "logical_page": 19,
+                "geometry_scope": "cell",
+                "geometry_status": "exact",
+                "coordinate_system": "pdf_points_top_left",
+                "grid_id": LIN_P19_GRID,
+                "row": source_row,
+                "col": month,
+                "field_name": field_name,
+                "geometry_provenance": deepcopy(provenance),
+                "bbox": [
+                    x_edges[month],
+                    y0,
+                    x_edges[month + 1],
+                    y1,
+                ],
+                "performance_month": performance_month,
+            }
+            for source_row, field_name, y0, y1 in (
+                (2, "status", 170.5, 183.5),
+                (3, "overdue_amount", 183.5, 196.5),
+            )
+        ]
+
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            # These bands are valid and ordered, but are a stale half-point
+            # derivative rather than the exact source-table cell boundaries.
+            "bbox": [
+                x_edges[month] + 0.5,
+                150.0,
+                x_edges[month + 1] + 0.5,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    context = SimpleNamespace(_personal_detail_extraction_issues=[])
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44, [
+        issue.get("observed_value")
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())[:1]
+    ]
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all(
+        row["_account_month_identity_proof"]["owner_basis"]
+        == "exact_source_table_account_owner"
+        for row in records
+    )
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+@pytest.mark.parametrize(
+    "derived_grid_bbox",
+    (
+        [45.05555555555556, 35.52983193277311, 399.49259259259264, 195.0],
+        [40.0, 30.0, 405.0, 280.0],
+    ),
+    ids=("undershoots_exact_cells", "overshoots_exact_owner_table"),
+)
+def test_lin_p19_exact_cells_supersede_damaged_derived_grid_extent(
+    derived_grid_bbox: list[float],
+) -> None:
+    """Exact cell/table ownership supersedes a damaged derived grid extent."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    grid = _lin_p19_grid()
+    grid["bbox"] = list(derived_grid_bbox)
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(
+            pages=[
+                SimpleNamespace(
+                    page_number=19,
+                    source_page_number=10,
+                    tables=[_lin_p19_native_table()],
+                )
+            ]
+        ),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_native_lattice_uses_registered_logical_pages() -> None:
+    """A split logical page must not be looked up in the physical PDF plane."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    logical_page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        # The sealed PDF plane owns source page 10 and deliberately has no
+        # logical-page-19 table.  Candidate-B's registered page plane does.
+        parse_result=SimpleNamespace(
+            pages=[SimpleNamespace(page_number=10, tables=[])]
+        ),
+        pages=[logical_page],
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        _lin_p19_rows(),
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert not any(
+        issue.get("issue_code") == "candidate_b_monthly_grid_owner_unresolved"
+        for issue in getattr(context, "_personal_detail_extraction_issues", ())
+    )
+
+
+def test_lin_p19_table_owner_withholds_unowned_candidate_identifier() -> None:
+    """A monthly-row identifier cannot veto its unique account-table owner."""
+
+    accounts = _lin_p19_accounts()
+    account_11 = accounts[0]
+    account_11["_canonical_segment"]["pages"] = [
+        {"logical_page": 18, "min_y": 535.5, "max_y": None}
+    ]
+    account_11["source_refs"].insert(
+        0,
+        {
+            "source": "native_detail_table",
+            "logical_page": 19,
+            "source_page": 10,
+            "table_id": "pt_19_0",
+            "coordinate_system": "pdf_points_top_left",
+            "geometry_scope": "table",
+            "bbox": list(_lin_p19_grid()["bbox"]),
+        },
+    )
+    rows = _lin_p19_rows()
+    for row in rows:
+        row["account_identifier"] = "B10611000H0001811132137961001"
+    grid = _lin_p19_grid()
+    grid["col_bands"] = [
+        {
+            "index": month,
+            "header": str(month),
+            "role": "month",
+            "bbox": [
+                46.0 + 27.0 * month,
+                150.0,
+                73.0 + 27.0 * month,
+                160.0,
+            ],
+            "geometry_status": "exact",
+            "geometry_source": "source_table_geometry",
+        }
+        for month in range(1, 13)
+    ]
+    grid["col_bands"][5]["bbox"], grid["col_bands"][6]["bbox"] = (
+        grid["col_bands"][6]["bbox"],
+        grid["col_bands"][5]["bbox"],
+    )
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[_lin_p19_native_table()],
+    )
+    context = SimpleNamespace(
+        parse_result=SimpleNamespace(pages=[page]),
+        source_page_by_logical={19: 10},
+    )
+
+    records = link_candidate_b_repayments(
+        rows,
+        accounts,
+        [grid],
+        issue_context=context,
+    )
+
+    assert len(records) == 44
+    assert {row["account_id"] for row in records} == {LIN_P19_ACCOUNT_11}
+    assert all("account_identifier" not in row for row in records)
+
+
+def test_lin_p19_native_lattice_proof_rejects_duplicate_physical_table() -> None:
+    table = _lin_p19_native_table()
+    page = SimpleNamespace(
+        page_number=19,
+        source_page_number=10,
+        tables=[table, deepcopy(table)],
+    )
+    context = SimpleNamespace(parse_result=SimpleNamespace(pages=[page]))
+
+    assert (
+        _native_month_lattice_from_exact_ref(
+            context,
+            _lin_p19_source_refs()[0],
+            expected_year=2022,
+            expected_month=8,
+        )
+        is None
+    )
 
 
 def _lin_p13_source_refs() -> list[dict[str, object]]:

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -247,9 +248,7 @@ def test_opted_in_hash_status_is_a_canonical_business_value_without_month_shift(
         if cell.get("role") == "status" and cell.get("text") == "#"
     ]
     assert len(hash_cells) == 3
-    assert {cell.get("recognition_source") for cell in hash_cells} == {
-        "canonical_row_sequence"
-    }
+    assert {cell.get("recognition_source") for cell in hash_cells} == {"canonical_row_sequence"}
 
 
 def test_unapproved_hash_remains_alignment_only_and_is_not_an_unknown_business_value():
@@ -277,11 +276,7 @@ def test_unapproved_hash_remains_alignment_only_and_is_not_an_unknown_business_v
     records = records_from_micro_grid_dict(out["micro_grid"])
 
     assert all(record["status"] != "#" for record in records)
-    assert {
-        record["month"]
-        for record in records
-        if record["status"] == "unknown"
-    } == {3, 4, 5}
+    assert {record["month"] for record in records if record["status"] == "unknown"} == {3, 4, 5}
 
 
 def test_credit_repayment_micro_grid_prefers_ocr_tokens_when_available():
@@ -307,11 +302,7 @@ def test_zero_status_preserves_contradictory_nonzero_amount_evidence_for_review(
     }
 
     out = extract_credit_repayment_records(lines, page=4)
-    direct = next(
-        record
-        for record in out["repayment_records"]
-        if record["year"] == 2020 and record["month"] == 12
-    )
+    direct = next(record for record in out["repayment_records"] if record["year"] == 2020 and record["month"] == 12)
     projected = next(
         record
         for record in records_from_micro_grid_dict(out["micro_grid"])
@@ -657,10 +648,7 @@ def test_candidate_b_does_not_split_one_undelimited_amount_across_numeric_status
         ("unknown", None),
     ]
     assert all(row["extraction_status"] == "review" for row in rows)
-    assert all(
-        row["_amount_pairing"]["status"] == "duplicate_or_ambiguous_cell"
-        for row in rows
-    )
+    assert all(row["_amount_pairing"]["status"] == "duplicate_or_ambiguous_cell" for row in rows)
 
 
 def test_candidate_b_splits_all_zero_run_only_across_unique_consecutive_month_bands() -> None:
@@ -789,6 +777,40 @@ def test_candidate_b_unique_fragment_cover_recovers_one_printed_amount_band() ->
     assert pairing["source_line_indices"] == [11, 12]
 
 
+def test_candidate_b_partial_month_geometry_keeps_owned_amount_field_local() -> None:
+    """A proved cell must not make an unproved sibling addressable."""
+
+    year_line = {
+        "idx": 10,
+        "text": "2024",
+        "bbox": [75.0, 270.0, 112.0, 288.0],
+        "confidence": 1.0,
+        "source_logical_page": 4,
+    }
+    amount_line = _candidate_b_direct_amount_line(
+        11,
+        "25",
+        [198.0, 277.0, 212.0, 289.0],
+    )
+    pairing = repayment_mod._candidate_b_amount_row_pair(
+        [year_line, amount_line],
+        year_line,
+        month_cols=[{"header": "2", "bbox": [180.0, 222.0, 230.0, 241.0]}],
+        active_months=[1, 2],
+        page=4,
+        excluded_line_indices=set(),
+        year_lines=[year_line],
+    )
+
+    assert pairing["status"] == "exact"
+    assert pairing["cell_status_by_month"] == {
+        "1": "month_geometry_unowned",
+        "2": "exact",
+    }
+    assert pairing["unowned_geometry_months"] == [1]
+    assert [token.text for token in pairing["tokens"]] == ["25"]
+
+
 @pytest.mark.parametrize(
     "amount_lines",
     [
@@ -887,9 +909,7 @@ def test_candidate_b_n_star_retains_reported_candidate_without_static_corroborat
     unresolved_grid["audit"]["static_status_validation"] = {"enabled": True}
     corroborated_grid = _candidate_b_row_role_grid("N", "0")
     corroborated_grid["audit"]["static_status_validation"] = {"enabled": True}
-    corroborated_grid["cells"][0][1]["recognition_source"] = (
-        "static_grid_template_consensus"
-    )
+    corroborated_grid["cells"][0][1]["recognition_source"] = "static_grid_template_consensus"
 
     unresolved = records_from_micro_grid_dict(
         unresolved_grid,
@@ -1024,6 +1044,230 @@ def test_candidate_b_mixed_year_boundary_keeps_month_cells_and_row_bands_distinc
     assert by_month[(2020, 1)]["source_cell_refs"][0]["col"] == 1
     assert by_month[(2020, 2)]["source_cell_refs"][0]["col"] == 2
     assert by_month[(2019, 12)]["source_cell_refs"][0]["col"] == 12
+
+
+def _candidate_b_boundary_page_with_visual_amount(
+    *,
+    target: tuple[int, int],
+    observed_amount: str,
+    visual_amount: str,
+) -> tuple[list[dict], object]:
+    """Replay one real-report failure mode: watermark noise changes amount OCR."""
+
+    import cv2
+    import numpy as np
+
+    lines = deepcopy(_candidate_b_boundary_lines())
+    target_bbox = {
+        (2020, 1): [148.0, 270.0, 162.0, 288.0],
+        (2019, 12): [698.0, 323.0, 712.0, 341.0],
+    }[target]
+    target_line = next(line for line in lines if line.get("bbox") == target_bbox)
+    target_line["content"] = observed_amount
+
+    image = np.full((600, 834, 3), 255, dtype=np.uint8)
+
+    def draw_glyph(glyph: str, center_x: float, center_y: float) -> None:
+        (width, height), _baseline = cv2.getTextSize(
+            glyph,
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.55,
+            1,
+        )
+        cv2.putText(
+            image,
+            glyph,
+            (round(center_x - width / 2), round(center_y + height / 2)),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.55,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # These are the three printed status cells in the business excerpt.  The
+    # amount glyph is drawn independently from its OCR token so this exercises
+    # deterministic visual validation, not a second OCR invocation.
+    draw_glyph("N", 155.0, 259.0)
+    draw_glyph("C", 205.0, 259.0)
+    draw_glyph("*", 705.0, 312.0)
+    amount_center = (155.0, 279.0) if target == (2020, 1) else (705.0, 332.0)
+    draw_glyph(visual_amount, *amount_center)
+    return lines, image
+
+
+@pytest.mark.parametrize(
+    ("target", "observed_amount", "expected_audit_text"),
+    [
+        ((2020, 1), "o", ""),
+        ((2019, 12), "10", "10"),
+        ((2019, 12), "20", "20"),
+    ],
+)
+def test_candidate_b_static_amount_zero_repairs_one_glyph_ocr_noise_without_reocr(
+    monkeypatch,
+    target: tuple[int, int],
+    observed_amount: str,
+    expected_audit_text: str,
+) -> None:
+    lines, image = _candidate_b_boundary_page_with_visual_amount(
+        target=target,
+        observed_amount=observed_amount,
+        visual_amount="0",
+    )
+
+    def forbidden_ocr(*_args, **_kwargs):
+        raise AssertionError("static amount validation must not invoke OCR")
+
+    monkeypatch.setattr(repayment_mod, "recognize_micro_cell_from_image", forbidden_ocr)
+    out = extract_credit_repayment_records(
+        lines,
+        page=4,
+        page_width=834,
+        page_height=600,
+        page_image=image,
+        enable_cell_ocr=False,
+        enable_static_status_validation=True,
+        enable_candidate_b_amount_pairing=True,
+    )
+    record = next(
+        row
+        for row in records_from_micro_grid_dict(
+            out["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if (row["year"], row["month"]) == target
+    )
+
+    assert record["overdue_amount"] == "0"
+    amount_cell = next(
+        cell
+        for row in out["micro_grid"]["cells"]
+        for cell in row
+        if cell.get("role") == "overdue_amount" and cell.get("col_index") == target[1] and cell.get("text") == "0"
+    )
+    assert amount_cell["recognition_source"] == "static_amount_zero_glyph_validation"
+    assert amount_cell["recognition_audit"]["observed_amount_text"] == expected_audit_text
+    assert out["micro_grid"]["audit"]["static_amount_zero_validation"]["corrections"] >= 1
+    assert out["micro_grid"]["audit"]["cell_crop_ocr"] == {
+        "enabled": False,
+        "attempts": 0,
+        "hits": 0,
+    }
+
+
+def test_candidate_b_static_amount_zero_uses_exact_source_lattice_when_row_is_noisy(
+    monkeypatch,
+) -> None:
+    """A noisy sibling status must not disable an exact target-cell repair."""
+
+    import cv2
+    import numpy as np
+
+    lines = _source_owned_base_lines(year=2022, status_text="#" + "N" * 11)
+    lines[-1]["content"] = "0 " * 11 + "10"
+    lines[0]["bbox"] = [250.0, 5.0, 500.0, 10.0]
+    lines[1]["bbox"] = [70.0, 15.0, 670.0, 20.0]
+    lines[2]["bbox"] = [70.0, 30.0, 670.0, 35.0]
+    lines[3]["bbox"] = [25.0, 37.0, 60.0, 42.0]
+    lines[4]["bbox"] = [70.0, 44.0, 670.0, 49.0]
+    image = np.full((100, 700, 3), 255, dtype=np.uint8)
+
+    def draw_glyph(glyph: str, center_x: float, center_y: float) -> None:
+        (width, height), _baseline = cv2.getTextSize(
+            glyph,
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.55,
+            1,
+        )
+        cv2.putText(
+            image,
+            glyph,
+            (round(center_x - width / 2), round(center_y + height / 2)),
+            cv2.FONT_HERSHEY_DUPLEX,
+            0.55,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+
+    draw_glyph("N", 645.0, 34.0)
+    draw_glyph("0", 645.0, 52.0)
+
+    def forbidden_ocr(*_args, **_kwargs):
+        raise AssertionError("static amount validation must not invoke OCR")
+
+    monkeypatch.setattr(repayment_mod, "recognize_micro_cell_from_image", forbidden_ocr)
+    geometry = _continuation_source_table_geometry(
+        table_id="pt_13_0",
+        logical_page=13,
+        year_left=20.0,
+        column_pitch=50.0,
+        row_edges=(25.0, 43.0, 61.0),
+    )
+    geometry["bbox"] = [20.0, 25.0, 670.0, 61.0]
+    out = extract_credit_repayment_records(
+        lines,
+        page=13,
+        page_width=700,
+        page_height=100,
+        page_image=image,
+        enable_cell_ocr=False,
+        enable_static_status_validation=True,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={"13": [geometry]},
+    )
+    record = next(
+        row
+        for row in records_from_micro_grid_dict(
+            out["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if (row["year"], row["month"]) == (2022, 12)
+    )
+
+    assert record["status"] == "N"
+    assert record["overdue_amount"] == "0"
+    assert record["recognition_source"] == "static_glyph_shape_validation"
+    assert out["micro_grid"]["audit"]["static_amount_zero_validation"]["corrections"] == 1
+
+
+@pytest.mark.parametrize("printed_amount", ["6", "8", "9", "10", "20"])
+def test_candidate_b_static_amount_zero_rejects_genuine_printed_nonzero(
+    printed_amount: str,
+) -> None:
+    lines, image = _candidate_b_boundary_page_with_visual_amount(
+        target=(2019, 12),
+        observed_amount=printed_amount,
+        visual_amount=printed_amount,
+    )
+    out = extract_credit_repayment_records(
+        lines,
+        page=4,
+        page_width=834,
+        page_height=600,
+        page_image=image,
+        enable_cell_ocr=False,
+        enable_static_status_validation=True,
+        enable_candidate_b_amount_pairing=True,
+    )
+    record = next(
+        row
+        for row in records_from_micro_grid_dict(
+            out["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if (row["year"], row["month"]) == (2019, 12)
+    )
+
+    assert record["overdue_amount"] == printed_amount
+    amount_cell = next(
+        cell
+        for row in out["micro_grid"]["cells"]
+        for cell in row
+        if cell.get("role") == "overdue_amount" and cell.get("col_index") == 12 and cell.get("text") == printed_amount
+    )
+    assert amount_cell["recognition_audit"]["reason"] == ("zero_status_conflicts_with_observed_nonzero_amount")
 
 
 @pytest.mark.parametrize(
@@ -1284,9 +1528,7 @@ def test_candidate_b_never_promotes_word_header_digit_when_status_row_is_missing
         accept_exact_row_numeric_status=True,
     )
 
-    assert [(row["year"], row["month"], row["status"]) for row in rows] == [
-        (2024, 1, "unknown")
-    ]
+    assert [(row["year"], row["month"], row["status"]) for row in rows] == [(2024, 1, "unknown")]
     assert rows[0]["extraction_status"] == "review"
 
 
@@ -1294,10 +1536,7 @@ def _multi_page_geometry_lines(year_pages: list[tuple[int, int]]) -> list[dict]:
     years = [year for year, _page in year_pages]
     lines = [
         {
-            "content": (
-                f"{min(years)}\u5e7401\u6708-{max(years)}\u5e7412\u6708"
-                "\u7684\u8fd8\u6b3e\u8bb0\u5f55"
-            ),
+            "content": (f"{min(years)}\u5e7401\u6708-{max(years)}\u5e7412\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55"),
             "bbox": [280.0, 10.0, 510.0, 15.0],
             "confidence": 1.0,
             "source_logical_page": 1,
@@ -1333,10 +1572,7 @@ def _multi_page_geometry_lines(year_pages: list[tuple[int, int]]) -> list[dict]:
 def _run_geometry_cache_witness(monkeypatch, year_pages: list[tuple[int, int]]):
     import numpy as np
 
-    images = {
-        logical_page: np.full((100, 800, 3), 255, dtype=np.uint8)
-        for _year, logical_page in year_pages
-    }
+    images = {logical_page: np.full((100, 800, 3), 255, dtype=np.uint8) for _year, logical_page in year_pages}
     calls: list[tuple[int, float, float, tuple[int, ...]]] = []
     original = repayment_mod._visual_month_col_bands
 
@@ -1386,11 +1622,7 @@ def test_visual_month_geometry_reuses_base_and_one_continuation_scan(monkeypatch
     assert len(calls) == 2
     assert [call[0] for call in calls] == [id(images[1]), id(images[2])]
     assert all(call[1:] == (800.0, 100.0, (100, 800, 3)) for call in calls)
-    expected = [
-        (year, month, "B", None)
-        for year, _logical_page in year_pages
-        for month in range(1, 13)
-    ]
+    expected = [(year, month, "B", None) for year, _logical_page in year_pages for month in range(1, 13)]
     assert _record_tuples(out["repayment_records"]) == expected
     assert _record_tuples(projected) == expected
 
@@ -1493,35 +1725,26 @@ def test_candidate_b_continuation_source_refs_match_month_cells_with_year_rule()
         assert all(ref["bbox"][0] == pytest.approx(expected_left, abs=2) for ref in refs)
         assert all(ref["bbox"][2] == pytest.approx(expected_right, abs=2) for ref in refs)
         assert all(
-            ref["geometry_provenance"]["selection_basis"]
-            == "source_table_year_plus_twelve_ownership"
-            for ref in refs
+            ref["geometry_provenance"]["selection_basis"] == "source_table_year_plus_twelve_ownership" for ref in refs
         )
         assert all(
             ref["geometry_provenance"]["source_table_comparison"] == "agree"
             and ref["geometry_provenance"]["value_inputs_used"] is False
             for ref in refs
         )
-    continuation_audit = extracted["micro_grid"]["audit"][
-        "visual_month_geometry_by_page"
-    ]["2"]
-    assert continuation_audit["selection_basis"] == (
-        "source_table_year_plus_twelve_ownership"
-    )
+    continuation_audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"]
+    assert continuation_audit["selection_basis"] == ("source_table_year_plus_twelve_ownership")
     from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
         project_personal_detail_datasets,
     )
 
     semantic = project_personal_detail_datasets(
-        {
-            "repayment_records": [
-                {**continuation[1], "account_id": "credit_account:test"}
-            ]
-        }
+        {"repayment_records": [{**continuation[1], "account_id": "credit_account:test"}]}
     )["credit_account_monthly_performance"][0]
-    assert semantic["source_cell_refs"][0]["geometry_provenance"][
-        "selection_basis"
-    ] == "source_table_year_plus_twelve_ownership"
+    assert (
+        semantic["source_cell_refs"][0]["geometry_provenance"]["selection_basis"]
+        == "source_table_year_plus_twelve_ownership"
+    )
 
 
 def test_candidate_b_continuation_without_image_fails_closed_only_when_enabled() -> None:
@@ -1614,9 +1837,7 @@ def test_candidate_b_exact_row_cell_disagreement_is_localized_unknown(
     assert all(row["status"] == "unknown" for row in rows)
     for row in rows:
         assert row["extraction_status"] == "review"
-        assert row["recognition_source"] == (
-            "candidate_b_exact_row_cell_status_conflict"
-        )
+        assert row["recognition_source"] == ("candidate_b_exact_row_cell_status_conflict")
         assert row["audit"]["reason"] == "exact_row_cell_status_disagreement"
         assert row["audit"]["row_status"] == "N"
         assert row["audit"]["cell_status"] == "M"
@@ -1627,10 +1848,7 @@ def test_candidate_b_exact_row_cell_disagreement_is_localized_unknown(
 def _p19_shaped_owned_status_lines(*, duplicate_month_8: bool = False) -> list[dict]:
     lines = [
         {
-            "content": (
-                "2024\u5e7401\u6708-2024\u5e7412\u6708"
-                "\u7684\u8fd8\u6b3e\u8bb0\u5f55"
-            ),
+            "content": ("2024\u5e7401\u6708-2024\u5e7412\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55"),
             "bbox": [90.0, 5.0, 270.0, 15.0],
             "confidence": 1.0,
         },
@@ -1734,17 +1952,11 @@ def test_candidate_b_owned_single_token_cell_disagreement_is_localized(
 
     assert target["status"] == "unknown"
     assert target["extraction_status"] == "review"
-    assert target["recognition_source"] == (
-        "candidate_b_owned_token_cell_status_conflict"
-    )
-    assert target["audit"]["reason"] == (
-        "owned_month_token_cell_status_disagreement"
-    )
+    assert target["recognition_source"] == ("candidate_b_owned_token_cell_status_conflict")
+    assert target["audit"]["reason"] == ("owned_month_token_cell_status_disagreement")
     assert target["audit"]["token_status"] == "N"
     assert target["audit"]["cell_status"] == "M"
-    assert target["audit"]["month_geometry_selection_basis"] == (
-        "year_plus_twelve_rule_ownership"
-    )
+    assert target["audit"]["month_geometry_selection_basis"] == ("year_plus_twelve_rule_ownership")
     assert target["audit"]["resolution"] == "withheld_unknown_review"
 
 
@@ -1805,9 +2017,7 @@ def test_candidate_b_owned_multiple_tokens_do_not_create_conflict_witness(
 
     assert target["status"] == "M"
     assert target["recognition_source"] == "cell_crop_consensus"
-    assert target.get("audit", {}).get("reason") != (
-        "owned_month_token_cell_status_disagreement"
-    )
+    assert target.get("audit", {}).get("reason") != ("owned_month_token_cell_status_disagreement")
 
 
 def test_owned_token_conflict_quarantine_is_candidate_b_only(monkeypatch) -> None:
@@ -1840,9 +2050,7 @@ def test_owned_token_conflict_quarantine_is_candidate_b_only(monkeypatch) -> Non
 
     assert rows
     assert all(row["status"] == "M" for row in rows)
-    assert all(
-        row.get("recognition_source") == "cell_crop_consensus" for row in rows
-    )
+    assert all(row.get("recognition_source") == "cell_crop_consensus" for row in rows)
 
 
 def test_static_n_star_classifier_separates_canonical_glyph_shapes() -> None:
@@ -1851,9 +2059,7 @@ def test_static_n_star_classifier_separates_canonical_glyph_shapes() -> None:
 
     def rendered(glyph: str):
         image = np.full((80, 80, 3), 255, dtype=np.uint8)
-        (width, height), _baseline = cv2.getTextSize(
-            glyph, cv2.FONT_HERSHEY_DUPLEX, 0.72, 1
-        )
+        (width, height), _baseline = cv2.getTextSize(glyph, cv2.FONT_HERSHEY_DUPLEX, 0.72, 1)
         cv2.putText(
             image,
             glyph,
@@ -1864,9 +2070,7 @@ def test_static_n_star_classifier_separates_canonical_glyph_shapes() -> None:
             1,
             cv2.LINE_AA,
         )
-        return repayment_mod.extract_micro_cell_glyph_template(
-            image, (0, 0, 80, 80), page_width=80, page_height=80
-        )
+        return repayment_mod.extract_micro_cell_glyph_template(image, (0, 0, 80, 80), page_width=80, page_height=80)
 
     n_glyph = rendered("N")
     star_glyph = rendered("*")
@@ -1887,9 +2091,7 @@ def test_static_n_star_classifier_rejects_other_status_and_noise_glyphs() -> Non
 
     for glyph in "HMBAZGC1234567#+.X/":
         image = np.full((64, 64, 3), 255, dtype=np.uint8)
-        (width, height), _baseline = cv2.getTextSize(
-            glyph, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2
-        )
+        (width, height), _baseline = cv2.getTextSize(glyph, cv2.FONT_HERSHEY_DUPLEX, 0.9, 2)
         cv2.putText(
             image,
             glyph,
@@ -1929,9 +2131,7 @@ def test_static_status_validation_corrects_n_star_without_calling_ocr(monkeypatc
         {"content": "2024", "bbox": [75.0, 270.0, 112.0, 288.0], "confidence": 1.0},
     ]
     star_image = np.full((80, 80, 3), 255, dtype=np.uint8)
-    (star_width, star_height), _baseline = cv2.getTextSize(
-        "*", cv2.FONT_HERSHEY_DUPLEX, 0.72, 1
-    )
+    (star_width, star_height), _baseline = cv2.getTextSize("*", cv2.FONT_HERSHEY_DUPLEX, 0.72, 1)
     cv2.putText(
         star_image,
         "*",
@@ -2009,9 +2209,7 @@ def test_static_status_validation_reports_but_retains_row_evidence_when_image_is
         enable_static_status_validation=True,
     )
 
-    assert [(row["year"], row["month"], row["status"]) for row in out["repayment_records"]] == [
-        (2024, 1, "N")
-    ]
+    assert [(row["year"], row["month"], row["status"]) for row in out["repayment_records"]] == [(2024, 1, "N")]
     projected = records_from_micro_grid_dict(out["micro_grid"])
     assert len(projected) == 1
     assert projected[0]["status"] == "N"
@@ -2030,9 +2228,7 @@ def _rendered_status_template(glyph: str):
     import numpy as np
 
     image = np.full((80, 80, 3), 255, dtype=np.uint8)
-    (width, height), _baseline = cv2.getTextSize(
-        glyph, cv2.FONT_HERSHEY_DUPLEX, 0.72, 1
-    )
+    (width, height), _baseline = cv2.getTextSize(glyph, cv2.FONT_HERSHEY_DUPLEX, 0.72, 1)
     cv2.putText(
         image,
         glyph,
@@ -2043,9 +2239,7 @@ def _rendered_status_template(glyph: str):
         1,
         cv2.LINE_AA,
     )
-    return repayment_mod.extract_micro_cell_glyph_template(
-        image, (0, 0, 80, 80), page_width=80, page_height=80
-    )
+    return repayment_mod.extract_micro_cell_glyph_template(image, (0, 0, 80, 80), page_width=80, page_height=80)
 
 
 def _exact_year_status_lines(statuses: str, *, amount_text: str = "2024") -> list[dict]:
@@ -2165,9 +2359,7 @@ def test_static_grid_template_consensus_stops_on_classifier_contradiction(monkey
     assert all(row["status"] == "N" for row in rows[3:])
     assert all(row.get("extraction_status") == "review" for row in rows[3:])
     assert all(row["audit"]["reported_value_retained"] is True for row in rows[3:])
-    assert out["micro_grid"]["audit"]["static_status_validation"][
-        "contradicted_observed_symbols"
-    ] == ["N"]
+    assert out["micro_grid"]["audit"]["static_status_validation"]["contradicted_observed_symbols"] == ["N"]
 
 
 def test_static_grid_template_consensus_rejects_nonzero_amount_conflict(monkeypatch) -> None:
@@ -2186,9 +2378,7 @@ def test_static_grid_template_consensus_rejects_nonzero_amount_conflict(monkeypa
         enable_static_status_validation=True,
     )
 
-    assert out["micro_grid"]["audit"]["static_status_validation"][
-        "template_consensus_resolved"
-    ] == 0
+    assert out["micro_grid"]["audit"]["static_status_validation"]["template_consensus_resolved"] == 0
     assert not any(
         row.get("recognition_source") == "static_grid_template_consensus"
         for row in records_from_micro_grid_dict(out["micro_grid"])
@@ -2536,10 +2726,7 @@ def _continuation_source_table_geometry(
             }
             for index in range(13)
         ],
-        "row_bands": [
-            {"index": row, "y0": row_edges[row], "y1": row_edges[row + 1]}
-            for row in range(row_count)
-        ],
+        "row_bands": [{"index": row, "y0": row_edges[row], "y1": row_edges[row + 1]} for row in range(row_count)],
         "cell_bboxes": cell_bboxes,
         "cell_geometry_status": cell_geometry_status,
         "cell_spans": [
@@ -2619,9 +2806,7 @@ def _extract_source_owned_continuation(
         enable_cell_ocr=enable_cell_ocr,
         enable_candidate_b_amount_pairing=True,
         continuation_logical_pages=continuation_logical_pages,
-        source_table_geometry_by_page={
-            "2": [geometry or _continuation_source_table_geometry()]
-        },
+        source_table_geometry_by_page={"2": [geometry or _continuation_source_table_geometry()]},
     )
 
 
@@ -2709,23 +2894,23 @@ def test_candidate_b_visual_lattice_source_requirement_is_disjunctive() -> None:
 
 @pytest.mark.parametrize(
     ("page", "year", "status_by_month", "targets"),
+    (
         (
-            (
-                10,
-                2022,
-                {6: "N", 7: "C"},
-                ((6, "C"),),
-            ),
-            (10, 2020, {8: "N", 9: "M"}, ((8, "M"),)),
-            (17, 2020, {9: "N", 10: "Z"}, ((9, "Z"),)),
-            (18, 2019, {9: "N", 10: "G"}, ((9, "G"),)),
+            10,
+            2022,
+            {6: "N", 7: "C"},
+            ((6, "C"),),
         ),
-        ids=(
-            "p10_2022_june",
-            "p10_2020_august",
-            "p17_2020_september",
-            "p18_2019_september",
-        ),
+        (10, 2020, {8: "N", 9: "M"}, ((8, "M"),)),
+        (17, 2020, {9: "N", 10: "Z"}, ((9, "Z"),)),
+        (18, 2019, {9: "N", 10: "G"}, ((9, "G"),)),
+    ),
+    ids=(
+        "p10_2022_june",
+        "p10_2020_august",
+        "p17_2020_september",
+        "p18_2019_september",
+    ),
 )
 def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
     monkeypatch,
@@ -2760,11 +2945,7 @@ def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
     for month, formerly_shifted_value in targets:
         assert rows[month]["status"] == status_by_month[month]
         assert rows[month]["status"] != formerly_shifted_value
-        status_ref = next(
-            ref
-            for ref in rows[month]["source_cell_refs"]
-            if ref["field_name"] == "status"
-        )
+        status_ref = next(ref for ref in rows[month]["source_cell_refs"] if ref["field_name"] == "status")
         provenance = status_ref["geometry_provenance"]
         assert status_ref["col"] == month
         assert status_ref["bbox"] == [
@@ -2775,17 +2956,13 @@ def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
         ]
         assert provenance["source"] == "source_table_geometry"
         assert provenance["table_id"] == f"pt_{page}_0"
-        assert provenance["source_table_comparison"] == (
-            "source_over_ambiguous_visual"
-        )
+        assert provenance["source_table_comparison"] == ("source_over_ambiguous_visual")
         assert provenance["visual_owned_month_rule_hits"] == 12
         assert provenance["visual_residual_shift_months"] == 0.52
         assert provenance["corroborated_by_source_table_geometry"] is False
         assert provenance["ambiguous_visual_geometry_superseded"] is True
         assert provenance["value_inputs_used"] is False
-    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][
-        str(page)
-    ]
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][str(page)]
     assert audit["reason"] == "exact_source_table_month_lattice_calibration"
     assert audit["source_table_comparison"] == "source_over_ambiguous_visual"
     assert audit["corroborated_by_source_table_geometry"] is False
@@ -2806,12 +2983,7 @@ def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
 
     overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
     corrected = overlay.correct_business_candidates(
-        {
-            "repayment_records": [
-                {**row, "account_id": "credit_account:test"}
-                for row in rows.values()
-            ]
-        },
+        {"repayment_records": [{**row, "account_id": "credit_account:test"} for row in rows.values()]},
         stage="candidate_b_final_validation",
     )
     corrected["personal_detail_extraction_issues"] = collect_extraction_issues(
@@ -2825,13 +2997,11 @@ def test_candidate_b_base_source_lattice_repairs_plus_one_month_visual_shift(
     for month, _formerly_shifted_value in targets:
         target_record_id = f"mg_p{page}_repayment_0:{year:04d}-{month:02d}"
         assert any(
-            row.get("monthly_performance_id") == target_record_id
-            and row.get("status_code") == status_by_month[month]
+            row.get("monthly_performance_id") == target_record_id and row.get("status_code") == status_by_month[month]
             for row in projected["credit_account_monthly_performance"]
         ), target_record_id
         assert not any(
-            issue.get("target_dataset")
-            == "credit_account_monthly_performance"
+            issue.get("target_dataset") == "credit_account_monthly_performance"
             and issue.get("target_record_id") == target_record_id
             and issue.get("field_name") == "status_code"
             and issue.get("issue_code")
@@ -2864,9 +3034,7 @@ def test_candidate_b_independently_exact_visual_source_disagreement_still_blocks
         page_width=320,
         page_height=100,
         enable_candidate_b_amount_pairing=True,
-        source_table_geometry_by_page={
-            str(page): [_base_source_geometry(page=page)]
-        },
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
     )
     rows = {
         row["month"]: row
@@ -2877,11 +3045,7 @@ def test_candidate_b_independently_exact_visual_source_disagreement_still_blocks
     }
 
     assert rows[6]["status"] == "unknown"
-    status_ref = next(
-        ref
-        for ref in rows[6]["source_cell_refs"]
-        if ref["field_name"] == "status"
-    )
+    status_ref = next(ref for ref in rows[6]["source_cell_refs"] if ref["field_name"] == "status")
     assert status_ref["geometry_rejection"] == {
         "source": "rejected_month_geometry",
         "reason": "source_table_month_geometry_plane_conflict",
@@ -2890,6 +3054,297 @@ def test_candidate_b_independently_exact_visual_source_disagreement_still_blocks
         "logical_page": 10,
         "value_inputs_used": False,
     }
+
+
+@pytest.mark.parametrize(
+    "exact_source",
+    (
+        "exact_native_source_table_status_cell",
+        "exact_corrected_source_table_status_cell",
+    ),
+)
+def test_candidate_b_exact_cell_atoms_resolve_visual_source_disagreement(
+    monkeypatch,
+    exact_source: str,
+) -> None:
+    """A third exact plane authorizes only its independently owned cells."""
+
+    page = 12
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: _owned_visual_cols(
+            shift=20.0,
+            owned_rule_hits=13,
+            residual_shift_months=0.1,
+        ),
+    )
+    tokens = [
+        {
+            "token_id": f"exact_status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": exact_source,
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 13)
+    ]
+
+    extracted = extract_credit_repayment_records(
+        _source_owned_base_lines(year=2023, status_text="N" * 12),
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert len(rows) == 12
+    assert all(row["status"] == "N" for row in rows)
+    assert all(row["overdue_amount"] == "0" for row in rows)
+    for row in rows:
+        status_ref = next(ref for ref in row["source_cell_refs"] if ref["field_name"] == "status")
+        proof = status_ref["geometry_provenance"]
+        assert proof["source_table_comparison"] == ("source_over_conflicting_visual_exact_cell_atoms")
+        assert proof["conflicting_visual_geometry_superseded"] is True
+        assert proof["exact_source_atom_geometry_months"] == list(range(1, 13))
+
+
+def test_candidate_b_exact_atoms_are_fill_only_for_valid_corrected_cells(
+    monkeypatch,
+) -> None:
+    """Native atoms authorize geometry but cannot overwrite corrected fields."""
+
+    page = 12
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: _owned_visual_cols(
+            shift=20.0,
+            owned_rule_hits=13,
+            residual_shift_months=0.1,
+        ),
+    )
+    lines = _source_owned_base_lines(year=2024, status_text="MCN" + "N" * 9)
+    lines[0]["content"] = "2024年01月-2024年03月的还款记录"
+    tokens = [
+        {
+            "token_id": f"exact_status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "exact_native_source_table_status_cell",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 4)
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert [(row["month"], row["status"]) for row in rows] == [
+        (1, "M"),
+        (2, "C"),
+        (3, "N"),
+    ]
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][str(page)]
+    assert audit["source_table_comparison"] == (
+        "source_over_conflicting_visual_exact_cell_atoms"
+    )
+    assert audit["exact_source_atom_geometry_months"] == [1, 2, 3]
+
+
+def test_candidate_b_exact_atom_preserves_corrected_status_and_agreed_amount(
+    monkeypatch,
+) -> None:
+    """A native/corrected status conflict remains field-level downstream."""
+
+    page = 19
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: _owned_visual_cols(
+            shift=0.0,
+            owned_rule_hits=13,
+            residual_shift_months=0.1,
+        ),
+    )
+    lines = _source_owned_base_lines(
+        year=2022,
+        status_text="N" * 7 + "M" + "N" * 4,
+    )
+    exact_native = {
+        "token_id": "exact_status_8",
+        "content": "N",
+        "bbox": [184.0, 28.0, 196.0, 36.0],
+        "confidence": 0.99,
+        "source": "exact_native_source_table_status_cell",
+        "coordinate_system": "pdf_points_top_left",
+    }
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=[exact_native],
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    august = next(row for row in rows if row["month"] == 8)
+
+    assert august["status"] == "M"
+    assert august["overdue_amount"] == "0"
+
+
+def test_candidate_b_partial_exact_atom_override_does_not_address_siblings(
+    monkeypatch,
+) -> None:
+    """Partial third-plane proof remains field-local through amount pairing."""
+
+    page = 12
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: _owned_visual_cols(
+            shift=20.0,
+            owned_rule_hits=13,
+            residual_shift_months=0.1,
+        ),
+    )
+    lines = _source_owned_base_lines(
+        year=2023,
+        status_text="N N N N 福 N N N N N N N",
+    )
+    lines[-1] = {
+        "content": "0",
+        "bbox": [124.0, 44.0, 136.0, 49.0],
+        "confidence": 1.0,
+    }
+    tokens = [
+        {
+            "token_id": "exact_status_5",
+            "content": "N",
+            "bbox": [124.0, 28.0, 136.0, 36.0],
+            "confidence": 0.99,
+            "source": "exact_native_source_table_status_cell",
+            "coordinate_system": "pdf_points_top_left",
+        }
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+
+    pairing = extracted["micro_grid"]["audit"]["candidate_b_amount_pairing"]["2023"]
+    assert pairing["cell_status_by_month"]["5"] == "exact"
+    assert pairing["cell_status_by_month"]["4"] == "month_geometry_unowned"
+    assert pairing["cell_status_by_month"]["6"] == "month_geometry_unowned"
+    assert pairing["unowned_geometry_months"] == [
+        month for month in range(1, 13) if month != 5
+    ]
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][str(page)]
+    assert audit["source_table_comparison"] == (
+        "source_over_conflicting_visual_exact_cell_atoms"
+    )
+    assert audit["exact_source_atom_geometry_months"] == [5]
+
+
+@pytest.mark.parametrize(
+    ("visual", "expected_comparison"),
+    (
+        (_owned_visual_cols(shift=0.0, owned_rule_hits=13, residual_shift_months=0.1), "agree"),
+        (_owned_visual_cols(shift=20.0), "source_over_ambiguous_visual"),
+    ),
+    ids=("complete_planes_agree", "visual_plane_is_ambiguous"),
+)
+def test_candidate_b_partial_repair_atoms_do_not_narrow_complete_source_plane(
+    monkeypatch,
+    visual: tuple[list[dict], dict],
+    expected_comparison: str,
+) -> None:
+    """Field atoms repair values; complete-plane arbitration owns geometry."""
+
+    page = 12
+    monkeypatch.setattr(
+        repayment_mod,
+        "_visual_month_col_bands",
+        lambda *_args, **_kwargs: visual,
+    )
+    lines = _source_owned_base_lines(
+        year=2023,
+        status_text="N N N N 福 N N N N N N N",
+    )
+    lines[-1] = {
+        "content": "0",
+        "bbox": [124.0, 44.0, 136.0, 49.0],
+        "confidence": 1.0,
+    }
+    tokens = [
+        {
+            "token_id": "exact_status_5",
+            "content": "N",
+            "bbox": [124.0, 28.0, 136.0, 36.0],
+            "confidence": 0.99,
+            "source": "exact_native_source_table_status_cell",
+            "coordinate_system": "pdf_points_top_left",
+        }
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+
+    pairing = extracted["micro_grid"]["audit"]["candidate_b_amount_pairing"]["2023"]
+    assert pairing["cell_status_by_month"]["5"] == "exact"
+    assert pairing["cell_status_by_month"]["4"] == "blank_amount_cell"
+    assert "unowned_geometry_months" not in pairing
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][str(page)]
+    assert audit["source_table_comparison"] == expected_comparison
+    assert audit["exact_source_atom_geometry_months"] == []
 
 
 def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
@@ -2922,11 +3377,7 @@ def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
     assert rows[6]["status"] == "N"
     assert rows[8]["status"] == "N"
     for month in (6, 8):
-        status_ref = next(
-            ref
-            for ref in rows[month]["source_cell_refs"]
-            if ref["field_name"] == "status"
-        )
+        status_ref = next(ref for ref in rows[month]["source_cell_refs"] if ref["field_name"] == "status")
         provenance = status_ref["geometry_provenance"]
         assert status_ref["col"] == month
         assert status_ref["bbox"] == [
@@ -2935,9 +3386,7 @@ def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
             40.0 + month * 20.0,
             40.0,
         ]
-        assert provenance["selection_basis"] == (
-            "source_table_year_plus_twelve_ownership"
-        )
+        assert provenance["selection_basis"] == ("source_table_year_plus_twelve_ownership")
         assert provenance["source_table_comparison"] == "agree"
         assert provenance["calibrated_from_source_table_geometry"] is True
         assert provenance["corroborated_by_source_table_geometry"] is True
@@ -2945,21 +3394,14 @@ def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
         assert provenance["visual_owned_month_rule_hits"] == 12
         assert provenance["visual_residual_shift_months"] == 0.52
         assert provenance["value_inputs_used"] is False
-    assert "PRIVATE_SOURCE_VALUE" not in json.dumps(
-        extracted["micro_grid"], ensure_ascii=False
-    )
+    assert "PRIVATE_SOURCE_VALUE" not in json.dumps(extracted["micro_grid"], ensure_ascii=False)
 
     from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
         project_personal_detail_datasets,
     )
 
     projected = project_personal_detail_datasets(
-        {
-            "repayment_records": [
-                {**row, "account_id": "credit_account:test"}
-                for row in rows.values()
-            ]
-        }
+        {"repayment_records": [{**row, "account_id": "credit_account:test"} for row in rows.values()]}
     )["credit_account_monthly_performance"]
     assert len(projected) == 12
     for projected_row in projected:
@@ -2968,9 +3410,7 @@ def test_candidate_b_base_source_lattice_calibrates_agreement_and_exposes_proof(
             assert ref["col"] == month
             assert ref["bbox"][0] == 40.0 + (month - 1) * 20.0
             assert ref["bbox"][2] == 40.0 + month * 20.0
-            assert ref["geometry_provenance"]["selection_basis"] == (
-                "source_table_year_plus_twelve_ownership"
-            )
+            assert ref["geometry_provenance"]["selection_basis"] == ("source_table_year_plus_twelve_ownership")
             assert ref["geometry_provenance"]["value_inputs_used"] is False
 
 
@@ -2996,9 +3436,7 @@ def test_candidate_b_underdetermined_owned_visual_lattice_without_source_fails_c
     )
 
     assert all(row["status"] == "unknown" for row in rows)
-    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"][
-        "10"
-    ]
+    audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["10"]
     assert audit["reason"] == "source_table_month_ownership_required"
     assert audit["visual_owned_month_rule_hits"] == 12
     assert audit["visual_residual_shift_months"] == 0.52
@@ -3051,9 +3489,7 @@ def test_candidate_b_headerless_continuation_uses_exact_source_table_geometry() 
             40.0 + month * 20.0,
             45.0,
         ]
-        assert refs["status"]["geometry_provenance"]["selection_basis"] == (
-            "source_table_year_plus_twelve_ownership"
-        )
+        assert refs["status"]["geometry_provenance"]["selection_basis"] == ("source_table_year_plus_twelve_ownership")
         assert refs["status"]["geometry_provenance"]["value_inputs_used"] is False
     audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"]
     assert audit["table_id"] == "pt_2_0"
@@ -3079,9 +3515,7 @@ def test_candidate_b_continuation_uses_boundary_straddling_year_singletons() -> 
     )
     lines = [dict(line) for line in _source_owned_continuation_lines()]
     continuation_year = next(
-        line
-        for line in lines
-        if line.get("source_logical_page") == 2 and line.get("content") == "2019"
+        line for line in lines if line.get("source_logical_page") == 2 and line.get("content") == "2019"
     )
     # In local continuation coordinates this is y=23..32, crossing the exact
     # singleton boundary at y=27 with material glyph support on both sides.
@@ -3107,9 +3541,7 @@ def test_candidate_b_continuation_uses_boundary_straddling_year_singletons() -> 
         assert refs["status"]["col"] == month
         assert refs["overdue_amount"]["col"] == month
     audit = extracted["micro_grid"]["audit"]["visual_month_geometry_by_page"]["2"]
-    assert audit["year_anchor_mode"] == (
-        "boundary_straddling_singleton_year_cells"
-    )
+    assert audit["year_anchor_mode"] == ("boundary_straddling_singleton_year_cells")
     assert audit["table_id"] == "pt_2_0"
     assert audit["value_inputs_used"] is False
 
@@ -3155,8 +3587,7 @@ def test_candidate_b_three_row_continuation_keeps_adjacent_month_columns_distinc
     continuation_status = next(
         line
         for line in lines
-        if line.get("source_logical_page") == 2
-        and line.get("bbox") == [120.0, 115.0, 280.0, 122.0]
+        if line.get("source_logical_page") == 2 and line.get("bbox") == [120.0, 115.0, 280.0, 122.0]
     )
     # The source table supplies geometry only.  Even when the status content is
     # identical, August and September must retain their own physical columns;
@@ -3172,16 +3603,8 @@ def test_candidate_b_three_row_continuation_keeps_adjacent_month_columns_distinc
 
     assert continuation[8]["status"] == "*"
     assert continuation[9]["status"] == "*"
-    assert {
-        ref["col"]
-        for ref in continuation[8]["source_cell_refs"]
-        if ref["field_name"] == "status"
-    } == {8}
-    assert {
-        ref["col"]
-        for ref in continuation[9]["source_cell_refs"]
-        if ref["field_name"] == "status"
-    } == {9}
+    assert {ref["col"] for ref in continuation[8]["source_cell_refs"] if ref["field_name"] == "status"} == {8}
+    assert {ref["col"] for ref in continuation[9]["source_cell_refs"] if ref["field_name"] == "status"} == {9}
     assert all(
         ref["geometry_provenance"]["value_inputs_used"] is False
         for month in (8, 9)
@@ -3257,9 +3680,7 @@ def test_candidate_b_source_geometry_preserves_local_cell_conflict(monkeypatch) 
     assert continuation[8]["status"] == "unknown"
     assert continuation[8]["extraction_status"] == "review"
     assert continuation[8]["audit"]["reason"] == "exact_row_cell_status_disagreement"
-    assert all(
-        row["status"] == "N" for month, row in continuation.items() if month != 8
-    )
+    assert all(row["status"] == "N" for month, row in continuation.items() if month != 8)
 
 
 def test_candidate_b_source_geometry_supersedes_high_residual_visual_lattice() -> None:
@@ -3276,8 +3697,7 @@ def test_candidate_b_source_geometry_supersedes_high_residual_visual_lattice() -
                 **line,
                 "bbox": (
                     [55.0, line["bbox"][1], 295.0, line["bbox"][3]]
-                    if line.get("source_logical_page") == 2
-                    and str(line.get("content") or "").startswith("N")
+                    if line.get("source_logical_page") == 2 and str(line.get("content") or "").startswith("N")
                     else line["bbox"]
                 ),
             }
@@ -3346,9 +3766,7 @@ def test_candidate_b_visual_source_geometry_allows_sub_cell_calibration_drift() 
             for month in range(1, 13)
         ]
 
-    assert repayment_mod._month_geometry_planes_agree(
-        month_cols(visual_edges), month_cols(source_edges)
-    )
+    assert repayment_mod._month_geometry_planes_agree(month_cols(visual_edges), month_cols(source_edges))
     assert not repayment_mod._month_geometry_planes_agree(
         month_cols(visual_edges),
         month_cols([edge + 13.5 for edge in source_edges]),
@@ -3370,9 +3788,7 @@ def test_candidate_b_visual_source_geometry_allows_sub_cell_calibration_drift() 
 
 def test_candidate_b_bundle_augmentation_plumbs_detached_continuation_geometry() -> None:
     joined_lines = _source_owned_continuation_lines()
-    base_lines = [
-        line for line in joined_lines if line.get("source_logical_page") == 1
-    ]
+    base_lines = [line for line in joined_lines if line.get("source_logical_page") == 1]
     continuation_lines = [
         {
             **line,
@@ -3416,13 +3832,11 @@ def test_candidate_b_bundle_augmentation_plumbs_detached_continuation_geometry()
     )
 
     augment_credit_repayment_evidence_bundles(domain_specific)
-    first_evidence = domain_specific["_page_evidence_bundles"][0][
-        "micro_grid_evidence"
-    ]
+    first_evidence = domain_specific["_page_evidence_bundles"][0]["micro_grid_evidence"]
     copied = first_evidence["continuation_source_table_geometry_by_page"]["2"]
-    domain_specific["_page_evidence_bundles"][1]["micro_grid_evidence"][
-        "source_table_geometry"
-    ][0]["table_id"] = "mutated_after_augmentation"
+    domain_specific["_page_evidence_bundles"][1]["micro_grid_evidence"]["source_table_geometry"][0]["table_id"] = (
+        "mutated_after_augmentation"
+    )
 
     assert first_evidence["continuation_logical_pages"] == [2]
     assert copied[0]["table_id"] == "pt_2_0"
@@ -3443,6 +3857,93 @@ def test_candidate_b_bundle_augmentation_plumbs_detached_continuation_geometry()
 
     assert len(continuation) == 12
     assert all(row["status"] == "N" for row in continuation)
+
+
+def test_candidate_b_bundle_augmentation_shifts_continuation_word_tokens() -> None:
+    joined_lines = _source_owned_continuation_lines()
+    base_lines = [line for line in joined_lines if line.get("source_logical_page") == 1]
+    continuation_lines = [
+        {
+            **line,
+            "content": ("N N 福 N 限" if str(line.get("content") or "") == "N" * 12 else line["content"]),
+            "bbox": [
+                line["bbox"][0],
+                line["bbox"][1] - 100.0,
+                line["bbox"][2],
+                line["bbox"][3] - 100.0,
+            ],
+        }
+        for line in joined_lines
+        if line.get("source_logical_page") == 2
+    ]
+    continuation_tokens = [
+        {
+            "token_id": f"continuation_status_{month}",
+            "content": "N",
+            "bbox": [
+                24.0 + month * 20.0,
+                12.0,
+                36.0 + month * 20.0,
+                20.0,
+            ],
+            "confidence": 0.99,
+            "source": "rapidocr_word",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 13)
+    ]
+    domain_specific = domain_specific_with_page_bundles(
+        page_evidence_bundle(
+            1,
+            page_width=320,
+            page_height=100,
+            micro_grid_evidence={
+                "page": 1,
+                "page_width": 320,
+                "page_height": 100,
+                "lines": base_lines,
+                "tokens": base_lines,
+            },
+        ),
+        page_evidence_bundle(
+            2,
+            page_width=320,
+            page_height=100,
+            micro_grid_evidence={
+                "page": 2,
+                "page_width": 320,
+                "page_height": 100,
+                "lines": continuation_lines,
+                "tokens": continuation_tokens,
+                "source_table_geometry": [_continuation_source_table_geometry()],
+            },
+        ),
+    )
+
+    augment_credit_repayment_evidence_bundles(domain_specific)
+    first_evidence = domain_specific["_page_evidence_bundles"][0]["micro_grid_evidence"]
+    shifted_tokens = [token for token in first_evidence["tokens"] if token.get("source_logical_page") == 2]
+
+    assert len(shifted_tokens) == 12
+    assert all(token["coordinate_status"] == "cross_page_y_shift" for token in shifted_tokens)
+    assert all(token["bbox"][1] >= 100.0 for token in shifted_tokens)
+
+    materialize_credit_repayment_micro_grids_from_bundles(
+        domain_specific,
+        enable_candidate_b_amount_pairing=True,
+    )
+    rows = [
+        row
+        for grid in micro_grid_structures_from_bundles(domain_specific)
+        for row in records_from_micro_grid_dict(
+            grid,
+            accept_exact_row_numeric_status=True,
+        )
+        if row["year"] == 2019
+    ]
+
+    assert len(rows) == 12
+    assert all(row["status"] == "N" for row in rows)
 
 
 def test_candidate_b_bundle_materializer_plumbs_base_source_geometry() -> None:
@@ -3477,9 +3978,667 @@ def test_candidate_b_bundle_materializer_plumbs_base_source_geometry() -> None:
     assert len(rows) == 12
     assert all(row["status"] == "N" for row in rows)
     assert all(
-        ref["geometry_provenance"]["selection_basis"]
-        == "source_table_year_plus_twelve_ownership"
+        ref["geometry_provenance"]["selection_basis"] == "source_table_year_plus_twelve_ownership"
         for row in rows
         for ref in row["source_cell_refs"]
     )
     assert "PRIVATE_SOURCE_VALUE" not in json.dumps(grid, ensure_ascii=False)
+
+
+def _noisy_active_quarter_source_fixture() -> tuple[list[dict], list[dict]]:
+    lines = [
+        {
+            "content": "2019\u5e7404\u6708-2024\u5e7403\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55",
+            "bbox": [80.0, 5.0, 260.0, 10.0],
+            "confidence": 1.0,
+        },
+        {
+            "content": "1 2 3 4 5 6 7 8 9 10 11 12",
+            "bbox": [40.0, 15.0, 280.0, 20.0],
+            "confidence": 1.0,
+        },
+        {
+            # Representative p17/p18 line: one unrelated glyph makes the
+            # merged OCR row unusable, and an out-of-range numeric glyph must
+            # not contaminate the active January-March cells.
+            "content": "N N \u798f N \u9650 2",
+            "bbox": [40.0, 28.0, 240.0, 36.0],
+            "confidence": 0.55,
+        },
+        {"content": "2024", "bbox": [20.0, 37.0, 38.0, 42.0], "confidence": 1.0},
+        {"content": "0 0 0", "bbox": [40.0, 44.0, 100.0, 49.0], "confidence": 1.0},
+    ]
+    tokens = [
+        {
+            "token_id": f"status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "rapidocr_word",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 4)
+    ]
+    tokens.extend(
+        [
+            {
+                "token_id": "status_noise_month_3",
+                "content": "\u798f",
+                "bbox": [82.0, 28.0, 87.0, 36.0],
+                "confidence": 0.35,
+                "source": "rapidocr_word",
+                "coordinate_system": "pdf_points_top_left",
+            },
+            {
+                "token_id": "inactive_numeric_noise",
+                "content": "2",
+                "bbox": [224.0, 28.0, 236.0, 36.0],
+                "confidence": 0.45,
+                "source": "rapidocr_word",
+                "coordinate_system": "pdf_points_top_left",
+            },
+        ]
+    )
+    return lines, tokens
+
+
+def test_candidate_b_noisy_active_quarter_recovers_only_exact_source_owned_n_zero_cells() -> None:
+    page = 17
+    lines, tokens = _noisy_active_quarter_source_fixture()
+    geometry = _base_source_geometry(page=page)
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [geometry]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    rows = [row for row in rows if row["year"] == 2024]
+
+    assert [(row["year"], row["month"]) for row in rows] == [
+        (2024, 1),
+        (2024, 2),
+        (2024, 3),
+    ]
+    assert all(row["status"] == "N" for row in rows)
+    assert all(row["overdue_amount"] == "0" for row in rows)
+    assert all(row["audit"]["row_repair"] == "exact_active_source_lattice_token_ownership" for row in rows)
+    for row in rows:
+        refs = {ref["field_name"]: ref for ref in row["source_cell_refs"]}
+        assert set(refs) == {"status", "overdue_amount"}
+        assert refs["status"]["col"] == row["month"]
+        assert refs["overdue_amount"]["col"] == row["month"]
+        assert all(ref["geometry_scope"] == "cell" for ref in refs.values())
+        assert all(
+            ref["geometry_provenance"]["selection_basis"] == "source_table_year_plus_twelve_ownership"
+            for ref in refs.values()
+        )
+        assert all(ref["geometry_provenance"]["value_inputs_used"] is False for ref in refs.values())
+    assert "PRIVATE_SOURCE_VALUE" not in json.dumps(
+        extracted["micro_grid"],
+        ensure_ascii=False,
+    )
+
+
+def test_candidate_b_incomplete_status_line_does_not_block_exact_source_owned_tokens() -> None:
+    """A partial line candidate must not mask a complete exact token row.
+
+    Real scanned reports can expose one isolated status as a usable OCR line
+    while retaining all twelve independently positioned word tokens.  The
+    value-free source lattice proves each token's month; the incomplete line
+    is weaker evidence and must not disable that deterministic repair.
+    """
+
+    page = 19
+    lines = _source_owned_base_lines(year=2023, status_text="N")
+    tokens = [
+        {
+            "token_id": f"status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "rapidocr_word",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 13)
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert len(rows) == 12
+    assert all(row["status"] == "N" for row in rows)
+    assert all(row["overdue_amount"] == "0" for row in rows)
+    assert all(row["audit"]["row_repair"] == "exact_active_source_lattice_token_ownership" for row in rows)
+
+
+def test_candidate_b_exact_status_atom_survives_same_value_line_duplicate() -> None:
+    """A canonical duplicate must not degrade its identical immutable atom."""
+
+    page = 19
+    lines = _source_owned_base_lines(year=2023, status_text="N" * 12)
+    tokens = []
+    for month in range(1, 13):
+        bbox = [
+            44.0 + (month - 1) * 20.0,
+            28.0,
+            56.0 + (month - 1) * 20.0,
+            36.0,
+        ]
+        tokens.extend(
+            [
+                {
+                    "token_id": f"canonical_status_{month}",
+                    "content": "N",
+                    "bbox": bbox,
+                    "confidence": 0.91,
+                    "source": "canonical_page_line",
+                    "coordinate_system": "pdf_points_top_left",
+                },
+                {
+                    "token_id": f"exact_status_{month}",
+                    "content": "N",
+                    "bbox": bbox,
+                    "confidence": 0.99,
+                    "source": "exact_native_source_table_status_cell",
+                    "coordinate_system": "pdf_points_top_left",
+                },
+            ]
+        )
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert len(rows) == 12
+    assert all(row["status"] == "N" for row in rows)
+    assert all(row["overdue_amount"] == "0" for row in rows)
+    assert all(row["audit"]["row_repair"] == "exact_active_source_lattice_token_ownership" for row in rows)
+
+
+@pytest.mark.parametrize(
+    "exact_amount_source",
+    (
+        "exact_native_source_table_amount_cell",
+        "exact_corrected_source_table_amount_cell",
+    ),
+)
+def test_candidate_b_exact_zero_atoms_fill_only_missing_amount_cells(
+    exact_amount_source: str,
+) -> None:
+    page = 17
+    lines, status_tokens = _noisy_active_quarter_source_fixture()
+    lines = [line for line in lines if line["content"] != "0 0 0"]
+    for token in status_tokens:
+        if token["token_id"].startswith("status_"):
+            token["source"] = "exact_native_source_table_status_cell"
+    zero_tokens = [
+        {
+            "token_id": f"exact_amount_{month}",
+            "content": "0",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                43.0,
+                56.0 + (month - 1) * 20.0,
+                49.0,
+            ],
+            "confidence": 0.99,
+            "source": exact_amount_source,
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 4)
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=[*status_tokens, *zero_tokens],
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    rows = [row for row in rows if row["year"] == 2024]
+
+    assert [(row["month"], row["status"], row["overdue_amount"]) for row in rows] == [
+        (1, "N", "0"),
+        (2, "N", "0"),
+        (3, "N", "0"),
+    ]
+    assert extracted["micro_grid"]["audit"]["candidate_b_amount_pairing"]["2024"]["exact_source_zero_months"] == [
+        1,
+        2,
+        3,
+    ]
+    amount_cells = [
+        cell
+        for row in extracted["micro_grid"]["cells"]
+        for cell in row
+        if cell["role"] == "overdue_amount" and cell["col_index"] in {1, 2, 3}
+    ]
+    assert all(cell["recognition_source"] == "exact_source_zero_cell" for cell in amount_cells)
+
+
+def test_candidate_b_exact_zero_atom_does_not_override_exact_nonzero_amount() -> None:
+    page = 17
+    lines, status_tokens = _noisy_active_quarter_source_fixture()
+    next(line for line in lines if line["content"] == "0 0 0")["content"] = "50 0 0"
+    for token in status_tokens:
+        if token["token_id"].startswith("status_"):
+            token["source"] = "exact_native_source_table_status_cell"
+    zero_token = {
+        "token_id": "contradicting_exact_zero",
+        "content": "0",
+        "bbox": [44.0, 43.0, 56.0, 49.0],
+        "confidence": 0.99,
+        "source": "exact_native_source_table_amount_cell",
+        "coordinate_system": "pdf_points_top_left",
+    }
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=[*status_tokens, zero_token],
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    row = next(
+        row
+        for row in records_from_micro_grid_dict(
+            extracted["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if row["year"] == 2024 and row["month"] == 1
+    )
+
+    assert row["overdue_amount"] == "50"
+    assert row["extraction_status"] == "review"
+    assert "exact_source_zero_months" not in extracted["micro_grid"]["audit"]["candidate_b_amount_pairing"]["2024"]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    (
+        "missing_source_geometry",
+        "competing_source_geometry",
+        "merged_token_only",
+    ),
+)
+def test_candidate_b_noisy_active_quarter_repair_fails_closed(
+    failure_mode: str,
+) -> None:
+    page = 17
+    lines, tokens = _noisy_active_quarter_source_fixture()
+    geometry = _base_source_geometry(page=page)
+    source_tables = [geometry]
+    if failure_mode == "missing_source_geometry":
+        source_tables = []
+    elif failure_mode == "competing_source_geometry":
+        duplicate = deepcopy(geometry)
+        duplicate["table_id"] = "pt_17_duplicate"
+        source_tables.append(duplicate)
+    else:
+        tokens = [
+            {
+                "token_id": "merged_noisy_status",
+                "content": "N N \u798f N",
+                "bbox": [40.0, 28.0, 100.0, 36.0],
+                "confidence": 0.55,
+                "source": "rapidocr_line",
+                "coordinate_system": "pdf_points_top_left",
+            }
+        ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): source_tables},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    rows = [row for row in rows if row["year"] == 2024]
+
+    assert [(row["year"], row["month"]) for row in rows] == [
+        (2024, 1),
+        (2024, 2),
+        (2024, 3),
+    ]
+    assert all(row["status"] == "unknown" for row in rows)
+    assert all(row["overdue_amount"] is None for row in rows)
+    assert all(row["extraction_status"] == "review" for row in rows)
+
+
+@pytest.mark.parametrize("failure_mode", ("missing_active_token", "duplicate_active_token"))
+def test_candidate_b_source_owned_status_repair_preserves_neighbor_consensus(
+    failure_mode: str,
+) -> None:
+    page = 17
+    lines, tokens = _noisy_active_quarter_source_fixture()
+    if failure_mode == "missing_active_token":
+        tokens = [token for token in tokens if token["token_id"] != "status_2"]
+    else:
+        duplicate_token = deepcopy(next(token for token in tokens if token["token_id"] == "status_2"))
+        duplicate_token["token_id"] = "status_2_duplicate"
+        tokens.append(duplicate_token)
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = {
+        row["month"]: row
+        for row in records_from_micro_grid_dict(
+            extracted["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if row["year"] == 2024
+    }
+
+    assert rows[1]["status"] == "N"
+    assert rows[3]["status"] == "N"
+    assert rows[2]["status"] == "N"
+    assert rows[2]["recognition_source"] == "row_neighbor_consensus"
+    assert rows[1]["audit"]["row_repair"] == ("exact_active_source_lattice_token_ownership")
+    assert rows[3]["audit"]["row_repair"] == ("exact_active_source_lattice_token_ownership")
+
+
+def test_candidate_b_source_owned_status_conflict_remains_field_local() -> None:
+    page = 17
+    lines, tokens = _noisy_active_quarter_source_fixture()
+    conflicting_token = deepcopy(next(token for token in tokens if token["token_id"] == "status_2"))
+    conflicting_token["token_id"] = "status_2_conflict"
+    conflicting_token["content"] = "C"
+    tokens.append(conflicting_token)
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = {
+        row["month"]: row
+        for row in records_from_micro_grid_dict(
+            extracted["micro_grid"],
+            accept_exact_row_numeric_status=True,
+        )
+        if row["year"] == 2024
+    }
+
+    assert rows[1]["status"] == "N"
+    assert rows[3]["status"] == "N"
+    assert rows[2]["status"] == "unknown"
+    assert rows[2]["extraction_status"] == "review"
+
+
+def test_candidate_b_noisy_full_year_repairs_missing_cell_by_neighbor_consensus() -> None:
+    page = 17
+    lines = _source_owned_base_lines(year=2023, status_text="NNNNNSNNNNNNN")
+    tokens = [
+        {
+            "token_id": f"status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "rapidocr_word",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 13)
+        if month != 6
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert len(rows) == 12
+    by_month = {row["month"]: row for row in rows}
+    assert all(row["status"] == "N" for row in by_month.values())
+    assert by_month[6]["recognition_source"] == "row_neighbor_consensus"
+
+
+def test_candidate_b_partial_status_band_disambiguates_singleton_year_boundary() -> None:
+    """A p17/p18-shaped partial status line must retain exact table ownership."""
+
+    page = 17
+    lines = [
+        {
+            "content": "2024\u5e7401\u6708-2024\u5e7403\u6708\u7684\u8fd8\u6b3e\u8bb0\u5f55",
+            "bbox": [80.0, 5.0, 260.0, 10.0],
+            "confidence": 1.0,
+        },
+        {
+            "content": "1 2 3 4 5 6 7 8 9 10 11 12",
+            "bbox": [40.0, 15.0, 280.0, 20.0],
+            "confidence": 1.0,
+        },
+        {"content": "NNN", "bbox": [40.0, 30.0, 100.0, 35.0], "confidence": 1.0},
+        {"content": "2024", "bbox": [20.0, 41.0, 38.0, 48.0], "confidence": 1.0},
+        {"content": "0 0 0", "bbox": [40.0, 44.0, 100.0, 49.0], "confidence": 1.0},
+    ]
+    geometry = _continuation_source_table_geometry(
+        table_id="pt_17_0",
+        logical_page=page,
+        row_edges=(25.0, 40.0, 52.0, 64.0),
+        status_row=0,
+        amount_row=1,
+        year_anchor_row=1,
+        year_row_span=1,
+        active_months=(1, 2, 3),
+    )
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [geometry]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert [(row["year"], row["month"]) for row in rows] == [
+        (2024, 1),
+        (2024, 2),
+        (2024, 3),
+    ]
+    assert all(row["status"] == "N" for row in rows)
+    assert all(row["overdue_amount"] == "0" for row in rows)
+    for row in rows:
+        refs = {ref["field_name"]: ref for ref in row["source_cell_refs"]}
+        assert refs["status"]["geometry_scope"] == "cell"
+        assert refs["status"]["col"] == row["month"]
+        assert refs["overdue_amount"]["col"] == row["month"]
+        assert refs["status"]["geometry_provenance"]["table_id"] == "pt_17_0"
+
+
+def test_candidate_b_repairs_exact_status_cells_without_requiring_whole_row_geometry() -> None:
+    """One merged source cell must not discard ten independent sibling cells."""
+
+    page = 19
+    lines = _source_owned_base_lines(
+        year=2023,
+        status_text="N N N N N 福 N N N N N N",
+    )
+    geometry = _base_source_geometry(page=page)
+    vertical_lines = geometry["vertical_lines"]
+    status_boxes = geometry["cell_bboxes"][0]
+    status_states = geometry["cell_geometry_status"][0]
+    status_boxes[6] = [
+        vertical_lines[6],
+        25.0,
+        vertical_lines[8],
+        40.0,
+    ]
+    status_boxes[7] = None
+    status_states[6] = "exact"
+    status_states[7] = "derived"
+    geometry["cell_spans"].append(
+        {
+            "row": 0,
+            "col": 6,
+            "row_span": 1,
+            "col_span": 2,
+            "bbox": status_boxes[6],
+        }
+    )
+    tokens = [
+        {
+            "token_id": f"status_{month}",
+            "content": "N",
+            "bbox": [
+                24.0 + month * 20.0,
+                28.0,
+                36.0 + month * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "exact_native_source_table_status_cell",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in (*range(1, 6), *range(8, 13))
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [geometry]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+    by_month = {row["month"]: row for row in rows if row["year"] == 2023}
+
+    assert set(by_month) == set(range(1, 13))
+    for month in (*range(1, 6), *range(8, 13)):
+        assert by_month[month]["status"] == "N"
+        assert by_month[month]["recognition_source"] == ("candidate_b_source_cell_repair")
+        [status_ref] = [ref for ref in by_month[month]["source_cell_refs"] if ref["field_name"] == "status"]
+        assert status_ref["geometry_scope"] == "cell"
+        assert status_ref["col"] == month
+    for month in (6, 7):
+        assert by_month[month]["status"] == "N"
+        assert by_month[month]["recognition_source"] == "row_neighbor_consensus"
+        [status_ref] = [ref for ref in by_month[month]["source_cell_refs"] if ref["field_name"] == "status"]
+        assert status_ref["geometry_scope"] == "logical_page"
+        assert status_ref["geometry_status"] == "unresolved"
+
+
+def test_candidate_b_partial_word_tokens_do_not_degrade_a_complete_clean_row() -> None:
+    page = 17
+    lines = _source_owned_base_lines(year=2023, status_text="N" * 12)
+    tokens = [
+        {
+            "token_id": f"status_{month}",
+            "content": "N",
+            "bbox": [
+                44.0 + (month - 1) * 20.0,
+                28.0,
+                56.0 + (month - 1) * 20.0,
+                36.0,
+            ],
+            "confidence": 0.99,
+            "source": "rapidocr_word",
+            "coordinate_system": "pdf_points_top_left",
+        }
+        for month in range(1, 13)
+        if month != 6
+    ]
+
+    extracted = extract_credit_repayment_records(
+        lines,
+        tokens=tokens,
+        page=page,
+        page_width=320,
+        page_height=100,
+        enable_candidate_b_amount_pairing=True,
+        source_table_geometry_by_page={str(page): [_base_source_geometry(page=page)]},
+    )
+    rows = records_from_micro_grid_dict(
+        extracted["micro_grid"],
+        accept_exact_row_numeric_status=True,
+    )
+
+    assert len(rows) == 12
+    assert all(row["status"] == "N" for row in rows)

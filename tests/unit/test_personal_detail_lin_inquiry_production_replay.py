@@ -808,15 +808,13 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
     }
     assert spec["expected"] == {
         "source_rows": 90,
-        "emitted_rows": 73,
+        "emitted_rows": 85,
         "target_repaired_rows": 87,
         "institution_endpoint": 89,
         "personal_endpoint": 1,
-        "omitted_institution_sequences": [
+        "omitted_institution_sequences": [4, 8, 9, 66, 67],
+        "field_unresolved_institution_sequences": [
             3,
-            4,
-            8,
-            9,
             25,
             26,
             40,
@@ -824,8 +822,6 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
             44,
             59,
             65,
-            66,
-            67,
             79,
             81,
             83,
@@ -863,9 +859,15 @@ def test_lin_replay_fixture_is_a_minimized_copy_of_fresh_audit_geometry() -> Non
     assert expected["target_repaired_rows"] == expected["source_rows"] - len(
         expected["target_final_omitted_institution_sequences"]
     )
-    assert set(expected["deferred_repair_sequences"]) == set(
+    assert set(expected["target_final_omitted_institution_sequences"]) < set(
         expected["omitted_institution_sequences"]
-    ) - set(expected["target_final_omitted_institution_sequences"])
+    )
+    assert set(expected["deferred_repair_sequences"]) == set(
+        expected["field_unresolved_institution_sequences"]
+    ) | (
+        set(expected["omitted_institution_sequences"])
+        - set(expected["target_final_omitted_institution_sequences"])
+    )
 
 
 def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
@@ -974,15 +976,21 @@ def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
         for issue in issues
     )
     missing_sequences = set(expected["omitted_institution_sequences"])
+    field_unresolved_sequences = set(
+        expected["field_unresolved_institution_sequences"]
+    )
     deferred_sequences = set(expected["deferred_repair_sequences"])
     final_omissions = set(
         expected["target_final_omitted_institution_sequences"]
     )
-    assert len(missing_sequences) == 17
+    assert len(missing_sequences) == 5
+    assert len(field_unresolved_sequences) == 12
     assert len(deferred_sequences) == 14
     assert len(final_omissions) == 3
     assert deferred_sequences.isdisjoint(final_omissions)
-    assert deferred_sequences | final_omissions == missing_sequences
+    assert deferred_sequences | final_omissions == (
+        missing_sequences | field_unresolved_sequences
+    )
 
     localized_by_sequence = {
         sequence: issue
@@ -994,11 +1002,13 @@ def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
         }
         and (
             sequence := _fixture_sequence_for_issue(issue, fixture_rows)
-        ) in missing_sequences
+        ) in (missing_sequences | field_unresolved_sequences)
     }
-    assert set(localized_by_sequence) == missing_sequences
+    assert set(localized_by_sequence) == (
+        missing_sequences | field_unresolved_sequences
+    )
 
-    deferred_date_repairs = deferred_sequences - {8, 9}
+    deferred_date_repairs = field_unresolved_sequences
     assert {
         sequence
         for sequence, issue in localized_by_sequence.items()
@@ -1010,8 +1020,15 @@ def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
         == fixture_rows[sequence]["values"]
         and localized_by_sequence[sequence].get("candidate_value")
         == {"missing_fields": ["inquiry_date"]}
-        and localized_by_sequence[sequence]["reason_codes"][-1]
-        == "record_not_invented"
+        and localized_by_sequence[sequence]["target_record_id"]
+        == next(
+            row["inquiry_id"]
+            for row in records
+            if row["inquiry_type"] == "institution"
+            and row["sequence"] == sequence
+        )
+        and localized_by_sequence[sequence]["reason_codes"][-2:]
+        == ["physical_record_identity_conserved", "field_local_value_withheld"]
         and len(
             [
                 ref
@@ -1025,7 +1042,7 @@ def test_lin_strict_discovery_localizes_repairs_without_guessing() -> None:
         for sequence in deferred_date_repairs
     )
 
-    unresolved_ordinal_sequences = {4, 8, 9, 66, 67}
+    unresolved_ordinal_sequences = missing_sequences
     assert unresolved_ordinal_sequences == ({8, 9} | final_omissions)
     assert {
         sequence
@@ -1240,18 +1257,17 @@ def test_lin_field_repair_policy_reaches_target_without_replacing_pages() -> Non
         for decision in plan.page_decisions
         if decision["ocr_invocations"] == 1
     )
+    date_repair_sequences = set(
+        expected["field_unresolved_institution_sequences"]
+    )
     for key, discovery in discovery_by_key.items():
         repaired = repaired_by_key[key]
-        assert {
-            field_name: repaired[field_name]
-            for field_name in ("inquiry_date", "institution", "reason")
-        } == {
-            field_name: discovery[field_name]
-            for field_name in ("inquiry_date", "institution", "reason")
-        }
+        assert repaired["institution"] == discovery["institution"]
+        assert repaired["reason"] == discovery["reason"]
+        if key[0] != "institution" or key[1] not in date_repair_sequences:
+            assert repaired["inquiry_date"] == discovery["inquiry_date"]
 
     deferred_sequences = set(expected["deferred_repair_sequences"])
-    date_repair_sequences = deferred_sequences.difference({8, 9})
     assert date_repair_sequences.issubset(repaired_by_sequence)
     assert {8, 9}.issubset(repaired_by_sequence)
     assert all(
@@ -1359,6 +1375,9 @@ def test_lin_strict_discovery_survives_source_and_public_projection() -> None:
         if isinstance(row, dict)
     ]
     missing_sequences = set(expected["omitted_institution_sequences"])
+    field_unresolved_sequences = set(
+        expected["field_unresolved_institution_sequences"]
+    )
     anonymous_missing_sequences = {4, 8, 9, 66, 67}
     exact_ordinal_missing_sequences = (
         missing_sequences - anonymous_missing_sequences
@@ -1383,6 +1402,32 @@ def test_lin_strict_discovery_survives_source_and_public_projection() -> None:
         and _fixture_sequence_for_issue(issue, fixture_rows)
         in exact_ordinal_missing_sequences
         for issue in canonical_omissions
+    )
+
+    field_local_issues = [
+        issue
+        for issue in public_issues
+        if issue.get("target_dataset") == "inquiries"
+        and issue.get("issue_code") == "candidate_b_inquiry_row_cells_unresolved"
+        and issue.get("field_name") == "inquiry_date"
+    ]
+    assert {
+        _fixture_sequence_for_issue(issue, fixture_rows)
+        for issue in field_local_issues
+    } == field_unresolved_sequences
+    public_institution_rows = {
+        row["sequence"]: row
+        for row in public_rows
+        if row["inquiry_type"] == "institution"
+    }
+    assert all(
+        issue["target_record_id"]
+        == public_institution_rows[sequence]["inquiry_id"]
+        and public_institution_rows[sequence]["inquiry_date"] is None
+        and issue["reason_code_count"] == 3
+        for issue in field_local_issues
+        if (sequence := _fixture_sequence_for_issue(issue, fixture_rows))
+        in field_unresolved_sequences
     )
 
     forbidden_row_omission_codes = {
@@ -1649,7 +1694,7 @@ def test_lin_producer_mutations_cannot_authorize_first_headerless_table(
         ("separate", None),
     ),
 )
-def test_lin_producer_requires_a_decidable_entity_table_relation(
+def test_lin_producer_exact_footer_schema_bridge_does_not_require_entity_relation(
     entity_mode: str,
     tables_continue: Any,
 ) -> None:
@@ -1665,7 +1710,12 @@ def test_lin_producer_requires_a_decidable_entity_table_relation(
         entity_mode=entity_mode,
         tables_continue=override,
     )[0]
-    assert not _has_projected_table(mutant, "pt_27_0")
+    assert _has_projected_table(mutant, "pt_27_0")
+    _page_owner, table = _projected_table(mutant, "pt_27_0")
+    owner = table.metadata["canonical_section_owner"]
+    assert owner["adjacency_proof"]["kind"] == (
+        "exact_printed_footer_schema_carry_bridge"
+    )
 
 
 def test_lin_producer_contains_tables_continue_exceptions() -> None:
@@ -1696,9 +1746,6 @@ def test_lin_producer_contains_tables_continue_exceptions() -> None:
         "source_page",
         "resolution_missing",
         "resolution_non_authoritative",
-        "entity_joined",
-        "entity_missing",
-        "tables_continue_none",
         "tables_continue_exception",
     ),
 )
@@ -1757,18 +1804,6 @@ def test_lin_consumer_replays_every_schema_bridge_seal(defect: str) -> None:
         context.reading_order_resolution = None
     elif defect == "resolution_non_authoritative":
         context.reading_order_resolution["authoritative"] = False
-    elif defect == "entity_joined":
-        context.entity_context = _entity_context(
-            context.pages,
-            mode="same_institution_entity",
-        )
-    elif defect == "entity_missing":
-        context.entity_context = _entity_context(
-            context.pages,
-            mode="missing_pt_27_0",
-        )
-    elif defect == "tables_continue_none":
-        context.tables_continue = lambda _left, _right: None
     elif defect == "tables_continue_exception":
         def broken_relation(_left: str, _right: str) -> bool:
             raise ValueError("adversarial entity relation failure")
@@ -1779,6 +1814,49 @@ def test_lin_consumer_replays_every_schema_bridge_seal(defect: str) -> None:
 
     assert canonical_inquiry_population_metadata(context, page, table) is None
     assert canonical_table_role(context, page, table) is None
+
+
+@pytest.mark.parametrize(
+    "relation_mode",
+    ("missing_entity_node", "undecidable_relation", "same_institution_entity"),
+)
+def test_lin_consumer_exact_footer_schema_bridge_does_not_require_entity_relation(
+    relation_mode: str,
+) -> None:
+    projection, evidence, topology, resolution, order, entities = (
+        _projection_case()
+    )
+    context = _consumer_context(
+        projection,
+        evidence,
+        topology,
+        resolution,
+        order,
+        entities,
+    )
+    page, table = _projected_table(projection, "pt_27_0")
+    expected_metadata = canonical_inquiry_population_metadata(context, page, table)
+    expected_role = canonical_table_role(context, page, table)
+    assert expected_metadata is not None
+    assert expected_role is not None
+
+    if relation_mode == "missing_entity_node":
+        context.entity_context = _entity_context(
+            context.pages,
+            mode="missing_pt_27_0",
+        )
+    elif relation_mode == "undecidable_relation":
+        context.tables_continue = lambda _left, _right: None
+    else:
+        context.entity_context = _entity_context(
+            context.pages,
+            mode="same_institution_entity",
+        )
+
+    assert canonical_inquiry_population_metadata(context, page, table) == (
+        expected_metadata
+    )
+    assert canonical_table_role(context, page, table) == expected_role
 
 
 @pytest.mark.parametrize(

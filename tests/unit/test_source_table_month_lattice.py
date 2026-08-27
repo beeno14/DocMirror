@@ -8,6 +8,7 @@ import pytest
 from docmirror.plugins.credit_report.source_table_month_lattice import (
     detached_source_table_geometry_by_page,
     resolve_unique_source_table_year_plus_twelve_ownership,
+    resolve_unique_source_table_year_plus_twelve_ownership_from_year,
 )
 
 
@@ -942,6 +943,41 @@ def test_resolver_rejects_ambiguous_shifted_and_non_exact_lattices() -> None:
         missing_horizontal_rule,
     ):
         assert resolve_unique_source_table_year_plus_twelve_ownership([invalid], **kwargs) is None
+
+
+def test_year_only_resolver_proves_one_value_free_lattice_before_status_repair() -> None:
+    table = _scanner_table()
+    table["raw_rows"] = [["2099", "PRIVATE_SOURCE_VALUE", "999999"]]
+
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+    )
+
+    assert lattice is not None
+    assert lattice.table_id == "pt_test_0"
+    assert lattice.month_bboxes[7] == (262.0, 163.0, 289.0, 176.0)
+    assert lattice.provenance_dict()["value_inputs_used"] is False
+
+
+def test_year_only_resolver_fails_closed_on_competing_lattice() -> None:
+    clean = _scanner_table()
+    duplicate = deepcopy(clean)
+    duplicate["table_id"] = "pt_test_duplicate"
+
+    assert (
+        resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+            [clean, duplicate],
+            logical_page=19,
+            expected_year=2022,
+            active_months=(8,),
+            year_bbox=[50.0, 164.0, 69.0, 187.0],
+        )
+        is None
+    )
 
 
 def test_resolver_malformed_public_arguments_fail_closed() -> None:

@@ -595,8 +595,20 @@ def _native_account_currency_value_slot(
                 or label_row >= value_row
                 or not coordinate_system
                 or not table_id
-                or not isinstance(evidence_ids, (list, tuple))
-                or any(str(value or "").strip() for value in evidence_ids)
+                # Blank native cells carry no OCR evidence.  The table-cell
+                # producer normally omits that empty list altogether, while
+                # hand-built envelopes may retain ``[]``.  Both encode the
+                # same absence; any populated or malformed value is rejected.
+                or (
+                    evidence_ids is not None
+                    and (
+                        not isinstance(evidence_ids, (list, tuple))
+                        or any(
+                            str(value or "").strip()
+                            for value in evidence_ids
+                        )
+                    )
+                )
             ):
                 continue
             ref["logical_page"] = logical_page
@@ -3766,10 +3778,71 @@ def _authenticated_source_monthly_closure(
     return frozenset(identities) if valid else frozenset()
 
 
+def _authenticated_source_monthly_position_count(
+    source: Mapping[str, list[dict[str, Any]]],
+) -> int | None:
+    """Authenticate the physical source-position denominator in the proof.
+
+    The identity digest remains the trust anchor.  Source-position counts are
+    accepted only from that same singleton proof and only when its owner-bound
+    and owner-unresolved ledgers close exactly.  Direct schema callers without
+    the internal proof retain identity-only completeness semantics.
+    """
+
+    identities = _strict_source_monthly_candidate_identities(
+        list(source.get("repayment_records") or ())
+    )
+    for raw_issue in source.get("personal_detail_extraction_issues") or ():
+        if not isinstance(raw_issue, Mapping):
+            continue
+        canonical_values = _extraction_issue(_normalized(dict(raw_issue)))
+        canonical_issue = _replace_normalized(dict(raw_issue), canonical_values)
+        identities.update(
+            _exact_localized_monthly_issue_identities(canonical_issue)
+        )
+    proof_rows = list(source.get(_MONTHLY_CLOSURE_PROOF_DATASET) or ())
+    if len(proof_rows) != 1 or not isinstance(proof_rows[0], Mapping):
+        return None
+    proof_record = dict(proof_rows[0])
+    proof = _normalized(proof_record)
+    expected_identity_count = proof.get("expected_identity_count")
+    source_position_count = proof.get("expected_source_position_count")
+    owner_bound = proof.get("owner_bound_source_position_count")
+    owner_unresolved = proof.get("owner_unresolved_source_position_count")
+    valid = bool(
+        str(proof_record.get("record_id") or proof.get("record_id") or "")
+        == "personal_detail_account_month_closure_proof:1"
+        and str(proof.get("schema") or "")
+        == "docmirror.pboc.account_month_closure_proof.v1"
+        and proof.get("identity_fields") == ["account_id", "performance_month"]
+        and str(proof.get("proof_basis") or "")
+        == "exact_source_account_month_identity_set"
+        and isinstance(expected_identity_count, int)
+        and not isinstance(expected_identity_count, bool)
+        and expected_identity_count == len(identities)
+        and re.fullmatch(r"[0-9a-f]{64}", str(proof.get("identity_sha256") or ""))
+        and str(proof.get("identity_sha256") or "")
+        == _monthly_identity_digest(identities)
+        and isinstance(source_position_count, int)
+        and not isinstance(source_position_count, bool)
+        and isinstance(owner_bound, int)
+        and not isinstance(owner_bound, bool)
+        and isinstance(owner_unresolved, int)
+        and not isinstance(owner_unresolved, bool)
+        and source_position_count >= len(identities)
+        and owner_bound >= 0
+        and owner_unresolved >= 0
+        and source_position_count == owner_bound + owner_unresolved
+        and proof.get("source_position_balance_valid") is True
+    )
+    return int(source_position_count) if valid else None
+
+
 def _canonical_quality_gate(
     projected: dict[str, list[dict[str, Any]]],
     *,
     authenticated_monthly_closure: frozenset[tuple[str, str]] = frozenset(),
+    authenticated_monthly_source_position_count: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Withhold invalid v2 values and publish one deduplicated uncertainty."""
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
@@ -5351,13 +5424,20 @@ def _canonical_quality_gate(
         and str(_normalized(record).get("target_dataset") or "") not in _CONTROL_DATASETS
     }
     monthly_dataset = "credit_account_monthly_performance"
-    if authenticated_monthly_closure:
+    if authenticated_monthly_closure or (
+        authenticated_monthly_source_position_count is not None
+        and authenticated_monthly_source_position_count > 0
+    ):
         # An exact closure may contain only withheld identities.  Preserve the
         # canonical dataset itself even when its published row set is empty.
         projected.setdefault(monthly_dataset, [])
-    if monthly_dataset in status_index or projected.get(monthly_dataset):
-        # Never preserve a count-only/raw-grid monthly denominator.  Rebuild it
-        # below from distinct emitted or exact localized account/month keys.
+    if (
+        monthly_dataset in status_index
+        or projected.get(monthly_dataset)
+        or authenticated_monthly_source_position_count is not None
+    ):
+        # A source-position denominator is accepted only from the authenticated
+        # internal closure proof.  Raw count-only diagnostics remain excluded.
         affected.add(monthly_dataset)
     for target in sorted(affected):
         existing_values = (
@@ -5419,14 +5499,22 @@ def _canonical_quality_gate(
                 | set(authenticated_monthly_closure)
             )
             normalized["observed_row_count"] = len(emitted_account_months)
-            if closure:
-                normalized["expected_row_count"] = len(closure)
+            expected_count = (
+                max(
+                    len(closure),
+                    authenticated_monthly_source_position_count,
+                )
+                if authenticated_monthly_source_position_count is not None
+                else len(closure)
+            )
+            if expected_count:
+                normalized["expected_row_count"] = expected_count
             else:
                 normalized.pop("expected_row_count", None)
             normalized["reason"] = (
-                "account_month_identity_partial_owner_unresolved"
+                "account_month_source_position_partial_owner_unresolved"
                 if unresolved_source_positions
-                else "account_month_identity_closure"
+                else "account_month_source_position_closure"
             )
         if target in status_index:
             index = status_index[target]
@@ -5763,6 +5851,9 @@ def project_personal_detail_datasets(
 
     source = {name: list(rows or []) for name, rows in datasets.items()}
     authenticated_monthly_closure = _authenticated_source_monthly_closure(source)
+    authenticated_monthly_source_position_count = (
+        _authenticated_source_monthly_position_count(source)
+    )
     employment_rows, blob_issues = _employment_source_records(source.get("employment_records") or [])
     if employment_rows:
         source["employment_records"] = employment_rows
@@ -5960,9 +6051,26 @@ def project_personal_detail_datasets(
         return values
 
     def project_extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
-        return remap_summary_business_target(
+        projected_values = remap_summary_business_target(
             _extraction_issue(values), id_field="target_record_id"
         )
+        if (
+            projected_values.get("issue_code")
+            == "source_credit_agreement_record_omitted"
+            and projected_values.get("target_dataset") == "credit_agreements"
+        ):
+            agreement_ids = {
+                _record_identity(record, "credit_agreements", index)
+                for index, record in enumerate(
+                    projected.get("credit_agreements") or (),
+                    start=1,
+                )
+            }
+            if str(projected_values.get("target_record_id") or "") not in agreement_ids:
+                # The source ordinal remains in typed issue evidence.  It is
+                # not a canonical business-record ID when the row is absent.
+                projected_values.pop("target_record_id", None)
+        return projected_values
 
     def project_field_observation(values: dict[str, Any]) -> dict[str, Any]:
         return remap_summary_business_target(
@@ -6084,6 +6192,9 @@ def project_personal_detail_datasets(
     projected = _canonical_quality_gate(
         projected,
         authenticated_monthly_closure=authenticated_monthly_closure,
+        authenticated_monthly_source_position_count=(
+            authenticated_monthly_source_position_count
+        ),
     )
     if projected.get("extraction_issues"):
         compact_issues, evidence_rows = _issue_evidence_rows(projected["extraction_issues"])

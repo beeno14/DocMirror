@@ -290,6 +290,17 @@ def _remap_issue_target(context: Any, issue: Mapping[str, Any]) -> dict[str, Any
         target, ambiguous = _resolve_issue_target(registry, source)
         if target:
             row["target_record_id"] = target
+            if (
+                row.get("issue_code")
+                == "candidate_b_account_cluster_field_unresolved"
+            ):
+                row["reason_codes"] = [
+                    str(value)
+                    for value in row.get("reason_codes") or ()
+                    if value
+                    and str(value)
+                    != "record_not_emitted_due_to_unresolved_account_ownership"
+                ]
         elif ambiguous:
             row.pop("target_record_id", None)
             row["reason_codes"] = list(
@@ -705,6 +716,31 @@ def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
             if (localized := _localize_final_liability_issue(row, final_liabilities))
             is not None
         ]
+    precise_account_fields = {
+        (
+            str(row.get("target_dataset") or ""),
+            str(row.get("target_record_id") or ""),
+            str(row.get("field_name") or ""),
+        )
+        for row in rows
+        if row.get("issue_code")
+        == "candidate_b_account_cluster_field_unresolved"
+        and str(row.get("status") or "requires_review")
+        not in _NON_DEGRADING_STATUSES
+    }
+    rows = [
+        row
+        for row in rows
+        if not (
+            row.get("issue_code") == "pboc_cell_contract_unresolved"
+            and (
+                str(row.get("target_dataset") or ""),
+                str(row.get("target_record_id") or ""),
+                str(row.get("field_name") or ""),
+            )
+            in precise_account_fields
+        )
+    ]
     precise_by_agreement_field: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         observed = row.get("observed_value")

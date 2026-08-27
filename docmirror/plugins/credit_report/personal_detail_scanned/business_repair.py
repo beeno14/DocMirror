@@ -29,6 +29,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.business_repair_pol
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
     PersonalDetailOCRCorrectionOverlay,
+    _exact_blank_account_currency_slot_identity,
     normalize_role_candidate,
     role_candidate_is_valid,
 )
@@ -73,6 +74,10 @@ def _boxes_associate(
 
 def _field_ref_identity(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
     """Return one immutable field-cell identity used by repair matching."""
+
+    blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
+    if blank_currency_owner is not None:
+        return blank_currency_owner
 
     logical_page = _page_number(ref)
     source_page = ref.get("source_page")
@@ -150,6 +155,33 @@ def _raw_payload_index(payload: Mapping[str, Any]) -> dict[tuple[str, str, str],
     return index
 
 
+def _published_payload_index(
+    payload: Mapping[str, Any],
+) -> dict[tuple[str, str, str], Any]:
+    """Index the currently published scalar independently of preserved raw OCR."""
+
+    index: dict[tuple[str, str, str], Any] = {}
+    for dataset_name, rows in payload.items():
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            values = (
+                row.get("normalized")
+                if isinstance(row.get("normalized"), Mapping)
+                else row
+            )
+            identity = _record_id(values) or _record_id(row)
+            if not identity:
+                continue
+            for field_name, value in values.items():
+                index[(str(dataset_name), identity, str(field_name))] = deepcopy(
+                    value
+                )
+    return index
+
+
 def _observed_scalar(value: Any, *, field_name: str) -> str:
     if isinstance(value, (list, tuple)) and len(value) == 1:
         return str(value[0] or "")
@@ -170,6 +202,8 @@ def _observed_scalar(value: Any, *, field_name: str) -> str:
 
 
 def _repair_role(dataset_name: str, field_name: str, fallback: str) -> str:
+    if field_name in {"currency", "account_currency", "reporting_amount_currency"}:
+        return "currency"
     if field_name == "inquiry_date":
         return "date"
     if field_name == "sequence" and dataset_name in {"inquiries", "inquiry_records"}:
@@ -233,6 +267,7 @@ class BusinessFieldRepair:
     candidate_value: str | None
     source_refs: tuple[dict[str, Any], ...]
     reason_codes: tuple[str, ...]
+    published_value: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -414,6 +449,7 @@ class BusinessUncertaintyRepairCoordinator:
         payload: Mapping[str, Any],
     ) -> tuple[BusinessFieldRepair, ...]:
         raw_index = _raw_payload_index(payload)
+        published_index = _published_payload_index(payload)
         repairs: list[BusinessFieldRepair] = []
         seen: set[tuple[Any, ...]] = set()
         for uncertainty in uncertainties:
@@ -521,6 +557,15 @@ class BusinessUncertaintyRepairCoordinator:
                     candidate_value=candidate,
                     source_refs=exact_refs,
                     reason_codes=reason_codes,
+                    published_value=deepcopy(
+                        published_index.get(
+                            (
+                                uncertainty.dataset_name,
+                                uncertainty.record_id,
+                                uncertainty.field_name,
+                            )
+                        )
+                    ),
                 )
             )
         return tuple(repairs)

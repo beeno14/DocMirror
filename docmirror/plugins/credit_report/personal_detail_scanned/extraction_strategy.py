@@ -705,10 +705,16 @@ class LazyExtractionStrategy:
             # present; stale rows from a now-absent section are not reused.
             for stage_name in available:
                 stage = registry.stage(stage_name)
+                section_state = (
+                    census.state_for(stage.section)
+                    if stage.section is not None
+                    else None
+                )
                 if (
                     not stage.optional
                     or stage.section is None
-                    or census.state_for(stage.section) is SectionState.OBSERVED
+                    or section_state
+                    in {SectionState.OBSERVED, SectionState.UNRESOLVED}
                 ):
                     roots.add(stage_name)
         return registry.dependency_closure(roots)
@@ -729,9 +735,13 @@ class LazyExtractionStrategy:
         census = request.census
         if census is None:
             return "section_census_missing"
-        if not census.complete:
+        partial_repair = (
+            request.purpose is PlanPurpose.REPAIR
+            and request.dependency_closure_known
+        )
+        if not census.complete and not partial_repair:
             return census.incomplete_reason or "section_census_incomplete"
-        if census.unresolved_sections:
+        if census.unresolved_sections and not partial_repair:
             return "section_census_unresolved:" + ",".join(census.unresolved_sections)
         missing_sections = tuple(
             section

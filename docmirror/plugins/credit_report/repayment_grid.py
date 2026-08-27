@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -15,6 +15,7 @@ from typing import Any, cast
 from docmirror.ocr.micro_grid.cell_recognition import (
     extract_micro_cell_glyph_template,
     normalize_allowlist_text,
+    pdf_bbox_to_image_region,
     recognize_micro_cell_from_image,
 )
 from docmirror.ocr.micro_grid.detect import detect_micro_grid_candidates
@@ -30,6 +31,7 @@ from docmirror.ocr.micro_grid.reconstruct import (
 from docmirror.plugins.credit_report.source_table_month_lattice import (
     SourceTableMonthLattice,
     resolve_unique_source_table_year_plus_twelve_ownership,
+    resolve_unique_source_table_year_plus_twelve_ownership_from_year,
 )
 
 _RANGE_RE = re.compile(r"(20\d{2})年\s*(\d{1,2})月\s*[-—一至~～]\s*(20\d{2})年\s*(\d{1,2})月.*还款记录")
@@ -37,6 +39,18 @@ _YEAR_RE = re.compile(r"^20\d{2}(?=\s|$)")
 _STATUS_CHARS = {"*", "/", "N", "C", "1", "2", "3", "4", "5", "6", "7", "B", "M", "D", "Z", "G"}
 _ZERO_OVERDUE_STATUSES = {"*", "/", "N", "C"}
 _MIN_MONTH_GRID_PAGE_COVERAGE = 0.40
+_EXACT_SOURCE_STATUS_CELL_SOURCES = frozenset(
+    {
+        "exact_native_source_table_status_cell",
+        "exact_corrected_source_table_status_cell",
+    }
+)
+_EXACT_SOURCE_AMOUNT_CELL_SOURCES = frozenset(
+    {
+        "exact_native_source_table_amount_cell",
+        "exact_corrected_source_table_amount_cell",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -166,8 +180,7 @@ def _candidate_b_owned_status_token(
         visual_col is not None
         and geometry_audit.get("usable") is not False
         and geometry_audit.get("source") == "vertical_rule_projection"
-        and geometry_audit.get("selection_basis")
-        == "year_plus_twelve_rule_ownership"
+        and geometry_audit.get("selection_basis") == "year_plus_twelve_rule_ownership"
         and len(cell_tokens) == 1
     ):
         return None
@@ -176,32 +189,17 @@ def _candidate_b_owned_status_token(
     if len(chars) != 1 or chars[0] not in status_charset:
         return None
     source_key = token.source_token_id or token.token_id
-    if (
-        sum(
-            1
-            for row_token in row_tokens
-            if (row_token.source_token_id or row_token.token_id) == source_key
-        )
-        != 1
-    ):
+    if sum(1 for row_token in row_tokens if (row_token.source_token_id or row_token.token_id) == source_key) != 1:
         return None
     try:
-        token_x0, _token_y0, token_x1, _token_y1 = (
-            float(value) for value in token.bbox
-        )
-        col_x0, _col_y0, col_x1, _col_y1 = (
-            float(value) for value in visual_col["bbox"]
-        )
+        token_x0, _token_y0, token_x1, _token_y1 = (float(value) for value in token.bbox)
+        col_x0, _col_y0, col_x1, _col_y1 = (float(value) for value in visual_col["bbox"])
     except (KeyError, TypeError, ValueError):
         return None
     token_width = token_x1 - token_x0
     overlap = max(0.0, min(token_x1, col_x1) - max(token_x0, col_x0))
     token_center = (token_x0 + token_x1) / 2.0
-    if (
-        token_width <= 0.0
-        or overlap / token_width < 0.80
-        or not col_x0 <= token_center <= col_x1
-    ):
+    if token_width <= 0.0 or overlap / token_width < 0.80 or not col_x0 <= token_center <= col_x1:
         return None
     return chars[0], token
 
@@ -337,9 +335,7 @@ def _static_status_reference_bank() -> tuple[Any, tuple[str, ...]]:
                 for font_scale in (0.72, 0.98):
                     for thickness in (1, 2):
                         image = np.full((80, 80), 255, dtype=np.uint8)
-                        (width, height), _baseline = cv2.getTextSize(
-                            character, font, font_scale, thickness
-                        )
+                        (width, height), _baseline = cv2.getTextSize(character, font, font_scale, thickness)
                         cv2.putText(
                             image,
                             character,
@@ -369,12 +365,8 @@ def _normalize_static_reference_glyph(image: Any, *, np: Any, cv2: Any) -> Any |
         return None
     glyph = image[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
     ink_full = (glyph < 128).astype(np.float32)
-    dense_cols = np.where(
-        ink_full.mean(axis=0) >= max(0.12, 2.0 / max(ink_full.shape[0], 1))
-    )[0]
-    dense_rows = np.where(
-        ink_full.mean(axis=1) >= max(0.12, 2.0 / max(ink_full.shape[1], 1))
-    )[0]
+    dense_cols = np.where(ink_full.mean(axis=0) >= max(0.12, 2.0 / max(ink_full.shape[0], 1)))[0]
+    dense_rows = np.where(ink_full.mean(axis=1) >= max(0.12, 2.0 / max(ink_full.shape[1], 1)))[0]
     if len(dense_cols) and len(dense_rows):
         x0 = max(0, int(dense_cols.min()) - 1)
         x1 = min(glyph.shape[1], int(dense_cols.max()) + 2)
@@ -482,12 +474,7 @@ def _static_n_star_glyph_classification(
         if winning_label == "N" and winning_score >= 0.90 and margin >= 0.020:
             confidence = min(0.98, 0.68 + winning_score * 0.3)
             return "N", confidence, audit
-        if (
-            winning_label == "*"
-            and winning_score >= 0.90
-            and margin >= 0.030
-            and solidity <= 0.75
-        ):
+        if winning_label == "*" and winning_score >= 0.90 and margin >= 0.030 and solidity <= 0.75:
             confidence = min(0.98, 0.68 + winning_score * 0.3)
             return "*", confidence, audit
     except Exception:
@@ -516,9 +503,10 @@ def _static_candidate_b_zero_status_glyph_classification(
             # An N-shaped crop that remains close to the closed-account C class
             # is not decisive.  This is the exact adjacent-row/terminal-month
             # confusion Candidate B must report instead of silently accepting.
-            if label != "N" or float(reference_scores.get("N") or 0.0) - float(
-                reference_scores.get("C") or 0.0
-            ) >= 0.06:
+            if (
+                label != "N"
+                or float(reference_scores.get("N") or 0.0) - float(reference_scores.get("C") or 0.0) >= 0.06
+            ):
                 return classification
         ranked = sorted(
             ((score, label) for label, score in reference_scores.items()),
@@ -540,6 +528,174 @@ def _static_candidate_b_zero_status_glyph_classification(
                 "reference_similarity": round(winning_score, 4),
                 "reference_margin": round(margin, 4),
                 "classification_basis": "candidate_b_conservative_reference_bank",
+            },
+        )
+    except Exception:
+        return None
+
+
+def _static_amount_zero_glyph_classification(
+    page_image: Any,
+    bbox: BBox,
+    *,
+    page_width: float,
+    page_height: float,
+) -> tuple[float, dict[str, Any]] | None:
+    """Recognize one printed zero without invoking OCR or using status semantics.
+
+    Watermarks crossing a small monthly-amount cell can make OCR report ``o``,
+    ``10``, or ``20`` for a single printed zero.  The dark report glyph remains
+    a closed loop, while the watermark is materially lighter.  Require that
+    topology and a conservative zero-shape vote at several fixed thresholds;
+    any second digit-like component vetoes the repair.
+    """
+
+    shape = getattr(page_image, "shape", None)
+    if not shape or len(shape) < 2:
+        return None
+    try:
+        import cv2
+        import numpy as np
+
+        region = pdf_bbox_to_image_region(
+            bbox,
+            page_width=page_width,
+            page_height=page_height,
+            image_width=int(shape[1]),
+            image_height=int(shape[0]),
+            pad_px=0,
+        )
+        crop = page_image[region[1] : region[3], region[0] : region[2]]
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return None
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if len(crop.shape) == 3 else crop.copy()
+        crop_height, crop_width = gray.shape[:2]
+        if crop_height < 10 or crop_width < 10:
+            return None
+        border = max(1, int(round(min(crop_height, crop_width) * 0.07)))
+        gray[:border, :] = 255
+        gray[-border:, :] = 255
+        gray[:, :border] = 255
+        gray[:, -border:] = 255
+
+        votes: list[dict[str, Any]] = []
+        for threshold in (96, 112, 128, 144, 160):
+            binary = (gray < threshold).astype(np.uint8)
+            count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+                binary,
+                8,
+            )
+            components: list[dict[str, Any]] = []
+            for label in range(1, count):
+                x, y, width, height, area = (int(value) for value in stats[label])
+                center_x = x + width / 2.0
+                center_y = y + height / 2.0
+                if not (
+                    area >= 6
+                    and height >= max(6, int(round(crop_height * 0.20)))
+                    and height <= crop_height * 0.78
+                    and width >= 1
+                    and width <= crop_width * 0.45
+                    and crop_width * 0.15 <= center_x <= crop_width * 0.85
+                    and crop_height * 0.10 <= center_y <= crop_height * 0.90
+                ):
+                    continue
+                component_mask = labels[y : y + height, x : x + width] == label
+                contours, hierarchy = cv2.findContours(
+                    component_mask.astype(np.uint8) * 255,
+                    cv2.RETR_CCOMP,
+                    cv2.CHAIN_APPROX_SIMPLE,
+                )[-2:]
+                holes = 0 if hierarchy is None else sum(1 for item in hierarchy[0] if int(item[3]) >= 0)
+                white_glyph = np.where(component_mask, 0, 255).astype(np.uint8)
+                template = _normalize_static_reference_glyph(
+                    white_glyph,
+                    np=np,
+                    cv2=cv2,
+                )
+                scores = _static_status_reference_scores(template, np=np)
+                ranked = sorted(
+                    ((float(score), str(label)) for label, score in scores.items()),
+                    reverse=True,
+                )
+                components.append(
+                    {
+                        "area": area,
+                        "bbox": (x, y, width, height),
+                        "center": (center_x, center_y),
+                        "holes": holes,
+                        "ranked": ranked,
+                    }
+                )
+
+            zero_candidates: list[dict[str, Any]] = []
+            for component in components:
+                ranked = component["ranked"]
+                if not ranked:
+                    continue
+                winning_score, winning_label = ranked[0]
+                competitor_score = ranked[1][0] if len(ranked) > 1 else 0.0
+                _x, _y, width, height = component["bbox"]
+                if (
+                    component["holes"] == 1
+                    and 0.30 <= width / max(height, 1) <= 0.90
+                    and winning_label == "0"
+                    and winning_score >= 0.82
+                    and winning_score - competitor_score >= 0.02
+                ):
+                    zero_candidates.append(component)
+            if len(zero_candidates) != 1:
+                continue
+            zero = zero_candidates[0]
+            _zero_x, _zero_y, _zero_width, zero_height = zero["bbox"]
+            blockers = [
+                component
+                for component in components
+                if component is not zero
+                and component["area"] >= max(6, int(round(zero["area"] * 0.18)))
+                and component["bbox"][3] >= zero_height * 0.60
+                and component["ranked"]
+                and component["ranked"][0][1] in set("0123456789")
+                and component["ranked"][0][0] >= 0.72
+            ]
+            if blockers:
+                continue
+            winning_score, _winning_label = zero["ranked"][0]
+            competitor_score = zero["ranked"][1][0]
+            votes.append(
+                {
+                    "threshold": threshold,
+                    "score": winning_score,
+                    "margin": winning_score - competitor_score,
+                    "center": zero["center"],
+                }
+            )
+
+        if len(votes) < 2:
+            return None
+        normalized_x = [vote["center"][0] / crop_width for vote in votes]
+        normalized_y = [vote["center"][1] / crop_height for vote in votes]
+        if max(normalized_x) - min(normalized_x) > 0.08 or max(normalized_y) - min(normalized_y) > 0.08:
+            return None
+        confidence = min(
+            0.99,
+            0.72 + 0.04 * len(votes) + 0.08 * min(vote["score"] for vote in votes),
+        )
+        return (
+            confidence,
+            {
+                "classification_basis": "dark_ink_closed_zero_multithreshold",
+                "threshold_vote_count": len(votes),
+                "thresholds": [vote["threshold"] for vote in votes],
+                "minimum_reference_similarity": round(
+                    min(vote["score"] for vote in votes),
+                    4,
+                ),
+                "minimum_reference_margin": round(
+                    min(vote["margin"] for vote in votes),
+                    4,
+                ),
+                "ocr_invoked": False,
             },
         )
     except Exception:
@@ -606,9 +762,7 @@ def _scan_specific_status_match(
             return None
         expected_score = float(vector @ expected["vector"])
         competitor_scores = [
-            float(vector @ prototype["vector"])
-            for status, prototype in prototypes.items()
-            if status != expected_status
+            float(vector @ prototype["vector"]) for status, prototype in prototypes.items() if status != expected_status
         ]
         competitor = max(competitor_scores, default=0.0)
         margin = expected_score - competitor
@@ -671,12 +825,12 @@ def _nearest_year_lines(
     expected_years = set(range(start_year, end_year + 1))
     candidates = sorted(
         [
-        line
-        for line in lines
-        if (match := _YEAR_RE.match(line["text"].strip()))
-        and int(match.group(0)) in expected_years
-        and line["bbox"][1] > ay1
-        and line["bbox"][1] < ay1 + 300
+            line
+            for line in lines
+            if (match := _YEAR_RE.match(line["text"].strip()))
+            and int(match.group(0)) in expected_years
+            and line["bbox"][1] > ay1
+            and line["bbox"][1] < ay1 + 300
         ],
         key=lambda line: (float(line["bbox"][1]), float(line["bbox"][0])),
     )
@@ -718,9 +872,7 @@ def _month_col_bands(header_line: dict[str, Any], *, n_months: int = 12) -> list
             boundaries.append(centres[-1] + (centres[-1] - centres[-2]) / 2.0)
             y0, y1 = float(header_line["bbox"][1]), float(header_line["bbox"][3])
             geometry_status = (
-                "exact"
-                if header_line.get("month_header_geometry") == "word_center_sequence_exact"
-                else "estimated"
+                "exact" if header_line.get("month_header_geometry") == "word_center_sequence_exact" else "estimated"
             )
             return [
                 {
@@ -972,9 +1124,7 @@ def _visual_month_col_bands(
                 indices = np.clip(np.rint(positions).astype(int), 0, image_width - 1)
                 strengths = projection[indices]
                 score = float(strengths.sum())
-                header_distance = (
-                    abs(candidate_start - start) + abs(candidate_end - end)
-                ) / max(step, 1e-6)
+                header_distance = (abs(candidate_start - start) + abs(candidate_end - end)) / max(step, 1e-6)
                 if prefer_validated_header_lattice or require_physical_month_ownership:
                     candidates.append(
                         (
@@ -997,9 +1147,7 @@ def _visual_month_col_bands(
             except (TypeError, ValueError):
                 year_x0 = year_x1 = 0.0
             rule_floor = max(0.04, float(np.median(projection)) * 1.5)
-            owned_candidates: list[
-                tuple[float, float, float, float, int, float, float, float]
-            ] = []
+            owned_candidates: list[tuple[float, float, float, float, int, float, float, float]] = []
             for score, candidate_start, candidate_end, header_distance in candidates:
                 candidate_step = (candidate_end - candidate_start) / 12.0
                 if not 0.80 * step <= candidate_step <= 1.20 * step:
@@ -1011,22 +1159,21 @@ def _visual_month_col_bands(
                 # of the printed year cell.  Ownership needs the year glyph
                 # box to touch that physical interval, not to be centred in it.
                 if year_x1 < predicted_year_left:
-                    ownership_error = (
-                        predicted_year_left - year_x1
-                    ) / max(candidate_step, 1e-6)
+                    ownership_error = (predicted_year_left - year_x1) / max(candidate_step, 1e-6)
                 elif year_x0 > candidate_start:
-                    ownership_error = (
-                        year_x0 - candidate_start
-                    ) / max(candidate_step, 1e-6)
+                    ownership_error = (year_x0 - candidate_start) / max(candidate_step, 1e-6)
                 else:
                     ownership_error = 0.0
                 if ownership_error > 0.40:
                     continue
                 year_width = max(1e-6, year_x1 - year_x0)
-                year_glyph_left_of_month_coverage = max(
-                    0.0,
-                    min(candidate_start, year_x1) - year_x0,
-                ) / year_width
+                year_glyph_left_of_month_coverage = (
+                    max(
+                        0.0,
+                        min(candidate_start, year_x1) - year_x0,
+                    )
+                    / year_width
+                )
                 # Merely touching the predicted year interval is insufficient:
                 # the classic year+months-1..11 lattice places its first
                 # "month" rule through the printed year glyph.  A physical
@@ -1044,9 +1191,7 @@ def _visual_month_col_bands(
                     image_width - 1,
                 )
                 month_strengths = projection[month_indices]
-                year_left_index = int(
-                    np.clip(round(predicted_year_left * sx), 0, image_width - 1)
-                )
+                year_left_index = int(np.clip(round(predicted_year_left * sx), 0, image_width - 1))
                 year_left_strength = float(projection[year_left_index])
                 month_rule_hits = int((month_strengths >= rule_floor).sum())
                 if month_rule_hits < 11 or year_left_strength < rule_floor:
@@ -1084,9 +1229,7 @@ def _visual_month_col_bands(
                     ),
                 )
                 best_positions = np.linspace(best_start * sx, best_end * sx, 13)
-                best_indices = np.clip(
-                    np.rint(best_positions).astype(int), 0, image_width - 1
-                )
+                best_indices = np.clip(np.rint(best_positions).astype(int), 0, image_width - 1)
                 best_strengths = projection[best_indices]
                 best_score = float(best_strengths.sum())
                 ownership_selected = True
@@ -1109,15 +1252,10 @@ def _visual_month_col_bands(
         preliminary_baseline_per_rule = float(np.median(projection))
         preliminary_rule_floor = max(0.04, preliminary_baseline_per_rule * 1.5)
         preliminary_rule_hits = (
-            int((best_strengths >= preliminary_rule_floor).sum())
-            if best_strengths is not None
-            else 0
+            int((best_strengths >= preliminary_rule_floor).sum()) if best_strengths is not None else 0
         )
         preliminary_baseline = preliminary_baseline_per_rule * 13.0
-        if (
-            best_score < max(0.5, preliminary_baseline * 1.05)
-            or preliminary_rule_hits < 10
-        ):
+        if best_score < max(0.5, preliminary_baseline * 1.05) or preliminary_rule_hits < 10:
             if require_physical_month_ownership and not allow_unowned_header_fallback:
                 return [], {
                     "source": "rejected_month_geometry",
@@ -1135,11 +1273,7 @@ def _visual_month_col_bands(
                 "rule_hits": preliminary_rule_hits,
                 **geometry,
             }
-        if (
-            require_physical_month_ownership
-            and not ownership_selected
-            and retain_validated_header_on_residual
-        ):
+        if require_physical_month_ownership and not ownership_selected and retain_validated_header_on_residual:
             return month_cols, {
                 "source": "header_geometry",
                 "usable": True,
@@ -1163,11 +1297,7 @@ def _visual_month_col_bands(
             # 1-11, shifting every source crop one cell left.  When the month
             # header was independently validated, use it as the tie-breaker.
             near_tie_tolerance = max(0.02, best_score * 0.02)
-            near_ties = [
-                candidate
-                for candidate in candidates
-                if candidate[0] >= best_score - near_tie_tolerance
-            ]
+            near_ties = [candidate for candidate in candidates if candidate[0] >= best_score - near_tie_tolerance]
             (
                 best_score,
                 best_start,
@@ -1178,15 +1308,11 @@ def _visual_month_col_bands(
                 key=lambda candidate: (candidate[3], -candidate[0]),
             )
             best_positions = np.linspace(best_start * sx, best_end * sx, 13)
-            best_indices = np.clip(
-                np.rint(best_positions).astype(int), 0, image_width - 1
-            )
+            best_indices = np.clip(np.rint(best_positions).astype(int), 0, image_width - 1)
             best_strengths = projection[best_indices]
         best_offset = best_start - start
         right_offset = best_end - end
-        residual_shift_months = max(
-            abs(best_offset), abs(right_offset)
-        ) / max(step, 1e-6)
+        residual_shift_months = max(abs(best_offset), abs(right_offset)) / max(step, 1e-6)
         if (
             max_residual_shift_months is not None
             and residual_shift_months > max_residual_shift_months
@@ -1342,6 +1468,8 @@ def _accepted_month_geometry_provenance(audit: Mapping[str, Any]) -> dict[str, A
         "value_inputs_used",
         "corroborated_by_source_table_geometry",
         "ambiguous_visual_geometry_superseded",
+        "conflicting_visual_geometry_superseded",
+        "exact_source_atom_geometry_months",
         "source_table_comparison",
         "calibrated_from_source_table_geometry",
         "visual_selection_basis",
@@ -1349,11 +1477,7 @@ def _accepted_month_geometry_provenance(audit: Mapping[str, Any]) -> dict[str, A
         "visual_residual_shift_months",
         "logical_page",
     )
-    provenance = {
-        key: audit[key]
-        for key in retained_keys
-        if key in audit and audit[key] is not None
-    }
+    provenance = {key: audit[key] for key in retained_keys if key in audit and audit[key] is not None}
     return {"geometry_provenance": provenance} if provenance else {}
 
 
@@ -1373,11 +1497,7 @@ def _rejected_month_geometry_provenance(audit: Mapping[str, Any]) -> dict[str, A
         "visual_owned_month_rule_hits",
         "visual_residual_shift_months",
     )
-    provenance = {
-        key: audit[key]
-        for key in retained_keys
-        if key in audit and audit[key] is not None
-    }
+    provenance = {key: audit[key] for key in retained_keys if key in audit and audit[key] is not None}
     return {"geometry_rejection": provenance} if provenance else {}
 
 
@@ -1399,10 +1519,7 @@ def _month_geometry_edges(
     if set(by_month) != set(range(1, 13)):
         return None
     ordered = [by_month[month] for month in range(1, 13)]
-    if any(
-        abs(left[1] - right[0]) > 2.0
-        for left, right in zip(ordered, ordered[1:])
-    ):
+    if any(abs(left[1] - right[0]) > 2.0 for left, right in zip(ordered, ordered[1:])):
         return None
     return (ordered[0][0], *(band[1] for band in ordered))
 
@@ -1433,19 +1550,14 @@ def _month_geometry_planes_agree(
     source_edges = _month_geometry_edges(source_cols)
     if visual_edges is None or source_edges is None:
         return False
-    source_widths = [
-        right - left for left, right in zip(source_edges, source_edges[1:])
-    ]
+    source_widths = [right - left for left, right in zip(source_edges, source_edges[1:])]
     # The visual-rule detector and the sealed physical-table reconstructor can
     # differ by a small page-local calibration scale even when they identify
     # the same thirteen month edges.  Keep agreement far below a half-cell
     # (which could change calendar ownership), while allowing the bounded
     # sub-cell drift observed across a full page-width lattice.
     tolerance = min(3.0, max(0.75, sorted(source_widths)[6] * 0.10))
-    return all(
-        abs(visual - source) <= tolerance
-        for visual, source in zip(visual_edges, source_edges, strict=True)
-    )
+    return all(abs(visual - source) <= tolerance for visual, source in zip(visual_edges, source_edges, strict=True))
 
 
 def _candidate_b_visual_lattice_needs_source_table(
@@ -1493,14 +1605,8 @@ def _joined_continuation_row_y(
         parsed.append(bbox)
     if not parsed:
         return None
-    shift = (
-        float(base_page_height or 0.0)
-        if logical_page != base_page
-        else 0.0
-    )
-    return min(box[1] for box in parsed) + shift, max(
-        box[3] for box in parsed
-    ) + shift
+    shift = float(base_page_height or 0.0) if logical_page != base_page else 0.0
+    return min(box[1] for box in parsed) + shift, max(box[3] for box in parsed) + shift
 
 
 def _coerce_token(obj: Any, *, page: int, idx: int) -> OCRToken | None:
@@ -1653,14 +1759,10 @@ def _candidate_b_status_row(
         height = max(1.0, float(line["bbox"][3]) - float(line["bbox"][1]))
         selected: list[dict[str, Any]] | None = None
         for cluster in clusters:
-            cluster_center = sum(
-                (float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0
-                for item in cluster
-            ) / len(cluster)
-            cluster_height = max(
-                max(1.0, float(item["bbox"][3]) - float(item["bbox"][1]))
-                for item in cluster
+            cluster_center = sum((float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0 for item in cluster) / len(
+                cluster
             )
+            cluster_height = max(max(1.0, float(item["bbox"][3]) - float(item["bbox"][1])) for item in cluster)
             if abs(center - cluster_center) <= max(3.0, 0.55 * max(height, cluster_height)):
                 selected = cluster
                 break
@@ -1673,11 +1775,9 @@ def _candidate_b_status_row(
     # to another year or the month header; they are never concatenated.
     row_lines = max(
         clusters,
-        key=lambda cluster: sum(
-            (float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0
-            for item in cluster
-        )
-        / len(cluster),
+        key=lambda cluster: (
+            sum((float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0 for item in cluster) / len(cluster)
+        ),
     )
     row_lines = sorted(row_lines, key=lambda item: float(item["bbox"][0]))
     status_tokens: list[OCRToken] = []
@@ -1712,6 +1812,423 @@ def _candidate_b_status_row(
         "candidate_b_status_tokens": status_tokens,
         "status_source_line_indices": [int(line["idx"]) for line in row_lines],
     }
+
+
+def _candidate_b_exact_active_source_status_row(
+    tokens: list[OCRToken],
+    year_line: dict[str, Any],
+    *,
+    source_lattice: SourceTableMonthLattice,
+    active_months: list[int],
+    status_charset: set[str],
+    page: int,
+    base_page_height: float | None,
+    fallback_status_tokens: list[OCRToken] | None = None,
+) -> dict[str, Any] | None:
+    """Recover independently positioned words one active source cell at a time.
+
+    A noisy merged OCR line may be unusable even though each active month still
+    has a clean one-word status observation.  The detached source table proves
+    the exact year-plus-twelve lattice without contributing values.  A missing,
+    duplicate, or source-reused token withholds only its affected month; it no
+    longer discards independently proved sibling cells.
+    """
+
+    if not active_months or len(set(active_months)) != len(active_months):
+        return None
+    logical_page = int(source_lattice.logical_page)
+    year_logical_page = int(year_line.get("source_logical_page") or page)
+    if logical_page != year_logical_page:
+        return None
+    if logical_page != page and not base_page_height:
+        return None
+    shift = float(base_page_height or 0.0) if logical_page != page else 0.0
+    source_cells = {
+        month: (
+            float(source_lattice.month_bboxes[month - 1][0]),
+            float(source_lattice.month_bboxes[month - 1][1]) + shift,
+            float(source_lattice.month_bboxes[month - 1][2]),
+            float(source_lattice.month_bboxes[month - 1][3]) + shift,
+        )
+        for month in active_months
+        if 1 <= month <= 12
+    }
+    if set(source_cells) != set(active_months):
+        return None
+
+    def owned_tokens_by_month(
+        observations: Iterable[OCRToken],
+    ) -> dict[int, list[OCRToken]]:
+        owned: dict[int, list[OCRToken]] = {month: [] for month in active_months}
+        for token in observations:
+            if str(token.coordinate_system or "") != "pdf_points_top_left":
+                continue
+            chars = _candidate_b_status_chars(token.text, status_charset)
+            if len(chars) != 1 or chars[0] not in status_charset:
+                continue
+            tx0, ty0, tx1, ty1 = (float(value) for value in token.bbox)
+            token_width = tx1 - tx0
+            token_height = ty1 - ty0
+            if token_width <= 0.0 or token_height <= 0.0:
+                continue
+            owners: list[int] = []
+            for month, (cx0, cy0, cx1, cy1) in source_cells.items():
+                x_overlap = max(0.0, min(tx1, cx1) - max(tx0, cx0))
+                y_overlap = max(0.0, min(ty1, cy1) - max(ty0, cy0))
+                cell_height = cy1 - cy0
+                if (
+                    x_overlap / token_width >= 0.80
+                    and y_overlap / min(token_height, cell_height) >= 0.70
+                    and cx0 <= token.center[0] <= cx1
+                    and cy0 <= token.center[1] <= cy1
+                ):
+                    owners.append(month)
+            if len(owners) == 1:
+                owned[owners[0]].append(replace(token, text=chars[0]))
+        return owned
+
+    tokens_by_month = owned_tokens_by_month(tokens)
+    fallback_by_month = owned_tokens_by_month(fallback_status_tokens or ())
+
+    def unique_candidates(
+        observations_by_month: Mapping[int, list[OCRToken]],
+        *,
+        source_key: Callable[[OCRToken], str],
+    ) -> tuple[dict[int, OCRToken], set[int]]:
+        candidates = {
+            month: month_tokens[0]
+            for month, month_tokens in observations_by_month.items()
+            if len(month_tokens) == 1
+        }
+        key_months: dict[str, list[int]] = {}
+        for month, token in candidates.items():
+            key_months.setdefault(source_key(token), []).append(month)
+        ambiguous_keys = {
+            key for key, months in key_months.items() if not key or len(months) != 1
+        }
+        ambiguous_months = {
+            month for key in ambiguous_keys for month in key_months.get(key, ())
+        }
+        return (
+            {
+                month: token
+                for month, token in candidates.items()
+                if source_key(token) not in ambiguous_keys
+            },
+            ambiguous_months,
+        )
+
+    fallback_candidates, fallback_ambiguous_months = unique_candidates(
+        fallback_by_month,
+        # Split characters from one corrected row have distinct token IDs even
+        # though they intentionally share the row's source token ID.
+        source_key=lambda token: str(token.token_id or ""),
+    )
+    exact_tokens_by_month = {
+        month: [
+            token
+            for token in month_tokens
+            if token.source in _EXACT_SOURCE_STATUS_CELL_SOURCES
+        ]
+        for month, month_tokens in tokens_by_month.items()
+    }
+    exact_candidates, exact_ambiguous_months = unique_candidates(
+        exact_tokens_by_month,
+        source_key=lambda token: str(token.source_token_id or token.token_id or ""),
+    )
+    ordinary_tokens_by_month = {
+        month: [
+            token
+            for token in month_tokens
+            if token.source not in _EXACT_SOURCE_STATUS_CELL_SOURCES
+        ]
+        for month, month_tokens in tokens_by_month.items()
+    }
+    ordinary_candidates, ordinary_ambiguous_months = unique_candidates(
+        ordinary_tokens_by_month,
+        source_key=lambda token: str(token.source_token_id or token.token_id or ""),
+    )
+
+    # Repair is deliberately fill-only.  A valid corrected row cell remains
+    # the corrected-plane observation even when another exact cell atom differs;
+    # later field-level guards can then localize that disagreement without
+    # deleting the otherwise valid month and its independently agreed amount.
+    selected_by_month: dict[int, OCRToken] = {}
+    for month in active_months:
+        selected = (
+            fallback_candidates.get(month)
+            or exact_candidates.get(month)
+            or ordinary_candidates.get(month)
+        )
+        if selected is not None:
+            selected_by_month[month] = selected
+    if not selected_by_month:
+        return None
+    unresolved_months = set(active_months).difference(selected_by_month)
+    conflict_months = {
+        month
+        for month in unresolved_months
+        if month in fallback_ambiguous_months
+        or month in exact_ambiguous_months
+        or month in ordinary_ambiguous_months
+        or len({token.text for token in tokens_by_month.get(month, ())}) > 1
+    }
+    selected_months = sorted(selected_by_month)
+    selected = [selected_by_month[month] for month in selected_months]
+    active_cells = [source_cells[month] for month in selected_months]
+    return {
+        "idx": int(year_line["idx"]),
+        "text": "".join(token.text for token in selected),
+        "bbox": [
+            min(cell[0] for cell in active_cells),
+            min(cell[1] for cell in active_cells),
+            max(cell[2] for cell in active_cells),
+            max(cell[3] for cell in active_cells),
+        ],
+        "confidence": min(float(token.confidence) for token in selected),
+        "source_logical_page": logical_page,
+        "candidate_b_status_tokens": selected,
+        "candidate_b_status_token_months": selected_months,
+        "candidate_b_exact_source_status_months": sorted(exact_candidates),
+        "status_source_line_indices": [],
+        "candidate_b_status_unresolved_months": sorted(unresolved_months),
+        "candidate_b_status_conflict_months": sorted(conflict_months),
+        "candidate_b_status_row_repair": ("exact_active_source_lattice_token_ownership"),
+    }
+
+
+def _candidate_b_exact_source_zero_amount_tokens(
+    tokens: list[OCRToken],
+    *,
+    source_lattice: SourceTableMonthLattice,
+    active_months: Iterable[int],
+    page: int,
+    base_page_height: float | None,
+) -> dict[int, OCRToken]:
+    """Bind exact singleton ``0`` atoms to exact source amount cells."""
+
+    months = tuple(dict.fromkeys(int(month) for month in active_months))
+    if not months or any(month < 1 or month > 12 for month in months):
+        return {}
+    logical_page = int(source_lattice.logical_page)
+    if logical_page != page and not base_page_height:
+        return {}
+    shift = float(base_page_height or 0.0) if logical_page != page else 0.0
+    source_cells = {
+        month: (
+            float(source_lattice.amount_bboxes[month - 1][0]),
+            float(source_lattice.amount_bboxes[month - 1][1]) + shift,
+            float(source_lattice.amount_bboxes[month - 1][2]),
+            float(source_lattice.amount_bboxes[month - 1][3]) + shift,
+        )
+        for month in months
+    }
+    owned: dict[int, list[OCRToken]] = {month: [] for month in months}
+    for token in tokens:
+        if (
+            token.source not in _EXACT_SOURCE_AMOUNT_CELL_SOURCES
+            or token.text.strip() != "0"
+            or token.coordinate_system != "pdf_points_top_left"
+        ):
+            continue
+        tx0, ty0, tx1, ty1 = (float(value) for value in token.bbox)
+        token_width = tx1 - tx0
+        token_height = ty1 - ty0
+        if token_width <= 0.0 or token_height <= 0.0:
+            continue
+        owners: list[int] = []
+        for month, (cx0, cy0, cx1, cy1) in source_cells.items():
+            x_overlap = max(0.0, min(tx1, cx1) - max(tx0, cx0))
+            y_overlap = max(0.0, min(ty1, cy1) - max(ty0, cy0))
+            cell_height = cy1 - cy0
+            if (
+                x_overlap / token_width >= 0.80
+                and y_overlap / min(token_height, cell_height) >= 0.70
+                and cx0 <= token.center[0] <= cx1
+                and cy0 <= token.center[1] <= cy1
+            ):
+                owners.append(month)
+        if len(owners) == 1:
+            owned[owners[0]].append(token)
+
+    selected = {month: month_tokens[0] for month, month_tokens in owned.items() if len(month_tokens) == 1}
+    source_key_months: dict[str, list[int]] = {}
+    for month, token in selected.items():
+        source_key = str(token.source_token_id or token.token_id or "")
+        source_key_months.setdefault(source_key, []).append(month)
+    reused_source_keys = {
+        source_key
+        for source_key, source_months in source_key_months.items()
+        if not source_key or len(source_months) != 1
+    }
+    return {
+        month: token
+        for month, token in selected.items()
+        if str(token.source_token_id or token.token_id or "") not in reused_source_keys
+    }
+
+
+def _candidate_b_merge_exact_source_zero_amounts(
+    amount_pairing: dict[str, Any],
+    tokens: list[OCRToken],
+    year_line: dict[str, Any],
+    *,
+    source_lattice: SourceTableMonthLattice,
+    active_months: list[int],
+    source_geometry_months: set[int],
+    page: int,
+    base_page_height: float | None,
+) -> dict[str, Any]:
+    """Repair only missing/blank amount fields proved by exact zero atoms."""
+
+    eligible_months = [month for month in active_months if month in source_geometry_months]
+    exact_zeros = _candidate_b_exact_source_zero_amount_tokens(
+        tokens,
+        source_lattice=source_lattice,
+        active_months=eligible_months,
+        page=page,
+        base_page_height=base_page_height,
+    )
+    cell_status = dict(amount_pairing.get("cell_status_by_month") or {})
+    repairable_statuses = {
+        "blank_amount_cell",
+        "missing_amount_row",
+        "non_immediate_amount_row",
+    }
+    repaired = {
+        month: token
+        for month, token in exact_zeros.items()
+        if str(cell_status.get(str(month)) or "missing_amount_row") in repairable_statuses
+    }
+    if not repaired:
+        return amount_pairing
+
+    for month in repaired:
+        cell_status[str(month)] = "exact"
+    merged_tokens = list(amount_pairing.get("tokens") or ()) + [repaired[month] for month in sorted(repaired)]
+    amount_line = amount_pairing.get("line")
+    if not isinstance(amount_line, dict):
+        boxes = [source_lattice.amount_bboxes[month - 1] for month in sorted(repaired)]
+        logical_page = int(source_lattice.logical_page)
+        shift = float(base_page_height or 0.0) if logical_page != page else 0.0
+        amount_line = {
+            "idx": int(year_line["idx"]),
+            "text": " ".join("0" for _month in sorted(repaired)),
+            "bbox": [
+                min(float(box[0]) for box in boxes),
+                min(float(box[1]) for box in boxes) + shift,
+                max(float(box[2]) for box in boxes),
+                max(float(box[3]) for box in boxes) + shift,
+            ],
+            "confidence": min(float(token.confidence) for token in repaired.values()),
+            "source_logical_page": logical_page,
+            "amount_source_line_indices": [],
+        }
+
+    complete = all(str(cell_status.get(str(month)) or "") == "exact" for month in active_months)
+    return {
+        **amount_pairing,
+        "status": ("exact" if complete else "field_local_exact_source_zero_repair"),
+        "row_relation": (
+            "exact_source_zero_cells" if complete else str(amount_pairing.get("row_relation") or "unresolved")
+        ),
+        "line": amount_line,
+        "tokens": merged_tokens,
+        "cell_status_by_month": cell_status,
+        "exact_source_zero_months": sorted(repaired),
+    }
+
+
+def _candidate_b_sparse_exact_source_status_row(
+    tokens: list[OCRToken],
+    year_line: dict[str, Any],
+    *,
+    source_tables: list[Mapping[str, Any]],
+    logical_page: int,
+    expected_year: int,
+    active_months: list[int],
+    year_bbox: BBox,
+    status_charset: set[str],
+    page: int,
+    base_page_height: float | None,
+    fallback_status_tokens: list[OCRToken] | None = None,
+) -> dict[str, Any] | None:
+    """Recover exact sibling cells when one damaged cell blocks a whole row.
+
+    Each month must independently resolve to the same value-free native table
+    row.  Only the jointly re-resolved subset is exposed to token ownership;
+    ambiguous or merged cells remain unresolved and cannot lend geometry to a
+    sibling.
+    """
+
+    lattices_by_month: dict[int, SourceTableMonthLattice] = {}
+    identities: set[tuple[str, int, int, int, int]] = set()
+    for month in active_months:
+        lattice = resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+            source_tables,
+            logical_page=logical_page,
+            expected_year=expected_year,
+            active_months=(month,),
+            year_bbox=year_bbox,
+        )
+        if lattice is None:
+            continue
+        identity = (
+            lattice.table_id,
+            lattice.logical_page,
+            lattice.year_anchor_row_index,
+            lattice.status_row_index,
+            lattice.amount_row_index,
+        )
+        identities.add(identity)
+        lattices_by_month[month] = lattice
+    if not lattices_by_month or len(identities) != 1:
+        return None
+
+    geometry_months = sorted(lattices_by_month)
+    aggregate_lattice = resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+        source_tables,
+        logical_page=logical_page,
+        expected_year=expected_year,
+        active_months=geometry_months,
+        year_bbox=year_bbox,
+    )
+    if aggregate_lattice is None:
+        return None
+    aggregate_identity = (
+        aggregate_lattice.table_id,
+        aggregate_lattice.logical_page,
+        aggregate_lattice.year_anchor_row_index,
+        aggregate_lattice.status_row_index,
+        aggregate_lattice.amount_row_index,
+    )
+    if aggregate_identity not in identities:
+        return None
+
+    repaired = _candidate_b_exact_active_source_status_row(
+        tokens,
+        year_line,
+        source_lattice=aggregate_lattice,
+        active_months=geometry_months,
+        status_charset=status_charset,
+        page=page,
+        base_page_height=base_page_height,
+        fallback_status_tokens=fallback_status_tokens,
+    )
+    if repaired is None:
+        return None
+    unresolved = {
+        int(value)
+        for value in repaired.get("candidate_b_status_unresolved_months", ())
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    repaired["candidate_b_status_unresolved_months"] = sorted(
+        set(active_months).difference(geometry_months) | unresolved
+    )
+    repaired["candidate_b_sparse_source_lattice"] = aggregate_lattice
+    repaired["candidate_b_sparse_geometry_months"] = geometry_months
+    repaired["candidate_b_status_row_repair"] = "exact_sparse_source_lattice_token_ownership"
+    return repaired
 
 
 def _numeric_amount_groups(text: Any) -> list[str]:
@@ -1848,9 +2365,7 @@ def _candidate_b_year_block_pitch(
 
     status_gap: float | None = None
     if status_line is not None:
-        status_center = (
-            float(status_line["bbox"][1]) + float(status_line["bbox"][3])
-        ) / 2.0
+        status_center = (float(status_line["bbox"][1]) + float(status_line["bbox"][3])) / 2.0
         if status_center < year_center:
             status_gap = year_center - status_center
 
@@ -1886,8 +2401,7 @@ def _candidate_b_fragment_months(
         owners = [
             int(col["header"])
             for col in month_cols
-            if int(col["header"]) in active_months
-            and float(col["bbox"][0]) <= center_x <= float(col["bbox"][2])
+            if int(col["header"]) in active_months and float(col["bbox"][0]) <= center_x <= float(col["bbox"][2])
         ]
         if len(owners) != 1:
             return None
@@ -1907,9 +2421,7 @@ def _candidate_b_fragment_months(
         )
         >= 0.2
     ]
-    if not spanned or any(
-        right != left + 1 for left, right in zip(spanned, spanned[1:])
-    ):
+    if not spanned or any(right != left + 1 for left, right in zip(spanned, spanned[1:])):
         return None
     return spanned
 
@@ -1955,10 +2467,7 @@ def _candidate_b_unique_amount_fragment_cover(
     if not slot_candidates:
         return None
 
-    centers = [
-        (float(line["bbox"][1]) + float(line["bbox"][3])) / 2.0
-        for line in slot_candidates
-    ]
+    centers = [(float(line["bbox"][1]) + float(line["bbox"][3])) / 2.0 for line in slot_candidates]
     if max(centers) - min(centers) > max(4.0, 0.35 * pitch):
         return None
     row_y0 = min(float(line["bbox"][1]) for line in slot_candidates)
@@ -1985,11 +2494,7 @@ def _candidate_b_unique_amount_fragment_cover(
             active_months=active_months,
             median_month_width=median_month_width,
         )
-        if (
-            spanned is None
-            or previous_last_month is not None
-            and spanned[0] <= previous_last_month
-        ):
+        if spanned is None or previous_last_month is not None and spanned[0] <= previous_last_month:
             return None
         line_tokens = _amount_sequence_tokens(
             line.get("text"),
@@ -2035,8 +2540,7 @@ def _candidate_b_unique_amount_fragment_cover(
         "source_line_indices": [int(line["idx"]) for line in row_lines],
         "observed_texts": [str(line.get("text") or "") for line in row_lines],
         "cell_status_by_month": {
-            str(month): "exact" if month in tokens_by_month else "blank_amount_cell"
-            for month in active_months
+            str(month): "exact" if month in tokens_by_month else "blank_amount_cell" for month in active_months
         },
     }
 
@@ -2060,11 +2564,37 @@ def _candidate_b_amount_row_pair(
     """
 
     cols_by_month = {int(col["header"]): col for col in month_cols}
+    owned_active_months = [month for month in active_months if month in cols_by_month]
+    unowned_active_months = sorted(set(active_months).difference(owned_active_months))
+
+    def retain_month_geometry_ownership(pairing: dict[str, Any]) -> dict[str, Any]:
+        if not unowned_active_months:
+            return pairing
+        cell_status_by_month = dict(pairing.get("cell_status_by_month") or {})
+        cell_status_by_month.update(
+            {str(month): "month_geometry_unowned" for month in unowned_active_months}
+        )
+        return {
+            **pairing,
+            "cell_status_by_month": cell_status_by_month,
+            "unowned_geometry_months": unowned_active_months,
+        }
+
+    if not owned_active_months:
+        return {
+            "status": "month_geometry_unowned",
+            "row_relation": "unresolved",
+            "source_line_indices": [],
+            "observed_texts": [],
+            "tokens": [],
+            "cell_status_by_month": {
+                str(month): "month_geometry_unowned" for month in active_months
+            },
+            "unowned_geometry_months": unowned_active_months,
+        }
     year_match = _YEAR_RE.match(str(year_line.get("text") or "").strip())
     year_remainder = (
-        _YEAR_RE.sub("", str(year_line.get("text") or "").strip(), count=1)
-        if year_match is not None
-        else ""
+        _YEAR_RE.sub("", str(year_line.get("text") or "").strip(), count=1) if year_match is not None else ""
     )
     year_y0 = float(year_line["bbox"][1])
     year_y1 = float(year_line["bbox"][3])
@@ -2081,16 +2611,14 @@ def _candidate_b_amount_row_pair(
             source_line_index=int(year_line["idx"]),
         )
         if remainder_tokens is None:
-            return {
+            return retain_month_geometry_ownership({
                 "status": "ambiguous_year_remainder",
                 "row_relation": "year_line_remainder",
                 "source_line_indices": [int(year_line["idx"])],
                 "observed_texts": [year_remainder],
                 "tokens": [],
-                "cell_status_by_month": {
-                    str(month): "ambiguous_sequence_cardinality" for month in active_months
-                },
-            }
+                "cell_status_by_month": {str(month): "ambiguous_sequence_cardinality" for month in active_months},
+            })
         active_cols = [cols_by_month[month] for month in active_months if month in cols_by_month]
         amount_line = {
             **year_line,
@@ -2103,7 +2631,7 @@ def _candidate_b_amount_row_pair(
             ],
             "amount_source_line_indices": [int(year_line["idx"])],
         }
-        return {
+        return retain_month_geometry_ownership({
             "status": "exact",
             "row_relation": "year_line_remainder",
             "line": amount_line,
@@ -2111,7 +2639,7 @@ def _candidate_b_amount_row_pair(
             "source_line_indices": [int(year_line["idx"])],
             "observed_texts": [year_remainder],
             "cell_status_by_month": {str(month): "exact" for month in active_months},
-        }
+        })
 
     month_x0 = min(float(col["bbox"][0]) for col in month_cols)
     month_x1 = max(float(col["bbox"][2]) for col in month_cols)
@@ -2141,12 +2669,8 @@ def _candidate_b_amount_row_pair(
         height = max(1.0, float(line["bbox"][3]) - float(line["bbox"][1]))
         selected: list[dict[str, Any]] | None = None
         for cluster in clusters:
-            cluster_centers = [
-                (float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0 for item in cluster
-            ]
-            cluster_heights = [
-                max(1.0, float(item["bbox"][3]) - float(item["bbox"][1])) for item in cluster
-            ]
+            cluster_centers = [(float(item["bbox"][1]) + float(item["bbox"][3])) / 2.0 for item in cluster]
+            cluster_heights = [max(1.0, float(item["bbox"][3]) - float(item["bbox"][1])) for item in cluster]
             tolerance = max(3.0, 0.6 * max(height, sum(cluster_heights) / len(cluster_heights)))
             if abs(center - sum(cluster_centers) / len(cluster_centers)) <= tolerance:
                 selected = cluster
@@ -2167,19 +2691,21 @@ def _candidate_b_amount_row_pair(
             page=page,
         )
         if fragment_cover is not None:
-            return fragment_cover
-        status = "ambiguous_immediate_rows" if clusters else (
-            "non_immediate_amount_row" if non_immediate else "missing_amount_row"
+            return retain_month_geometry_ownership(fragment_cover)
+        status = (
+            "ambiguous_immediate_rows"
+            if clusters
+            else ("non_immediate_amount_row" if non_immediate else "missing_amount_row")
         )
         candidates = [item for cluster in clusters for item in cluster] or non_immediate
-        return {
+        return retain_month_geometry_ownership({
             "status": status,
             "row_relation": "unresolved",
             "source_line_indices": [int(item["idx"]) for item in candidates],
             "observed_texts": [str(item.get("text") or "") for item in candidates],
             "tokens": [],
             "cell_status_by_month": {str(month): status for month in active_months},
-        }
+        })
 
     row_lines = sorted(clusters[0], key=lambda item: float(item["bbox"][0]))
     row_y0 = min(float(line["bbox"][1]) for line in row_lines)
@@ -2213,12 +2739,7 @@ def _candidate_b_amount_row_pair(
             nearest = min(
                 (int(col["header"]) for col in month_cols),
                 key=lambda month: abs(
-                    center_x
-                    - (
-                        float(cols_by_month[month]["bbox"][0])
-                        + float(cols_by_month[month]["bbox"][2])
-                    )
-                    / 2.0
+                    center_x - (float(cols_by_month[month]["bbox"][0]) + float(cols_by_month[month]["bbox"][2])) / 2.0
                 ),
                 default=None,
             )
@@ -2238,8 +2759,7 @@ def _candidate_b_amount_row_pair(
                 if int(col["header"]) in active_months
                 and max(
                     0.0,
-                    min(lx1, float(col["bbox"][2]))
-                    - max(lx0, float(col["bbox"][0])),
+                    min(lx1, float(col["bbox"][2])) - max(lx0, float(col["bbox"][0])),
                 )
                 / min(
                     line_width,
@@ -2268,14 +2788,10 @@ def _candidate_b_amount_row_pair(
     tokens_by_month: dict[int, list[OCRToken]] = {}
     for token in tokens:
         month = min(
-            active_months,
+            owned_active_months,
             key=lambda value: abs(
                 token.center[0]
-                - (
-                    float(cols_by_month[value]["bbox"][0])
-                    + float(cols_by_month[value]["bbox"][2])
-                )
-                / 2.0
+                - (float(cols_by_month[value]["bbox"][0]) + float(cols_by_month[value]["bbox"][2])) / 2.0
             ),
         )
         tokens_by_month.setdefault(month, []).append(token)
@@ -2293,7 +2809,7 @@ def _candidate_b_amount_row_pair(
         )
         for month in active_months
     }
-    return {
+    return retain_month_geometry_ownership({
         "status": "exact",
         "row_relation": "aligned_or_immediate_after_year",
         "line": row_line,
@@ -2301,7 +2817,7 @@ def _candidate_b_amount_row_pair(
         "source_line_indices": [int(line["idx"]) for line in row_lines],
         "observed_texts": [str(line.get("text") or "") for line in row_lines],
         "cell_status_by_month": cell_status_by_month,
-    }
+    })
 
 
 def _month_observations(line: dict[str, Any]) -> list[tuple[int, float]]:
@@ -2361,10 +2877,7 @@ def _word_center_month_header(
         height = y1 - y0
         selected: list[tuple[dict[str, Any], list[tuple[int, float]]]] | None = None
         for cluster in clusters:
-            cluster_centers = [
-                (float(item[0]["bbox"][1]) + float(item[0]["bbox"][3])) / 2.0
-                for item in cluster
-            ]
+            cluster_centers = [(float(item[0]["bbox"][1]) + float(item[0]["bbox"][3])) / 2.0 for item in cluster]
             cluster_heights = [float(item[0]["bbox"][3]) - float(item[0]["bbox"][1]) for item in cluster]
             tolerance = max(3.0, 0.65 * max(height, sum(cluster_heights) / len(cluster_heights)))
             if abs(center - sum(cluster_centers) / len(cluster_centers)) <= tolerance:
@@ -2384,9 +2897,7 @@ def _word_center_month_header(
         if len(by_month) < 8 or min(by_month) > 2 or max(by_month) < 11:
             continue
         centres_by_month = {
-            month: sorted(values)[len(values) // 2]
-            for month, values in by_month.items()
-            if month in range(1, 13)
+            month: sorted(values)[len(values) // 2] for month, values in by_month.items() if month in range(1, 13)
         }
         ordered = sorted(centres_by_month.items())
         if any(right[1] <= left[1] for left, right in zip(ordered, ordered[1:])):
@@ -2426,15 +2937,9 @@ def _word_center_month_header(
             ),
             "month_header_observed_count": len(centres_by_month),
             "month_header_max_residual": round(max_residual, 4),
-            "month_header_source_line_indices": [
-                int(line["idx"]) for line in cluster_lines
-            ],
+            "month_header_source_line_indices": [int(line["idx"]) for line in cluster_lines],
         }
-        logical_pages = {
-            int(line["source_logical_page"])
-            for line in cluster_lines
-            if line.get("source_logical_page")
-        }
+        logical_pages = {int(line["source_logical_page"]) for line in cluster_lines if line.get("source_logical_page")}
         if len(logical_pages) == 1:
             header["source_logical_page"] = next(iter(logical_pages))
         candidates.append(((len(centres_by_month), -max_residual), header))
@@ -2504,12 +3009,8 @@ def reconstruct_repayment_micro_grid_from_lines(
     line_items = _line_items(lines)
     status_charset = _STATUS_CHARS | {str(item) for item in extra_status_chars if str(item)}
     zero_overdue_statuses = _ZERO_OVERDUE_STATUSES | ({"A"} if "A" in status_charset else set())
-    static_sensitive_statuses = {"N", "*"} | (
-        {"C"} if enable_candidate_b_amount_pairing else set()
-    )
-    affirmative_continuation_pages = {
-        int(value) for value in continuation_logical_pages if int(value) > 0
-    }
+    static_sensitive_statuses = {"N", "*"} | ({"C"} if enable_candidate_b_amount_pairing else set())
+    affirmative_continuation_pages = {int(value) for value in continuation_logical_pages if int(value) > 0}
     evidence_tokens = _coerce_tokens(tokens, page=page)
     candidates = detect_micro_grid_candidates(
         evidence_tokens,
@@ -2532,18 +3033,13 @@ def reconstruct_repayment_micro_grid_from_lines(
     anchor, (start_year, start_month, end_year, end_month) = found
     ax0, ay0, ax1, ay1 = anchor["bbox"]
     exact_header_line = _find_month_header(line_items, anchor, page_width=page_width)
-    header_line = exact_header_line or _line_after(
-        line_items, ay1, x_min=ax0 - 220, x_max=ax1 + 260, max_gap=35.0
-    )
+    header_line = exact_header_line or _line_after(line_items, ay1, x_min=ax0 - 220, x_max=ax1 + 260, max_gap=35.0)
     header_alignment_exact = bool(
         exact_header_line is not None
-        and exact_header_line.get("month_header_geometry")
-        in {"merged_line_exact", "word_center_sequence_exact"}
+        and exact_header_line.get("month_header_geometry") in {"merged_line_exact", "word_center_sequence_exact"}
     )
     header_spatial_lattice_exact = bool(
-        exact_header_line is not None
-        and exact_header_line.get("month_header_geometry")
-        == "word_center_sequence_exact"
+        exact_header_line is not None and exact_header_line.get("month_header_geometry") == "word_center_sequence_exact"
     )
     if header_line is None:
         return RepaymentExtraction(None, [], {"reason": "month_header_not_found", "anchor": anchor})
@@ -2587,17 +3083,9 @@ def reconstruct_repayment_micro_grid_from_lines(
         year_column_bbox=base_year_column_bbox,
         require_physical_month_ownership=enable_candidate_b_amount_pairing,
         max_right_shift_months=(1.10 if enable_candidate_b_amount_pairing else 0.55),
-        prefer_validated_header_lattice=bool(
-            enable_candidate_b_amount_pairing and header_alignment_exact
-        ),
-        retain_validated_header_on_residual=bool(
-            enable_candidate_b_amount_pairing and header_spatial_lattice_exact
-        ),
-        max_residual_shift_months=(
-            0.5
-            if enable_candidate_b_amount_pairing and header_alignment_exact
-            else None
-        ),
+        prefer_validated_header_lattice=bool(enable_candidate_b_amount_pairing and header_alignment_exact),
+        retain_validated_header_on_residual=bool(enable_candidate_b_amount_pairing and header_spatial_lattice_exact),
+        max_residual_shift_months=(0.5 if enable_candidate_b_amount_pairing and header_alignment_exact else None),
     )
     if visual_month_cols:
         month_cols = visual_month_cols
@@ -2678,12 +3166,36 @@ def reconstruct_repayment_micro_grid_from_lines(
 
     records: list[dict[str, Any]] = []
     record_months = set(_months_between(start_year, start_month, end_year, end_month))
-    header_source_indices = {
-        int(value) for value in header_line.get("month_header_source_line_indices") or ()
-    }
+    header_source_indices = {int(value) for value in header_line.get("month_header_source_line_indices") or ()}
     header_source_indices.add(int(header_line["idx"]))
+    source_tables_cache: dict[int, list[Mapping[str, Any]]] = {}
+
+    def source_tables_for(logical_page: int) -> list[Mapping[str, Any]]:
+        cached = source_tables_cache.get(logical_page)
+        if cached is not None:
+            return cached
+        raw_source_tables = (
+            source_table_geometry_by_page.get(logical_page) if source_table_geometry_by_page is not None else None
+        )
+        if raw_source_tables is None and source_table_geometry_by_page is not None:
+            raw_source_tables = source_table_geometry_by_page.get(str(logical_page))
+        normalized = (
+            [table for table in raw_source_tables if isinstance(table, Mapping)]
+            if isinstance(raw_source_tables, Iterable) and not isinstance(raw_source_tables, (str, bytes, Mapping))
+            else []
+        )
+        source_tables_cache[logical_page] = normalized
+        return normalized
+
     status_lines_by_year_index: dict[int, dict[str, Any]] = {}
     for candidate_year_line in years:
+        candidate_year_match = _YEAR_RE.match(str(candidate_year_line.get("text") or "").strip())
+        candidate_year = int(candidate_year_match.group(0)) if candidate_year_match is not None else None
+        candidate_active_months = (
+            [month for observed_year, month in sorted(record_months) if observed_year == candidate_year]
+            if candidate_year is not None
+            else []
+        )
         candidate_status_line = (
             _candidate_b_status_row(
                 line_items,
@@ -2702,6 +3214,78 @@ def reconstruct_repayment_micro_grid_from_lines(
                 max_gap=55.0,
             )
         )
+        if (
+            enable_candidate_b_amount_pairing
+            and candidate_year is not None
+            and candidate_active_months
+            and source_table_geometry_by_page is not None
+        ):
+            candidate_logical_page = int(candidate_year_line.get("source_logical_page") or page)
+            if candidate_logical_page == page or candidate_logical_page in affirmative_continuation_pages:
+                candidate_source_tables = source_tables_for(candidate_logical_page)
+                candidate_year_bbox = _local_page_bbox(
+                    tuple(float(value) for value in candidate_year_line["bbox"]),
+                    logical_page=candidate_logical_page,
+                    base_page=page,
+                    base_page_height=page_height,
+                )
+                candidate_source_lattice = (
+                    resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+                        candidate_source_tables,
+                        logical_page=candidate_logical_page,
+                        expected_year=candidate_year,
+                        active_months=candidate_active_months,
+                        year_bbox=candidate_year_bbox,
+                    )
+                    if candidate_source_tables
+                    else None
+                )
+                fallback_status_tokens = (
+                    list(candidate_status_line.get("candidate_b_status_tokens"))
+                    if isinstance(candidate_status_line, Mapping)
+                    and isinstance(
+                        candidate_status_line.get("candidate_b_status_tokens"),
+                        list,
+                    )
+                    else None
+                )
+                exact_source_status_line = None
+                if candidate_source_lattice is not None:
+                    exact_source_status_line = _candidate_b_exact_active_source_status_row(
+                        evidence_tokens,
+                        candidate_year_line,
+                        source_lattice=candidate_source_lattice,
+                        active_months=candidate_active_months,
+                        status_charset=status_charset,
+                        page=page,
+                        base_page_height=page_height,
+                        fallback_status_tokens=fallback_status_tokens,
+                    )
+                    if exact_source_status_line is not None:
+                        exact_source_status_line["candidate_b_sparse_source_lattice"] = candidate_source_lattice
+                        exact_source_status_line["candidate_b_sparse_geometry_months"] = list(
+                            exact_source_status_line.get("candidate_b_status_token_months") or ()
+                        )
+                elif candidate_source_tables:
+                    exact_source_status_line = _candidate_b_sparse_exact_source_status_row(
+                        evidence_tokens,
+                        candidate_year_line,
+                        source_tables=candidate_source_tables,
+                        logical_page=candidate_logical_page,
+                        expected_year=candidate_year,
+                        active_months=candidate_active_months,
+                        year_bbox=candidate_year_bbox,
+                        status_charset=status_charset,
+                        page=page,
+                        base_page_height=page_height,
+                        fallback_status_tokens=fallback_status_tokens,
+                    )
+                if exact_source_status_line is not None:
+                    # A line-level candidate can be only a surviving fragment
+                    # of the printed row. Independently source-owned cells are
+                    # stronger evidence and remain field-local when a sibling
+                    # cell's geometry is damaged.
+                    candidate_status_line = exact_source_status_line
         if (
             candidate_status_line is None
             or candidate_status_line is header_line
@@ -2732,6 +3316,11 @@ def reconstruct_repayment_micro_grid_from_lines(
     static_status_unresolved = 0
     static_status_unavailable = 0
     static_template_consensus_resolved = 0
+    static_amount_zero_attempts = 0
+    static_amount_zero_resolved = 0
+    static_amount_zero_corrections = 0
+    static_amount_zero_unresolved = 0
+    static_amount_zero_unavailable = 0
     status_templates: dict[str, list[Any]] = {}
     static_status_seeds: dict[str, list[dict[str, Any]]] = {}
     static_status_contradictions: set[str] = set()
@@ -2742,9 +3331,7 @@ def reconstruct_repayment_micro_grid_from_lines(
         tuple[int, int, float, float, tuple[int, ...], tuple[float, float]],
         tuple[list[dict[str, Any]], dict[str, Any]],
     ] = {}
-    visual_geometry_audit_by_page: dict[str, dict[str, Any]] = {
-        str(page): dict(visual_geometry_audit)
-    }
+    visual_geometry_audit_by_page: dict[str, dict[str, Any]] = {str(page): dict(visual_geometry_audit)}
 
     for year_line in years:
         year_match = _YEAR_RE.match(year_line["text"].strip())
@@ -2753,9 +3340,7 @@ def reconstruct_repayment_micro_grid_from_lines(
         year = int(year_match.group(0))
         status_line = status_lines_by_year_index.get(int(year_line["idx"]))
         if (
-            status_line is None
-            or status_line is header_line
-            or "还款记录" in status_line["text"]
+            status_line is None or status_line is header_line or "还款记录" in status_line["text"]
         ) and not enable_candidate_b_amount_pairing:
             status_line = _line_after(
                 line_items, year_line["bbox"][1], x_min=grid_x0 - 10, x_max=grid_x1 + 10, max_gap=55.0
@@ -2828,60 +3413,33 @@ def reconstruct_repayment_micro_grid_from_lines(
                             y0=max(0.0, row_local_bbox[1]),
                             y1=min(row_height, row_local_bbox[3]),
                             year_column_bbox=continuation_year_bbox,
-                            require_physical_month_ownership=(
-                                enable_candidate_b_amount_pairing
-                            ),
+                            require_physical_month_ownership=(enable_candidate_b_amount_pairing),
                             max_left_shift_months=1.85,
-                            max_right_shift_months=(
-                                1.85 if enable_candidate_b_amount_pairing else 0.55
-                            ),
+                            max_right_shift_months=(1.85 if enable_candidate_b_amount_pairing else 0.55),
                             prefer_validated_header_lattice=bool(
-                                enable_candidate_b_amount_pairing
-                                and header_alignment_exact
+                                enable_candidate_b_amount_pairing and header_alignment_exact
                             ),
                             # A header observed on the base page is not evidence
                             # for a continuation page's physical cell ownership.
                             retain_validated_header_on_residual=False,
-                            allow_unowned_header_fallback=(
-                                not enable_candidate_b_amount_pairing
-                            ),
+                            allow_unowned_header_fallback=(not enable_candidate_b_amount_pairing),
                             max_residual_shift_months=(
-                                0.5
-                                if enable_candidate_b_amount_pairing
-                                and header_alignment_exact
-                                else None
+                                0.5 if enable_candidate_b_amount_pairing and header_alignment_exact else None
                             ),
                         )
                         continuation_visual_cols_cache[cache_key] = cached_geometry
                     year_visual_cols, row_geometry_audit = cached_geometry
         source_lattice: SourceTableMonthLattice | None = None
+        complete_source_lattice = False
+        source_geometry_months = set(active_months)
         source_status_row_y: tuple[float, float] | None = None
         source_amount_row_y: tuple[float, float] | None = None
         if (
             enable_candidate_b_amount_pairing
-            and (
-                status_logical_page == page
-                or status_logical_page in affirmative_continuation_pages
-            )
+            and (status_logical_page == page or status_logical_page in affirmative_continuation_pages)
             and source_table_geometry_by_page is not None
         ):
-            raw_source_tables = source_table_geometry_by_page.get(
-                status_logical_page
-            )
-            if raw_source_tables is None:
-                raw_source_tables = source_table_geometry_by_page.get(
-                    str(status_logical_page)
-                )
-            source_tables = (
-                [
-                    table
-                    for table in raw_source_tables
-                    if isinstance(table, Mapping)
-                ]
-                if isinstance(raw_source_tables, Iterable)
-                and not isinstance(raw_source_tables, (str, bytes, Mapping))
-                else []
-            )
+            source_tables = source_tables_for(status_logical_page)
             source_lattice = (
                 resolve_unique_source_table_year_plus_twelve_ownership(
                     source_tables,
@@ -2904,31 +3462,98 @@ def reconstruct_repayment_micro_grid_from_lines(
                 if source_tables
                 else None
             )
+            complete_source_lattice = source_lattice is not None
+            sparse_lattice = status_line.get("candidate_b_sparse_source_lattice")
+            sparse_months = status_line.get("candidate_b_sparse_geometry_months")
+            normalized_sparse_months = {
+                int(value)
+                for value in sparse_months or ()
+                if isinstance(value, int) and not isinstance(value, bool) and value in active_months
+            }
+            if (
+                isinstance(sparse_lattice, SourceTableMonthLattice)
+                and sparse_lattice.logical_page == status_logical_page
+                and sparse_lattice.expected_year == year
+                and normalized_sparse_months
+            ):
+                if source_lattice is None:
+                    source_lattice = sparse_lattice
+                source_geometry_months = normalized_sparse_months
         if source_lattice is not None:
-            source_month_cols = _source_lattice_month_cols(source_lattice)
+            full_source_month_cols = [
+                col
+                for col in _source_lattice_month_cols(source_lattice)
+                if int(col["header"]) in active_months
+            ]
+            source_month_cols = [
+                col for col in full_source_month_cols if int(col["header"]) in source_geometry_months
+            ]
+            source_comparison_cols = (
+                full_source_month_cols if complete_source_lattice else source_month_cols
+            )
             visual_physical_lattice = bool(
                 year_visual_cols
                 and row_geometry_audit.get("usable") is not False
-                and row_geometry_audit.get("source")
-                == "vertical_rule_projection"
+                and row_geometry_audit.get("source") == "vertical_rule_projection"
             )
             visual_requires_source = bool(
-                visual_physical_lattice
-                and _candidate_b_visual_lattice_needs_source_table(
-                    row_geometry_audit
-                )
+                visual_physical_lattice and _candidate_b_visual_lattice_needs_source_table(row_geometry_audit)
             )
             visual_source_agree = bool(
                 visual_physical_lattice
                 and _month_geometry_planes_agree(
                     year_visual_cols,
-                    source_month_cols,
+                    source_comparison_cols,
                 )
             )
+            repaired_status_tokens = status_line.get("candidate_b_status_tokens")
+            repaired_status_months = status_line.get("candidate_b_status_token_months")
+            declared_exact_status_months = status_line.get(
+                "candidate_b_exact_source_status_months"
+            )
+            exact_status_atom_months = (
+                {
+                    int(month)
+                    for month in declared_exact_status_months
+                    if isinstance(month, int)
+                    and not isinstance(month, bool)
+                    and month in active_months
+                }
+                if isinstance(declared_exact_status_months, (list, tuple, set))
+                else {
+                    int(month)
+                    for month, token in zip(
+                        repaired_status_months or (),
+                        repaired_status_tokens or (),
+                        strict=False,
+                    )
+                    if isinstance(month, int)
+                    and not isinstance(month, bool)
+                    and isinstance(token, OCRToken)
+                    and token.source in _EXACT_SOURCE_STATUS_CELL_SOURCES
+                }
+            )
+            strong_visual_source_conflict = bool(
+                visual_physical_lattice and not visual_source_agree and not visual_requires_source
+            )
+            exact_atom_source_override = False
+            if strong_visual_source_conflict:
+                source_geometry_months &= exact_status_atom_months
+                source_month_cols = [
+                    col
+                    for col in source_comparison_cols
+                    if int(col["header"]) in source_geometry_months
+                ]
+                exact_atom_source_override = bool(source_month_cols)
+            elif complete_source_lattice:
+                # A complete source table is compared as a complete plane.  A
+                # partial set of field-repair atoms must not make corroborated
+                # or ambiguity-resolving sibling columns disappear.
+                source_geometry_months = set(active_months)
+                source_month_cols = full_source_month_cols
             if (
-                visual_physical_lattice
-                and not visual_source_agree
-                and not visual_requires_source
+                strong_visual_source_conflict
+                and not exact_atom_source_override
             ):
                 row_geometry_audit = {
                     "source": "rejected_month_geometry",
@@ -2939,9 +3564,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                         else "source_table_month_geometry_plane_conflict"
                     ),
                     "visual_edges": _month_geometry_edges(year_visual_cols),
-                    "source_table_edges": _month_geometry_edges(
-                        source_month_cols
-                    ),
+                    "source_table_edges": _month_geometry_edges(source_comparison_cols),
                     "source_table_id": source_lattice.table_id,
                     "source_table_comparison": "disagree",
                     "value_inputs_used": False,
@@ -2972,18 +3595,12 @@ def reconstruct_repayment_micro_grid_from_lines(
                     **source_provenance,
                     "source": "source_table_geometry",
                     "usable": True,
-                    "selection_basis": (
-                        "source_table_year_plus_twelve_ownership"
-                    ),
+                    "selection_basis": ("source_table_year_plus_twelve_ownership"),
                     "reason": "exact_source_table_month_lattice_calibration",
                     "table_id": source_lattice.table_id,
-                    "continuation_logical_page": (
-                        status_logical_page if status_logical_page != page else None
-                    ),
+                    "continuation_logical_page": (status_logical_page if status_logical_page != page else None),
                     "logical_page": status_logical_page,
-                    "vertical_rule_count": int(
-                        source_provenance.get("rule_count") or 14
-                    ),
+                    "vertical_rule_count": int(source_provenance.get("rule_count") or 14),
                     "column_count": 13,
                     "status_row_index": source_lattice.status_row_index,
                     "amount_row_index": source_lattice.amount_row_index,
@@ -2992,34 +3609,25 @@ def reconstruct_repayment_micro_grid_from_lines(
                         "agree"
                         if visual_source_agree
                         else (
-                            "source_over_ambiguous_visual"
-                            if visual_requires_source
-                            else "source_only"
+                            "source_over_conflicting_visual_exact_cell_atoms"
+                            if exact_atom_source_override
+                            else ("source_over_ambiguous_visual" if visual_requires_source else "source_only")
                         )
                     ),
                     "calibrated_from_source_table_geometry": True,
-                    "corroborated_by_source_table_geometry": bool(
-                        visual_source_agree
+                    "corroborated_by_source_table_geometry": bool(visual_source_agree),
+                    "ambiguous_visual_geometry_superseded": bool(visual_requires_source and not visual_source_agree),
+                    "conflicting_visual_geometry_superseded": bool(
+                        exact_atom_source_override and not visual_source_agree
                     ),
-                    "ambiguous_visual_geometry_superseded": bool(
-                        visual_requires_source and not visual_source_agree
+                    "exact_source_atom_geometry_months": sorted(
+                        source_geometry_months if exact_atom_source_override else ()
                     ),
-                    "visual_selection_basis": row_geometry_audit.get(
-                        "selection_basis"
-                    ),
-                    "visual_owned_month_rule_hits": row_geometry_audit.get(
-                        "owned_month_rule_hits"
-                    ),
-                    "visual_residual_shift_months": row_geometry_audit.get(
-                        "residual_shift_months"
-                    ),
+                    "visual_selection_basis": row_geometry_audit.get("selection_basis"),
+                    "visual_owned_month_rule_hits": row_geometry_audit.get("owned_month_rule_hits"),
+                    "visual_residual_shift_months": row_geometry_audit.get("residual_shift_months"),
                 }
-        elif (
-            enable_candidate_b_amount_pairing
-            and _candidate_b_visual_lattice_needs_source_table(
-                row_geometry_audit
-            )
-        ):
+        elif enable_candidate_b_amount_pairing and _candidate_b_visual_lattice_needs_source_table(row_geometry_audit):
             rejected_visual_audit = dict(row_geometry_audit)
             year_visual_cols = []
             row_geometry_audit = {
@@ -3028,38 +3636,20 @@ def reconstruct_repayment_micro_grid_from_lines(
                 "reason": "source_table_month_ownership_required",
                 "logical_page": status_logical_page,
                 "value_inputs_used": False,
-                "visual_selection_basis": rejected_visual_audit.get(
-                    "selection_basis"
-                ),
-                "visual_owned_month_rule_hits": rejected_visual_audit.get(
-                    "owned_month_rule_hits"
-                ),
-                "visual_residual_shift_months": rejected_visual_audit.get(
-                    "residual_shift_months"
-                ),
+                "visual_selection_basis": rejected_visual_audit.get("selection_basis"),
+                "visual_owned_month_rule_hits": rejected_visual_audit.get("owned_month_rule_hits"),
+                "visual_residual_shift_months": rejected_visual_audit.get("residual_shift_months"),
             }
         if enable_candidate_b_amount_pairing:
-            visual_geometry_audit_by_page[str(status_logical_page)] = dict(
-                row_geometry_audit
-            )
-        row_month_geometry_exact = bool(
-            header_alignment_exact or source_lattice is not None
-        )
-        year_assignment_cols = (
-            year_visual_cols if enable_candidate_b_amount_pairing else month_cols
-        )
-        year_visual_cols_by_month = {
-            int(col["header"]): col for col in year_visual_cols
-        }
+            visual_geometry_audit_by_page[str(status_logical_page)] = dict(row_geometry_audit)
+        row_month_geometry_exact = bool(header_alignment_exact or source_lattice is not None)
+        year_assignment_cols = year_visual_cols if enable_candidate_b_amount_pairing else month_cols
+        year_visual_cols_by_month = {int(col["header"]): col for col in year_visual_cols}
         row_geometry_provenance = (
-            _accepted_month_geometry_provenance(row_geometry_audit)
-            if enable_candidate_b_amount_pairing
-            else {}
+            _accepted_month_geometry_provenance(row_geometry_audit) if enable_candidate_b_amount_pairing else {}
         )
         row_geometry_rejection = (
-            _rejected_month_geometry_provenance(row_geometry_audit)
-            if enable_candidate_b_amount_pairing
-            else {}
+            _rejected_month_geometry_provenance(row_geometry_audit) if enable_candidate_b_amount_pairing else {}
         )
         amount_pairing: dict[str, Any] | None = None
         amount_row_tokens: list[OCRToken] | None = None
@@ -3082,28 +3672,37 @@ def reconstruct_repayment_micro_grid_from_lines(
                     "source_line_indices": [],
                     "observed_texts": [],
                     "tokens": [],
-                    "cell_status_by_month": {
-                        str(month): "month_geometry_unowned"
-                        for month in active_months
-                    },
+                    "cell_status_by_month": {str(month): "month_geometry_unowned" for month in active_months},
                 }
+            if source_lattice is not None:
+                amount_pairing = _candidate_b_merge_exact_source_zero_amounts(
+                    amount_pairing,
+                    evidence_tokens,
+                    year_line,
+                    source_lattice=source_lattice,
+                    active_months=active_months,
+                    source_geometry_months=source_geometry_months,
+                    page=page,
+                    base_page_height=page_height,
+                )
             amount_line = amount_pairing.get("line")
             raw_amount_tokens = amount_pairing.get("tokens")
-            amount_row_tokens = (
-                list(raw_amount_tokens) if isinstance(raw_amount_tokens, list) else []
-            )
+            amount_row_tokens = list(raw_amount_tokens) if isinstance(raw_amount_tokens, list) else []
         else:
             # Shared callers retain their existing materialization. Candidate B
             # never falls back to treating the printed year as an amount row.
             year_remainder = _YEAR_RE.sub("", year_line["text"].strip(), count=1)
             amount_line = year_line
             if not re.search(r"\d", year_remainder):
-                amount_line = _explicit_amount_line_after_year(
-                    line_items,
-                    year_line,
-                    x_min=grid_x0 - 10,
-                    x_max=grid_x1 + 10,
-                ) or year_line
+                amount_line = (
+                    _explicit_amount_line_after_year(
+                        line_items,
+                        year_line,
+                        x_min=grid_x0 - 10,
+                        x_max=grid_x1 + 10,
+                    )
+                    or year_line
+                )
 
         row_pad = 0.0 if enable_candidate_b_amount_pairing else 3.0
         status_band = _row_band(
@@ -3131,22 +3730,15 @@ def reconstruct_repayment_micro_grid_from_lines(
             amount_band["bbox"][1] = source_amount_row_y[0]
             amount_band["bbox"][3] = source_amount_row_y[1]
         if enable_candidate_b_amount_pairing and amount_band is not None:
-            status_center = (
-                float(status_band["bbox"][1]) + float(status_band["bbox"][3])
-            ) / 2.0
-            amount_center = (
-                float(amount_band["bbox"][1]) + float(amount_band["bbox"][3])
-            ) / 2.0
+            status_center = (float(status_band["bbox"][1]) + float(status_band["bbox"][3])) / 2.0
+            amount_center = (float(amount_band["bbox"][1]) + float(amount_band["bbox"][3])) / 2.0
             if amount_center <= status_center + 0.5:
                 amount_pairing = {
                     **(amount_pairing or {}),
                     "status": "ambiguous_vertical_row_geometry",
                     "row_relation": "unresolved",
                     "tokens": [],
-                    "cell_status_by_month": {
-                        str(month): "ambiguous_vertical_row_geometry"
-                        for month in active_months
-                    },
+                    "cell_status_by_month": {str(month): "ambiguous_vertical_row_geometry" for month in active_months},
                 }
                 amount_row_tokens = []
                 amount_line = None
@@ -3157,9 +3749,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                 amount_band["bbox"][1] = max(float(amount_band["bbox"][1]), boundary)
         if enable_candidate_b_amount_pairing and amount_pairing is not None:
             amount_pairing_by_year[str(year)] = {
-                key: value
-                for key, value in amount_pairing.items()
-                if key not in {"line", "tokens"}
+                key: value for key, value in amount_pairing.items() if key not in {"line", "tokens"}
             }
         status_band["index"] = len(row_bands)
         row_bands.append(status_band)
@@ -3194,10 +3784,25 @@ def reconstruct_repayment_micro_grid_from_lines(
         hash_is_business_status = "#" in status_charset
         status_chars = [ch for ch in raw_status_text if ch in status_charset or ch == "#"]
         candidate_status_tokens = status_line.get("candidate_b_status_tokens")
+        source_repair_unresolved_months = {
+            int(value)
+            for value in status_line.get(
+                "candidate_b_status_unresolved_months",
+                (),
+            )
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+        source_repair_conflict_months = {
+            int(value)
+            for value in status_line.get(
+                "candidate_b_status_conflict_months",
+                (),
+            )
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
         status_row_tokens = (
             list(candidate_status_tokens)
-            if enable_candidate_b_amount_pairing
-            and isinstance(candidate_status_tokens, list)
+            if enable_candidate_b_amount_pairing and isinstance(candidate_status_tokens, list)
             else _expand_line_to_char_tokens(
                 {**status_line, "text": normalized_status_text},
                 page=page,
@@ -3222,24 +3827,16 @@ def reconstruct_repayment_micro_grid_from_lines(
                 if len(cell_tokens) == 1:
                     status_by_month[candidate_month] = cell_tokens[0].text
             observed_months = set(status_by_month)
-            exact_full_row = (
-                observed_months == set(range(1, 13))
-                and observed_status_token_count == 12
-            )
-            exact_active_row = (
-                observed_months == set(active_months)
-                and observed_status_token_count == len(active_months)
+            exact_full_row = observed_months == set(range(1, 13)) and observed_status_token_count == 12
+            exact_active_row = observed_months == set(active_months) and observed_status_token_count == len(
+                active_months
             )
             row_alignment_exact = bool(
                 (exact_full_row or exact_active_row)
                 and ("#" not in status_by_month.values() or hash_is_business_status)
             )
         elif year == end_year and len(status_chars) == 2 and set(status_chars) == {"N", "C"}:
-            status_by_month = (
-                {active_months[0]: "N", active_months[1]: "C"}
-                if len(active_months) == 2
-                else {}
-            )
+            status_by_month = {active_months[0]: "N", active_months[1]: "C"} if len(active_months) == 2 else {}
             row_alignment_exact = False
         elif len(status_chars) == 12:
             status_by_month = dict(zip(range(1, 13), status_chars))
@@ -3262,9 +3859,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                 else []
             )
         amount_assignments = (
-            _assign_row(amount_row_tokens, amount_band, year_assignment_cols)
-            if amount_band is not None
-            else {}
+            _assign_row(amount_row_tokens, amount_band, year_assignment_cols) if amount_band is not None else {}
         )
 
         for col in month_cols:
@@ -3272,14 +3867,11 @@ def reconstruct_repayment_micro_grid_from_lines(
             st_tokens = status_assignments.get(month, [])
             status_center_y = (float(status_line["bbox"][1]) + float(status_line["bbox"][3])) / 2.0
             if amount_line is not None:
-                amount_center_y = (
-                    float(amount_line["bbox"][1]) + float(amount_line["bbox"][3])
-                ) / 2.0
+                amount_center_y = (float(amount_line["bbox"][1]) + float(amount_line["bbox"][3])) / 2.0
                 st_tokens = [
                     token
                     for token in st_tokens
-                    if abs(token.center[1] - status_center_y)
-                    <= abs(token.center[1] - amount_center_y)
+                    if abs(token.center[1] - status_center_y) <= abs(token.center[1] - amount_center_y)
                 ]
             visual_col = year_visual_cols_by_month.get(month)
             owned_token_witness = (
@@ -3318,6 +3910,24 @@ def reconstruct_repayment_micro_grid_from_lines(
                     "observed_status_count": len(status_chars),
                     "active_months": list(active_months),
                     "logical_page": int(status_line.get("source_logical_page") or page),
+                    **(
+                        {"row_repair": status_line["candidate_b_status_row_repair"]}
+                        if status_line.get("candidate_b_status_row_repair")
+                        else {}
+                    ),
+                }
+            elif (
+                month in status_by_month
+                and month not in source_repair_unresolved_months
+                and status_line.get("candidate_b_status_row_repair")
+            ):
+                status_recognition_source = "candidate_b_source_cell_repair"
+                status_recognition_audit = {
+                    "alignment_status": "exact_source_cell",
+                    "active_months": list(active_months),
+                    "logical_page": int(status_line.get("source_logical_page") or page),
+                    "row_repair": status_line["candidate_b_status_row_repair"],
+                    "unresolved_months": sorted(source_repair_unresolved_months),
                 }
             neighbor_status = (
                 _neighbor_status_fallback(
@@ -3325,7 +3935,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                     month,
                     zero_overdue_statuses=zero_overdue_statuses,
                 )
-                if not status
+                if not status and month not in source_repair_conflict_months
                 else ""
             )
             if neighbor_status:
@@ -3339,13 +3949,7 @@ def reconstruct_repayment_micro_grid_from_lines(
             visual_status_bbox = _cell_bbox(status_band, visual_col) if visual_col is not None else None
             visual = None
             if (
-                (
-                    enable_cell_ocr
-                    or (
-                        enable_static_status_validation
-                        and status in static_sensitive_statuses
-                    )
-                )
+                (enable_cell_ocr or (enable_static_status_validation and status in static_sensitive_statuses))
                 and (year, month) in record_months
                 and visual_status_bbox is not None
             ):
@@ -3383,26 +3987,16 @@ def reconstruct_repayment_micro_grid_from_lines(
                             min_confidence=0.9 if status.isdigit() else 0.8,
                         )
                         cell_candidate_accepted = bool(
-                            (
-                                weak_cell
-                                and (_strong_visual_status(rec) or template_confirmed)
-                            )
-                            or consensus_count >= 2
+                            (weak_cell and (_strong_visual_status(rec) or template_confirmed)) or consensus_count >= 2
                         )
                         if cell_candidate_accepted:
-                            if (
-                                enable_candidate_b_amount_pairing
-                                and exact_row_status
-                                and rec.text != exact_row_status
-                            ):
+                            if enable_candidate_b_amount_pairing and exact_row_status and rec.text != exact_row_status:
                                 # Exact row parsing and independent cell OCR are
                                 # two evidence planes.  A disagreement is not a
                                 # licence for either plane to silently win.
                                 status = ""
                                 status_row_cell_conflict = True
-                                status_recognition_source = (
-                                    "candidate_b_exact_row_cell_status_conflict"
-                                )
+                                status_recognition_source = "candidate_b_exact_row_cell_status_conflict"
                                 status_recognition_audit = {
                                     **rec.audit,
                                     "reason": "exact_row_cell_status_disagreement",
@@ -3424,25 +4018,16 @@ def reconstruct_repayment_micro_grid_from_lines(
                                 # month; neither value is allowed to win.
                                 status = ""
                                 status_row_cell_conflict = True
-                                status_recognition_source = (
-                                    "candidate_b_owned_token_cell_status_conflict"
-                                )
+                                status_recognition_source = "candidate_b_owned_token_cell_status_conflict"
                                 status_recognition_audit = {
                                     **rec.audit,
-                                    "reason": (
-                                        "owned_month_token_cell_status_disagreement"
-                                    ),
+                                    "reason": ("owned_month_token_cell_status_disagreement"),
                                     "token_status": token_status,
                                     "cell_status": rec.text,
                                     "token_source": token_witness.source,
-                                    "token_source_id": (
-                                        token_witness.source_token_id
-                                        or token_witness.token_id
-                                    ),
+                                    "token_source_id": (token_witness.source_token_id or token_witness.token_id),
                                     "consensus_count": consensus_count,
-                                    "month_geometry_selection_basis": (
-                                        row_geometry_audit.get("selection_basis")
-                                    ),
+                                    "month_geometry_selection_basis": (row_geometry_audit.get("selection_basis")),
                                     "resolution": "withheld_unknown_review",
                                     "logical_page": visual_page,
                                 }
@@ -3482,9 +4067,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                     classification = None
                     if static_template is not None:
                         classification = (
-                            _static_candidate_b_zero_status_glyph_classification(
-                                static_template
-                            )
+                            _static_candidate_b_zero_status_glyph_classification(static_template)
                             if enable_candidate_b_amount_pairing
                             else _static_n_star_glyph_classification(static_template)
                         )
@@ -3534,6 +4117,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                 not status
                 and not static_status_failed
                 and not status_row_cell_conflict
+                and month not in source_repair_unresolved_months
             ):
                 neighbor_status = _neighbor_status_fallback(
                     status_by_month,
@@ -3595,9 +4179,7 @@ def reconstruct_repayment_micro_grid_from_lines(
             )
             status_cells.append(st_cell)
             if observed_row_status in static_sensitive_statuses and (year, month) in record_months:
-                static_status_geometry.append(
-                    (tuple(round(float(value), 4) for value in st_cell.bbox), year)
-                )
+                static_status_geometry.append((tuple(round(float(value), 4) for value in st_cell.bbox), year))
 
             amount = ""
             status_amount_conflict = False
@@ -3605,6 +4187,7 @@ def reconstruct_repayment_micro_grid_from_lines(
             amount_pair_status = "missing_amount_row"
             if amount_band is not None:
                 amt_tokens = amount_assignments.get(month, [])
+                observed_amount_text = _token_text(amt_tokens)
                 amount_pair_status = "exact"
                 if enable_candidate_b_amount_pairing and amount_pairing is not None:
                     amount_pair_status = str(
@@ -3619,19 +4202,76 @@ def reconstruct_repayment_micro_grid_from_lines(
                         amt_tokens = []
                 amount = _normalize_amount_text(_token_text(amt_tokens))
                 status_implies_zero = status in zero_overdue_statuses
-                status_amount_conflict = status_implies_zero and amount not in {"", "0"}
                 amount_bbox = _cell_bbox(amount_band, cell_col) if visual_col is not None else None
                 visual_amount_bbox = amount_bbox
                 amount_crop = None
-                if amount_pair_status not in {"exact", "not_applicable"}:
+                static_amount_zero: tuple[float, dict[str, Any]] | None = None
+                if (
+                    enable_candidate_b_amount_pairing
+                    and enable_static_status_validation
+                    and status_implies_zero
+                    and amount != "0"
+                    and amount_pair_status in {"exact", "blank_amount_cell"}
+                    # A uniquely owned source-table lattice proves this target
+                    # cell's geometry even when noise elsewhere makes the
+                    # whole status row non-exact.
+                    and (row_alignment_exact or source_lattice is not None)
+                    and row_month_geometry_exact
+                    and (year, month) in record_months
+                    and visual_amount_bbox is not None
+                ):
+                    static_amount_zero_attempts += 1
+                    amount_visual = _visual_page_context(
+                        source_line=(amount_line if isinstance(amount_line, dict) else status_line),
+                        bbox=visual_amount_bbox,
+                        base_page=page,
+                        base_page_width=page_width,
+                        base_page_height=page_height,
+                        page_image=page_image,
+                        page_image_resolver=page_image_resolver,
+                    )
+                    if amount_visual is None:
+                        static_amount_zero_unresolved += 1
+                        static_amount_zero_unavailable += 1
+                    else:
+                        (
+                            amount_visual_image,
+                            amount_visual_bbox,
+                            amount_visual_width,
+                            amount_visual_height,
+                            _amount_visual_page,
+                        ) = amount_visual
+                        static_amount_zero = _static_amount_zero_glyph_classification(
+                            amount_visual_image,
+                            amount_visual_bbox,
+                            page_width=amount_visual_width,
+                            page_height=amount_visual_height,
+                        )
+                        if static_amount_zero is None:
+                            static_amount_zero_unresolved += 1
+                        else:
+                            static_amount_zero_resolved += 1
+                            static_amount_zero_corrections += 1
+                            amount = "0"
+                            amount_pair_status = "exact"
+                status_amount_conflict = status_implies_zero and amount not in {"", "0"}
+                if static_amount_zero is not None:
+                    amount_recognition_source = "static_amount_zero_glyph_validation"
+                    amount_recognition_audit = {
+                        "reason": "printed_zero_glyph_independently_validated",
+                        "amount_pair_status": "exact",
+                        "observed_amount_text": observed_amount_text,
+                        "published_amount": "0",
+                        "confidence": static_amount_zero[0],
+                        **static_amount_zero[1],
+                    }
+                elif amount_pair_status not in {"exact", "not_applicable"}:
                     amount_recognition_source = "candidate_b_amount_pair_unresolved"
                     amount_recognition_audit = {
                         "reason": amount_pair_status,
                         "amount_pair_status": amount_pair_status,
                         "row_pair_status": str(amount_pairing.get("status") or "unresolved"),
-                        "source_line_indices": list(
-                            amount_pairing.get("source_line_indices") or ()
-                        ),
+                        "source_line_indices": list(amount_pairing.get("source_line_indices") or ()),
                         "observed_texts": list(amount_pairing.get("observed_texts") or ()),
                     }
                 elif status_amount_conflict:
@@ -3640,6 +4280,17 @@ def reconstruct_repayment_micro_grid_from_lines(
                         "reason": "zero_status_conflicts_with_observed_nonzero_amount",
                         "status": status,
                         "observed_amount": amount,
+                    }
+                elif (
+                    status_implies_zero
+                    and amount == "0"
+                    and len(amt_tokens) == 1
+                    and amt_tokens[0].source in _EXACT_SOURCE_AMOUNT_CELL_SOURCES
+                ):
+                    amount_recognition_source = "exact_source_zero_cell"
+                    amount_recognition_audit = {
+                        "reason": "exact_zero_atom_in_exact_source_amount_cell",
+                        "source_token_id": (amt_tokens[0].source_token_id or amt_tokens[0].token_id),
                     }
                 elif status_implies_zero and amount == "0":
                     amount_recognition_source = "explicit_paired_zero"
@@ -3723,15 +4374,11 @@ def reconstruct_repayment_micro_grid_from_lines(
                 and (year, month) in record_months
             ):
                 exact_status_geometry = bool(
-                    row_alignment_exact
-                    and row_month_geometry_exact
-                    and visual_col is not None
+                    row_alignment_exact and row_month_geometry_exact and visual_col is not None
                 )
                 document_status_glyph_observations.append(
                     {
-                        "repayment_id": (
-                            f"mg_p{page}_repayment_{grid_index}:{year:04d}-{month:02d}"
-                        ),
+                        "repayment_id": (f"mg_p{page}_repayment_{grid_index}:{year:04d}-{month:02d}"),
                         "grid_id": f"mg_p{page}_repayment_{grid_index}",
                         "page": status_logical_page,
                         "year": year,
@@ -3747,22 +4394,14 @@ def reconstruct_repayment_micro_grid_from_lines(
                             else ""
                         ),
                         "decisive_confidence": float(visual_confidence),
-                        "classifier_conflict": bool(
-                            visual_status and visual_status != observed_row_status
-                        ),
+                        "classifier_conflict": bool(visual_status and visual_status != observed_row_status),
                         "alignment_exact": bool(
-                            row_alignment_exact
-                            and row_month_geometry_exact
-                            and (year, month) in record_months
+                            row_alignment_exact and row_month_geometry_exact and (year, month) in record_months
                         ),
                         "exact_status_geometry": exact_status_geometry,
-                        "status_bbox_key": tuple(
-                            round(float(value), 4) for value in st_cell.bbox
-                        ),
+                        "status_bbox_key": tuple(round(float(value), 4) for value in st_cell.bbox),
                         "amount": amount or None,
-                        "amount_pair_exact": bool(
-                            amount_pair_status == "exact" and amount not in {"", None}
-                        ),
+                        "amount_pair_exact": bool(amount_pair_status == "exact" and amount not in {"", None}),
                         "status_amount_conflict": bool(status_amount_conflict),
                         "source_ref": dict(status_ref_payload),
                     }
@@ -3782,13 +4421,10 @@ def reconstruct_repayment_micro_grid_from_lines(
                         "amount_bbox": amount_bbox,
                         "amount_band_index": amount_band["index"] if amount_band is not None else None,
                         "status_amount_conflict": bool(
-                            observed_row_status in zero_overdue_statuses
-                            and amount not in {"", "0"}
+                            observed_row_status in zero_overdue_statuses and amount not in {"", "0"}
                         ),
                         "alignment_exact": bool(
-                            row_alignment_exact
-                            and row_month_geometry_exact
-                            and (year, month) in record_months
+                            row_alignment_exact and row_month_geometry_exact and (year, month) in record_months
                         ),
                     }
                 )
@@ -3868,9 +4504,7 @@ def reconstruct_repayment_micro_grid_from_lines(
             observation["geometry_reused_across_years"] = True
         observation.pop("status_bbox_key", None)
     if candidate_b_status_glyph_observations is not None:
-        candidate_b_status_glyph_observations.extend(
-            document_status_glyph_observations
-        )
+        candidate_b_status_glyph_observations.extend(document_status_glyph_observations)
     for pending in pending_static_statuses:
         expected_status = str(pending.get("observed_status") or "")
         cell = pending.get("cell")
@@ -3904,9 +4538,7 @@ def reconstruct_repayment_micro_grid_from_lines(
                 "visual_status": expected_status,
                 "template_similarity": round(similarity, 4),
                 "template_margin": round(margin, 4),
-                "template_seed_count": int(
-                    (prototypes.get(expected_status) or {}).get("seed_count") or 0
-                ),
+                "template_seed_count": int((prototypes.get(expected_status) or {}).get("seed_count") or 0),
             },
         )
         status_cells = pending.get("status_cells")
@@ -4007,11 +4639,16 @@ def reconstruct_repayment_micro_grid_from_lines(
                 "unavailable": static_status_unavailable,
                 "contradicted_observed_symbols": sorted(static_status_contradictions),
             },
-            **(
-                {"candidate_b_amount_pairing": amount_pairing_by_year}
-                if enable_candidate_b_amount_pairing
-                else {}
-            ),
+            "static_amount_zero_validation": {
+                "enabled": bool(enable_candidate_b_amount_pairing and enable_static_status_validation),
+                "attempts": static_amount_zero_attempts,
+                "resolved": static_amount_zero_resolved,
+                "corrections": static_amount_zero_corrections,
+                "unresolved": static_amount_zero_unresolved,
+                "unavailable": static_amount_zero_unavailable,
+                "ocr_invoked": False,
+            },
+            **({"candidate_b_amount_pairing": amount_pairing_by_year} if enable_candidate_b_amount_pairing else {}),
             "visual_month_geometry": visual_geometry_audit,
             **(
                 {"visual_month_geometry_by_page": visual_geometry_audit_by_page}
@@ -4061,9 +4698,7 @@ def extract_credit_repayment_records(
         enable_static_status_validation=enable_static_status_validation,
         extra_status_chars=extra_status_chars,
         enable_candidate_b_amount_pairing=enable_candidate_b_amount_pairing,
-        candidate_b_status_glyph_observations=(
-            candidate_b_status_glyph_observations
-        ),
+        candidate_b_status_glyph_observations=(candidate_b_status_glyph_observations),
         continuation_logical_pages=continuation_logical_pages,
         source_table_geometry_by_page=source_table_geometry_by_page,
         grid_index=grid_index,
@@ -4139,9 +4774,7 @@ def records_from_micro_grid_dict(
     static_validation_audit = grid_audit.get("static_status_validation") or {}
     static_validation_enabled = bool(static_validation_audit.get("enabled"))
     static_sensitive_statuses = {
-        str(value)
-        for value in static_validation_audit.get("required_statuses") or ("N", "*")
-        if value
+        str(value) for value in static_validation_audit.get("required_statuses") or ("N", "*") if value
     }
     visual_month_geometry = grid_audit.get("visual_month_geometry") or {}
     month_geometry_usable = not isinstance(visual_month_geometry, dict) or (
@@ -4181,9 +4814,7 @@ def records_from_micro_grid_dict(
     amount_rows_by_index: dict[int, list[list[dict[str, Any]]]] = {}
     for row in amount_rows:
         row_indices = {
-            int(cell.get("row_index") or 0)
-            for cell in row
-            if str(cell.get("role") or "") == "overdue_amount"
+            int(cell.get("row_index") or 0) for cell in row if str(cell.get("role") or "") == "overdue_amount"
         }
         if len(row_indices) != 1:
             continue
@@ -4192,17 +4823,14 @@ def records_from_micro_grid_dict(
         for cell in row:
             if str(cell.get("role") or "") != "overdue_amount":
                 continue
-            amount_cells_by_row_col.setdefault(
-                (row_idx, int(cell.get("col_index") or 0)), []
-            ).append(cell)
+            amount_cells_by_row_col.setdefault((row_idx, int(cell.get("col_index") or 0)), []).append(cell)
 
     status_year_counts: dict[int, int] = {}
     for row in status_rows:
         years = {
             int(match.group(0))
             for cell in row
-            if str(cell.get("role") or "") == "year"
-            and (match := _YEAR_RE.match(str(cell.get("text") or "").strip()))
+            if str(cell.get("role") or "") == "year" and (match := _YEAR_RE.match(str(cell.get("text") or "").strip()))
         }
         if len(years) == 1:
             year = next(iter(years))
@@ -4211,31 +4839,22 @@ def records_from_micro_grid_dict(
     records: list[dict[str, Any]] = []
     for status_row in status_rows:
         status_row_indices = {
-            int(cell.get("row_index") or 0)
-            for cell in status_row
-            if str(cell.get("role") or "") == "status"
+            int(cell.get("row_index") or 0) for cell in status_row if str(cell.get("role") or "") == "status"
         }
         status_years = {
             int(match.group(0))
             for cell in status_row
-            if str(cell.get("role") or "") == "year"
-            and (match := _YEAR_RE.match(str(cell.get("text") or "").strip()))
+            if str(cell.get("role") or "") == "year" and (match := _YEAR_RE.match(str(cell.get("text") or "").strip()))
         }
         row_idx = next(iter(status_row_indices)) if len(status_row_indices) == 1 else -1
         row_year = next(iter(status_years)) if len(status_years) == 1 else None
         status_cells_by_col: dict[int, list[dict[str, Any]]] = {}
         for candidate_cell in status_row:
             if str(candidate_cell.get("role") or "") == "status":
-                status_cells_by_col.setdefault(
-                    int(candidate_cell.get("col_index") or 0), []
-                ).append(candidate_cell)
+                status_cells_by_col.setdefault(int(candidate_cell.get("col_index") or 0), []).append(candidate_cell)
         amount_row_idx = row_idx + 1
         paired_amount_rows = amount_rows_by_index.get(amount_row_idx, [])
-        unique_status_row_role = bool(
-            row_idx >= 0
-            and row_year is not None
-            and status_year_counts.get(row_year) == 1
-        )
+        unique_status_row_role = bool(row_idx >= 0 and row_year is not None and status_year_counts.get(row_year) == 1)
         for cell in status_row:
             if str(cell.get("role") or "") != "status":
                 continue
@@ -4253,11 +4872,7 @@ def records_from_micro_grid_dict(
                 continue
             paired_amount_cells = amount_cells_by_row_col.get((amount_row_idx, col_idx), [])
             amount_cell = paired_amount_cells[0] if len(paired_amount_cells) == 1 else None
-            amount_audit = (
-                dict(amount_cell.get("recognition_audit") or {})
-                if isinstance(amount_cell, dict)
-                else {}
-            )
+            amount_audit = dict(amount_cell.get("recognition_audit") or {}) if isinstance(amount_cell, dict) else {}
             year_pairing = (
                 candidate_b_amount_pairing.get(str(year))
                 if isinstance(candidate_b_amount_pairing.get(str(year)), dict)
@@ -4269,15 +4884,10 @@ def records_from_micro_grid_dict(
                 or ""
             )
             amount = _explicit_amount_value(amount_cell.get("text")) if amount_cell else None
-            unique_status_cell_geometry = bool(
-                unique_month_columns
-                and len(status_cells_by_col.get(col_idx, [])) == 1
-            )
+            unique_status_cell_geometry = bool(unique_month_columns and len(status_cells_by_col.get(col_idx, [])) == 1)
             exact_status_geometry = unique_status_row_role and unique_status_cell_geometry
             unique_amount_geometry = bool(
-                len(paired_amount_rows) == 1
-                and len(paired_amount_cells) == 1
-                and declared_pair_status in {"", "exact"}
+                len(paired_amount_rows) == 1 and len(paired_amount_cells) == 1 and declared_pair_status in {"", "exact"}
             )
             exact_row_pair = exact_status_geometry and unique_amount_geometry
             if not exact_row_pair:
@@ -4325,25 +4935,17 @@ def records_from_micro_grid_dict(
             amount_pair_status = declared_pair_status
             if not amount_pair_status:
                 if len(paired_amount_rows) != 1:
-                    amount_pair_status = (
-                        "missing_amount_row"
-                        if not paired_amount_rows
-                        else "ambiguous_immediate_rows"
-                    )
+                    amount_pair_status = "missing_amount_row" if not paired_amount_rows else "ambiguous_immediate_rows"
                 elif len(paired_amount_cells) != 1:
                     amount_pair_status = (
-                        "blank_amount_cell"
-                        if not paired_amount_cells
-                        else "duplicate_or_ambiguous_cell"
+                        "blank_amount_cell" if not paired_amount_cells else "duplicate_or_ambiguous_cell"
                     )
                 elif amount is None:
                     amount_pair_status = "blank_amount_cell"
                 else:
                     amount_pair_status = "exact"
             amount_pair_unresolved = bool(
-                accept_exact_row_numeric_status
-                and status
-                and (amount_pair_status != "exact" or amount is None)
+                accept_exact_row_numeric_status and status and (amount_pair_status != "exact" or amount is None)
             )
             if amount_pair_unresolved and not isinstance(amount_cell, dict):
                 source_refs.append(
@@ -4429,13 +5031,11 @@ def records_from_micro_grid_dict(
         exact_row_pair = bool(record.get("_exact_row_pair"))
         exact_status_geometry = bool(record.get("_exact_status_geometry"))
         paired_amount_positive = bool(record.get("_paired_amount_positive"))
-        static_status_corroborated = not static_validation_enabled or str(
-            record.get("recognition_source") or ""
-        ) in {"static_glyph_shape_validation", "static_grid_template_consensus"}
-        static_sensitive_exact_candidate = bool(
-            status in static_sensitive_statuses
-            and exact_status_geometry
-        )
+        static_status_corroborated = not static_validation_enabled or str(record.get("recognition_source") or "") in {
+            "static_glyph_shape_validation",
+            "static_grid_template_consensus",
+        }
+        static_sensitive_exact_candidate = bool(status in static_sensitive_statuses and exact_status_geometry)
         structurally_typed_status = status in (_STATUS_CHARS | {"A", "#"})
         if (
             accept_exact_row_numeric_status
@@ -4479,9 +5079,7 @@ def records_from_micro_grid_dict(
             record["audit"] = {
                 "reason": (
                     "numeric_status_requires_positive_paired_amount"
-                    if status in {"1", "2", "3", "4", "5", "6", "7"}
-                    and exact_row_pair
-                    and exact_status_geometry
+                    if status in {"1", "2", "3", "4", "5", "6", "7"} and exact_row_pair and exact_status_geometry
                     else "numeric_status_row_role_or_month_geometry_unresolved"
                 ),
                 "field_name": "status_code",
@@ -4496,11 +5094,7 @@ def records_from_micro_grid_dict(
                 "field_name": "status_code",
                 "observed_status": status,
                 "reported_value_retained": True,
-                **(
-                    {"static_reason": prior_audit.get("reason")}
-                    if prior_audit.get("reason")
-                    else {}
-                ),
+                **({"static_reason": prior_audit.get("reason")} if prior_audit.get("reason") else {}),
             }
     for record in records:
         for internal_key in (
@@ -4577,7 +5171,9 @@ def dedupe_repayment_records(records: list[dict[str, Any]]) -> list[dict[str, An
             output.append(record)
             continue
         current = output[existing]
-        selected = record if float(record.get("confidence") or 0.0) > float(current.get("confidence") or 0.0) else current
+        selected = (
+            record if float(record.get("confidence") or 0.0) > float(current.get("confidence") or 0.0) else current
+        )
         selected = dict(selected)
         merged_refs = _merged_source_cell_refs(current, record)
         if merged_refs:

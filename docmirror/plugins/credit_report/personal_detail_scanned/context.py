@@ -73,9 +73,7 @@ _STRONG_FAMILY_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 _PAGE_NUMBER_RE = re.compile(r"^(?:第\s*\d+\s*页(?:[,，]\s*共\s*\d+\s*页)?|page\s*\d+)", re.I)
 _PRINTED_PAGE_RE = re.compile(r"第\s*(?P<page>\d{1,3})\s*页\s*[,，]?\s*共\s*(?P<total>\d{1,3})\s*页")
-_PRINTED_PAGE_ONLY_RE = re.compile(
-    r"^\s*第\s*(?P<page>\d{1,3})\s*页\s*[,，。.]?\s*$"
-)
+_PRINTED_PAGE_ONLY_RE = re.compile(r"^\s*第\s*(?P<page>\d{1,3})\s*页\s*[,，。.]?\s*$")
 _NUMBERED_RE = re.compile(r"^\s*\d{1,4}[.、)]")
 _ACCOUNT_ANCHOR_RE = re.compile(r"(?:账户|业务)\s*[（(]?\s*(\d{1,3})\s*[）)]?")
 _BUSINESS_HEADING_RE = re.compile(
@@ -115,6 +113,269 @@ def _finite(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return result if math.isfinite(result) else 0.0
+
+
+_MONTHLY_STATUS_ATOMS = frozenset(
+    {"*", "/", "N", "C", "1", "2", "3", "4", "5", "6", "7", "B", "M", "D", "Z", "G", "A", "#"}
+)
+_MONTHLY_REPAIR_ATOMS = _MONTHLY_STATUS_ATOMS | {"0"}
+_MONTHLY_STATUS_TRANSLATION = str.maketrans({"☆": "*", "★": "*", "＊": "*"})
+
+
+def _exact_source_table_repair_tokens_by_page(
+    owner: Any,
+    pages: Any,
+    selected_pages: set[int],
+) -> dict[int, list[dict[str, Any]]]:
+    """Expose exact singleton status/zero atoms from canonical table cells.
+
+    Table values never participate.  Every candidate is re-resolved from the
+    immutable token plane and must remain uniquely owned by one exact native
+    cell.  A canonical ``parse_result_table_cell`` atom may supply the corrected
+    singleton value, but only when its identity, source reference, metadata,
+    and bbox all independently bind it to that same cell.  The returned atoms
+    are consumed only by the later source-lattice field repair; they do not
+    replace canonical page lines.
+    """
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
+        _exact_native_table_cell_tokens,
+    )
+
+    page_values = list(pages) if isinstance(pages, (list, tuple)) else []
+    candidates_by_token: dict[str, list[dict[str, Any]]] = {}
+
+    confidence_observations_by_token_id: dict[str, list[tuple[str, float]]] = {}
+    corrected_observations_by_cell: dict[
+        tuple[str, int, int, str],
+        list[dict[str, Any]],
+    ] = {}
+    plane = getattr(owner, "evidence_plane", None)
+    if plane is None:
+        plane = getattr(getattr(owner, "parse_result", None), "evidence_plane", None)
+    evidence = getattr(plane, "evidence", None)
+    text_atoms = getattr(evidence, "text_atoms", None)
+    if isinstance(text_atoms, list):
+        for atom in text_atoms:
+            raw_confidence = atom.get("confidence") if isinstance(atom, Mapping) else getattr(atom, "confidence", None)
+            raw_text = atom.get("text") if isinstance(atom, Mapping) else getattr(atom, "text", None)
+            repair_atom = str(raw_text or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
+            if len(repair_atom) != 1 or repair_atom not in _MONTHLY_REPAIR_ATOMS:
+                continue
+            raw_source_refs = (
+                atom.get("source_refs") if isinstance(atom, Mapping) else getattr(atom, "source_refs", None)
+            )
+            source_refs = (
+                tuple(dict.fromkeys(str(value) for value in raw_source_refs if str(value or "")))
+                if isinstance(raw_source_refs, (list, tuple))
+                else ()
+            )
+            if not source_refs:
+                # Older/lightweight planes used the raw token ID as the atom ID.
+                # This is confidence metadata only; exact cell ownership is still
+                # independently re-resolved below from the immutable token plane.
+                legacy_id = str(
+                    (atom.get("id") if isinstance(atom, Mapping) else getattr(atom, "id", "")) or ""
+                )
+                source_refs = (legacy_id,) if legacy_id else ()
+            confidence = min(1.0, max(0.0, _finite(raw_confidence)))
+            for source_ref in source_refs:
+                confidence_observations_by_token_id.setdefault(source_ref, []).append(
+                    (repair_atom, confidence)
+                )
+
+            source_kind = str(
+                (atom.get("source_kind") if isinstance(atom, Mapping) else getattr(atom, "source_kind", ""))
+                or ""
+            )
+            atom_metadata = (
+                atom.get("metadata") if isinstance(atom, Mapping) else getattr(atom, "metadata", None)
+            )
+            if source_kind != "parse_result_table_cell" or not isinstance(atom_metadata, Mapping):
+                continue
+            table_id = str(atom_metadata.get("table_id") or "")
+            row_index = atom_metadata.get("row_index")
+            column_index = atom_metadata.get("col_index")
+            metadata_token_ids = atom_metadata.get("token_ids")
+            normalized_metadata_token_ids = (
+                tuple(dict.fromkeys(str(value) for value in metadata_token_ids if str(value or "")))
+                if isinstance(metadata_token_ids, (list, tuple))
+                else ()
+            )
+            if (
+                not table_id
+                or not isinstance(row_index, int)
+                or isinstance(row_index, bool)
+                or row_index < 0
+                or not isinstance(column_index, int)
+                or isinstance(column_index, bool)
+                or column_index < 0
+                or str(atom_metadata.get("geometry_status") or "") != "exact"
+                or len(source_refs) != 1
+                or normalized_metadata_token_ids != source_refs
+            ):
+                continue
+            raw_bbox = atom.get("bbox") if isinstance(atom, Mapping) else getattr(atom, "bbox", None)
+            try:
+                atom_bbox = tuple(float(value) for value in raw_bbox)
+            except (TypeError, ValueError):
+                continue
+            if len(atom_bbox) != 4 or atom_bbox[2] <= atom_bbox[0] or atom_bbox[3] <= atom_bbox[1]:
+                continue
+            atom_id = str((atom.get("id") if isinstance(atom, Mapping) else getattr(atom, "id", "")) or "")
+            if not atom_id:
+                continue
+            corrected_observations_by_cell.setdefault(
+                (table_id, row_index, column_index, source_refs[0]),
+                [],
+            ).append(
+                {
+                    "atom_id": atom_id,
+                    "content": repair_atom,
+                    "bbox": atom_bbox,
+                    "confidence": confidence,
+                }
+            )
+
+    for fallback_page, page_value in enumerate(page_values, start=1):
+        page_number = (
+            page_value.get("page_number")
+            if isinstance(page_value, Mapping)
+            else getattr(page_value, "page_number", None)
+        )
+        logical_page = (
+            page_number
+            if isinstance(page_number, int) and not isinstance(page_number, bool) and page_number > 0
+            else fallback_page
+        )
+        if logical_page not in selected_pages:
+            continue
+        tables = page_value.get("tables") if isinstance(page_value, Mapping) else getattr(page_value, "tables", None)
+        if not isinstance(tables, (list, tuple)):
+            continue
+        for table in tables:
+            table_id = str(
+                (table.get("table_id") if isinstance(table, Mapping) else getattr(table, "table_id", ""))
+                or ""
+            )
+            metadata = table.get("metadata") if isinstance(table, Mapping) else getattr(table, "metadata", None)
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            geometry = metadata.get("geometry")
+            geometry = geometry if isinstance(geometry, Mapping) else metadata
+            if str(geometry.get("coordinate_system") or "pdf_points_top_left") != ("pdf_points_top_left"):
+                continue
+            token_grid = geometry.get("cell_token_ids")
+            cell_bboxes = geometry.get("cell_bboxes")
+            if not table_id or not isinstance(token_grid, list) or not isinstance(cell_bboxes, list):
+                continue
+            for row_index, token_row in enumerate(token_grid):
+                if (
+                    not isinstance(token_row, list)
+                    or row_index >= len(cell_bboxes)
+                    or not isinstance(cell_bboxes[row_index], list)
+                ):
+                    continue
+                for column_index, token_ids in enumerate(token_row):
+                    if (
+                        not isinstance(token_ids, list)
+                        or column_index >= len(cell_bboxes[row_index])
+                    ):
+                        continue
+                    normalized_ids = tuple(dict.fromkeys(str(value) for value in token_ids if str(value or "")))
+                    if len(normalized_ids) != 1:
+                        continue
+                    resolved = _exact_native_table_cell_tokens(
+                        owner,
+                        table,
+                        row=row_index,
+                        column=column_index,
+                        logical_page=logical_page,
+                    )
+                    if resolved is None or len(resolved) != 1:
+                        continue
+                    raw_text, bbox, token_id = resolved[0]
+                    if token_id != normalized_ids[0]:
+                        continue
+                    raw_cell_bbox = cell_bboxes[row_index][column_index]
+                    try:
+                        cell_bbox = tuple(float(value) for value in raw_cell_bbox)
+                    except (TypeError, ValueError):
+                        continue
+                    if len(cell_bbox) != 4 or cell_bbox[2] <= cell_bbox[0] or cell_bbox[3] <= cell_bbox[1]:
+                        continue
+                    corrected = [
+                        observation
+                        for observation in corrected_observations_by_cell.get(
+                            (table_id, row_index, column_index, token_id),
+                            [],
+                        )
+                        if all(
+                            abs(left - right) <= 1e-3
+                            for left, right in zip(observation["bbox"], cell_bbox, strict=True)
+                        )
+                    ]
+                    if len(corrected) > 1:
+                        # Duplicate corrected owners are ambiguous even when
+                        # their glyphs happen to agree.  Do not fall back to a
+                        # different value plane for that cell.
+                        continue
+                    if corrected:
+                        observation = corrected[0]
+                        repair_atom = str(observation["content"])
+                        output_bbox = list(cell_bbox)
+                        confidence = float(observation["confidence"])
+                        source = (
+                            "exact_corrected_source_table_status_cell"
+                            if repair_atom in _MONTHLY_STATUS_ATOMS
+                            else "exact_corrected_source_table_amount_cell"
+                        )
+                        evidence_ids = [token_id, str(observation["atom_id"])]
+                    else:
+                        repair_atom = str(raw_text or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
+                        if len(repair_atom) != 1 or repair_atom not in _MONTHLY_REPAIR_ATOMS:
+                            continue
+                        matching_confidences = [
+                            confidence
+                            for observed_atom, confidence in confidence_observations_by_token_id.get(token_id, [])
+                            if observed_atom == repair_atom
+                        ]
+                        confidence = min(matching_confidences, default=0.0)
+                        output_bbox = list(bbox)
+                        source = (
+                            "exact_native_source_table_status_cell"
+                            if repair_atom in _MONTHLY_STATUS_ATOMS
+                            else "exact_native_source_table_amount_cell"
+                        )
+                        evidence_ids = [token_id]
+                    candidates_by_token.setdefault(token_id, []).append(
+                        {
+                            "token_id": token_id,
+                            "content": repair_atom,
+                            "bbox": output_bbox,
+                            "confidence": confidence,
+                            "page": logical_page,
+                            "source_logical_page": logical_page,
+                            "coordinate_system": "pdf_points_top_left",
+                            "source": source,
+                            "evidence_ids": evidence_ids,
+                        }
+                    )
+
+    output: dict[int, list[dict[str, Any]]] = {}
+    for candidates in candidates_by_token.values():
+        if len(candidates) != 1:
+            continue
+        candidate = candidates[0]
+        output.setdefault(int(candidate["page"]), []).append(candidate)
+    for page_tokens in output.values():
+        page_tokens.sort(
+            key=lambda token: (
+                float(token["bbox"][1]),
+                float(token["bbox"][0]),
+                str(token["token_id"]),
+            )
+        )
+    return output
 
 
 def _page_ocr_score(words: Iterable[dict[str, Any]], *, image_shape: Any = None) -> float:
@@ -180,11 +441,7 @@ def _single_page_ocr(image: Any) -> tuple[list[dict[str, Any]], float, dict[str,
                 continue
             restored.append({**word, "bbox": mapped})
         words = restored
-    audit = {
-        key: deepcopy(value)
-        for key, value in deskew.items()
-        if key not in {"forward_matrix", "inverse_matrix"}
-    }
+    audit = {key: deepcopy(value) for key, value in deskew.items() if key not in {"forward_matrix", "inverse_matrix"}}
     return words, _page_ocr_score(words, image_shape=shape), audit
 
 
@@ -303,8 +560,7 @@ def _project_table_for_static_slice(
     cell_boxes = metadata.get("cell_bboxes")
     if isinstance(cell_boxes, list):
         metadata["cell_bboxes"] = [
-            [project(box) for box in row] if isinstance(row, list) else row
-            for row in cell_boxes
+            [project(box) for box in row] if isinstance(row, list) else row for row in cell_boxes
         ]
     raw_rows = _raw_rows(table)
     if raw_rows:
@@ -549,19 +805,14 @@ def _printed_reading_order_resolution(
         if page_height > 0.0:
             page_heights_by_logical.setdefault(logical, []).append(page_height)
         text_evidence_by_page.setdefault(logical, []).extend(
-            (str(getattr(block, "content", "") or ""), block)
-            for block in getattr(page, "texts", None) or []
+            (str(getattr(block, "content", "") or ""), block) for block in getattr(page, "texts", None) or []
         )
 
     for bundle in _domain_specific(parse_result).get("_page_evidence_bundles") or []:
         if not isinstance(bundle, dict):
             continue
         local = bundle.get("local_structure_evidence")
-        logical = int(
-            bundle.get("page")
-            or (local.get("page") if isinstance(local, Mapping) else 0)
-            or 0
-        )
+        logical = int(bundle.get("page") or (local.get("page") if isinstance(local, Mapping) else 0) or 0)
         if logical > 0:
             evidence_bundles_by_logical.setdefault(logical, []).append(bundle)
         if not isinstance(local, dict):
@@ -574,10 +825,7 @@ def _printed_reading_order_resolution(
             int(bundle.get("source_page_number") or local.get("source_page") or logical),
         )
         page_height = _finite(
-            local.get("page_height")
-            or bundle.get("page_height")
-            or local.get("height")
-            or bundle.get("height")
+            local.get("page_height") or bundle.get("page_height") or local.get("height") or bundle.get("height")
         )
         if page_height > 0.0:
             page_heights_by_logical.setdefault(logical, []).append(page_height)
@@ -593,11 +841,7 @@ def _printed_reading_order_resolution(
         """Check every sealed table representation, not only its preferred rows."""
 
         def member(owner: Any, name: str, default: Any = None) -> Any:
-            return (
-                owner.get(name, default)
-                if isinstance(owner, Mapping)
-                else getattr(owner, name, default)
-            )
+            return owner.get(name, default) if isinstance(owner, Mapping) else getattr(owner, name, default)
 
         def scalar_present(value: Any) -> bool:
             if value is None:
@@ -668,16 +912,8 @@ def _printed_reading_order_resolution(
             return False
         page = native_pages[0]
         if any(
-            _compact(
-                pair.get("key")
-                if isinstance(pair, Mapping)
-                else getattr(pair, "key", "")
-            )
-            or _compact(
-                pair.get("value")
-                if isinstance(pair, Mapping)
-                else getattr(pair, "value", "")
-            )
+            _compact(pair.get("key") if isinstance(pair, Mapping) else getattr(pair, "key", ""))
+            or _compact(pair.get("value") if isinstance(pair, Mapping) else getattr(pair, "value", ""))
             for pair in getattr(page, "key_values", None) or []
         ):
             return False
@@ -690,10 +926,7 @@ def _printed_reading_order_resolution(
             for line in getattr(page, "lines", None) or []
         ):
             return False
-        if any(
-            table_source_content_present(table)
-            for table in getattr(page, "tables", None) or []
-        ):
+        if any(table_source_content_present(table) for table in getattr(page, "tables", None) or []):
             return False
         sealed_bundle_content_keys = (
             "lines",
@@ -719,14 +952,11 @@ def _printed_reading_order_resolution(
             ):
                 return False
             region_detect = bundle.get("region_detect")
-            if isinstance(region_detect, Mapping) and region_detect.get(
-                "region_detect_candidates"
-            ):
+            if isinstance(region_detect, Mapping) and region_detect.get("region_detect_candidates"):
                 return False
             morphology_summary = bundle.get("morphology_summary")
             if isinstance(morphology_summary, Mapping) and any(
-                value not in (None, "", 0, 0.0, False)
-                for value in morphology_summary.values()
+                value not in (None, "", 0, 0.0, False) for value in morphology_summary.values()
             ):
                 return False
         return True
@@ -742,15 +972,8 @@ def _printed_reading_order_resolution(
         blank_logical_pages: Iterable[int] = (),
     ) -> tuple[dict[int, int], dict[str, Any]]:
         observed = sorted(observed_pages)
-        printed = {
-            int(logical): int(page)
-            for logical, page in (printed_by_logical or {}).items()
-        }
-        duplicate_printed_pages = sorted(
-            page
-            for page, count in Counter(printed.values()).items()
-            if count > 1
-        )
+        printed = {int(logical): int(page) for logical, page in (printed_by_logical or {}).items()}
+        duplicate_printed_pages = sorted(page for page, count in Counter(printed.values()).items() if count > 1)
         return identity, {
             "resolved": False,
             "authoritative": False,
@@ -854,11 +1077,7 @@ def _printed_reading_order_resolution(
     # certification is available only when the observed population could
     # already contain the whole numbered document.
     blank_logical_pages = (
-        {
-            logical
-            for logical in observed_pages - set(printed_by_logical)
-            if source_evidence_empty(logical)
-        }
+        {logical for logical in observed_pages - set(printed_by_logical) if source_evidence_empty(logical)}
         if expected_total <= len(observed_pages)
         else set()
     )
@@ -870,9 +1089,7 @@ def _printed_reading_order_resolution(
         full_footer_logical_pages=full_footer_pages,
         excluded_logical_pages=blank_logical_pages,
     )
-    unprinted_nonblank_pages = (
-        observed_pages - set(printed_by_logical) - blank_logical_pages
-    )
+    unprinted_nonblank_pages = observed_pages - set(printed_by_logical) - blank_logical_pages
     if unprinted_nonblank_pages:
         return unresolved(
             "logical_page_footer_unresolved",
@@ -926,10 +1143,7 @@ def _printed_reading_order_resolution(
         key=lambda page: (printed_by_logical[page], page),
     )
     ordered_logical_pages = ordered_report_pages + sorted(blank_logical_pages)
-    order = {
-        logical: index
-        for index, logical in enumerate(ordered_logical_pages, start=1)
-    }
+    order = {logical: index for index, logical in enumerate(ordered_logical_pages, start=1)}
     has_blank_tail = bool(blank_logical_pages)
     return order, {
         "resolved": True,
@@ -1117,27 +1331,21 @@ def _infer_paired_printed_pages(
             crop_and_dimension_profile,
         )
 
-    fully_printed_profiles: list[
-        tuple[int, tuple[float, ...], tuple[float, ...]]
-    ] = []
+    fully_printed_profiles: list[tuple[int, tuple[float, ...], tuple[float, ...]]] = []
     for logicals in logicals_by_source.values():
         ordered = topology.ordered_pair(logicals)
         if ordered is None or not set(ordered).issubset(full_footers):
             continue
         left, right = ordered
         profile = spread_profile(logicals)
-        if (
-            profile is None
-            or printed_by_logical.get(right) != printed_by_logical.get(left, 0) + 1
-        ):
+        if profile is None or printed_by_logical.get(right) != printed_by_logical.get(left, 0) + 1:
             # One nonconsecutive or geometrically incompatible fully printed
             # spread disproves a document-wide sequential imposition profile.
             return inferred
         fully_printed_profiles.append(profile)
 
     if len(fully_printed_profiles) < 2 or not all(
-        spread_profiles_match(fully_printed_profiles[0], profile)
-        for profile in fully_printed_profiles[1:]
+        spread_profiles_match(fully_printed_profiles[0], profile) for profile in fully_printed_profiles[1:]
     ):
         return inferred
     proved_profile = fully_printed_profiles[0]
@@ -1145,11 +1353,7 @@ def _infer_paired_printed_pages(
     for logicals in logicals_by_source.values():
         ordered = topology.ordered_pair(logicals)
         profile = spread_profile(logicals)
-        if (
-            ordered is None
-            or profile is None
-            or not spread_profiles_match(profile, proved_profile)
-        ):
+        if ordered is None or profile is None or not spread_profiles_match(profile, proved_profile):
             continue
         left, right = ordered
         if left in excluded or right in excluded:
@@ -1157,17 +1361,15 @@ def _infer_paired_printed_pages(
         if left in printed_by_logical and right not in printed_by_logical:
             candidate = printed_by_logical[left] + 1
             if (
-                (expected_total is None or 1 <= candidate <= expected_total)
-                and candidate not in printed_by_logical.values()
-            ):
+                expected_total is None or 1 <= candidate <= expected_total
+            ) and candidate not in printed_by_logical.values():
                 printed_by_logical[right] = candidate
                 inferred.add(right)
         elif right in printed_by_logical and left not in printed_by_logical:
             candidate = printed_by_logical[right] - 1
             if (
-                (expected_total is None or 1 <= candidate <= expected_total)
-                and candidate not in printed_by_logical.values()
-            ):
+                expected_total is None or 1 <= candidate <= expected_total
+            ) and candidate not in printed_by_logical.values():
                 printed_by_logical[left] = candidate
                 inferred.add(left)
     return inferred
@@ -1210,13 +1412,8 @@ def _collect_personal_detail_units(
             topology,
         )
     else:
-        reading_order = {
-            int(logical): int(position)
-            for logical, position in registered_reading_order.items()
-        }
-        reading_order_resolution = deepcopy(
-            dict(registered_reading_order_resolution or {})
-        )
+        reading_order = {int(logical): int(position) for logical, position in registered_reading_order.items()}
+        reading_order_resolution = deepcopy(dict(registered_reading_order_resolution or {}))
 
     for page_index, page in enumerate(pages, start=1):
         logical = int(getattr(page, "page_number", 0) or page_index)
@@ -1526,9 +1723,7 @@ class PersonalDetailExtractionContext:
         # ordinary field repairs retain the discovery pages and consult their
         # independent OCR acquisition only through the exact-field overlay.
         self._business_repair_active = True
-        self._personal_detail_extraction_issues = deepcopy(
-            self._initial_personal_detail_extraction_issues
-        )
+        self._personal_detail_extraction_issues = deepcopy(self._initial_personal_detail_extraction_issues)
         self._cache.clear()
         if reconstruction_evidence:
             # Account anchors are cached directly on the context because
@@ -1536,13 +1731,9 @@ class PersonalDetailExtractionContext:
             # A genuine template reconstruction can split or recover an anchor,
             # so only that path invalidates the canonical page plane.  A
             # field-only repair continues to use the discovery projection.
-            discovery_account_skeletons = self.__dict__.get(
-                "_candidate_b_account_anchor_skeleton_cache"
-            )
+            discovery_account_skeletons = self.__dict__.get("_candidate_b_account_anchor_skeleton_cache")
             if isinstance(discovery_account_skeletons, list):
-                self._candidate_b_pre_repair_account_anchor_inventory = tuple(
-                    deepcopy(discovery_account_skeletons)
-                )
+                self._candidate_b_pre_repair_account_anchor_inventory = tuple(deepcopy(discovery_account_skeletons))
             self.__dict__.pop("_candidate_b_account_anchor_skeleton_cache", None)
             self._canonical_layout_projection_cache = None
             self._pboc_layout_profile_cache = None
@@ -1667,24 +1858,21 @@ class PersonalDetailExtractionContext:
                 grid_evidence = bundle.get("micro_grid_evidence")
                 if not isinstance(grid_evidence, dict):
                     return
-                evidence_page = str(
-                    grid_evidence.get("page") or bundle.get("page") or ""
-                ).strip()
-                grid_evidence["lines"] = [
-                    line
-                    for line in grid_evidence.get("lines") or []
-                    if not (
-                        isinstance(line, dict)
-                        and (
-                            line.get("coordinate_status")
-                            == "cross_page_y_shift"
-                            or (
-                                str(line.get("source_logical_page") or "")
-                                not in {"", evidence_page}
+                evidence_page = str(grid_evidence.get("page") or bundle.get("page") or "").strip()
+                for evidence_key in ("lines", "tokens"):
+                    if evidence_key not in grid_evidence:
+                        continue
+                    grid_evidence[evidence_key] = [
+                        item
+                        for item in grid_evidence.get(evidence_key) or []
+                        if not (
+                            isinstance(item, dict)
+                            and (
+                                item.get("coordinate_status") == "cross_page_y_shift"
+                                or (str(item.get("source_logical_page") or "") not in {"", evidence_page})
                             )
                         )
-                    )
-                ]
+                    ]
                 grid_evidence.pop("credit_cross_page_augmented", None)
                 grid_evidence.pop("continuation_logical_pages", None)
                 grid_evidence.pop(
@@ -1714,34 +1902,20 @@ class PersonalDetailExtractionContext:
                     return value
 
                 def raw_physical_signature(table: Any) -> Any | None:
-                    metadata = (
-                        table.get("metadata")
-                        if isinstance(table, Mapping)
-                        else getattr(table, "metadata", None)
-                    )
+                    metadata = table.get("metadata") if isinstance(table, Mapping) else getattr(table, "metadata", None)
                     metadata = metadata if isinstance(metadata, Mapping) else {}
                     geometry = metadata.get("geometry")
                     geometry = geometry if isinstance(geometry, Mapping) else {}
                     cell_bboxes = geometry.get("cell_bboxes")
                     if not isinstance(cell_bboxes, (list, tuple)):
                         cell_bboxes = metadata.get("cell_bboxes")
-                    bbox = (
-                        table.get("bbox")
-                        if isinstance(table, Mapping)
-                        else getattr(table, "bbox", None)
-                    )
-                    if not isinstance(bbox, (list, tuple)) and not isinstance(
-                        cell_bboxes, (list, tuple)
-                    ):
+                    bbox = table.get("bbox") if isinstance(table, Mapping) else getattr(table, "bbox", None)
+                    if not isinstance(bbox, (list, tuple)) and not isinstance(cell_bboxes, (list, tuple)):
                         return None
                     return freeze_geometry(
                         {
                             "bbox": bbox if isinstance(bbox, (list, tuple)) else None,
-                            "cell_bboxes": (
-                                cell_bboxes
-                                if isinstance(cell_bboxes, (list, tuple))
-                                else None
-                            ),
+                            "cell_bboxes": (cell_bboxes if isinstance(cell_bboxes, (list, tuple)) else None),
                         }
                     )
 
@@ -1755,19 +1929,14 @@ class PersonalDetailExtractionContext:
                     )
                     logical_page = (
                         page_number
-                        if isinstance(page_number, int)
-                        and not isinstance(page_number, bool)
+                        if isinstance(page_number, int) and not isinstance(page_number, bool)
                         else fallback_page
                     )
                     if logical_page in selected_pages:
                         page_counts[logical_page] += 1
-                        page_values_by_logical.setdefault(logical_page, []).append(
-                            page_value
-                        )
+                        page_values_by_logical.setdefault(logical_page, []).append(page_value)
 
-                blocked_pages = {
-                    page for page in selected_pages if page_counts.get(page, 0) != 1
-                }
+                blocked_pages = {page for page in selected_pages if page_counts.get(page, 0) != 1}
                 raw_table_owners: dict[str, set[int]] = {}
                 for page in selected_pages - blocked_pages:
                     page_value = page_values_by_logical[page][0]
@@ -1784,26 +1953,21 @@ class PersonalDetailExtractionContext:
                             (
                                 table.get("table_id") or table.get("id")
                                 if isinstance(table, Mapping)
-                                else getattr(table, "table_id", None)
-                                or getattr(table, "id", None)
+                                else getattr(table, "table_id", None) or getattr(table, "id", None)
                             )
                             or ""
                         ).strip()
                         for table in raw_tables
                     ]
-                    nonempty_raw_ids = [
-                        table_id for table_id in raw_table_ids if table_id
-                    ]
+                    nonempty_raw_ids = [table_id for table_id in raw_table_ids if table_id]
                     raw_signatures = [
-                        signature
-                        for table in raw_tables
-                        if (signature := raw_physical_signature(table)) is not None
+                        signature for table in raw_tables if (signature := raw_physical_signature(table)) is not None
                     ]
                     for table_id in set(nonempty_raw_ids):
                         raw_table_owners.setdefault(table_id, set()).add(page)
-                    if len(nonempty_raw_ids) != len(set(nonempty_raw_ids)) or len(
-                        raw_signatures
-                    ) != len(set(raw_signatures)):
+                    if len(nonempty_raw_ids) != len(set(nonempty_raw_ids)) or len(raw_signatures) != len(
+                        set(raw_signatures)
+                    ):
                         blocked_pages.add(page)
                         continue
                 for owners in raw_table_owners.values():
@@ -1816,19 +1980,13 @@ class PersonalDetailExtractionContext:
 
                 for page in selected_pages - blocked_pages:
                     tables = detached_by_page.get(page) or []
-                    if not isinstance(tables, list) or not all(
-                        isinstance(table, Mapping) for table in tables
-                    ):
+                    if not isinstance(tables, list) or not all(isinstance(table, Mapping) for table in tables):
                         blocked_pages.add(page)
                         continue
-                    table_ids = [
-                        str(table.get("table_id") or "").strip() for table in tables
-                    ]
+                    table_ids = [str(table.get("table_id") or "").strip() for table in tables]
                     nonempty_ids = [table_id for table_id in table_ids if table_id]
                     signatures = [freeze_geometry(table) for table in tables]
-                    if len(nonempty_ids) != len(set(nonempty_ids)) or len(
-                        signatures
-                    ) != len(set(signatures)):
+                    if len(nonempty_ids) != len(set(nonempty_ids)) or len(signatures) != len(set(signatures)):
                         blocked_pages.add(page)
                         continue
                     geometry_by_page[page] = deepcopy(tables)
@@ -1881,12 +2039,41 @@ class PersonalDetailExtractionContext:
                 # The evidence lines and physical cells must come from the same
                 # transformed canonical page plane.  Never mix in sealed values.
                 geometry_pages = getattr(canonical_projection, "pages", None)
-            source_table_geometry_by_page, nonunique_geometry_pages = (
-                detached_geometry_from_unique_pages(geometry_pages, selected_pages)
+            source_table_geometry_by_page, nonunique_geometry_pages = detached_geometry_from_unique_pages(
+                geometry_pages, selected_pages
             )
             geometry_blocked_pages.update(nonunique_geometry_pages)
             for page in geometry_blocked_pages:
                 source_table_geometry_by_page.pop(page, None)
+            exact_repair_tokens_by_page = _exact_source_table_repair_tokens_by_page(
+                self,
+                geometry_pages,
+                selected_pages - geometry_blocked_pages,
+            )
+
+            def monthly_evidence_tokens(
+                page: int,
+                lines: list[dict[str, Any]],
+            ) -> list[dict[str, Any]]:
+                exact_tokens = deepcopy(exact_repair_tokens_by_page.get(page) or [])
+                exact_ids = {str(token.get("token_id") or "") for token in exact_tokens}
+                exact_visual_keys = {
+                    (
+                        str(token.get("content") or ""),
+                        tuple(round(float(value), 3) for value in token.get("bbox") or ()),
+                    )
+                    for token in exact_tokens
+                }
+                retained_lines: list[dict[str, Any]] = []
+                for line in deepcopy(lines):
+                    evidence_ids = tuple(str(value) for value in line.get("evidence_ids") or () if str(value or ""))
+                    text = str(line.get("text") or line.get("content") or "").strip()
+                    bbox = tuple(round(float(value), 3) for value in line.get("bbox") or ())
+                    if (len(evidence_ids) == 1 and evidence_ids[0] in exact_ids) or (text, bbox) in exact_visual_keys:
+                        continue
+                    retained_lines.append(line)
+                return retained_lines + exact_tokens
+
             observed_pages: set[int] = set()
             for bundle in detached.get("_page_evidence_bundles") or []:
                 if not isinstance(bundle, dict):
@@ -1929,12 +2116,11 @@ class PersonalDetailExtractionContext:
                         "page_width": canonical.get("page_width"),
                         "page_height": canonical.get("page_height"),
                         "lines": deepcopy(lines),
-                        # Tokens from the sealed pre-registration page must not
-                        # outrank the canonical complete-page evidence.
-                        "tokens": deepcopy(lines),
-                        "source_table_geometry": deepcopy(
-                            source_table_geometry_by_page.get(page) or []
-                        ),
+                        # Ordinary sealed tokens do not outrank the canonical
+                        # page. Exact singleton table atoms are reintroduced
+                        # only for the later source-lattice field repair.
+                        "tokens": monthly_evidence_tokens(page, lines),
+                        "source_table_geometry": deepcopy(source_table_geometry_by_page.get(page) or []),
                     }
                 )
             for page, canonical in canonical_pages.items():
@@ -1957,10 +2143,8 @@ class PersonalDetailExtractionContext:
                             "page_width": canonical.get("page_width"),
                             "page_height": canonical.get("page_height"),
                             "lines": lines,
-                            "tokens": deepcopy(lines),
-                            "source_table_geometry": deepcopy(
-                                source_table_geometry_by_page.get(page) or []
-                            ),
+                            "tokens": monthly_evidence_tokens(page, lines),
+                            "source_table_geometry": deepcopy(source_table_geometry_by_page.get(page) or []),
                         },
                     }
                 )
@@ -2016,36 +2200,22 @@ class PersonalDetailExtractionContext:
                 enable_cell_ocr=False,
                 extra_status_chars={"A", "#"},
             )
-            source_structure_grids = micro_grid_structures_from_domain_specific(
-                source_baseline
-            )
+            source_structure_grids = micro_grid_structures_from_domain_specific(source_baseline)
             source_structure_records = dedupe_repayment_records(
-                [
-                    record
-                    for grid in source_structure_grids
-                    for record in records_from_micro_grid_dict(grid)
-                ]
+                [record for grid in source_structure_grids for record in records_from_micro_grid_dict(grid)]
             )
             # Keep the detached structural plane private and value-inert.  The
             # relationship layer may use only its printed range/cell geometry
             # to reconcile extraction-local grid aliases after a unique account
             # owner is proven; no detached status value enters business rows.
-            self._candidate_b_monthly_source_structure_grids = deepcopy(
-                source_structure_grids
-            )
-            self._candidate_b_monthly_source_structure_records = deepcopy(
-                source_structure_records
-            )
+            self._candidate_b_monthly_source_structure_grids = deepcopy(source_structure_grids)
+            self._candidate_b_monthly_source_structure_records = deepcopy(source_structure_records)
             source_structure_count = len(source_structure_records)
 
             def exact_monthly_key(
                 record: Mapping[str, Any],
             ) -> tuple[str, int, int] | None:
-                refs = [
-                    ref
-                    for ref in record.get("source_cell_refs") or ()
-                    if isinstance(ref, Mapping)
-                ]
+                refs = [ref for ref in record.get("source_cell_refs") or () if isinstance(ref, Mapping)]
                 grid_ids = {
                     str(value).strip()
                     for value in (
@@ -2078,12 +2248,9 @@ class PersonalDetailExtractionContext:
             canonical_keys = {
                 key
                 for record in deduped
-                if isinstance(record, Mapping)
-                and (key := exact_monthly_key(record)) is not None
+                if isinstance(record, Mapping) and (key := exact_monthly_key(record)) is not None
             }
-            source_records_by_key: dict[
-                tuple[str, int, int], list[Mapping[str, Any]]
-            ] = {}
+            source_records_by_key: dict[tuple[str, int, int], list[Mapping[str, Any]]] = {}
             for record in source_structure_records:
                 if not isinstance(record, Mapping):
                     continue
@@ -2098,9 +2265,7 @@ class PersonalDetailExtractionContext:
                 if isinstance(grid, Mapping) and str(grid.get("grid_id") or "")
             }
             for grid_id in sorted({key[0] for key in missing_source_keys}):
-                localized_keys = sorted(
-                    key for key in missing_source_keys if key[0] == grid_id
-                )
+                localized_keys = sorted(key for key in missing_source_keys if key[0] == grid_id)
                 report_localized_monthly_omissions(
                     self,
                     issue_code="canonical_monthly_source_structure_missing_field",
@@ -2111,11 +2276,7 @@ class PersonalDetailExtractionContext:
                     parser_stage="canonical_monthly_grid_materialization",
                     grid_id=grid_id,
                     months=((key[1], key[2]) for key in localized_keys),
-                    source_records=(
-                        record
-                        for key in localized_keys
-                        for record in source_records_by_key[key]
-                    ),
+                    source_records=(record for key in localized_keys for record in source_records_by_key[key]),
                     grid=grids_by_id.get(grid_id),
                     observed_context={"source_structure_key_count": len(localized_keys)},
                     reason_codes=(
@@ -2152,13 +2313,9 @@ class PersonalDetailExtractionContext:
                         observed_value={"canonical_row_count": len(deduped)},
                         candidate_value={
                             "source_structure_row_count": source_structure_count,
-                            "unreconciled_source_position_count": (
-                                unreconciled_source_position_count
-                            ),
+                            "unreconciled_source_position_count": (unreconciled_source_position_count),
                             "account_month_expected_row_count": None,
-                            "localization_status": (
-                                "pending_unique_account_owner_reconciliation"
-                            ),
+                            "localization_status": ("pending_unique_account_owner_reconciliation"),
                         },
                         reason_codes=(
                             "cell_level_ocr_disabled",
@@ -2227,9 +2384,7 @@ class PersonalDetailExtractionContext:
     def candidate_b_status_glyph_observations(self) -> list[dict[str, Any]]:
         """Return private document-local glyph evidence for the final gate."""
         self.corrected_repayment_records()
-        return deepcopy(
-            getattr(self, "_candidate_b_status_glyph_observations", [])
-        )
+        return deepcopy(getattr(self, "_candidate_b_status_glyph_observations", []))
 
     def section_content(self, full_text: str) -> dict[str, Any]:
         """Return supplemental datasets from the same Candidate B result."""
@@ -2383,8 +2538,7 @@ class PersonalDetailExtractionContext:
         )
         conserved = self._construct_static_topology_pages(ordered)
         self._conserved_source_page_by_logical = {
-            int(page.get("page") or 0): int(page.get("source_page") or 0)
-            for page in conserved
+            int(page.get("page") or 0): int(page.get("source_page") or 0) for page in conserved
         }
         return conserved
 
@@ -2413,16 +2567,13 @@ class PersonalDetailExtractionContext:
             )
         known = {int(page.get("page") or 0) for page in merged}
         merged.extend(
-            deepcopy(page)
-            for logical, page in self._business_repair_evidence_by_page.items()
-            if logical not in known
+            deepcopy(page) for logical, page in self._business_repair_evidence_by_page.items() if logical not in known
         )
         # Line-level normalization is permitted only now: the first schema
         # pass selected these pages as business-uncertain.
         selected = [page for page in merged if int(page.get("page") or 0) in affected]
         corrected_by_page = {
-            int(page.get("page") or 0): page
-            for page in self._ocr_correction_overlay.corrected_evidence_pages(selected)
+            int(page.get("page") or 0): page for page in self._ocr_correction_overlay.corrected_evidence_pages(selected)
         }
         return [corrected_by_page.get(int(page.get("page") or 0), page) for page in merged]
 
@@ -2451,8 +2602,7 @@ class PersonalDetailExtractionContext:
             failed = decision.get("status") == "failed"
             issue_code = "static_page_split_validation_failed" if failed else "static_page_split_uncertain"
             if any(
-                item.get("code") == issue_code
-                and int(item.get("source_page") or 0) == source
+                item.get("code") == issue_code and int(item.get("source_page") or 0) == source
                 for item in self._topology_recovery_issues
             ):
                 continue
@@ -2514,8 +2664,7 @@ class PersonalDetailExtractionContext:
                 # the topology uncertainty without invoking OCR.
                 merged.extend(base_pages)
                 if not any(
-                    item.get("code") == "static_split_pair_incomplete"
-                    and int(item.get("source_page") or 0) == source
+                    item.get("code") == "static_split_pair_incomplete" and int(item.get("source_page") or 0) == source
                     for item in self._topology_recovery_issues
                 ):
                     self._topology_recovery_issues.append(
@@ -2655,7 +2804,10 @@ class PersonalDetailExtractionContext:
             order_keys[logical] = (source_order, segment, logical)
         self.reading_order_by_logical.clear()
         self.reading_order_by_logical.update(
-            {logical: index for index, logical in enumerate(sorted(order_keys, key=lambda item: order_keys[item]), start=1)}
+            {
+                logical: index
+                for index, logical in enumerate(sorted(order_keys, key=lambda item: order_keys[item]), start=1)
+            }
         )
         return sorted(
             merged,
@@ -2852,9 +3004,7 @@ class PersonalDetailExtractionContext:
             raw_pages.append(
                 {
                     "logical_page": int(bundle.get("page") or local.get("page") or 0),
-                    "source_page": int(
-                        bundle.get("source_page_number") or local.get("source_page") or 0
-                    ),
+                    "source_page": int(bundle.get("source_page_number") or local.get("source_page") or 0),
                 }
             )
 
@@ -2877,9 +3027,7 @@ class PersonalDetailExtractionContext:
             logical for logical, count in Counter(raw_logicals).items() if logical <= 0 or count != 1
         )
         duplicate_conserved_logicals = sorted(
-            logical
-            for logical, count in Counter(conserved_logicals).items()
-            if logical <= 0 or count != 1
+            logical for logical, count in Counter(conserved_logicals).items() if logical <= 0 or count != 1
         )
         source_mappings: list[dict[str, Any]] = []
         static_replacement_sources: list[int] = []
@@ -2894,18 +3042,11 @@ class PersonalDetailExtractionContext:
                     int(page.get("page") or 0),
                 ),
             )
-            conserved_for_source_logicals = [
-                int(page.get("page") or 0) for page in conserved_for_source
-            ]
-            segments = sorted(
-                int(page.get("segment_index") or 0) for page in conserved_for_source
-            )
-            has_static_registration = any(
-                page.get("plugin_static_subpage") is True for page in conserved_for_source
-            )
+            conserved_for_source_logicals = [int(page.get("page") or 0) for page in conserved_for_source]
+            segments = sorted(int(page.get("segment_index") or 0) for page in conserved_for_source)
+            has_static_registration = any(page.get("plugin_static_subpage") is True for page in conserved_for_source)
             registered_to_source = all(
-                frozen_source_map.get(logical) == source
-                and logical in self._frozen_logical_pages
+                frozen_source_map.get(logical) == source and logical in self._frozen_logical_pages
                 for logical in conserved_for_source_logicals
             )
             if (
@@ -2984,10 +3125,7 @@ class PersonalDetailExtractionContext:
         """Localize every source page omitted from one canonical projection."""
 
         conserved = self.conserved_corrected_evidence_pages()
-        source_by_logical = {
-            int(page.get("page") or 0): int(page.get("source_page") or 0)
-            for page in conserved
-        }
+        source_by_logical = {int(page.get("page") or 0): int(page.get("source_page") or 0) for page in conserved}
         registrations = {
             int(row.get("logical_page") or 0): row
             for row in getattr(projection, "registrations", ())
@@ -3000,13 +3138,8 @@ class PersonalDetailExtractionContext:
             for logical in group.get("fragment_logical_pages") or ()
         }
         conserved_logicals = set(source_by_logical)
-        admitted_logicals = admitted_projection_logicals.intersection(
-            conserved_logicals
-        )
-        unresolved_projection_logicals = {
-            int(logical)
-            for logical in getattr(projection, "unresolved_pages", ())
-        }
+        admitted_logicals = admitted_projection_logicals.intersection(conserved_logicals)
+        unresolved_projection_logicals = {int(logical) for logical in getattr(projection, "unresolved_pages", ())}
         withheld_pages: list[dict[str, Any]] = []
         for logical in sorted(set(source_by_logical).difference(admitted_logicals)):
             registration = registrations.get(logical, {})
@@ -3049,11 +3182,10 @@ class PersonalDetailExtractionContext:
                 }
             )
         registered_logicals = set(registrations)
-        partition_valid = admitted_logicals.isdisjoint(
-            {row["logical_page"] for row in withheld_pages}
-        ) and admitted_logicals | {
-            row["logical_page"] for row in withheld_pages
-        } == conserved_logicals
+        partition_valid = (
+            admitted_logicals.isdisjoint({row["logical_page"] for row in withheld_pages})
+            and admitted_logicals | {row["logical_page"] for row in withheld_pages} == conserved_logicals
+        )
         return {
             "phase": phase,
             "valid": (
@@ -3066,15 +3198,11 @@ class PersonalDetailExtractionContext:
             "canonical_page_count": len(getattr(projection, "pages", ())),
             "admitted_logical_page_count": len(admitted_logicals),
             "admitted_logical_pages": sorted(admitted_logicals),
-            "admitted_non_census_logical_pages": sorted(
-                admitted_projection_logicals.difference(conserved_logicals)
-            ),
+            "admitted_non_census_logical_pages": sorted(admitted_projection_logicals.difference(conserved_logicals)),
             "withheld_logical_page_count": len(withheld_pages),
             "withheld_logical_pages": [row["logical_page"] for row in withheld_pages],
             "withheld_pages": withheld_pages,
-            "unregistered_conserved_logical_pages": sorted(
-                conserved_logicals.difference(registered_logicals)
-            ),
+            "unregistered_conserved_logical_pages": sorted(conserved_logicals.difference(registered_logicals)),
         }
 
     def _canonical_projection_phase_history(self) -> list[dict[str, Any]]:
@@ -3146,9 +3274,7 @@ class PersonalDetailExtractionContext:
         if not left_entity_id or not right_entity_id:
             return None
         if left_unit.page != right_unit.page:
-            if not _authoritative_reading_order(
-                getattr(self, "reading_order_resolution", None)
-            ) or not (
+            if not _authoritative_reading_order(getattr(self, "reading_order_resolution", None)) or not (
                 isinstance(left_unit.page, int)
                 and not isinstance(left_unit.page, bool)
                 and isinstance(right_unit.page, int)
@@ -3159,9 +3285,7 @@ class PersonalDetailExtractionContext:
         return left_entity_id == right_entity_id
 
     def pages_adjacent_in_reading_order(self, left_page: int, right_page: int) -> bool:
-        if not _authoritative_reading_order(
-            getattr(self, "reading_order_resolution", None)
-        ):
+        if not _authoritative_reading_order(getattr(self, "reading_order_resolution", None)):
             return False
         if (
             not isinstance(left_page, int)
@@ -3173,23 +3297,14 @@ class PersonalDetailExtractionContext:
         ):
             return False
         registered_positions = list(self.reading_order_by_logical.values())
-        registered_logical_pages = set(
-            getattr(self, "source_page_by_logical", {}) or {}
-        )
+        registered_logical_pages = set(getattr(self, "source_page_by_logical", {}) or {})
         if (
             any(
-                not isinstance(position, int)
-                or isinstance(position, bool)
-                or position <= 0
+                not isinstance(position, int) or isinstance(position, bool) or position <= 0
                 for position in registered_positions
             )
             or len(registered_positions) != len(set(registered_positions))
-            or (
-                registered_logical_pages
-                and not registered_logical_pages.issubset(
-                    self.reading_order_by_logical
-                )
-            )
+            or (registered_logical_pages and not registered_logical_pages.issubset(self.reading_order_by_logical))
         ):
             return False
         left_order = self.reading_order_by_logical.get(left_page)
@@ -3214,9 +3329,7 @@ class PersonalDetailExtractionContext:
     ) -> bool | None:
         if left_page == right_page:
             return True
-        if not _authoritative_reading_order(
-            getattr(self, "reading_order_resolution", None)
-        ):
+        if not _authoritative_reading_order(getattr(self, "reading_order_resolution", None)):
             return False
         if not self.pages_adjacent_in_reading_order(left_page, right_page):
             return False

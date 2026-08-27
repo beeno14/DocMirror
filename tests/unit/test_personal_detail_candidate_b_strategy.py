@@ -232,10 +232,16 @@ def test_unresolved_unknown_or_partial_audit_falls_back_eagerly(
 
     assert census.complete is False
     assert census.fallback_reason == expected_reason
-    assert all(
-        state is SectionState.UNRESOLVED
-        for _section, state in census.census.states
-    )
+    if expected_reason == "canonical_unresolved_pages:2":
+        assert set(census.fingerprint_by_page) == {1, 3}
+        assert census.census.state_for(REPORT_HEADER_SECTION) is SectionState.OBSERVED
+        assert census.census.state_for(INQUIRY_SECTION) is SectionState.OBSERVED
+        assert census.census.state_for(ACCOUNT_SECTION) is SectionState.UNRESOLVED
+    else:
+        assert all(
+            state is SectionState.UNRESOLVED
+            for _section, state in census.census.states
+        )
     assert plan.mode is MaterializationMode.EAGER_FALLBACK
     assert plan.ordered_stage_names == CANDIDATE_B_STAGE_REGISTRY.ordered()
     assert plan.skipped_stage_names == ()
@@ -285,6 +291,34 @@ def test_explicit_blank_fragment_group_is_accepted_without_materialization():
     assert plan.mode is MaterializationMode.LAZY
 
 
+def test_blank_registration_outside_conserved_plane_does_not_invalidate_census():
+    audit = _complete_audit()
+    registrations = audit["registrations"]
+    assert isinstance(registrations, list)
+    registrations.append(_blank_registration(31))
+
+    census, plan = plan_candidate_b_initial_extraction(audit)
+
+    assert census.complete is True
+    assert set(census.fingerprint_by_page) == {1, 2, 3}
+    assert plan.mode is MaterializationMode.LAZY
+
+
+def test_business_registration_outside_conserved_plane_fails_closed():
+    audit = _complete_audit()
+    registrations = audit["registrations"]
+    assert isinstance(registrations, list)
+    extra = _registration(31, ACCOUNT_SECTION)
+    extra["printed_total"] = 31
+    registrations.append(extra)
+
+    census, plan = plan_candidate_b_initial_extraction(audit)
+
+    assert census.complete is False
+    assert census.fallback_reason == "canonical_registration_page_census_mismatch"
+    assert plan.mode is MaterializationMode.EAGER_FALLBACK
+
+
 def test_owner_contract_and_fragment_contract_changes_invalidate_lazy_repair():
     audit = _complete_audit(include_inquiries=False)
     account_registration = _registration_for_page(audit, 2)
@@ -331,8 +365,13 @@ def test_owner_contract_and_fragment_contract_changes_invalidate_lazy_repair():
         affected_pages=[2],
         repair_dataset_names=["credit_accounts"],
     )
-    assert owner_scope.eager_fallback_required is True
+    assert owner_scope.eager_fallback_required is False
     assert owner_scope.ownership_changed_pages == (2,)
+    assert {
+        "account_inventory",
+        "liabilities",
+        "source_rows",
+    }.issubset(owner_scope.dirty_stage_names)
 
     fragment_changed_audit = deepcopy(audit)
     fragment_changed_audit["fragment_groups"][1]["coverage_ratio"] = 0.999
@@ -350,7 +389,7 @@ def test_owner_contract_and_fragment_contract_changes_invalidate_lazy_repair():
         affected_pages=[2],
         repair_dataset_names=["credit_accounts"],
     )
-    assert fragment_scope.eager_fallback_required is True
+    assert fragment_scope.eager_fallback_required is False
     assert fragment_scope.ownership_changed_pages == (2,)
 
 
@@ -451,7 +490,61 @@ def test_business_repair_adapter_uses_only_page_scoped_uncertainty_datasets():
     assert "inquiries" not in scope.dirty_stage_names
 
 
-def test_repair_falls_back_when_affected_owner_fingerprint_changes():
+def test_field_only_repair_reuses_every_source_extraction_stage():
+    audit = _complete_audit()
+    _census, initial_plan = plan_candidate_b_initial_extraction(audit)
+    scope = candidate_b_repair_scope(
+        {
+            "affected_pages": [2],
+            "reconstruction_evidence": {},
+            "uncertainties": [
+                {
+                    "logical_pages": [2],
+                    "dataset_name": "repayment_records",
+                }
+            ],
+        },
+        audit,
+        deepcopy(audit),
+    )
+    plan = scope.plan(
+        available_stage_names=initial_plan.ordered_stage_names,
+    )
+
+    assert scope.eager_fallback_required is False
+    assert scope.dirty_stage_names == ()
+    assert plan.mode is MaterializationMode.LAZY
+    assert plan.ordered_stage_names == ()
+    assert plan.reused_stage_names == initial_plan.ordered_stage_names
+
+
+def test_reconstruction_scope_excludes_field_only_pages_and_datasets():
+    audit = _complete_audit()
+    scope = candidate_b_repair_scope(
+        {
+            "affected_pages": [2, 3],
+            "reconstruction_evidence": {2: {"page": 2}},
+            "uncertainties": [
+                {
+                    "logical_pages": [2],
+                    "dataset_name": "repayment_records",
+                },
+                {
+                    "logical_pages": [3],
+                    "dataset_name": "inquiry_records",
+                },
+            ],
+        },
+        audit,
+        deepcopy(audit),
+    )
+
+    assert scope.affected_pages == (2,)
+    assert "monthly_repayments" in scope.dirty_stage_names
+    assert "inquiries" not in scope.dirty_stage_names
+
+
+def test_repair_invalidates_only_affected_stages_when_owner_fingerprint_changes():
     discovery_audit = _complete_audit()
     repaired_audit = deepcopy(discovery_audit)
     _registration_for_page(repaired_audit, 2)["basis"] = "repaired_heading"
@@ -465,15 +558,45 @@ def test_repair_falls_back_when_affected_owner_fingerprint_changes():
         repair_dataset_names=["credit_accounts"],
     )
 
-    assert scope.eager_fallback_required is True
+    assert scope.eager_fallback_required is False
     assert scope.ownership_changed_pages == (2,)
-    assert scope.fallback_reason == "repair_affected_page_ownership_changed:2"
+    assert scope.fallback_reason == ""
     plan = scope.plan(
         available_stage_names=CANDIDATE_B_STAGE_REGISTRY.names
     )
-    assert plan.mode is MaterializationMode.EAGER_FALLBACK
-    assert plan.ordered_stage_names == CANDIDATE_B_STAGE_REGISTRY.ordered()
-    assert plan.audit().to_dict()["fallback_reason"] == scope.fallback_reason
+    assert plan.mode is MaterializationMode.LAZY
+    assert plan.ordered_stage_names == scope.dirty_stage_names
+    assert "inquiries" in plan.reused_stage_names
+    assert "header" in plan.reused_stage_names
+    assert plan.audit().to_dict()["fallback_reason"] is None
+
+
+def test_partial_census_reuses_resolved_sections_during_repair():
+    discovery_audit = _complete_audit()
+    discovery_audit["unresolved_pages"] = [2]
+    discovery = build_candidate_b_section_census(discovery_audit)
+    repaired = build_candidate_b_section_census(_complete_audit())
+
+    assert discovery.complete is False
+    assert set(discovery.fingerprint_by_page) == {1, 3}
+
+    scope = resolve_candidate_b_repair_scope(
+        discovery,
+        repaired,
+        affected_pages=[2],
+        repair_dataset_names=["credit_accounts"],
+    )
+    plan = scope.plan(
+        available_stage_names=CANDIDATE_B_STAGE_REGISTRY.names,
+    )
+
+    assert scope.eager_fallback_required is False
+    assert scope.ownership_changed_pages == (2,)
+    assert plan.mode is MaterializationMode.LAZY
+    assert "account_inventory" in plan.ordered_stage_names
+    assert "monthly_repayments" in plan.ordered_stage_names
+    assert "inquiries" in plan.reused_stage_names
+    assert "header" in plan.reused_stage_names
 
 
 @pytest.mark.parametrize(

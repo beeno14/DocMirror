@@ -958,6 +958,7 @@ def test_source_projection_account_month_ledger_is_set_based_and_fail_closed() -
     assert closure["candidate_identity_count"] == 1
     assert closure["localized_missing_identity_count"] == 1
     assert closure["expected_identity_count"] == 2
+    assert closure["expected_source_position_count"] == 4
     assert closure["raw_source_month_positions"] == 4
     assert closure["owner_bound_account_months"] == 3
     assert closure["owner_unresolved_positions"] == 1
@@ -972,7 +973,15 @@ def test_source_projection_account_month_ledger_is_set_based_and_fail_closed() -
         "repayment_records"
     ]
     assert state["observed_row_count"] == 1
-    assert state["expected_row_count"] == 2
+    assert state["expected_row_count"] == 4
+    projected = project_personal_detail_datasets(prepared["datasets"])
+    monthly_status = next(
+        row
+        for row in projected["dataset_status"]
+        if row["dataset_name"] == "credit_account_monthly_performance"
+    )
+    assert monthly_status["observed_row_count"] == 1
+    assert monthly_status["expected_row_count"] == 4
 
 
 def test_source_projection_deduplicates_evidence_alias_across_geometry_variants() -> None:
@@ -1147,7 +1156,7 @@ def test_source_projection_deduplicates_exact_geometry_with_distinct_evidence() 
     assert closure["physical_alias_source_month_observations"] == 1
 
 
-def test_source_projection_reconciles_early_grid_alias_after_final_cell_calibration() -> None:
+def test_source_projection_keeps_grid_alias_physical_count_after_final_cell_calibration() -> None:
     performance_month = "2024-01"
     context = SimpleNamespace(_personal_detail_extraction_issues=[])
     account = {
@@ -1256,14 +1265,14 @@ def test_source_projection_reconciles_early_grid_alias_after_final_cell_calibrat
 
     closure = prepared["facts"]["personal_detail_account_month_closure"]
     assert closure["source_month_position_observations"] == 2
-    assert closure["raw_source_month_positions"] == 1
-    assert closure["unique_physical_source_month_positions"] == 1
-    assert closure["owner_bound_account_months"] == 1
+    assert closure["raw_source_month_positions"] == 2
+    assert closure["unique_physical_source_month_positions"] == 2
+    assert closure["owner_bound_account_months"] == 2
     assert closure["alias_source_month_positions"] == 1
-    assert closure["physical_alias_source_month_observations"] == 1
+    assert closure["physical_alias_source_month_observations"] == 0
 
 
-def test_source_projection_calibrated_grid_alias_requires_consistent_source_page() -> None:
+def test_source_projection_does_not_treat_a_source_table_as_one_month_cell() -> None:
     account_id = "account:1"
     performance_month = "2024-01"
 
@@ -1369,9 +1378,12 @@ def test_source_projection_calibrated_grid_alias_requires_consistent_source_page
     )["facts"]["personal_detail_account_month_closure"]
 
     assert same_source["source_month_position_observations"] == 2
-    assert same_source["raw_source_month_positions"] == 1
-    assert same_source["owner_bound_account_months"] == 1
-    assert same_source["physical_alias_source_month_observations"] == 1
+    # A source-table id proves which table calibrated the grid. It is not a
+    # physical month-cell identity: these observations have different exact
+    # geometry and evidence, even when their source page and table agree.
+    assert same_source["raw_source_month_positions"] == 2
+    assert same_source["owner_bound_account_months"] == 2
+    assert same_source["physical_alias_source_month_observations"] == 0
     assert conflicting_source["source_month_position_observations"] == 2
     assert conflicting_source["raw_source_month_positions"] == 2
     assert conflicting_source["owner_bound_account_months"] == 2
@@ -2492,11 +2504,13 @@ def test_source_projection_does_not_reconcile_alias_without_exact_owner() -> Non
 def _asymmetric_detached_month_alias_content(
     *,
     alias_status: str = "informational",
+    performance_month: str = "2020-01",
+    primary_exact_geometry: bool = False,
 ) -> dict[str, object]:
     """Model Yang page 8 without depending on private OCR fixtures."""
 
     account_id = "credit_account:non_revolving_loan:15"
-    performance_month = "2020-01"
+    month_number = int(performance_month[-2:])
     primary_grid_id = "mg_p8_repayment_1"
     alias_grid_id = "mg_p8_repayment_0"
     owner_key = stable_record_id(
@@ -2513,6 +2527,46 @@ def _asymmetric_detached_month_alias_content(
         "grid_geometry_exact": True,
         "unique_owner": True,
     }
+    primary_cell_refs: list[dict[str, object]] = [
+        {
+            "page": 8,
+            "logical_page": 8,
+            "geometry_scope": "logical_page",
+            "geometry_status": "unresolved",
+            "coordinate_system": "pdf_points_top_left",
+            "grid_id": primary_grid_id,
+            "row": 2,
+            "col": month_number,
+            "field_name": "status",
+            "geometry_rejection": {
+                "source": "rejected_month_geometry",
+                "reason": "source_table_month_ownership_required",
+                "logical_page": 8,
+                "value_inputs_used": False,
+            },
+        }
+    ]
+    if primary_exact_geometry:
+        left = 66.41666666666667 + 25.08333333333333 * month_number
+        right = 91.5 + 25.08333333333333 * month_number
+        primary_cell_refs = [
+            {
+                "page": 8,
+                "logical_page": 8,
+                "geometry_scope": "cell",
+                "coordinate_system": "pdf_points_top_left",
+                "grid_id": primary_grid_id,
+                "row": row,
+                "col": month_number,
+                "field_name": field_name,
+                "performance_month": performance_month,
+                "bbox": [left, top, right, bottom],
+            }
+            for row, field_name, top, bottom in (
+                (2, "status", 197.5, 210.5),
+                (3, "overdue_amount", 210.5, 223.5),
+            )
+        ]
     primary = {
         "record_id": f"{primary_grid_id}:{performance_month}",
         "repayment_id": f"{primary_grid_id}:{performance_month}",
@@ -2525,25 +2579,7 @@ def _asymmetric_detached_month_alias_content(
         # The retained grid has an exact owner/month proof, but its source-table
         # cell geometry was rejected.  It intentionally contributes no physical
         # fingerprint, matching the frozen Yang artifact.
-        "source_cell_refs": [
-            {
-                "page": 8,
-                "logical_page": 8,
-                "geometry_scope": "logical_page",
-                "geometry_status": "unresolved",
-                "coordinate_system": "pdf_points_top_left",
-                "grid_id": primary_grid_id,
-                "row": 2,
-                "col": 1,
-                "field_name": "status",
-                "geometry_rejection": {
-                    "source": "rejected_month_geometry",
-                    "reason": "source_table_month_ownership_required",
-                    "logical_page": 8,
-                    "value_inputs_used": False,
-                },
-            }
-        ],
+        "source_cell_refs": primary_cell_refs,
     }
     alias_refs = [
         {
@@ -2553,7 +2589,7 @@ def _asymmetric_detached_month_alias_content(
             "coordinate_system": "pdf_points_top_left",
             "grid_id": alias_grid_id,
             "row": row,
-            "col": 1,
+            "col": month_number,
             "field_name": "performance_month",
             "source_field_name": source_field_name,
             "performance_month": performance_month,
@@ -2563,8 +2599,26 @@ def _asymmetric_detached_month_alias_content(
             "binding_quality": "source_account_month_alias",
         }
         for row, source_field_name, bbox in (
-            (2, "status", [91.5, 287.5, 116.58333333333333, 304.5]),
-            (3, "overdue_amount", [91.5, 301.0, 116.58333333333333, 317.0]),
+            (
+                2,
+                "status",
+                [
+                    66.41666666666667 + 25.08333333333333 * month_number,
+                    287.5,
+                    91.5 + 25.08333333333333 * month_number,
+                    304.5,
+                ],
+            ),
+            (
+                3,
+                "overdue_amount",
+                [
+                    66.41666666666667 + 25.08333333333333 * month_number,
+                    301.0,
+                    91.5 + 25.08333333333333 * month_number,
+                    317.0,
+                ],
+            ),
         )
     ]
     sibling_refs = [
@@ -2705,6 +2759,45 @@ def test_source_projection_reconciles_strict_asymmetric_detached_alias_only_in_r
     amount_sibling["source_refs"][0]["field_name"] = "status_amount"
     production_issues[1:1] = [status_sibling, amount_sibling]
     assert _month_closure(production_family)["raw_source_month_positions"] == 1
+
+
+def test_source_projection_counts_ye_shaped_nine_month_detached_block() -> None:
+    months = [
+        *(f"2023-{month:02d}" for month in range(7, 13)),
+        *(f"2024-{month:02d}" for month in range(1, 4)),
+    ]
+    contents = [
+        _asymmetric_detached_month_alias_content(
+            performance_month=month,
+            primary_exact_geometry=True,
+        )
+        for month in months
+    ]
+    closure = _month_closure(
+        {
+            "facts": {},
+            "datasets": {
+                "repayment_records": [
+                    row
+                    for content in contents
+                    for row in content["datasets"]["repayment_records"]  # type: ignore[index]
+                ],
+                "personal_detail_extraction_issues": [
+                    row
+                    for content in contents
+                    for row in content["datasets"]["personal_detail_extraction_issues"]  # type: ignore[index]
+                ],
+            },
+        }
+    )
+
+    assert closure["candidate_identity_count"] == 9
+    assert closure["canonical_account_month_identity_count"] == 9
+    assert closure["source_month_position_observations"] == 18
+    assert closure["raw_source_month_positions"] == 18
+    assert closure["owner_bound_account_months"] == 18
+    assert closure["alias_source_month_positions"] == 9
+    assert closure["physical_alias_source_month_observations"] == 0
 
 
 def test_source_projection_detached_alias_contract_mutations_fail_closed() -> None:

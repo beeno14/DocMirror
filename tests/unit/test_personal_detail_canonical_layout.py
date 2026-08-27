@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
     PBOCCanonicalTemplateAssembler,
     _project_table,
@@ -14,6 +16,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.context import (
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _canonical_inquiry_line_rows,
     _extract_inquiries,
+    _extract_residence_records,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
@@ -1186,6 +1189,129 @@ def test_mixed_pboc_page_projects_only_exact_table_local_section_owners() -> Non
     assert projection.registrations[0]["basis"] == (
         "exact_table_local_pboc_section_ownership"
     )
+
+
+def _residence_mixed_page_case(
+    *,
+    address_header: str = "居住地址 G",
+    populated: bool = True,
+    exact_address_owner: bool = True,
+    duplicate_header_owner: bool = False,
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    residence = _exact_mixed_schema_table(
+        "mixed-residence",
+        top=80.0,
+        header=("编号", address_header, "住宅电话", "居住状况", "信息更新日期"),
+        values=(
+            "1",
+            "福建省厦门市湖里区凯悦新城49栋702",
+            "13960812955",
+            "自置",
+            "2022.04.28" if populated else "",
+        ),
+        widths=(2.0, 12.0, 6.0, 4.0, 6.0),
+    )
+    geometry = residence.metadata["geometry"]
+    if not exact_address_owner:
+        geometry["cell_geometry_status"][0][1] = "derived"
+    if duplicate_header_owner:
+        geometry["cell_evidence_ids"][0][1] = list(
+            geometry["cell_evidence_ids"][0][0]
+        )
+    unrelated = _exact_mixed_schema_table(
+        "mixed-employment-unowned",
+        top=245.0,
+        header=("编号", "工作单位"),
+        values=("1", "示例单位"),
+    )
+    result = SimpleNamespace(
+        pages=[
+            _page(
+                2,
+                source=2,
+                width=550.0,
+                height=700.0,
+                tables=[residence, unrelated],
+            )
+        ]
+    )
+    evidence: list[dict[str, object]] = [
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 550.0,
+            "page_height": 700.0,
+            "lines": [
+                # Production-shaped shallow overlap with the residence table's
+                # top rule: the heading centre remains above the table.
+                _line("（三）居住信息", [205.0, 69.0, 345.0, 82.0]),
+                _line("（四）职业信息", [205.0, 215.0, 345.0, 238.0]),
+            ],
+        }
+    ]
+    return result, evidence
+
+
+def test_residence_table_local_owner_admits_only_the_lazy_optional_section() -> None:
+    result, evidence = _residence_mixed_page_case()
+
+    projection = _assembler(result, evidence).build()
+
+    assert projection.unresolved_pages == ()
+    assert len(projection.pages) == 1
+    projected_page = projection.pages[0]
+    assert projected_page.canonical_template_id == "mixed_pboc_sections"
+    assert [table.table_id for table in projected_page.tables] == [
+        "mixed-residence"
+    ]
+    residence_owner = projected_page.tables[0].metadata[
+        "canonical_section_owner"
+    ]
+    assert residence_owner["template_id"] == "report_header_and_identity"
+    assert residence_owner["header_binding"] == (
+        "bounded_residence_address_ascii_residue"
+    )
+
+    context = SimpleNamespace(
+        pages=list(projection.pages),
+        _personal_detail_extraction_issues=[],
+    )
+    records = _extract_residence_records(context)
+    assert [(row["sequence"], row["address"]) for row in records] == [
+        (1, "福建省厦门市湖里区凯悦新城49栋702")
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "multi_ascii_residue",
+        "han_residue",
+        "missing_population_witness",
+        "inexact_header_geometry",
+        "duplicate_header_evidence",
+    ),
+)
+def test_residence_table_local_owner_fails_closed_outside_bounded_contract(
+    case: str,
+) -> None:
+    kwargs: dict[str, object] = {}
+    if case == "multi_ascii_residue":
+        kwargs["address_header"] = "居住地址 GG"
+    elif case == "han_residue":
+        kwargs["address_header"] = "居住地址 家"
+    elif case == "missing_population_witness":
+        kwargs["populated"] = False
+    elif case == "inexact_header_geometry":
+        kwargs["exact_address_owner"] = False
+    else:
+        kwargs["duplicate_header_owner"] = True
+    result, evidence = _residence_mixed_page_case(**kwargs)
+
+    projection = _assembler(result, evidence).build()
+
+    assert projection.pages == ()
+    assert projection.unresolved_pages == (2,)
 
 
 def test_mixed_pboc_owned_reordered_inquiry_header_extracts_by_semantic_roles() -> None:

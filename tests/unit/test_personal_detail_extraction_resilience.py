@@ -1482,6 +1482,82 @@ def test_projection_prefers_independent_inquiry_endpoints_over_emitted_rows() ->
     assert "target_record_id" not in issue
 
 
+def test_projection_recovers_sum_of_dense_typed_endpoints_from_stale_aggregate() -> None:
+    institution = list(range(1, 97))
+    personal = list(range(1, 17))
+    content = prepare_personal_detail_source_collections(
+        {
+            "facts": {
+                "personal_detail_source_completeness_ledger": {
+                    # Reproduces the former Ye deployment defect: a stale
+                    # aggregate survived beside two sealed typed populations.
+                    "inquiry_records": 36,
+                    "inquiry_sequence_endpoints": {
+                        "institution": 96,
+                        "personal": 16,
+                    },
+                    "inquiry_observed_sequences": {
+                        "institution": [*institution, 789],
+                        "personal": personal,
+                    },
+                    "inquiry_sequence_outliers": {"institution": [789]},
+                    "inquiry_ordinal_observations": {
+                        inquiry_type: {
+                            str(sequence): {
+                                "sequence": sequence,
+                                "inquiry_type": inquiry_type,
+                                "source_refs": [
+                                    {
+                                        "logical_page": 28 if inquiry_type == "institution" else 30,
+                                        "source_page": 27 if inquiry_type == "institution" else 29,
+                                        "table_id": f"{inquiry_type}_inquiries",
+                                        "row": sequence,
+                                        "bbox": [0.0, float(sequence), 10.0, float(sequence + 1)],
+                                        "evidence_ids": [f"{inquiry_type}:{sequence}"],
+                                    }
+                                ],
+                            }
+                            for sequence in sequences
+                        }
+                        for inquiry_type, sequences in (
+                            ("institution", institution),
+                            ("personal", personal),
+                        )
+                    },
+                }
+            },
+            "datasets": {
+                "inquiry_records": [
+                    {
+                        "inquiry_id": f"credit_inquiry:institution:{sequence}",
+                        "inquiry_type": "institution",
+                        "sequence": sequence,
+                    }
+                    for sequence in institution
+                    if sequence not in {59, 61, 62, 66, 93, 94, 95, 96}
+                ]
+                + [
+                    {
+                        "inquiry_id": f"credit_inquiry:personal:{sequence}",
+                        "inquiry_type": "personal",
+                        "sequence": sequence,
+                    }
+                    for sequence in personal
+                ]
+            },
+        }
+    )
+
+    status = next(
+        row
+        for row in content["datasets"]["personal_detail_dataset_status"]
+        if row["dataset_name"] == "inquiry_records"
+    )
+    assert status["presence_status"] == "partial"
+    assert status["observed_row_count"] == 104
+    assert status["expected_row_count"] == 112
+
+
 def test_source_ledger_projects_exact_missing_account_and_printed_field_issues() -> None:
     ref = {
         "source": "candidate_b_account_anchor",

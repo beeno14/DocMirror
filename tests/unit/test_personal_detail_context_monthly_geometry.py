@@ -67,17 +67,11 @@ def _context(
 ) -> PersonalDetailExtractionContext:
     evidence_pages = canonical_pages if canonical_pages is not None else sealed_pages
     logical_pages = sorted(
-        {
-            page.page_number
-            for page in evidence_pages
-            if isinstance(page.page_number, int) and page.page_number > 0
-        }
+        {page.page_number for page in evidence_pages if isinstance(page.page_number, int) and page.page_number > 0}
     )
     context = object.__new__(PersonalDetailExtractionContext)
     context._cache = {}
-    context.reading_order_by_logical = {
-        page: order for order, page in enumerate(logical_pages, start=1)
-    }
+    context.reading_order_by_logical = {page: order for order, page in enumerate(logical_pages, start=1)}
     context.reading_order_resolution = {
         "resolved": False,
         "authoritative": False,
@@ -100,9 +94,7 @@ def _context(
         ),
     )
     context._canonical_layout_projection_cache = (
-        None
-        if canonical_pages is None
-        else SimpleNamespace(pages=canonical_pages)
+        None if canonical_pages is None else SimpleNamespace(pages=canonical_pages)
     )
     context.corrected_evidence_pages = lambda: [
         {
@@ -127,8 +119,7 @@ def _captured_primary_input(
         captured.append(deepcopy(detached))
 
     monkeypatch.setattr(
-        "docmirror.plugins.credit_report.micro_grid_materialize."
-        "materialize_credit_repayment_micro_grids_from_bundles",
+        "docmirror.plugins.credit_report.micro_grid_materialize.materialize_credit_repayment_micro_grids_from_bundles",
         materialize,
     )
     assert context.corrected_repayment_records() == []
@@ -141,11 +132,7 @@ def _source_geometry(
     *,
     page: int = 1,
 ) -> list[dict[str, Any]]:
-    bundle = next(
-        bundle
-        for bundle in detached["_page_evidence_bundles"]
-        if bundle["page"] == page
-    )
+    bundle = next(bundle for bundle in detached["_page_evidence_bundles"] if bundle["page"] == page)
     return bundle["micro_grid_evidence"]["source_table_geometry"]
 
 
@@ -226,12 +213,8 @@ def test_monthly_geometry_allows_same_layout_on_distinct_canonical_pages(
 
     detached = _captured_primary_input(monkeypatch, context)
 
-    assert [table["table_id"] for table in _source_geometry(detached, page=1)] == [
-        "page-1-grid"
-    ]
-    assert [table["table_id"] for table in _source_geometry(detached, page=2)] == [
-        "page-2-grid"
-    ]
+    assert [table["table_id"] for table in _source_geometry(detached, page=1)] == ["page-1-grid"]
+    assert [table["table_id"] for table in _source_geometry(detached, page=2)] == ["page-2-grid"]
 
 
 def test_monthly_geometry_rejects_one_table_identity_claiming_two_pages(
@@ -264,3 +247,240 @@ def test_monthly_geometry_preserves_sealed_ordinary_page_fallback(
     assert [table["table_id"] for table in geometry] == ["ordinary-grid"]
     assert geometry[0]["cell_bboxes"] == [[[40.0, 100.0, 60.0, 120.0]]]
     assert "N" not in repr(geometry)
+
+
+def test_monthly_repair_deploys_only_exact_source_table_field_atoms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canonical table atoms, not table values, reach the field repair seam."""
+
+    status_bbox = [120.0, 100.0, 140.0, 120.0]
+    amount_bbox = [120.0, 120.0, 140.0, 140.0]
+    table = SimpleNamespace(
+        table_id="repayment-grid",
+        bbox=[100.0, 100.0, 360.0, 140.0],
+        extraction_layer="scanned_image_line_grid",
+        rows=[["2024", "PRIVATE_STATUS_VALUE"], ["", "PRIVATE_AMOUNT_VALUE"]],
+        metadata={
+            "geometry": {
+                "geometry_source": "scanned_image_line_grid",
+                "coordinate_system": "pdf_points_top_left",
+                "cell_bboxes": [
+                    [[100.0, 100.0, 120.0, 140.0], status_bbox],
+                    [None, amount_bbox],
+                ],
+                "cell_geometry_status": [
+                    ["exact", "exact"],
+                    ["derived", "exact"],
+                ],
+                "cell_evidence_ids": [
+                    [["year-token"], ["status-token"]],
+                    [[], ["amount-token"]],
+                ],
+                "cell_token_ids": [
+                    [["year-token"], ["status-token"]],
+                    [[], ["amount-token"]],
+                ],
+                "cell_spans": [{"row": 0, "col": 0, "row_span": 2, "col_span": 1}],
+                "row_bands": [
+                    {"index": 0, "y0": 100.0, "y1": 120.0},
+                    {"index": 1, "y0": 120.0, "y1": 140.0},
+                ],
+                "col_bands": [
+                    {"index": 0, "x0": 100.0, "x1": 120.0},
+                    {"index": 1, "x0": 120.0, "x1": 140.0},
+                ],
+            }
+        },
+    )
+    context = _context(
+        sealed_pages=[_page(1)],
+        canonical_pages=[_page(1, table)],
+    )
+    context.parse_result.entities.domain_specific["_page_evidence_bundles"][0]["tokens"] = [
+        {
+            "token_id": "year-token",
+            "text": "2024",
+            "bbox": [101.0, 105.0, 117.0, 115.0],
+            "confidence": 0.99,
+            "page": 1,
+            "evidence_ids": ["year-token"],
+        },
+        {
+            "token_id": "status-token",
+            "text": "N",
+            "bbox": [125.0, 104.0, 135.0, 116.0],
+            "confidence": 0.97,
+            "page": 1,
+            "evidence_ids": ["status-token"],
+        },
+        {
+            "token_id": "amount-token",
+            "text": "0",
+            "bbox": [125.0, 124.0, 135.0, 136.0],
+            "confidence": 0.98,
+            "page": 1,
+            "evidence_ids": ["amount-token"],
+        },
+    ]
+    context.parse_result.evidence_plane = SimpleNamespace(
+        evidence=SimpleNamespace(
+            text_atoms=[
+                SimpleNamespace(
+                    id="ev:0001:text:000001",
+                    text="2024",
+                    bbox=[101.0, 105.0, 117.0, 115.0],
+                    confidence=0.99,
+                    source_refs=["year-token"],
+                ),
+                SimpleNamespace(
+                    id="ev:0001:text:000002",
+                    text="N",
+                    bbox=[125.0, 104.0, 135.0, 116.0],
+                    confidence=0.97,
+                    source_refs=["status-token"],
+                ),
+                SimpleNamespace(
+                    id="ev:0001:text:000003",
+                    text="0",
+                    bbox=[125.0, 124.0, 135.0, 136.0],
+                    confidence=0.98,
+                    source_refs=["amount-token"],
+                ),
+                SimpleNamespace(
+                    id="ev:0001:text:000004",
+                    text="PRIVATE_STATUS_VALUE",
+                    bbox=status_bbox,
+                    confidence=0.99,
+                    source_refs=["status-token"],
+                ),
+            ]
+        )
+    )
+
+    detached = _captured_primary_input(monkeypatch, context)
+    [bundle] = detached["_page_evidence_bundles"]
+    tokens = bundle["micro_grid_evidence"]["tokens"]
+
+    assert tokens == [
+        {
+            "token_id": "status-token",
+            "content": "N",
+            "bbox": [125.0, 104.0, 135.0, 116.0],
+            "confidence": 0.97,
+            "page": 1,
+            "source_logical_page": 1,
+            "coordinate_system": "pdf_points_top_left",
+            "source": "exact_native_source_table_status_cell",
+            "evidence_ids": ["status-token"],
+        },
+        {
+            "token_id": "amount-token",
+            "content": "0",
+            "bbox": [125.0, 124.0, 135.0, 136.0],
+            "confidence": 0.98,
+            "page": 1,
+            "source_logical_page": 1,
+            "coordinate_system": "pdf_points_top_left",
+            "source": "exact_native_source_table_amount_cell",
+            "evidence_ids": ["amount-token"],
+        },
+    ]
+    assert "PRIVATE_STATUS_VALUE" not in repr(tokens)
+    assert "PRIVATE_AMOUNT_VALUE" not in repr(tokens)
+
+
+def test_monthly_repair_uses_exact_corrected_cell_atom_when_raw_token_is_noisy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A corrected cell stays usable while raw OCR proves only its ownership."""
+
+    cell_bbox = [120.0, 100.0, 140.0, 120.0]
+    table = SimpleNamespace(
+        table_id="corrected-repayment-grid",
+        bbox=cell_bbox,
+        extraction_layer="scanned_image_line_grid",
+        rows=[["PRIVATE_TABLE_VALUE_MUST_NOT_LEAK"]],
+        metadata={
+            "geometry": {
+                "geometry_source": "scanned_image_line_grid",
+                "coordinate_system": "pdf_points_top_left",
+                "cell_bboxes": [[cell_bbox]],
+                "cell_geometry_status": [["exact"]],
+                "cell_evidence_ids": [[["status-token"]]],
+                "cell_token_ids": [[["status-token"]]],
+                "cell_spans": [],
+                "row_bands": [{"index": 0, "y0": 100.0, "y1": 120.0}],
+                "col_bands": [{"index": 0, "x0": 120.0, "x1": 140.0}],
+            }
+        },
+    )
+    context = _context(
+        sealed_pages=[_page(1)],
+        canonical_pages=[_page(1, table)],
+    )
+    context.parse_result.entities.domain_specific["_page_evidence_bundles"][0]["tokens"] = [
+        {
+            "token_id": "status-token",
+            "text": "?",
+            "bbox": [125.0, 104.0, 135.0, 116.0],
+            "confidence": 0.41,
+            "page": 1,
+            "evidence_ids": ["status-token"],
+        }
+    ]
+    context.parse_result.evidence_plane = SimpleNamespace(
+        evidence=SimpleNamespace(
+            text_atoms=[
+                SimpleNamespace(
+                    id="ev:0001:text:corrected",
+                    source_kind="parse_result_table_cell",
+                    text="N",
+                    bbox=cell_bbox,
+                    confidence=0.96,
+                    source_refs=["status-token"],
+                    metadata={
+                        "table_id": "corrected-repayment-grid",
+                        "row_index": 0,
+                        "col_index": 0,
+                        "geometry_status": "exact",
+                        "token_ids": ["status-token"],
+                    },
+                ),
+                SimpleNamespace(
+                    id="ev:0001:text:wrong-cell",
+                    source_kind="parse_result_table_cell",
+                    text="M",
+                    bbox=cell_bbox,
+                    confidence=0.99,
+                    source_refs=["status-token"],
+                    metadata={
+                        "table_id": "different-grid",
+                        "row_index": 0,
+                        "col_index": 0,
+                        "geometry_status": "exact",
+                        "token_ids": ["status-token"],
+                    },
+                ),
+            ]
+        )
+    )
+
+    detached = _captured_primary_input(monkeypatch, context)
+    [bundle] = detached["_page_evidence_bundles"]
+    tokens = bundle["micro_grid_evidence"]["tokens"]
+
+    assert tokens == [
+        {
+            "token_id": "status-token",
+            "content": "N",
+            "bbox": cell_bbox,
+            "confidence": 0.96,
+            "page": 1,
+            "source_logical_page": 1,
+            "coordinate_system": "pdf_points_top_left",
+            "source": "exact_corrected_source_table_status_cell",
+            "evidence_ids": ["status-token", "ev:0001:text:corrected"],
+        }
+    ]
+    assert "PRIVATE_TABLE_VALUE_MUST_NOT_LEAK" not in repr(tokens)

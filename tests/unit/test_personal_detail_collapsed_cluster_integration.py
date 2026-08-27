@@ -543,6 +543,63 @@ def test_collapsed_account_terms_withhold_only_ambiguous_date() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("raw_currency", "expected"),
+    [
+        ("美元 福", "USD"),
+        ("美元贷款", None),
+        ("美元 欧元", None),
+    ],
+)
+def test_exact_currency_slot_repairs_only_one_bounded_ocr_glyph(
+    raw_currency: str,
+    expected: str | None,
+) -> None:
+    table = _table(
+        "lin-card-3",
+        ["发卡机构", "账户标识", "开立日期", "账户授信额度", "币种", "业务种类", "担保方式"],
+        [
+            "中国光大银行股份有限公司",
+            "B10711000H0001USD406252283488479277",
+            "2010.04.28",
+            "37,870",
+            raw_currency,
+            "贷记卡",
+            "信用/免担保",
+        ],
+    )
+    page = _page(table)
+    result = SimpleNamespace(_personal_detail_extraction_issues=[])
+    account = {
+        "account_id": "credit_account:credit_card:3",
+        "account_type": "credit_card",
+        "canonical_raw": {},
+    }
+
+    _apply_account_facts(
+        result,
+        account,
+        table.metadata["raw_rows"],
+        page=page,
+        table=table,
+    )
+
+    assert account.get("account_currency") == expected
+    if expected is not None:
+        assert account["canonical_raw"]["account_currency"] == raw_currency
+        assert not any(
+            issue.get("field_name") in {"currency", "account_currency"}
+            and issue.get("status") not in {"resolved", "informational"}
+            for issue in result._personal_detail_extraction_issues
+        )
+    else:
+        assert any(
+            issue.get("issue_code") == "candidate_b_exact_slot_value_invalid"
+            and issue.get("field_name") == "currency"
+            for issue in result._personal_detail_extraction_issues
+        )
+
+
 def test_two_cell_account_header_recovers_only_invariant_typed_values() -> None:
     first_raw = (
         "B10211000H0001 样例银行股份 2019.06.13 "

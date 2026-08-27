@@ -48,9 +48,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "household_address": ("户籍地址",),
 }
 _LABEL_TO_FIELD = {
-    re.sub(r"[\s:：，,；;()（）\[\]【】]", "", alias): field
-    for field, aliases in _ALIASES.items()
-    for alias in aliases
+    re.sub(r"[\s:：，,；;()（）\[\]【】]", "", alias): field for field, aliases in _ALIASES.items() for alias in aliases
 }
 _VOCAB_ROLES = {
     "gender": "gender",
@@ -59,13 +57,9 @@ _VOCAB_ROLES = {
     "education_level": "education_level",
     "degree": "degree",
 }
-_STRICT_PROFILE_SCALAR_FIELDS = frozenset(
-    {*_VOCAB_ROLES, "birth_date", "nationality"}
-)
+_STRICT_PROFILE_SCALAR_FIELDS = frozenset({*_VOCAB_ROLES, "birth_date", "nationality"})
 _PHONE_FIELDS = frozenset({"mobile_phone", "work_phone", "residence_phone"})
-_EXACT_PROFILE_TOKEN_FIELDS = frozenset(
-    {*_STRICT_PROFILE_SCALAR_FIELDS, *_PHONE_FIELDS, "email"}
-)
+_EXACT_PROFILE_TOKEN_FIELDS = frozenset({*_STRICT_PROFILE_SCALAR_FIELDS, *_PHONE_FIELDS, "email"})
 _ADDRESS_FIELDS = frozenset({"mailing_address", "household_address"})
 _PROFILE_TEMPLATE_ID = "report_header_and_identity"
 _PROFILE_TABLE_ANCHORS = (
@@ -123,9 +117,7 @@ _PROVINCE_LEVEL_RE = re.compile(
     r"内蒙古自治区|广西壮族自治区|西藏自治区|宁夏回族自治区|新疆维吾尔自治区|"
     r"香港特别行政区|澳门特别行政区"
 )
-_SUBORDINATE_REGION_PREFIX_RE = re.compile(
-    r"^[\u3400-\u9fff]{1,10}(?:市|自治州|地区|盟|县|自治县|区|旗|镇|乡|街道|村)"
-)
+_SUBORDINATE_REGION_PREFIX_RE = re.compile(r"^[\u3400-\u9fff]{1,10}(?:市|自治州|地区|盟|县|自治县|区|旗|镇|乡|街道|村)")
 _ADDRESS_ADJACENT_FIELD_RE = re.compile(
     r"通讯地址|通信地址|户籍地址|"
     r"数据发生机构(?:名称)?|数据提供机构(?:名称)?|"
@@ -157,7 +149,9 @@ def _finite_bbox(value: Any) -> tuple[float, float, float, float] | None:
         left, top, right, bottom = (float(coordinate) for coordinate in value)
     except (TypeError, ValueError):
         return None
-    if not all(coordinate == coordinate and abs(coordinate) != float("inf") for coordinate in (left, top, right, bottom)):
+    if not all(
+        coordinate == coordinate and abs(coordinate) != float("inf") for coordinate in (left, top, right, bottom)
+    ):
         return None
     return (left, top, right, bottom) if right > left and bottom > top else None
 
@@ -221,9 +215,7 @@ def _profile_provider_evidence(value: str) -> dict[str, Any]:
     return {
         "raw": raw,
         "normalized_value": normalized if valid else None,
-        "observation_status": (
-            "normalized" if valid and raw != normalized else "observed" if valid else "unreadable"
-        ),
+        "observation_status": ("normalized" if valid and raw != normalized else "observed" if valid else "unreadable"),
     }
 
 
@@ -293,20 +285,13 @@ def _is_profile_table(page: Any, table: Any, rows: list[list[str]]) -> bool:
 
 def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
     metadata = getattr(table, "metadata", None) or {}
-    source_logical_page = (
-        int(metadata.get("source_logical_page") or 0)
-        if isinstance(metadata, Mapping)
-        else 0
-    )
+    source_logical_page = int(metadata.get("source_logical_page") or 0) if isinstance(metadata, Mapping) else 0
     source_page = int(metadata.get("source_page") or 0) if isinstance(metadata, Mapping) else 0
     ref: dict[str, Any] = {
         "source": "candidate_b_canonical_table",
         "logical_page": source_logical_page or int(getattr(page, "page_number", 0) or 0),
         "source_page": int(
-            source_page
-            or getattr(page, "source_page_number", 0)
-            or getattr(page, "page_number", 0)
-            or 0
+            source_page or getattr(page, "source_page_number", 0) or getattr(page, "page_number", 0) or 0
         ),
         "table_id": str(getattr(table, "table_id", "") or ""),
         "row": row,
@@ -347,11 +332,7 @@ def _source_ref(page: Any, table: Any, row: int, col: int) -> dict[str, Any]:
             and isinstance(evidence_ids[row][col], list)
         ):
             ref["evidence_ids"] = [str(value) for value in evidence_ids[row][col] if value]
-    if (
-        isinstance(bbox, (list, tuple))
-        and len(bbox) == 4
-        and geometry_status == "exact"
-    ):
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4 and geometry_status == "exact":
         ref["bbox"] = list(bbox)
         ref["geometry_scope"] = "cell"
         ref["geometry_status"] = geometry_status
@@ -419,16 +400,8 @@ def _exact_profile_cell_tokens(
     cell = _exact_profile_cell(table, row, col)
     if cell is None:
         return None
-    evidence_ids = tuple(
-        str(value)
-        for value in getattr(cell, "evidence_ids", None) or ()
-        if str(value or "")
-    )
-    token_ids = tuple(
-        str(value)
-        for value in getattr(cell, "token_ids", None) or ()
-        if str(value or "")
-    )
+    evidence_ids = tuple(str(value) for value in getattr(cell, "evidence_ids", None) or () if str(value or ""))
+    token_ids = tuple(str(value) for value in getattr(cell, "token_ids", None) or () if str(value or ""))
     if (
         not token_ids
         or len(token_ids) != len(set(token_ids))
@@ -465,12 +438,7 @@ def _profile_token_boxes_are_disjoint(
     boxes = [token[1] for token in tokens]
     for index, left in enumerate(boxes):
         for right in boxes[index + 1 :]:
-            if (
-                left[0] < right[2]
-                and right[0] < left[2]
-                and left[1] < right[3]
-                and right[1] < left[3]
-            ):
+            if left[0] < right[2] and right[0] < left[2] and left[1] < right[3] and right[1] < left[3]:
                 return False
     return True
 
@@ -505,6 +473,90 @@ def _profile_token_ids_have_unique_cell_owners(
                     for token_id in required & owned:
                         owner_counts[token_id] += 1
     return all(count == 1 for count in owner_counts.values())
+
+
+def _bounded_profile_mailing_header_residue(
+    context: Any,
+    table: Any,
+    row_index: int,
+    column: int,
+) -> bool:
+    """Prove ``通讯地址`` beside one stray Han atom in an exact header cell.
+
+    Prefer the independently resolved two-token partition.  Some native table
+    producers retain the exact cell and its two immutable owners while their
+    token boxes overlap at the OCR seam.  In that bounded case the complete
+    raw-cell signature plus unique ownership is still sufficient to recover
+    the *header role*; no value cell is repaired by this fallback.
+    """
+
+    cell = _exact_profile_cell(table, row_index, column)
+    rows = _rows(table)
+    if not (
+        cell is not None
+        and getattr(cell, "row_span", 1) == 1
+        and getattr(cell, "col_span", 1) == 1
+        and 0 <= row_index < len(rows)
+        and 0 <= column < len(rows[row_index])
+    ):
+        return False
+    raw_header = str(rows[row_index][column] or "").strip()
+    bounded_raw_residue = bool(
+        re.fullmatch(
+            r"[\u3400-\u9fff]\s+(?:通讯地址|通信地址)",
+            raw_header,
+        )
+    )
+    metadata = getattr(table, "metadata", None) or {}
+    logical_page = int(metadata.get("source_logical_page") or 0) if isinstance(metadata, Mapping) else 0
+    tokens = _exact_profile_cell_tokens(
+        context,
+        table,
+        row_index,
+        column,
+        logical_page=logical_page,
+    )
+    if tokens is not None and len(tokens) == 2:
+        strict_partition = bool(
+            _profile_token_boxes_are_disjoint(tokens)
+            and _compact("".join(text for text, _bbox, _token_id in tokens)) == _compact(raw_header)
+        )
+        mailing_tokens = [token for token in tokens if _label_fields(token[0]) == ["mailing_address"]]
+        residue_tokens = [token for token in tokens if token not in mailing_tokens]
+        if strict_partition and len(mailing_tokens) == len(residue_tokens) == 1:
+            mailing = mailing_tokens[0]
+            residue = residue_tokens[0]
+            cell_bbox = _finite_bbox(getattr(cell, "bbox", None))
+            vertical_delta = (
+                abs((residue[1][1] + residue[1][3]) / 2.0 - (mailing[1][1] + mailing[1][3]) / 2.0)
+                if cell_bbox is not None
+                else float("inf")
+            )
+            token_ids = tuple(token_id for _text, _bbox, token_id in tokens)
+            if (
+                re.fullmatch(r"[\u3400-\u9fff]", _compact(residue[0])) is not None
+                and not _label_fields(residue[0])
+                and residue[1][2] <= mailing[1][0]
+                and cell_bbox is not None
+                and vertical_delta <= max(2.0, (cell_bbox[3] - cell_bbox[1]) * 0.35)
+                and len(token_ids) == len(set(token_ids))
+                and _profile_token_ids_have_unique_cell_owners(
+                    context,
+                    token_ids,
+                )
+            ):
+                return True
+
+    evidence_ids = tuple(str(value) for value in getattr(cell, "evidence_ids", None) or () if str(value or ""))
+    token_ids = tuple(str(value) for value in getattr(cell, "token_ids", None) or () if str(value or ""))
+    return bool(
+        bounded_raw_residue
+        and len(evidence_ids) == len(token_ids) == 2
+        and len(set(evidence_ids)) == 2
+        and len(set(token_ids)) == 2
+        and set(evidence_ids) == set(token_ids)
+        and _profile_token_ids_have_unique_cell_owners(context, token_ids)
+    )
 
 
 def _exact_profile_scalar_token_candidate(
@@ -564,24 +616,15 @@ def _exact_profile_scalar_token_candidate(
         return None
 
     rows = _rows(table)
-    if not (
-        0 <= header_row < len(rows)
-        and 0 <= header_column < len(rows[header_row])
-    ):
+    if not (0 <= header_row < len(rows) and 0 <= header_column < len(rows[header_row])):
         return None
     header_raw = str(rows[header_row][header_column] or "")
-    if (
-        re.sub(r"\s+", "", "".join(token[0] for token in header_tokens))
-        != re.sub(r"\s+", "", header_raw)
-        or re.sub(r"\s+", "", "".join(token[0] for token in value_tokens))
-        != re.sub(r"\s+", "", str(raw or ""))
-    ):
+    if re.sub(r"\s+", "", "".join(token[0] for token in header_tokens)) != re.sub(r"\s+", "", header_raw) or re.sub(
+        r"\s+", "", "".join(token[0] for token in value_tokens)
+    ) != re.sub(r"\s+", "", str(raw or "")):
         return None
 
-    header_token_roles = tuple(
-        _LABEL_TO_FIELD.get(_compact(text))
-        for text, _bbox, _token_id in header_tokens
-    )
+    header_token_roles = tuple(_LABEL_TO_FIELD.get(_compact(text)) for text, _bbox, _token_id in header_tokens)
     if (
         any(role is None for role in header_token_roles)
         or len(set(header_token_roles)) != len(header_token_roles)
@@ -603,11 +646,7 @@ def _exact_profile_scalar_token_candidate(
             valid, normalized = _candidate_valid(role, token_text)
             if valid and normalized is not None:
                 matches.append((role, str(normalized)))
-        if (
-            len(matches) != 1
-            or matches[0][0] != header_role
-            or header_role in assignments
-        ):
+        if len(matches) != 1 or matches[0][0] != header_role or header_role in assignments:
             return None
         assignments[header_role] = (
             token_text,
@@ -618,13 +657,9 @@ def _exact_profile_scalar_token_candidate(
     if set(assignments) != set(roles):
         return None
 
-    all_token_ids = tuple(
-        token_id
-        for _text, _bbox, token_id in (*header_tokens, *value_tokens)
-    )
-    if (
-        len(all_token_ids) != len(set(all_token_ids))
-        or not _profile_token_ids_have_unique_cell_owners(context, all_token_ids)
+    all_token_ids = tuple(token_id for _text, _bbox, token_id in (*header_tokens, *value_tokens))
+    if len(all_token_ids) != len(set(all_token_ids)) or not _profile_token_ids_have_unique_cell_owners(
+        context, all_token_ids
     ):
         return None
     token_text, normalized, token_bbox, token_id = assignments[field]
@@ -697,10 +732,7 @@ def _bounded_profile_address_sequence_residue(
     if (
         ordinal_width > cell_width * 0.12
         or address_width < cell_width * 0.45
-        or abs(
-            ((ordinal[1][1] + ordinal[1][3]) / 2.0)
-            - ((address[1][1] + address[1][3]) / 2.0)
-        )
+        or abs(((ordinal[1][1] + ordinal[1][3]) / 2.0) - ((address[1][1] + address[1][3]) / 2.0))
         > max(3.0, (cell_bbox[3] - cell_bbox[1]) * 0.35)
     ):
         return None
@@ -792,12 +824,7 @@ def _label_fields(value: Any) -> list[str]:
 
     alias_roles = tuple(
         sorted(
-            {
-                (_compact(alias), field)
-                for field, aliases in _ALIASES.items()
-                for alias in aliases
-                if _compact(alias)
-            },
+            {(_compact(alias), field) for field, aliases in _ALIASES.items() for alias in aliases if _compact(alias)},
             key=lambda item: (-len(item[0]), item[0], item[1]),
         )
     )
@@ -845,11 +872,7 @@ def _merged_household_header_trait(
 
     cell = _exact_profile_cell(table, row_index, column)
     metadata = getattr(table, "metadata", None) or {}
-    logical_page = (
-        int(metadata.get("source_logical_page") or 0)
-        if isinstance(metadata, Mapping)
-        else 0
-    )
+    logical_page = int(metadata.get("source_logical_page") or 0) if isinstance(metadata, Mapping) else 0
     tokens = _exact_profile_cell_tokens(
         context,
         table,
@@ -863,8 +886,7 @@ def _merged_household_header_trait(
     if not (
         0 <= row_index < len(rows)
         and 0 <= column < len(rows[row_index])
-        and _compact("".join(text for text, _bbox, _token_id in tokens))
-        == _compact(rows[row_index][column])
+        and _compact("".join(text for text, _bbox, _token_id in tokens)) == _compact(rows[row_index][column])
         and _profile_token_boxes_are_disjoint(tokens)
     ):
         return None
@@ -879,9 +901,8 @@ def _merged_household_header_trait(
     ):
         return None
     evidence_ids = tuple(token_id for _text, _bbox, token_id in tokens)
-    if (
-        len(evidence_ids) != len(set(evidence_ids))
-        or not _profile_token_ids_have_unique_cell_owners(context, evidence_ids)
+    if len(evidence_ids) != len(set(evidence_ids)) or not _profile_token_ids_have_unique_cell_owners(
+        context, evidence_ids
     ):
         return None
     bbox = _finite_bbox(getattr(cell, "bbox", None))
@@ -919,11 +940,7 @@ def _exact_clipped_nationality_column(
         return False
 
     metadata = getattr(table, "metadata", None) or {}
-    logical_page = (
-        int(metadata.get("source_logical_page") or 0)
-        if isinstance(metadata, Mapping)
-        else 0
-    )
+    logical_page = int(metadata.get("source_logical_page") or 0) if isinstance(metadata, Mapping) else 0
     header_cell = _exact_profile_cell(table, header_row, column)
     value_cell = _exact_profile_cell(table, value_row, column)
     header_tokens = _exact_profile_cell_tokens(
@@ -949,8 +966,7 @@ def _exact_clipped_nationality_column(
         or not value_tokens
         or not _profile_token_boxes_are_disjoint(value_tokens)
         or _compact(header_tokens[0][0]) != "国"
-        or _compact("".join(text for text, _bbox, _token_id in value_tokens))
-        != _compact(rows[value_row][column])
+        or _compact("".join(text for text, _bbox, _token_id in value_tokens)) != _compact(rows[value_row][column])
     ):
         return False
 
@@ -958,19 +974,13 @@ def _exact_clipped_nationality_column(
     value_bbox = _finite_bbox(getattr(value_cell, "bbox", None))
     if header_bbox is None or value_bbox is None:
         return False
-    horizontal_overlap = min(header_bbox[2], value_bbox[2]) - max(
-        header_bbox[0], value_bbox[0]
-    )
+    horizontal_overlap = min(header_bbox[2], value_bbox[2]) - max(header_bbox[0], value_bbox[0])
     if horizontal_overlap <= 0:
         return False
 
-    token_ids = tuple(
-        token_id
-        for _text, _bbox, token_id in (*header_tokens, *value_tokens)
-    )
+    token_ids = tuple(token_id for _text, _bbox, token_id in (*header_tokens, *value_tokens))
     return bool(
-        len(token_ids) == len(set(token_ids))
-        and _profile_token_ids_have_unique_cell_owners(context, token_ids)
+        len(token_ids) == len(set(token_ids)) and _profile_token_ids_have_unique_cell_owners(context, token_ids)
     )
 
 
@@ -1010,24 +1020,11 @@ def _row_label_fields(
                 )
             ):
                 by_column[2].append("nationality")
-    household_columns = [
-        column
-        for column, fields in by_column.items()
-        if "household_address" in fields
-    ]
+    household_columns = [column for column, fields in by_column.items() if "household_address" in fields]
     if len(household_columns) > 1:
         for column in household_columns:
-            by_column[column] = [
-                field
-                for field in by_column[column]
-                if field != "household_address"
-            ]
-    elif (
-        not household_columns
-        and context is not None
-        and table is not None
-        and isinstance(row_index, int)
-    ):
+            by_column[column] = [field for field in by_column[column] if field != "household_address"]
+    elif not household_columns and context is not None and table is not None and isinstance(row_index, int):
         traits = [
             trait
             for column in range(len(row))
@@ -1044,11 +1041,29 @@ def _row_label_fields(
         # Duplicate physical owners make the semantic column ambiguous.
         if len(traits) == 1:
             by_column[traits[0].column].append("household_address")
-    return [
-        (column, field)
-        for column, fields in by_column.items()
-        for field in fields
-    ]
+    mailing_columns = [column for column, fields in by_column.items() if "mailing_address" in fields]
+    household_columns = [column for column, fields in by_column.items() if "household_address" in fields]
+    if (
+        not mailing_columns
+        and len(household_columns) == 1
+        and len(row) == 4
+        and context is not None
+        and table is not None
+        and isinstance(row_index, int)
+    ):
+        residue_columns = [
+            column
+            for column in range(len(row))
+            if _bounded_profile_mailing_header_residue(
+                context,
+                table,
+                row_index,
+                column,
+            )
+        ]
+        if len(residue_columns) == 1:
+            by_column[residue_columns[0]].append("mailing_address")
+    return [(column, field) for column, fields in by_column.items() for field in fields]
 
 
 def _field_fragments(field: str, value: str) -> list[tuple[str, str]]:
@@ -1061,9 +1076,7 @@ def _field_fragments(field: str, value: str) -> list[tuple[str, str]]:
         valid, normalized = _candidate_valid(field, text)
         return [(text, str(normalized))] if valid and normalized is not None else []
     business_text = (
-        text
-        if field in _ADDRESS_FIELDS
-        else re.split(r"数据发生机构(?:名称)?", text, maxsplit=1)[0].strip()
+        text if field in _ADDRESS_FIELDS else re.split(r"数据发生机构(?:名称)?", text, maxsplit=1)[0].strip()
     )
     if not business_text:
         return []
@@ -1090,22 +1103,21 @@ def _table_candidates(context: Any, pages: Iterable[Any]) -> dict[str, list[dict
                 for label_column, label_field in labels:
                     fields_by_column[label_column].add(label_field)
                 for column, field in labels:
-                    header_fields = tuple(
-                        label_field
-                        for label_column, label_field in labels
-                        if label_column == column
-                    )
+                    header_fields = tuple(label_field for label_column, label_field in labels if label_column == column)
                     choices: list[tuple[str, int, int]] = []
                     next_label_column = next(
-                        (candidate_column for candidate_column, _candidate_field in labels if candidate_column > column),
+                        (
+                            candidate_column
+                            for candidate_column, _candidate_field in labels
+                            if candidate_column > column
+                        ),
                         len(row),
                     )
                     inline_values = (
                         [
                             (str(row[candidate_column]), row_index, candidate_column)
                             for candidate_column in range(column + 1, next_label_column)
-                            if str(row[candidate_column] or "").strip()
-                            and not _label_fields(row[candidate_column])
+                            if str(row[candidate_column] or "").strip() and not _label_fields(row[candidate_column])
                         ]
                         if len(fields_by_column[column]) == 1
                         else []
@@ -1183,11 +1195,7 @@ def _table_candidates(context: Any, pages: Iterable[Any]) -> dict[str, list[dict
                                 }
                             )
                             continue
-                        address_split = (
-                            _split_profile_address_provider(raw)
-                            if field in _ADDRESS_FIELDS
-                            else None
-                        )
+                        address_split = _split_profile_address_provider(raw) if field in _ADDRESS_FIELDS else None
                         if address_split is not None:
                             provider_evidence = dict(address_split["provider_evidence"])
                             provider_evidence["source_refs"] = [ref]
@@ -1204,10 +1212,7 @@ def _table_candidates(context: Any, pages: Iterable[Any]) -> dict[str, list[dict
                                 }
                             )
                             continue
-                        strict_multi_role = (
-                            field in _EXACT_PROFILE_TOKEN_FIELDS
-                            and len(header_fields) > 1
-                        )
+                        strict_multi_role = field in _EXACT_PROFILE_TOKEN_FIELDS and len(header_fields) > 1
                         strict_token_candidate = (
                             _exact_profile_scalar_token_candidate(
                                 context,
@@ -1238,11 +1243,7 @@ def _table_candidates(context: Any, pages: Iterable[Any]) -> dict[str, list[dict
                                 }
                             )
                             continue
-                        fragments = (
-                            []
-                            if strict_multi_role
-                            else _field_fragments(field, raw)
-                        )
+                        fragments = [] if strict_multi_role else _field_fragments(field, raw)
                         if not fragments and not strict_multi_role:
                             valid, normalized = _candidate_valid(field, raw)
                             fragments = [(raw.strip(), str(normalized))] if valid and normalized is not None else []
@@ -1333,26 +1334,14 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
                 ),
             )
         candidates = _dedupe_candidates(raw_candidates)
-        valid = [
-            candidate
-            for candidate in candidates
-            if candidate.get("valid") and not candidate.get("source_absent")
-        ]
+        valid = [candidate for candidate in candidates if candidate.get("valid") and not candidate.get("source_absent")]
         normalized_values = {str(candidate.get("normalized") or "") for candidate in valid}
         if candidates and all(candidate.get("source_absent") for candidate in candidates):
             result[field] = {
                 "value": None,
                 "normalized_value": None,
-                "raw": [
-                    str(candidate.get("raw") or "")
-                    for candidate in candidates
-                    if candidate.get("raw")
-                ],
-                "source_refs": [
-                    ref
-                    for candidate in raw_candidates
-                    for ref in candidate.get("source_refs") or ()
-                ],
+                "raw": [str(candidate.get("raw") or "") for candidate in candidates if candidate.get("raw")],
+                "source_refs": [ref for candidate in raw_candidates for ref in candidate.get("source_refs") or ()],
                 "observation_status": "source_absent",
             }
             continue
@@ -1377,11 +1366,7 @@ def extract_candidate_b_profile(context: Any) -> dict[str, Any]:
             continue
 
         observed = [str(candidate.get("raw") or "") for candidate in candidates if candidate.get("raw")]
-        refs = [
-            ref
-            for candidate in raw_candidates
-            for ref in candidate.get("source_refs") or ()
-        ]
+        refs = [ref for candidate in raw_candidates for ref in candidate.get("source_refs") or ()]
         status = "ambiguous" if len(normalized_values) > 1 else "unreadable"
         result[field] = {
             "value": None,

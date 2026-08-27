@@ -679,7 +679,7 @@ def _prefix_residue_agreement_context(
     return context
 
 
-def test_separated_agreement_prefix_requires_two_exact_headings_and_preserves_raw(
+def test_separated_agreement_prefix_uses_exact_field_grammar_and_preserves_raw(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identifier = "B10711000H0001100000111111111498898000000"
@@ -714,19 +714,20 @@ def test_separated_agreement_prefix_requires_two_exact_headings_and_preserves_ra
         issue
         for issue in context._personal_detail_extraction_issues
         if issue.get("issue_code")
-        == "candidate_b_credit_agreement_identifier_separated_prefix_recovered"
+        == "candidate_b_credit_agreement_identifier_invalid_leading_glyph_repaired"
     ]
     assert len(issues) == 1
     assert issues[0]["observed_value"]["raw_agreement_cell_identifier"] == raw_identifier
-    assert len(issues[0]["source_refs"]) == 3
+    assert len(issues[0]["source_refs"]) == 1
 
 
 @pytest.mark.parametrize(
-    ("raw_identifier", "account_identifiers"),
+    ("raw_identifier", "account_identifiers", "expected_repair"),
     (
         (
             "R B10711000H00011000 0011111111149889800 0000",
             ["B10711000H0001100000111111111498898000000"],
+            True,
         ),
         (
             "RB10711000H0001100000111111111498898000000",
@@ -734,6 +735,7 @@ def test_separated_agreement_prefix_requires_two_exact_headings_and_preserves_ra
                 "B10711000H0001100000111111111498898000000",
                 "B10711000H0001100000111111111498898000000",
             ],
+            False,
         ),
         (
             "R B10711000H00011000 0011111111149889800 0000",
@@ -742,14 +744,16 @@ def test_separated_agreement_prefix_requires_two_exact_headings_and_preserves_ra
                 "B10711000H0001100000111111111498898000000",
                 "RB10711000H0001100000111111111498898000000",
             ],
+            True,
         ),
     ),
     ids=("one_witness", "unseparated_prefix", "competing_exact_entity"),
 )
-def test_agreement_prefix_residue_correction_fails_closed_on_ambiguity(
+def test_agreement_prefix_residue_repair_is_local_and_grammar_bounded(
     monkeypatch: pytest.MonkeyPatch,
     raw_identifier: str,
     account_identifiers: list[str],
+    expected_repair: bool,
 ) -> None:
     context = _prefix_residue_agreement_context(
         raw_identifier,
@@ -772,7 +776,19 @@ def test_agreement_prefix_residue_correction_fails_closed_on_ambiguity(
     )
 
     assert len(rows) == 1
-    assert rows[0]["account_identifier"] == raw_identifier.replace(" ", "")
+    expected_identifier = (
+        "B10711000H0001100000111111111498898000000"
+        if expected_repair
+        else raw_identifier.replace(" ", "")
+    )
+    assert rows[0]["account_identifier"] == expected_identifier
+    repaired = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("issue_code")
+        == "candidate_b_credit_agreement_identifier_invalid_leading_glyph_repaired"
+    ]
+    assert bool(repaired) is expected_repair
     assert not any(
         issue.get("issue_code")
         == "candidate_b_credit_agreement_identifier_separated_prefix_recovered"

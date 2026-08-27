@@ -1284,7 +1284,7 @@ def _candidate_lattices(
     expected_year: int,
     active_months: frozenset[int],
     year_bbox: BBox,
-    status_bbox: BBox,
+    status_bbox: BBox | None,
 ) -> list[SourceTableMonthLattice]:
     effective_table = _effective_column_table(table)
     if effective_table is None:
@@ -1390,9 +1390,11 @@ def _candidate_lattices(
             status_cells[-1][2],
             row_bands[amount_row][3],
         )
-        if not (
-            _target_owns_year_column(year_bbox, year_cell, row_pair)
-            and _status_target_matches_row(status_bbox, status_cells)
+        if not _target_owns_year_column(year_bbox, year_cell, row_pair):
+            continue
+        if status_bbox is not None and not _status_target_matches_row(
+            status_bbox,
+            status_cells,
         ):
             continue
         provenance = {
@@ -1453,21 +1455,20 @@ def _candidate_lattices(
     return candidates
 
 
-def resolve_unique_source_table_year_plus_twelve_ownership(
+def _resolve_unique_source_table_year_plus_twelve_ownership(
     tables: Iterable[Mapping[str, Any]],
     *,
     logical_page: int,
     expected_year: int,
     active_months: Iterable[int],
     year_bbox: Sequence[float],
-    status_bbox: Sequence[float],
+    status_bbox: Sequence[float] | None,
+    require_status_bbox: bool,
 ) -> SourceTableMonthLattice | None:
-    """Return one exact value-free lattice, or ``None`` on any ambiguity."""
-
     normalized_logical_page = _integer(logical_page)
     normalized_expected_year = _integer(expected_year)
     year_box = _bbox(year_bbox)
-    status_box = _bbox(status_bbox)
+    status_box = _bbox(status_bbox) if status_bbox is not None else None
     if isinstance(active_months, (str, bytes, Mapping)):
         return None
     try:
@@ -1482,7 +1483,7 @@ def resolve_unique_source_table_year_plus_twelve_ownership(
     )
     if (
         year_box is None
-        or status_box is None
+        or (require_status_bbox and status_box is None)
         or not months
         or normalized_expected_year is None
         or normalized_logical_page is None
@@ -1512,8 +1513,57 @@ def resolve_unique_source_table_year_plus_twelve_ownership(
     return candidates[0] if len(candidates) == 1 else None
 
 
+def resolve_unique_source_table_year_plus_twelve_ownership(
+    tables: Iterable[Mapping[str, Any]],
+    *,
+    logical_page: int,
+    expected_year: int,
+    active_months: Iterable[int],
+    year_bbox: Sequence[float],
+    status_bbox: Sequence[float],
+) -> SourceTableMonthLattice | None:
+    """Return one exact value-free lattice, or ``None`` on any ambiguity."""
+
+    return _resolve_unique_source_table_year_plus_twelve_ownership(
+        tables,
+        logical_page=logical_page,
+        expected_year=expected_year,
+        active_months=active_months,
+        year_bbox=year_bbox,
+        status_bbox=status_bbox,
+        require_status_bbox=True,
+    )
+
+
+def resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+    tables: Iterable[Mapping[str, Any]],
+    *,
+    logical_page: int,
+    expected_year: int,
+    active_months: Iterable[int],
+    year_bbox: Sequence[float],
+) -> SourceTableMonthLattice | None:
+    """Resolve one exact lattice before a noisy status row has been accepted.
+
+    This entry point proves only the value-free source-table structure and the
+    printed year owner.  Callers must independently prove each status token's
+    exact active-month cell before using the lattice for value extraction.
+    """
+
+    return _resolve_unique_source_table_year_plus_twelve_ownership(
+        tables,
+        logical_page=logical_page,
+        expected_year=expected_year,
+        active_months=active_months,
+        year_bbox=year_bbox,
+        status_bbox=None,
+        require_status_bbox=False,
+    )
+
+
 __all__ = [
     "SourceTableMonthLattice",
     "detached_source_table_geometry_by_page",
     "resolve_unique_source_table_year_plus_twelve_ownership",
+    "resolve_unique_source_table_year_plus_twelve_ownership_from_year",
 ]
