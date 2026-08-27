@@ -102,3 +102,35 @@ def test_replay_refuses_unbound_or_modified_input_artifacts(tmp_path, monkeypatc
     path.write_text("{\"modified\":true}", encoding="utf-8")
     with pytest.raises(AssertionError, match="checksum or ownership"):
         _verify_inputs(entry)
+
+
+def test_saved_fixture_mode_explicitly_does_not_certify_current_extraction(tmp_path, monkeypatch):
+    from scripts.validate import bank_consumer_exports as runner
+
+    monkeypatch.setattr(runner, "REPO_ROOT", tmp_path)
+    root = tmp_path / "tmp" / "pdfs"
+    root.mkdir(parents=True)
+    source = root / "source.json"
+    extractor = "docmirror/input/extraction/extractor.py"
+    source.write_text(json.dumps({
+        "tier": "primary", "failed": 0, "passed": 1, "code_unchanged_during_run": True,
+        "results": [{"filename": "case.pdf"}], "code_hashes": {extractor: "old"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(runner, "_hashes", lambda: {extractor: "new"})
+    monkeypatch.setattr(runner, "_verify_inputs", lambda entry: None)
+    monkeypatch.setattr(runner, "_load_auditor", lambda: None)
+    monkeypatch.setattr(runner, "refresh_case", lambda entry, output, auditor: {
+        "filename": entry["filename"], "status": "pass", "errors": [],
+    })
+    args = ["--source-report", str(source), "--output-root", str(root / "output")]
+    with pytest.raises(AssertionError, match="extraction/shared code changed"):
+        runner.main(args)
+    assert not (root / "output").exists()
+    assert runner.main([*args, "--saved-inputs-only"]) == 0
+    report = json.loads((root / "output" / "report.json").read_text(encoding="utf-8"))
+    assert report["passed"] == 1 and report["failed"] == 0
+    assert report["validation_scope"] == "saved_semantic_to_outputs"
+    assert report["current_extraction_code_validated"] is False
+    assert report["extraction_executed"] is False
+    assert report["allowed_output_code_changes"] == []
+    assert report["source_capture_code_changes"] == [extractor]

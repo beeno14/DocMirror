@@ -215,6 +215,13 @@ BANK_STANDARD_FIELDS = [
 
 BANK_DATA_DICTIONARY: dict[str, Any] = {
     "fields": {
+        "document_type": {"label": "文档类型", "type": "string"},
+        # Legacy field-schema names also need Chinese presentation fallbacks.
+        "account_name": {"label": "账户名称", "type": "string"},
+        "statement_period": {"label": "账单统计期间", "type": "string"},
+        "total_deposits": {"label": "收入总额", "type": "money"},
+        "total_withdrawals": {"label": "支出总额", "type": "money"},
+        "transaction_count": {"label": "交易总笔数", "type": "integer"},
         "organization": {"label": "银行名称", "type": "string"},
         "subject_name": {"label": "账户名称", "type": "string"},
         "subject_id": {"label": "账户标识", "type": "long_id", "sensitive": True, "display": "masked"},
@@ -283,12 +290,12 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "coverage_ratio": {"label": "交易覆盖率", "type": "percentage"},
         "institution_authority": {"label": "银行识别依据", "type": "string"},
         "pipe_parse_failed": {"label": "管道表解析失败", "type": "boolean"},
-        "canonical_expected": {"label": "Canonical 预期笔数", "type": "integer"},
-        "canonical_extracted": {"label": "Canonical 提取笔数", "type": "integer"},
-        "canonical_ratio": {"label": "Canonical 覆盖率", "type": "percentage"},
+        "canonical_expected": {"label": "规范记录预期笔数", "type": "integer"},
+        "canonical_extracted": {"label": "规范记录提取笔数", "type": "integer"},
+        "canonical_ratio": {"label": "规范记录覆盖率", "type": "percentage"},
         "extract_status": {"label": "提取状态", "type": "string"},
-        "blo_tables_parsed": {"label": "BLO 已解析表数", "type": "integer"},
-        "blo_tables_skipped": {"label": "BLO 已跳过表数", "type": "integer"},
+        "blo_tables_parsed": {"label": "版式表已解析数", "type": "integer"},
+        "blo_tables_skipped": {"label": "版式表已跳过数", "type": "integer"},
         "extraction_route": {"label": "提取路线", "type": "string"},
         "source_reported_transaction_count": {"label": "原文报告交易笔数", "type": "integer"},
         "document_scene_refined": {"label": "修正文档场景", "type": "string"},
@@ -297,9 +304,9 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
     },
     "record_columns": {
         "statement_header_id": {
-            "label": "流水表头记录ID",
+            "label": "流水表头记录标识",
             "type": "string",
-            "definition": "关联 statement_header 数据集中的来源流水表头记录。",
+            "definition": "关联来源流水表头数据集中的记录。",
         },
         "statement_title": {"label": "流水标题", "type": "string"},
         "account_holder": {"label": "账户名称", "type": "string"},
@@ -347,7 +354,9 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "voucher_type": {"label": "凭证种类", "type": "string"},
     },
     "datasets": {
+        "transactions": {"label": "交易明细"},
         "statement_header": {
+            "label": "账户信息",
             "definition": "一行对应一个来源银行流水表头或账户账期范围。",
             "columns": {
                 "statement_title": {"label": "流水标题", "type": "string"},
@@ -473,6 +482,10 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
     },
     "enums": {
         "direction": {"income": "收入", "expense": "支出"},
+        "currency": {"CNY": "人民币", "RMB": "人民币", "USD": "美元", "HKD": "港元", "EUR": "欧元", "JPY": "日元"},
+        "direction_filter": {"income": "收入", "expense": "支出", "all": "全部"},
+        "sort_order": {"asc": "升序", "ascending": "升序", "desc": "降序", "descending": "降序"},
+        "extraction_route": {"digital": "数字文档", "scanned": "扫描文档"},
         "counterparty_status": {"present": "已提供", "source_null": "原文未提供"},
         "extract_status": {
             "success": "成功",
@@ -491,6 +504,45 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         },
         "layout_profile_id_refined": {
             "borderless_ledger_bank": "无框银行流水版式",
+        },
+    },
+    # Full-message matches retain diagnostic quantities without translating
+    # arbitrary source text or hiding new/unrecognised diagnostic formats.
+    "warnings": {
+        "CQF_DEGRADED": {
+            "label": "记录质量待复核",
+            "pattern": r"cqf_degraded:canonical_quality",
+            "message": "规范记录质量检查提示降级，请复核。",
+        },
+        "CQF_LOW_COVERAGE": {
+            "label": "记录覆盖率偏低",
+            "pattern": r"cqf_low_coverage:canonical_quality",
+            "message": "规范记录覆盖率偏低，请复核。",
+        },
+        "LOW_COVERAGE": {
+            "label": "交易覆盖率偏低",
+            "pattern": r"low_coverage:bank_ledger",
+            "message": "银行流水交易覆盖率偏低，请复核。",
+        },
+        "BANK_PHYSICAL_LOGICAL_ROW_MISMATCH": {
+            "label": "来源行数与交易笔数不一致",
+            "pattern": r"BANK_PHYSICAL_LOGICAL_ROW_MISMATCH:physical=(?P<physical>\d+):canonical=(?P<canonical>\d+)",
+            "message": "来源物理行数 {physical}，规范交易笔数 {canonical}，请复核跨行或跨页记录。",
+        },
+        "DATASET_COMPLETENESS_UNVERIFIED": {
+            "label": "完整性尚未独立核验",
+            "pattern": r"dataset (?P<dataset>\S+) has (?P<emitted>\d+) emitted records but no independent source count",
+            "message": "{dataset}已输出 {emitted} 条记录，但缺少独立的来源笔数，尚不能确认完整性。",
+        },
+        "DATASET_ROW_COUNT_MISMATCH": {
+            "label": "记录笔数不一致",
+            "pattern": r"dataset (?P<dataset>\S+) emitted (?P<emitted>\d+) of (?P<expected>\d+) expected records",
+            "message": "{dataset}预期 {expected} 条记录，实际输出 {emitted} 条，请复核。",
+        },
+        "DATASET_VERIFICATION_BLOCKED": {
+            "label": "记录质量尚未通过核验",
+            "pattern": r"dataset (?P<dataset>\S+) emitted the expected (?P<expected>\d+) records but domain quality did not permit verification",
+            "message": "{dataset}已输出预期的 {expected} 条记录，但业务质量检查尚未通过。",
         },
     },
 }

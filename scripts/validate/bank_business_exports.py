@@ -24,6 +24,16 @@ _PAGE_ONLY_LABELS = {
     "pagetransactioncount", "页码", "页号", "pagenumber", "source_header_page_label",
 }
 
+# Independent presentation expectations; never reuse the renderer's dictionary
+# to validate its own translations. Source variants must bypass these mappings.
+_MARKDOWN_ENUM_LABELS = {
+    "direction": {"income": "收入", "expense": "支出"},
+    "currency": {"CNY": "人民币", "RMB": "人民币", "USD": "美元", "HKD": "港元", "EUR": "欧元", "JPY": "日元"},
+    "direction_filter": {"income": "收入", "expense": "支出", "all": "全部"},
+    "sort_order": {"asc": "升序", "ascending": "升序", "desc": "降序", "descending": "降序"},
+    "document_type": {"bank_statement": "银行流水", "bank_reconciliation": "银行对账单"},
+}
+
 
 def _allowed_omission(dataset_name: str, key: str, descriptor: dict) -> bool:
     if key in INTERNAL_ROW_FIELDS:
@@ -191,14 +201,19 @@ def assert_business_markdown_values(payload: dict, markdown: str) -> None:
         raise AssertionError("business Markdown is missing its trailing extraction appendix")
     body = markdown.split("\n\n## 提取说明\n\n", 1)[0]
 
-    def check(value: Any) -> None:
+    def check(value: Any, enum_key: str = "") -> None:
         if isinstance(value, dict):
-            for item in value.values():
-                check(item)
+            if "value" in value and set(value) <= {"page", "value"}:
+                check(value.get("page"))
+                check(value["value"], enum_key)
+            else:
+                for item in value.values():
+                    check(item)
         elif isinstance(value, list):
             for item in value:
-                check(item)
+                check(item, enum_key)
         elif value not in (None, ""):
+            value = _MARKDOWN_ENUM_LABELS.get(enum_key, {}).get(value, value)
             expected = html.escape(str(value).lower() if isinstance(value, bool) else str(value), quote=False)
             expected = expected.replace("\\", "\\\\")
             for char in "`*_[]~|":
@@ -208,13 +223,43 @@ def assert_business_markdown_values(payload: dict, markdown: str) -> None:
                 raise AssertionError("a business value is absent from the Markdown body")
 
     for dataset in payload["datasets"]:
+        columns = {column["key"]: column for column in dataset["columns"]}
         for row in dataset["rows"]:
-            for value in row["normalized"].values():
-                check(value)
+            for key, value in row["normalized"].items():
+                descriptor = columns.get(key, {})
+                check(value, "" if "source_header" in descriptor else descriptor.get("enum_ref") or key)
         if any(_allowed_omission(dataset["name"], column["key"], column) for column in dataset["columns"]):
             raise AssertionError("intermediate field survived into the reading catalog")
     for section in payload["sections"]:
         items = [*section["items"], *(item for group in section["groups"] for item in group["items"])]
         for item in items:
-            check(item.get("value"))
-            check(item.get("additional_values"))
+            enum_key = "" if "source_header" in item else item.get("enum_ref") or item["key"]
+            check(item.get("value"), enum_key)
+            check(item.get("additional_values"), enum_key)
+
+    # Presence alone could miss swapped directions (both Chinese words might
+    # occur elsewhere). Check the actual direction cells in transaction order.
+    tables = [block.splitlines() for block in body.split("\n\n") if block.startswith("| ")]
+    for dataset in payload["datasets"]:
+        column = next((column for column in dataset["columns"] if column["key"] == "direction"), None)
+        if dataset["name"] == "statement_header" or column is None:
+            continue
+        labels = {column.get("label"), "收支方向", "direction"}
+        for table in tables:
+            headings = [cell.strip() for cell in re.split(r"(?<!\\)\|", table[0])[1:-1]]
+            if not any(heading in labels for heading in headings):
+                continue
+            index = next(i for i, heading in enumerate(headings) if heading in labels)
+            actual = [re.split(r"(?<!\\)\|", line)[1:-1][index].strip() for line in table[2:]]
+            translations = {} if "source_header" in column else _MARKDOWN_ENUM_LABELS["direction"]
+            expected = [translations.get(row["normalized"].get("direction"), row["normalized"].get("direction"))
+                        for row in dataset["rows"]]
+            # Known enums have no escaping; unknown/source values were checked
+            # literally above and must not be silently assigned a direction.
+            if len(actual) != len(expected) or any(value in {"收入", "支出"} and value != shown
+                                                    for value, shown in zip(expected, actual)):
+                raise AssertionError("Markdown transaction directions differ from business rows")
+            tables.remove(table)
+            break
+        else:
+            raise AssertionError("Markdown transaction direction column is absent")
