@@ -28,6 +28,7 @@ class SourceTableMonthLattice:
 
     table_id: str
     logical_page: int
+    source_logical_page: int
     source_page: int | None
     expected_year: int
     year_anchor_row_index: int
@@ -40,6 +41,7 @@ class SourceTableMonthLattice:
     coordinate_system: str
     geometry_source: str
     provenance: tuple[tuple[str, Any], ...]
+    source_to_canonical_affine: tuple[float, float, float, float] | None = None
 
     def month_col_bands(self) -> list[dict[str, Any]]:
         """Return field-grid-compatible, detached physical month bands."""
@@ -94,6 +96,12 @@ def _matrix_get(matrix: Any, row: int, col: int, default: Any = None) -> Any:
 def _geometry(table: Any) -> dict[str, Any]:
     metadata = _get(table, "metadata")
     metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+    canonical_geometry = metadata.get("canonical_geometry")
+    if isinstance(canonical_geometry, Mapping):
+        # Projected tables explicitly carry two coordinate planes. Candidate B
+        # consumes the registered canonical plane; immutable token ownership is
+        # re-resolved separately from the retained source plane.
+        return deepcopy(dict(canonical_geometry))
     geometry = metadata.get("geometry")
     geometry = dict(geometry) if isinstance(geometry, Mapping) else {}
     for key in (
@@ -206,12 +214,45 @@ def detached_source_table_geometry_by_page(
 
     result: dict[int, list[dict[str, Any]]] = {}
     for fallback_page, page in enumerate(_page_sequence(parse_result_or_pages), start=1):
-        logical_page = _integer(_get(page, "page_number")) or fallback_page
-        source_page = _integer(_get(page, "source_page_number") or _get(page, "source_page"))
+        raw_page_number = _get(page, "page_number")
+        page_logical_page = fallback_page if raw_page_number is None else _integer(raw_page_number)
+        if page_logical_page is None or page_logical_page <= 0:
+            continue
+        raw_page_source = _get(page, "source_page_number")
+        if raw_page_source is None:
+            raw_page_source = _get(page, "source_page")
+        page_source_page = _integer(raw_page_source) if raw_page_source is not None else None
+        if raw_page_source is not None and (page_source_page is None or page_source_page <= 0):
+            continue
         tables = _get(page, "tables")
         if not isinstance(tables, (list, tuple)):
             continue
         for table in tables:
+            metadata = _get(table, "metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            raw_coordinate_page = metadata.get("coordinate_logical_page")
+            logical_page = (
+                page_logical_page
+                if raw_coordinate_page is None
+                else _integer(raw_coordinate_page)
+            )
+            raw_source_logical_page = metadata.get("source_logical_page")
+            source_logical_page = (
+                logical_page
+                if raw_source_logical_page is None
+                else _integer(raw_source_logical_page)
+            )
+            raw_source_page = metadata.get("source_page")
+            source_page = page_source_page if raw_source_page is None else _integer(raw_source_page)
+            if (
+                logical_page is None
+                or logical_page <= 0
+                or logical_page != page_logical_page
+                or source_logical_page is None
+                or source_logical_page <= 0
+                or (raw_source_page is not None and (source_page is None or source_page <= 0))
+            ):
+                continue
             geometry = _geometry(table)
             typed_boxes, typed_statuses, typed_spans = _typed_cell_matrices(table)
             cell_bboxes = geometry.get("cell_bboxes")
@@ -228,7 +269,11 @@ def detached_source_table_geometry_by_page(
                 {
                     "table_id": table_id,
                     "logical_page": logical_page,
+                    "coordinate_logical_page": logical_page,
+                    "source_logical_page": source_logical_page,
                     "source_page": source_page,
+                    "source_to_canonical_affine": deepcopy(metadata.get("source_to_canonical_affine")),
+                    "canonical_geometry_registered": isinstance(metadata.get("canonical_geometry"), Mapping),
                     "bbox": deepcopy(_get(table, "bbox")),
                     "extraction_layer": str(_get(table, "extraction_layer") or ""),
                     "geometry_source": str(geometry.get("geometry_source") or _get(table, "extraction_layer") or ""),
@@ -348,7 +393,8 @@ def _vertical_edges(table: Mapping[str, Any]) -> tuple[float, ...] | None:
     lines: list[float] = []
     for value in raw_lines:
         if isinstance(value, Mapping):
-            value = value.get("x") or value.get("position")
+            coordinate = value.get("x")
+            value = value.get("position") if coordinate is None else coordinate
         try:
             coordinate = float(value)
         except (TypeError, ValueError):
@@ -376,7 +422,8 @@ def _raw_column_geometry(
     lines: list[float] = []
     for value in raw_lines:
         if isinstance(value, Mapping):
-            value = value.get("x") or value.get("position")
+            coordinate = value.get("x")
+            value = value.get("position") if coordinate is None else coordinate
         try:
             coordinate = float(value)
         except (TypeError, ValueError):
@@ -789,7 +836,8 @@ def _rows_follow_horizontal_rules(
     lines: list[float] = []
     for value in raw_lines:
         if isinstance(value, Mapping):
-            value = value.get("y") or value.get("position")
+            coordinate = value.get("y")
+            value = value.get("position") if coordinate is None else coordinate
         try:
             coordinate = float(value)
         except (TypeError, ValueError):
@@ -1290,11 +1338,64 @@ def _candidate_lattices(
     if effective_table is None:
         return []
     table = effective_table
+    raw_source_logical_page = table.get("source_logical_page")
+    source_logical_page = (
+        logical_page
+        if raw_source_logical_page is None
+        else _integer(raw_source_logical_page)
+    )
+    raw_coordinate_logical_page = table.get("coordinate_logical_page")
+    coordinate_logical_page = (
+        None
+        if raw_coordinate_logical_page is None
+        else _integer(raw_coordinate_logical_page)
+    )
+    source_page = _integer(table.get("source_page"))
     if (
         _integer(table.get("logical_page")) != logical_page
+        or source_logical_page is None
+        or source_logical_page <= 0
+        or (
+            raw_coordinate_logical_page is not None
+            and (
+                coordinate_logical_page is None
+                or coordinate_logical_page <= 0
+                or coordinate_logical_page != logical_page
+            )
+        )
+        or (
+            "source_page" in table
+            and table.get("source_page") is not None
+            and (source_page is None or source_page <= 0)
+        )
         or str(table.get("coordinate_system") or "") != "pdf_points_top_left"
     ):
         return []
+    raw_affine = table.get("source_to_canonical_affine")
+    source_to_canonical_affine: tuple[float, float, float, float] | None = None
+    if isinstance(raw_affine, Mapping):
+        try:
+            affine_values = tuple(
+                float(raw_affine[key])
+                for key in ("scale_x", "scale_y", "offset_x", "offset_y")
+            )
+        except (KeyError, TypeError, ValueError):
+            affine_values = ()
+        if (
+            len(affine_values) == 4
+            and all(isfinite(value) for value in affine_values)
+            and affine_values[0] > 0.0
+            and affine_values[1] > 0.0
+        ):
+            source_to_canonical_affine = affine_values
+    elif (
+        raw_affine is None
+        and table.get("canonical_geometry_registered") is not True
+        and source_logical_page == logical_page
+    ):
+        # Legacy detached tables already use their own raw page's PDF plane.
+        # Registered canonical tables must carry an explicit inverse instead.
+        source_to_canonical_affine = (1.0, 1.0, 0.0, 0.0)
     owned_columns = _owned_columns(table)
     table_box = _table_bbox(table)
     row_bands = (
@@ -1413,6 +1514,9 @@ def _candidate_lattices(
             "year_anchor_row_index": year_anchor_row,
             "exact_preceding_header": exact_header,
             "active_months": sorted(active_months),
+            "logical_page": logical_page,
+            "source_logical_page": source_logical_page,
+            "source_page": source_page,
         }
         if isinstance(canonicalization, Mapping):
             provenance.update(
@@ -1438,7 +1542,8 @@ def _candidate_lattices(
             SourceTableMonthLattice(
                 table_id=str(table.get("table_id") or ""),
                 logical_page=logical_page,
-                source_page=_integer(table.get("source_page")),
+                source_logical_page=source_logical_page,
+                source_page=source_page,
                 expected_year=expected_year,
                 year_anchor_row_index=year_anchor_row,
                 header_row_index=header_row if exact_header else -1,
@@ -1450,6 +1555,7 @@ def _candidate_lattices(
                 coordinate_system="pdf_points_top_left",
                 geometry_source=str(table.get("geometry_source") or ""),
                 provenance=tuple(sorted(provenance.items())),
+                source_to_canonical_affine=source_to_canonical_affine,
             )
         )
     return candidates

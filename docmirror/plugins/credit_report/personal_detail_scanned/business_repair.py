@@ -75,6 +75,14 @@ def _boxes_associate(
 def _field_ref_identity(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
     """Return one immutable field-cell identity used by repair matching."""
 
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+        monthly_field_slot_identity,
+    )
+
+    monthly_owner = monthly_field_slot_identity(ref)
+    if monthly_owner is not None:
+        return monthly_owner
+
     blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
     if blank_currency_owner is not None:
         return blank_currency_owner
@@ -359,8 +367,64 @@ class BusinessRepairPlan:
 class BusinessUncertaintyRepairCoordinator:
     """Plan and resolve the only post-schema page repair stage."""
 
-    def __init__(self, parse_result: Any) -> None:
+    def __init__(self, parse_result: Any, *, monthly_context: Any | None = None) -> None:
         self.parse_result = parse_result
+        self.monthly_context = monthly_context if monthly_context is not None else parse_result
+
+    def _monthly_uncertainties(self, payload: Mapping[str, Any]) -> list[BusinessUncertainty]:
+        """Authorize only slots independently bound to the sealed month lattice."""
+
+        from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+            MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM,
+            _MonthlySourceEvidence,
+            authenticated_monthly_field_slots,
+        )
+
+        evidence = _MonthlySourceEvidence(self.parse_result)
+        uncertainties: list[BusinessUncertainty] = []
+        physical_owners: dict[tuple[Any, ...], set[str]] = {}
+        rows_and_slots: list[tuple[Mapping[str, Any], dict[str, dict[str, Any]]]] = []
+        for record in payload.get("repayment_records") or ():
+            if not isinstance(record, Mapping):
+                continue
+            slots = authenticated_monthly_field_slots(self.monthly_context, record, evidence=evidence)
+            rows_and_slots.append((record, slots))
+            for ref in slots.values():
+                owner = _field_ref_identity(ref)
+                if owner is not None:
+                    physical_owners.setdefault(owner[:-1], set()).add(ref["monthly_slot_proof"]["account_id"])
+        for record, slots in rows_and_slots:
+            values = record.get("normalized") if isinstance(record.get("normalized"), Mapping) else record
+            record_id = _record_id(values) or _record_id(record)
+            if not record_id:
+                continue
+            for field_name, ref in slots.items():
+                identity = _field_ref_identity(ref)
+                if identity is None or len(physical_owners.get(identity[:-1], ())) != 1:
+                    continue
+                role = "repayment_status" if field_name in {"status", "status_code"} else "amount"
+                published = values.get(field_name)
+                valid = role_candidate_is_valid("" if published is None else str(published), role)
+                score = ref.get("source_ocr_confidence")
+                low_confidence = bool(
+                    role == "repayment_status" and valid
+                    and isinstance(score, (int, float)) and not isinstance(score, bool)
+                    and score < MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM
+                )
+                if valid and not low_confidence:
+                    continue
+                observed = str(ref.get("observed_raw") or "")
+                reason = "low_source_ocr_confidence" if low_confidence else "monthly_field_value_unresolved"
+                marker = (record_id, field_name, _field_ref_identity(ref), observed, reason)
+                digest = hashlib.sha256(repr(marker).encode("utf-8")).hexdigest()[:16]
+                uncertainties.append(BusinessUncertainty(
+                    uncertainty_id=f"personal_detail_business_uncertainty:{digest}",
+                    path=f"repayment_records[{record_id}].{field_name}", role=role,
+                    dataset_name="repayment_records", record_id=record_id, field_name=field_name,
+                    observed_value=observed, reason_codes=(reason, "exact_monthly_source_slot", "field_local_overlay_only"),
+                    source_refs=(deepcopy(ref),), logical_pages=(ref["logical_page"],),
+                ))
+        return uncertainties
 
     @staticmethod
     def _proactive_liability_uncertainties(
@@ -472,7 +536,9 @@ class BusinessUncertaintyRepairCoordinator:
                 )
             )
             observed = _observed_scalar(
-                uncertainty.observed_value if observed_raw is None else observed_raw,
+                uncertainty.observed_value
+                if observed_raw is None or uncertainty.dataset_name == "repayment_records"
+                else observed_raw,
                 field_name=uncertainty.field_name,
             )
             role = _repair_role(
@@ -492,6 +558,8 @@ class BusinessUncertaintyRepairCoordinator:
                 "independent_context_rich_reocr_required",
                 "field_local_overlay_only",
             )
+            if uncertainty.dataset_name == "repayment_records":
+                reason_codes = tuple(dict.fromkeys((*reason_codes, *uncertainty.reason_codes)))
             if role == "date" and uncertainty.field_name == "inquiry_date":
                 candidate = deterministic_inquiry_date_candidate(observed)
                 if candidate is not None:
@@ -534,6 +602,7 @@ class BusinessUncertaintyRepairCoordinator:
                     )
             marker = (
                 uncertainty.dataset_name,
+                uncertainty.record_id if uncertainty.dataset_name == "repayment_records" else "",
                 uncertainty.field_name,
                 observed,
                 candidate,
@@ -652,7 +721,19 @@ class BusinessUncertaintyRepairCoordinator:
                 continue
             known_ids.add(uncertainty.uncertainty_id)
             uncertainties.append(uncertainty)
-        field_repairs = self._field_repairs(uncertainties, payload)
+        monthly_uncertainties = self._monthly_uncertainties(payload)
+        for uncertainty in monthly_uncertainties:
+            if uncertainty.uncertainty_id not in known_ids:
+                known_ids.add(uncertainty.uncertainty_id)
+                uncertainties.append(uncertainty)
+        authenticated_monthly_ids = {item.uncertainty_id for item in monthly_uncertainties}
+        # Keep unrepairable monthly uncertainties visible in the audit without
+        # treating their caller-supplied grid refs as repair authorization.
+        field_repairs = self._field_repairs(
+            (item for item in uncertainties if item.dataset_name != "repayment_records"
+             or item.uncertainty_id in authenticated_monthly_ids),
+            payload,
+        )
         unresolved = tuple(
             sorted(
                 {
@@ -871,9 +952,163 @@ class BusinessUncertaintyRepairCoordinator:
         return True
 
 
+def apply_planned_monthly_field_repairs(
+    context: Any, payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Materialize only approved monthly fields, including null source values.
+
+    Reconstructing an affected page may produce a different grid-local ID. The
+    immutable source slot, not that detector ID or a neighbouring value, binds
+    this pass back to its directive. A failed attempt never promotes raw text.
+    """
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+        _MonthlySourceEvidence,
+        authenticated_monthly_field_slots,
+        monthly_field_slot_identity,
+    )
+
+    corrected = deepcopy(dict(payload))
+    plan = getattr(context, "_business_repair_plan", None)
+    overlay = getattr(context, "_ocr_correction_overlay", None)
+    if plan is None or overlay is None or not getattr(context, "_business_repair_active", False):
+        return corrected
+    directives = [
+        repair for repair in getattr(plan, "field_repairs", ())
+        if repair.dataset_name == "repayment_records" and repair.mode == "context_rich_reocr"
+    ]
+    if not directives:
+        return corrected
+    evidence = _MonthlySourceEvidence(context.parse_result)
+    records_and_slots = []
+    physical_records: dict[tuple[Any, ...], set[tuple[str, str]]] = {}
+    for record in corrected.get("repayment_records") or ():
+        if not isinstance(record, dict):
+            continue
+        values = record.get("normalized") if isinstance(record.get("normalized"), dict) else record
+        slots = authenticated_monthly_field_slots(context, record, evidence=evidence)
+        records_and_slots.append((record, values, slots))
+        record_id = _record_id(values) or _record_id(record)
+        for ref in slots.values():
+            owner = monthly_field_slot_identity(ref)
+            if owner is not None:
+                physical_records.setdefault(owner[:-1], set()).add((owner[-1], record_id))
+    for record, values, slots in records_and_slots:
+        for field_name, ref in slots.items():
+            owner = monthly_field_slot_identity(ref)
+            if owner is None or len(physical_records.get(owner[:-1], ())) != 1:
+                continue
+            record_id = _record_id(values) or _record_id(record)
+
+            def record_matches(repair: BusinessFieldRepair) -> bool:
+                if record_id and record_id == repair.record_id:
+                    return True
+                # A page rebuild can change a detector-local grid name. Only
+                # its generated grid:YYYY-MM alias is transferable; arbitrary
+                # record IDs cannot borrow another record's directive.
+                proof = ref["monthly_slot_proof"]
+                suffix = f":{proof['year']:04d}-{proof['month']:02d}"
+                old_grid = repair.source_refs[0].get("registered_source_ref", {}).get("grid_id")
+                new_grid = values.get("grid_id") or record.get("grid_id")
+                return bool(old_grid and new_grid and repair.record_id == f"{old_grid}{suffix}" and record_id == f"{new_grid}{suffix}")
+
+            matches = [
+                repair for repair in directives
+                if repair.field_name == field_name and len(repair.source_refs) == 1
+                and monthly_field_slot_identity(repair.source_refs[0]) == owner
+                and record_matches(repair)
+            ]
+            if owner is None or len(matches) != 1:
+                continue
+            repair = matches[0]
+            # Re-authentication above also verifies that the stored raw token
+            # set still owns this slot. Never substitute an unrelated current
+            # value for the original input used to authorize the repair.
+            if str(ref.get("observed_raw") or "") != repair.observed_value:
+                continue
+            current = values.get(field_name)
+            current_text = "" if current is None else str(current)
+            published_text = "" if repair.published_value is None else str(repair.published_value)
+            confirmation_only = bool(
+                role_candidate_is_valid(current_text, repair.role)
+                and current_text != published_text
+            )
+            updated, decision = overlay.repair_planned_text(
+                repair.observed_value, repair=repair, source_refs=(ref,),
+                confirmation_value=current_text if confirmation_only else None,
+            )
+            if decision is None or decision.action not in {"applied", "confirmed"}:
+                continue
+            if not role_candidate_is_valid(updated, repair.role):
+                continue
+            original = values.get(field_name)
+            raw = record.setdefault("canonical_raw", {})
+            if isinstance(raw, dict):
+                raw.setdefault(field_name, repair.observed_value or original)
+            values[field_name] = updated
+            if values is not record and field_name in record:
+                record[field_name] = updated
+            aliases = {"status", "status_code"} if repair.role == "repayment_status" else {"overdue_amount", "status_amount"}
+            for alias in aliases:
+                if alias in values:
+                    values[alias] = updated
+                if values is not record and alias in record:
+                    record[alias] = updated
+            field_ref = deepcopy(ref["registered_source_ref"])
+            field_ref["field_name"] = field_name
+            old_refs = [dict(item) for item in record.get("source_cell_refs") or () if isinstance(item, Mapping)]
+            record["source_cell_refs"] = [item for item in old_refs if item.get("field_name") not in aliases] + [field_ref]
+            refs_by_field = record.setdefault("source_refs_by_field", {})
+            if isinstance(refs_by_field, dict):
+                for alias in aliases:
+                    if alias in refs_by_field:
+                        refs_by_field[alias] = [deepcopy(field_ref), deepcopy(decision.source_refs[-1])]
+                refs_by_field[field_name] = [deepcopy(field_ref), deepcopy(decision.source_refs[-1])]
+            audit = record.setdefault("audit", {})
+            if isinstance(audit, dict):
+                history = audit.setdefault("monthly_field_repairs", [])
+                if isinstance(history, list):
+                    history.append({
+                        "field_name": field_name, "correction_id": decision.correction_id,
+                        "action": decision.action, "original": original, "corrected": updated,
+                        "selected_acquisition": decision.selected_acquisition,
+                        "source_ocr_confidence": ref.get("source_ocr_confidence"),
+                        "selected_ocr_confidence": decision.confidence,
+                        "original_source_refs": [item for item in old_refs if item.get("field_name") in aliases],
+                    })
+                unresolved = audit.get("unresolved_fields")
+                if isinstance(unresolved, list):
+                    audit["unresolved_fields"] = [item for item in unresolved if item not in aliases]
+            for container in (record, values):
+                unresolved = container.get("_unresolved_fields")
+                if isinstance(unresolved, list):
+                    container["_unresolved_fields"] = [item for item in unresolved if item not in aliases]
+            if repair.role == "amount":
+                for container in (record, values):
+                    pairing = container.get("_amount_pairing")
+                    if isinstance(pairing, dict):
+                        pairing["status"] = "exact"
+                        pairing["reason"] = "independent_page_evidence_exact_month_slot"
+            status = values.get("status_code", values.get("status"))
+            amount = values.get("status_amount", values.get("overdue_amount"))
+            if (
+                isinstance(audit, dict)
+                and audit.get("reason") in {"status_value_withheld", "corrected_status_planes_disagree"}
+                and not audit.get("unresolved_fields") and not record.get("_unresolved_fields")
+                and role_candidate_is_valid("" if status is None else str(status), "repayment_status")
+                and role_candidate_is_valid("" if amount is None else str(amount), "amount")
+            ):
+                audit["resolved_source_reason"] = audit.pop("reason")
+                record.pop("extraction_status", None)
+                if values is not record:
+                    values.pop("extraction_status", None)
+    return corrected
+
+
 __all__ = [
     "BusinessFieldRepair",
     "BusinessRepairPlan",
     "BusinessUncertainty",
     "BusinessUncertaintyRepairCoordinator",
+    "apply_planned_monthly_field_repairs",
 ]

@@ -17,6 +17,8 @@ from docmirror.output.markdown_renderer import MARKDOWN_PROFILE_MARKER, validate
 
 _TOP_LEVEL_BLOCKS = {"schema", "document", "sections", "datasets", "reading", "files", "warnings"}
 _RECORD_BLOCKS = {"record_id", "normalized", "canonical_raw", "raw", "source"}
+_NORMALIZED_RECORD_BLOCKS = {"record_id", "normalized", "source"}
+_BUSINESS_RECORD_BLOCKS = {"normalized", "extraction"}
 _COMMUNITY_READING_MARKER = (
     '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->'
 )
@@ -162,8 +164,15 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
 
     validation = validate_projection_payload("community", payload)
     issues.extend(f"schema: {error}" for error in validation.errors)
-    if set(payload) != _TOP_LEVEL_BLOCKS:
+    schema = payload.get("schema") if isinstance(payload.get("schema"), dict) else {}
+    business_view = schema.get("version") == "5.0.0"
+    top_level_blocks = (_TOP_LEVEL_BLOCKS - {"warnings"}) | {"extraction"} if business_view else _TOP_LEVEL_BLOCKS
+    if set(payload) != top_level_blocks:
         issues.append(f"community: top-level blocks={sorted(payload)}")
+    if business_view:
+        record_blocks = _BUSINESS_RECORD_BLOCKS
+    else:
+        record_blocks = _NORMALIZED_RECORD_BLOCKS if schema.get("version") == "4.0.0" else _RECORD_BLOCKS
 
     root = path.parent
     files = payload.get("files") if isinstance(payload.get("files"), dict) else {}
@@ -215,14 +224,17 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
             if not isinstance(row, dict):
                 issues.append(f"{dataset_id}.rows[{row_index}]: must be an object")
                 continue
-            missing = _RECORD_BLOCKS - set(row)
+            missing = record_blocks - set(row)
             if missing:
                 issues.append(f"{dataset_id}.rows[{row_index}]: missing {sorted(missing)}")
-            record_id = str(row.get("record_id") or "")
+            identity = row.get("extraction") if business_view else row
+            record_id = str(identity.get("record_id") or "") if isinstance(identity, dict) else ""
             record_ids.append(record_id)
             if not record_id:
                 issues.append(f"{dataset_id}.rows[{row_index}]: empty record_id")
-            for block in ("normalized", "canonical_raw", "raw", "source"):
+            for block in ("normalized", "canonical_raw", "raw", "source", "extraction"):
+                if block not in record_blocks:
+                    continue
                 if not isinstance(row.get(block), dict):
                     issues.append(f"{dataset_id}.rows[{row_index}].{block}: must be an object")
             normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}

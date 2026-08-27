@@ -50,18 +50,40 @@ def resolve_exact_page_token_atoms(
     token_ids: Iterable[str],
     *,
     logical_page: int | None = None,
+    require_raw_tokens: bool = False,
 ) -> tuple[ExactTokenAtom, ...] | None:
-    """Resolve one exact closed token-ID set from immutable source evidence.
+    """Resolve one exact closed token-ID set from sealed source evidence.
 
     The canonical evidence plane remains authoritative when it owns any of the
     requested IDs.  A page bundle is considered only when the plane owns none,
     and only with an explicit logical page.  Duplicate IDs, partial ownership,
     wrong-page tokens, non-singleton evidence ownership, or malformed token
     geometry all fail closed.
+
+    Direct canonical IDs retain the generic sealed-evidence contract: their
+    atoms need not carry raw-OCR metadata, and ``source_refs`` may identify
+    different underlying source IDs.  The legacy integer-zero page hint means
+    unspecified only in this generic contract.  Any explicit page marker must
+    agree with a supplied positive page.  Monthly repair opts into
+    ``require_raw_tokens`` to exclude typed/table/line projections and require
+    explicit raw-token/page ownership.  Opaque source-reference lookup is always raw-only and requires
+    one exact source ID and an explicit matching page, in either mode.
     """
 
     requested = tuple(str(value) for value in token_ids if str(value or ""))
     if not requested or len(requested) != len(set(requested)):
+        return None
+    if not require_raw_tokens and type(logical_page) is int and logical_page == 0:
+        # Native profile helpers use 0 for an absent source-page hint. Only
+        # direct sealed IDs can resolve without it; raw aliases/bundles cannot.
+        logical_page = None
+    if logical_page is not None and (
+        not isinstance(logical_page, int)
+        or isinstance(logical_page, bool)
+        or logical_page <= 0
+    ):
+        return None
+    if require_raw_tokens and logical_page is None:
         return None
 
     plane = getattr(owner, "evidence_plane", None)
@@ -70,15 +92,108 @@ def resolve_exact_page_token_atoms(
     evidence_store = getattr(plane, "evidence", None)
     text_atoms = getattr(evidence_store, "text_atoms", None)
     plane_matches: dict[str, Any] = {}
+    plane_claimed_ids: set[str] = set()
     if isinstance(text_atoms, list):
         for atom in text_atoms:
             atom_id = str(_value(atom, "id", "") or "")
-            if atom_id not in requested:
+            direct_match = atom_id if atom_id in requested else ""
+            if direct_match and not require_raw_tokens:
+                # A sealed atom's own ID is authoritative in the generic
+                # contract. Its source refs are provenance, not alternative
+                # owners of that canonical ID; legacy atoms omit page metadata.
+                page_id = _value(atom, "page_id")
+                if (
+                    logical_page is not None
+                    and page_id not in (None, "")
+                    and page_id != f"page:{logical_page:04d}"
+                ) or direct_match in plane_matches:
+                    return None
+                plane_claimed_ids.add(direct_match)
+                plane_matches[direct_match] = atom
                 continue
-            if atom_id in plane_matches:
+            source_kind = str(_value(atom, "source_kind", "") or "").lower()
+            metadata = _value(atom, "metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            granularity = str(metadata.get("granularity") or "").lower()
+            # Table cells, lines, and semantic projections may carry the same
+            # source ref as one OCR token. They are distinct value planes and
+            # cannot satisfy raw-token ownership. Generic direct-ID lookup was
+            # handled above; source-ref lookup never promotes these projections.
+            raw_token_kind = bool(
+                source_kind == "metadata_ocr_token"
+                or (
+                    granularity == "token"
+                    and (
+                        "ocr" in source_kind
+                        or source_kind in {
+                            "ocr",
+                            "metadata",
+                            "micro_grid_evidence_token",
+                            "local_structure_evidence_token",
+                        }
+                    )
+                    and not any(
+                        marker in source_kind
+                        for marker in ("table", "cell", "line", "semantic")
+                    )
+                )
+            )
+            if not raw_token_kind:
+                if direct_match:
+                    return None
+                continue
+            raw_source_refs = _value(atom, "source_refs", ())
+            if raw_source_refs is None:
+                raw_source_refs = ()
+            if not isinstance(raw_source_refs, (list, tuple)):
+                malformed_claims = (
+                    (raw_source_refs,)
+                    if isinstance(raw_source_refs, str)
+                    else raw_source_refs.keys()
+                    if isinstance(raw_source_refs, Mapping)
+                    else ()
+                )
+                if direct_match or any(value in requested for value in malformed_claims):
+                    return None
+                continue
+            referenced_requested_ids = {
+                value
+                for value in raw_source_refs
+                if isinstance(value, str) and value in requested
+            }
+            if not direct_match and not referenced_requested_ids:
+                continue
+            if any(
+                not isinstance(value, str) or not value.strip()
+                for value in raw_source_refs
+            ):
                 return None
-            plane_matches[atom_id] = atom
-    if plane_matches:
+            source_refs = tuple(raw_source_refs)
+            if direct_match:
+                if source_refs and source_refs != (direct_match,):
+                    return None
+                claimed = {direct_match}
+            else:
+                claimed = referenced_requested_ids
+            plane_claimed_ids.update(value for value in claimed if value)
+            if (
+                len(claimed) != 1
+                or (
+                    not direct_match
+                    and (
+                        len(source_refs) != 1
+                        or source_refs[0] not in claimed
+                    )
+                )
+                or logical_page is None
+                or _value(atom, "page_id") != f"page:{logical_page:04d}"
+            ):
+                return None
+            match_id = next(iter(claimed))
+            if match_id in plane_matches:
+                return None
+            plane_matches[match_id] = atom
+    if plane_matches or plane_claimed_ids:
         if set(plane_matches) != set(requested):
             return None
         resolved = tuple(_resolved_atom(plane_matches[token_id], token_id) for token_id in requested)
@@ -113,11 +228,13 @@ def resolve_exact_page_token_atoms(
                 token_page = int(token.get("page") or 0)
             except (TypeError, ValueError):
                 token_page = 0
-            evidence_ids = tuple(
-                str(value)
-                for value in token.get("evidence_ids") or ()
-                if str(value or "")
-            )
+            raw_evidence_ids = token.get("evidence_ids")
+            if not isinstance(raw_evidence_ids, (list, tuple)) or any(
+                not isinstance(value, str) or not value.strip()
+                for value in raw_evidence_ids
+            ):
+                return None
+            evidence_ids = tuple(raw_evidence_ids)
             if (
                 token_id in bundle_matches
                 or bundle_page != logical_page

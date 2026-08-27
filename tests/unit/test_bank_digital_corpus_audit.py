@@ -64,6 +64,25 @@ def test_harness_derives_manifest_from_work_root(tmp_path, audit_module):
     assert manifest["file_count"] == 1
 
 
+def test_projection_fingerprint_covers_shared_export_code(audit_module):
+    _fingerprint, files = audit_module._bank_code_fingerprint()
+    assert "docmirror/output/community_bundle.py" in files
+    assert "docmirror/server/edition_outputs.py" in files
+    assert "docmirror/output/normalized_records.py" in files
+    assert "docmirror/output/bank_business_view.py" in files
+    assert "docmirror/models/schemas/registry.py" in files
+
+
+def test_export_validation_options_do_not_enable_pdf_perception(audit_module):
+    args = audit_module._parser().parse_args(
+        ["reproject", "--validate-exports", "--baseline-report", "prior.json"]
+    )
+    assert args.validate_exports is True
+    assert args.baseline_report == "prior.json"
+    assert args.refresh is False
+    assert args.command == "reproject"
+
+
 def test_harness_rejects_manifest_corpus_mismatch_before_processing(tmp_path, audit_module):
     corpus = tmp_path / "Primary"
     other_corpus = tmp_path / "All"
@@ -2247,3 +2266,47 @@ def test_direction_distribution_zero_amount_count_slack_fails_closed(
     assert candidates == ()
     assert audit["status"] == "fail"
     assert audit["finding_counts"]["header_direction_distribution_mismatch"] == 1
+
+
+@pytest.mark.parametrize("evidence_state", ["retained", "missing", "different_normalized"])
+def test_normalized_delivery_is_audited_against_retained_internal_evidence(audit_module, evidence_state):
+    import copy
+
+    evidence = _direction_distribution_payload(
+        [("expense", "10.00"), ("income", "5.00")],
+        debit_count=1, debit_total="10.00", credit_count=1, credit_total="5.00",
+    )
+    payload = copy.deepcopy(evidence)
+    payload["schema"] = {"version": "4.0.0"}
+    for dataset in payload["datasets"]:
+        for row in dataset["rows"]:
+            row.pop("raw")
+            row.pop("canonical_raw")
+    if evidence_state == "different_normalized":
+        payload["datasets"][1]["rows"][0]["normalized"]["amount"] = "999.00"
+    result = audit_module.audit_community_payload(
+        payload, effective_page_count=1,
+        evidence_payload=None if evidence_state == "missing" else evidence,
+    )
+    if evidence_state == "retained":
+        assert result["status"] == "pass"
+    elif evidence_state == "missing":
+        assert result["finding_counts"]["internal_evidence_required_for_normalized_export"] == 1
+    else:
+        assert result["finding_counts"]["internal_evidence_mismatch"] == 1
+
+
+def test_normalized_projection_cache_requires_hash_checked_evidence(tmp_path, audit_module):
+    payload_path = tmp_path / "sample.community.json"
+    meta_path = tmp_path / "sample.meta.json"
+    evidence_path = payload_path.with_suffix(".evidence.json")
+    audit_module._atomic_write_json(payload_path, {"schema": {"version": "4.0.0"}})
+    meta = {"community_sha256": audit_module._sha256_file(payload_path)}
+    audit_module._atomic_write_json(meta_path, meta)
+    assert not audit_module._projection_payload_is_valid(payload_path, meta_path, {})
+    audit_module._atomic_write_json(evidence_path, {"datasets": []})
+    meta["evidence_sha256"] = audit_module._sha256_file(evidence_path)
+    audit_module._atomic_write_json(meta_path, meta)
+    assert audit_module._projection_payload_is_valid(payload_path, meta_path, {})
+    audit_module._atomic_write_json(evidence_path, {"datasets": ["changed"]})
+    assert not audit_module._projection_payload_is_valid(payload_path, meta_path, {})

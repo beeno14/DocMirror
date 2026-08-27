@@ -104,6 +104,15 @@ def _date_range_only_grid(
                 "end_month": end_month,
             },
         }
+    printed_anchor_identity = (
+        anchor.get("printed_anchor_identity")
+        if isinstance(anchor, Mapping)
+        else getattr(anchor, "printed_anchor_identity", None)
+    )
+    if isinstance(printed_anchor_identity, Mapping):
+        # A printed range remains identifiable when its month-cell geometry
+        # is unresolved. This is opaque provenance, never a value/slot proof.
+        audit["printed_anchor_provenance"] = deepcopy(dict(printed_anchor_identity))
     return {
         "grid_id": f"mg_p{page}_repayment_{grid_index}",
         "structure_kind": "micro_grid",

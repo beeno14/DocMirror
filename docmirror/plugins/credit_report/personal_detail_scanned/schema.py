@@ -2929,8 +2929,10 @@ def _extraction_issue(values: dict[str, Any]) -> dict[str, Any]:
     else:
         values.pop("target_dataset", None)
     if (
-        values.get("issue_code")
-        == "candidate_b_native_source_cell_repayment_status_conflict"
+        values.get("issue_code") in (
+            "candidate_b_native_source_cell_repayment_status_conflict",
+            "candidate_b_monthly_source_ocr_confidence_unresolved",
+        )
         and values.get("target_dataset") == "credit_account_monthly_performance"
         and values.get("field_name") == "status"
     ):
@@ -3409,6 +3411,106 @@ def _exact_final_gate_monthly_identity(
     return target_record_id, account_id, grid_id, performance_month
 
 
+def _low_confidence_monthly_issue_identity(record: Mapping[str, Any]) -> tuple[str, str, str, str] | None:
+    """Recognize the field-local receipt of the authenticated native guard."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+        MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM,
+        monthly_field_slot_identity,
+    )
+
+    values = _normalized(dict(record))
+    if not (
+        values.get("issue_code") == "candidate_b_monthly_source_ocr_confidence_unresolved"
+        and values.get("category") == "ocr_cell_level_error"
+        and values.get("parser_stage") == "candidate_b_final_native_source_cell_guard"
+        and values.get("target_dataset") == "credit_account_monthly_performance"
+        and values.get("field_name") == "status_code"
+        and values.get("status") == "requires_review"
+        and values.get("candidate_value") == {"resolution": "withheld_pending_independent_page_evidence"}
+    ):
+        return None
+    reasons = values.get("reason_codes")
+    observed = values.get("observed_value")
+    if not (
+        isinstance(reasons, (list, tuple)) and len(reasons) == 4
+        and all(isinstance(reason, str) for reason in reasons)
+        and set(reasons) == {
+            "low_source_ocr_confidence", "exact_monthly_source_slot",
+            "independent_page_confirmation_missing", "normalized_value_withheld",
+        }
+        and isinstance(observed, Mapping) and set(observed) == {
+            "observed_status", "source_ocr_confidence", "minimum_source_ocr_confidence",
+        }
+        and str(observed.get("observed_status") or "") in _CANONICAL_MONTHLY_STATUS_CODES
+    ):
+        return None
+    score = observed.get("source_ocr_confidence")
+    minimum = observed.get("minimum_source_ocr_confidence")
+    if not (
+        type(score) in (int, float) and isfinite(score)
+        and type(minimum) in (int, float) and minimum == MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM
+        and 0.0 <= score < minimum
+    ):
+        return None
+    owners = (record, values, record.get("source"))
+    containers = [
+        owner[key] for owner in owners if isinstance(owner, Mapping)
+        for key in ("source_refs", "source_cell_refs") if key in owner
+    ]
+    if not containers or any(
+        not isinstance(refs, (list, tuple)) or len(refs) != 2
+        or not all(isinstance(ref, Mapping) for ref in refs)
+        for refs in containers
+    ):
+        return None
+    refs = list(containers[0])
+    if any(list(container) != refs for container in containers[1:]):
+        return None
+    slots = [ref for ref in refs if ref.get("source") == "sealed_native_monthly_field_slot"]
+    if len(slots) != 1:
+        return None
+    slot = slots[0]
+    if slot.get("field_name") != "status_code" or monthly_field_slot_identity(slot) is None:
+        return None
+    proof = slot["monthly_slot_proof"]
+    evidence_groups = [slot.get("evidence_ids"), *(proof.get(key) for key in (
+        "year_evidence_ids", "header_evidence_ids", "parent_evidence_ids",
+    ))]
+    if any(
+        not isinstance(ids, (list, tuple)) or not ids
+        or not all(isinstance(value, str) and value and value == value.strip() for value in ids)
+        or len(ids) != len(set(ids))
+        for ids in evidence_groups
+    ):
+        return None
+    registered = slot.get("registered_source_ref")
+    if not isinstance(registered, Mapping) or registered not in refs:
+        return None
+    month = f'{proof["year"]:04d}-{proof["month"]:02d}'
+    grid_id = registered.get("grid_id")
+    account_id = proof["account_id"]
+    if not (
+        isinstance(grid_id, str) and grid_id and grid_id == grid_id.strip()
+        and account_id == account_id.strip()
+        and slot.get("evidence_plane") == "sealed_native_source_table"
+        and type(slot.get("source_ocr_confidence")) in (int, float)
+        and slot["source_ocr_confidence"] == score
+        and _nonnegative_native_index(proof.get("header_row")) is not None
+        and _positive_native_page(slot.get("registered_logical_page")) is not None
+        and _finite_cell_bbox(slot.get("registered_bbox")) is not None
+        and registered.get("logical_page", registered.get("page")) == slot["registered_logical_page"]
+        and registered.get("bbox") == slot.get("registered_bbox")
+        and registered.get("col", registered.get("column")) == proof["month"]
+        and _nonnegative_native_index(registered.get("row")) is not None
+        and registered.get("field_name") in ("status", "status_code")
+        and registered.get("geometry_scope") == "cell"
+        and registered.get("geometry_status") in ("exact", "accepted")
+        and values.get("target_record_id") == f"{grid_id}:{month}"
+    ):
+        return None
+    return f"{grid_id}:{month}", account_id, grid_id, month
+
+
 def _monthly_issue_account_month_identities(
     record: Mapping[str, Any],
     *,
@@ -3664,6 +3766,8 @@ def _exact_localized_monthly_issue_identities(
 
 
 _MONTHLY_CLOSURE_PROOF_DATASET = "_personal_detail_account_month_closure_proof"
+_MONTHLY_POPULATION_GUARD_DATASET = "_personal_detail_account_month_population_guard"
+_PRINTED_MONTHLY_POPULATION_PROOF_DATASET = "_personal_detail_printed_month_population_proof"
 
 
 def _monthly_identity_digest(identities: set[tuple[str, str]]) -> str:
@@ -3735,9 +3839,10 @@ def _authenticated_source_monthly_closure(
     """Validate the internal closure proof against exact source identities.
 
     The public dataset-status row is intentionally excluded from this proof.
-    Direct schema callers may omit the singleton proof record, but still need
+    Legacy direct schema callers may omit the singleton proof record, but still need
     the same strict row/issue identity contracts; a supplied proof must match
-    both the complete identity set and its SHA-256 digest exactly.
+    both the complete identity set and its SHA-256 digest exactly.  Managed
+    reconciliation that withheld its proof must never enter that fallback.
     """
 
     identities = _strict_source_monthly_candidate_identities(
@@ -3754,7 +3859,11 @@ def _authenticated_source_monthly_closure(
 
     proof_rows = list(source.get(_MONTHLY_CLOSURE_PROOF_DATASET) or ())
     if not proof_rows:
-        return frozenset(identities)
+        return (
+            frozenset()
+            if _MONTHLY_POPULATION_GUARD_DATASET in source
+            else frozenset(identities)
+        )
     if len(proof_rows) != 1 or not isinstance(proof_rows[0], Mapping):
         return frozenset()
     proof_record = dict(proof_rows[0])
@@ -3788,6 +3897,46 @@ def _authenticated_source_monthly_position_count(
     and owner-unresolved ledgers close exactly.  Direct schema callers without
     the internal proof retain identity-only completeness semantics.
     """
+
+    if _PRINTED_MONTHLY_POPULATION_PROOF_DATASET in source:
+        from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+            _PRINTED_GRID_CENSUS_ISSUE_CODE,
+            _validated_printed_anchor_inventory_issue,
+        )
+
+        rows = source.get(_PRINTED_MONTHLY_POPULATION_PROOF_DATASET) or ()
+        census_rows = [
+            row for row in source.get("personal_detail_extraction_issues") or ()
+            if isinstance(row, Mapping)
+            and _normalized(dict(row)).get("issue_code") == _PRINTED_GRID_CENSUS_ISSUE_CODE
+            and _normalized(dict(row)).get("status") != "resolved"
+        ]
+        if len(rows) != 1 or not isinstance(rows[0], Mapping) or len(census_rows) != 1:
+            return None
+        # Use the original private issue, before its target dataset is renamed
+        # for publication.  Recheck its identity and full source refs on every
+        # projection; an edited/stale receipt cannot certify a denominator.
+        inventory = _validated_printed_anchor_inventory_issue(census_rows[0])
+        if inventory is None or not inventory["complete"]:
+            return None
+        proof = _normalized(dict(rows[0]))
+        population = sum(
+            (anchor["date_range"][2] - anchor["date_range"][0]) * 12
+            + anchor["date_range"][3] - anchor["date_range"][1] + 1
+            for anchor in inventory["anchors"]
+        )
+        valid = bool(
+            str(rows[0].get("record_id") or proof.get("record_id") or "")
+            == "personal_detail_printed_month_population_proof:1"
+            and proof.get("schema") == "docmirror.pboc.printed_month_population_proof.v1"
+            and proof.get("proof_basis") == "complete_sealed_printed_anchor_inventory"
+            and proof.get("census_issue_id") == inventory["issue_id"]
+            and type(proof.get("source_anchor_count")) is int
+            and proof["source_anchor_count"] == len(inventory["anchors"])
+            and type(proof.get("expected_source_position_count")) is int
+            and proof["expected_source_position_count"] == population
+        )
+        return population if valid else None
 
     identities = _strict_source_monthly_candidate_identities(
         list(source.get("repayment_records") or ())
@@ -3843,6 +3992,7 @@ def _canonical_quality_gate(
     *,
     authenticated_monthly_closure: frozenset[tuple[str, str]] = frozenset(),
     authenticated_monthly_source_position_count: int | None = None,
+    monthly_source_position_proof_required: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Withhold invalid v2 values and publish one deduplicated uncertainty."""
     from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
@@ -4145,6 +4295,10 @@ def _canonical_quality_gate(
         and str(values.get("field_name") or "") == "status_code"
         and str(values.get("target_record_id") or "").strip()
     }
+    low_confidence_monthly_identities = {
+        identity for issue in issues
+        if (identity := _low_confidence_monthly_issue_identity(issue)) is not None
+    }
 
     # Monthly status candidates must survive relationship construction and the
     # professional correction overlay. Only this final public-schema boundary
@@ -4398,11 +4552,18 @@ def _canonical_quality_gate(
                 and _explicit_valid_monthly_amount(values.get("status_amount"))
                 and stable_record_id in native_source_status_conflict_record_ids
             )
-            if retain_native_source_conflict:
+            retain_low_confidence_status = bool(
+                exact_identity is not None
+                and (stable_record_id, *exact_identity[1:]) in low_confidence_monthly_identities
+            )
+            if retain_native_source_conflict or retain_low_confidence_status:
                 # The exact same-cell conflict proves that the status is
                 # unknown, not that the entire month is absent.  Keep the
                 # independently explicit amount and stable month identity,
                 # while ensuring no candidate status enters normalized data.
+                # A native low-confidence slot remains a known month even if
+                # its amount is missing too; the amount gate below reports
+                # that independent field error without inferring a zero.
                 values["status_code"] = None
                 values["extraction_status"] = "review"
                 record = _replace_normalized(record, values)
@@ -5424,7 +5585,7 @@ def _canonical_quality_gate(
         and str(_normalized(record).get("target_dataset") or "") not in _CONTROL_DATASETS
     }
     monthly_dataset = "credit_account_monthly_performance"
-    if authenticated_monthly_closure or (
+    if monthly_source_position_proof_required or authenticated_monthly_closure or (
         authenticated_monthly_source_position_count is not None
         and authenticated_monthly_source_position_count > 0
     ):
@@ -5435,6 +5596,7 @@ def _canonical_quality_gate(
         monthly_dataset in status_index
         or projected.get(monthly_dataset)
         or authenticated_monthly_source_position_count is not None
+        or monthly_source_position_proof_required
     ):
         # A source-position denominator is accepted only from the authenticated
         # internal closure proof.  Raw count-only diagnostics remain excluded.
@@ -5500,21 +5662,36 @@ def _canonical_quality_gate(
             )
             normalized["observed_row_count"] = len(emitted_account_months)
             expected_count = (
-                max(
-                    len(closure),
-                    authenticated_monthly_source_position_count,
-                )
+                authenticated_monthly_source_position_count
                 if authenticated_monthly_source_position_count is not None
                 else len(closure)
             )
-            if expected_count:
+            population_unverified = bool(
+                monthly_source_position_proof_required
+                and authenticated_monthly_source_position_count is None
+            )
+            if expected_count and not population_unverified:
                 normalized["expected_row_count"] = expected_count
             else:
                 normalized.pop("expected_row_count", None)
             normalized["reason"] = (
-                "account_month_source_position_partial_owner_unresolved"
-                if unresolved_source_positions
-                else "account_month_source_position_closure"
+                "account_month_source_position_population_unverified"
+                if population_unverified
+                else (
+                    "account_month_source_position_population_conflict"
+                    if authenticated_monthly_source_position_count is not None
+                    and len(closure) > authenticated_monthly_source_position_count
+                    else (
+                        str(existing_values["reason"])
+                        if existing_values.get("reason") in (
+                            "account_month_source_localization_invalid",
+                            "account_month_physical_owner_conflict",
+                        )
+                        else "account_month_source_position_partial_owner_unresolved"
+                        if unresolved_source_positions
+                        else "account_month_source_position_closure"
+                    )
+                )
             )
         if target in status_index:
             index = status_index[target]
@@ -6194,6 +6371,11 @@ def project_personal_detail_datasets(
         authenticated_monthly_closure=authenticated_monthly_closure,
         authenticated_monthly_source_position_count=(
             authenticated_monthly_source_position_count
+        ),
+        monthly_source_position_proof_required=(
+            _MONTHLY_POPULATION_GUARD_DATASET in source
+            or _MONTHLY_CLOSURE_PROOF_DATASET in source
+            or _PRINTED_MONTHLY_POPULATION_PROOF_DATASET in source
         ),
     )
     if projected.get("extraction_issues"):

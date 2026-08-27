@@ -768,11 +768,7 @@ def _project_business_columns(
                     not _has_business_value((row.get("normalized") or {}).get(key))
                     for row in rows
                 ),
-                "raw_available": any(
-                    _has_business_value((row.get("canonical_raw") or {}).get(key))
-                    or _has_business_value((row.get("raw") or {}).get(key))
-                    for row in rows
-                ),
+                "raw_available": False,
                 "evidence_available": False,
             }
         )
@@ -816,24 +812,10 @@ def _project_business_dataset(
             if isinstance(page_range, list) and len(page_range) == 2
             else {}
         )
-        canonical_raw = _project_business_raw_pool(
-            dataset_name,
-            row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {},
-            normalized,
-            source_normalized,
-        )
-        raw = _project_business_raw_pool(
-            dataset_name,
-            row.get("raw") if isinstance(row.get("raw"), dict) else {},
-            normalized,
-            source_normalized,
-        )
         rows.append(
             {
                 "record_id": str(row.get("record_id") or ""),
                 "normalized": normalized,
-                "canonical_raw": canonical_raw,
-                "raw": raw,
                 "source": compact_source,
             }
         )
@@ -1101,9 +1083,10 @@ def _clean_public_navigation(payload: dict[str, Any]) -> None:
 
 
 def project_enterprise_community_json(payload: dict[str, Any]) -> dict[str, Any]:
-    """Project rich enterprise semantic datasets to business-only Community JSON."""
+    """Emit normalized-only Community v4; keep raw evidence in semantic artifacts."""
 
     projected = deepcopy(payload)
+    projected.setdefault("schema", {})["version"] = "4.0.0"
     policy = enterprise_public_dataset_policy()
     datasets: list[dict[str, Any]] = []
     for dataset in projected.get("datasets") or []:

@@ -1970,6 +1970,30 @@ def _withhold_independent_plane_conflicts(
     )
 
 
+def _overdue_view_input_basis(payload: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Snapshot only the inputs consumed by the existing derived view."""
+
+    return tuple(
+        tuple(deepcopy({key: row.get(key) for key in keys}) for row in payload.get(dataset) or () if isinstance(row, Mapping))
+        for dataset, keys in (
+            ("credit_accounts", ("account_id", "account_type", "credit_card_type", "account_status", "account_state", "status", "five_tier_class", "overdue_amount", "current_overdue_amount", "source_refs", "confidence")),
+            ("repayment_records", ("account_id", "status", "status_code", "year", "month", "performance_month", "overdue_amount", "status_amount", "source_cell_refs", "confidence")),
+        )
+    )
+
+
+def _refresh_final_overdue_view(payload: dict[str, Any], previous_basis: tuple[Any, ...]) -> None:
+    if _overdue_view_input_basis(payload) == previous_basis:
+        return
+    from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+        derive_candidate_b_overdue_records,
+    )
+
+    payload["overdue_records"] = derive_candidate_b_overdue_records(
+        list(payload.get("credit_accounts") or ()), list(payload.get("repayment_records") or ()),
+    )
+
+
 def _canonical_account_issue_field(field_name: Any) -> str:
     field = str(field_name or "")
     return "account_currency" if field in {"currency", "account_currency"} else field
@@ -3415,6 +3439,7 @@ class CandidateBPipeline:
             source_status_glyph_observations = (
                 repaired_result.status_glyph_observations
             )
+            overdue_input_basis = _overdue_view_input_basis(source_datasets)
             source_datasets = _reconcile_candidate_b_header_lifecycle(
                 self.context,
                 first_datasets,
@@ -3433,15 +3458,20 @@ class CandidateBPipeline:
                 first_profile,
             )
             source_status_glyph_observations = first_status_glyph_observations
+            overdue_input_basis = _overdue_view_input_basis(source_datasets)
 
         # The final correction plane covers every source dataset, including
         # monthly grids and profile/detail tables. It consumes only evidence
         # selected by the document-wide repair coordinator.
+        from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+            apply_planned_monthly_field_repairs,
+        )
+
         corrected_payload = self.context.correct_candidate_b_datasets(
-            {
+            apply_planned_monthly_field_repairs(self.context, {
                 "credit_summary": dict(source_business.get("credit_summary") or {}),
                 **source_datasets,
-            }
+            })
         )
         _enforce_employment_record_contracts(
             self.context,
@@ -3509,9 +3539,13 @@ class CandidateBPipeline:
             ],
             enabled=True,
         )
+        # This view depends on the final status/amount, not on the discovery
+        # pass. Field overlays and final guards may repair or withhold either
+        # input after the lazy derived stage has already run.
+        _refresh_final_overdue_view(corrected_payload, overdue_input_basis)
         all_datasets: dict[str, list[dict[str, Any]]] = {
             name: list(corrected_payload.get(name) or ())
-            for name in source_datasets
+            for name in dict.fromkeys((*source_datasets, "overdue_records"))
         }
         business: dict[str, Any] = {
             name: list(all_datasets.get(name) or ())

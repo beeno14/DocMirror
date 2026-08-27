@@ -18,6 +18,18 @@ from docmirror.plugins.credit_report.personal_brief_native.schema import (
 )
 
 
+def _keys(value: object) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            keys.add(str(key))
+            keys.update(_keys(item))
+    elif isinstance(value, list):
+        for item in value:
+            keys.update(_keys(item))
+    return keys
+
+
 def _column(key: str) -> dict[str, object]:
     return {
         "key": key,
@@ -362,6 +374,8 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
     projected = project_personal_brief_community_json(payload)
 
     assert payload == before
+    assert projected["schema"]["version"] == "4.0.0"
+    assert not {"raw", "canonical_raw"} & _keys(projected)
     validation = validate_projection_payload("community", projected)
     assert validation.valid, validation.errors
 
@@ -418,19 +432,14 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
     for dataset in datasets.values():
         assert not {"reading_columns", "storage_role", "record_path"} & set(dataset)
         for row in dataset["rows"]:
-            assert set(row) == {
-                "record_id",
-                "normalized",
-                "canonical_raw",
-                "raw",
-                "source",
-            }
-            assert row["canonical_raw"] == row["raw"] == row["source"] == {}
+            assert set(row) == {"record_id", "normalized", "source"}
+            assert row["source"] == {}
         assert all(not column["raw_available"] and not column["evidence_available"] for column in dataset["columns"])
 
     sections = {section["id"]: section for section in projected["sections"]}
     assert sections["sec_header"]["items"] == []
     assert [item["key"] for item in sections["sec_non_credit"]["items"]] == ["record_status"]
+    assert "additional_values" not in sections["sec_non_credit"]["items"][0]
     assert "sec_notes" not in sections
     assert "ds_public_records" not in sections["sec_public"]["dataset_refs"]
     public_ids = {dataset["id"] for dataset in datasets.values()}
@@ -442,6 +451,71 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
         range(1, len(projected["reading"]["document_flow"]) + 1)
     )
     assert {item["ref_id"] for item in projected["reading"]["document_flow"] if item["kind"] == "dataset"} == public_ids
+
+
+def test_personal_brief_public_projection_preserves_distinct_section_business_text() -> None:
+    payload = _payload()
+    section = next(section for section in payload["sections"] if section["id"] == "sec_non_credit")
+    section["items"][0]["raw"] = "未记录非信贷交易信息"
+    section["items"].append(
+        {"key": "lookback_years", "label": "统计年限", "value": 5, "raw": "5", "type": "integer"}
+    )
+    before = deepcopy(payload)
+
+    projected = project_personal_brief_community_json(payload)
+
+    assert payload == before
+    items = next(section for section in projected["sections"] if section["id"] == "sec_non_credit")["items"]
+    assert items[0]["value"] == "not_reported"
+    assert items[0]["additional_values"] == ["未记录非信贷交易信息"]
+    assert items[1]["value"] == 5
+    assert "additional_values" not in items[1]
+    assert not {"raw", "canonical_raw"} & _keys(projected)
+    assert validate_projection_payload("community", projected).valid
+    assert project_personal_brief_community_json(projected) == projected
+
+
+@pytest.mark.parametrize("empty", [False, True], ids=["populated", "empty"])
+def test_personal_brief_v4_projection_is_idempotent(empty: bool) -> None:
+    payload = _payload()
+    if empty:
+        payload["datasets"] = []
+        payload["sections"] = []
+
+    projected = project_personal_brief_community_json(payload)
+
+    assert projected["schema"]["version"] == "4.0.0"
+    assert not {"raw", "canonical_raw"} & _keys(projected)
+    assert validate_projection_payload("community", projected).valid
+    assert project_personal_brief_community_json(projected) == projected
+    if empty:
+        assert projected["datasets"] == []
+        assert projected["sections"] == []
+        assert projected["reading"]["tables"] == []
+
+
+@pytest.mark.parametrize("location", ["record_raw", "record_canonical_raw", "section_raw", "group_raw"])
+def test_personal_brief_v4_schema_rejects_reintroduced_source_value_pools(location: str) -> None:
+    projected = project_personal_brief_community_json(_payload())
+    if location.startswith("record_"):
+        target = projected["datasets"][0]["rows"][0]
+        key = location.removeprefix("record_")
+        value = {}
+    else:
+        section = next(section for section in projected["sections"] if section["id"] == "sec_non_credit")
+        target = section["items"][0]
+        if location == "group_raw":
+            target = deepcopy(target)
+            section["groups"] = [{"key": "status", "label": "记录状态", "items": [target]}]
+        key = "raw"
+        value = "not_reported"
+
+    assert validate_projection_payload("community", projected).valid
+    target[key] = value
+
+    validation = validate_projection_payload("community", projected)
+    assert not validation.valid
+    assert validation.errors
 
 
 def test_personal_brief_public_projection_rejects_unclassified_content() -> None:
@@ -494,10 +568,13 @@ def test_personal_brief_artifact_projection_leaves_rich_semantic_untouched() -> 
         ],
     }
     before = deepcopy(semantic)
+    public_before = deepcopy(projected)
 
     artifact = project_personal_brief_artifact_semantic(semantic, projected)
 
     assert semantic == before
+    assert projected == public_before
+    assert not {"raw", "canonical_raw"} & _keys(projected)
     assert [dataset["name"] for dataset in artifact["datasets"]] == [
         dataset["name"] for dataset in projected["datasets"]
     ]
@@ -506,12 +583,14 @@ def test_personal_brief_artifact_projection_leaves_rich_semantic_untouched() -> 
     assert set(artifact["datasets"][0]["rows"][0]["canonical_raw"]) == set(
         artifact["datasets"][0]["rows"][0]["normalized"]
     )
+    assert artifact["datasets"][0]["rows"][0]["raw"] == artifact["datasets"][0]["rows"][0]["canonical_raw"]
     assert semantic["datasets"][0]["rows"][0]["source"]["source_refs"]
     assert artifact["structure"]["blocks"] == [{"id": "b1"}]
     assert artifact["structure"]["sections"] == projected["sections"]
     artifact_account = next(dataset for dataset in artifact["datasets"] if dataset["name"] == "credit_accounts")
     assert "used_amount" not in artifact_account["rows"][0]["normalized"]
     assert artifact_account["rows"][0]["canonical_raw"]["used_amount"] == "not-a-number"
+    assert artifact_account["rows"][0]["raw"]["used_amount"] == "not-a-number"
     assert {binding["dataset_id"] for binding in artifact["bindings"]} == {
         "ds_personal_report_metadata"
     }

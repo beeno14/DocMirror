@@ -405,6 +405,9 @@ def test_yang_month_conflict_guard_and_public_projection_are_exactly_local(
         "native_numeric_witnesses_rejected_for_nonpositive_amount": 1,
         "agreements": 0,
         "conflicts_withheld": 1,
+        "low_source_ocr_confidence_withheld": 0,
+        "independent_monthly_field_confirmations": 0,
+        "preserved_source_plane_conflicts": 0,
     }
     assert issue_target_ids == {"mg_p13_repayment_1:2019-08"}
 

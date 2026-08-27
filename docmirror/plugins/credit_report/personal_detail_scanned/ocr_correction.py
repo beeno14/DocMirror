@@ -37,6 +37,11 @@ from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence impo
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _canonical_nonmobile_phone,
 )
+from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+    _MonthlySourceEvidence,
+    monthly_field_slot_identity,
+    resolve_sealed_monthly_field_slot,
+)
 
 _DATE_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
 _DATE_LOOSE_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[.,/-]?(\d{2})[.,/-](\d{2})(?!\d)")
@@ -1352,6 +1357,7 @@ def _exact_repair_target_ref(
     if field_name is not None and not _field_name_matches_role(field_name, role):
         return None
     for item in refs:
+        monthly_owner = monthly_field_slot_identity(item)
         logical_page = item.get("logical_page") or item.get("page")
         source_page = item.get("source_page")
         bound_field_name = str(item.get("field_name") or "").strip()
@@ -1372,6 +1378,7 @@ def _exact_repair_target_ref(
             or (
                 _strict_repair_evidence_ids(item.get("evidence_ids")) is None
                 and _exact_blank_account_currency_slot_identity(item) is None
+                and monthly_owner is None
             )
             or _target_page_reocr_acquisitions(item) is None
             or (
@@ -1387,6 +1394,10 @@ def _exact_repair_target_ref(
             )
             or any(bound_role != role for bound_role in bound_roles)
             or (
+                monthly_owner is not None
+                and role != ("repayment_status" if item.get("field_name") in {"status", "status_code"} else "amount")
+            )
+            or (
                 item.get("geometry_scope") != "cell"
                 and item.get("binding") != "canonical_field_slot"
             )
@@ -1399,6 +1410,9 @@ def _exact_repair_target_ref(
 def _exact_repair_owner(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
     """Return the immutable table-cell owner shared with a planned repair."""
 
+    monthly_owner = monthly_field_slot_identity(ref)
+    if monthly_owner is not None:
+        return monthly_owner
     blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
     if blank_currency_owner is not None:
         return blank_currency_owner
@@ -1474,6 +1488,7 @@ class PersonalDetailOCRCorrectionOverlay:
         self._audited_cells: set[tuple[str, str, str, str]] = set()
         self._cell_anomalies: list[PersonalDetailCellAnomaly] = []
         self._cell_anomaly_keys: set[tuple[str, str, str, str, str]] = set()
+        self._monthly_source_evidence: _MonthlySourceEvidence | None = None
 
     @property
     def decisions(self) -> tuple[PersonalDetailCorrectionDecision, ...]:
@@ -1487,6 +1502,7 @@ class PersonalDetailOCRCorrectionOverlay:
             "decision_count": len(self._decisions),
             "applied_count": counts.get("applied", 0),
             "suggested_count": counts.get("suggested", 0),
+            "confirmed_count": counts.get("confirmed", 0),
             "repair_evidence_page_count": len(self._repair_evidence_by_page),
             "repair_evidence_target_count": (
                 None
@@ -1662,6 +1678,7 @@ class PersonalDetailOCRCorrectionOverlay:
         *,
         repair: Any,
         source_refs: Iterable[dict[str, Any]],
+        confirmation_value: str | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision | None]:
         """Apply one coordinator-approved directive to its exact field only."""
 
@@ -1684,6 +1701,11 @@ class PersonalDetailOCRCorrectionOverlay:
             or planned_ref is None
             or _exact_repair_owner(ref) is None
             or _exact_repair_owner(ref) != _exact_repair_owner(planned_ref)
+        ):
+            return original, None
+        if confirmation_value is not None and (
+            monthly_field_slot_identity(ref) is None or mode != "context_rich_reocr"
+            or not _is_valid_for_role(confirmation_value, role)
         ):
             return original, None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
@@ -1730,7 +1752,10 @@ class PersonalDetailOCRCorrectionOverlay:
         published_original = str(
             getattr(repair, "published_value", "") or ""
         )
-        allow_equal_candidate = published_original != original
+        allow_equal_candidate = confirmation_value is not None or published_original != original or (
+            monthly_field_slot_identity(ref) is not None
+            and "low_source_ocr_confidence" in tuple(getattr(repair, "reason_codes", ()) or ())
+        )
         repaired = self._repair_from_installed_page_evidence(
             original,
             role=role,
@@ -1741,8 +1766,10 @@ class PersonalDetailOCRCorrectionOverlay:
             # only when the schema had withheld or published another value.
             allow_equal_candidate=allow_equal_candidate,
             decision_original=(
-                published_original if allow_equal_candidate else None
+                confirmation_value if confirmation_value is not None
+                else published_original if allow_equal_candidate else None
             ),
+            required_candidate_value=confirmation_value,
         )
         return repaired if repaired is not None else (original, None)
 
@@ -1754,6 +1781,16 @@ class PersonalDetailOCRCorrectionOverlay:
     ) -> tuple[bool, bool]:
         """Return ``(admissible, resolved)`` for one immutable target cell."""
 
+        monthly_owner = monthly_field_slot_identity(ref)
+        if monthly_owner is not None:
+            if self._monthly_source_evidence is None:
+                self._monthly_source_evidence = _MonthlySourceEvidence(self.parse_result)
+            resolved = resolve_sealed_monthly_field_slot(
+                self.parse_result, ref, evidence=self._monthly_source_evidence,
+            )
+            return (resolved is not None, resolved is not None)
+        if ref.get("source") == "sealed_native_monthly_field_slot":
+            return False, False
         if not _sealed_evidence_store_available(self.parse_result):
             return True, False
         target = _exact_repair_bbox(ref.get("bbox"))
@@ -1799,6 +1836,7 @@ class PersonalDetailOCRCorrectionOverlay:
         refs: tuple[dict[str, Any], ...],
         allow_equal_candidate: bool = False,
         decision_original: str | None = None,
+        required_candidate_value: str | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
         if ref is None:
@@ -1833,6 +1871,7 @@ class PersonalDetailOCRCorrectionOverlay:
             sealed_target_resolved=sealed_target_resolved,
             allow_equal_candidate=allow_equal_candidate,
             decision_original=decision_original,
+            required_candidate_value=required_candidate_value,
         )
 
     def _repair_from_page_evidence(
@@ -1847,6 +1886,7 @@ class PersonalDetailOCRCorrectionOverlay:
         sealed_target_resolved: bool,
         allow_equal_candidate: bool = False,
         decision_original: str | None = None,
+        required_candidate_value: str | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         """Select a typed value from already-acquired complete-page evidence."""
         selection = self._select_page_evidence_candidate(
@@ -1858,10 +1898,20 @@ class PersonalDetailOCRCorrectionOverlay:
         if selection is None:
             return None
         selected = str(selection["normalized"])
+        if required_candidate_value is not None and selected != required_candidate_value:
+            # A reconstruction may already contain the approved reading. It
+            # can be confirmed, but never overwritten under that exception.
+            # Reject before recording any applied/confirmed decision.
+            return None
         if selected == original and not allow_equal_candidate:
             # Page evidence that merely repeats the installed value is not a
             # repair.  Recording it as ``applied`` makes the correction ledger
             # claim a mutation that never occurred.
+            return None
+        if (
+            monthly_field_slot_identity(ref) is not None
+            and self._repair_allowed_field_targets is None
+        ):
             return None
         if (
             role == "liability_related_party_name"
@@ -1876,6 +1926,10 @@ class PersonalDetailOCRCorrectionOverlay:
             return None
         if field_name is not None:
             selected_ref = {**selected_ref, "field_name": field_name}
+        confirmation_only = bool(
+            monthly_field_slot_identity(ref) is not None
+            and selected == (decision_original if decision_original is not None else original)
+        )
         return selected, self._record(
             role=role,
             original=(
@@ -1884,7 +1938,7 @@ class PersonalDetailOCRCorrectionOverlay:
                 else original
             ),
             corrected=selected,
-            method="schema_bound_page_evidence_reparse",
+            method="schema_bound_monthly_confidence_confirmation" if confirmation_only else "schema_bound_page_evidence_reparse",
             reason_codes=(
                 "business_uncertainty_trigger",
                 "schema_role_validation",
@@ -1896,7 +1950,43 @@ class PersonalDetailOCRCorrectionOverlay:
             candidates=tuple(selection["candidates"]),
             selected_raw=str(selection["raw"]),
             selected_acquisition=str(selection["acquisition"]),
+            action="confirmed" if confirmation_only else "applied",
         )
+
+    def monthly_field_confirmation(
+        self, ref: Mapping[str, Any], *, value: str,
+    ) -> PersonalDetailCorrectionDecision | None:
+        """Return only a live, approved, independently revalidated slot repair."""
+
+        owner = monthly_field_slot_identity(ref)
+        if owner is None or self._repair_allowed_field_targets is None:
+            return None
+        matching = [
+            decision for decision in self._decisions
+            if decision.action in {"applied", "confirmed"}
+            and decision.corrected == value and decision.selected_acquisition
+            and decision.source_refs and monthly_field_slot_identity(decision.source_refs[0]) == owner
+        ]
+        if len(matching) != 1:
+            return None
+        decision = matching[0]
+        original_ref = decision.source_refs[0]
+        if _exact_repair_target_identity(original_ref) not in self._repair_allowed_field_targets:
+            return None
+        admissible, resolved = self._sealed_target_resolution(original_ref, logical_page=original_ref["logical_page"])
+        page = self._repair_evidence_by_page.get(original_ref["logical_page"])
+        if not admissible or page is None:
+            return None
+        selection = self._select_page_evidence_candidate(
+            role=decision.role, ref=original_ref, page=page, sealed_target_resolved=resolved,
+        )
+        if (
+            selection is None or selection["normalized"] != value
+            or selection["acquisition"] != decision.selected_acquisition
+            or tuple(selection["evidence_ids"]) != tuple(decision.source_refs[-1].get("evidence_ids") or ())
+        ):
+            return None
+        return decision
 
     @staticmethod
     def _select_page_evidence_candidate(
@@ -1910,9 +2000,12 @@ class PersonalDetailOCRCorrectionOverlay:
 
         target = _exact_repair_bbox(ref.get("bbox"))
         blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
+        monthly_owner = monthly_field_slot_identity(ref)
         target_evidence_ids = (
             ()
             if blank_currency_owner is not None
+            else tuple(ref["evidence_ids"])
+            if monthly_owner is not None
             else _strict_repair_evidence_ids(ref.get("evidence_ids"))
         )
         logical_page = page.get("page")

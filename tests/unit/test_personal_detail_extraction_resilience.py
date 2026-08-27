@@ -1286,14 +1286,75 @@ def test_source_ledger_treats_spaced_duplicate_sequence_digits_as_one_number() -
 
 
 def test_inquiry_source_ledger_counts_withheld_rows_and_headerless_continuations() -> None:
-    _institutional = _table(
+    # Simulated printed tables retain the same registered cell lattice and
+    # section ownership supplied by canonical layout in the live pipeline.
+    institutional = _exact_table(
         "institutional-1",
         [
             ["编号", "查询日期", "查询机构", "查询原因"],
             ["1", "2024.01.03", "示例银行", "贷款审批"],
             ["3", "", "", ""],
         ],
+        canonical_template_id="annotations_and_inquiries",
     )
+    continuation = _exact_table(
+        "institutional-2",
+        [["4", "2024.01.01", "另一银行", "贷后管理"]],
+        canonical_template_id="annotations_and_inquiries",
+    )
+    personal = _exact_table(
+        "personal",
+        [
+            ["编号", "查询日期", "查询机构", "查询原因"],
+            ["1", "2023.12.03", "本人", "本人查询"],
+            ["2", "", "", ""],
+        ],
+        canonical_template_id="annotations_and_inquiries",
+    )
+    pages = [
+        SimpleNamespace(
+            page_number=20,
+            source_page_number=10,
+            canonical_template_id="annotations_and_inquiries",
+            tables=[institutional],
+        ),
+        SimpleNamespace(
+            page_number=21,
+            source_page_number=11,
+            canonical_template_id="annotations_and_inquiries",
+            tables=[continuation],
+        ),
+        SimpleNamespace(
+            page_number=22,
+            source_page_number=12,
+            canonical_template_id="annotations_and_inquiries",
+            tables=[personal],
+        ),
+    ]
+    result = SimpleNamespace(
+        pages=pages,
+        corrected_evidence_pages=lambda: [],
+        reading_order_by_logical={20: 1, 21: 2, 22: 3},
+        reading_order_resolution={
+            "status": "resolved",
+            "resolved": True,
+            "authoritative": True,
+        },
+    )
+
+    ledger = _source_completeness_ledger(result)
+
+    assert ledger["inquiry_records"] == 6
+    assert ledger["inquiry_sequence_endpoints"] == {"institution": 4, "personal": 2}
+    assert ledger["inquiry_observed_sequences"] == {
+        "institution": [1, 3, 4],
+        "personal": [1, 2],
+    }
+    assert {ref["logical_page"] for ref in ledger["source_refs"]["inquiry_records"]} == {
+        20,
+        21,
+        22,
+    }
 
 
 def _complete_liability_table(
@@ -1326,53 +1387,6 @@ def _complete_liability_table(
         rows=[],
         bbox=[20, top, 570, top + len(rows) * 24],
     )
-    continuation = _table(
-        "institutional-2",
-        [["4", "2024.01.01", "另一银行", "贷后管理"]],
-    )
-    personal = _table(
-        "personal",
-        [
-            ["编号", "查询日期", "查询机构", "查询原因"],
-            ["1", "2023.12.03", "本人", "本人查询"],
-            ["2", "", "", ""],
-        ],
-    )
-    pages = [
-        SimpleNamespace(
-            page_number=20,
-            source_page_number=10,
-            canonical_template_id="annotations_and_inquiries",
-            tables=[institutional],
-        ),
-        SimpleNamespace(
-            page_number=21,
-            source_page_number=11,
-            canonical_template_id="annotations_and_inquiries",
-            tables=[continuation],
-        ),
-        SimpleNamespace(
-            page_number=22,
-            source_page_number=12,
-            canonical_template_id="annotations_and_inquiries",
-            tables=[personal],
-        ),
-    ]
-    result = SimpleNamespace(pages=pages, corrected_evidence_pages=lambda: [])
-
-    ledger = _source_completeness_ledger(result)
-
-    assert ledger["inquiry_records"] == 6
-    assert ledger["inquiry_sequence_endpoints"] == {"institution": 4, "personal": 2}
-    assert ledger["inquiry_observed_sequences"] == {
-        "institution": [1, 3, 4],
-        "personal": [1, 2],
-    }
-    assert {ref["logical_page"] for ref in ledger["source_refs"]["inquiry_records"]} == {
-        20,
-        21,
-        22,
-    }
 
 
 def test_inquiry_endpoint_trusts_sparse_exact_ordinals_but_rejects_proven_prefix_bleed() -> None:

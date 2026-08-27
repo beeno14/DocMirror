@@ -23,6 +23,7 @@ _REPAYMENT_RANGE_SEPARATORS = frozenset({"", "-", "—", "–", "－", "至", "�
 _PERFORMANCE_MONTH_RE = re.compile(r"((?:19|20)\d{2})-(0[1-9]|1[0-2])\Z")
 _OWNED_GRID_MONTHLY_OMISSION_CODE = "candidate_b_monthly_owned_grid_missing_field"
 _OWNED_GRID_MONTHLY_REF_SOURCE = "candidate_b_monthly_owned_grid_cell"
+_PRINTED_GRID_CENSUS_ISSUE_CODE = "candidate_b_printed_month_grid_inventory"
 _OWNED_GRID_MONTHLY_INPUT_SOURCES = frozenset(
     {"native_detail_table_cell", "sealed_native_physical_table_cell"}
 )
@@ -36,6 +37,173 @@ _OWNED_GRID_MONTHLY_INPUT_BINDINGS = frozenset(
         "source_monthly_field_cell",
     }
 )
+
+
+def _validated_printed_anchor_provenance(value: Any) -> dict[str, Any] | None:
+    """Read the sealed raw-anchor contract, never infer it from cell geometry."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "coordinate_system", "coordinate_plane", "source_logical_page",
+        "source_page", "evidence_ids", "bbox", "date_range",
+    }:
+        return None
+    if (
+        value.get("coordinate_system") != "pdf_points_top_left"
+        or value.get("coordinate_plane") != "raw_logical_page"
+        or any(type(value.get(key)) is not int or value[key] <= 0
+               for key in ("source_logical_page", "source_page"))
+    ):
+        return None
+    evidence_ids = value.get("evidence_ids")
+    bbox = value.get("bbox")
+    date_range = value.get("date_range")
+    if not (
+        isinstance(evidence_ids, (list, tuple)) and evidence_ids
+        and all(isinstance(item, str) and item and item == item.strip()
+                for item in evidence_ids)
+        and len(set(evidence_ids)) == len(evidence_ids)
+        and isinstance(bbox, (list, tuple)) and len(bbox) == 4
+        and all(type(item) in (int, float) and math.isfinite(float(item)) for item in bbox)
+        and bbox[2] > bbox[0] and bbox[3] > bbox[1]
+        and isinstance(date_range, (list, tuple)) and len(date_range) == 4
+        and all(type(item) is int for item in date_range)
+    ):
+        return None
+    start_year, start_month, end_year, end_month = date_range
+    if not (
+        1900 <= start_year <= end_year <= 9999
+        and 1 <= start_month <= 12 and 1 <= end_month <= 12
+        and (start_year, start_month) <= (end_year, end_month)
+    ):
+        return None
+    return {
+        "coordinate_system": "pdf_points_top_left",
+        "coordinate_plane": "raw_logical_page",
+        "source_logical_page": value["source_logical_page"],
+        "source_page": value["source_page"],
+        "evidence_ids": sorted(evidence_ids),
+        "bbox": [float(item) for item in bbox],
+        "date_range": list(date_range),
+    }
+
+
+def _printed_anchor_identity_key(provenance: Mapping[str, Any]) -> tuple[Any, ...]:
+    return (
+        provenance["source_page"], provenance["source_logical_page"],
+        tuple(provenance["evidence_ids"]), tuple(provenance["bbox"]),
+        tuple(provenance["date_range"]),
+    )
+
+
+def _printed_grid_census_source_refs(entries: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Carry the complete sealed anchor plane alongside the signed census data."""
+    refs: list[dict[str, Any]] = []
+    for entry in entries:
+        provenance = _validated_printed_anchor_provenance(
+            entry.get("printed_anchor_provenance")
+        )
+        if provenance is None:
+            continue
+        refs.append({
+            "source": "sealed_printed_monthly_anchor",
+            "source_grid_plane": entry.get("plane"),
+            "grid_id": entry.get("grid_id"),
+            "logical_page": provenance["source_logical_page"],
+            "source_page": provenance["source_page"],
+            "coordinate_system": provenance["coordinate_system"],
+            "coordinate_plane": provenance["coordinate_plane"],
+            "bbox": list(provenance["bbox"]),
+            "evidence_ids": list(provenance["evidence_ids"]),
+            "printed_month_range": list(provenance["date_range"]),
+        })
+    return refs
+
+
+def _printed_anchor_inventory_source_refs(anchors: Iterable[Any]) -> list[dict[str, Any]]:
+    refs = _printed_grid_census_source_refs(
+        {"plane": "inventory", "grid_id": None, "printed_anchor_provenance": anchor}
+        for anchor in anchors
+    )
+    for ref in refs:
+        ref["source"] = "sealed_printed_monthly_range_inventory"
+        ref.pop("grid_id")
+    return refs
+
+
+def _validated_printed_anchor_inventory_issue(issue: Any) -> dict[str, Any] | None:
+    """Authenticate persisted census identity and its complete raw anchor plane."""
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import make_issue
+
+    if not isinstance(issue, Mapping):
+        return None
+    normalized = issue.get("normalized")
+    values = normalized if isinstance(normalized, Mapping) else issue
+    observed = values.get("observed_value")
+    reasons = values.get("reason_codes")
+    if not (
+        values.get("issue_code") == _PRINTED_GRID_CENSUS_ISSUE_CODE
+        and values.get("category") == "schema_incompleteness"
+        and values.get("parser_stage") == "candidate_b_relationship_schema"
+        and values.get("target_dataset") == "repayment_records"
+        and values.get("target_record_id") == "printed_month_grid_inventory:1"
+        and values.get("field_name") in (None, "")
+        and values.get("status") in ("informational", "requires_review")
+        and values.get("severity") in ("info", "warning")
+        and values.get("candidate_value") == {"resolution": "source_population_audit_only"}
+        and isinstance(reasons, (list, tuple)) and len(reasons) == 3
+        and all(isinstance(reason, str) for reason in reasons)
+        and set(reasons) == {"sealed_printed_anchor_identity", "separate_canonical_and_detached_detector_namespaces", "business_cell_values_not_used"}
+        and isinstance(observed, Mapping)
+        and set(observed) == {"anchors", "anchor_inventory_complete", "grids"}
+        and type(observed.get("anchor_inventory_complete")) is bool
+        and isinstance(observed.get("anchors"), list)
+        and isinstance(observed.get("grids"), list)
+        and all(isinstance(entry, Mapping) for entry in observed["grids"])
+    ):
+        return None
+    expected_id = make_issue(
+        category="schema_incompleteness", issue_code=_PRINTED_GRID_CENSUS_ISSUE_CODE,
+        message="", target_dataset="repayment_records",
+        target_record_id="printed_month_grid_inventory:1", observed_value=observed,
+    )["extraction_issue_id"]
+    record_ids = [owner["record_id"] for owner in (values, issue) if "record_id" in owner]
+    if (
+        values.get("extraction_issue_id") != expected_id
+        or ("extraction_issue_id" in issue and issue["extraction_issue_id"] != expected_id)
+        or not record_ids or any(record_id != expected_id for record_id in record_ids)
+    ):
+        return None
+    anchors: list[dict[str, Any]] = []
+    anchor_keys: set[tuple[Any, ...]] = set()
+    anchor_by_atom: dict[tuple[int, int, str], tuple[Any, ...]] = {}
+    for value in observed["anchors"]:
+        anchor = _validated_printed_anchor_provenance(value)
+        if anchor is None:
+            return None
+        key = _printed_anchor_identity_key(anchor)
+        if key in anchor_keys:
+            return None
+        for evidence_id in anchor["evidence_ids"]:
+            atom = (anchor["source_page"], anchor["source_logical_page"], evidence_id)
+            if anchor_by_atom.setdefault(atom, key) != key:
+                return None
+        anchors.append(anchor)
+        anchor_keys.add(key)
+    expected_refs = [
+        *_printed_anchor_inventory_source_refs(anchors),
+        *_printed_grid_census_source_refs(observed["grids"]),
+    ]
+    owners = (issue, values, issue.get("source"))
+    containers = [owner["source_refs"] for owner in owners if isinstance(owner, Mapping) and "source_refs" in owner]
+    if expected_refs:
+        if not containers or any(not isinstance(refs, (list, tuple)) or list(refs) != expected_refs for refs in containers):
+            return None
+    elif any(refs not in ([], ()) for refs in containers):
+        return None
+    return {
+        "anchors": anchors, "anchor_keys": anchor_keys,
+        "complete": observed["anchor_inventory_complete"],
+        "grids": observed["grids"], "issue_id": expected_id,
+    }
 
 
 def _geometry_box(value: Any) -> list[float] | None:
@@ -761,6 +929,11 @@ def _localized_monthly_source_refs(
     refs: list[dict[str, Any]] = []
     fallback_refs: list[dict[str, Any]] = []
     for record in records:
+        # A month column is not a calendar identity.  Detached grids commonly
+        # contain the same column in several years; do not retarget every
+        # January (or a reused detector ID) into the requested observation.
+        if _candidate_b_monthly_observed_position(record) != (grid_id, year, month):
+            continue
         for raw_ref in record.get("source_cell_refs") or ():
             if not isinstance(raw_ref, Mapping):
                 continue
@@ -1285,6 +1458,7 @@ def _report_reconciled_monthly_source_alias(
     source_records: Iterable[Mapping[str, Any]],
     grid: Mapping[str, Any] | None,
     linkage_basis: str,
+    source_plane: str | None = None,
 ) -> None:
     """Keep one source-position alias visible without double-counting it.
 
@@ -1350,7 +1524,8 @@ def _report_reconciled_monthly_source_alias(
                 "account_month_owner_basis": linkage_basis or None,
             },
             candidate_value={
-                "resolution": "reconciled_to_existing_account_month_identity"
+                "resolution": "reconciled_to_existing_account_month_identity",
+                **({"source_grid_plane": source_plane} if source_plane is not None else {}),
             },
             source_refs=localized_refs,
             reason_codes=(
@@ -1787,6 +1962,14 @@ def link_candidate_b_repayments(
         )
         if isinstance(record, dict)
     ]
+    printed_grid_census_required = bool(
+        getattr(issue_context, "_candidate_b_printed_grid_census_required", False) is True
+        or any(
+            isinstance(grid.get("audit"), Mapping)
+            and "printed_anchor_provenance" in grid["audit"]
+            for grid in (*grids.values(), *source_structure_grids.values())
+        )
+    )
     valid_ids: set[str] = set()
     account_segments: dict[str, list[tuple[int, float, float | None]]] = {}
     fallback_anchors_by_page: dict[int, list[tuple[float, str]]] = {}
@@ -2764,6 +2947,7 @@ def link_candidate_b_repayments(
             source_records: Iterable[Mapping[str, Any]],
             grid: Mapping[str, Any] | None,
             linkage_basis: str,
+            source_plane: str = "canonical",
         ) -> None:
             """Register one exact source position under its canonical identity."""
 
@@ -2777,6 +2961,7 @@ def link_candidate_b_repayments(
                     "source_records": list(source_records),
                     "grid": grid,
                     "linkage_basis": linkage_basis,
+                    "source_plane": source_plane,
                 },
             )
 
@@ -3030,6 +3215,7 @@ def link_candidate_b_repayments(
                     source_records=records,
                     grid=grid,
                     linkage_basis=linkage_basis,
+                    source_plane="detached",
                 )
             proven_missing_months = {
                 (year, month)
@@ -3199,6 +3385,111 @@ def link_candidate_b_repayments(
                     anchor=anchor,
                     missing_months=missing_anchor_months,
                 )
+        if printed_grid_census_required:
+            anchor_inventory = getattr(issue_context, "_candidate_b_printed_anchor_inventory", None)
+            anchor_inventory_complete = getattr(
+                issue_context, "_candidate_b_printed_anchor_inventory_complete", None,
+            )
+            census_entries: list[dict[str, Any]] = []
+            for plane, plane_grids, plane_records, duplicate_ids in (
+                ("canonical", grids, source_candidates_by_grid, duplicate_grid_ids),
+                ("detached", source_structure_grids, source_structure_records_by_grid,
+                 duplicate_source_structure_grid_ids),
+            ):
+                for grid_id, grid in sorted(plane_grids.items()):
+                    records = plane_records.get(grid_id, [])
+                    positions_for_grid = [
+                        _candidate_b_monthly_observed_position(record) for record in records
+                    ]
+                    observed_months = {
+                        (position[1], position[2])
+                        for position in positions_for_grid
+                        if position is not None and position[0] == grid_id
+                    }
+                    if plane == "canonical":
+                        grid_owner, owner_basis = owner_by_grid.get(grid_id, (None, ""))
+                    else:
+                        grid_owner, owner_basis = exact_segment_owner(
+                            grid_id, grid, duplicate_ids=duplicate_ids,
+                        )
+                    owner_id = str((grid_owner or {}).get("account_id") or "").strip()
+                    owner_proven = bool(
+                        owner_id and _grid_months(grid) and all(
+                            _account_month_identity_proof(
+                                grid_owner, grid, linkage_basis=owner_basis,
+                                year=year, month=month,
+                            ) is not None
+                            for year, month in _grid_months(grid)
+                        )
+                    )
+                    audit = grid.get("audit")
+                    audit = audit if isinstance(audit, Mapping) else {}
+                    census_entries.append({
+                        "plane": plane,
+                        "grid_id": grid_id,
+                        "printed_anchor_provenance": audit.get("printed_anchor_provenance"),
+                        "observed_months": sorted(
+                            f"{year:04d}-{month:02d}" for year, month in observed_months
+                        ),
+                        "printed_months": sorted(
+                            f"{year:04d}-{month:02d}" for year, month in _grid_months(grid)
+                        ),
+                        "invalid_record_count": sum(
+                            position is None or position[0] != grid_id
+                            for position in positions_for_grid
+                        ),
+                        "duplicate_grid_id": grid_id in duplicate_ids,
+                        "account_id": owner_id if owner_proven else None,
+                        "account_month_owner_basis": owner_basis if owner_proven else None,
+                    })
+            census_issue = make_issue(
+                category="schema_incompleteness",
+                issue_code=_PRINTED_GRID_CENSUS_ISSUE_CODE,
+                message=(
+                    "A value-inert census preserves each sealed printed repayment anchor "
+                    "and its observed monthly positions across canonical and detached planes."
+                ),
+                severity="info",
+                status="informational",
+                parser_stage="candidate_b_relationship_schema",
+                target_dataset="repayment_records",
+                target_record_id="printed_month_grid_inventory:1",
+                observed_value={
+                    "anchors": anchor_inventory,
+                    "anchor_inventory_complete": anchor_inventory_complete,
+                    "grids": census_entries,
+                },
+                candidate_value={"resolution": "source_population_audit_only"},
+                source_refs=[
+                    *_printed_anchor_inventory_source_refs(
+                        anchor_inventory if isinstance(anchor_inventory, list) else ()
+                    ),
+                    *_printed_grid_census_source_refs(census_entries),
+                ],
+                reason_codes=(
+                    "sealed_printed_anchor_identity",
+                    "separate_canonical_and_detached_detector_namespaces",
+                    "business_cell_values_not_used",
+                ),
+            )
+            existing_census = None
+            for issue in getattr(issue_context, "_personal_detail_extraction_issues", ()):
+                if not (
+                    isinstance(issue, dict)
+                    and issue.get("issue_code") == _PRINTED_GRID_CENSUS_ISSUE_CODE
+                    and issue.get("parser_stage") == "candidate_b_relationship_schema"
+                    and issue.get("target_record_id") == "printed_month_grid_inventory:1"
+                ):
+                    continue
+                if issue.get("extraction_issue_id") == census_issue["extraction_issue_id"]:
+                    existing_census = issue
+                else:
+                    issue["status"] = "resolved"
+            if existing_census is not None:
+                existing_census.update(census_issue)
+            else:
+                record_issue(issue_context, census_issue)
+
         for identity, source_positions in bound_source_positions.items():
             if len(source_positions) <= 1:
                 continue
@@ -3227,6 +3518,7 @@ def link_candidate_b_repayments(
                     source_records=payload["source_records"],
                     grid=payload["grid"],
                     linkage_basis=payload["linkage_basis"],
+                    source_plane=(payload["source_plane"] if printed_grid_census_required else None),
                 )
     return output
 

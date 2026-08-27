@@ -29,6 +29,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.schema import (
     PBOC_DATASET_ORDER,
     personal_detail_data_dictionary,
 )
+from scripts.personal_detail_audit_input import write_sealed_audit_input
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 
@@ -1625,6 +1626,49 @@ def _assert_lin_august_2022_status_oracle(community: dict) -> None:
     )
 
 
+def _assert_lin_low_confidence_legal_status_oracle(community: dict) -> None:
+    """Printed p19 July-2019 and September-2021 are N, never a silent OCR M.
+
+    The July zero amount is independently source-vetted. An unresolved glyph
+    may remain explicitly null, but must retain the row, its sibling amount,
+    and a field-local source-page issue; merely labelling a wrong M for review
+    does not make the published value correct.
+    """
+
+    datasets = _dataset_map(community)
+    accepted_issue_codes = {
+        "candidate_b_native_source_cell_repayment_status_conflict",
+        "candidate_b_monthly_source_ocr_confidence_unresolved",
+    }
+    for record_id in ("mg_p19_repayment_0:2019-07", "mg_p19_repayment_0:2021-09"):
+        rows = _monthly_wrappers_for_record(community, record_id)
+        assert len(rows) == 1, f"{record_id}: the affected monthly row must be retained exactly once"
+        _assert_monthly_status_value_or_reported(community, record_id, "N")
+        values = rows[0].get("normalized") or {}
+        if values.get("status_code") is None:
+            assert (rows[0].get("review") or {}).get("status") == "requires_review"
+            localized_issues = [
+                wrapper
+                for wrapper in datasets["extraction_issues"].get("rows") or []
+                if (issue := wrapper.get("normalized") or {}).get("target_record_id") == record_id
+                and issue.get("target_dataset") == "credit_account_monthly_performance"
+                and issue.get("field_name") == "status_code"
+                and issue.get("issue_code") in accepted_issue_codes
+                and str(issue.get("status") or "requires_review")
+                not in {"resolved", "suppressed_redundant", "informational"}
+                and (wrapper.get("source") or {}).get("page_range") == [19, 19]
+            ]
+            assert localized_issues, f"{record_id}: null status lacks an exact p19 repair/conflict issue"
+        if record_id.endswith(":2019-07"):
+            assert _decimal_amount(values.get("status_amount")) == Decimal(0), (
+                f"{record_id}: status uncertainty must not erase the independently proved zero"
+            )
+        elif values.get("status_amount") is None:
+            assert _active_monthly_field_issues(community, record_id, "status_amount"), (
+                f"{record_id}: a missing amount needs its own field issue"
+            )
+
+
 def _assert_lin_p20_continuation_month_binding_oracle(community: dict) -> None:
     """Keep p20 continuation glyphs bound to their physical August/September cells."""
 
@@ -2365,6 +2409,10 @@ def test_personal_detail_ocr_correction_invariants(
 ) -> None:
     """Exercise source correction and the schema boundary on every private report."""
     sealed = _perceive(fixture)
+    if os.environ.get("DOCMIRROR_PERSONAL_DETAIL_SAVE_SEALED_INPUT") == "1":
+        input_audit_dir = os.environ.get("DOCMIRROR_PERSONAL_DETAIL_AUDIT_DIR")
+        assert input_audit_dir, "sealed input capture requires an explicit private audit directory"
+        write_sealed_audit_input(sealed, fixture, Path(input_audit_dir))
     result = sealed.to_read_view()
     context = build_personal_detail_extraction_context(result)
     domain_specific = result.entities.domain_specific
@@ -2727,6 +2775,15 @@ def test_personal_detail_ocr_correction_invariants(
         and str(row.get("status") or "requires_review")
         not in {"resolved", "suppressed_redundant", "informational"}
     }
+    active_source_confidence_ids = {
+        str(row.get("target_record_id") or "")
+        for row in issue_rows
+        if row.get("target_dataset") == "credit_account_monthly_performance"
+        and row.get("field_name") == "status_code"
+        and row.get("issue_code") == "candidate_b_monthly_source_ocr_confidence_unresolved"
+        and str(row.get("status") or "requires_review")
+        not in {"resolved", "suppressed_redundant", "informational"}
+    }
     canonical_monthly_status_values = {
         "*", "/", "#", "N", "1", "2", "3", "4", "5", "6", "7",
         "A", "B", "C", "D", "G", "M", "Z",
@@ -2742,15 +2799,20 @@ def test_personal_detail_ocr_correction_invariants(
             f"{monthly_id}: monthly status must be canonical or explicitly null, "
             f"observed {status_code!r}"
         )
-        assert monthly_id in active_native_status_conflict_ids, (
-            f"{monthly_id}: null monthly status lacks an exact active native-source-cell conflict"
+        assert monthly_id in active_native_status_conflict_ids | active_source_confidence_ids, (
+            f"{monthly_id}: null monthly status lacks an exact active source-cell conflict "
+            "or unresolved source-OCR confidence issue"
         )
         assert row.get("account_id") and row.get("grid_id")
         assert re.fullmatch(
             r"\d{4}-(?:0[1-9]|1[0-2])",
             str(row.get("performance_month") or ""),
         )
-        assert _decimal_amount(row.get("status_amount")) is not None
+        if _decimal_amount(row.get("status_amount")) is None:
+            # A status-only confidence repair does not create a missing amount.
+            # The independent missing field needs its own active disclosure.
+            assert monthly_id in active_source_confidence_ids
+            assert _active_monthly_field_issues(payload, monthly_id, "status_amount")
         assert (wrapper.get("review") or {}).get("status") == "requires_review"
     field_observation_rows = [
         row["normalized"]
@@ -3171,6 +3233,7 @@ def test_personal_detail_ocr_correction_invariants(
         _assert_lin_month_ref_physical_ownership_oracle(semantic)
         _assert_lin_monthly_position_conservation_oracle(payload, semantic)
         _assert_lin_august_2022_status_oracle(payload)
+        _assert_lin_low_confidence_legal_status_oracle(payload)
         _assert_lin_p20_continuation_month_binding_oracle(payload)
         _assert_lin_watermarked_zero_amount_cells_oracle(payload)
 
@@ -3499,6 +3562,7 @@ def test_saved_lin_semantic_account_fragment_oracle() -> None:
         (_assert_lin_monthly_position_conservation_oracle, (community, semantic)),
         (_assert_lin_february_2020_status_oracle, (community,)),
         (_assert_lin_august_2022_status_oracle, (community,)),
+        (_assert_lin_low_confidence_legal_status_oracle, (community,)),
         (_assert_lin_p20_continuation_month_binding_oracle, (community,)),
         (_assert_lin_watermarked_zero_amount_cells_oracle, (community,)),
         (_assert_zero_overdue_status_amount_oracle, (community,)),

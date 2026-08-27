@@ -1455,7 +1455,12 @@ def _apply_personal_detail_dataset_status(payload: dict[str, Any]) -> None:
                 "basis": (
                     f"personal_detail_dataset_status:{presence}:expected_less_than_emitted"
                     if count_conflict
-                    else f"personal_detail_dataset_status:{presence}"
+                    else (
+                        f"personal_detail_dataset_status:{presence}:observed_only:population_unverified"
+                        if expected_raw is None
+                        and control.get("reason") == "account_month_source_position_population_unverified"
+                        else f"personal_detail_dataset_status:{presence}"
+                    )
                 ),
             }
         )

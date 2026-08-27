@@ -2989,7 +2989,7 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     audit_rows = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
     markdown = bundle.render_markdown()
 
-    record_ids = [row["record_id"] for row in json_rows]
+    record_ids = [row["extraction"]["record_id"] for row in json_rows]
     assert dataset["row_count"] == len(json_rows) == len(csv_rows) == 2
     assert record_ids == ["records:r000001", "records:r000002"]
     assert [row["record_id"] for row in csv_rows] == record_ids
@@ -3002,7 +3002,7 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     assert first_json["normalized"]["date"] == "2023-06-28"
     assert first_json["normalized"]["amount"] == "1000000.0"
     assert first_json["normalized"]["balance"] == "1006296.3"
-    assert first_json["source"]["page_range"] == [1, 2]
+    assert first_json["extraction"]["page_range"] == [1, 2]
     assert first_csv["date"] == "2023-06-28"
     assert first_csv["amount"] == "1000000.0"
     assert first_csv["balance"] == "1006296.3"

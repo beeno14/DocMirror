@@ -127,29 +127,308 @@ def _exact_source_table_repair_tokens_by_page(
     pages: Any,
     selected_pages: set[int],
 ) -> dict[int, list[dict[str, Any]]]:
-    """Expose exact singleton status/zero atoms from canonical table cells.
+    """Expose independently owned status/zero atoms from native table cells.
 
-    Table values never participate.  Every candidate is re-resolved from the
-    immutable token plane and must remain uniquely owned by one exact native
-    cell.  A canonical ``parse_result_table_cell`` atom may supply the corrected
-    singleton value, but only when its identity, source reference, metadata,
-    and bbox all independently bind it to that same cell.  The returned atoms
-    are consumed only by the later source-lattice field repair; they do not
-    replace canonical page lines.
+    Flat table values never participate. Every candidate is re-resolved from
+    the immutable token plane and must remain uniquely owned by one exact native
+    cell. Only one audited ``parse_result_table_cell`` correction atom may
+    change that immutable value; a canonical typed cell is corroboration, never
+    correction authority. The returned atoms are consumed only by the later
+    source-lattice field repair; they do not replace canonical page lines.
+    A declared vertical merge or multiword cell may expose one raw repair atom
+    only after resolving its complete token set. Its own token box, never the
+    merged cell box or typed text, determines the later field ownership.
     """
 
     from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
         _exact_native_table_cell_tokens,
+        _native_table_cell_span,
     )
 
+    def member(value: Any, name: str, default: Any = None) -> Any:
+        return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+    def unique_ids(value: Any) -> tuple[str, ...] | None:
+        if (
+            not isinstance(value, (list, tuple))
+            or not value
+            or any(not isinstance(item, str) or not item for item in value)
+            or len(set(value)) != len(value)
+        ):
+            return None
+        return tuple(value)
+
+    def exact_vertical_span(
+        geometry: Mapping[str, Any],
+        *,
+        row: int,
+        column: int,
+        span: tuple[int, int],
+    ) -> bool:
+        """Authenticate the covered rows that the generic span reader skips."""
+
+        row_span, column_span = span
+        if row_span <= 1 or column_span != 1:
+            return False
+        spans = geometry.get("cell_spans")
+        if not isinstance(spans, list):
+            return False
+        owners = 0
+        for declaration in spans:
+            if not isinstance(declaration, Mapping):
+                return False
+            values = tuple(declaration.get(key) for key in ("row", "col", "row_span", "col_span"))
+            if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+                return False
+            other_row, other_col, other_rows, other_cols = values
+            if other_row < 0 or other_col < 0 or other_rows < 1 or other_cols < 1:
+                return False
+            if (
+                other_col <= column < other_col + other_cols
+                and other_row < row + row_span
+                and other_row + other_rows > row
+            ):
+                if values != (row, column, row_span, 1):
+                    return False
+                owners += 1
+        if owners != 1:
+            return False
+        for covered_row in range(row + 1, row + row_span):
+            for key, expected in (
+                ("cell_bboxes", None),
+                ("cell_geometry_status", "derived"),
+                ("cell_evidence_ids", []),
+                ("cell_token_ids", []),
+            ):
+                grid = geometry.get(key)
+                if (
+                    not isinstance(grid, list)
+                    or covered_row >= len(grid)
+                    or not isinstance(grid[covered_row], list)
+                    or column >= len(grid[covered_row])
+                    or grid[covered_row][column] != expected
+                ):
+                    return False
+        return True
+
+    def exact_bbox(value: Any) -> tuple[float, float, float, float] | None:
+        try:
+            bbox = tuple(float(coordinate) for coordinate in value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            len(bbox) != 4
+            or not all(math.isfinite(coordinate) for coordinate in bbox)
+            or bbox[2] <= bbox[0]
+            or bbox[3] <= bbox[1]
+        ):
+            return None
+        return cast(tuple[float, float, float, float], bbox)
+
+    def same_bbox(left: Any, right: Any) -> bool:
+        left_bbox = exact_bbox(left)
+        right_bbox = exact_bbox(right)
+        return bool(
+            left_bbox is not None
+            and right_bbox is not None
+            and all(
+                abs(left_coordinate - right_coordinate) <= 1e-3
+                for left_coordinate, right_coordinate in zip(
+                    left_bbox,
+                    right_bbox,
+                    strict=True,
+                )
+            )
+        )
+
+    def projected_bbox(table: Any, value: Any) -> tuple[float, float, float, float] | None:
+        bbox = exact_bbox(value)
+        if bbox is None:
+            return None
+        metadata = member(table, "metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        affine = metadata.get("source_to_canonical_affine")
+        if not isinstance(affine, Mapping):
+            return bbox
+        try:
+            scale_x = float(affine["scale_x"])
+            scale_y = float(affine["scale_y"])
+            offset_x = float(affine["offset_x"])
+            offset_y = float(affine["offset_y"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        projected = (
+            offset_x + bbox[0] * scale_x,
+            offset_y + bbox[1] * scale_y,
+            offset_x + bbox[2] * scale_x,
+            offset_y + bbox[3] * scale_y,
+        )
+        return exact_bbox(projected)
+
+    parse_result = getattr(owner, "parse_result", owner)
+    parser_info = getattr(parse_result, "parser_info", None)
+    parser_options = getattr(parser_info, "options", None)
+    correction_audit = (
+        parser_options.get("ocr_corrections")
+        if isinstance(parser_options, Mapping)
+        else None
+    )
+    correction_events = (
+        correction_audit.get("events")
+        if isinstance(correction_audit, Mapping)
+        else None
+    )
+    applied_correction_events_by_token: dict[str, list[Mapping[str, Any]]] = {}
+    for event in correction_events or ():
+        if not isinstance(event, Mapping) or str(event.get("action") or "") != "applied":
+            continue
+        source_ref = str(event.get("source_ref") or "")
+        if source_ref:
+            applied_correction_events_by_token.setdefault(source_ref, []).append(event)
+
+    def canonical_cell_observation(
+        table: Any,
+        *,
+        table_id: str,
+        raw_row_index: int,
+        column_index: int,
+        source_logical_page: int,
+        token_ids: tuple[str, ...],
+        source_cell_bbox: tuple[float, ...],
+        expected_span: tuple[int, int] = (1, 1),
+        allow_multiword_text: bool = False,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Return one exact typed-cell corroboration, never correction authority."""
+
+        scalar_types = (str, bytes, int, float, bool)
+
+        def row_cells(row: Any) -> list[Any]:
+            cells = member(row, "cells")
+            if not isinstance(cells, (list, tuple)) and isinstance(row, (list, tuple)):
+                cells = row
+            return list(cells) if isinstance(cells, (list, tuple)) else []
+
+        candidate_cells: list[Any] = []
+        candidate_ids: set[int] = set()
+
+        def add_candidate(cell: Any) -> None:
+            if cell is None or isinstance(cell, scalar_types) or id(cell) in candidate_ids:
+                return
+            candidate_ids.add(id(cell))
+            candidate_cells.append(cell)
+
+        # Projected tables retain an explicitly raw-row-aligned matrix. Header
+        # slots are None and therefore cannot shift the first typed body row.
+        aligned_rows = member(table, "source_cell_objects")
+        if isinstance(aligned_rows, (list, tuple)) and raw_row_index < len(aligned_rows):
+            cells = row_cells(aligned_rows[raw_row_index])
+            if column_index < len(cells):
+                add_candidate(cells[column_index])
+
+        # Native/lightweight tables retain typed rows without the preserved
+        # header. Infer the offset only from an explicit raw-row cardinality.
+        typed_rows = member(table, "rows")
+        metadata = member(table, "metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        raw_rows = metadata.get("raw_rows")
+        if isinstance(typed_rows, (list, tuple)):
+            row_offset = (
+                1
+                if isinstance(raw_rows, (list, tuple))
+                and len(raw_rows) == len(typed_rows) + 1
+                else 0
+            )
+            typed_slot = raw_row_index - row_offset
+            if 0 <= typed_slot < len(typed_rows):
+                cells = row_cells(typed_rows[typed_slot])
+                if column_index < len(cells):
+                    add_candidate(cells[column_index])
+
+            # Explicit raw_row ownership is stronger than container position
+            # and covers sparse typed-row containers.
+            for row in typed_rows:
+                for cell in row_cells(row):
+                    refs = member(cell, "source_cell_refs")
+                    if not isinstance(refs, (list, tuple)):
+                        continue
+                    if any(
+                        isinstance(ref, Mapping)
+                        and ref.get("raw_row") == raw_row_index
+                        and ref.get("col") == column_index
+                        for ref in refs
+                    ):
+                        add_candidate(cell)
+
+        if not candidate_cells:
+            return False, None
+        if len(candidate_cells) != 1:
+            return True, None
+        cell = candidate_cells[0]
+        typed_row_index = member(cell, "row_index")
+        typed_column_index = member(cell, "col_index")
+        typed_span = (member(cell, "row_span", 1), member(cell, "col_span", 1))
+        if (
+            not isinstance(typed_row_index, int)
+            or isinstance(typed_row_index, bool)
+            or typed_row_index < 0
+            or not isinstance(typed_column_index, int)
+            or isinstance(typed_column_index, bool)
+            or typed_column_index != column_index
+            or str(member(cell, "geometry_status") or "") != "exact"
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in typed_span)
+            or typed_span != expected_span
+        ):
+            return True, None
+        typed_cell_bbox = exact_bbox(member(cell, "bbox"))
+        if typed_cell_bbox is None or not same_bbox(typed_cell_bbox, source_cell_bbox):
+            return True, None
+        evidence_ids = unique_ids(member(cell, "evidence_ids"))
+        typed_token_ids = unique_ids(member(cell, "token_ids"))
+        if (
+            evidence_ids is None
+            or typed_token_ids is None
+            or set(evidence_ids) != set(token_ids)
+            or set(typed_token_ids) != set(token_ids)
+        ):
+            return True, None
+        source_cell_refs = member(cell, "source_cell_refs")
+        if not isinstance(source_cell_refs, (list, tuple)) or len(source_cell_refs) != 1:
+            return True, None
+        [source_cell_ref] = source_cell_refs
+        if (
+            not isinstance(source_cell_ref, Mapping)
+            or str(source_cell_ref.get("table_id") or "") != table_id
+            or source_cell_ref.get("row") != typed_row_index
+            or source_cell_ref.get("raw_row") != raw_row_index
+            or source_cell_ref.get("col") != column_index
+            or source_cell_ref.get("page") != source_logical_page
+        ):
+            return True, None
+        repair_atom = str(member(cell, "text") or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
+        if not allow_multiword_text and (len(repair_atom) != 1 or repair_atom not in _MONTHLY_REPAIR_ATOMS):
+            return True, None
+        raw_confidence = member(cell, "geometry_confidence")
+        if raw_confidence is None:
+            raw_confidence = member(cell, "confidence")
+        return True, {
+            "content": repair_atom,
+            "bbox": typed_cell_bbox,
+            "confidence": min(1.0, max(0.0, _finite(raw_confidence))),
+            "evidence_ids": list(token_ids),
+            "typed_row_index": typed_row_index,
+        }
+
     page_values = list(pages) if isinstance(pages, (list, tuple)) else []
-    candidates_by_token: dict[str, list[dict[str, Any]]] = {}
+    candidates_by_token: dict[str, list[tuple[dict[str, Any], tuple[str, ...]]]] = {}
+    declared_token_owners: Counter[str] = Counter()
 
     confidence_observations_by_token_id: dict[str, list[tuple[str, float]]] = {}
     corrected_observations_by_cell: dict[
-        tuple[str, int, int, str],
+        tuple[str, str],
         list[dict[str, Any]],
     ] = {}
+    corrected_claims_by_cell: set[tuple[str, str]] = set()
+    raw_only_correction_claims: set[tuple[str, str]] = set()
     plane = getattr(owner, "evidence_plane", None)
     if plane is None:
         plane = getattr(getattr(owner, "parse_result", None), "evidence_plane", None)
@@ -160,8 +439,7 @@ def _exact_source_table_repair_tokens_by_page(
             raw_confidence = atom.get("confidence") if isinstance(atom, Mapping) else getattr(atom, "confidence", None)
             raw_text = atom.get("text") if isinstance(atom, Mapping) else getattr(atom, "text", None)
             repair_atom = str(raw_text or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
-            if len(repair_atom) != 1 or repair_atom not in _MONTHLY_REPAIR_ATOMS:
-                continue
+            is_repair_atom = len(repair_atom) == 1 and repair_atom in _MONTHLY_REPAIR_ATOMS
             raw_source_refs = (
                 atom.get("source_refs") if isinstance(atom, Mapping) else getattr(atom, "source_refs", None)
             )
@@ -179,10 +457,11 @@ def _exact_source_table_repair_tokens_by_page(
                 )
                 source_refs = (legacy_id,) if legacy_id else ()
             confidence = min(1.0, max(0.0, _finite(raw_confidence)))
-            for source_ref in source_refs:
-                confidence_observations_by_token_id.setdefault(source_ref, []).append(
-                    (repair_atom, confidence)
-                )
+            if is_repair_atom:
+                for source_ref in source_refs:
+                    confidence_observations_by_token_id.setdefault(source_ref, []).append(
+                        (repair_atom, confidence)
+                    )
 
             source_kind = str(
                 (atom.get("source_kind") if isinstance(atom, Mapping) else getattr(atom, "source_kind", ""))
@@ -193,7 +472,25 @@ def _exact_source_table_repair_tokens_by_page(
             )
             if source_kind != "parse_result_table_cell" or not isinstance(atom_metadata, Mapping):
                 continue
+            if not any(
+                key in atom_metadata
+                for key in (
+                    "ocr_original_text",
+                    "ocr_corrected_text",
+                    "ocr_correction_id",
+                    "ocr_correction_action",
+                    "ocr_correction_rule_id",
+                )
+            ):
+                # Every typed cell produces a table atom, even when no
+                # correction was attempted. That ordinary observation cannot
+                # turn an exact raw token into a failed correction claim.
+                # Present but empty/incomplete correction metadata still
+                # reaches the fail-closed claim and event checks below.
+                continue
             table_id = str(atom_metadata.get("table_id") or "")
+            if table_id:
+                raw_only_correction_claims.update((table_id, source_ref) for source_ref in source_refs)
             row_index = atom_metadata.get("row_index")
             column_index = atom_metadata.get("col_index")
             metadata_token_ids = atom_metadata.get("token_ids")
@@ -215,18 +512,19 @@ def _exact_source_table_repair_tokens_by_page(
                 or normalized_metadata_token_ids != source_refs
             ):
                 continue
-            raw_bbox = atom.get("bbox") if isinstance(atom, Mapping) else getattr(atom, "bbox", None)
-            try:
-                atom_bbox = tuple(float(value) for value in raw_bbox)
-            except (TypeError, ValueError):
+            cell_key = (table_id, source_refs[0])
+            corrected_claims_by_cell.add(cell_key)
+            if not is_repair_atom:
                 continue
-            if len(atom_bbox) != 4 or atom_bbox[2] <= atom_bbox[0] or atom_bbox[3] <= atom_bbox[1]:
+            raw_bbox = atom.get("bbox") if isinstance(atom, Mapping) else getattr(atom, "bbox", None)
+            atom_bbox = exact_bbox(raw_bbox)
+            if atom_bbox is None:
                 continue
             atom_id = str((atom.get("id") if isinstance(atom, Mapping) else getattr(atom, "id", "")) or "")
             if not atom_id:
                 continue
             corrected_observations_by_cell.setdefault(
-                (table_id, row_index, column_index, source_refs[0]),
+                cell_key,
                 [],
             ).append(
                 {
@@ -234,6 +532,13 @@ def _exact_source_table_repair_tokens_by_page(
                     "content": repair_atom,
                     "bbox": atom_bbox,
                     "confidence": confidence,
+                    "row_index": row_index,
+                    "column_index": column_index,
+                    "page_id": str(
+                        (atom.get("page_id") if isinstance(atom, Mapping) else getattr(atom, "page_id", ""))
+                        or ""
+                    ),
+                    "metadata": dict(atom_metadata),
                 }
             )
 
@@ -260,77 +565,261 @@ def _exact_source_table_repair_tokens_by_page(
             )
             metadata = table.get("metadata") if isinstance(table, Mapping) else getattr(table, "metadata", None)
             metadata = metadata if isinstance(metadata, Mapping) else {}
-            geometry = metadata.get("geometry")
-            geometry = geometry if isinstance(geometry, Mapping) else metadata
-            if str(geometry.get("coordinate_system") or "pdf_points_top_left") != ("pdf_points_top_left"):
+            nested_source_geometry = metadata.get("geometry")
+            source_geometry = (
+                nested_source_geometry
+                if isinstance(nested_source_geometry, Mapping)
+                else metadata
+            )
+            token_grid = source_geometry.get("cell_token_ids")
+            if not isinstance(token_grid, list):
+                token_grid = metadata.get("cell_token_ids")
+            if isinstance(token_grid, list):
+                # An invalid competing cell is still an ownership claim. Do
+                # not make a reused token unique by filtering that owner out.
+                for claimed_row in token_grid:
+                    if not isinstance(claimed_row, list):
+                        continue
+                    for claimed_ids in claimed_row:
+                        if isinstance(claimed_ids, (list, tuple)):
+                            declared_token_owners.update(
+                                token_id for token_id in claimed_ids if isinstance(token_id, str) and token_id
+                            )
+            coordinate_geometry = metadata.get("canonical_geometry")
+            has_canonical_geometry = isinstance(coordinate_geometry, Mapping)
+            coordinate_geometry = (
+                coordinate_geometry
+                if has_canonical_geometry
+                else source_geometry
+            )
+            if (
+                str(source_geometry.get("coordinate_system") or "pdf_points_top_left")
+                != "pdf_points_top_left"
+                or str(coordinate_geometry.get("coordinate_system") or "pdf_points_top_left")
+                != "pdf_points_top_left"
+            ):
                 continue
-            token_grid = geometry.get("cell_token_ids")
-            cell_bboxes = geometry.get("cell_bboxes")
-            if not table_id or not isinstance(token_grid, list) or not isinstance(cell_bboxes, list):
+            source_cell_bboxes = source_geometry.get("cell_bboxes")
+            if not isinstance(source_cell_bboxes, list):
+                source_cell_bboxes = metadata.get("source_cell_bboxes")
+            if (
+                not isinstance(source_cell_bboxes, list)
+                and not has_canonical_geometry
+            ):
+                # An unprojected lightweight table has only one (raw) plane.
+                source_cell_bboxes = metadata.get("cell_bboxes")
+            cell_bboxes = coordinate_geometry.get("cell_bboxes")
+            if not isinstance(cell_bboxes, list):
+                cell_bboxes = metadata.get("cell_bboxes")
+            source_logical_page = metadata.get("source_logical_page", logical_page)
+            if (
+                not table_id
+                or not isinstance(source_logical_page, int)
+                or isinstance(source_logical_page, bool)
+                or source_logical_page <= 0
+                or not isinstance(token_grid, list)
+                or not isinstance(source_cell_bboxes, list)
+                or not isinstance(cell_bboxes, list)
+            ):
                 continue
             for row_index, token_row in enumerate(token_grid):
                 if (
                     not isinstance(token_row, list)
                     or row_index >= len(cell_bboxes)
                     or not isinstance(cell_bboxes[row_index], list)
+                    or row_index >= len(source_cell_bboxes)
+                    or not isinstance(source_cell_bboxes[row_index], list)
                 ):
                     continue
                 for column_index, token_ids in enumerate(token_row):
                     if (
                         not isinstance(token_ids, list)
                         or column_index >= len(cell_bboxes[row_index])
+                        or column_index >= len(source_cell_bboxes[row_index])
                     ):
                         continue
-                    normalized_ids = tuple(dict.fromkeys(str(value) for value in token_ids if str(value or "")))
-                    if len(normalized_ids) != 1:
+                    normalized_cell_token_ids = unique_ids(token_ids)
+                    if normalized_cell_token_ids is None:
+                        continue
+                    evidence_grid = source_geometry.get("cell_evidence_ids")
+                    if (
+                        not isinstance(evidence_grid, list)
+                        or row_index >= len(evidence_grid)
+                        or not isinstance(evidence_grid[row_index], list)
+                        or column_index >= len(evidence_grid[row_index])
+                    ):
+                        continue
+                    cell_evidence_ids = unique_ids(evidence_grid[row_index][column_index])
+                    if cell_evidence_ids is None or set(cell_evidence_ids) != set(normalized_cell_token_ids):
+                        continue
+                    allowed_span = _native_table_cell_span(table, row=row_index, column=column_index)
+                    if allowed_span is not None and not exact_vertical_span(
+                        source_geometry,
+                        row=row_index,
+                        column=column_index,
+                        span=allowed_span,
+                    ):
                         continue
                     resolved = _exact_native_table_cell_tokens(
                         owner,
                         table,
                         row=row_index,
                         column=column_index,
-                        logical_page=logical_page,
+                        allowed_span=allowed_span,
+                        logical_page=source_logical_page,
+                        require_raw_tokens=True,
                     )
-                    if resolved is None or len(resolved) != 1:
+                    if (
+                        resolved is None
+                        or len(resolved) != len(normalized_cell_token_ids)
+                        or {item[2] for item in resolved} != set(normalized_cell_token_ids)
+                    ):
                         continue
-                    raw_text, bbox, token_id = resolved[0]
-                    if token_id != normalized_ids[0]:
+                    raw_only_cell = allowed_span is not None or len(normalized_cell_token_ids) > 1
+                    if raw_only_cell:
+                        # A whole-cell correction cannot authorize a subfield
+                        # inside a merge. Resolve all words, but expose exactly
+                        # one independently positioned raw repair glyph.
+                        if any(
+                            (table_id, source_id) in raw_only_correction_claims
+                            or applied_correction_events_by_token.get(source_id)
+                            for source_id in normalized_cell_token_ids
+                        ):
+                            continue
+                        eligible = [
+                            item
+                            for item in resolved
+                            if str(item[0] or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
+                            in _MONTHLY_REPAIR_ATOMS
+                        ]
+                        if len(eligible) != 1:
+                            continue
+                        raw_text, bbox, token_id = eligible[0]
+                    else:
+                        raw_text, bbox, token_id = resolved[0]
+                    source_cell_bbox = exact_bbox(source_cell_bboxes[row_index][column_index])
+                    cell_bbox = exact_bbox(cell_bboxes[row_index][column_index])
+                    if source_cell_bbox is None or cell_bbox is None:
                         continue
-                    raw_cell_bbox = cell_bboxes[row_index][column_index]
-                    try:
-                        cell_bbox = tuple(float(value) for value in raw_cell_bbox)
-                    except (TypeError, ValueError):
+                    if raw_only_cell and not same_bbox(projected_bbox(table, source_cell_bbox), cell_bbox):
                         continue
-                    if len(cell_bbox) != 4 or cell_bbox[2] <= cell_bbox[0] or cell_bbox[3] <= cell_bbox[1]:
+                    typed_cell_present, typed_cell_observation = canonical_cell_observation(
+                        table,
+                        table_id=table_id,
+                        raw_row_index=row_index,
+                        column_index=column_index,
+                        source_logical_page=source_logical_page,
+                        token_ids=normalized_cell_token_ids,
+                        source_cell_bbox=source_cell_bbox,
+                        expected_span=allowed_span or (1, 1),
+                        allow_multiword_text=len(normalized_cell_token_ids) > 1,
+                    )
+                    if typed_cell_present and typed_cell_observation is None:
                         continue
-                    corrected = [
-                        observation
-                        for observation in corrected_observations_by_cell.get(
-                            (table_id, row_index, column_index, token_id),
-                            [],
+                    cell_key = (table_id, token_id)
+                    raw_token_text = str(raw_text or "").strip()
+                    applied_events = applied_correction_events_by_token.get(token_id, [])
+                    corrected: list[dict[str, Any]] = []
+                    for observation in corrected_observations_by_cell.get(cell_key, []):
+                        observation_metadata = observation.get("metadata")
+                        observation_metadata = (
+                            observation_metadata
+                            if isinstance(observation_metadata, Mapping)
+                            else {}
                         )
-                        if all(
-                            abs(left - right) <= 1e-3
-                            for left, right in zip(observation["bbox"], cell_bbox, strict=True)
+                        source_refs = observation_metadata.get("source_cell_refs")
+                        if not isinstance(source_refs, (list, tuple)) or len(source_refs) != 1:
+                            continue
+                        source_ref = source_refs[0]
+                        if not isinstance(source_ref, Mapping):
+                            continue
+                        typed_row_index = source_ref.get("row")
+                        if (
+                            observation.get("column_index") != column_index
+                            or source_ref.get("raw_row") != row_index
+                            or source_ref.get("col") != column_index
+                            or source_ref.get("table_id") != table_id
+                            or source_ref.get("page") != source_logical_page
+                            or observation.get("row_index") != typed_row_index
+                            or observation.get("page_id") != f"page:{source_logical_page:04d}"
+                            or not same_bbox(observation.get("bbox"), source_cell_bbox)
+                            or len(applied_events) != 1
+                        ):
+                            continue
+                        event = applied_events[0]
+                        event_id = str(event.get("event_id") or "")
+                        rule_id = str(event.get("rule_id") or "")
+                        repair_atom = str(observation.get("content") or "")
+                        if (
+                            not event_id
+                            or not rule_id
+                            or str(event.get("source_ref") or "") != token_id
+                            or str(event.get("action") or "") != "applied"
+                            or str(event.get("original") or "") != raw_token_text
+                            or str(event.get("corrected") or "") != repair_atom
+                            or str(observation_metadata.get("ocr_correction_action") or "")
+                            != "applied"
+                            or str(observation_metadata.get("ocr_original_text") or "")
+                            != raw_token_text
+                            or str(observation_metadata.get("ocr_corrected_text") or "")
+                            != repair_atom
+                            or str(observation_metadata.get("ocr_correction_id") or "")
+                            != event_id
+                            or str(observation_metadata.get("ocr_correction_rule_id") or "")
+                            != rule_id
+                            or (
+                                typed_cell_observation is not None
+                                and str(typed_cell_observation.get("content") or "")
+                                != repair_atom
+                            )
+                        ):
+                            continue
+                        projected_observation_bbox = projected_bbox(
+                            table,
+                            observation.get("bbox"),
                         )
-                    ]
+                        if projected_observation_bbox is None or not same_bbox(
+                            projected_observation_bbox,
+                            cell_bbox,
+                        ):
+                            continue
+                        corrected.append(
+                            {
+                                **observation,
+                                "correction_identity": (event_id, rule_id),
+                            }
+                        )
                     if len(corrected) > 1:
-                        # Duplicate corrected owners are ambiguous even when
-                        # their glyphs happen to agree.  Do not fall back to a
-                        # different value plane for that cell.
                         continue
                     if corrected:
                         observation = corrected[0]
                         repair_atom = str(observation["content"])
                         output_bbox = list(cell_bbox)
-                        confidence = float(observation["confidence"])
+                        confidence = min(
+                            float(observation["confidence"]),
+                            float(typed_cell_observation.get("confidence", 1.0))
+                            if typed_cell_observation is not None
+                            else 1.0,
+                        )
                         source = (
                             "exact_corrected_source_table_status_cell"
                             if repair_atom in _MONTHLY_STATUS_ATOMS
                             else "exact_corrected_source_table_amount_cell"
                         )
-                        evidence_ids = [token_id, str(observation["atom_id"])]
+                        evidence_ids = [
+                            token_id,
+                            *dict.fromkeys(
+                                str(value.get("atom_id") or "")
+                                for value in corrected
+                                if str(value.get("atom_id") or "")
+                            ),
+                        ]
                     else:
+                        if cell_key in corrected_claims_by_cell or applied_events:
+                            # A table-cell correction was asserted for this
+                            # owner but failed its audit/geometry contract. Do
+                            # not silently fall back through that ambiguity.
+                            continue
                         repair_atom = str(raw_text or "").strip().translate(_MONTHLY_STATUS_TRANSLATION)
                         if len(repair_atom) != 1 or repair_atom not in _MONTHLY_REPAIR_ATOMS:
                             continue
@@ -340,7 +829,10 @@ def _exact_source_table_repair_tokens_by_page(
                             if observed_atom == repair_atom
                         ]
                         confidence = min(matching_confidences, default=0.0)
-                        output_bbox = list(bbox)
+                        projected_token_bbox = projected_bbox(table, bbox)
+                        if projected_token_bbox is None:
+                            continue
+                        output_bbox = list(projected_token_bbox)
                         source = (
                             "exact_native_source_table_status_cell"
                             if repair_atom in _MONTHLY_STATUS_ATOMS
@@ -348,24 +840,30 @@ def _exact_source_table_repair_tokens_by_page(
                         )
                         evidence_ids = [token_id]
                     candidates_by_token.setdefault(token_id, []).append(
-                        {
-                            "token_id": token_id,
-                            "content": repair_atom,
-                            "bbox": output_bbox,
-                            "confidence": confidence,
-                            "page": logical_page,
-                            "source_logical_page": logical_page,
-                            "coordinate_system": "pdf_points_top_left",
-                            "source": source,
-                            "evidence_ids": evidence_ids,
-                        }
+                        (
+                            {
+                                "token_id": token_id,
+                                "content": repair_atom,
+                                "bbox": output_bbox,
+                                "confidence": confidence,
+                                "page": logical_page,
+                                "source_logical_page": logical_page,
+                                "source_origin_logical_page": source_logical_page,
+                                "coordinate_system": "pdf_points_top_left",
+                                "source": source,
+                                "evidence_ids": evidence_ids,
+                            },
+                            normalized_cell_token_ids,
+                        )
                     )
 
     output: dict[int, list[dict[str, Any]]] = {}
     for candidates in candidates_by_token.values():
         if len(candidates) != 1:
             continue
-        candidate = candidates[0]
+        candidate, cell_token_ids = candidates[0]
+        if any(declared_token_owners[token_id] != 1 for token_id in cell_token_ids):
+            continue
         output.setdefault(int(candidate["page"]), []).append(candidate)
     for page_tokens in output.values():
         page_tokens.sort(
@@ -375,6 +873,252 @@ def _exact_source_table_repair_tokens_by_page(
                 str(token["token_id"]),
             )
         )
+    return output
+
+
+def _printed_monthly_anchor_shape(
+    line: Mapping[str, Any],
+) -> tuple[tuple[str, ...], tuple[float, ...], tuple[int, ...], str] | None:
+    """Read one complete printed range line without accepting projected boxes."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.relations import _printed_repayment_range
+
+    text = str(line.get("text") or line.get("content") or "").strip()
+    if (
+        not text
+        or (line.get("text") and line.get("content") and str(line["text"]).strip() != str(line["content"]).strip())
+        or text.count("还款记录") != 1
+        or str(line.get("coordinate_system") or "pdf_points_top_left") != "pdf_points_top_left"
+    ):
+        return None
+    printed_range = _printed_repayment_range(text)
+    if printed_range is None:
+        return None
+    date_range = tuple(printed_range[key] for key in ("start_year", "start_month", "end_year", "end_month"))
+    ids = line.get("evidence_ids")
+    if (
+        not isinstance(ids, (list, tuple))
+        or not ids
+        or any(not isinstance(value, str) or not value for value in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        return None
+    token_ids = line.get("token_ids")
+    if token_ids is not None and (
+        not isinstance(token_ids, (list, tuple))
+        or any(not isinstance(value, str) or not value for value in token_ids)
+        or len(set(token_ids)) != len(token_ids)
+        or set(token_ids) != set(ids)
+    ):
+        return None
+    raw_bbox = line.get("bbox")
+    if not isinstance(raw_bbox, (list, tuple)) or len(raw_bbox) != 4:
+        return None
+    try:
+        bbox = tuple(float(value) for value in raw_bbox)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in bbox) or bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return None
+    return tuple(sorted(ids)), bbox, date_range, text
+
+
+def _authenticated_printed_monthly_anchor_inventory(
+    owner: Any,
+) -> tuple[dict[tuple[int, tuple[str, ...]], dict[str, Any]], bool]:
+    """Authenticate and close the original raw repayment-range population.
+
+    Source bbox fields on transformed lines have several different historical
+    meanings. None are consulted here: only the immutable raw OCR words and
+    their complete original line can establish the printed-grid identity.
+    A valid duplicate view cannot hide a malformed original range line. The
+    completeness bit describes this sealed source inventory, not whether any
+    detector or canonical registration subsequently materialized its grids.
+    """
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
+        resolve_exact_page_token_atoms,
+    )
+
+    def positive_page(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+    def range_line(line: Mapping[str, Any]) -> bool:
+        # A damaged range is still part of the source census. Do not require
+        # its dates, IDs or geometry to pass the authenticator before deciding
+        # that a failed original line makes the population incomplete.
+        return any(
+            "还款记录" in _compact(value)
+            and re.search(r"\d{4}\s*年", str(value or "")) is not None
+            for value in (line.get("text"), line.get("content"))
+        )
+
+    parse_result = getattr(owner, "parse_result", owner)
+    bundles = _domain_specific(parse_result).get("_page_evidence_bundles")
+    if not isinstance(bundles, (list, tuple)) or not bundles:
+        return {}, False
+    complete = True
+    page_counts = Counter(
+        bundle["page"]
+        for bundle in bundles
+        if isinstance(bundle, Mapping) and positive_page(bundle.get("page"))
+    )
+    raw_pages: dict[int, list[Any]] = {}
+    for page in getattr(parse_result, "pages", None) or ():
+        page_number = getattr(page, "page_number", None)
+        if positive_page(page_number):
+            raw_pages.setdefault(page_number, []).append(page)
+        else:
+            complete = False
+    if (
+        not raw_pages
+        or set(raw_pages) != set(page_counts)
+        or any(len(pages) != 1 or page_counts.get(logical_page) != 1 for logical_page, pages in raw_pages.items())
+    ):
+        complete = False
+    output: dict[tuple[int, tuple[str, ...]], dict[str, Any]] = {}
+    for bundle in bundles:
+        if not isinstance(bundle, Mapping):
+            complete = False
+            continue
+        logical_page = bundle.get("page")
+        if not positive_page(logical_page) or page_counts[logical_page] != 1:
+            complete = False
+            continue
+        pages = raw_pages.get(logical_page) or []
+        if len(pages) != 1:
+            complete = False
+            continue
+        source_claims = [bundle.get("source_page_number"), getattr(pages[0], "source_page_number", None)]
+        evidence_views = [
+            view
+            for key in ("local_structure_evidence", "micro_grid_evidence")
+            if isinstance(view := bundle.get(key), Mapping)
+        ]
+        if not evidence_views or any(
+            bundle.get(key) is not None and not isinstance(bundle.get(key), Mapping)
+            for key in ("local_structure_evidence", "micro_grid_evidence")
+        ):
+            complete = False
+        source_claims.extend(view.get("source_page") for view in evidence_views)
+        source_claims = [value for value in source_claims if value is not None]
+        if (
+            not source_claims
+            or any(not positive_page(value) for value in source_claims)
+            or len(set(source_claims)) != 1
+            or any(
+                not positive_page(view.get("page", logical_page))
+                or view.get("page", logical_page) != logical_page
+                for view in evidence_views
+            )
+        ):
+            complete = False
+            continue
+        source_page = source_claims[0]
+        for view in evidence_views:
+            lines = view.get("lines")
+            if not isinstance(lines, (list, tuple)):
+                complete = False
+                continue
+            for line in lines:
+                if not isinstance(line, Mapping):
+                    complete = False
+                    continue
+                if line.get("coordinate_status") == "cross_page_y_shift":
+                    # The shared pre-plugin enricher can retain explicit
+                    # next-page aliases in a raw bundle. They are not new
+                    # original lines; the source page's own bundle is already
+                    # required by the closed-world page coverage check above.
+                    continue
+                if not range_line(line):
+                    continue
+                shape = _printed_monthly_anchor_shape(line)
+                if shape is None:
+                    complete = False
+                    continue
+                if any(
+                    not positive_page(line.get(key, logical_page))
+                    or line.get(key, logical_page) != logical_page
+                    for key in ("page", "source_logical_page", "coordinate_logical_page")
+                ):
+                    complete = False
+                    continue
+                ids, bbox, date_range, text = shape
+                resolved = resolve_exact_page_token_atoms(
+                    owner,
+                    ids,
+                    logical_page=logical_page,
+                    require_raw_tokens=True,
+                )
+                if resolved is None or len(resolved) != len(ids) or {item[2] for item in resolved} != set(ids):
+                    complete = False
+                    continue
+                words = sorted(resolved, key=lambda item: (item[1][0], item[1][1], item[2]))
+                raw_bbox = (
+                    min(word[1][0] for word in words),
+                    min(word[1][1] for word in words),
+                    max(word[1][2] for word in words),
+                    max(word[1][3] for word in words),
+                )
+                if _compact(" ".join(word[0] for word in words)) != _compact(text) or any(
+                    abs(left - right) > 1e-3 for left, right in zip(raw_bbox, bbox, strict=True)
+                ):
+                    complete = False
+                    continue
+                output[(logical_page, ids)] = {
+                    "coordinate_system": "pdf_points_top_left",
+                    "coordinate_plane": "raw_logical_page",
+                    "source_logical_page": logical_page,
+                    "source_page": source_page,
+                    "evidence_ids": list(ids),
+                    "bbox": list(raw_bbox),
+                    "date_range": list(date_range),
+                }
+    return output, complete
+
+
+def _authenticated_printed_monthly_anchors(
+    owner: Any,
+) -> dict[tuple[int, tuple[str, ...]], dict[str, Any]]:
+    """Compatibility index over individually authenticated original anchors."""
+
+    return _authenticated_printed_monthly_anchor_inventory(owner)[0]
+
+
+def _lines_with_printed_monthly_anchors(
+    lines: Iterable[Mapping[str, Any]],
+    *,
+    logical_page: Any,
+    source_page: Any,
+    anchors: Mapping[tuple[int, tuple[str, ...]], Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Stamp only authenticated raw lines before any coordinate projection."""
+
+    output: list[dict[str, Any]] = []
+    for value in lines:
+        if not isinstance(value, Mapping):
+            continue
+        line = deepcopy(dict(value))
+        line.pop("printed_anchor_identity", None)
+        shape = _printed_monthly_anchor_shape(line)
+        if (
+            shape is not None
+            and isinstance(logical_page, int)
+            and not isinstance(logical_page, bool)
+            and isinstance(source_page, int)
+            and not isinstance(source_page, bool)
+            and (anchor := anchors.get((logical_page, shape[0]))) is not None
+            and anchor.get("source_page") == source_page
+            and anchor.get("bbox") == list(shape[1])
+            and anchor.get("date_range") == list(shape[2])
+            and line.get("coordinate_status") != "cross_page_y_shift"
+            and all(
+                type(line.get(key, logical_page)) is int and line.get(key, logical_page) == logical_page
+                for key in ("page", "source_logical_page", "coordinate_logical_page")
+            )
+        ):
+            line["printed_anchor_identity"] = deepcopy(dict(anchor))
+        output.append(line)
     return output
 
 
@@ -1612,6 +2356,8 @@ class PersonalDetailExtractionContext:
         self.reading_order_resolution = deepcopy(dict(reading_order_resolution))
         self.page_topology = page_topology
         self._cache: dict[str, Any] = {}
+        self._candidate_b_printed_anchor_inventory: list[dict[str, Any]] = []
+        self._candidate_b_printed_anchor_inventory_complete = False
         self._frozen_logical_pages: dict[int, Any] = {
             int(getattr(page, "page_number", 0) or index): page
             for index, page in enumerate(getattr(parse_result, "pages", None) or [], start=1)
@@ -1660,6 +2406,23 @@ class PersonalDetailExtractionContext:
             self._cache[key] = deepcopy(factory())
         return cast(_T, deepcopy(self._cache[key]))
 
+    def _sealed_printed_monthly_anchor_index(self) -> dict[tuple[int, tuple[str, ...]], dict[str, Any]]:
+        """Publish the original source census independently of detector output."""
+
+        anchors, complete = self.cached(
+            "authenticated_printed_monthly_anchor_inventory",
+            lambda: _authenticated_printed_monthly_anchor_inventory(self),
+        )
+        # Deduplicate only the complete immutable proof. Date ranges, page-local
+        # IDs, detector IDs and transformed boxes alone never identify a grid.
+        inventory = {
+            json.dumps(anchor, sort_keys=True, ensure_ascii=False): deepcopy(anchor)
+            for anchor in anchors.values()
+        }
+        self._candidate_b_printed_anchor_inventory = [inventory[key] for key in sorted(inventory)]
+        self._candidate_b_printed_anchor_inventory_complete = complete is True
+        return anchors
+
     def account_collections(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import _extract_accounts
 
@@ -1693,7 +2456,7 @@ class PersonalDetailExtractionContext:
             BusinessUncertaintyRepairCoordinator,
         )
 
-        coordinator = BusinessUncertaintyRepairCoordinator(self.parse_result)
+        coordinator = BusinessUncertaintyRepairCoordinator(self.parse_result, monthly_context=self)
         plan = coordinator.plan(
             payload,
             canonical_audit=self.canonical_layout_audit(),
@@ -2074,6 +2837,38 @@ class PersonalDetailExtractionContext:
                     retained_lines.append(line)
                 return retained_lines + exact_tokens
 
+            def monthly_coordinate_lines(
+                page: int,
+                values: Iterable[Mapping[str, Any]],
+            ) -> list[dict[str, Any]]:
+                """Expose one coordinate page while retaining fragment origin."""
+
+                normalized: list[dict[str, Any]] = []
+                for value in values:
+                    line = deepcopy(dict(value))
+                    coordinate_page = line.get("coordinate_logical_page")
+                    if coordinate_page is None:
+                        normalized.append(line)
+                        continue
+                    if (
+                        not isinstance(coordinate_page, int)
+                        or isinstance(coordinate_page, bool)
+                        or coordinate_page != page
+                    ):
+                        # A transformed line claiming another coordinate frame
+                        # cannot safely enter this page-local reconstruction.
+                        continue
+                    source_origin = line.get("source_logical_page")
+                    if (
+                        isinstance(source_origin, int)
+                        and not isinstance(source_origin, bool)
+                        and source_origin > 0
+                    ):
+                        line["source_origin_logical_page"] = source_origin
+                    line["source_logical_page"] = coordinate_page
+                    normalized.append(line)
+                return normalized
+
             observed_pages: set[int] = set()
             for bundle in detached.get("_page_evidence_bundles") or []:
                 if not isinstance(bundle, dict):
@@ -2084,7 +2879,7 @@ class PersonalDetailExtractionContext:
                 if canonical is None:
                     continue
                 observed_pages.add(page)
-                lines = deepcopy(list(canonical.get("lines") or []))
+                lines = monthly_coordinate_lines(page, canonical.get("lines") or ())
                 if not isinstance(local, dict):
                     local = {}
                     bundle["local_structure_evidence"] = local
@@ -2126,7 +2921,7 @@ class PersonalDetailExtractionContext:
             for page, canonical in canonical_pages.items():
                 if page in observed_pages:
                     continue
-                lines = deepcopy(list(canonical.get("lines") or []))
+                lines = monthly_coordinate_lines(page, canonical.get("lines") or ())
                 detached.setdefault("_page_evidence_bundles", []).append(
                     {
                         "page": page,
@@ -2185,10 +2980,20 @@ class PersonalDetailExtractionContext:
             # ranges that canonical registration may have missed.
             source_baseline = deepcopy(_domain_specific(self.parse_result))
             source_baseline.pop("credit_repayment_records", None)
+            printed_anchors = self._sealed_printed_monthly_anchor_index()
             for bundle in source_baseline.get("_page_evidence_bundles") or []:
                 if isinstance(bundle, dict):
                     bundle.pop("micro_grid_structures", None)
                     strip_cross_page_augmentation(bundle)
+                    for evidence_key in ("local_structure_evidence", "micro_grid_evidence"):
+                        evidence = bundle.get(evidence_key)
+                        if isinstance(evidence, dict):
+                            evidence["lines"] = _lines_with_printed_monthly_anchors(
+                                evidence.get("lines") or (),
+                                logical_page=bundle.get("page"),
+                                source_page=bundle.get("source_page_number", evidence.get("source_page")),
+                                anchors=printed_anchors,
+                            )
             if cross_page_order_authoritative:
                 augment_credit_repayment_evidence_bundles(
                     source_baseline,
@@ -2210,6 +3015,7 @@ class PersonalDetailExtractionContext:
             # owner is proven; no detached status value enters business rows.
             self._candidate_b_monthly_source_structure_grids = deepcopy(source_structure_grids)
             self._candidate_b_monthly_source_structure_records = deepcopy(source_structure_records)
+            self._candidate_b_printed_grid_census_required = True
             source_structure_count = len(source_structure_records)
 
             def exact_monthly_key(
@@ -2259,13 +3065,18 @@ class PersonalDetailExtractionContext:
                     source_records_by_key.setdefault(key, []).append(record)
             source_keys = set(source_records_by_key)
             missing_source_keys = source_keys - canonical_keys
+            # Grid IDs are parser-local. Physical aliases cannot be collapsed
+            # safely until the relationship layer has proved one unique
+            # account owner for both positions, so this early structural
+            # ledger intentionally retains every missing key.
+            unreconciled_source_keys = missing_source_keys
             grids_by_id = {
                 str(grid.get("grid_id") or ""): grid
                 for grid in source_structure_grids
                 if isinstance(grid, Mapping) and str(grid.get("grid_id") or "")
             }
-            for grid_id in sorted({key[0] for key in missing_source_keys}):
-                localized_keys = sorted(key for key in missing_source_keys if key[0] == grid_id)
+            for grid_id in sorted({key[0] for key in unreconciled_source_keys}):
+                localized_keys = sorted(key for key in unreconciled_source_keys if key[0] == grid_id)
                 report_localized_monthly_omissions(
                     self,
                     issue_code="canonical_monthly_source_structure_missing_field",
@@ -2292,7 +3103,7 @@ class PersonalDetailExtractionContext:
             # printed ranges are not implied months.  Report only the detached
             # source-position delta here; the relationship layer owns the
             # unique account/month reconciliation and the public denominator.
-            unreconciled_source_position_count = len(missing_source_keys)
+            unreconciled_source_position_count = len(unreconciled_source_keys)
             if unreconciled_source_position_count:
                 from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
                     make_issue,
@@ -2497,6 +3308,7 @@ class PersonalDetailExtractionContext:
 
     def _build_source_evidence_pages(self) -> list[dict[str, Any]]:
         domain_specific = _domain_specific(self.parse_result)
+        printed_anchors = self._sealed_printed_monthly_anchor_index()
         pages: list[dict[str, Any]] = []
         for bundle in domain_specific.get("_page_evidence_bundles") or []:
             if not isinstance(bundle, dict):
@@ -2504,7 +3316,12 @@ class PersonalDetailExtractionContext:
             local = bundle.get("local_structure_evidence")
             if not isinstance(local, dict):
                 continue
-            lines = [dict(line) for line in local.get("lines") or [] if isinstance(line, dict)]
+            lines = _lines_with_printed_monthly_anchors(
+                local.get("lines") or (),
+                logical_page=bundle.get("page", local.get("page")),
+                source_page=bundle.get("source_page_number", local.get("source_page")),
+                anchors=printed_anchors,
+            )
             if not lines:
                 continue
             pages.append(

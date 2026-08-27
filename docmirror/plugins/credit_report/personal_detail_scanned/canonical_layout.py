@@ -5494,8 +5494,12 @@ def _project_table(
     transform: Callable[[Sequence[float]], list[float]],
 ) -> Any:
     metadata = deepcopy(dict(getattr(table, "metadata", None) or {}))
+    source_geometry = metadata.get("geometry")
+    source_geometry = deepcopy(dict(source_geometry)) if isinstance(source_geometry, Mapping) else {}
     rows = _raw_rows(table)
     cell_boxes = metadata.get("cell_bboxes")
+    if not isinstance(cell_boxes, list):
+        cell_boxes = source_geometry.get("cell_bboxes")
     table_rows = list(getattr(table, "rows", None) or ())
     row_offset = 1 if getattr(table, "headers", None) and len(rows) == len(table_rows) + 1 else 0
     source_cell_objects: list[list[Any]] | None = None
@@ -5558,16 +5562,153 @@ def _project_table(
             cell_boxes = metadata.get("cell_bboxes")
     if rows:
         metadata["raw_rows"] = rows
+    table_box = _bbox(table)
+
+    def transformed_bbox(value: Any) -> list[float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            box = tuple(float(coordinate) for coordinate in value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not all(math.isfinite(coordinate) for coordinate in box)
+            or box[2] <= box[0]
+            or box[3] <= box[1]
+        ):
+            return None
+        return transform(box)
+
+    def transformed_bands(value: Any, *, axis: str) -> Any:
+        if not isinstance(value, list):
+            return deepcopy(value)
+        projected: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                return []
+            band = deepcopy(dict(item))
+            raw_band_bbox = band.get("bbox")
+            if isinstance(raw_band_bbox, (list, tuple)) and len(raw_band_bbox) == 4:
+                projected_bbox = transformed_bbox(raw_band_bbox)
+                if projected_bbox is None:
+                    return []
+                band["bbox"] = projected_bbox
+                if axis == "row":
+                    band["y0"], band["y1"] = projected_bbox[1], projected_bbox[3]
+                else:
+                    band["x0"], band["x1"] = projected_bbox[0], projected_bbox[2]
+            elif table_box is not None:
+                try:
+                    source_band_bbox = (
+                        (table_box[0], float(band["y0"]), table_box[2], float(band["y1"]))
+                        if axis == "row"
+                        else (float(band["x0"]), table_box[1], float(band["x1"]), table_box[3])
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return []
+                projected_bbox = transform(source_band_bbox)
+                band["bbox"] = projected_bbox
+                if axis == "row":
+                    band["y0"], band["y1"] = projected_bbox[1], projected_bbox[3]
+                else:
+                    band["x0"], band["x1"] = projected_bbox[0], projected_bbox[2]
+            else:
+                # Axis-only bands cannot be projected without an orthogonal
+                # table extent. Keep them on the raw plane only.
+                return []
+            projected.append(band)
+        return projected
+
+    def transformed_rules(value: Any, *, axis: str) -> Any:
+        if not isinstance(value, list) or table_box is None:
+            return []
+        projected: list[Any] = []
+        for item in value:
+            raw_coordinate = item
+            if isinstance(item, Mapping):
+                raw_coordinate = item.get(axis)
+                if raw_coordinate is None:
+                    raw_coordinate = item.get("position")
+            try:
+                coordinate = float(raw_coordinate)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(coordinate):
+                return []
+            source_rule_bbox = (
+                (coordinate, table_box[1], coordinate, table_box[3])
+                if axis == "x"
+                else (table_box[0], coordinate, table_box[2], coordinate)
+            )
+            projected_bbox = transform(source_rule_bbox)
+            projected_coordinate = projected_bbox[0] if axis == "x" else projected_bbox[1]
+            if isinstance(item, Mapping):
+                rule = deepcopy(dict(item))
+                if axis in rule:
+                    rule[axis] = projected_coordinate
+                elif "position" in rule:
+                    rule["position"] = projected_coordinate
+                else:
+                    rule[axis] = projected_coordinate
+                projected.append(rule)
+            else:
+                projected.append(projected_coordinate)
+        return projected
+
+    canonical_geometry = deepcopy(source_geometry)
     if isinstance(cell_boxes, list):
-        metadata["source_cell_bboxes"] = deepcopy(cell_boxes)
-        metadata["cell_bboxes"] = [
-            [transform(box) if isinstance(box, (list, tuple)) and len(box) == 4 else box for box in row]
-            if isinstance(row, list)
-            else row
+        projected_cell_boxes = [
+            [transformed_bbox(box) for box in row] if isinstance(row, list) else deepcopy(row)
             for row in cell_boxes
         ]
+        metadata["source_cell_bboxes"] = deepcopy(cell_boxes)
+        metadata["cell_bboxes"] = projected_cell_boxes
+        canonical_geometry["cell_bboxes"] = deepcopy(projected_cell_boxes)
+        canonical_geometry["source_cell_bboxes"] = deepcopy(cell_boxes)
+    for key in (
+        "cell_geometry_status",
+        "cell_geometry_loss_reason",
+        "cell_spans",
+        "cell_evidence_ids",
+        "cell_token_ids",
+        "cell_confidences",
+        "cell_geometry_confidences",
+        "geometry_source",
+        "coordinate_system",
+    ):
+        value = metadata.get(key, source_geometry.get(key))
+        if value is not None:
+            canonical_geometry[key] = deepcopy(value)
+            metadata[key] = deepcopy(value)
+    for key, axis in (("row_bands", "row"), ("col_bands", "col")):
+        value = metadata.get(key, source_geometry.get(key))
+        projected = transformed_bands(value, axis=axis)
+        if value is not None:
+            metadata[f"source_{key}"] = deepcopy(value)
+            metadata[key] = deepcopy(projected)
+            canonical_geometry[key] = deepcopy(projected)
+    for key, axis in (("vertical_lines", "x"), ("horizontal_lines", "y")):
+        value = metadata.get(key, source_geometry.get(key))
+        projected = transformed_rules(value, axis=axis)
+        if value is not None:
+            metadata[f"source_{key}"] = deepcopy(value)
+            metadata[key] = deepcopy(projected)
+            canonical_geometry[key] = deepcopy(projected)
+    canonical_geometry["coordinate_system"] = str(
+        canonical_geometry.get("coordinate_system") or "pdf_points_top_left"
+    )
+    if table_box is not None:
+        canonical_geometry["table_bbox"] = transform(table_box)
+    source_origin = transform((0.0, 0.0, 0.0, 0.0))
+    source_unit = transform((1.0, 1.0, 1.0, 1.0))
+    metadata["source_to_canonical_affine"] = {
+        "scale_x": float(source_unit[0]) - float(source_origin[0]),
+        "scale_y": float(source_unit[1]) - float(source_origin[1]),
+        "offset_x": float(source_origin[0]),
+        "offset_y": float(source_origin[1]),
+    }
+    metadata["canonical_geometry"] = canonical_geometry
     metadata["canonical_template_id"] = template_id
-    table_box = _bbox(table)
     return SimpleNamespace(
         table_id=str(getattr(table, "table_id", "") or ""),
         metadata=metadata,
@@ -6452,6 +6593,7 @@ class PBOCCanonicalTemplateAssembler:
                         template_id=table_template_id,
                         transform=transform,
                     )
+                    projected.metadata["coordinate_logical_page"] = representative
                     projected.metadata["source_logical_page"] = logical
                     projected.metadata["source_page"] = int(local_evidence.get("source_page") or logical)
                     if isinstance(section_owner, Mapping):
@@ -6472,6 +6614,7 @@ class PBOCCanonicalTemplateAssembler:
                         "source_bbox": list(box),
                         "bbox": transform(box),
                         "page": representative,
+                        "coordinate_logical_page": representative,
                         "source_logical_page": logical,
                         "canonical_page": int(group["canonical_page"]),
                         "canonical_template_id": template_id,
@@ -6489,6 +6632,7 @@ class PBOCCanonicalTemplateAssembler:
                     if str(value or "")
                 ],
                 source_bbox=list(line.get("source_bbox") or line.get("bbox") or []),
+                coordinate_logical_page=int(line.get("coordinate_logical_page") or representative),
                 source_logical_page=int(line.get("source_logical_page") or representative),
             )
             for line in output_lines

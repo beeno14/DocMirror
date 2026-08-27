@@ -180,9 +180,11 @@ def test_community_json_orders_statement_header_before_transactions(monkeypatch)
     assert {
         key: header["normalized"][key] for key in expected_header_values
     } == expected_header_values
-    assert header["raw"]["币种"] == "人民币"
-    assert header["canonical_raw"]["currency"] == "人民币"
-    assert header["source"]["field_sources"]["account_number"]["evidence_ids"] == [
+    internal_header = bundle.semantic_payload()["datasets"][0]["rows"][0]
+    assert "raw" not in header and "canonical_raw" not in header
+    assert internal_header["raw"]["币种"] == "人民币"
+    assert internal_header["canonical_raw"]["currency"] == "人民币"
+    assert internal_header["source"]["field_sources"]["account_number"]["evidence_ids"] == [
         "header:p1:账号"
     ]
     assert "style_id" not in header["normalized"]
@@ -191,12 +193,13 @@ def test_community_json_orders_statement_header_before_transactions(monkeypatch)
     transaction = payload["datasets"][1]["rows"][0]["normalized"]
     assert payload["datasets"][1]["foreign_keys"] == [
         {
-            "columns": ["statement_header_id"],
+            "columns": ["extraction.statement_header_id"],
             "reference_dataset": "statement_header",
-            "reference_columns": ["record_id"],
+            "reference_columns": ["extraction.record_id"],
         }
     ]
-    assert transaction["statement_header_id"] == header["record_id"]
+    assert "statement_header_id" not in transaction
+    assert payload["datasets"][1]["rows"][0]["extraction"]["statement_header_id"] == header["extraction"]["record_id"]
     assert transaction["own_account"] == "3211020801201000170968"
     assert transaction["account_holder"] == "测试工具有限公司"
     assert transaction["currency"] == "CNY"
@@ -206,6 +209,43 @@ def test_community_json_orders_statement_header_before_transactions(monkeypatch)
     assert transaction["print_date"] == "2023-08-24"
     assert validate_projection_payload("community", payload).valid
     assert bundle.conservation_issues(payload=payload) == []
+
+
+def test_digital_bank_unmasks_all_identifier_fields_and_scanned_default_is_unchanged(monkeypatch) -> None:
+    from docmirror.output.community_bundle import render_community_reading_markdown
+    from docmirror.server.output_builder import materialize_community_bundle
+
+    result = _synthetic_extract_result()
+    identifiers = {
+        "account_number": ("账号", "3211020801201000170968"),
+        "card_number": ("卡号", "6222123400005678901"),
+        "internal_account": ("内部账号", "000123459876"),
+        "customer_number": ("客户号", "000123456789"),
+        "id_number": ("证件号码", "110101199001021234"),
+    }
+    for key, (label, value) in identifiers.items():
+        result.identity_fields[key] = _detail(label, value)
+    projection, bundle, payload = _project_synthetic_result(monkeypatch, _parse_result(), result)
+    assert projection.semantic["enhanced_markdown"]["privacy_mode"] == "full"
+    assert payload["reading"]["privacy_mode"] == "full"
+    replay = materialize_community_bundle(payload, ParseResult())
+    assert replay.json_payload() == payload
+    def reject_application_mask(_value):
+        raise AssertionError("digital-bank Markdown must not invoke masking")
+
+    monkeypatch.setattr("docmirror.output.community_bundle._masked_display", reject_application_mask)
+    for markdown in (
+        bundle.render_enhanced_markdown(),
+        render_community_reading_markdown(payload),
+        replay.render_enhanced_markdown(),
+    ):
+        for _label, value in identifiers.values():
+            assert value in markdown
+    result.extraction_route = BankExtractionRoute.SCANNED
+    scanned, _, scanned_payload = _project_synthetic_result(monkeypatch, _parse_result(), result)
+    assert "enhanced_markdown" not in scanned.semantic
+    assert "privacy_mode" not in scanned_payload["reading"]
+    assert scanned_payload["schema"]["version"] == "3.0.0"
 
 
 def test_normalized_only_source_period_envelope_preserves_exact_header_components(monkeypatch) -> None:
@@ -267,27 +307,29 @@ def test_normalized_only_source_period_envelope_preserves_exact_header_component
     assert header["normalized"]["query_period"] == "2023-06-01 ~ 2023-07-31"
     assert header["normalized"]["period_start"] == "2023-06-01"
     assert header["normalized"]["period_end"] == "2023-07-31"
-    assert header["canonical_raw"]["period_start"] == "20230601"
-    assert header["canonical_raw"]["period_end"] == "20230731"
-    assert "query_period" not in header["canonical_raw"]
-    assert "query_period" not in header["raw"]
-    assert "source period components" not in header["raw"]
-    assert json.loads(header["raw"]["起始日期"]) == [
+    internal_header = bundle.semantic_payload()["datasets"][0]["rows"][0]
+    assert "raw" not in header and "canonical_raw" not in header
+    assert internal_header["canonical_raw"]["period_start"] == "20230601"
+    assert internal_header["canonical_raw"]["period_end"] == "20230731"
+    assert "query_period" not in internal_header["canonical_raw"]
+    assert "query_period" not in internal_header["raw"]
+    assert "source period components" not in internal_header["raw"]
+    assert json.loads(internal_header["raw"]["起始日期"]) == [
         {"page": 1, "value": "20230601"},
         {"page": 2, "value": "20230701"},
     ]
-    assert json.loads(header["raw"]["截止日期"]) == [
+    assert json.loads(internal_header["raw"]["截止日期"]) == [
         {"page": 1, "value": "20230630"},
         {"page": 2, "value": "20230731"},
     ]
-    period_source = header["source"]["field_sources"]["query_period"]
+    period_source = internal_header["source"]["field_sources"]["query_period"]
     assert period_source["source"] == "canonical_evidence_atoms"
     assert period_source["derivation"] == "source_period_envelope"
     assert period_source["normalized_only"] is True
     assert period_source["component_count"] == 2
     assert period_source["evidence_ids"] == ["p1-start", "p1-end", "p2-start", "p2-end"]
-    assert header["source"]["field_sources"]["period_start"]["evidence_ids"] == ["p1-start", "p1-end"]
-    assert header["source"]["field_sources"]["period_end"]["evidence_ids"] == ["p2-start", "p2-end"]
+    assert internal_header["source"]["field_sources"]["period_start"]["evidence_ids"] == ["p1-start", "p1-end"]
+    assert internal_header["source"]["field_sources"]["period_end"]["evidence_ids"] == ["p2-start", "p2-end"]
     assert validate_projection_payload("community", payload).valid
     assert bundle.conservation_issues(payload=payload) == []
 
@@ -354,17 +396,19 @@ def test_promoted_signed_transaction_preserves_business_fields_and_source(monkey
     projection, bundle, payload = _project_synthetic_result(monkeypatch, parse_result, result)
     projected_transaction = projection.datasets["records"][0]
     transaction = payload["datasets"][1]["rows"][0]
+    internal_transaction = bundle.semantic_payload()["datasets"][1]["rows"][0]
 
     assert projected_transaction["normalized"]["amount"] == 25.0
     assert projected_transaction["normalized"]["direction"] == "expense"
-    assert transaction["raw"]["业务类型"] == "商户清算"
-    assert transaction["raw"]["票据号"] == "20231007C106320166"
-    assert transaction["raw"]["借方/贷方金额"] == "-25.00"
-    assert transaction["raw"]["对手户名"] == "上海测试科技有限公司"
-    assert transaction["canonical_raw"]["transaction_name"] == "商户清算"
-    assert transaction["canonical_raw"]["voucher_number"] == "20231007C106320166"
-    assert transaction["canonical_raw"]["amount"] == "-25.00"
-    assert transaction["canonical_raw"]["counter_party"] == "上海测试科技有限公司"
+    assert "raw" not in transaction and "canonical_raw" not in transaction
+    assert internal_transaction["raw"]["业务类型"] == "商户清算"
+    assert internal_transaction["raw"]["票据号"] == "20231007C106320166"
+    assert internal_transaction["raw"]["借方/贷方金额"] == "-25.00"
+    assert internal_transaction["raw"]["对手户名"] == "上海测试科技有限公司"
+    assert internal_transaction["canonical_raw"]["transaction_name"] == "商户清算"
+    assert internal_transaction["canonical_raw"]["voucher_number"] == "20231007C106320166"
+    assert internal_transaction["canonical_raw"]["amount"] == "-25.00"
+    assert internal_transaction["canonical_raw"]["counter_party"] == "上海测试科技有限公司"
     assert transaction["normalized"]["transaction_name"] == "商户清算"
     assert transaction["normalized"]["voucher_number"] == "20231007C106320166"
     assert transaction["normalized"]["amount"] == "25.0"
@@ -372,7 +416,7 @@ def test_promoted_signed_transaction_preserves_business_fields_and_source(monkey
     assert transaction["normalized"]["counter_party"] == "上海测试科技有限公司"
     for key, value in source.items():
         assert projected_transaction["source"][key] == value
-        assert transaction["source"][key] == value
+        assert internal_transaction["source"][key] == value
     assert validate_projection_payload("community", payload).valid
     assert bundle.conservation_issues(payload=payload) == []
 
@@ -454,3 +498,30 @@ def test_explicit_source_issuer_overrides_internal_routing_hint(monkeypatch) -> 
     assert projection.entity_fields["organization"] == "测试银行"
     assert projection.datasets["statement_header"][0]["normalized"]["bank_name"] == "测试银行"
     assert "错误路由银行" not in projection.content_markdown_override
+
+
+def test_digital_bank_enables_compact_export_without_pruning_extracted_records(monkeypatch) -> None:
+    projection, bundle, payload = _project_synthetic_result(
+        monkeypatch, _parse_result(), _synthetic_extract_result()
+    )
+    assert bundle.compact_output["omit_absent_fields"] is True
+    assert bundle.compact_output["minify_json"] is True
+    assert bundle.compact_output["normalized_only"] is True
+    assert bundle.compact_output["business_view"] is True
+    assert payload["schema"]["version"] == "5.0.0"
+    header = payload["datasets"][0]
+    assert "omitted_normalized_fields" not in header
+    assert "wechat_id" not in header["rows"][0]["normalized"]
+    assert "wechat_id" not in {column["key"] for column in header["columns"]}
+    assert "wechat_id" in {column["key"] for column in bundle.datasets[0].public["columns"]}
+    assert bundle.datasets[0].rows == projection.datasets["statement_header"]
+    assert "account_number" in header["rows"][0]["normalized"]
+
+
+def test_scanned_bank_keeps_existing_dense_export_default(monkeypatch) -> None:
+    result = _synthetic_extract_result()
+    result.extraction_route = BankExtractionRoute.SCANNED
+    _projection, bundle, payload = _project_synthetic_result(monkeypatch, _parse_result(), result)
+    assert bundle.compact_output == {}
+    assert "omitted_normalized_fields" not in payload["datasets"][0]
+    assert payload["datasets"][0]["rows"][0]["normalized"]["wechat_id"] is None

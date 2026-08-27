@@ -17,10 +17,16 @@ preserves the production-only topology that helper-style alias tests miss:
 * retained canonical refs have rejected geometry, while the detached alias has
   exact cell boxes and no ``source_page``.
 
+The deficient original remains a fail-closed case: the signed four-row oracle
+does not itself supply the missing physical evidence to the pipeline.  A
+separate, explicitly simulated full-provenance variant supplies four complete
+status/amount pairs.  It retains the detached cell boxes above, adds a simulated
+pair for pt_10_0, and aligns the account/grid bounds to that coordinate plane.
+The values are held constant to isolate ownership and population, not to assert
+OCR accuracy for those cells.
+
 The tests enter through the real orchestration planner, relationship producer,
-source-projection ledger, and final schema projector.  They are intentionally
-stronger than helper-only consumer fixtures and may remain red while production
-source changes are frozen.
+source-projection ledger, and final schema projector without running a PDF.
 """
 
 from __future__ import annotations
@@ -211,6 +217,43 @@ def _lin_p10_detached_cell_refs(
     raise AssertionError((grid_id, performance_month))
 
 
+def _lin_p10_complete_cell_refs(
+    table_id: str,
+    grid_id: str,
+    performance_month: str,
+    *,
+    source: str,
+) -> list[dict[str, object]]:
+    """Supply a declared full-provenance simulation, not repaired saved output."""
+
+    assert performance_month in LIN_P10_SIGNED_SOURCE_TABLE_MONTHS[table_id]
+    if table_id == "pt_10_0":
+        # No exact month cell for this table survived in the minimized corpus.
+        # This pair is deliberately simulated one table above the retained
+        # pt_10_1 cells, rather than presented as an observed real-PDF repair.
+        refs = _lin_exact_cell_refs(
+            grid_id,
+            performance_month=performance_month,
+            status_bbox=[291.3333333333333, 274.5, 316.375, 296.0],
+            amount_bbox=[291.3333333333333, 289.5, 316.375, 312.5],
+        )
+    else:
+        detector_id = LIN_P10_GRID_0 if table_id == "pt_10_1" else LIN_P10_GRID_1
+        refs = _lin_p10_detached_cell_refs(detector_id, performance_month)
+    for ref in refs:
+        ref.update(
+            {
+                "grid_id": grid_id,
+                "source_page": 5,
+                "source_logical_page": 10,
+                "table_id": table_id,
+                "geometry_status": "exact",
+                "source": source,
+            }
+        )
+    return refs
+
+
 def _lin_rejected_canonical_ref(
     grid_id: str,
     performance_month: str,
@@ -273,10 +316,19 @@ def _lin_source_structure_month_row(
     }
 
 
-def _lin_detached_issue_trio() -> list[dict[str, object]]:
+def _lin_detached_issue_trio(
+    *,
+    fully_sourced: bool = False,
+) -> list[dict[str, object]]:
     grid_id = LIN_P10_GRID_0
     performance_month = "2020-10"
-    raw_refs = _lin_p10_detached_cell_refs(grid_id, performance_month)
+    raw_refs = (
+        _lin_p10_complete_cell_refs(
+            "pt_10_1", grid_id, performance_month, source="source_table_geometry"
+        )
+        if fully_sourced
+        else _lin_p10_detached_cell_refs(grid_id, performance_month)
+    )
 
     def localized_ref(index: int, field_name: str) -> dict[str, object]:
         ref = deepcopy(raw_refs[index])
@@ -330,7 +382,7 @@ def _lin_detached_issue_trio() -> list[dict[str, object]]:
     ]
 
 
-def _lin_p10_producer_result() -> tuple[
+def _lin_p10_producer_result(*, fully_sourced: bool = False) -> tuple[
     list[dict[str, object]], SimpleNamespace
 ]:
     accounts = [
@@ -386,8 +438,39 @@ def _lin_p10_producer_result() -> tuple[
         _lin_source_structure_month_row(LIN_P10_GRID_0, "2020-10"),
         _lin_source_structure_month_row(LIN_P10_GRID_1, "2020-10"),
     ]
+    if fully_sourced:
+        accounts = [
+            _lin_account(LIN_ACCOUNT_16, minimum=200.0, maximum=330.0),
+            _lin_account(LIN_ACCOUNT_17, minimum=330.0, maximum=430.0),
+            _lin_account(LIN_ACCOUNT_18, minimum=430.0, maximum=540.0),
+        ]
+        canonical_tables = {
+            LIN_P10_GRID_0: "pt_10_0",
+            LIN_P10_GRID_1: "pt_10_1",
+            LIN_P10_GRID_2: "pt_10_2",
+        }
+        detached_tables = {
+            LIN_P10_GRID_0: "pt_10_1",
+            LIN_P10_GRID_1: "pt_10_2",
+        }
+        table_tops = {"pt_10_0": 254.5, "pt_10_1": 354.5, "pt_10_2": 454.5}
+        for grids, rows, tables, source in (
+            (canonical_grids, canonical_rows, canonical_tables, "repayment_grid"),
+            (detached_grids, detached_rows, detached_tables, "source_table_geometry"),
+        ):
+            for grid in grids:
+                top = table_tops[tables[grid["grid_id"]]]
+                grid["bbox"] = [42.0, top, 397.5, top + 62.0]
+            for row in rows:
+                grid_id = row["grid_id"]
+                performance_month = f"{int(row['year']):04d}-{int(row['month']):02d}"
+                row["source_cell_refs"] = _lin_p10_complete_cell_refs(
+                    tables[grid_id], grid_id, performance_month, source=source
+                )
     context = SimpleNamespace(
-        _personal_detail_extraction_issues=_lin_detached_issue_trio(),
+        _personal_detail_extraction_issues=_lin_detached_issue_trio(
+            fully_sourced=fully_sourced
+        ),
         _candidate_b_monthly_source_structure_grids=detached_grids,
         _candidate_b_monthly_source_structure_records=detached_rows,
     )
@@ -401,8 +484,8 @@ def _lin_p10_producer_result() -> tuple[
     return linked, context
 
 
-def _lin_p10_content() -> dict[str, object]:
-    linked, context = _lin_p10_producer_result()
+def _lin_p10_content(*, fully_sourced: bool = False) -> dict[str, object]:
+    linked, context = _lin_p10_producer_result(fully_sourced=fully_sourced)
     return {
         "facts": {},
         "datasets": {
@@ -444,8 +527,8 @@ def _lin_p10_detached_siblings(
     ]
 
 
-def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_rows() -> None:
-    content = _lin_p10_content()
+def test_lin_p10_fully_sourced_topology_conserves_four_physical_rows_and_four_business_rows() -> None:
+    content = _lin_p10_content(fully_sourced=True)
     datasets = content["datasets"]
     linked = datasets["repayment_records"]
     issues = datasets["personal_detail_extraction_issues"]
@@ -493,7 +576,9 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
     assert all(
         ref["geometry_scope"] == "cell"
         and "bbox" in ref
-        and "source_page" not in ref
+        and ref["source_page"] == 5
+        and ref["source_logical_page"] == 10
+        and ref["table_id"] == "pt_10_1"
         for ref in exact_alias["source_refs"]
     )
     retained_october = next(
@@ -502,24 +587,34 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
         if row["account_id"] == LIN_ACCOUNT_17 and row["month"] == 10
     )
     assert retained_october["grid_id"] == LIN_P10_GRID_1
-    assert retained_october["source_cell_refs"][0]["geometry_scope"] == "logical_page"
-    assert retained_october["source_cell_refs"][0]["geometry_status"] == "unresolved"
-    assert "bbox" not in retained_october["source_cell_refs"][0]
+    assert len(retained_october["source_cell_refs"]) == 2
+    assert all(
+        ref["geometry_scope"] == "cell"
+        and ref["geometry_status"] == "exact"
+        and ref["table_id"] == "pt_10_1"
+        for ref in retained_october["source_cell_refs"]
+    )
 
     prepared = prepare_personal_detail_source_collections(content)
     closure = prepared["facts"]["personal_detail_account_month_closure"]
     assert closure["candidate_identity_count"] == 4
     assert closure["expected_identity_count"] == 4
-    assert closure["source_month_position_observations"] == 5
+    # Reused detector IDs yield seven (detector position, physical pair)
+    # observations, not five unique detector keys and not seven real rows.
+    assert closure["source_month_position_observations"] == 7
     assert closure["raw_source_month_positions"] == 4
     assert closure["unique_physical_source_month_positions"] == 4
     assert closure["owner_bound_account_months"] == 4
     assert closure["owner_unresolved_positions"] == 0
     assert closure["alias_source_month_positions"] == 3
-    assert closure["physical_alias_source_month_observations"] == 1
+    assert closure["physical_alias_source_month_observations"] == 3
     assert closure["physical_owner_conflict_free"] is True
     assert closure["source_position_balance_valid"] is True
     assert closure["status"] == "identity_closed"
+    proof_rows = prepared["datasets"]["_personal_detail_account_month_closure_proof"]
+    assert len(proof_rows) == 1
+    assert proof_rows[0]["expected_identity_count"] == 4
+    assert proof_rows[0]["expected_source_position_count"] == 4
     assert prepared["facts"]["personal_detail_dataset_states"][
         "repayment_records"
     ] == {
@@ -543,6 +638,30 @@ def test_lin_p10_real_topology_conserves_four_physical_rows_and_four_business_ro
     )
 
 
+def test_lin_p10_deficient_excerpt_cannot_claim_the_signed_physical_closure() -> None:
+    content = _lin_p10_content()
+    rows = content["datasets"]["repayment_records"]
+    assert len(rows) == sum(
+        len(months) for months in LIN_P10_SIGNED_SOURCE_TABLE_MONTHS.values()
+    ) == 4
+    assert all(
+        ref["geometry_status"] == "unresolved" and "bbox" not in ref
+        for row in rows
+        for ref in row["source_cell_refs"]
+    )
+
+    prepared = prepare_personal_detail_source_collections(content)
+    closure = prepared["facts"]["personal_detail_account_month_closure"]
+    assert closure["candidate_identity_count"] == 4
+    assert closure["physical_alias_source_month_observations"] == 0
+    assert closure["status"] != "identity_closed"
+    assert closure["source_position_balance_valid"] is True
+    assert "_personal_detail_account_month_closure_proof" not in prepared["datasets"]
+    # Missing provenance cannot establish which reused detector key denotes
+    # which physical table.  A conservative conflict here is not a signed
+    # assertion that the real document itself has conflicting ownership.
+
+
 def test_lin_p10_producer_does_not_leave_resolved_alias_as_active_business_omission() -> None:
     _linked, context = _lin_p10_producer_result()
     active = [
@@ -555,13 +674,13 @@ def test_lin_p10_producer_does_not_leave_resolved_alias_as_active_business_omiss
 
     # Once the same producer emits an exact account/month alias, the earlier
     # detached trio may remain as audit history but must no longer claim that a
-    # business month is missing.  This is expected to be red until the producer
-    # and consumer contracts are changed together.
+    # business month is missing.  This is distinct from proving physical
+    # deduplication across the deficient canonical and detached source planes.
     assert active == []
 
 
 def test_lin_p10_geometry_fallback_survives_when_exact_alias_issue_is_absent() -> None:
-    content = _lin_p10_content()
+    content = _lin_p10_content(fully_sourced=True)
     datasets = content["datasets"]
     issues = datasets["personal_detail_extraction_issues"]
     issues[:] = [
@@ -576,29 +695,17 @@ def test_lin_p10_geometry_fallback_survives_when_exact_alias_issue_is_absent() -
             == "2020-10"
         )
     ]
-    retained = next(
-        row
-        for row in datasets["repayment_records"]
-        if row["account_id"] == LIN_ACCOUNT_17 and row["month"] == 10
-    )
-    retained_refs = _lin_p10_detached_cell_refs(
-        LIN_P10_GRID_0, "2020-10"
-    )
-    for ref in retained_refs:
-        ref["grid_id"] = LIN_P10_GRID_1
-        ref["source_page"] = 5
-    retained["source_cell_refs"] = retained_refs
-
     prepared = prepare_personal_detail_source_collections(content)
     closure = prepared["facts"]["personal_detail_account_month_closure"]
-    assert closure["source_month_position_observations"] == 5
+    assert closure["source_month_position_observations"] == 7
     assert closure["raw_source_month_positions"] == 4
     assert closure["owner_bound_account_months"] == 4
     assert closure["owner_unresolved_positions"] == 0
     assert closure["alias_source_month_positions"] == 2
     assert closure["reconciled_detached_diagnostic_positions"] == 1
-    assert closure["physical_alias_source_month_observations"] == 1
+    assert closure["physical_alias_source_month_observations"] == 3
     assert closure["source_position_balance_valid"] is True
+    assert closure["status"] == "identity_closed"
 
 
 @pytest.mark.parametrize(
@@ -700,7 +807,7 @@ def test_lin_p10_competing_physical_owner_fails_closed_and_withholds_proof() -> 
     assert closure["cross_owner_physical_conflict_count"] >= 1
     assert closure["status"] == "physical_owner_conflict"
     assert closure["source_position_balance_valid"] is True
-    assert "personal_detail_account_month_closure_proof" not in prepared["datasets"]
+    assert "_personal_detail_account_month_closure_proof" not in prepared["datasets"]
     assert any(
         issue.get("issue_code") == "account_month_physical_owner_conflict"
         for issue in prepared["datasets"]["personal_detail_extraction_issues"]
@@ -1079,6 +1186,15 @@ def _lin_p19_native_cell(
         geometry_source="scanned_image_line_grid",
         evidence_ids=evidence_ids,
         token_ids=list(evidence_ids),
+        source_cell_refs=[
+            {
+                "page": 19,
+                "table_id": "pt_19_0",
+                "row": row,
+                "raw_row": row,
+                "col": col,
+            }
+        ],
     )
 
 
@@ -1180,7 +1296,8 @@ def _lin_p19_native_table() -> SimpleNamespace:
         table_id="pt_19_0",
         bbox=[x_edges[0], y_edges[0], x_edges[-1], y_edges[-1]],
         extraction_layer="scanned_image_line_grid",
-        metadata={"geometry": geometry},
+        metadata={"geometry": geometry, "preserve_headers": False},
+        headers=[],
         rows=[
             *leading_rows,
             SimpleNamespace(cells=header_cells),

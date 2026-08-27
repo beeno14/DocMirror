@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from docmirror.plugins.credit_report.source_table_month_lattice import (
+    _rows_follow_horizontal_rules,
+    _vertical_edges,
     detached_source_table_geometry_by_page,
     resolve_unique_source_table_year_plus_twelve_ownership,
     resolve_unique_source_table_year_plus_twelve_ownership_from_year,
@@ -1151,6 +1153,9 @@ def test_sanitizer_prefers_logical_cell_geometry_and_emits_no_values() -> None:
                     "coordinate_system",
                 }
             },
+            "coordinate_logical_page": 19,
+            "source_logical_page": 7,
+            "source_page": 10,
             "source_cell_bboxes": [[[1.0, 1.0, 2.0, 2.0]]],
         },
         rows=[],
@@ -1165,4 +1170,98 @@ def test_sanitizer_prefers_logical_cell_geometry_and_emits_no_values() -> None:
 
     assert detached["cell_bboxes"][1][8] == geometry["cell_bboxes"][1][8]
     assert detached["source_cell_bboxes"] == [[[1.0, 1.0, 2.0, 2.0]]]
+    assert detached["logical_page"] == 19
+    assert detached["coordinate_logical_page"] == 19
+    assert detached["source_logical_page"] == 7
+    assert detached["source_page"] == 10
     assert not {"text", "raw_rows", "evidence_ids", "token_ids"}.intersection(detached)
+
+
+def test_rule_parsers_preserve_explicit_zero_coordinates() -> None:
+    vertical = [{"x": 0.0, "position": 999.0}] + [
+        {"x": float(index * 10)} for index in range(1, 14)
+    ]
+    assert _vertical_edges({"vertical_lines": vertical}) == tuple(
+        float(index * 10) for index in range(14)
+    )
+
+    row_bands = {
+        0: (0.0, 0.0, 100.0, 10.0),
+        1: (0.0, 10.0, 100.0, 20.0),
+    }
+    assert _rows_follow_horizontal_rules(
+        {
+            "horizontal_lines": [
+                {"y": 0.0, "position": 999.0},
+                {"y": 10.0},
+                {"y": 20.0},
+            ]
+        },
+        row_bands,
+    )
+
+
+@pytest.mark.parametrize("coordinate_page", (0, True, "19", 18))
+def test_resolver_rejects_present_invalid_or_conflicting_coordinate_page(coordinate_page: object) -> None:
+    table = _scanner_table()
+    table["coordinate_logical_page"] = coordinate_page
+    assert resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+        [table],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("coordinate_logical_page", "19"),
+        ("coordinate_logical_page", True),
+        ("coordinate_logical_page", 0),
+        ("coordinate_logical_page", 18),
+        ("source_logical_page", "19"),
+        ("source_logical_page", False),
+        ("source_page", -1),
+    ),
+)
+def test_detacher_does_not_launder_present_invalid_page_markers(key: str, value: object) -> None:
+    geometry = _scanner_table()
+    table = SimpleNamespace(
+        table_id="pt_test_0",
+        bbox=geometry["bbox"],
+        metadata={"geometry": geometry, key: value},
+        rows=[],
+    )
+    page = SimpleNamespace(page_number=19, source_page_number=10, tables=[table])
+    assert detached_source_table_geometry_by_page([page]) == {}
+
+
+def test_detacher_and_lattice_preserve_explicit_canonical_inverse() -> None:
+    geometry = _scanner_table()
+    affine = {"scale_x": 1.25, "scale_y": 0.75, "offset_x": 8.0, "offset_y": 16.0}
+    table = SimpleNamespace(
+        table_id="pt_test_0",
+        bbox=geometry["bbox"],
+        metadata={
+            "canonical_geometry": geometry,
+            "coordinate_logical_page": 19,
+            "source_logical_page": 7,
+            "source_page": 10,
+            "source_to_canonical_affine": affine,
+        },
+        rows=[],
+    )
+    page = SimpleNamespace(page_number=19, source_page_number=10, tables=[table])
+    [detached] = detached_source_table_geometry_by_page([page])[19]
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership_from_year(
+        [detached],
+        logical_page=19,
+        expected_year=2022,
+        active_months=(8,),
+        year_bbox=[50.0, 164.0, 69.0, 187.0],
+    )
+    assert lattice is not None
+    assert lattice.source_logical_page == 7
+    assert lattice.source_to_canonical_affine == (1.25, 0.75, 8.0, 16.0)

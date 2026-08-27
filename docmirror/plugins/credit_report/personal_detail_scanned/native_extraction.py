@@ -20656,6 +20656,7 @@ def _exact_native_table_cell_tokens(
     column: int,
     allowed_span: tuple[int, int] | None = None,
     logical_page: int | None = None,
+    require_raw_tokens: bool = False,
 ) -> tuple[tuple[str, tuple[float, float, float, float], str], ...] | None:
     """Return ordered OCR tokens for one exact native cell.
 
@@ -20759,6 +20760,7 @@ def _exact_native_table_cell_tokens(
         parse_result,
         token_ids,
         logical_page=logical_page,
+        require_raw_tokens=require_raw_tokens,
     )
     if resolved_tokens is None:
         return None

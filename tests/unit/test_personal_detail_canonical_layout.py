@@ -2473,3 +2473,103 @@ def test_projected_canonical_table_preserves_exact_atomic_cell_provenance() -> N
     assert projected.metadata["cell_geometry_confidences"] == [[0.97]]
     assert "source_cell_objects" not in projected.metadata
     assert projected.source_cell_objects == [[cell]]
+
+
+def test_projected_table_keeps_raw_and_canonical_geometry_planes_separate() -> None:
+    table = SimpleNamespace(
+        table_id="affine-grid",
+        headers=[],
+        rows=[],
+        metadata={
+            "geometry": {
+                "coordinate_system": "pdf_points_top_left",
+                "geometry_source": "scanned_image_line_grid",
+                "cell_bboxes": [[[0.0, 10.0, 20.0, 30.0]]],
+                "cell_geometry_status": [["exact"]],
+                "row_bands": [{"index": 0, "y0": 10.0, "y1": 30.0}],
+                "col_bands": [{"index": 0, "x0": 0.0, "x1": 20.0}],
+                "vertical_lines": [
+                    {"x": 0.0, "position": 999.0},
+                    {"x": 20.0},
+                ],
+                "horizontal_lines": [{"y": 10.0}, {"y": 30.0}],
+            }
+        },
+        bbox=[0.0, 10.0, 20.0, 30.0],
+        confidence=0.9,
+    )
+
+    projected = _project_table(
+        table,
+        template_id="affine-template",
+        transform=lambda box: [
+            float(box[0]) * 2.0 + 10.0,
+            float(box[1]) * 3.0 + 20.0,
+            float(box[2]) * 2.0 + 10.0,
+            float(box[3]) * 3.0 + 20.0,
+        ],
+    )
+
+    raw = projected.metadata["geometry"]
+    canonical = projected.metadata["canonical_geometry"]
+    assert raw["cell_bboxes"] == [[[0.0, 10.0, 20.0, 30.0]]]
+    assert raw["vertical_lines"][0]["x"] == 0.0
+    assert canonical["cell_bboxes"] == [[[10.0, 50.0, 50.0, 110.0]]]
+    assert canonical["row_bands"] == [
+        {
+            "index": 0,
+            "y0": 50.0,
+            "y1": 110.0,
+            "bbox": [10.0, 50.0, 50.0, 110.0],
+        }
+    ]
+    assert canonical["col_bands"] == [
+        {
+            "index": 0,
+            "x0": 10.0,
+            "x1": 50.0,
+            "bbox": [10.0, 50.0, 50.0, 110.0],
+        }
+    ]
+    assert canonical["vertical_lines"][0]["x"] == 10.0
+    assert canonical["horizontal_lines"] == [{"y": 50.0}, {"y": 110.0}]
+    assert canonical["table_bbox"] == [10.0, 50.0, 50.0, 110.0]
+    assert projected.metadata["source_to_canonical_affine"] == {
+        "scale_x": 2.0,
+        "scale_y": 3.0,
+        "offset_x": 10.0,
+        "offset_y": 20.0,
+    }
+
+
+def test_projected_table_drops_axis_only_geometry_without_table_extent() -> None:
+    table = SimpleNamespace(
+        table_id="extentless-grid",
+        headers=[],
+        rows=[],
+        metadata={
+            "geometry": {
+                "coordinate_system": "pdf_points_top_left",
+                "cell_bboxes": [[[1.0, 2.0, 3.0, 4.0]]],
+                "row_bands": [{"index": 0, "y0": 2.0, "y1": 4.0}],
+                "col_bands": [{"index": 0, "x0": 1.0, "x1": 3.0}],
+                "vertical_lines": [0.0, 3.0],
+                "horizontal_lines": [2.0, 4.0],
+            }
+        },
+        bbox=None,
+        confidence=0.9,
+    )
+
+    projected = _project_table(
+        table,
+        template_id="extentless-template",
+        transform=lambda box: [float(value) + 10.0 for value in box],
+    )
+
+    canonical = projected.metadata["canonical_geometry"]
+    assert canonical["cell_bboxes"] == [[[11.0, 12.0, 13.0, 14.0]]]
+    assert canonical["row_bands"] == []
+    assert canonical["col_bands"] == []
+    assert canonical["vertical_lines"] == []
+    assert canonical["horizontal_lines"] == []

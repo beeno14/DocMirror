@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://valuemapglobal.github.io/DocMirror/schemas/community_bundle.schema.json",
-  "title": "DocMirror Community Bundle JSON v3",
+  "title": "DocMirror Community Bundle JSON v3 / normalized v4 / business v5",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema", "document", "sections", "datasets", "reading", "files", "warnings"],
+  "required": ["schema", "document", "sections", "datasets", "reading", "files"],
   "properties": {
     "schema": {
       "type": "object",
@@ -12,7 +12,7 @@
       "required": ["name", "version", "edition", "domain", "support_level"],
       "properties": {
         "name": {"const": "docmirror.community"},
-        "version": {"const": "3.0.0"},
+        "version": {"enum": ["3.0.0", "4.0.0", "5.0.0"]},
         "edition": {"const": "community"},
         "domain": {"type": "string", "minLength": 1},
         "support_level": {"enum": ["ga", "beta", "generic", "unsupported"]}
@@ -61,6 +61,15 @@
         "dataset_audit_csv": {"type": "string", "pattern": "_datasets/_audit_cells\\.csv$"}
       }
     },
+    "extraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["route", "warnings"],
+      "properties": {
+        "route": {"const": "digital"},
+        "warnings": {"$ref": "#/properties/warnings"}
+      }
+    },
     "warnings": {
       "type": "array",
       "items": {
@@ -78,7 +87,114 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": {"properties": {"schema": {"properties": {"version": {"const": "5.0.0"}}}}},
+      "then": {
+        "required": ["extraction"],
+        "properties": {
+          "schema": {"properties": {"domain": {"const": "bank_statement"}}},
+          "reading": {
+            "required": ["presentation", "privacy_mode"],
+            "properties": {"presentation": {"const": "bank_business"}, "privacy_mode": {"const": "full"}}
+          },
+          "warnings": false,
+          "datasets": {"items": {"properties": {
+            "primary_key": {"const": "extraction.record_id"},
+            "rows": {"items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["normalized", "extraction"],
+              "properties": {
+                "normalized": {
+                  "type": "object",
+                  "propertyNames": {"not": {"enum": [
+                    "additional_fields", "statement_header_id", "style_id", "style_confidence",
+                    "parser_chain", "institution_hint", "secondary_styles", "reconstruction_source",
+                    "expected_primary_rows", "extracted_rows", "coverage_ratio", "institution_authority",
+                    "pipe_parse_failed", "canonical_expected", "canonical_extracted", "canonical_ratio",
+                    "extract_status", "blo_tables_parsed", "blo_tables_skipped", "extraction_route",
+                    "document_scene_refined", "layout_profile_id_refined", "layout_profile_refine_confidence",
+                    "classification_source", "doc_type_hint_source", "user_doc_type_hint", "user_doc_type_hint_strength",
+                    "mirror_expected_data_rows", "mirror_ltqg_enabled", "mirror_ltqg_export_tables",
+                    "mirror_ltqg_passed_tables", "mirror_ltqg_raw_max_rows", "mirror_ltqg_skipped_tables",
+                    "mirror_quarantined_logical_count", "mirror_quarantined_physical_count"
+                  ]}}
+                },
+                "extraction": {"$ref": "#/$defs/recordExtraction"}
+              }
+            }}
+          }}}
+        }
+      },
+      "else": {
+        "required": ["warnings"],
+        "properties": {
+          "extraction": false,
+          "datasets": {"items": {"properties": {
+            "primary_key": {"const": "record_id"},
+            "rows": {"items": {"required": ["record_id", "source"]}}
+          }}}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"schema": {"properties": {"version": {"const": "3.0.0"}}}}},
+      "then": {
+        "properties": {
+          "datasets": {"items": {"properties": {"rows": {"items": {"required": ["canonical_raw", "raw"]}}}}},
+          "sections": {"items": {
+            "properties": {
+              "items": {"items": {"required": ["raw"]}},
+              "groups": {"items": {"properties": {"items": {"items": {"required": ["raw"]}}}}}
+            }
+          }}
+        }
+      },
+      "else": {
+        "properties": {
+          "datasets": {"items": {"properties": {"rows": {"items": {
+            "properties": {
+              "canonical_raw": false,
+              "raw": false,
+              "normalized": {"properties": {
+                "additional_fields": {"type": "array", "items": {"$ref": "#/$defs/additionalField"}}
+              }}
+            }
+          }}}}},
+          "sections": {"items": {
+            "properties": {
+              "items": {"items": {"properties": {"raw": false}}},
+              "groups": {"items": {"properties": {"items": {"items": {"properties": {"raw": false}}}}}}
+            }
+          }}
+        }
+      }
+    }
+  ],
   "$defs": {
+    "recordExtraction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id"],
+      "properties": {
+        "record_id": {"type": "string", "minLength": 1},
+        "page_range": {"$ref": "#/$defs/pageRange"},
+        "statement_header_id": {"type": "string", "minLength": 1},
+        "confidence": {"type": ["number", "string"]},
+        "review": {"type": "object"}
+      }
+    },
+    "additionalField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": {"type": "string"},
+        "field": {"type": "string", "minLength": 1},
+        "value": {}
+      }
+    },
     "pageRange": {
       "type": "array",
       "prefixItems": [
@@ -91,13 +207,14 @@
       "item": {
         "type": "object",
         "additionalProperties": true,
-      "required": ["key", "label", "value", "raw", "type"],
+      "required": ["key", "label", "value", "type"],
       "properties": {
         "key": {"type": "string", "minLength": 1},
         "label": {"type": "string"},
         "value": {},
         "raw": {"type": "string"},
-        "type": {"enum": ["string", "integer", "decimal", "money", "date", "datetime", "boolean", "enum", "text"]},
+        "additional_values": {"type": "array"},
+        "type": {"enum": ["string", "integer", "decimal", "money", "date", "datetime", "boolean", "enum", "text", "array", "object", "json"]},
         "unit": {"type": "string"}
       }
     },
@@ -145,17 +262,20 @@
       "properties": {
         "key": {"type": "string", "minLength": 1},
         "label": {"type": "string"},
-        "type": {"enum": ["string", "integer", "decimal", "money", "date", "datetime", "boolean", "enum", "text"]},
+        "type": {"enum": ["string", "integer", "decimal", "money", "date", "datetime", "boolean", "enum", "text", "array", "object", "json"]},
         "unit": {"type": "string"},
         "nullable": {"type": "boolean"},
         "raw_available": {"type": "boolean"},
-        "evidence_available": {"type": "boolean"}
+        "evidence_available": {"type": "boolean"},
+        "source_header": {"type": "string"},
+        "source_occurrence": {"type": "integer", "minimum": 1},
+        "canonical_field": {"type": "string", "minLength": 1}
       }
     },
       "record": {
         "type": "object",
         "additionalProperties": true,
-      "required": ["record_id", "normalized", "canonical_raw", "raw", "source"],
+      "required": ["normalized"],
       "properties": {
         "record_id": {"type": "string", "minLength": 1},
         "normalized": {"type": "object", "additionalProperties": true},
@@ -196,12 +316,18 @@
         "csv": {"type": "string", "pattern": "_datasets/[0-9a-z_]+\\.csv$"},
         "row_count": {"type": "integer", "minimum": 0},
         "grain": {"type": "string", "minLength": 1},
-        "primary_key": {"const": "record_id"},
+        "primary_key": {"enum": ["record_id", "extraction.record_id"]},
         "storage_role": {"const": "canonical"},
         "record_path": {"const": "rows"},
         "schema_version": {"const": "1.0"},
         "status": {"enum": ["complete", "empty", "partial", "failed"]},
         "columns": {"type": "array", "items": {"$ref": "#/$defs/column"}},
+        "omitted_normalized_fields": {
+          "type": "array",
+          "description": "Optional source-absent normalized fields omitted from records and the reading view; the column catalog remains complete.",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
         "completeness": {"$ref": "#/$defs/completeness"},
         "rows": {
           "type": "array",
@@ -240,6 +366,7 @@
       "properties": {
         "version": {"const": "1.0"},
         "profile": {"const": "community"},
+        "privacy_mode": {"enum": ["full", "masked"]},
         "document_flow": {"type": "array", "items": {"$ref": "#/$defs/readingFlowEntry"}},
         "tables": {"type": "array", "items": {"$ref": "#/$defs/readingTable"}}
       }

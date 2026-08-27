@@ -44,9 +44,10 @@ def materialize_community_bundle(
     parse_result_schema: str = "docmirror.sealed_parse_result.v1",
 ):
     """Restore Community renderer state and apply request-specific delivery names."""
+    from docmirror.output.bank_business_view import restore_business_records
     from docmirror.output.community_bundle import CommunityBundle, CommunityDataset
 
-    projected = copy.deepcopy(payload)
+    projected = restore_business_records(payload)
     document = dict(projected.get("document") or {})
     if document_id:
         document["id"] = document_id
@@ -87,6 +88,10 @@ def materialize_community_bundle(
         public["csv"] = f"{file_id}_datasets/{csv_name}"
         rows = [row for row in (raw_dataset.get("rows") or []) if isinstance(row, dict)]
         datasets.append(CommunityDataset(public=public, rows=rows))
+    domain = {"compatibility_projection": copy.deepcopy(projected.get("document") or {})}
+    privacy_mode = (projected.get("reading") or {}).get("privacy_mode")
+    if privacy_mode in {"full", "masked"}:
+        domain["extensions"] = {"enhanced_markdown": {"privacy_mode": privacy_mode}}
     return CommunityBundle(
         schema=dict(projected.get("schema") or {}),
         document=document,
@@ -102,7 +107,7 @@ def materialize_community_bundle(
             "projector_id": "community.compatibility_adapter",
             "support_level": str((projected.get("schema") or {}).get("support_level") or "generic"),
         },
-        domain={"compatibility_projection": copy.deepcopy(projected.get("document") or {})},
+        domain=domain,
         diagnostics={"materialized_from_community_json": True},
     )
 

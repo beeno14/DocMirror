@@ -1792,6 +1792,11 @@ def test_repeated_page_object_cannot_remap_suppressed_instance_children() -> Non
     assert suppressed["target_record_id"] == observed[
         "suppressed_table_observation_instance_id"
     ]
+    assert {ref.get("table_id") for ref in suppressed["source_refs"]} == {
+        "same-table"
+    }
+    assert "duplicate_source_observation_suppressed" in suppressed["reason_codes"]
+    assert "source_provenance_retained" in suppressed["reason_codes"]
 
 
 def _attach_exact_inquiry_geometry(table: SimpleNamespace) -> SimpleNamespace:
@@ -1822,11 +1827,6 @@ def _attach_exact_inquiry_geometry(table: SimpleNamespace) -> SimpleNamespace:
         "cell_spans": [],
     }
     return table
-    assert {ref.get("table_id") for ref in suppressed["source_refs"]} == {
-        "same-table"
-    }
-    assert "duplicate_source_observation_suppressed" in suppressed["reason_codes"]
-    assert "source_provenance_retained" in suppressed["reason_codes"]
 
 
 def test_suppressed_unmatched_account_issue_retains_locator_and_nonemission_lifecycle(
