@@ -247,20 +247,61 @@ def _business_text(value: Any) -> str:
 def render_business_markdown(payload: dict[str, Any]) -> str:
     """Readable business tables plus a short, trailing extraction appendix."""
 
-    def shown(value: Any) -> str:
+    # Deferred to avoid the plugin/projector/output import cycle. Public-v5
+    # replay uses the same dictionary without rebuilding semantic/extraction data.
+    from docmirror.plugins.bank_statement.community_plugin import BANK_DATA_DICTIONARY
+
+    dictionary = BANK_DATA_DICTIONARY
+
+    def field_label(key: str, descriptor: dict[str, Any], dataset_name: str = "") -> str:
+        label = str(descriptor.get("label") or key)
+        canonical = str(descriptor.get("canonical_field") or key)
+        source_header = descriptor.get("source_header")
+        if source_header is not None and source_header not in {canonical, "unlabelled_header_period"}:
+            return label  # A genuine source heading is not a generated fallback.
+        spec = (dictionary.get("datasets", {}).get(dataset_name, {}).get("columns", {}).get(canonical)
+                or dictionary.get("record_columns", {}).get(canonical)
+                or dictionary.get("fields", {}).get(canonical) or {})
+        translated = spec.get("label")
+        if not translated:
+            return label
+        if source_header is not None:
+            suffix = re.search(r"（原文）(?:（\d+）)?$", label)
+            base = label[:suffix.start()] if suffix else label
+            if re.search(r"[\u3400-\u9fff]", base):
+                return label
+            return str(translated) + (suffix.group() if suffix else "（原文）")
+        return label if re.search(r"[\u3400-\u9fff]", label) else str(translated)
+
+    def dataset_label(dataset: dict[str, Any]) -> str:
+        name = dataset["name"]
+        label = str(dataset.get("label") or name)
+        if re.search(r"[\u3400-\u9fff]", label):
+            return label
+        return dictionary.get("datasets", {}).get(name, {}).get("label") or label
+
+    def shown(value: Any, *, key: str = "", descriptor: dict[str, Any] | None = None) -> str:
+        descriptor = descriptor or {}
+        # Promoted source variants (including *_original) remain literal.
+        enums = {} if "source_header" in descriptor else dictionary["enums"].get(descriptor.get("enum_ref") or key, {})
+        if isinstance(value, (str, int, float, bool)):
+            value = enums.get(str(value).lower() if isinstance(value, bool) else value, value)
         if isinstance(value, list):
-            return "；".join(shown(item) for item in value)
+            return "；".join(shown(item, key=key, descriptor=descriptor) for item in value)
         if isinstance(value, dict):
             if "value" in value and set(value) <= {"page", "value"}:
                 prefix = f"第 {_business_text(value['page'])} 页：" if "page" in value else ""
-                return prefix + shown(value["value"])
+                return prefix + shown(value["value"], key=key, descriptor=descriptor)
             return "；".join(f"{_business_text(key)}：{shown(item)}" for key, item in value.items())
         return _business_text(value)
 
     document = payload.get("document") or {}
+    title = document.get("title") or "银行流水"
+    if title == document.get("type"):
+        title = dictionary["enums"]["document_type"].get(title, title)
     parts = ['<!-- docmirror:markdown-profile version="1.0" -->',
              '<!-- docmirror:reading-profile version="2.0" mode="enhanced" source="community-semantic" -->',
-             f"# {shown(document.get('title') or '银行流水')}"]
+             f"# {shown(title)}"]
     # Scalar business facts remain visible, including ones not repeated in datasets.
     scalar_items = []
     for section in payload.get("sections") or []:
@@ -271,7 +312,8 @@ def render_business_markdown(payload: dict[str, Any]) -> str:
         value = item.get("value")
         values = [value, *(item.get("additional_values") or [])]
         if any(value not in (None, "") for value in values):
-            parts.append(f"**{shown(item.get('label') or item['key'])}:** " + " · ".join(shown(v) for v in values))
+            parts.append(f"**{shown(field_label(item['key'], item, 'statement_header'))}:** "
+                         + " · ".join(shown(v, key=item['key'], descriptor=item) for v in values))
     for dataset in payload.get("datasets") or []:
         columns = {column["key"]: column for column in dataset.get("columns") or []}
         rows = dataset.get("rows") or []
@@ -281,11 +323,12 @@ def render_business_markdown(payload: dict[str, Any]) -> str:
                 if len(rows) > 1:
                     parts.append(f"### 账户 {index}")
                 lines = ["| 项目 | 内容 |", "| --- | --- |"]
-                lines.extend(f"| {shown(column.get('label') or key)} | {shown(row['normalized'][key])} |"
+                lines.extend(f"| {shown(field_label(key, column, dataset['name']))} | "
+                             f"{shown(row['normalized'][key], key=key, descriptor=column)} |"
                              for key, column in columns.items() if key in row["normalized"])
                 parts.append("\n".join(lines))
             continue
-        parts.append(f"## {shown(dataset.get('label') or dataset['name'])}")
+        parts.append(f"## {shown(dataset_label(dataset))}")
         keys = [key for key in TRANSACTION_ORDER if key in columns]
         keys.extend(key for key in columns if key not in keys)
         for key in list(keys):
@@ -294,12 +337,14 @@ def render_business_markdown(payload: dict[str, Any]) -> str:
             if rows and len(keys) > 1 and context_key in CONTEXT_FIELDS:
                 value = rows[0]["normalized"].get(key)
                 if value not in (None, "") and all(key in row["normalized"] and _same(value, row["normalized"][key]) for row in rows):
-                    parts.append(f"**{shown(column.get('label') or key)}:** {shown(value)}")
+                    parts.append(f"**{shown(field_label(key, column, dataset['name']))}:** "
+                                 f"{shown(value, key=key, descriptor=column)}")
                     keys.remove(key)
         if keys:
-            lines = ["| " + " | ".join(shown(columns[key].get("label") or key) for key in keys) + " |",
+            lines = ["| " + " | ".join(shown(field_label(key, columns[key], dataset['name'])) for key in keys) + " |",
                      "| " + " | ".join("---" for _ in keys) + " |"]
-            lines.extend("| " + " | ".join(shown(row["normalized"].get(key)) for key in keys) + " |" for row in rows)
+            lines.extend("| " + " | ".join(shown(row["normalized"].get(key), key=key, descriptor=columns[key])
+                                           for key in keys) + " |" for row in rows)
             parts.append("\n".join(lines))
         if not rows:
             parts.append("_无交易记录。_")
@@ -307,12 +352,21 @@ def render_business_markdown(payload: dict[str, Any]) -> str:
     parts.append(f"来源：{shown((document.get('source_file') or {}).get('name') or '数字 PDF')}；页数：{shown(document.get('page_count'))}。")
     for dataset in payload.get("datasets") or []:
         status = "已核验" if (dataset.get("completeness") or {}).get("verified") is True else "尚未核验"
-        parts.append(f"{shown(dataset.get('label') or dataset['name'])}：{dataset['row_count']} 条；完整性：{status}。")
+        parts.append(f"{shown(dataset_label(dataset))}：{dataset['row_count']} 条；完整性：{status}。")
     warnings = (payload.get("extraction") or {}).get("warnings") or []
     seen = set()
     for warning in warnings:
         signature = (warning.get("code"), warning.get("message"))
         if signature not in seen:
             seen.add(signature)
-            parts.append(f"提示（{shown(warning.get('code'))}）：{shown(warning.get('message'))}")
+            code, message = signature
+            spec = dictionary.get("warnings", {}).get(code, {})
+            match = re.fullmatch(spec["pattern"], str(message or "")) if spec else None
+            if match:
+                values = match.groupdict()
+                if "dataset" in values:
+                    by_id = {dataset['id']: dataset_label(dataset) for dataset in payload.get('datasets') or []}
+                    values['dataset'] = by_id.get(values['dataset'], values['dataset'])
+                code, message = spec["label"], spec["message"].format(**values)
+            parts.append(f"提示（{shown(code)}）：{shown(message)}")
     return "\n\n".join(parts).rstrip() + "\n"

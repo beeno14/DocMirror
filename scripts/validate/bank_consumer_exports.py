@@ -49,9 +49,13 @@ _DELIVERY_ONLY_FILES = {
 }
 
 
-def assert_output_only_changes(before: dict, after: dict) -> list[str]:
+def _changed_bank_files(before: dict, after: dict) -> list[str]:
     before, after = _bank_runtime_hashes(before), _bank_runtime_hashes(after)
-    changed = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+    return sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
+
+
+def assert_output_only_changes(before: dict, after: dict) -> list[str]:
+    changed = _changed_bank_files(before, after)
     if set(changed) - _DELIVERY_ONLY_FILES:
         raise AssertionError("extraction/shared code changed; saved evidence cannot validate those changes")
     return changed
@@ -233,6 +237,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-report", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--saved-inputs-only", action="store_true", help=(
+        "Test saved semantic evidence as output fixtures, even after unrelated extraction changes. "
+        "Does NOT validate current extraction code; PDF opens and extraction remain forbidden."
+    ))
     args = parser.parse_args(argv)
     previous = _read(_checked_path(args.source_report))
     if (previous.get("tier") not in {"primary", "secondary"} or previous.get("failed") != 0
@@ -240,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
             or previous.get("passed") != len(previous["results"]) or not previous["results"]):
         raise ValueError("a passing Primary or Secondary report is required")
     code_hashes = _hashes()
-    changes = assert_output_only_changes(previous["code_hashes"], code_hashes)
+    changes = (_changed_bank_files(previous["code_hashes"], code_hashes) if args.saved_inputs_only
+               else assert_output_only_changes(previous["code_hashes"], code_hashes))
     for entry in previous["results"]:
         _verify_inputs(entry)
         if Path(entry["filename"]).name != entry["filename"]:
@@ -252,7 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     writer = ArtifactWriter(output)
     report = {"tier": previous["tier"], "file_count": len(previous["results"]), "operation": "consumer_output_replay",
               "source_report": str(args.source_report.resolve()), "extraction_executed": False,
-              "allowed_output_code_changes": changes, "code_hashes": code_hashes, "results": []}
+              "allowed_output_code_changes": [] if args.saved_inputs_only else changes,
+              "source_capture_code_changes": changes,
+              "validation_scope": "saved_semantic_to_outputs" if args.saved_inputs_only else "output_only_change",
+              "current_extraction_code_validated": False,
+              "code_hashes": code_hashes, "results": []}
     auditor = _load_auditor()
     started = time.perf_counter()
     with without_extraction():
