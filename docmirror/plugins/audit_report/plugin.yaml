@@ -1,0 +1,44 @@
+schema_version: 1
+
+provider:
+  id: audit_report
+  domain_name: audit_report
+  version: community-1
+  implementation: docmirror.plugins.audit_report.community_plugin:plugin
+
+projection:
+  internal_fields: [document_label, summary, audit_projection, dataset_source_row_refs, dataset_verification_blockers]
+  dataset_labels:
+    balance_sheet: 资产负债表
+    income_statement: 利润表
+    cash_flow_statement: 现金流量表
+    owners_equity_changes: 所有者权益变动表
+  dataset_types:
+    balance_sheet: financial_statement
+    income_statement: financial_statement
+    cash_flow_statement: financial_statement
+    owners_equity_changes: financial_statement
+  dataset_grains:
+    balance_sheet: one row per source statement line
+    income_statement: one row per source statement line
+    cash_flow_statement: one row per source statement line
+    owners_equity_changes: one row per source statement line and presented period
+  section_type_markers:
+    审计报告基本信息: basic_information
+    审计意见: audit_opinion
+    形成审计意见的基础: basis_for_opinion
+    财务报表: financial_statement
+  completeness:
+    balance_sheet: &statement_completeness
+      basis: domain_source_row_ledger
+      ledger_key: dataset_source_row_refs
+      verification_blocker_key: dataset_verification_blockers
+      public_basis: source_statement_rows
+    income_statement: *statement_completeness
+    cash_flow_statement: *statement_completeness
+    owners_equity_changes: *statement_completeness
+
+projection_outputs:
+  document_type: audit_report
+  datasets: [balance_sheet, income_statement, cash_flow_statement, owners_equity_changes]
+  domain_fact_prefix: audit_report

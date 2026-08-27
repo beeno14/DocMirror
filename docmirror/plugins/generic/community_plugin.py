@@ -48,14 +48,7 @@ class GenericCommunityPlugin(CommunityProjector):
         detected_type = getattr(getattr(parse_result, "entities", None), "document_type", "") or "generic"
         if detected_type in ("", "unknown"):
             detected_type = "generic"
-        projection = build_generic_projection(parse_result, detected_type, text)
-        if detected_type != "audit_report":
-            return projection
-        semantic = dict(projection.semantic)
-        presentation = dict(semantic.get("enhanced_markdown") or {})
-        presentation["strategy"] = "source_overlay"
-        semantic["enhanced_markdown"] = presentation
-        return projection.model_copy(update={"semantic": semantic})
+        return build_generic_projection(parse_result, detected_type, text)
 
 
 plugin = GenericCommunityPlugin()

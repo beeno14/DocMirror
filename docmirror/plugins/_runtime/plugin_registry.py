@@ -18,6 +18,7 @@ from docmirror.plugin_api import PluginProvider
 logger = logging.getLogger(__name__)
 
 _BUNDLED_POST_SEAL_DOMAINS = (
+    "audit_report",
     "bank_statement",
     "wechat_payment",
     "alipay_payment",

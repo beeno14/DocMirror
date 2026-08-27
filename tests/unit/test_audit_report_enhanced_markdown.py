@@ -16,7 +16,9 @@ from docmirror.models.mirror.document_flow import DocumentFlowGraph, ReadingFlow
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.community_bundle import render_community_reading_markdown
 from docmirror.output.markdown_renderer import render_semantic_source_overlay_markdown
-from docmirror.plugins.generic.community_plugin import plugin
+from docmirror.plugins.audit_report.community_plugin import AuditReportPlugin
+from docmirror.plugins.audit_report.reading_projection import render_audit_reading_markdown
+from docmirror.plugins.generic.community_plugin import plugin as generic_plugin
 
 
 def test_audit_renderer_preserves_source_flow_and_does_not_mutate_semantic() -> None:
@@ -160,7 +162,7 @@ def test_audit_renderer_keeps_source_table_when_dataset_row_count_is_lower() -> 
     assert "| 应收账款 | 2,000.00 |" in enhanced
 
 
-def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
+def test_audit_plugin_owns_audit_renderer_without_changing_generic_renderer() -> None:
     def result(document_type: str) -> ParseResult:
         node = StructureNode(node_id="body:1", type="paragraph", page=1, text="完整正文。")
         return ParseResult(
@@ -173,7 +175,7 @@ def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
             entities=DocumentEntities(document_type=document_type),
         )
 
-    audit_bundle = plugin.project_bundle(seal_parse_result(result("audit_report")), file_path="audit.pdf")
+    audit_bundle = AuditReportPlugin().project_bundle(seal_parse_result(result("audit_report")), file_path="audit.pdf")
     assert audit_bundle is not None
     audit_semantic = audit_bundle.semantic_payload()
     audit_json = audit_bundle.json_payload(audit_semantic)
@@ -183,7 +185,7 @@ def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
     )
     assert audit_bundle.json_payload(audit_semantic) == audit_json
 
-    financial_bundle = plugin.project_bundle(
+    financial_bundle = generic_plugin.project_bundle(
         seal_parse_result(result("financial_report")),
         file_path="finance.pdf",
     )
@@ -195,3 +197,62 @@ def test_generic_plugin_uses_audit_bundle_only_for_audit_report() -> None:
     assert financial_bundle.render_enhanced_markdown(
         financial_semantic, public_payload=financial_bundle.json_payload(financial_semantic)
     ) == render_community_reading_markdown(financial_semantic)
+
+
+def test_audit_reading_projection_deduplicates_titles_and_preserves_blank_pages() -> None:
+    semantic = {
+        "document": {"type": "audit_report", "title": "2024年度审计报告", "page_count": 3},
+        "structure": {
+            "blocks": [
+                {
+                    "id": "title:1",
+                    "kind": "heading",
+                    "role": "title",
+                    "order": 1,
+                    "page": 1,
+                    "text": "2024年度审计报告",
+                    "bbox": [100.0, 80.0, 400.0, 120.0],
+                },
+                {
+                    "id": "heading:1",
+                    "kind": "paragraph",
+                    "role": "body",
+                    "order": 2,
+                    "page": 1,
+                    "text": "⼀、审计意⻅",
+                    "bbox": [50.0, 150.0, 300.0, 180.0],
+                },
+                {
+                    "id": "page-number:2",
+                    "kind": "paragraph",
+                    "role": "list_marker",
+                    "order": 3,
+                    "page": 2,
+                    "text": "1",
+                    "bbox": [300.0, 790.0, 310.0, 805.0],
+                },
+                {
+                    "id": "amount:3",
+                    "kind": "paragraph",
+                    "role": "body",
+                    "order": 4,
+                    "page": 3,
+                    "text": "123.45",
+                    "bbox": [300.0, 300.0, 350.0, 320.0],
+                },
+            ],
+            "source_tables": [],
+            "reading_flows": [{"id": "main", "node_ids": ["title:1", "heading:1", "page-number:2", "amount:3"]}],
+        },
+        "datasets": [],
+        "bindings": [],
+    }
+
+    enhanced = render_audit_reading_markdown(semantic)
+
+    assert enhanced.count("2024年度审计报告") == 1
+    assert "## 一、审计意见" in enhanced
+    assert '<!-- docmirror:page logical="2" source="2" -->' in enhanced
+    assert "（空白页）" in enhanced
+    assert "## 123.45" not in enhanced
+    assert "123.45" in enhanced
