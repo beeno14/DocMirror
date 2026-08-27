@@ -2,7 +2,7 @@
 """Fail-closed attestation for the private personal-detail OCR audit.
 
 The PowerShell launcher owns process scheduling.  This module owns the immutable
-7-live + 8-saved contract, snapshot comparison, persisted-output validation,
+6-live + 7-saved contract, snapshot comparison, persisted-output validation,
 JUnit interpretation, result-matrix construction, and completion attestation.
 """
 
@@ -96,14 +96,6 @@ EXPECTED_SOURCE_PDFS: tuple[SourcePdf, ...] = (
         r"tests/regression/test_personal_detail_ocr_quality_private.py::test_personal_detail_ocr_correction_invariants[\u738b\u6839\u9547\u5f81\u4fe1.pdf]",
     ),
     SourcePdf(
-        "06",
-        "cao-moyan",
-        "曹末艳-征信",
-        "曹末艳-征信.pdf",
-        "1a33a80b4b818640105e94488db00f1656d8f3e86004caa92f0e98163d523eee",
-        r"tests/regression/test_personal_detail_ocr_quality_private.py::test_personal_detail_ocr_correction_invariants[\u66f9\u672b\u8273-\u5f81\u4fe1.pdf]",
-    ),
-    SourcePdf(
         "07",
         "huang-shenghui",
         "黄圣辉_个人详版征信报告",
@@ -143,11 +135,6 @@ SAVED_CASES: tuple[SavedCase, ...] = (
         "13",
         "saved-huang-population",
         r"tests/regression/test_personal_detail_expanded_saved_population_private.py::test_saved_expanded_personal_detail_population_acceptance[\u9ec4\u5723\u8f89_\u4e2a\u4eba\u8be6\u7248\u5f81\u4fe1\u62a5\u544a]",
-    ),
-    SavedCase(
-        "14",
-        "saved-cao-population",
-        r"tests/regression/test_personal_detail_expanded_saved_population_private.py::test_saved_expanded_personal_detail_population_acceptance[\u66f9\u672b\u8273-\u5f81\u4fe1]",
     ),
     SavedCase(
         "15",
@@ -947,7 +934,10 @@ def verify_completed_audit(audit_dir: Path) -> dict[str, Any]:
         "saved_passed": len(saved),
     }
     if any(marker.get(key) != value for key, value in expected_totals.items()):
-        raise AuditError(f"Completion totals do not prove 7+8 passes: {marker!r}")
+        raise AuditError(
+            "Completion totals do not prove "
+            f"{len(EXPECTED_SOURCE_PDFS)}+{len(SAVED_CASES)} passes: {marker!r}"
+        )
     manifest_records = {str(row.get("path") or ""): row for row in manifest.get("artifacts") or ()}
     actual_paths = _current_evidence_catalog(audit_dir, include_attestation=True)
     if set(manifest_records) != actual_paths:

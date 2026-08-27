@@ -1720,6 +1720,32 @@ def test_registered_population_preserves_two_up_anchors_on_one_source_page() -> 
     )
 
 
+@pytest.mark.parametrize(
+    "family",
+    (
+        "non_revolving_loan",
+        "revolving_loan_subaccount",
+        "revolving_loan_account",
+    ),
+)
+def test_registered_population_rejects_heading_only_loan_family_identities(
+    family: str,
+) -> None:
+    pages, plane = _registered_card_population_inventory(count=3)
+    for ordinal, line in enumerate(plane[80], start=1):
+        line["account_type"] = family
+        line["evidence_ids"] = [f"registered-{family}:{ordinal}"]
+
+    observations = native_extraction._registered_account_population_observations(
+        (pages, plane)
+    )
+
+    assert observations is None
+    assert native_extraction._sealed_registered_account_population_observations(
+        observations
+    ) == observations
+
+
 def test_registered_population_authority_rejects_promoted_logical_copy() -> None:
     inventory = (
         [

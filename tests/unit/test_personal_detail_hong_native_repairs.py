@@ -1098,14 +1098,24 @@ def test_production_shaped_headerless_tail_owns_122_through_145_without_promotin
     institutional = {
         row["sequence"]: row for row in rows if row["inquiry_type"] == "institution"
     }
-    # The exact span witnesses prove that 131 and 141 exist, but do not
-    # silently promote merged business cells into emitted records.
-    assert set(institutional) == set(range(122, 146)) - {131, 141}
+    # The exact span witnesses and the independently valid reason cells prove
+    # that 131 and 141 are physical records.  Their damaged fields stay null
+    # and local instead of causing the whole rows to disappear.
+    assert set(institutional) == set(range(122, 146))
     assert institutional[125]["reason"] is None
     assert institutional[125]["extraction_status"] == "review"
     assert "reason" in institutional[125]["_unresolved_fields"]
     assert institutional[144]["institution"] == "上海浦东发展银行股份有限公司"
     assert institutional[145]["institution"] == "中国工商银行股份有限公司"
+    for sequence in (131, 141):
+        assert institutional[sequence]["inquiry_date"] is None
+        assert institutional[sequence]["institution"] is None
+        assert institutional[sequence]["reason"] == "贷后管理"
+        assert institutional[sequence]["extraction_status"] == "review"
+        assert institutional[sequence]["_unresolved_fields"] == [
+            "inquiry_date",
+            "institution",
+        ]
     assert coverage["sequence_endpoints"] == {"institution": 145, "personal": 1}
     assert coverage["numbering_model"] == "unknown"
     assert "expected_row_count" not in coverage
@@ -1167,7 +1177,16 @@ def test_production_shaped_headerless_population_survives_detached_business_toke
     institutional = {
         row["sequence"]: row for row in rows if row["inquiry_type"] == "institution"
     }
-    assert {131, 141, 144, 145}.isdisjoint(institutional)
+    assert {144, 145}.isdisjoint(institutional)
+    assert {131, 141} <= set(institutional)
+    for sequence in (131, 141):
+        assert institutional[sequence]["inquiry_date"] is None
+        assert institutional[sequence]["institution"] is None
+        assert institutional[sequence]["reason"] == "贷后管理"
+        assert institutional[sequence]["_unresolved_fields"] == [
+            "inquiry_date",
+            "institution",
+        ]
 
 
 def _move_headerless_tail_atoms_to_page_bundle(
@@ -1393,11 +1412,35 @@ def test_exact_tokens_recover_personal_inquiry_from_date_institution_span() -> N
     ],
 )
 def test_personal_date_institution_span_recovery_fails_closed(defect: str) -> None:
-    rows = native_extraction._extract_inquiries(
-        _merged_personal_inquiry_context(defect=defect)
-    )
+    context = _merged_personal_inquiry_context(defect=defect)
+    rows = native_extraction._extract_inquiries(context)
 
-    assert [row["sequence"] for row in rows] == [1]
+    assert [row["sequence"] for row in rows] == [1, 2]
+    unresolved = rows[1]
+    assert unresolved["inquiry_type"] == "personal"
+    assert unresolved["inquiry_date"] is None
+    assert unresolved["institution"] is None
+    assert unresolved["reason"] == "本人查询(自助查询机)"
+    assert unresolved["extraction_status"] == "review"
+    assert unresolved["_unresolved_fields"] == [
+        "inquiry_date",
+        "institution",
+    ]
+    issues = [
+        issue
+        for issue in context._personal_detail_extraction_issues
+        if issue.get("target_record_id") == unresolved["inquiry_id"]
+        and issue.get("issue_code") == "candidate_b_inquiry_row_cells_unresolved"
+    ]
+    assert {issue["field_name"] for issue in issues} == {
+        "inquiry_date",
+        "institution",
+    }
+    assert all(
+        issue["reason_codes"][-2:]
+        == ["physical_record_identity_conserved", "field_local_value_withheld"]
+        for issue in issues
+    )
 
 
 def test_token_split_helpers_reject_duplicate_slot_ownership() -> None:
@@ -1470,13 +1513,17 @@ def test_exact_inquiry_field_ref_accepts_only_complete_token_contract() -> None:
     )
 
 
-def test_personal_token_ordinals_enter_source_coverage_without_emission() -> None:
+def test_personal_token_ordinals_enter_source_coverage_with_field_local_row() -> None:
     context = _merged_personal_inquiry_context(defect="extra_span_token")
 
     rows = native_extraction._extract_inquiries(context)
     coverage = native_extraction._inquiry_source_coverage(context)
 
-    assert [row["sequence"] for row in rows] == [1]
+    assert [row["sequence"] for row in rows] == [1, 2]
+    assert rows[1]["inquiry_date"] is None
+    assert rows[1]["institution"] is None
+    assert rows[1]["reason"] == "本人查询(自助查询机)"
+    assert rows[1]["extraction_status"] == "review"
     assert coverage["sequence_endpoints"] == {"personal": 2}
     assert coverage["observed_sequences"] == {"personal": [1, 2]}
     omitted = coverage["ordinal_observations"]["personal"]["2"]

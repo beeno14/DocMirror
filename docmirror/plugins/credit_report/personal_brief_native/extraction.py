@@ -292,19 +292,21 @@ def _personal_summary_records(
     text: str = "",
     *,
     expected_account_count: int | None = None,
+    parsed_summary: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     from docmirror.plugins.credit_report.business_records import (
-        _linear,
         _personal_brief_summary_from_canonical_tables,
         _source_refs,
         _stable_id,
     )
 
-    summary = _personal_brief_summary_from_canonical_tables(
-        parse_result,
-        text,
-        expected_account_count=expected_account_count,
-    )
+    summary = parsed_summary
+    if summary is None:
+        summary = _personal_brief_summary_from_canonical_tables(
+            parse_result,
+            text,
+            expected_account_count=expected_account_count,
+        )
     page = int(summary.get("source_summary_page") or 1)
     table_id = str(summary.get("source_summary_table_id") or "")
     summary_refs = _source_refs(page, "canonical_summary_table")
@@ -618,7 +620,6 @@ def _personal_public_records(
 ) -> dict[str, list[dict[str, Any]]]:
     from docmirror.plugins.credit_report.business_records import (
         _number,
-        _source_refs,
         _stable_id,
     )
 
@@ -822,7 +823,6 @@ def extract_personal_brief_native_business(
 ) -> dict[str, Any]:
     """Transform a ParseResult into personal-brief business candidates."""
     from docmirror.plugins.credit_report.business_records import (
-        _linear,
         _overdue_from_personal_brief_accounts,
         _page_texts,
         _personal_brief_accounts,

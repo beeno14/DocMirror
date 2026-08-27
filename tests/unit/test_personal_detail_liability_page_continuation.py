@@ -8,6 +8,7 @@ import pytest
 from docmirror.plugins.credit_report.personal_detail_scanned import native_extraction
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
     PBOCCanonicalTemplateAssembler,
+    _mixed_account_liability_table_owners,
     _sealed_liability_page_continuation_proved,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
@@ -23,6 +24,17 @@ LIABILITY_ROLES = (
     "还款责任金额",
     "币种",
     "保证合同编号",
+)
+
+ACCOUNT_ROLES = (
+    "发卡机构",
+    "账户标识",
+    "开立日期",
+    "账户授信额度",
+    "共享授信额度",
+    "币种",
+    "业务种类",
+    "担保方式",
 )
 
 
@@ -258,6 +270,54 @@ def _foreign_table(table_id: str, *, top: float) -> SimpleNamespace:
     )
 
 
+def _account_table(sequence: int, *, top: float) -> SimpleNamespace:
+    return _grid_table(
+        f"account-{sequence}",
+        top=top,
+        header=list(ACCOUNT_ROLES),
+        values=[
+            f"测试银行股份有限公司{sequence}支行",
+            f"B10111000H0001000000000000000{sequence:02d}",
+            "2020.01.01",
+            "10000",
+            "10000",
+            "人民币元",
+            "贷记卡",
+            "信用/免担保",
+        ],
+        widths=[5.0, 8.0, 4.0, 4.0, 4.0, 3.0, 3.0, 4.0],
+    )
+
+
+def _composite_account_table(sequence: int, *, top: float) -> SimpleNamespace:
+    """Model a real account card whose OCR packed its header lattice."""
+
+    return _grid_table(
+        f"account-composite-{sequence}",
+        top=top,
+        header=[
+            "发卡机构账户标识开立日期账户授信额度共享授信额度币种业务种类担保方式",
+            "",
+        ],
+        values=[
+            f"测试银行股份有限公司{sequence}支行 "
+            f"B10111000H0001000000000000000{sequence:02d} 2020.01.01",
+            "",
+        ],
+        widths=[9.0, 1.0],
+    )
+
+
+def _monthly_tail_table(*, top: float) -> SimpleNamespace:
+    return _grid_table(
+        "account-19-monthly-tail",
+        top=top,
+        header=["", "10", "11", "12"],
+        values=["2022", "N", "N", "N"],
+        widths=[2.0, 2.0, 2.0, 2.0],
+    )
+
+
 def _append_exact_row(table: SimpleNamespace, row: list[str]) -> None:
     """Append one sealed physical row to both geometry copies."""
 
@@ -367,6 +427,73 @@ def _case(
     return [previous, current], [previous_evidence, current_evidence]
 
 
+def _lin_production_shaped_mixed_case() -> tuple[
+    SimpleNamespace,
+    dict[str, object],
+    SimpleNamespace,
+    dict[str, object],
+]:
+    previous = _page(
+        22,
+        [
+            _foreign_table("account-17-monthly-tail", top=35.0),
+            _composite_account_table(18, top=120.0),
+            _composite_account_table(19, top=245.0),
+        ],
+    )
+    liability = _liability_table(
+        1,
+        top=428.0,
+        reordered=False,
+        merged_slots=True,
+    )
+    raw_rows = liability.metadata["raw_rows"]
+    for row in raw_rows:
+        for column, value in enumerate(row):
+            replacements = {
+                "责任人类型": "贵任人类型",
+                "还款责任金额": "还款贵任金额",
+                "五级分类 囍": "7五级分类S",
+            }
+            if value in replacements:
+                row[column] = replacements[value]
+    raw_rows[4][0] = "#截至2024年07月01日"
+    current = _page(
+        23,
+        [
+            _monthly_tail_table(top=35.0),
+            _account_table(20, top=99.0),
+            _account_table(21, top=207.0),
+            _account_table(22, top=315.0),
+            liability,
+        ],
+    )
+    previous_evidence = _evidence(
+        22,
+        22,
+        _line("账户18", [35.0, 104.0, 120.0, 115.0], evidence_id="lin-account:18"),
+        _line("账户19", [35.0, 229.0, 120.0, 240.0], evidence_id="lin-account:19"),
+    )
+    current_evidence = _evidence(
+        23,
+        23,
+        _line("账户20", [35.0, 83.0, 120.0, 94.0], evidence_id="lin-account:20"),
+        _line("账户21", [35.0, 191.0, 120.0, 202.0], evidence_id="lin-account:21"),
+        _line(
+            "账户22(授信协议标识:CREDIT-LINE-22)",
+            [35.0, 299.0, 250.0, 310.0],
+            evidence_id="lin-account:22",
+        ),
+        _line(
+            "(四)相关还款责任信息",
+            [180.0, 384.0, 370.0, 396.0],
+            evidence_id="lin-liability-section",
+        ),
+        _line("账户1", [35.0, 412.0, 120.0, 423.0], evidence_id="lin-liability:1"),
+    )
+    return previous, previous_evidence, current, current_evidence
+
+
 def _build(
     pages: list[SimpleNamespace],
     evidence: list[dict[str, object]],
@@ -386,6 +513,214 @@ def _build(
         issue_owner=owner,
     ).build()
     return projection, owner
+
+
+def test_account_cards_before_first_liability_heading_keep_table_local_owners() -> None:
+    previous = _page(18, [_account_table(18, top=100.0), _account_table(19, top=210.0)])
+    current = _page(
+        19,
+        [
+            _monthly_tail_table(top=35.0),
+            _account_table(20, top=99.0),
+            _account_table(21, top=207.0),
+            _account_table(22, top=315.0),
+            _liability_table(
+                1,
+                top=428.0,
+                reordered=False,
+                merged_slots=True,
+            ),
+        ],
+    )
+    previous_evidence = _evidence(
+        18,
+        18,
+        _line(
+            "三信贷交易信息明细",
+            [180.0, 30.0, 370.0, 48.0],
+            evidence_id="account-section",
+        ),
+        _line("账户18", [35.0, 84.0, 120.0, 95.0], evidence_id="account-anchor:18"),
+        _line("账户19", [35.0, 194.0, 120.0, 205.0], evidence_id="account-anchor:19"),
+    )
+    current_evidence = _evidence(
+        19,
+        19,
+        _line("账户20", [35.0, 83.0, 120.0, 94.0], evidence_id="account-anchor:20"),
+        _line("账户21", [35.0, 191.0, 120.0, 202.0], evidence_id="account-anchor:21"),
+        _line("账户22", [35.0, 299.0, 120.0, 310.0], evidence_id="account-anchor:22"),
+        _line(
+            "(四)相关还款责任信息",
+            [180.0, 384.0, 370.0, 396.0],
+            evidence_id="liability-section:current",
+        ),
+        _line("账户1", [35.0, 412.0, 120.0, 423.0], evidence_id="liability-anchor:1"),
+    )
+
+    projection, _owner = _build(
+        [previous, current],
+        [previous_evidence, current_evidence],
+        continuations={("account-19", "account-19-monthly-tail")},
+    )
+
+    registration = {
+        item["logical_page"]: item for item in projection.registrations
+    }[19]
+    assert registration["template_id"] == "mixed_pboc_sections"
+    owners = registration["section_table_owners"]
+    assert {
+        table_id: owner["template_id"] for table_id, owner in owners.items()
+    } == {
+        "account-19-monthly-tail": "credit_account_detail",
+        "account-20": "credit_account_detail",
+        "account-21": "credit_account_detail",
+        "account-22": "credit_account_detail",
+        "liability-1": "repayment_responsibility",
+    }
+    assert owners["account-19-monthly-tail"]["binding"] == (
+        "authoritative_prior_account_table_continuation"
+    )
+
+
+def test_mixed_account_liability_accepts_registered_flow_continuation_predecessor() -> None:
+    previous = _page(18, [_account_table(18, top=100.0), _account_table(19, top=210.0)])
+    current = _page(
+        19,
+        [
+            _monthly_tail_table(top=35.0),
+            _account_table(20, top=99.0),
+            _account_table(21, top=207.0),
+            _account_table(22, top=315.0),
+            _liability_table(1, top=428.0, reordered=False, merged_slots=True),
+        ],
+    )
+    previous_evidence = _evidence(
+        18,
+        18,
+        _line("账户18", [35.0, 84.0, 120.0, 95.0], evidence_id="account-anchor:18"),
+        _line("账户19", [35.0, 194.0, 120.0, 205.0], evidence_id="account-anchor:19"),
+    )
+    current_evidence = _evidence(
+        19,
+        19,
+        _line("账户20", [35.0, 83.0, 120.0, 94.0], evidence_id="account-anchor:20"),
+        _line("账户21", [35.0, 191.0, 120.0, 202.0], evidence_id="account-anchor:21"),
+        _line("账户22", [35.0, 299.0, 120.0, 310.0], evidence_id="account-anchor:22"),
+        _line(
+            "(四)相关还款责任信息",
+            [180.0, 384.0, 370.0, 396.0],
+            evidence_id="liability-section:current",
+        ),
+        _line("账户1", [35.0, 412.0, 120.0, 423.0], evidence_id="liability-anchor:1"),
+    )
+
+    owners = _mixed_account_liability_table_owners(
+        previous,
+        previous_evidence,
+        {
+            "status": "registered",
+            "template_id": "credit_account_detail",
+            "basis": "canonical_flow_continuation",
+        },
+        current,
+        current_evidence,
+        tables_continue=lambda left, right: (
+            left,
+            right,
+        ) == ("account-19", "account-19-monthly-tail"),
+    )
+
+    assert set(owners) == {
+        "account-19-monthly-tail",
+        "account-20",
+        "account-21",
+        "account-22",
+        "liability-1",
+    }
+
+
+def test_lin_shaped_packed_predecessor_and_finite_liability_ocr_variants_are_owned() -> None:
+    previous, previous_evidence, current, current_evidence = (
+        _lin_production_shaped_mixed_case()
+    )
+
+    owners = _mixed_account_liability_table_owners(
+        previous,
+        previous_evidence,
+        {
+            "status": "registered",
+            "template_id": "credit_account_detail",
+            "basis": "source_page_evidence",
+        },
+        current,
+        current_evidence,
+        tables_continue=lambda left, right: (left, right)
+        == ("account-composite-19", "account-19-monthly-tail"),
+    )
+
+    assert {
+        table_id: owner["template_id"] for table_id, owner in owners.items()
+    } == {
+        "account-19-monthly-tail": "credit_account_detail",
+        "account-20": "credit_account_detail",
+        "account-21": "credit_account_detail",
+        "account-22": "credit_account_detail",
+        "liability-1": "repayment_responsibility",
+    }
+    assert owners["account-22"]["printed_sequence"] == 22
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "unknown_liability_header",
+        "malformed_full_account_heading",
+        "missing_full_account_heading_evidence",
+        "footer_gap",
+        "continuation_denied",
+        "intervening_section",
+    ),
+)
+def test_lin_shaped_mixed_transition_remains_fail_closed(defect: str) -> None:
+    previous, previous_evidence, current, current_evidence = (
+        _lin_production_shaped_mixed_case()
+    )
+    continuation_allowed = True
+    if defect == "unknown_liability_header":
+        current.tables[-1].metadata["raw_rows"][0][4] = "未知责任类型"
+    elif defect == "malformed_full_account_heading":
+        current_evidence["lines"][2]["text"] = "账户22(其他标识:CREDIT-LINE-22)"
+    elif defect == "missing_full_account_heading_evidence":
+        current_evidence["lines"][2]["evidence_ids"] = []
+    elif defect == "footer_gap":
+        current_evidence["lines"][-1]["text"] = "第24页，共24页"
+    elif defect == "continuation_denied":
+        continuation_allowed = False
+    else:
+        previous_evidence["lines"].insert(
+            -1,
+            _line(
+                "(四)相关还款责任信息",
+                [180.0, 620.0, 370.0, 635.0],
+                evidence_id="lin-intervening-section",
+            ),
+        )
+
+    owners = _mixed_account_liability_table_owners(
+        previous,
+        previous_evidence,
+        {
+            "status": "registered",
+            "template_id": "credit_account_detail",
+            "basis": "source_page_evidence",
+        },
+        current,
+        current_evidence,
+        tables_continue=lambda left, right: continuation_allowed
+        and (left, right) == ("account-composite-19", "account-19-monthly-tail"),
+    )
+
+    assert owners == {}
 
 
 @pytest.mark.parametrize("current_count", [1, 3, 5])

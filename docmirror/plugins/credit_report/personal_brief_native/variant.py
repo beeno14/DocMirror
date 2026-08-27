@@ -11,7 +11,7 @@ from docmirror.plugins.credit_report.shared.variant import CreditReportVariantAd
 
 
 class PersonalBriefNativeVariant(CreditReportVariantAdapter):
-    """Keep personal-brief extraction and reading behavior isolated."""
+    """Keep personal-brief extraction behavior isolated."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -166,32 +166,6 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
     def strip_supplemental_node_bindings(self) -> bool:
         """Personal supplemental views copy source rows into several datasets."""
         return True
-
-    def build_reading_projection(
-        self,
-        parse_result: Any,
-        *,
-        content_mode: str,
-    ) -> Any | None:
-        if content_mode not in {"native_text", "mixed"}:
-            return None
-        from docmirror.output.reading_projection import ReadingProjection
-        from docmirror.plugins.credit_report.account_reading_order import (
-            build_account_reading_projection,
-        )
-        from docmirror.plugins.credit_report.inquiry_reading_order import (
-            build_institution_inquiry_reading_projection,
-        )
-
-        projections = (
-            build_account_reading_projection(parse_result),
-            build_institution_inquiry_reading_projection(parse_result),
-        )
-        transforms = tuple(
-            transform for projection in projections if projection is not None for transform in projection.transforms
-        )
-        return ReadingProjection(plugin_id="credit_report", transforms=transforms) if transforms else None
-
 
 variant = PersonalBriefNativeVariant()
 

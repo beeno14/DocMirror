@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
+
 from docmirror.plugins.credit_report.personal_detail_scanned.canonical_layout import (
     PBOCCanonicalTemplateAssembler,
     _project_table,
@@ -14,6 +16,7 @@ from docmirror.plugins.credit_report.personal_detail_scanned.context import (
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _canonical_inquiry_line_rows,
     _extract_inquiries,
+    _extract_residence_records,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_parser import (
     PBOCPersonalDetailNativeParser,
@@ -592,6 +595,176 @@ def test_explicit_summary_heading_outranks_repeated_account_category_names() -> 
     assert projection.registrations[0]["confidence"] >= 0.92
 
 
+def _information_summary_continuation_case(
+    defect: str = "",
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    first_rows = [[f"概要指标{index}", str(index)] for index in range(1, 25)]
+    second_rows = [[f"概要指标{index}", str(index)] for index in range(25, 48)]
+    first_rows[0][0] = "逾期(透支)信息汇总"
+    second_rows[0][0] = "最近1个月内的查询机构数和查询次数"
+    first_table = SimpleNamespace(
+        table_id="summary:违约",
+        bbox=[30.0, 100.0, 570.0, 285.0],
+        headers=[],
+        rows=[],
+        metadata={"raw_rows": first_rows},
+    )
+    second_table = SimpleNamespace(
+        table_id="summary:查询",
+        bbox=[30.0, 360.0, 570.0, 570.0],
+        headers=[],
+        rows=[],
+        metadata={"raw_rows": second_rows},
+    )
+    tables = [first_table, second_table]
+    if defect == "extra_unowned_table":
+        tables.append(
+            SimpleNamespace(
+                table_id="unowned:third",
+                bbox=[30.0, 610.0, 570.0, 680.0],
+                headers=[],
+                rows=[],
+                metadata={"raw_rows": [["任意字段", "任意值"]]},
+            )
+        )
+    elif defect == "extra_unheaded_summary_table":
+        tables.append(
+            SimpleNamespace(
+                table_id="unheaded:summary-shaped",
+                bbox=[30.0, 610.0, 570.0, 680.0],
+                headers=[],
+                rows=[],
+                metadata={
+                    "raw_rows": [
+                        ["最近1个月内的查询机构数", "3"],
+                        ["最近1个月内的查询次数", "8"],
+                    ]
+                },
+            )
+        )
+    elif defect == "independently_owned_table":
+        tables.append(
+            _exact_mixed_schema_table(
+                "owned:inquiry",
+                top=620.0,
+                header=("查询原因", "查询机构", "编号", "查询日期"),
+                values=("贷后管理", "机构乙", "1", "2025.04.03"),
+            )
+        )
+    pages = [
+        _page(2, source=1),
+        _page(3, source=2, tables=tables),
+    ]
+    evidence: list[dict[str, object]] = [
+        {
+            "page": 2,
+            "source_page": 1,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line("二信息概要", [210.0, 620.0, 330.0, 640.0]),
+                _line("第2页,共31页", [220.0, 760.0, 380.0, 785.0]),
+            ],
+        },
+        {
+            "page": 3,
+            "source_page": 2,
+            "page_width": 600,
+            "page_height": 800,
+            "lines": [
+                _line(
+                    "(二)信贷交易违约信息概要",
+                    [170.0, 80.0, 430.0, 100.0],
+                ),
+                # This exact account-family atom is legitimate summary-table
+                # content and reproduces the live false whole-page role.
+                _line("贷记卡账户", [80.0, 130.0, 190.0, 150.0]),
+                _line(
+                    "(四)查询记录概要",
+                    [190.0, 340.0, 410.0, 360.0],
+                ),
+                _line("第3页,共31页", [220.0, 760.0, 380.0, 785.0]),
+            ],
+        },
+    ]
+    if defect == "one_current_heading":
+        evidence[1]["lines"] = [line for line in evidence[1]["lines"] if line["text"] != "(四)查询记录概要"]
+    elif defect == "nonconsecutive_footer":
+        evidence[1]["lines"][-1]["text"] = "第4页,共31页"
+    elif defect == "conflicting_top_level":
+        evidence[1]["lines"].append(_line("公共信息明细", [180.0, 590.0, 420.0, 610.0]))
+    elif defect == "numbered_account_card":
+        evidence[1]["lines"].append(_line("账户12", [80.0, 180.0, 160.0, 200.0]))
+    elif defect == "account_family_outside_table":
+        evidence[1]["lines"][1]["bbox"] = [80.0, 305.0, 190.0, 325.0]
+    elif defect == "independently_owned_table":
+        evidence[1]["lines"].insert(
+            -1,
+            _line("(十一)查询记录", [180.0, 595.0, 360.0, 620.0]),
+        )
+    return SimpleNamespace(pages=pages), evidence
+
+
+def test_sealed_summary_continuation_preserves_all_47_metric_shaped_rows() -> None:
+    result, evidence = _information_summary_continuation_case()
+
+    projection = _assembler(result, evidence).build()
+
+    registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+    assert registration["template_id"] == "information_summary"
+    assert "multiple_exact_summary_subsection_headings" in registration["signals"]
+    current = next(page for page in projection.pages if page.page_number == 3)
+    assert current.canonical_template_id == "information_summary"
+    assert sum(len(table.metadata["raw_rows"]) for table in current.tables) == 47
+    assert all(table.metadata["canonical_template_id"] == "information_summary" for table in current.tables)
+
+
+def test_summary_continuation_fails_closed_without_every_local_proof() -> None:
+    for defect in (
+        "one_current_heading",
+        "nonconsecutive_footer",
+        "conflicting_top_level",
+        "account_family_outside_table",
+        "extra_unowned_table",
+        "extra_unheaded_summary_table",
+        "independently_owned_table",
+        "non_authoritative_identity",
+        "numbered_account_card",
+    ):
+        result, evidence = _information_summary_continuation_case(defect)
+        owner = (
+            SimpleNamespace(
+                reading_order_resolution={
+                    "resolved": False,
+                    "authoritative": False,
+                    "identity_fallback": True,
+                    "printed_total": 31,
+                    "printed_page_by_logical": {2: 2, 3: 3},
+                }
+            )
+            if defect == "non_authoritative_identity"
+            else None
+        )
+
+        projection = _assembler(result, evidence, owner=owner).build()
+
+        registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+        assert registration["template_id"] != "information_summary", defect
+
+
+def test_summary_page_with_independently_owned_table_stays_mixed() -> None:
+    result, evidence = _information_summary_continuation_case(
+        "independently_owned_table"
+    )
+
+    projection = _assembler(result, evidence).build()
+
+    registration = next(row for row in projection.registrations if row["logical_page"] == 3)
+    assert registration["template_id"] == "mixed_pboc_sections"
+    current = next(page for page in projection.pages if page.page_number == 3)
+    assert [table.table_id for table in current.tables] == ["owned:inquiry"]
+
+
 def test_unanchored_table_page_does_not_inherit_previous_template_by_shape_alone() -> None:
     summary_table = SimpleNamespace(table_id="summary:1", metadata={"raw_rows": [["A", "B"]]}, bbox=[10, 80, 590, 300])
     unrelated_table = SimpleNamespace(table_id="unknown:2", metadata={"raw_rows": [["X", "Y"]]}, bbox=[10, 80, 590, 300])
@@ -1016,6 +1189,129 @@ def test_mixed_pboc_page_projects_only_exact_table_local_section_owners() -> Non
     assert projection.registrations[0]["basis"] == (
         "exact_table_local_pboc_section_ownership"
     )
+
+
+def _residence_mixed_page_case(
+    *,
+    address_header: str = "居住地址 G",
+    populated: bool = True,
+    exact_address_owner: bool = True,
+    duplicate_header_owner: bool = False,
+) -> tuple[SimpleNamespace, list[dict[str, object]]]:
+    residence = _exact_mixed_schema_table(
+        "mixed-residence",
+        top=80.0,
+        header=("编号", address_header, "住宅电话", "居住状况", "信息更新日期"),
+        values=(
+            "1",
+            "福建省厦门市湖里区凯悦新城49栋702",
+            "13960812955",
+            "自置",
+            "2022.04.28" if populated else "",
+        ),
+        widths=(2.0, 12.0, 6.0, 4.0, 6.0),
+    )
+    geometry = residence.metadata["geometry"]
+    if not exact_address_owner:
+        geometry["cell_geometry_status"][0][1] = "derived"
+    if duplicate_header_owner:
+        geometry["cell_evidence_ids"][0][1] = list(
+            geometry["cell_evidence_ids"][0][0]
+        )
+    unrelated = _exact_mixed_schema_table(
+        "mixed-employment-unowned",
+        top=245.0,
+        header=("编号", "工作单位"),
+        values=("1", "示例单位"),
+    )
+    result = SimpleNamespace(
+        pages=[
+            _page(
+                2,
+                source=2,
+                width=550.0,
+                height=700.0,
+                tables=[residence, unrelated],
+            )
+        ]
+    )
+    evidence: list[dict[str, object]] = [
+        {
+            "page": 2,
+            "source_page": 2,
+            "page_width": 550.0,
+            "page_height": 700.0,
+            "lines": [
+                # Production-shaped shallow overlap with the residence table's
+                # top rule: the heading centre remains above the table.
+                _line("（三）居住信息", [205.0, 69.0, 345.0, 82.0]),
+                _line("（四）职业信息", [205.0, 215.0, 345.0, 238.0]),
+            ],
+        }
+    ]
+    return result, evidence
+
+
+def test_residence_table_local_owner_admits_only_the_lazy_optional_section() -> None:
+    result, evidence = _residence_mixed_page_case()
+
+    projection = _assembler(result, evidence).build()
+
+    assert projection.unresolved_pages == ()
+    assert len(projection.pages) == 1
+    projected_page = projection.pages[0]
+    assert projected_page.canonical_template_id == "mixed_pboc_sections"
+    assert [table.table_id for table in projected_page.tables] == [
+        "mixed-residence"
+    ]
+    residence_owner = projected_page.tables[0].metadata[
+        "canonical_section_owner"
+    ]
+    assert residence_owner["template_id"] == "report_header_and_identity"
+    assert residence_owner["header_binding"] == (
+        "bounded_residence_address_ascii_residue"
+    )
+
+    context = SimpleNamespace(
+        pages=list(projection.pages),
+        _personal_detail_extraction_issues=[],
+    )
+    records = _extract_residence_records(context)
+    assert [(row["sequence"], row["address"]) for row in records] == [
+        (1, "福建省厦门市湖里区凯悦新城49栋702")
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "multi_ascii_residue",
+        "han_residue",
+        "missing_population_witness",
+        "inexact_header_geometry",
+        "duplicate_header_evidence",
+    ),
+)
+def test_residence_table_local_owner_fails_closed_outside_bounded_contract(
+    case: str,
+) -> None:
+    kwargs: dict[str, object] = {}
+    if case == "multi_ascii_residue":
+        kwargs["address_header"] = "居住地址 GG"
+    elif case == "han_residue":
+        kwargs["address_header"] = "居住地址 家"
+    elif case == "missing_population_witness":
+        kwargs["populated"] = False
+    elif case == "inexact_header_geometry":
+        kwargs["exact_address_owner"] = False
+    else:
+        kwargs["duplicate_header_owner"] = True
+    result, evidence = _residence_mixed_page_case(**kwargs)
+
+    projection = _assembler(result, evidence).build()
+
+    assert projection.pages == ()
+    assert projection.unresolved_pages == (2,)
 
 
 def test_mixed_pboc_owned_reordered_inquiry_header_extracts_by_semantic_roles() -> None:
@@ -2177,3 +2473,103 @@ def test_projected_canonical_table_preserves_exact_atomic_cell_provenance() -> N
     assert projected.metadata["cell_geometry_confidences"] == [[0.97]]
     assert "source_cell_objects" not in projected.metadata
     assert projected.source_cell_objects == [[cell]]
+
+
+def test_projected_table_keeps_raw_and_canonical_geometry_planes_separate() -> None:
+    table = SimpleNamespace(
+        table_id="affine-grid",
+        headers=[],
+        rows=[],
+        metadata={
+            "geometry": {
+                "coordinate_system": "pdf_points_top_left",
+                "geometry_source": "scanned_image_line_grid",
+                "cell_bboxes": [[[0.0, 10.0, 20.0, 30.0]]],
+                "cell_geometry_status": [["exact"]],
+                "row_bands": [{"index": 0, "y0": 10.0, "y1": 30.0}],
+                "col_bands": [{"index": 0, "x0": 0.0, "x1": 20.0}],
+                "vertical_lines": [
+                    {"x": 0.0, "position": 999.0},
+                    {"x": 20.0},
+                ],
+                "horizontal_lines": [{"y": 10.0}, {"y": 30.0}],
+            }
+        },
+        bbox=[0.0, 10.0, 20.0, 30.0],
+        confidence=0.9,
+    )
+
+    projected = _project_table(
+        table,
+        template_id="affine-template",
+        transform=lambda box: [
+            float(box[0]) * 2.0 + 10.0,
+            float(box[1]) * 3.0 + 20.0,
+            float(box[2]) * 2.0 + 10.0,
+            float(box[3]) * 3.0 + 20.0,
+        ],
+    )
+
+    raw = projected.metadata["geometry"]
+    canonical = projected.metadata["canonical_geometry"]
+    assert raw["cell_bboxes"] == [[[0.0, 10.0, 20.0, 30.0]]]
+    assert raw["vertical_lines"][0]["x"] == 0.0
+    assert canonical["cell_bboxes"] == [[[10.0, 50.0, 50.0, 110.0]]]
+    assert canonical["row_bands"] == [
+        {
+            "index": 0,
+            "y0": 50.0,
+            "y1": 110.0,
+            "bbox": [10.0, 50.0, 50.0, 110.0],
+        }
+    ]
+    assert canonical["col_bands"] == [
+        {
+            "index": 0,
+            "x0": 10.0,
+            "x1": 50.0,
+            "bbox": [10.0, 50.0, 50.0, 110.0],
+        }
+    ]
+    assert canonical["vertical_lines"][0]["x"] == 10.0
+    assert canonical["horizontal_lines"] == [{"y": 50.0}, {"y": 110.0}]
+    assert canonical["table_bbox"] == [10.0, 50.0, 50.0, 110.0]
+    assert projected.metadata["source_to_canonical_affine"] == {
+        "scale_x": 2.0,
+        "scale_y": 3.0,
+        "offset_x": 10.0,
+        "offset_y": 20.0,
+    }
+
+
+def test_projected_table_drops_axis_only_geometry_without_table_extent() -> None:
+    table = SimpleNamespace(
+        table_id="extentless-grid",
+        headers=[],
+        rows=[],
+        metadata={
+            "geometry": {
+                "coordinate_system": "pdf_points_top_left",
+                "cell_bboxes": [[[1.0, 2.0, 3.0, 4.0]]],
+                "row_bands": [{"index": 0, "y0": 2.0, "y1": 4.0}],
+                "col_bands": [{"index": 0, "x0": 1.0, "x1": 3.0}],
+                "vertical_lines": [0.0, 3.0],
+                "horizontal_lines": [2.0, 4.0],
+            }
+        },
+        bbox=None,
+        confidence=0.9,
+    )
+
+    projected = _project_table(
+        table,
+        template_id="extentless-template",
+        transform=lambda box: [float(value) + 10.0 for value in box],
+    )
+
+    canonical = projected.metadata["canonical_geometry"]
+    assert canonical["cell_bboxes"] == [[[11.0, 12.0, 13.0, 14.0]]]
+    assert canonical["row_bands"] == []
+    assert canonical["col_bands"] == []
+    assert canonical["vertical_lines"] == []
+    assert canonical["horizontal_lines"] == []

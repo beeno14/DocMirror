@@ -9,6 +9,10 @@ import pytest
 
 from docmirror.evidence.repair import RepairCandidate
 from docmirror.plugins.credit_report.personal_detail_scanned import relations
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair import (
+    BusinessFieldRepair,
+    BusinessUncertaintyRepairCoordinator,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
     _final_account_field_is_valid,
     _reconcile_final_account_field_issues,
@@ -68,6 +72,299 @@ def _one_shot_page_line(
     if content is not None:
         line["content"] = content
     return line
+
+
+def _planned_repair_ref(
+    *,
+    field_name: str = "inquiry_date",
+    row: int = 1,
+    column: int = 1,
+    bbox: list[float] | None = None,
+) -> dict[str, object]:
+    return {
+        "source": "native_detail_table_cell",
+        "logical_page": 1,
+        "source_page": 1,
+        "table_id": "pt_1_0",
+        "row": row,
+        "column": column,
+        "bbox": bbox or [10, 10, 40, 30],
+        "evidence_ids": [f"native:{field_name}:{row}:{column}"],
+        "geometry_scope": "cell",
+        "field_name": field_name,
+        "binding": "canonical_header_column",
+    }
+
+
+def _planned_repair(
+    *,
+    mode: str,
+    observed: str,
+    candidate: str | None,
+    source_ref: dict[str, object],
+    published_value: object = None,
+) -> BusinessFieldRepair:
+    return BusinessFieldRepair(
+        repair_id="repair:1",
+        uncertainty_id="uncertainty:1",
+        mode=mode,
+        dataset_name="inquiry_records",
+        record_id="credit_inquiry:institution:3",
+        field_name="inquiry_date",
+        role="date",
+        observed_value=observed,
+        candidate_value=candidate,
+        source_refs=(source_ref,),
+        reason_codes=("focused_policy_fixture",),
+        published_value=published_value,
+    )
+
+
+def test_planned_deterministic_repair_mutates_only_its_exact_owned_field() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref()
+    repair = _planned_repair(
+        mode="deterministic",
+        observed="2022.06.16 广",
+        candidate="2022-06-16",
+        source_ref=target,
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "2022.06.16 广",
+        repair=repair,
+        source_refs=(target,),
+    )
+    wrong_owner, wrong_decision = overlay.repair_planned_text(
+        "2022.06.16 广",
+        repair=repair,
+        source_refs=(_planned_repair_ref(column=2),),
+    )
+
+    assert corrected == "2022-06-16"
+    assert decision is not None
+    assert decision.method == "schema_bound_deterministic_field_repair"
+    assert "no_ocr_acquisition" in decision.reason_codes
+    assert wrong_owner == "2022.06.16 广"
+    assert wrong_decision is None
+
+
+def test_planned_context_rich_reocr_uses_page_context_but_only_target_cell() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref()
+    repair = _planned_repair(
+        mode="context_rich_reocr",
+        observed="2023.01.03 20",
+        candidate=None,
+        source_ref=target,
+    )
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "inquiry-date-context",
+                "lines": [
+                    _one_shot_page_line(
+                        "2023.01.03",
+                        bbox=[10, 10, 40, 30],
+                        page_key="inquiry-date-context",
+                    ),
+                    _one_shot_page_line(
+                        "unrelated page context",
+                        bbox=[80, 80, 160, 95],
+                        page_key="inquiry-date-context",
+                        word_index=1,
+                    ),
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "2023.01.03 20",
+        repair=repair,
+        source_refs=(target,),
+    )
+
+    assert corrected == "2023-01-03"
+    assert decision is not None
+    assert decision.method == "schema_bound_page_evidence_reparse"
+    assert decision.selected_acquisition == (
+        "personal_detail_page_reocr_once:inquiry-date-context"
+    )
+    assert len(decision.source_refs) == 2
+    assert decision.source_refs[0]["geometry_scope"] == "cell"
+    assert decision.source_refs[1]["geometry_scope"] == "token_band"
+
+
+def test_planned_reocr_that_restores_withheld_raw_value_audits_published_change() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref(
+        field_name="institution",
+    )
+    repair = BusinessFieldRepair(
+        repair_id="repair:published-change",
+        uncertainty_id="uncertainty:published-change",
+        mode="context_rich_reocr",
+        dataset_name="credit_lines",
+        record_id="credit_line:1",
+        field_name="institution",
+        role="institution_name",
+        observed_value="平安消费金融有限公司",
+        candidate_value=None,
+        source_refs=(target,),
+        reason_codes=("focused_policy_fixture",),
+        published_value=None,
+    )
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "published-change",
+                "lines": [
+                    _one_shot_page_line(
+                        "平安消费金融有限公司",
+                        bbox=[10, 10, 40, 30],
+                        page_key="published-change",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "平安消费金融有限公司",
+        repair=repair,
+        source_refs=(target,),
+    )
+
+    assert corrected == "平安消费金融有限公司"
+    assert decision is not None
+    assert decision.original == ""
+    assert decision.corrected == corrected
+    assert decision.original != decision.corrected
+
+
+def test_installed_reocr_evidence_is_sealed_to_planned_target_cells() -> None:
+    overlay = _overlay()
+    allowed_target = _planned_repair_ref()
+    unrelated_target = _planned_repair_ref(
+        row=2,
+        bbox=[10, 40, 40, 60],
+    )
+    same_cell_other_field = {
+        **allowed_target,
+        "field_name": "birth_date",
+    }
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "target-seal",
+                "lines": [
+                    _one_shot_page_line(
+                        "2023.01.03",
+                        bbox=[10, 10, 40, 30],
+                        page_key="target-seal",
+                    ),
+                    _one_shot_page_line(
+                        "2023.01.04",
+                        bbox=[10, 40, 40, 60],
+                        page_key="target-seal",
+                        word_index=1,
+                    ),
+                ],
+            }
+        ],
+        affected_pages={1},
+        allowed_target_refs=(allowed_target,),
+    )
+
+    allowed, allowed_decision = overlay.correct_text(
+        "2023.01.03 20",
+        role="date",
+        field_name="inquiry_date",
+        source_refs=(allowed_target,),
+    )
+    unrelated, unrelated_decision = overlay.correct_text(
+        "2023.01.04 21",
+        role="date",
+        field_name="inquiry_date",
+        source_refs=(unrelated_target,),
+    )
+    same_cell, same_cell_decision = overlay.correct_text(
+        "2023.01.03 20",
+        role="date",
+        field_name="birth_date",
+        source_refs=(same_cell_other_field,),
+    )
+
+    assert allowed == "2023-01-03"
+    assert allowed_decision is not None
+    assert unrelated == "2023.01.04 21"
+    assert unrelated_decision is None
+    assert same_cell == "2023.01.03 20"
+    assert same_cell_decision is None
+    assert overlay.audit()["repair_evidence_target_count"] == 1
+
+
+def test_context_rich_reocr_does_not_treat_compacted_ambiguous_name_as_repair() -> None:
+    overlay = _overlay()
+    target = _planned_repair_ref(
+        field_name="related_party_name",
+        row=3,
+        column=0,
+        bbox=[10, 40, 90, 60],
+    )
+    repair = BusinessFieldRepair(
+        repair_id="repair:liability-name",
+        uncertainty_id="uncertainty:liability-name",
+        mode="context_rich_reocr",
+        dataset_name="repayment_liability_records",
+        record_id="repayment_liability:2",
+        field_name="related_party_name",
+        role="liability_related_party_name",
+        observed_value="密 厦门雯明轩商贸有限公司",
+        candidate_value=None,
+        source_refs=(target,),
+        reason_codes=("separated_leading_han_company_boundary",),
+    )
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "logical_page": 1,
+                "source_page": 1,
+                "page_key": "unchanged-liability-name",
+                "lines": [
+                    _one_shot_page_line(
+                        "密厦门雯明轩商贸有限公司",
+                        bbox=[10, 40, 90, 60],
+                        page_key="unchanged-liability-name",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+        allowed_target_refs=(target,),
+    )
+
+    corrected, decision = overlay.repair_planned_text(
+        "密 厦门雯明轩商贸有限公司",
+        repair=repair,
+        source_refs=(target,),
+    )
+
+    assert corrected == "密 厦门雯明轩商贸有限公司"
+    assert decision is None
 
 
 @pytest.mark.parametrize("raw", ("1,2", "1,,2", "1,23,456", "12,34"))
@@ -1172,13 +1469,14 @@ def _blank_account_currency_observation(
         metadata["geometry"] = {
             "coordinate_system": "pdf_points",
             "cell_bboxes": [
-                [[0, 0, 40, 10]],
+                [[10, 0, 50, 10]],
                 [[10, 20, 50, 40]],
             ],
             "cell_evidence_ids": [
                 [["native:currency-header"]],
-                [["native:currency-blank"]],
+                [[]],
             ],
+            "cell_geometry_status": [["exact"], ["exact"]],
         }
     table = SimpleNamespace(
         table_id="pt_23_1",
@@ -1222,7 +1520,33 @@ def test_blank_account_currency_reports_unreadable_value_cell_not_invalid_value(
     assert ref["canonical_value_row"] == 1
     assert ref["field_slot_role"] == "value"
     assert ref["bbox"] == [10, 20, 50, 40]
-    assert ref["evidence_ids"] == ["native:currency-blank"]
+    assert "evidence_ids" not in ref
+    assert ref["geometry_status"] == "exact"
+    assert ref["canonical_label_text"] == "币种"
+    assert ref["canonical_label_bbox"] == [10, 0, 50, 10]
+    assert ref["canonical_label_evidence_ids"] == ["native:currency-header"]
+
+
+def test_blank_account_currency_is_planned_as_one_field_local_page_repair() -> None:
+    context = SimpleNamespace()
+    account = _blank_account_currency_observation(context)
+
+    plan = BusinessUncertaintyRepairCoordinator(context).plan(
+        {"credit_accounts": [account]},
+        canonical_audit={"unresolved_pages": []},
+        extraction_issues=collect_extraction_issues(context),
+    )
+
+    repairs = [
+        repair
+        for repair in plan.field_repairs
+        if repair.dataset_name == "credit_accounts"
+        and repair.record_id == "credit_account:credit_card:20"
+        and repair.field_name == "currency"
+    ]
+    assert len(repairs) == 1
+    assert repairs[0].mode == "context_rich_reocr"
+    assert plan.affected_pages == (23,)
 
 
 def test_final_overlay_recovers_one_exact_blank_account_currency_and_closes_issue() -> None:
@@ -1390,6 +1714,51 @@ def test_missing_currency_repair_resolves_target_ids_against_available_sealed_st
     assert "currency" not in corrected
     assert corrected["canonical_raw"]["currency"] == [""]
     assert overlay.audit()["applied_count"] == 0
+
+
+def test_missing_currency_repair_accepts_exact_blank_slot_with_sealed_label() -> None:
+    context = SimpleNamespace(
+        evidence_plane=SimpleNamespace(
+            evidence=SimpleNamespace(
+                text_atoms=[
+                    {
+                        "id": "native:currency-header",
+                        "text": "币种",
+                        "bbox": [10, 0, 50, 10],
+                    }
+                ]
+            )
+        )
+    )
+    account = _blank_account_currency_observation(context)
+    overlay = PersonalDetailOCRCorrectionOverlay(context)
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 23,
+                "source_page": 12,
+                "page_key": "currency-sealed-label",
+                "lines": [
+                    _one_shot_page_line(
+                        "人民币元",
+                        bbox=[12, 22, 48, 38],
+                        page_key="currency-sealed-label",
+                    )
+                ],
+            }
+        ],
+        affected_pages={23},
+    )
+
+    corrected = overlay.correct_business_candidates(
+        {"credit_accounts": [account]},
+        stage="candidate_b_final_validation",
+    )["credit_accounts"][0]
+
+    assert corrected["currency"] == "CNY"
+    assert corrected["account_currency"] == "CNY"
+    assert corrected["reporting_amount_currency"] == "CNY"
+    assert overlay.audit()["applied_count"] == 1
 
 
 @pytest.mark.parametrize("guard", ("conflict", "nonblank_raw"))
@@ -1994,6 +2363,37 @@ def test_schema_assigned_field_uses_only_coordinator_installed_page_evidence() -
     )
     assert overlay.audit()["repair_evidence_reparse_attempt_count"] == 1
     assert overlay.audit()["ocr_started_by_correction_overlay"] is False
+
+
+def test_schema_assigned_page_evidence_noop_is_not_recorded_as_applied() -> None:
+    overlay = PersonalDetailOCRCorrectionOverlay(SimpleNamespace())
+    overlay.install_business_repair_evidence(
+        [
+            {
+                "page": 1,
+                "source_page": 9,
+                "lines": [
+                    _one_shot_page_line(
+                        "平安消费金融有限公司",
+                        confidence=0.96,
+                        bbox=[1, 1, 20, 10],
+                        page_key="institution-page-1",
+                    )
+                ],
+            }
+        ],
+        affected_pages={1},
+    )
+
+    corrected, decision = overlay.correct_text(
+        "平安消费金融有限公司",
+        role="institution_name",
+        source_refs=(_exact_identity_repair_target_ref(),),
+    )
+
+    assert corrected == "平安消费金融有限公司"
+    assert decision is None
+    assert overlay.audit()["decisions"] == []
 
 
 def test_page_repair_rejects_destructive_normalization_of_candidate_text() -> None:

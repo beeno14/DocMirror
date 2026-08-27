@@ -26,6 +26,7 @@ def _cell(
     *,
     row: int,
     col: int,
+    raw_row: int | None = None,
     row_span: int = 1,
     exact: bool = True,
 ) -> SimpleNamespace:
@@ -41,6 +42,15 @@ def _cell(
         geometry_source="scanned_image_line_grid",
         evidence_ids=evidence,
         token_ids=evidence,
+        source_cell_refs=[
+            {
+                "page": 19,
+                "table_id": "pt_19_0",
+                "row": row,
+                "raw_row": row if raw_row is None else raw_row,
+                "col": col,
+            }
+        ],
     )
 
 
@@ -119,7 +129,8 @@ def _native_table() -> SimpleNamespace:
         table_id="pt_19_0",
         bbox=[edges[0], header_y[0], edges[-1], amount_y[1]],
         extraction_layer="scanned_image_line_grid",
-        metadata={"geometry": geometry},
+        metadata={"geometry": geometry, "preserve_headers": False},
+        headers=[],
         rows=rows,
     )
 
@@ -196,25 +207,34 @@ def _case(
     return context, records
 
 
-def _source_owned_p19_case() -> tuple[SimpleNamespace, list[dict[str, Any]]]:
+def _source_owned_p19_case(
+    *,
+    preserve_headers: bool = False,
+) -> tuple[SimpleNamespace, list[dict[str, Any]]]:
     """Reproduce p19's row-8 header and row-9/10 source-owned lattice."""
 
     context, records = _case(basis="source_table_year_plus_twelve_ownership")
     table = context.parse_result.pages[0].tables[0]
     target_rows = table.rows
-    for offset, row in enumerate(target_rows, start=8):
+    source_offset = 1 if preserve_headers else 0
+    for raw_row, row in enumerate(target_rows, start=8):
         for cell in row.cells:
-            cell.row_index = offset
+            cell.row_index = raw_row - source_offset
+            cell.source_cell_refs[0].update(
+                {"row": cell.row_index, "raw_row": raw_row}
+            )
     year_cell = target_rows[1].cells[0]
     year_cell.text = "2022 搜"
     year_cell.token_ids = ["ocr:p19:year:2022", "ocr:p19:year:noise"]
     year_cell.evidence_ids = list(year_cell.token_ids)
 
     table.rows = (
-        [SimpleNamespace(cells=[]) for _ in range(8)]
+        [SimpleNamespace(cells=[]) for _ in range(8 - source_offset)]
         + target_rows
         + [SimpleNamespace(cells=[]) for _ in range(6)]
     )
+    table.metadata["preserve_headers"] = preserve_headers
+    table.headers = ["账户信息"] + [""] * 12 if preserve_headers else []
     geometry = table.metadata["geometry"]
     missing_boxes = [[None] * 13 for _ in range(8)]
     missing_statuses = [["missing"] * 13 for _ in range(8)]
@@ -338,6 +358,165 @@ def test_source_owned_base_page_binds_actual_p19_shape_with_damaged_year_text() 
     }
 
 
+@pytest.mark.parametrize("source_owned", (False, True))
+def test_preserved_header_maps_raw_lattice_rows_to_their_typed_owners(
+    source_owned: bool,
+) -> None:
+    context, records = _source_owned_p19_case(preserve_headers=True)
+    table = context.parse_result.pages[0].tables[0]
+    if not source_owned:
+        for ref in records[0]["source_cell_refs"]:
+            ref["geometry_provenance"] = _provenance()
+
+    # The raw p19 header/status/amount rows remain 8/9/10, while the
+    # preserved first table header makes their typed row indices 7/8/9.
+    assert [table.rows[index].cells[8].row_index for index in (7, 8, 9)] == [7, 8, 9]
+    assert [
+        table.rows[index].cells[8].source_cell_refs[0]["raw_row"]
+        for index in (7, 8, 9)
+    ] == [8, 9, 10]
+    assert all(not row.cells for row in table.rows[:7])
+
+    audit = apply_candidate_b_native_status_conflict_guard(
+        context,
+        records,
+        enabled=True,
+    )
+
+    assert "status" not in records[0]
+    assert records[0]["overdue_amount"] == "0"
+    assert audit["unique_native_witnesses"] == 1
+    assert audit["conflicts_withheld"] == 1
+    native_refs = context._personal_detail_extraction_issues[0]["source_refs"][2:]
+    assert {(ref["row"], ref["col"]) for ref in native_refs} == {(9, 8), (10, 8)}
+    assert all(ref["logical_page"] == 19 and ref["source_page"] == 10 for ref in native_refs)
+
+
+def test_preserved_first_header_without_typed_owner_never_binds_shifted_rows() -> None:
+    context, records = _case()
+    table = context.parse_result.pages[0].tables[0]
+    table.metadata["preserve_headers"] = True
+    table.headers = [cell.text for cell in table.rows[0].cells]
+    table.rows = table.rows[1:]
+    for row in table.rows:
+        for cell in row.cells:
+            cell.row_index -= 1
+            cell.source_cell_refs[0]["row"] = cell.row_index
+
+    audit = apply_candidate_b_native_status_conflict_guard(context, records, enabled=True)
+
+    assert records[0]["status"] == "M"
+    assert audit["unique_native_witnesses"] == 0
+    assert audit["conflicts_withheld"] == 0
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("empty", "missing_refs", "wrong_table", "duplicate_ref", "duplicate_owner"),
+)
+def test_unrelated_unowned_native_rows_do_not_disable_an_exact_used_lattice(
+    defect: str,
+) -> None:
+    context, records = _source_owned_p19_case()
+    table = context.parse_result.pages[0].tables[0]
+    if defect != "empty":
+        unrelated_cell = _cell("unrelated", None, row=0, col=0)
+        table.rows[0] = SimpleNamespace(cells=[unrelated_cell])
+        if defect == "missing_refs":
+            unrelated_cell.source_cell_refs = []
+        elif defect == "wrong_table":
+            unrelated_cell.source_cell_refs[0]["table_id"] = "pt_19_other"
+        elif defect == "duplicate_ref":
+            unrelated_cell.source_cell_refs.append(deepcopy(unrelated_cell.source_cell_refs[0]))
+        elif defect == "duplicate_owner":
+            table.rows[1] = SimpleNamespace(
+                cells=[_cell("unrelated", None, row=1, raw_row=0, col=0)]
+            )
+
+    audit = apply_candidate_b_native_status_conflict_guard(context, records, enabled=True)
+
+    assert "status" not in records[0]
+    assert records[0]["overdue_amount"] == "0"
+    assert audit["unique_native_witnesses"] == 1
+    assert audit["conflicts_withheld"] == 1
+
+
+@pytest.mark.parametrize("source_owned", (False, True))
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "missing_refs",
+        "missing_raw_row",
+        "malformed_raw_row",
+        "wrong_raw_row",
+        "wrong_typed_row",
+        "wrong_table",
+        "wrong_column",
+        "source_page_instead_of_coordinate_page",
+        "duplicate_ref",
+        "duplicate_cell",
+        "duplicate_row_owner",
+        "disjoint_row_owners",
+        "malformed_competing_owner",
+    ),
+)
+def test_used_native_rows_require_unique_well_formed_raw_ownership(
+    source_owned: bool,
+    defect: str,
+) -> None:
+    context, records = _source_owned_p19_case(preserve_headers=True)
+    table = context.parse_result.pages[0].tables[0]
+    if not source_owned:
+        for final_ref in records[0]["source_cell_refs"]:
+            final_ref["geometry_provenance"] = _provenance()
+    status_row = table.rows[8]  # Typed row 8 owns raw geometry row 9.
+    status_cell = status_row.cells[8]
+    ref = status_cell.source_cell_refs[0]
+    if defect == "missing_refs":
+        status_cell.source_cell_refs = []
+    elif defect == "missing_raw_row":
+        ref.pop("raw_row")
+    elif defect == "malformed_raw_row":
+        ref["raw_row"] = "9"
+    elif defect == "wrong_raw_row":
+        ref["raw_row"] = 10
+    elif defect == "wrong_typed_row":
+        ref["row"] = 9
+    elif defect == "wrong_table":
+        ref["table_id"] = "pt_19_other"
+    elif defect == "wrong_column":
+        ref["col"] = 9
+    elif defect == "source_page_instead_of_coordinate_page":
+        ref["page"] = 10
+    elif defect == "duplicate_ref":
+        status_cell.source_cell_refs.append(deepcopy(ref))
+    elif defect == "duplicate_cell":
+        status_row.cells.append(deepcopy(status_cell))
+    else:
+        if defect == "disjoint_row_owners":
+            competing_cells = status_row.cells[8:]
+            status_row.cells = status_row.cells[:8]
+        elif defect == "duplicate_row_owner":
+            competing_cells = deepcopy(status_row.cells)
+        else:
+            competing_cells = [deepcopy(status_cell)]
+        for cell in competing_cells:
+            cell.row_index = 99
+            cell.source_cell_refs[0]["row"] = 99
+            if defect == "malformed_competing_owner":
+                cell.source_cell_refs[0]["table_id"] = "pt_19_other"
+        table.rows.append(SimpleNamespace(cells=competing_cells))
+
+    audit = apply_candidate_b_native_status_conflict_guard(context, records, enabled=True)
+
+    assert records[0]["status"] == "M"
+    assert records[0]["overdue_amount"] == "0"
+    assert audit["unique_native_witnesses"] == 0
+    assert audit["conflicts_withheld"] == 0
+    assert not hasattr(context, "_personal_detail_extraction_issues")
+
+
 def test_source_owned_base_page_never_uses_geometry_only_when_typed_header_is_missing() -> None:
     context, records = _source_owned_p19_case()
     context.parse_result.pages[0].tables[0].rows[8].cells = []
@@ -402,6 +581,9 @@ def test_source_owned_base_page_requires_one_unique_physical_lattice() -> None:
     context, records = _source_owned_p19_case()
     duplicate = deepcopy(context.parse_result.pages[0].tables[0])
     duplicate.table_id = "pt_19_duplicate"
+    for row in duplicate.rows:
+        for cell in row.cells:
+            cell.source_cell_refs[0]["table_id"] = duplicate.table_id
     context.parse_result.pages[0].tables.append(duplicate)
 
     audit = apply_candidate_b_native_status_conflict_guard(
@@ -707,6 +889,9 @@ def test_native_binding_defects_and_incomplete_rows_fail_closed(defect: str) -> 
     elif defect == "duplicate_native":
         duplicate = deepcopy(table)
         duplicate.table_id = "pt_19_duplicate"
+        for row in duplicate.rows:
+            for cell in row.cells:
+                cell.source_cell_refs[0]["table_id"] = duplicate.table_id
         context.parse_result.pages[0].tables.append(duplicate)
     elif defect == "native_amount_mismatch":
         table.rows[2].cells[8].text = "1"

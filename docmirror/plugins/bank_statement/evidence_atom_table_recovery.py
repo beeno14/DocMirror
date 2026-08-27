@@ -1731,7 +1731,12 @@ def _recover_geometry_bank_tables(
                 original_rows.append(original_row)
                 overlay_repairs_by_row.append(overlay_repairs)
         if rows:
-            previous_balance = _repair_geometry_rows(rows, col_map, previous_balance=previous_balance)
+            previous_balance = _repair_geometry_rows(
+                rows,
+                col_map,
+                source_headers=source_headers,
+                previous_balance=previous_balance,
+            )
             for row_atoms, original_row, row, overlay_repairs in zip(
                 row_atom_groups,
                 original_rows,
@@ -2992,6 +2997,7 @@ def _repair_geometry_rows(
     rows: list[list[str]],
     col_map: dict[str, int],
     *,
+    source_headers: list[str] | None = None,
     previous_balance: float | None = None,
 ) -> float | None:
     sequence_idx = col_map.get("sequence_no")
@@ -3006,8 +3012,12 @@ def _repair_geometry_rows(
         for index in (amount_idx, balance_idx):
             if index is not None and index < len(row):
                 row[index] = _repair_malformed_money(row[index])
-    if sequence_idx is not None:
-        _repair_sequence_values(rows, sequence_idx)
+    if sequence_idx is not None and source_headers is not None and sequence_idx < len(source_headers):
+        _repair_sequence_values(
+            rows,
+            sequence_idx,
+            source_header=source_headers[sequence_idx],
+        )
     if amount_idx is None or balance_idx is None:
         return previous_balance
 
@@ -3056,16 +3066,60 @@ def _repair_geometry_rows(
     return previous_balance
 
 
-def _repair_sequence_values(rows: list[list[str]], sequence_idx: int) -> None:
+def _is_ordinal_sequence_header(source_header: str) -> bool:
+    """Return whether a source column is a repairable row ordinal."""
+
+    compact = re.sub(
+        r"[\s.:：]+",
+        "",
+        unicodedata.normalize("NFKC", str(source_header or "")),
+    ).casefold()
+    return compact in {"序号", "交易序号", "no", "sequence", "序号/no", "no/序号"}
+
+
+def _nearest_sequence_anchor(
+    texts: list[str],
+    values: list[int | None],
+    *,
+    start: int,
+    step: int,
+) -> int | None:
+    """Find an ordinal anchor without crossing a non-empty opaque value."""
+
+    position = start + step
+    while 0 <= position < len(values):
+        if values[position] is not None:
+            return position
+        if texts[position]:
+            return None
+        position += step
+    return None
+
+
+def _repair_sequence_values(
+    rows: list[list[str]],
+    sequence_idx: int,
+    *,
+    source_header: str,
+) -> None:
+    # ``sequence_no`` is a shared canonical field, but issuer columns such as
+    # 日志号 and 流水号 contain opaque identifiers rather than row ordinals.
+    # Only an explicit ordinal header permits interpolation, and even then a
+    # non-empty source value is immutable.
+    if not _is_ordinal_sequence_header(source_header):
+        return
+
+    texts: list[str] = []
     values: list[int | None] = []
     for row in rows:
         text = str(row[sequence_idx] or "").strip() if sequence_idx < len(row) else ""
+        texts.append(text)
         values.append(int(text) if re.fullmatch(r"\d{1,6}", text) else None)
     for index, value in enumerate(values):
-        if value is not None:
+        if value is not None or texts[index]:
             continue
-        previous = next((position for position in range(index - 1, -1, -1) if values[position] is not None), None)
-        following = next((position for position in range(index + 1, len(values)) if values[position] is not None), None)
+        previous = _nearest_sequence_anchor(texts, values, start=index, step=-1)
+        following = _nearest_sequence_anchor(texts, values, start=index, step=1)
         inferred: int | None = None
         if previous is not None and following is not None:
             if values[following] - values[previous] == following - previous:

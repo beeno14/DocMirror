@@ -1,7 +1,7 @@
 # Copyright (c) 2026 ValueMap Global and contributors. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Community Bundle v3 JSON, Markdown, dataset CSV, and audit CSV projection."""
+"""Community v3/v4 and business-facing v5 JSON, Markdown, CSV, and audit projection."""
 
 from __future__ import annotations
 
@@ -12,12 +12,21 @@ import io
 import json
 import mimetypes
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from docmirror.models.community_semantic import CommunitySemanticResult
+from docmirror.output.bank_business_view import (
+    BUSINESS_VIEW_VERSION,
+    business_view,
+    is_business_view,
+    render_business_markdown,
+    restore_business_records,
+)
 from docmirror.output.markdown_renderer import render_markdown
+from docmirror.output.normalized_records import enrich_normalized_dataset, strip_source_value_pools
 
 _SYSTEM_COLUMNS = ("record_id", "_page_start", "_page_end")
 _AUDIT_COLUMNS = (
@@ -190,6 +199,8 @@ def _type_of(value: Any, declared: Any = "") -> str:
 
 
 def _json_value(value: Any, value_type: str) -> Any:
+    if value_type in {"array", "object", "json"}:
+        return _json_safe(value)
     value = _scalar(value)
     if value_type in {"money", "decimal"} and value not in (None, ""):
         return str(value)
@@ -380,12 +391,13 @@ def _record_pools(row: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         canonical_keys = []
         for key in keys:
             detail = field_sources.get(key)
+            normalized_only = bool(isinstance(detail, dict) and detail.get("normalized_only") is True)
             explicitly_derived = bool(
                 isinstance(detail, dict)
                 and str(detail.get("source") or "").startswith("derived.")
                 and str(detail.get("derivation") or "").strip()
             )
-            if key in raw or not explicitly_derived:
+            if key in raw or not (normalized_only or explicitly_derived):
                 canonical_keys.append(key)
         return (
             {str(key): normalized.get(key, raw.get(key)) for key in keys},
@@ -412,6 +424,75 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _source_absent_normalized_fields(
+    rows: list[Any],
+    columns: list[dict[str, Any]],
+    *,
+    source_aliases: dict[str, Any],
+    foreign_keys: list[dict[str, Any]],
+) -> list[str]:
+    """Find optional schema placeholders, using records before public expansion.
+
+    Absence is dataset-wide: a source column on any row keeps that field on
+    every row. Explicit nulls, canonical source keys, and field provenance are
+    retained. An unrecognized blank source column makes absence uncertain.
+    """
+    if not rows or not all(isinstance(row, dict) for row in rows):
+        return []
+
+    def header_key(value: Any) -> str:
+        return re.sub(r"[\s:：]+", "", unicodedata.normalize("NFKC", str(value))).casefold()
+
+    names: dict[str, set[str]] = {}
+    supported = {
+        str(column["key"])
+        for column in columns
+        if column.get("nullable") is False or column.get("required") is True
+    }
+    for foreign_key in foreign_keys:
+        supported.update(str(key) for key in foreign_key.get("columns") or [])
+    for column in columns:
+        key = str(column["key"])
+        aliases = source_aliases.get(key)
+        aliases = aliases if isinstance(aliases, (list, tuple)) else []
+        for name in (key, column.get("label") or key, *aliases):
+            normalized_name = header_key(name)
+            if normalized_name:
+                names.setdefault(normalized_name, set()).add(key)
+
+    source_headers: dict[str, bool] = {}
+    for row in rows:
+        normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        canonical_raw = row.get("canonical_raw") if isinstance(row.get("canonical_raw"), dict) else {}
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
+        supported.update(canonical_raw)
+        supported.update(field_sources)
+        supported.update(key for key, value in normalized.items() if value != "")
+        if not raw and not canonical_raw and not field_sources:
+            # Without a source plane, an explicit empty value is not proof of
+            # source absence. Only fields inserted by the schema may disappear.
+            supported.update(normalized)
+        for key, value in raw.items():
+            if not str(key).startswith("_"):
+                name = header_key(key)
+                source_headers[name] = source_headers.get(name, False) or value in (None, "")
+
+    for header, has_blank in source_headers.items():
+        matched = set(names.get(header, ()))
+        if not matched:
+            # Conservative containment preserves stacked/bilingual/compound
+            # source headings; false matches merely retain an extra column.
+            for name, fields in names.items():
+                if len(name) > 1 and name in header:
+                    matched.update(fields)
+        if not matched and has_blank:
+            return []
+        supported.update(matched)
+    return [str(column["key"]) for column in columns if str(column["key"]) not in supported]
+
+
 def _public_record(
     row: Any,
     *,
@@ -419,10 +500,15 @@ def _public_record(
     row_index: int,
     columns: list[dict[str, Any]],
     fallback_page_range: list[int],
+    preserve_canonical_raw: bool = False,
 ) -> dict[str, Any]:
     """Project one complete, stable Community API record."""
     record_id = _canonical_record_id(row, dataset_id, row_index)
     normalized, canonical_raw = _record_pools(row)
+    if preserve_canonical_raw and isinstance(row, dict):
+        # A public replay must not turn schema-inserted normalized nulls into
+        # purported source values. The exported source pool is authoritative.
+        canonical_raw = row.get("canonical_raw") or {}
     source_raw = row.get("raw") if isinstance(row, dict) and isinstance(row.get("raw"), dict) else canonical_raw
     column_types = {str(column["key"]): str(column.get("type") or "string") for column in columns}
 
@@ -724,13 +810,40 @@ def _warning_code(raw: str) -> str:
     return code or "PARTIAL_PARSE"
 
 
+def _effective_omitted_normalized_fields(dataset: dict[str, Any]) -> set[str]:
+    """Honor saved omission declarations without hiding subsequently added data."""
+    omitted = set(dataset.get("omitted_normalized_fields") or [])
+    if not omitted:
+        return omitted
+    columns = list(dataset.get("columns") or [])
+    omitted.intersection_update(str(column["key"]) for column in columns)
+    omitted.difference_update(
+        str(column["key"])
+        for column in columns
+        if column.get("nullable") is False or column.get("required") is True
+    )
+    for foreign_key in dataset.get("foreign_keys") or []:
+        omitted.difference_update(foreign_key.get("columns") or [])
+    for row in dataset.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
+        omitted.difference_update(field_sources)
+        for pool_name in ("normalized", "canonical_raw"):
+            pool = row.get(pool_name) if isinstance(row.get(pool_name), dict) else {}
+            omitted.difference_update(key for key, value in pool.items() if value not in (None, ""))
+    return omitted
+
+
 def _reading_column_keys(dataset: dict[str, Any]) -> list[str]:
     available = [str(column.get("key") or "") for column in dataset.get("columns") or [] if column.get("key")]
     preferred = tuple(dataset.get("reading_columns") or ()) or _READING_COLUMN_PREFERENCES.get(
         str(dataset.get("name") or ""), ()
     )
     selected = [key for key in preferred if key in available]
-    return selected or available
+    omitted = _effective_omitted_normalized_fields(dataset)
+    return [key for key in (selected or available) if key not in omitted]
 
 
 def _build_public_reading_model(
@@ -847,9 +960,11 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
     )
     extensions = semantic_domain.get("extensions") if isinstance(semantic_domain.get("extensions"), dict) else {}
     presentation = extensions.get("enhanced_markdown") if isinstance(extensions.get("enhanced_markdown"), dict) else {}
-    privacy_mode = str(presentation.get("privacy_mode") or "masked")
+    privacy_mode = str(presentation.get("privacy_mode") or (payload.get("reading") or {}).get("privacy_mode") or "masked")
     if (payload.get("schema") or {}).get("name") == "docmirror.community.semantic":
         payload = _community_view_from_semantic(payload)
+    if is_business_view(payload):
+        return render_business_markdown(payload)
     document = payload.get("document") or {}
     if document.get("type") == "personal_credit_report_detailed":
         privacy_mode = "full"
@@ -895,10 +1010,15 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
 
     def item_line(item: dict[str, Any], *, label: str = "") -> str:
         key = str(item.get("key") or "")
-        return (
+        line = (
             f"**{_markdown_text(label or item.get('label') or key)}:** "
             f"{_markdown_display(item.get('value'), key=key, descriptor=item, dictionary=dictionary, privacy_mode=privacy_mode)}"
         )
+        for value in item.get("additional_values") or []:
+            line += " · " + _markdown_display(
+                value, key=key, descriptor=item, dictionary=dictionary, privacy_mode=privacy_mode
+            )
+        return line
 
     def document_item(spec: dict[str, Any]) -> dict[str, Any] | None:
         path = str(spec.get("path") or "")
@@ -1088,6 +1208,8 @@ def render_community_reading_markdown(payload: dict[str, Any]) -> str:
         dataset_rows = [row for row in (dataset.get("rows") or []) if isinstance(row, dict)]
         configured_keys = dataset_layout.get("columns") or table.get("column_keys") or []
         keys = [str(key) for key in configured_keys if str(key) in column_by_key]
+        omitted = _effective_omitted_normalized_fields(dataset)
+        keys = [key for key in keys if key not in omitted]
         if dataset_layout.get(
             "suppress_empty_columns",
             presentation.get("suppress_empty_columns", False),
@@ -1959,7 +2081,7 @@ def _semantic_bindings(
 def _community_view_from_semantic(semantic: dict[str, Any]) -> dict[str, Any]:
     """Return the stable Community JSON view of one semantic result."""
     structure = semantic.get("structure") if isinstance(semantic.get("structure"), dict) else {}
-    return {
+    payload = {
         "schema": {
             "name": "docmirror.community",
             "version": "3.0.0",
@@ -1982,6 +2104,17 @@ def _community_view_from_semantic(semantic: dict[str, Any]) -> dict[str, Any]:
         "files": copy.deepcopy(dict(semantic.get("files") or {})),
         "warnings": copy.deepcopy(list(semantic.get("warnings") or [])),
     }
+    extensions = (semantic.get("domain") or {}).get("extensions") or {}
+    policy = extensions.get("compact_output") or {}
+    if policy.get("normalized_only") is True:
+        strip_source_value_pools(payload)
+        # Persist the digital bank's explicit presentation choice for JSON replay.
+        privacy_mode = (extensions.get("enhanced_markdown") or {}).get("privacy_mode")
+        if privacy_mode in {"full", "masked"}:
+            payload["reading"]["privacy_mode"] = privacy_mode
+        if policy.get("business_view") is True:
+            return business_view(payload)
+    return payload
 
 
 @dataclass
@@ -1989,7 +2122,16 @@ class CommunityDataset:
     public: dict[str, Any]
     rows: list[Any] = field(default_factory=list)
 
-    def to_payload(self, *, fallback_page_range: list[int] | None = None) -> dict[str, Any]:
+    def to_payload(
+        self,
+        *,
+        fallback_page_range: list[int] | None = None,
+        compact: bool = False,
+        source_aliases: dict[str, Any] | None = None,
+        preserve_canonical_raw: bool = False,
+        normalized_only: bool = False,
+        preserve_normalized_keys: bool = False,
+    ) -> dict[str, Any]:
         """Return the self-contained public dataset, including every record."""
         metadata = {key: _json_safe(value) for key, value in self.public.items() if not key.startswith("_")}
         columns = list(metadata.get("columns") or [])
@@ -2000,9 +2142,48 @@ class CommunityDataset:
                 row_index=index,
                 columns=columns,
                 fallback_page_range=list(fallback_page_range or []),
+                preserve_canonical_raw=preserve_canonical_raw,
             )
             for index, row in enumerate(self.rows, start=1)
         ]
+        if preserve_normalized_keys:
+            for projected, original in zip(projected_rows, self.rows, strict=True):
+                projected["normalized"] = {key: value for key, value in projected["normalized"].items()
+                                           if key in original["normalized"]}
+        if normalized_only:
+            enrich_normalized_dataset(projected_rows, self.rows, columns, source_aliases or {})
+            metadata["columns"] = columns
+        omitted = list(metadata.get("omitted_normalized_fields") or [])
+        if compact:
+            omitted = list(
+                dict.fromkeys(
+                    [
+                        *omitted,
+                        *_source_absent_normalized_fields(
+                            self.rows,
+                            columns,
+                            source_aliases=source_aliases or {},
+                            foreign_keys=list(metadata.get("foreign_keys") or []),
+                        ),
+                    ]
+                )
+            )
+        if omitted:
+            # Materialized Community JSON already carries source-absence
+            # decisions; do not re-expand its sparse rows on a replay.
+            omitted_keys = _effective_omitted_normalized_fields(
+                {**metadata, "rows": projected_rows, "omitted_normalized_fields": omitted}
+            )
+            if omitted_keys:
+                for row in projected_rows:
+                    row["normalized"] = {
+                        key: value
+                        for key, value in row["normalized"].items()
+                        if key not in omitted_keys or value not in (None, "")
+                    }
+                metadata["omitted_normalized_fields"] = [key for key in omitted if key in omitted_keys]
+            else:
+                metadata.pop("omitted_normalized_fields", None)
         record_ids = [str(row["record_id"]) for row in projected_rows]
         if len(record_ids) != len(set(record_ids)):
             raise ValueError(f"duplicate record_id in dataset {metadata.get('id')}")
@@ -2049,15 +2230,41 @@ class CommunityBundle:
     diagnostics: dict[str, Any] = field(default_factory=dict)
     content_markdown_override: str = ""
 
+    @property
+    def compact_output(self) -> dict[str, Any]:
+        """Return provider-opted-in formatting policy; defaults stay unchanged."""
+        extensions = self.domain.get("extensions") or {}
+        policy = extensions.get("compact_output") if isinstance(extensions, dict) else None
+        if isinstance(policy, dict):
+            return policy
+        if self.schema.get("version") == "4.0.0":
+            return {"normalized_only": True, "minify_json": True}
+        if self.schema.get("version") == BUSINESS_VIEW_VERSION:
+            return {"normalized_only": True, "minify_json": True, "business_view": True}
+        if any(dataset.public.get("omitted_normalized_fields") for dataset in self.datasets):
+            return {"minify_json": True}
+        return {}
+
     def semantic_payload(self) -> dict[str, Any]:
         """Build and validate the public semantic source for all renderers."""
         sections_by_id = {str(section["id"]): section for section in self.sections}
         public_sections = [self._public_section(section) for section in self.sections]
+        compact = self.compact_output
+        source_aliases = compact.get("source_aliases") or {}
         public_datasets = [
             dataset.to_payload(
                 fallback_page_range=list(
                     sections_by_id.get(str(dataset.public.get("section_id") or ""), {}).get("page_range") or []
-                )
+                ),
+                compact=compact.get("omit_absent_fields") is True,
+                source_aliases=source_aliases.get(str(dataset.public.get("name") or ""), {}),
+                preserve_canonical_raw=(
+                    bool(compact) and self.diagnostics.get("materialized_from_community_json") is True
+                ),
+                normalized_only=compact.get("normalized_only") is True,
+                preserve_normalized_keys=(
+                    compact.get("business_view") is True and self.diagnostics.get("materialized_from_community_json") is True
+                ),
             )
             for dataset in self.datasets
         ]
@@ -2078,6 +2285,9 @@ class CommunityBundle:
             },
         }
         structure = _semantic_source_structure(self.result, public_sections, public_datasets)
+        domain = copy.deepcopy(self.domain)
+        if compact.get("normalized_only") is True:
+            domain.setdefault("extensions", {})["compact_output"] = copy.deepcopy(compact)
         payload = {
             "schema": {
                 "name": "docmirror.community.semantic",
@@ -2095,7 +2305,7 @@ class CommunityBundle:
             "structure": structure,
             "datasets": public_datasets,
             "bindings": _semantic_bindings(public_datasets, structure),
-            "domain": _json_safe(self.domain),
+            "domain": _json_safe(domain),
             "reading": reading,
             "files": copy.deepcopy(self.files),
             "warnings": copy.deepcopy(self.warnings),
@@ -2135,7 +2345,10 @@ class CommunityBundle:
     def render_dataset_csvs(self, semantic: dict[str, Any] | None = None) -> dict[str, str]:
         """Render dataset CSVs directly from the public semantic source."""
         rendered: dict[str, str] = {}
-        for public in (semantic or self.semantic_payload()).get("datasets") or []:
+        payload = semantic or self.semantic_payload()
+        if self.compact_output.get("business_view") is True:
+            payload = restore_business_records(self.json_payload(payload))
+        for public in payload.get("datasets") or []:
             relative_path = str(public["csv"])
             columns = list(public.get("columns") or [])
             fieldnames = [*_SYSTEM_COLUMNS, *(str(column["key"]) for column in columns)]
@@ -2176,6 +2389,8 @@ class CommunityBundle:
     ) -> list[str]:
         """Return JSON/internal/CSV record conservation violations."""
         public_payload = payload or self.json_payload()
+        if is_business_view(public_payload):
+            public_payload = restore_business_records(public_payload)
         internal = {str(dataset.public.get("id") or ""): dataset for dataset in self.datasets}
         issues: list[str] = []
         for dataset_payload in public_payload.get("datasets") or []:
@@ -2246,6 +2461,17 @@ class CommunityBundle:
                 for key in columns:
                     value = normalized.get(key, raw.get(key))
                     raw_value = raw.get(key, value)
+                    if self.compact_output.get("normalized_only") is True and (
+                        key == "additional_fields"
+                        or (
+                            self.diagnostics.get("materialized_from_community_json") is True
+                            and not row.get("canonical_raw")
+                            and not row.get("raw")
+                        )
+                    ):
+                        # Supplemental normalized fields have no single raw
+                        # cell; a lean JSON replay has no raw evidence at all.
+                        raw_value = ""
                     if value in (None, "") and raw_value in (None, ""):
                         continue
                     column = columns.get(key) or {"key": key, "label": key, "type": _type_of(value)}
@@ -2326,13 +2552,15 @@ def _csv_safe(value: Any, value_type: str = "string") -> Any:
 def _csv_safe_with_flag(value: Any, value_type: str = "string") -> tuple[Any, bool]:
     if value is None:
         return "", False
+    if value_type in {"array", "object", "json"} and isinstance(value, (list, dict)):
+        return _canonical_json(value), False
     if not isinstance(value, str):
         return value, False
     # Prevent spreadsheet formula execution for textual cells without changing
     # legitimate signed numbers such as -10.25. JSON remains untouched.
     if value_type == "long_id" and value:
         return ("'" + value if not value.startswith("'") else value), not value.startswith("'")
-    textual_types = {"string", "text", "enum", "date", "datetime"}
+    textual_types = {"string", "text", "enum", "date", "datetime", "json"}
     escaped = value_type in textual_types and value.startswith(("=", "+", "-", "@"))
     return ("'" + value if escaped else value), escaped
 

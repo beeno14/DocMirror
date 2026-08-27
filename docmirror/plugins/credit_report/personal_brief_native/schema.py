@@ -10,6 +10,7 @@ no longer derives from it.
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 
 from docmirror.plugins.credit_report.personal_brief_native.contracts import (
@@ -20,7 +21,10 @@ from docmirror.plugins.credit_report.personal_brief_native.contracts import (
 )
 
 
-def personal_brief_data_dictionary() -> dict[str, Any]:
+@lru_cache(maxsize=1)
+def _personal_brief_data_dictionary_template() -> dict[str, Any]:
+    """Build the package-private dictionary template exactly once."""
+
     from docmirror.plugins.credit_report.semantic_enrichment import (
         credit_report_data_dictionary,
     )
@@ -155,6 +159,18 @@ def personal_brief_data_dictionary() -> dict[str, Any]:
         "reporting_amount_unit"
     ]["enum"] = deepcopy(PERSONAL_BRIEF_AMOUNT_UNIT_LABELS)
     return dictionary
+
+
+def _personal_brief_dataset_descriptors() -> dict[str, Any]:
+    """Return cached descriptors for read-only use inside this package."""
+
+    return _personal_brief_data_dictionary_template()["datasets"]
+
+
+def personal_brief_data_dictionary() -> dict[str, Any]:
+    """Return an isolated copy of the cached personal-brief dictionary."""
+
+    return deepcopy(_personal_brief_data_dictionary_template())
 
 
 def personal_brief_semantic_extensions() -> dict[str, Any]:

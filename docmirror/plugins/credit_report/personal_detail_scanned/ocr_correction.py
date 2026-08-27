@@ -27,11 +27,20 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
+from docmirror.plugins.credit_report.personal_detail_scanned.business_repair_policy import (
+    liability_business_type_is_valid,
+    separated_leading_han_company_boundary,
+)
 from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
     resolve_exact_page_token_atoms,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction import (
     _canonical_nonmobile_phone,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+    _MonthlySourceEvidence,
+    monthly_field_slot_identity,
+    resolve_sealed_monthly_field_slot,
 )
 
 _DATE_TOKEN_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
@@ -763,6 +772,18 @@ def _is_valid_for_role(value: str, role: str) -> bool:
         return vocabulary is not None and value in vocabulary
     if role == "inquiry_row":
         return bool(_DATE_TOKEN_RE.search(value) and any(marker in value for marker in _VALID_INQUIRY_REASONS))
+    if role == "inquiry_sequence":
+        return bool(re.fullmatch(r"[1-9]\d{0,3}", value))
+    if role == "liability_business_type":
+        return liability_business_type_is_valid(value)
+    if role == "liability_related_party_name":
+        compact = re.sub(r"\s+", "", _plain_text(value))
+        return bool(
+            2 <= len(compact) <= 120
+            and re.search(r"[\u3400-\u9fffA-Za-z]", compact)
+            and re.search(r"[\"'?？]{2,}", compact) is None
+            and not separated_leading_han_company_boundary(value)
+        )
     return bool(value)
 
 
@@ -830,6 +851,12 @@ def _normalize_role(value: str, role: str) -> str:
     if role == "inquiry_reason":
         text = _field_local_inquiry_reason_alias(value)
         return _normalize_business_enum(text, _VALID_INQUIRY_REASONS)
+    if role in {
+        "inquiry_sequence",
+        "liability_business_type",
+        "liability_related_party_name",
+    }:
+        return re.sub(r"\s+", "", _plain_text(value))
     if role == "account_line":
         return _normalize_account_line(value)
     return text
@@ -1059,6 +1086,98 @@ def _strict_repair_evidence_ids(value: Any) -> tuple[str, ...] | None:
     return evidence_ids if len(evidence_ids) == len(set(evidence_ids)) else None
 
 
+def _exact_blank_account_currency_slot_identity(
+    ref: Mapping[str, Any],
+) -> tuple[Any, ...] | None:
+    """Return an exact empty currency cell sealed by its adjacent label.
+
+    A blank physical cell has no token ID of its own.  Its immutable owner is
+    therefore the exact table coordinate and bbox, plus the exact currency
+    label in the same column.  This contract is intentionally currency-only;
+    it does not weaken evidence requirements for populated cells or other
+    repair roles.
+    """
+
+    logical_page = ref.get("logical_page") or ref.get("page")
+    source_page = ref.get("source_page")
+    table_id = str(ref.get("table_id") or "")
+    row = ref.get("row")
+    column = ref.get("column")
+    label_row = ref.get("canonical_label_row")
+    value_row = ref.get("canonical_value_row")
+    value_bbox = _exact_repair_bbox(ref.get("bbox"))
+    label_bbox = _exact_repair_bbox(ref.get("canonical_label_bbox"))
+    label_evidence_ids = _strict_repair_evidence_ids(
+        ref.get("canonical_label_evidence_ids")
+    )
+    field_name = str(ref.get("field_name") or "")
+    label_text = re.sub(r"\s+", "", str(ref.get("canonical_label_text") or ""))
+    raw_value_evidence = ref.get("evidence_ids")
+    if (
+        not isinstance(logical_page, int)
+        or isinstance(logical_page, bool)
+        or logical_page <= 0
+        or not isinstance(source_page, int)
+        or isinstance(source_page, bool)
+        or source_page <= 0
+        or not table_id
+        or not isinstance(row, int)
+        or isinstance(row, bool)
+        or row < 0
+        or not isinstance(column, int)
+        or isinstance(column, bool)
+        or column < 0
+        or not isinstance(label_row, int)
+        or isinstance(label_row, bool)
+        or not isinstance(value_row, int)
+        or isinstance(value_row, bool)
+        or row != value_row
+        or label_row < 0
+        or label_row >= value_row
+        or field_name not in {"currency", "account_currency"}
+        or label_text not in {"币种", "账户币种"}
+        or ref.get("source") != "native_detail_table_cell"
+        or ref.get("geometry_scope") != "cell"
+        or ref.get("geometry_status") != "exact"
+        or ref.get("canonical_label_geometry_status") != "exact"
+        or ref.get("field_slot_role") != "value"
+        or ref.get("binding") != "canonical_field_slot"
+        or ref.get("binding_quality") != "canonical_header_column"
+        or value_bbox is None
+        or label_bbox is None
+        or label_evidence_ids is None
+        or raw_value_evidence not in (None, [], ())
+    ):
+        return None
+    horizontal_overlap = max(
+        0.0,
+        min(value_bbox[2], label_bbox[2]) - max(value_bbox[0], label_bbox[0]),
+    )
+    minimum_width = min(
+        value_bbox[2] - value_bbox[0],
+        label_bbox[2] - label_bbox[0],
+    )
+    if (
+        minimum_width <= 0.0
+        or horizontal_overlap / minimum_width < 0.9
+        or label_bbox[1] >= value_bbox[1]
+        or label_bbox[3] > value_bbox[1] + 1.0
+    ):
+        return None
+    return (
+        "blank_account_currency_slot",
+        logical_page,
+        source_page,
+        table_id,
+        row,
+        column,
+        value_bbox,
+        label_row,
+        label_bbox,
+        label_evidence_ids,
+    )
+
+
 def _consistent_line_text(value: Mapping[str, Any]) -> tuple[str, bool]:
     """Return one line value and whether its two textual views conflict."""
 
@@ -1238,6 +1357,7 @@ def _exact_repair_target_ref(
     if field_name is not None and not _field_name_matches_role(field_name, role):
         return None
     for item in refs:
+        monthly_owner = monthly_field_slot_identity(item)
         logical_page = item.get("logical_page") or item.get("page")
         source_page = item.get("source_page")
         bound_field_name = str(item.get("field_name") or "").strip()
@@ -1255,7 +1375,11 @@ def _exact_repair_target_ref(
             or source_page <= 0
             or not str(item.get("source") or "").strip()
             or _exact_repair_bbox(item.get("bbox")) is None
-            or _strict_repair_evidence_ids(item.get("evidence_ids")) is None
+            or (
+                _strict_repair_evidence_ids(item.get("evidence_ids")) is None
+                and _exact_blank_account_currency_slot_identity(item) is None
+                and monthly_owner is None
+            )
             or _target_page_reocr_acquisitions(item) is None
             or (
                 bound_field_name
@@ -1270,6 +1394,10 @@ def _exact_repair_target_ref(
             )
             or any(bound_role != role for bound_role in bound_roles)
             or (
+                monthly_owner is not None
+                and role != ("repayment_status" if item.get("field_name") in {"status", "status_code"} else "amount")
+            )
+            or (
                 item.get("geometry_scope") != "cell"
                 and item.get("binding") != "canonical_field_slot"
             )
@@ -1277,6 +1405,66 @@ def _exact_repair_target_ref(
             continue
         candidates.append(dict(item))
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _exact_repair_owner(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Return the immutable table-cell owner shared with a planned repair."""
+
+    monthly_owner = monthly_field_slot_identity(ref)
+    if monthly_owner is not None:
+        return monthly_owner
+    blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
+    if blank_currency_owner is not None:
+        return blank_currency_owner
+
+    logical_page = ref.get("logical_page") or ref.get("page")
+    source_page = ref.get("source_page")
+    table_id = str(ref.get("table_id") or "")
+    row = ref.get("row")
+    column = ref.get("column")
+    bbox = _exact_repair_bbox(ref.get("bbox"))
+    evidence_ids = _strict_repair_evidence_ids(ref.get("evidence_ids"))
+    if (
+        not isinstance(logical_page, int)
+        or isinstance(logical_page, bool)
+        or logical_page <= 0
+        or not isinstance(source_page, int)
+        or isinstance(source_page, bool)
+        or source_page <= 0
+        or not table_id
+        or not isinstance(row, int)
+        or isinstance(row, bool)
+        or row < 0
+        or not isinstance(column, int)
+        or isinstance(column, bool)
+        or column < 0
+        or bbox is None
+        or evidence_ids is None
+    ):
+        return None
+    return (
+        logical_page,
+        source_page,
+        table_id,
+        row,
+        column,
+        bbox,
+        evidence_ids,
+    )
+
+
+def _exact_repair_target_identity(
+    ref: Mapping[str, Any],
+    *,
+    field_name: str | None = None,
+) -> tuple[Any, ...] | None:
+    """Bind an immutable physical owner to one semantic field target."""
+
+    owner = _exact_repair_owner(ref)
+    semantic_field = str(field_name or ref.get("field_name") or "").strip()
+    if owner is None or not semantic_field:
+        return None
+    return (*owner, semantic_field)
 
 
 class PersonalDetailOCRCorrectionOverlay:
@@ -1293,12 +1481,14 @@ class PersonalDetailOCRCorrectionOverlay:
     ) -> None:
         self.parse_result = parse_result
         self._repair_evidence_by_page: dict[int, dict[str, Any]] = {}
+        self._repair_allowed_field_targets: set[tuple[Any, ...]] | None = None
         self._repair_evidence_reparse_attempts = 0
         self._decisions: list[PersonalDetailCorrectionDecision] = []
         self._decision_keys: set[tuple[str, str, str, str]] = set()
         self._audited_cells: set[tuple[str, str, str, str]] = set()
         self._cell_anomalies: list[PersonalDetailCellAnomaly] = []
         self._cell_anomaly_keys: set[tuple[str, str, str, str, str]] = set()
+        self._monthly_source_evidence: _MonthlySourceEvidence | None = None
 
     @property
     def decisions(self) -> tuple[PersonalDetailCorrectionDecision, ...]:
@@ -1312,7 +1502,13 @@ class PersonalDetailOCRCorrectionOverlay:
             "decision_count": len(self._decisions),
             "applied_count": counts.get("applied", 0),
             "suggested_count": counts.get("suggested", 0),
+            "confirmed_count": counts.get("confirmed", 0),
             "repair_evidence_page_count": len(self._repair_evidence_by_page),
+            "repair_evidence_target_count": (
+                None
+                if self._repair_allowed_field_targets is None
+                else len(self._repair_allowed_field_targets)
+            ),
             "repair_evidence_reparse_attempt_count": self._repair_evidence_reparse_attempts,
             "ocr_started_by_correction_overlay": False,
             "audited_cell_count": len(self._audited_cells),
@@ -1326,6 +1522,7 @@ class PersonalDetailOCRCorrectionOverlay:
         pages: Iterable[Mapping[str, Any]],
         *,
         affected_pages: Iterable[int],
+        allowed_target_refs: Iterable[Mapping[str, Any]] | None = None,
     ) -> None:
         """Install the coordinator's fixed evidence without acquiring any OCR."""
         allowed = {int(page) for page in affected_pages if int(page) > 0}
@@ -1335,6 +1532,16 @@ class PersonalDetailOCRCorrectionOverlay:
             if isinstance(page, Mapping)
             and int(page.get("page") or 0) in allowed
         }
+        self._repair_allowed_field_targets = (
+            None
+            if allowed_target_refs is None
+            else {
+                target
+                for ref in allowed_target_refs
+                if isinstance(ref, Mapping)
+                and (target := _exact_repair_target_identity(ref)) is not None
+            }
+        )
 
     def _audit_cell(
         self,
@@ -1465,6 +1672,107 @@ class PersonalDetailOCRCorrectionOverlay:
                 return repaired
         return original, None
 
+    def repair_planned_text(
+        self,
+        value: Any,
+        *,
+        repair: Any,
+        source_refs: Iterable[dict[str, Any]],
+        confirmation_value: str | None = None,
+    ) -> tuple[str, PersonalDetailCorrectionDecision | None]:
+        """Apply one coordinator-approved directive to its exact field only."""
+
+        original = str(value or "")
+        observed = str(getattr(repair, "observed_value", "") or "")
+        role = str(getattr(repair, "role", "") or "")
+        field_name = str(getattr(repair, "field_name", "") or "") or None
+        mode = str(getattr(repair, "mode", "") or "")
+        refs = _source_refs(source_refs)
+        if original != observed or not role:
+            return original, None
+        ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
+        planned_ref = _exact_repair_target_ref(
+            _source_refs(getattr(repair, "source_refs", ())),
+            role=role,
+            field_name=field_name,
+        )
+        if (
+            ref is None
+            or planned_ref is None
+            or _exact_repair_owner(ref) is None
+            or _exact_repair_owner(ref) != _exact_repair_owner(planned_ref)
+        ):
+            return original, None
+        if confirmation_value is not None and (
+            monthly_field_slot_identity(ref) is None or mode != "context_rich_reocr"
+            or not _is_valid_for_role(confirmation_value, role)
+        ):
+            return original, None
+        logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
+        target_admissible, _sealed_target_resolved = self._sealed_target_resolution(
+            ref,
+            logical_page=logical_page,
+        )
+        if not target_admissible:
+            return original, None
+        if mode == "deterministic":
+            candidate = str(getattr(repair, "candidate_value", "") or "")
+            if not candidate or not _is_valid_for_role(candidate, role):
+                return original, None
+            published_original = str(
+                getattr(repair, "published_value", "") or ""
+            )
+            if candidate == original and published_original == original:
+                return original, None
+            return candidate, self._record(
+                role=role,
+                original=(
+                    published_original
+                    if candidate == original
+                    else original
+                ),
+                corrected=candidate,
+                method="schema_bound_deterministic_field_repair",
+                reason_codes=tuple(
+                    dict.fromkeys(
+                        (
+                            *(str(code) for code in getattr(repair, "reason_codes", ()) or ()),
+                            "exact_owned_field_cell",
+                            "no_ocr_acquisition",
+                        )
+                    )
+                ),
+                confidence=1.0,
+                refs=(dict(ref),),
+                candidates=(candidate,),
+                selected_raw=original,
+            )
+        if mode != "context_rich_reocr":
+            return original, None
+        published_original = str(
+            getattr(repair, "published_value", "") or ""
+        )
+        allow_equal_candidate = confirmation_value is not None or published_original != original or (
+            monthly_field_slot_identity(ref) is not None
+            and "low_source_ocr_confidence" in tuple(getattr(repair, "reason_codes", ()) or ())
+        )
+        repaired = self._repair_from_installed_page_evidence(
+            original,
+            role=role,
+            field_name=field_name,
+            refs=refs,
+            # The repair input is preserved raw OCR, not necessarily the
+            # currently published field.  Repeating raw text is a real repair
+            # only when the schema had withheld or published another value.
+            allow_equal_candidate=allow_equal_candidate,
+            decision_original=(
+                confirmation_value if confirmation_value is not None
+                else published_original if allow_equal_candidate else None
+            ),
+            required_candidate_value=confirmation_value,
+        )
+        return repaired if repaired is not None else (original, None)
+
     def _sealed_target_resolution(
         self,
         ref: Mapping[str, Any],
@@ -1473,19 +1781,46 @@ class PersonalDetailOCRCorrectionOverlay:
     ) -> tuple[bool, bool]:
         """Return ``(admissible, resolved)`` for one immutable target cell."""
 
+        monthly_owner = monthly_field_slot_identity(ref)
+        if monthly_owner is not None:
+            if self._monthly_source_evidence is None:
+                self._monthly_source_evidence = _MonthlySourceEvidence(self.parse_result)
+            resolved = resolve_sealed_monthly_field_slot(
+                self.parse_result, ref, evidence=self._monthly_source_evidence,
+            )
+            return (resolved is not None, resolved is not None)
+        if ref.get("source") == "sealed_native_monthly_field_slot":
+            return False, False
         if not _sealed_evidence_store_available(self.parse_result):
             return True, False
         target = _exact_repair_bbox(ref.get("bbox"))
+        blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
+        evidence_ids = (
+            _strict_repair_evidence_ids(
+                ref.get("canonical_label_evidence_ids")
+            )
+            if blank_currency_owner is not None
+            else _strict_repair_evidence_ids(ref.get("evidence_ids"))
+        )
+        containment_bbox = (
+            _exact_repair_bbox(ref.get("canonical_label_bbox"))
+            if blank_currency_owner is not None
+            else target
+        )
         resolved = resolve_exact_page_token_atoms(
             self.parse_result,
-            _strict_repair_evidence_ids(ref.get("evidence_ids")) or (),
+            evidence_ids or (),
             logical_page=logical_page,
         )
         if (
             target is None
+            or containment_bbox is None
             or resolved is None
             or any(
-                not _candidate_is_contained_by_field_cell(target, atom_bbox)
+                not _candidate_is_contained_by_field_cell(
+                    containment_bbox,
+                    atom_bbox,
+                )
                 for _text, atom_bbox, _token_id in resolved
             )
         ):
@@ -1499,9 +1834,21 @@ class PersonalDetailOCRCorrectionOverlay:
         role: str,
         field_name: str | None,
         refs: tuple[dict[str, Any], ...],
+        allow_equal_candidate: bool = False,
+        decision_original: str | None = None,
+        required_candidate_value: str | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         ref = _exact_repair_target_ref(refs, role=role, field_name=field_name)
         if ref is None:
+            return None
+        target_identity = _exact_repair_target_identity(
+            ref,
+            field_name=field_name,
+        )
+        if (
+            self._repair_allowed_field_targets is not None
+            and target_identity not in self._repair_allowed_field_targets
+        ):
             return None
         logical_page = int(ref.get("logical_page") or ref.get("page") or 0)
         target_admissible, sealed_target_resolved = self._sealed_target_resolution(
@@ -1522,6 +1869,9 @@ class PersonalDetailOCRCorrectionOverlay:
             refs=refs,
             page=evidence,
             sealed_target_resolved=sealed_target_resolved,
+            allow_equal_candidate=allow_equal_candidate,
+            decision_original=decision_original,
+            required_candidate_value=required_candidate_value,
         )
 
     def _repair_from_page_evidence(
@@ -1534,6 +1884,9 @@ class PersonalDetailOCRCorrectionOverlay:
         refs: tuple[dict[str, Any], ...],
         page: Mapping[str, Any],
         sealed_target_resolved: bool,
+        allow_equal_candidate: bool = False,
+        decision_original: str | None = None,
+        required_candidate_value: str | None = None,
     ) -> tuple[str, PersonalDetailCorrectionDecision] | None:
         """Select a typed value from already-acquired complete-page evidence."""
         selection = self._select_page_evidence_candidate(
@@ -1545,16 +1898,47 @@ class PersonalDetailOCRCorrectionOverlay:
         if selection is None:
             return None
         selected = str(selection["normalized"])
+        if required_candidate_value is not None and selected != required_candidate_value:
+            # A reconstruction may already contain the approved reading. It
+            # can be confirmed, but never overwritten under that exception.
+            # Reject before recording any applied/confirmed decision.
+            return None
+        if selected == original and not allow_equal_candidate:
+            # Page evidence that merely repeats the installed value is not a
+            # repair.  Recording it as ``applied`` makes the correction ledger
+            # claim a mutation that never occurred.
+            return None
+        if (
+            monthly_field_slot_identity(ref) is not None
+            and self._repair_allowed_field_targets is None
+        ):
+            return None
+        if (
+            role == "liability_related_party_name"
+            and selected == re.sub(r"\s+", "", _plain_text(original))
+        ):
+            # The proactive trigger is an ambiguous separated leading-Han
+            # boundary. Merely repeating the same glyphs without whitespace is
+            # not independent resolution and must leave the field unchanged.
+            return None
         selected_ref = selection.get("source_ref")
         if not isinstance(selected_ref, dict):
             return None
         if field_name is not None:
             selected_ref = {**selected_ref, "field_name": field_name}
+        confirmation_only = bool(
+            monthly_field_slot_identity(ref) is not None
+            and selected == (decision_original if decision_original is not None else original)
+        )
         return selected, self._record(
             role=role,
-            original=original,
+            original=(
+                decision_original
+                if decision_original is not None
+                else original
+            ),
             corrected=selected,
-            method="schema_bound_page_evidence_reparse",
+            method="schema_bound_monthly_confidence_confirmation" if confirmation_only else "schema_bound_page_evidence_reparse",
             reason_codes=(
                 "business_uncertainty_trigger",
                 "schema_role_validation",
@@ -1566,7 +1950,43 @@ class PersonalDetailOCRCorrectionOverlay:
             candidates=tuple(selection["candidates"]),
             selected_raw=str(selection["raw"]),
             selected_acquisition=str(selection["acquisition"]),
+            action="confirmed" if confirmation_only else "applied",
         )
+
+    def monthly_field_confirmation(
+        self, ref: Mapping[str, Any], *, value: str,
+    ) -> PersonalDetailCorrectionDecision | None:
+        """Return only a live, approved, independently revalidated slot repair."""
+
+        owner = monthly_field_slot_identity(ref)
+        if owner is None or self._repair_allowed_field_targets is None:
+            return None
+        matching = [
+            decision for decision in self._decisions
+            if decision.action in {"applied", "confirmed"}
+            and decision.corrected == value and decision.selected_acquisition
+            and decision.source_refs and monthly_field_slot_identity(decision.source_refs[0]) == owner
+        ]
+        if len(matching) != 1:
+            return None
+        decision = matching[0]
+        original_ref = decision.source_refs[0]
+        if _exact_repair_target_identity(original_ref) not in self._repair_allowed_field_targets:
+            return None
+        admissible, resolved = self._sealed_target_resolution(original_ref, logical_page=original_ref["logical_page"])
+        page = self._repair_evidence_by_page.get(original_ref["logical_page"])
+        if not admissible or page is None:
+            return None
+        selection = self._select_page_evidence_candidate(
+            role=decision.role, ref=original_ref, page=page, sealed_target_resolved=resolved,
+        )
+        if (
+            selection is None or selection["normalized"] != value
+            or selection["acquisition"] != decision.selected_acquisition
+            or tuple(selection["evidence_ids"]) != tuple(decision.source_refs[-1].get("evidence_ids") or ())
+        ):
+            return None
+        return decision
 
     @staticmethod
     def _select_page_evidence_candidate(
@@ -1579,7 +1999,15 @@ class PersonalDetailOCRCorrectionOverlay:
         """Return one uniquely source-bound typed candidate and its OCR evidence."""
 
         target = _exact_repair_bbox(ref.get("bbox"))
-        target_evidence_ids = _strict_repair_evidence_ids(ref.get("evidence_ids"))
+        blank_currency_owner = _exact_blank_account_currency_slot_identity(ref)
+        monthly_owner = monthly_field_slot_identity(ref)
+        target_evidence_ids = (
+            ()
+            if blank_currency_owner is not None
+            else tuple(ref["evidence_ids"])
+            if monthly_owner is not None
+            else _strict_repair_evidence_ids(ref.get("evidence_ids"))
+        )
         logical_page = page.get("page")
         declared_logical_page = page.get("logical_page")
         source_page = page.get("source_page")
@@ -1959,7 +2387,7 @@ class PersonalDetailOCRCorrectionOverlay:
                         or not isinstance(value_row, int)
                         or row != value_row
                         or label_row >= value_row
-                        or _strict_repair_evidence_ids(ref.get("evidence_ids")) is None
+                        or _exact_blank_account_currency_slot_identity(ref) is None
                         or _target_page_reocr_acquisitions(ref) is None
                     ):
                         continue

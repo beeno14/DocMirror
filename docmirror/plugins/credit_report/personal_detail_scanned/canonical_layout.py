@@ -46,6 +46,36 @@ _MONTHLY_GRID_RE = re.compile(
     r"20\d{2}\s*年\s*\d{1,2}\s*月\s*[-—一至到~～]\s*20\d{2}\s*年\s*\d{1,2}\s*月.*(?:还款|缴费)记录"
 )
 _ACCOUNT_CARD_HEADING_RE = re.compile(r"^账户\s*(?P<sequence>[1-9]\d{0,2})$")
+_ACCOUNT_DETAIL_CARD_HEADING_RE = re.compile(
+    r"^账户(?P<sequence>[1-9]\d{0,2})(?:"
+    r"\(授信协议标识[:：][^()（）]{1,80}\)|"
+    r"（授信协议标识[:：][^()（）]{1,80}）"
+    r")?$"
+)
+_INFORMATION_SUMMARY_SUBSECTION_RE = re.compile(
+    r"^(?:(?:[（(][\u3007零一二三四五六七八九十百]{1,5}[）)])|"
+    r"[\u3007零一二三四五六七八九十百]{1,5})?"
+    r"(?P<title>"
+    r"信贷交易信息提示|"
+    r"信贷交易违约信息概要|"
+    r"信贷交易授信及负债信息概要(?:[（(]未结清/未销户[）)])?|"
+    r"查询记录概要"
+    r")$"
+)
+_INQUIRY_SEED_SUBSECTION_TITLES = frozenset(
+    {
+        "查询记录机构查询记录明细",
+        "机构查询记录明细",
+        "本人查询记录明细",
+    }
+)
+_BOUNDED_INQUIRY_HEADER_RESIDUE_RE = re.compile(
+    r"^(?:\?查询日期查询机构X|\?查询日期查询机构|查询日期查询机构X)$"
+)
+_PRINTED_IDENTITY_UNSPECIFIED = object()
+_INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF = (
+    "exact_printed_footer_schema_carry_bridge"
+)
 _LIABILITY_HEADER_ROLE_BY_LABEL = {
     "管理机构": "管理机构",
     "业务种类": "业务种类",
@@ -53,7 +83,9 @@ _LIABILITY_HEADER_ROLE_BY_LABEL = {
     "成立日期": "开立日期",
     "到期日期": "到期日期",
     "责任人类型": "责任人类型",
+    "贵任人类型": "责任人类型",
     "还款责任金额": "还款责任金额",
+    "还款贵任金额": "还款责任金额",
     "币种": "币种",
     "保证合同编号": "保证合同编号",
 }
@@ -105,12 +137,13 @@ _LIABILITY_STATUS_ROLE_BY_LABEL = {
     "余额": "余额",
     "五级分类": "五级分类",
     "五级分类囍": "五级分类",
+    "7五级分类S": "五级分类",
     "逾期月数": "履约状态",
     "还款状态": "履约状态",
 }
 _LIABILITY_STATUS_ROLES = frozenset({"余额", "五级分类", "履约状态"})
 _LIABILITY_SNAPSHOT_RE = re.compile(
-    r"^(?:[0-9人])?截至(?:19|20)\d{2}年\d{1,2}月\d{1,2}日$"
+    r"^(?:[0-9人#?])?截至(?:19|20)\d{2}年\d{1,2}月\d{1,2}日(?:司)?$"
 )
 _HEADERLESS_SEQUENCE_DATE_CELL_RE = re.compile(
     r"^\s*(?P<sequence>[1-9]\d{0,3})\s+"
@@ -139,6 +172,17 @@ _ACCOUNT_TABLE_LABELS = frozenset(
 # section/subsection heading are additionally required before the role can own
 # a table.
 _MIXED_PAGE_TABLE_SCHEMAS: Mapping[str, tuple[frozenset[str], ...]] = {
+    "report_header_and_identity": (
+        frozenset(
+            {
+                "编号",
+                "居住地址",
+                "住宅电话",
+                "居住状况",
+                "信息更新日期",
+            }
+        ),
+    ),
     "postpaid_detail": (
         frozenset(
             {
@@ -207,6 +251,14 @@ _MIXED_PAGE_TABLE_SCHEMAS: Mapping[str, tuple[frozenset[str], ...]] = {
         ),
     ),
 }
+
+_RESIDENCE_MIXED_PAGE_HEADER = (
+    "编号",
+    "居住地址",
+    "住宅电话",
+    "居住状况",
+    "信息更新日期",
+)
 
 
 @dataclass(frozen=True)
@@ -762,6 +814,350 @@ def _exact_inquiry_table_schema(table: Any) -> dict[str, Any] | None:
     }
 
 
+def _bounded_inquiry_seed_table_schema(table: Any) -> dict[str, Any] | None:
+    """Own one first inquiry table with a narrowly damaged colspan header.
+
+    Some scanned reports preserve the four immutable header roles and their
+    exact two-column span while adding one or two ASCII OCR atoms around the
+    merged ``查询日期/查询机构`` label.  The shared exact-header
+    contract correctly rejects that text.  Canonical registration may still
+    seed the inquiry chain when the residue is from the observed finite set,
+    the colspan geometry is exact, and every physical body row has exact
+    four-cell ownership.  First/last sequence endpoints close the physical row
+    count; interior sequence OCR anomalies stay raw and field-local instead of
+    being normalized from row order.  Institution/reason values never select
+    the owner.
+    """
+
+    table_id = str(getattr(table, "table_id", "") or "")
+    table_bbox = _bbox(table)
+    rows = _raw_rows(table)
+    if not table_id or table_bbox is None or len(rows) < 4 or any(len(row) != 4 for row in rows):
+        return None
+    header = tuple(_compact(value) for value in rows[0])
+    if (
+        header[0] != "编号"
+        or header[2]
+        or header[3] != "查询原因"
+        or _BOUNDED_INQUIRY_HEADER_RESIDUE_RE.fullmatch(header[1]) is None
+    ):
+        return None
+
+    metadata = getattr(table, "metadata", None) or {}
+    if not isinstance(metadata, Mapping):
+        return None
+    geometry_views = [
+        owner
+        for owner in (metadata.get("geometry"), metadata)
+        if isinstance(owner, Mapping)
+        and all(
+            isinstance(owner.get(key), list)
+            for key in (
+                "cell_geometry_status",
+                "cell_bboxes",
+                "cell_evidence_ids",
+            )
+        )
+    ]
+    if not geometry_views:
+        return None
+    for geometry in geometry_views:
+        statuses = geometry["cell_geometry_status"]
+        bboxes = geometry["cell_bboxes"]
+        evidence_ids = geometry["cell_evidence_ids"]
+        if any(
+            not grid or not isinstance(grid[0], list) or len(grid[0]) != 4 for grid in (statuses, bboxes, evidence_ids)
+        ):
+            return None
+        if tuple(str(value or "") for value in statuses[0]) != (
+            "exact",
+            "exact",
+            "derived",
+            "exact",
+        ):
+            return None
+        if bboxes[0][2] is not None or evidence_ids[0][2] not in ([], None):
+            return None
+        spans = geometry.get("cell_spans")
+        matching_spans = [
+            span
+            for span in spans or ()
+            if isinstance(span, Mapping)
+            and span.get("row") == 0
+            and span.get("col") == 1
+            and span.get("row_span") == 1
+            and span.get("col_span") == 2
+        ]
+        if len(matching_spans) != 1:
+            return None
+        merged_ids = tuple(str(value) for value in evidence_ids[0][1] or () if str(value or ""))
+        span_ids = tuple(str(value) for value in matching_spans[0].get("evidence_ids") or () if str(value or ""))
+        if (
+            not merged_ids
+            or len(merged_ids) != len(set(merged_ids))
+            or span_ids != merged_ids
+            or _bbox({"bbox": matching_spans[0].get("bbox")}) != _bbox({"bbox": bboxes[0][1]})
+        ):
+            return None
+
+    header_owners = [_exact_table_cell_owner(table, row=0, column=column) for column in (0, 1, 3)]
+    if any(owner is None for owner in header_owners):
+        return None
+    exact_header_owners = [owner for owner in header_owners if owner is not None]
+
+    populated_rows = [
+        row_index for row_index in range(1, len(rows)) if any(_compact(value) for value in rows[row_index])
+    ]
+    if populated_rows != list(range(1, len(rows))):
+        return None
+    if (
+        _compact(rows[populated_rows[0]][0]) != "1"
+        or _compact(rows[populated_rows[-1]][0]) != str(len(populated_rows))
+    ):
+        return None
+    date_re = re.compile(r"(?:19|20)\d{2}[.,/-]\d{1,2}[.,/-]\d{1,2}")
+    for row_index in populated_rows:
+        row = rows[row_index]
+        raw_date = _compact(row[1])
+        date_matches = tuple(date_re.finditer(raw_date))
+        date_residue = (
+            raw_date[: date_matches[0].start()] + raw_date[date_matches[0].end() :]
+            if len(date_matches) == 1
+            else ""
+        )
+        if (
+            len(date_matches) != 1
+            or len(date_residue) > 2
+            or any(character.isdigit() or character in ".,/-" for character in date_residue)
+            or not _compact(row[2])
+            or not _compact(row[3])
+        ):
+            return None
+
+    def exact_empty_sequence_slot(row_index: int) -> tuple[float, float, float, float] | None:
+        candidates: set[tuple[float, float, float, float]] = set()
+        for geometry in geometry_views:
+            statuses = geometry["cell_geometry_status"]
+            bboxes = geometry["cell_bboxes"]
+            evidence_ids = geometry["cell_evidence_ids"]
+            if any(
+                row_index >= len(grid)
+                or not isinstance(grid[row_index], list)
+                or not grid[row_index]
+                for grid in (statuses, bboxes, evidence_ids)
+            ):
+                return None
+            bbox = _bbox({"bbox": bboxes[row_index][0]})
+            if (
+                str(statuses[row_index][0] or "") != "exact"
+                or bbox is None
+                or evidence_ids[row_index][0] not in ([], None)
+            ):
+                return None
+            token_ids = geometry.get("cell_token_ids")
+            if (
+                isinstance(token_ids, list)
+                and (
+                    row_index >= len(token_ids)
+                    or not isinstance(token_ids[row_index], list)
+                    or not token_ids[row_index]
+                    or token_ids[row_index][0] not in ([], None)
+                )
+            ):
+                return None
+            if any(
+                isinstance(span, Mapping)
+                and isinstance(span.get("row"), int)
+                and isinstance(span.get("col"), int)
+                and isinstance(span.get("row_span"), int)
+                and isinstance(span.get("col_span"), int)
+                and int(span["row"]) <= row_index < int(span["row"]) + int(span["row_span"])
+                and int(span["col"]) <= 0 < int(span["col"]) + int(span["col_span"])
+                for span in geometry.get("cell_spans") or ()
+            ):
+                return None
+            candidates.add(bbox)
+        return next(iter(candidates)) if len(candidates) == 1 else None
+
+    non_sequence_owners = [
+        _exact_table_cell_owner(table, row=row_index, column=column)
+        for row_index in populated_rows
+        for column in (1, 2, 3)
+    ]
+    if any(owner is None for owner in non_sequence_owners):
+        return None
+    exact_body_owners = [owner for owner in non_sequence_owners if owner is not None]
+    empty_sequence_boxes: list[tuple[float, float, float, float]] = []
+    sequence_anomalies: list[dict[str, Any]] = []
+    physical_field_omission_rows: list[int] = []
+    for expected_sequence, row_index in enumerate(populated_rows, start=1):
+        raw_sequence = _compact(rows[row_index][0])
+        if raw_sequence:
+            owner = _exact_table_cell_owner(table, row=row_index, column=0)
+            if owner is None:
+                return None
+            exact_body_owners.append(owner)
+        else:
+            empty_box = exact_empty_sequence_slot(row_index)
+            if empty_box is None:
+                return None
+            empty_sequence_boxes.append(empty_box)
+            physical_field_omission_rows.append(row_index)
+        if raw_sequence != str(expected_sequence):
+            sequence_anomalies.append(
+                {
+                    "row": row_index,
+                    "expected_sequence": expected_sequence,
+                    "raw_sequence": raw_sequence,
+                    "status": (
+                        "physical_field_omission"
+                        if not raw_sequence
+                        else "unparsed_raw_sequence"
+                    ),
+                }
+            )
+    all_owners = [*exact_header_owners, *exact_body_owners]
+    owner_ids = [evidence_id for _owner_bbox, evidence_ids in all_owners for evidence_id in evidence_ids]
+    owner_boxes = [
+        *(owner_bbox for owner_bbox, _evidence_ids in all_owners),
+        *empty_sequence_boxes,
+    ]
+    if (
+        len(owner_ids) != len(set(owner_ids))
+        or not _boxes_have_disjoint_interiors(owner_boxes)
+        or any(
+            box[0] < table_bbox[0] - 1e-6
+            or box[1] < table_bbox[1] - 1e-6
+            or box[2] > table_bbox[2] + 1e-6
+            or box[3] > table_bbox[3] + 1e-6
+            for box in owner_boxes
+        )
+    ):
+        return None
+    return {
+        "template_id": "annotations_and_inquiries",
+        "table_id": table_id,
+        "header_row": 0,
+        "header_rows": [0],
+        "population_witness_row": populated_rows[0],
+        "population_endpoint_row": populated_rows[-1],
+        "population_start": 1,
+        "population_endpoint": len(populated_rows),
+        "header_labels": ["编号", "查询日期", "查询机构", "查询原因"],
+        "inquiry_role_columns": {
+            "sequence": 0,
+            "inquiry_date": 1,
+            "institution": 2,
+            "reason": 3,
+        },
+        "evidence_ids": sorted(owner_ids),
+        "table_bbox": list(table_bbox),
+        "header_binding": "exact_bounded_residue_collapsed_header_lattice",
+        "physical_field_omission_rows": physical_field_omission_rows,
+        "sequence_field_anomalies": sequence_anomalies,
+    }
+
+
+def _sealed_inquiry_seed_table_owner(
+    page: Any,
+    evidence: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    """Bind one damaged first inquiry table to an exact local subsection."""
+
+    page_width = _finite(evidence.get("page_width") or getattr(page, "width", 0))
+    page_height = _finite(evidence.get("page_height") or getattr(page, "height", 0))
+    headings: list[
+        tuple[
+            str,
+            tuple[float, float, float, float],
+            tuple[str, ...],
+        ]
+    ] = []
+    for line in evidence.get("lines") or ():
+        bbox = _exact_evidence_line_bbox(line)
+        if bbox is None:
+            continue
+        if page_width > 0 and (bbox[0] < 0 or bbox[2] > page_width):
+            continue
+        if page_height > 0 and (bbox[1] < 0 or bbox[3] > page_height):
+            continue
+        subsection = canonical_registered_subsection_heading(_compact(line.get("text") or line.get("content") or ""))
+        if (
+            subsection is None
+            or subsection[0] != "annotations_and_inquiries"
+            or subsection[1] not in _INQUIRY_SEED_SUBSECTION_TITLES
+        ):
+            continue
+        heading_ids = tuple(str(value) for value in line.get("evidence_ids") or () if str(value or ""))
+        if not heading_ids or len(heading_ids) != len(set(heading_ids)):
+            return None
+        headings.append((subsection[1], bbox, heading_ids))
+    if len(headings) != 1:
+        return None
+    heading_title, heading_bbox, heading_ids = headings[0]
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for table in getattr(page, "tables", None) or ():
+        table_bbox = _bbox(table)
+        schema = _bounded_inquiry_seed_table_schema(table)
+        if table_bbox is None or schema is None:
+            continue
+        horizontal_overlap = max(
+            0.0,
+            min(heading_bbox[2], table_bbox[2]) - max(heading_bbox[0], table_bbox[0]),
+        )
+        if horizontal_overlap <= 0.0 or not _heading_attaches_to_table(
+            heading_bbox,
+            table_bbox,
+        ):
+            continue
+        if set(heading_ids).intersection(schema["evidence_ids"]):
+            return None
+        candidates.append(
+            (
+                str(schema["table_id"]),
+                {
+                    **schema,
+                    "heading_title": heading_title,
+                    "heading_bbox": list(heading_bbox),
+                    "heading_evidence_ids": list(heading_ids),
+                    "binding": ("exact_inquiry_subsection_and_bounded_header_residue"),
+                },
+            )
+        )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _bounded_mixed_page_header_labels(
+    row: Sequence[Any],
+    *,
+    row_index: int,
+) -> tuple[tuple[str, ...], str | None]:
+    """Normalize only the sealed Lin residence-header glyph residue.
+
+    This is not fuzzy schema matching.  All five physical columns and their
+    order must be exact, and the address label may carry only one separated
+    ASCII letter.  Exact, unique cell ownership is proved by the caller before
+    the normalized labels can authorize a table-local section.
+    """
+
+    labels = tuple(_compact(value) for value in row)
+    if row_index != 0 or len(row) != len(_RESIDENCE_MIXED_PAGE_HEADER):
+        return labels, None
+    if any(
+        labels[column] != expected
+        for column, expected in enumerate(_RESIDENCE_MIXED_PAGE_HEADER)
+        if column != 1
+    ):
+        return labels, None
+    address_label = str(row[1] or "").strip()
+    if re.fullmatch(r"居住地址[ \t]+[A-Za-z]", address_label) is None:
+        return labels, None
+    return (
+        _RESIDENCE_MIXED_PAGE_HEADER,
+        "bounded_residence_address_ascii_residue",
+    )
+
+
 def _exact_mixed_page_table_schema(
     table: Any,
 ) -> dict[str, Any] | None:
@@ -779,6 +1175,13 @@ def _exact_mixed_page_table_schema(
     for row_index, row in enumerate(rows[:-1]):
         populated = [(column, _compact(value)) for column, value in enumerate(row) if _compact(value)]
         labels = tuple(value for _column, value in populated)
+        bounded_labels, header_binding = _bounded_mixed_page_header_labels(
+            row,
+            row_index=row_index,
+        )
+        if header_binding is not None:
+            labels = bounded_labels
+            populated = list(enumerate(labels))
         if not labels or len(labels) != len(set(labels)):
             continue
         label_set = frozenset(labels)
@@ -854,6 +1257,11 @@ def _exact_mixed_page_table_schema(
                 "header_labels": list(labels),
                 "evidence_ids": sorted({*header_ids, *value_ids}),
                 "table_bbox": list(table_bbox),
+                **(
+                    {"header_binding": header_binding}
+                    if header_binding is not None
+                    else {}
+                ),
             }
         )
 
@@ -2012,6 +2420,279 @@ def _exact_headerless_collapsed_sequence_date_lattice(
     }
 
 
+def _strict_inquiry_sequence_from_row(
+    row: Sequence[Any],
+    *,
+    role_columns: Mapping[str, int],
+    physical_role_columns: Any = None,
+) -> int | None:
+    if len(row) == 4:
+        sequence_column = role_columns.get("sequence")
+        if not isinstance(sequence_column, int) or not 0 <= sequence_column < 4:
+            return None
+        raw_sequence = _compact(row[sequence_column])
+        return int(raw_sequence) if re.fullmatch(r"[1-9]\d{0,3}", raw_sequence) else None
+    if len(row) != 3 or not isinstance(physical_role_columns, list) or len(physical_role_columns) != 3:
+        return None
+    for column, raw_roles in enumerate(physical_role_columns):
+        roles = tuple(str(role) for role in raw_roles or ()) if isinstance(raw_roles, list) else ()
+        if "sequence" not in roles:
+            continue
+        if roles == ("sequence",):
+            raw_sequence = _compact(row[column])
+            return int(raw_sequence) if re.fullmatch(r"[1-9]\d{0,3}", raw_sequence) else None
+        if set(roles) == {"sequence", "inquiry_date"}:
+            parsed = _unique_sequence_date_cell(
+                row[column],
+                sequence_precedes_date=roles.index("sequence") < roles.index("inquiry_date"),
+            )
+            return int(parsed[0]) if parsed is not None else None
+    return None
+
+
+def _raw_inquiry_sequence_from_row(
+    row: Sequence[Any],
+    *,
+    role_columns: Mapping[str, int],
+    physical_role_columns: Any = None,
+) -> str | None:
+    if len(row) == 4:
+        sequence_column = role_columns.get("sequence")
+        return (
+            _compact(row[sequence_column])
+            if isinstance(sequence_column, int) and 0 <= sequence_column < 4
+            else None
+        )
+    if len(row) != 3 or not isinstance(physical_role_columns, list) or len(physical_role_columns) != 3:
+        return None
+    candidates = [
+        _compact(row[column])
+        for column, raw_roles in enumerate(physical_role_columns)
+        if isinstance(raw_roles, list)
+        and "sequence" in {str(role) for role in raw_roles}
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _owned_inquiry_population_endpoint(
+    table: Any,
+    owner: Mapping[str, Any],
+) -> int | None:
+    declared = _positive_int(owner.get("population_endpoint"))
+    if declared is not None:
+        return declared
+    role_columns = owner.get("inquiry_role_columns")
+    if not isinstance(role_columns, Mapping):
+        return None
+    rows = _raw_rows(table)
+    header_rows = owner.get("header_rows") or ()
+    if not isinstance(header_rows, (list, tuple)) or any(
+        not isinstance(row, int) or isinstance(row, bool) or row < 0 for row in header_rows
+    ):
+        return None
+    body_start = max(header_rows, default=-1) + 1
+    body_rows = [row for row in rows[body_start:] if any(_compact(value) for value in row)]
+    if not body_rows:
+        return None
+    return _strict_inquiry_sequence_from_row(
+        body_rows[-1],
+        role_columns=role_columns,
+        physical_role_columns=owner.get("physical_role_columns"),
+    )
+
+
+def _sealed_inquiry_population_bounds(
+    rows: Sequence[Sequence[Any]],
+    *,
+    role_columns: Mapping[str, int],
+    physical_role_columns: Any = None,
+) -> tuple[int, int] | None:
+    """Close physical endpoints without deciding damaged interior fields."""
+
+    if not rows:
+        return None
+    start = _strict_inquiry_sequence_from_row(
+        rows[0],
+        role_columns=role_columns,
+        physical_role_columns=physical_role_columns,
+    )
+    endpoint = _strict_inquiry_sequence_from_row(
+        rows[-1],
+        role_columns=role_columns,
+        physical_role_columns=physical_role_columns,
+    )
+    if start is None and endpoint is None:
+        return None
+    if start is None:
+        start = endpoint - len(rows) + 1 if endpoint is not None else None
+    if endpoint is None:
+        endpoint = start + len(rows) - 1 if start is not None else None
+    if (
+        start is None
+        or endpoint is None
+        or start <= 0
+        or endpoint != start + len(rows) - 1
+    ):
+        return None
+    return start, endpoint
+
+
+def _reading_order_seals_exact_printed_pair(
+    reading_order_resolution: Any,
+    previous_page: Any,
+    current_page: Any,
+    *,
+    previous_printed: tuple[int, int],
+    current_printed: tuple[int, int],
+) -> bool:
+    if not isinstance(reading_order_resolution, Mapping):
+        return True
+    previous_logical = _positive_int(getattr(previous_page, "page_number", None))
+    current_logical = _positive_int(getattr(current_page, "page_number", None))
+    printed_total = _positive_int(reading_order_resolution.get("printed_total"))
+    printed_by_logical = _logical_int_mapping(
+        reading_order_resolution.get("printed_page_by_logical")
+    )
+    return bool(
+        reading_order_resolution.get("resolved") is True
+        and reading_order_resolution.get("authoritative") is True
+        and reading_order_resolution.get("identity_fallback") is not True
+        and previous_logical is not None
+        and current_logical is not None
+        and printed_total == previous_printed[1] == current_printed[1]
+        and printed_by_logical is not None
+        and printed_by_logical.get(previous_logical) == previous_printed[0]
+        and printed_by_logical.get(current_logical) == current_printed[0]
+    )
+
+
+def _inquiry_continuation_adjacency_proof(
+    previous_page: Any,
+    previous_evidence: Mapping[str, Any],
+    current_page: Any,
+    current_evidence: Mapping[str, Any],
+    *,
+    previous_printed: tuple[int, int],
+    current_printed: tuple[int, int],
+    kind: str,
+    identity_kind: str,
+    topology: Any = None,
+) -> dict[str, Any] | None:
+    """Seal the exact page identities used by one continuation edge."""
+
+    if kind not in {
+        "exact_printed_footer_table_edge",
+        _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF,
+        "local_paired_topology_entity_edge",
+    } or identity_kind not in {
+        "exact_footer_pair",
+        "paired_inferred_current_footer",
+    }:
+        return None
+
+    def page_identity(
+        page: Any,
+        evidence: Mapping[str, Any],
+        printed: tuple[int, int],
+    ) -> dict[str, Any] | None:
+        logical = _positive_int(
+            getattr(page, "page_number", None) or evidence.get("page")
+        )
+        source = _positive_int(
+            getattr(page, "source_page_number", None)
+            or evidence.get("source_page")
+        )
+        evidence_source = _positive_int(evidence.get("source_page"))
+        width = _finite(getattr(page, "width", 0))
+        height = _finite(getattr(page, "height", 0))
+        evidence_width = _finite(evidence.get("page_width"))
+        evidence_height = _finite(evidence.get("page_height"))
+        topology_geometry = None
+        if topology is not None and logical is not None:
+            try:
+                topology_geometry = topology.geometry(logical)
+            except (AttributeError, TypeError, ValueError):
+                return None
+        if (
+            logical is None
+            or source is None
+            or evidence_source != source
+            or printed[0] <= 0
+            or printed[1] <= 0
+            or printed[0] > printed[1]
+            or width <= 0.0
+            or height <= 0.0
+            or evidence_width <= 0.0
+            or evidence_height <= 0.0
+            or not math.isclose(width, evidence_width, rel_tol=1e-7, abs_tol=1e-6)
+            or not math.isclose(height, evidence_height, rel_tol=1e-7, abs_tol=1e-6)
+        ):
+            return None
+        geometry = {
+            "kind": "page",
+            "width": width,
+            "height": height,
+        }
+        if topology_geometry is not None:
+            topology_source = _positive_int(
+                getattr(topology_geometry, "source_page", None)
+            )
+            topology_width = _finite(getattr(topology_geometry, "width", 0))
+            topology_height = _finite(getattr(topology_geometry, "height", 0))
+            crop = getattr(topology_geometry, "source_crop_bbox", None)
+            if (
+                topology_source != source
+                or topology_width <= 0.0
+                or topology_height <= 0.0
+                or (
+                    crop is not None
+                    and (
+                        not isinstance(crop, tuple)
+                        or len(crop) != 4
+                        or any(not math.isfinite(float(value)) for value in crop)
+                    )
+                )
+            ):
+                return None
+            geometry = {
+                "kind": "topology",
+                "width": topology_width,
+                "height": topology_height,
+                "split_kind": str(
+                    getattr(topology_geometry, "split_kind", "") or ""
+                ),
+                "segment_index": getattr(topology_geometry, "segment_index", None),
+                "selected_rotation": int(
+                    getattr(topology_geometry, "selected_rotation", 0) or 0
+                ),
+                "transform_usable": getattr(
+                    topology_geometry,
+                    "transform_usable",
+                    None,
+                )
+                is True,
+                "source_crop_bbox": list(crop) if crop is not None else None,
+            }
+        return {
+            "logical_page": logical,
+            "source_page": source,
+            "printed_page": printed[0],
+            "printed_total": printed[1],
+            "geometry": geometry,
+        }
+
+    previous = page_identity(previous_page, previous_evidence, previous_printed)
+    current = page_identity(current_page, current_evidence, current_printed)
+    if previous is None or current is None:
+        return None
+    return {
+        "kind": kind,
+        "identity_kind": identity_kind,
+        "previous": previous,
+        "current": current,
+    }
+
+
 def _headerless_inquiry_continuation_owner(
     previous_page: Any,
     previous_evidence: Mapping[str, Any],
@@ -2033,8 +2714,13 @@ def _headerless_inquiry_continuation_owner(
     entity/table continuation edge, a previously owned exact inquiry schema,
     and an exact current lattice in the inherited semantic column order.  A
     missing current footer may be replaced only by the context's sealed
-    paired-spread inference after that inference is independently replayed
-    against the same frozen, valid topology and repeated imposition profile.
+    paired-spread inference after that inference is independently replayed.
+    For an ordinary exact inquiry seed, a false entity-table edge still permits
+    schema-only carry across distinct physical tables when authoritative exact
+    consecutive footers and consecutive population endpoints agree.  This
+    proof never grants ordinal closure.  A closed-ordinal seed with a false
+    document-wide edge still requires the same frozen repeated-spread topology
+    and an independently sealed local entity transition.
     Exact empty slots and sealed colspans preserve physical omissions without
     manufacturing values.  A three-column continuation is accepted only when
     the inherited sequence/date roles are adjacent and at least one merged
@@ -2043,16 +2729,36 @@ def _headerless_inquiry_continuation_owner(
 
     if not callable(tables_continue):
         return None
-    previous_printed = _printed_identity(previous_evidence)
-    current_printed = _printed_identity(current_evidence)
+    previous_printed = _sealed_printed_identity(previous_evidence)
+    current_printed = _sealed_printed_identity(current_evidence)
     printed_adjacency = bool(
         previous_printed is not None
         and current_printed is not None
         and previous_printed[1] == current_printed[1]
         and current_printed[0] == previous_printed[0] + 1
     )
-    local_paired_adjacency = False
-    if not printed_adjacency:
+    if printed_adjacency and not _reading_order_seals_exact_printed_pair(
+        reading_order_resolution,
+        previous_page,
+        current_page,
+        previous_printed=previous_printed,
+        current_printed=current_printed,
+    ):
+        return None
+    local_topology_adjacency = False
+    if printed_adjacency:
+        local_topology_adjacency = _local_exact_spread_printed_adjacency(
+            previous_page,
+            previous_evidence,
+            current_page,
+            current_evidence,
+            previous_printed=previous_printed,
+            current_printed=current_printed,
+            reading_order_resolution=reading_order_resolution,
+            topology=topology,
+            frozen_topology_audit_loader=frozen_topology_audit_loader,
+        )
+    else:
         local_paired_adjacency = _local_paired_printed_adjacency(
             previous_page,
             previous_evidence,
@@ -2064,7 +2770,8 @@ def _headerless_inquiry_continuation_owner(
             topology=topology,
             frozen_topology_audit_loader=frozen_topology_audit_loader,
         )
-        printed_adjacency = local_paired_adjacency
+        local_topology_adjacency = local_paired_adjacency
+        printed_adjacency = local_topology_adjacency
     if (
         not printed_adjacency
         or _sealed_registered_heading_roles(current_page, current_evidence).difference(
@@ -2144,10 +2851,12 @@ def _headerless_inquiry_continuation_owner(
         or not current_table_id
     ):
         return None
-    continuation_decision = tables_continue(previous_table_id, current_table_id)
-    if continuation_decision is not True and continuation_decision is not False:
+    try:
+        continuation_decision = tables_continue(previous_table_id, current_table_id)
+    except Exception:
+        # This callback is an authority boundary.  A broken or unavailable
+        # entity relation cannot authorize a headerless table.
         return None
-
     rows = _raw_rows(current_table)
     table_bbox = _bbox(current_table)
     physical_widths = {len(row) for row in rows}
@@ -2197,8 +2906,45 @@ def _headerless_inquiry_continuation_owner(
     )
     if lattice is None:
         return None
-    if continuation_decision is not True and not (
-        local_paired_adjacency
+    previous_endpoint = _owned_inquiry_population_endpoint(
+        previous_table,
+        previous_owner,
+    )
+    current_bounds = _sealed_inquiry_population_bounds(
+        rows,
+        role_columns=prior_role_columns,
+        physical_role_columns=lattice.get("physical_role_columns"),
+    )
+    if (
+        previous_endpoint is None
+        or current_bounds is None
+        or current_bounds[0] != previous_endpoint + 1
+    ):
+        return None
+    current_start, current_endpoint = current_bounds
+    sequence_anomalies = [
+        {
+            "row": row_index,
+            "expected_sequence": current_start + row_index,
+            "raw_sequence": raw_sequence,
+            "status": (
+                "physical_field_omission"
+                if not raw_sequence
+                else "unparsed_raw_sequence"
+            ),
+        }
+        for row_index, row in enumerate(rows)
+        for raw_sequence in (
+            _raw_inquiry_sequence_from_row(
+                row,
+                role_columns=prior_role_columns,
+                physical_role_columns=lattice.get("physical_role_columns"),
+            ),
+        )
+        if raw_sequence != str(current_start + row_index)
+    ]
+    local_entity_adjacency = bool(
+        local_topology_adjacency
         and _local_paired_inquiry_entity_continuation_proved(
             entity_context,
             previous_page,
@@ -2208,7 +2954,84 @@ def _headerless_inquiry_continuation_owner(
             current_table,
             lattice,
         )
-    ):
+    )
+    previous_proof = previous_owner.get("adjacency_proof")
+    ordinary_schema_carry_chain = bool(
+        previous_owner.get("binding")
+        in {
+            "exact_pboc_section_heading_and_table_schema",
+            "exact_inquiry_subsection_and_bounded_header_residue",
+        }
+        or (
+            isinstance(previous_proof, Mapping)
+            and previous_proof.get("kind")
+            == _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF
+        )
+    )
+    exact_footer_schema_carry_bridge = bool(
+        continuation_decision is not True
+        and current_printed is not None
+        and isinstance(reading_order_resolution, Mapping)
+        and ordinary_schema_carry_chain
+    )
+    requires_local_paired_proof = bool(
+        (
+            continuation_decision is not True
+            and not exact_footer_schema_carry_bridge
+        )
+        or current_printed is None
+    )
+    if requires_local_paired_proof and not local_entity_adjacency:
+        return None
+    sealed_current_printed = current_printed
+    if sealed_current_printed is None:
+        printed_total = (
+            _positive_int(reading_order_resolution.get("printed_total"))
+            if isinstance(reading_order_resolution, Mapping)
+            else None
+        )
+        printed_by_logical = (
+            _logical_int_mapping(
+                reading_order_resolution.get("printed_page_by_logical")
+            )
+            if isinstance(reading_order_resolution, Mapping)
+            else None
+        )
+        current_logical = _positive_int(getattr(current_page, "page_number", None))
+        inferred_current = (
+            printed_by_logical.get(current_logical)
+            if printed_by_logical is not None and current_logical is not None
+            else None
+        )
+        if printed_total is None or inferred_current is None:
+            return None
+        sealed_current_printed = (inferred_current, printed_total)
+    if previous_printed is None:
+        return None
+    adjacency_proof = _inquiry_continuation_adjacency_proof(
+        previous_page,
+        previous_evidence,
+        current_page,
+        current_evidence,
+        previous_printed=previous_printed,
+        current_printed=sealed_current_printed,
+        kind=(
+            "local_paired_topology_entity_edge"
+            if requires_local_paired_proof
+            else (
+                _INQUIRY_EXACT_FOOTER_SCHEMA_CARRY_PROOF
+                if exact_footer_schema_carry_bridge
+                else "exact_printed_footer_table_edge"
+            )
+        ),
+        identity_kind=(
+            "paired_inferred_current_footer"
+            if current_printed is None
+            else "exact_footer_pair"
+        ),
+        topology=topology,
+    )
+    if adjacency_proof is None:
         return None
     evidence_ids = tuple(lattice["evidence_ids"])
     prior_evidence_ids = {
@@ -2223,6 +3046,7 @@ def _headerless_inquiry_continuation_owner(
         "table_id": current_table_id,
         "header_row": None,
         "population_witness_row": lattice["population_witness_row"],
+        "population_endpoint_row": len(rows) - 1,
         "header_labels": list(header_labels),
         "inquiry_role_columns": dict(prior_role_columns),
         "evidence_ids": sorted(evidence_ids),
@@ -2232,6 +3056,10 @@ def _headerless_inquiry_continuation_owner(
         "physical_field_omission_rows": list(
             lattice["physical_field_omission_rows"]
         ),
+        "population_start": current_start,
+        "population_endpoint": current_endpoint,
+        "sequence_field_anomalies": sequence_anomalies,
+        "adjacency_proof": adjacency_proof,
         **(
             {"physical_role_columns": lattice["physical_role_columns"]}
             if "physical_role_columns" in lattice
@@ -2297,6 +3125,173 @@ def _topology_sources(value: Any) -> dict[int, tuple[int, ...]] | None:
         seen_logicals.update(logicals)
         result[source] = tuple(sorted(logicals))
     return result
+
+
+def _local_exact_spread_printed_adjacency(
+    previous_page: Any,
+    previous_evidence: Mapping[str, Any],
+    current_page: Any,
+    current_evidence: Mapping[str, Any],
+    *,
+    previous_printed: tuple[int, int] | None,
+    current_printed: tuple[int, int] | None,
+    reading_order_resolution: Any,
+    topology: Any,
+    frozen_topology_audit_loader: Any,
+) -> bool:
+    """Prove one exact-footer edge inside or across a repeated two-up spread.
+
+    With no document-wide resolution, exact local footers may prove the
+    printed identities.  A present resolution is an authority boundary and
+    must itself seal the same pair.  The frozen/runtime topology audits must
+    also agree, and the edge must be either the validated pair on one source
+    surface or the terminal-to-leading edge across two consecutive source
+    surfaces with the same complete two-up geometry profile.
+    """
+
+    if (
+        previous_printed is None
+        or current_printed is None
+        or previous_printed[1] != current_printed[1]
+        or current_printed[0] != previous_printed[0] + 1
+        or topology is None
+        or not callable(frozen_topology_audit_loader)
+    ):
+        return False
+    previous_logical = _positive_int(
+        getattr(previous_page, "page_number", None) or previous_evidence.get("page")
+    )
+    current_logical = _positive_int(
+        getattr(current_page, "page_number", None) or current_evidence.get("page")
+    )
+    if previous_logical is None or current_logical is None or previous_logical == current_logical:
+        return False
+    if isinstance(reading_order_resolution, Mapping):
+        printed_total = _positive_int(reading_order_resolution.get("printed_total"))
+        printed_by_logical = _logical_int_mapping(
+            reading_order_resolution.get("printed_page_by_logical")
+        )
+        if (
+            reading_order_resolution.get("resolved") is not True
+            or reading_order_resolution.get("authoritative") is not True
+            or reading_order_resolution.get("identity_fallback") is True
+            or printed_total is None
+            or printed_by_logical is None
+            or printed_total != previous_printed[1]
+            or printed_total != current_printed[1]
+            or printed_by_logical.get(previous_logical) != previous_printed[0]
+            or printed_by_logical.get(current_logical) != current_printed[0]
+        ):
+            return False
+    try:
+        frozen_audit = frozen_topology_audit_loader()
+        runtime_audit = topology.audit()
+        previous_geometry = topology.geometry(previous_logical)
+        current_geometry = topology.geometry(current_logical)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (
+        not isinstance(frozen_audit, Mapping)
+        or not isinstance(runtime_audit, Mapping)
+        or previous_geometry is None
+        or current_geometry is None
+    ):
+        return False
+    frozen_sources = _topology_sources(frozen_audit.get("logical_pages_by_source"))
+    runtime_sources = _topology_sources(runtime_audit.get("logical_pages_by_source"))
+    if (
+        frozen_audit.get("topology_frozen_before_reocr") is not True
+        or frozen_audit.get("valid") is not True
+        or runtime_audit.get("valid") is not True
+        or frozen_sources is None
+        or runtime_sources is None
+        or frozen_sources != runtime_sources
+    ):
+        return False
+    previous_source = _positive_int(getattr(previous_geometry, "source_page", None))
+    current_source = _positive_int(getattr(current_geometry, "source_page", None))
+    if (
+        previous_source is None
+        or current_source is None
+        or _positive_int(previous_evidence.get("source_page")) != previous_source
+        or _positive_int(current_evidence.get("source_page")) != current_source
+        or _positive_int(getattr(previous_page, "source_page_number", None)) != previous_source
+        or _positive_int(getattr(current_page, "source_page_number", None)) != current_source
+        or getattr(previous_geometry, "split_kind", None) != "two_page_spread"
+        or getattr(current_geometry, "split_kind", None) != "two_page_spread"
+        or getattr(previous_geometry, "transform_usable", None) is not True
+        or getattr(current_geometry, "transform_usable", None) is not True
+    ):
+        return False
+    if previous_source == current_source:
+        return bool(
+            getattr(previous_geometry, "segment_index", None) == 0
+            and getattr(current_geometry, "segment_index", None) == 1
+            and topology.ordered_pair((previous_logical, current_logical))
+            == (previous_logical, current_logical)
+        )
+    if (
+        current_source != previous_source + 1
+        or getattr(previous_geometry, "segment_index", None) != 1
+        or getattr(current_geometry, "segment_index", None) != 0
+    ):
+        return False
+
+    try:
+        previous_pair = tuple(topology.logicals_for_source(previous_source))
+        current_pair = tuple(topology.logicals_for_source(current_source))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (
+        len(previous_pair) != 2
+        or len(current_pair) != 2
+        or previous_pair[-1] != previous_logical
+        or current_pair[0] != current_logical
+        or set(previous_pair) != set(runtime_sources.get(previous_source, ()))
+        or set(current_pair) != set(runtime_sources.get(current_source, ()))
+    ):
+        return False
+
+    profiles: list[tuple[Any, Any]] = []
+    for left_logical, right_logical in zip(previous_pair, current_pair, strict=True):
+        try:
+            left = topology.geometry(left_logical)
+            right = topology.geometry(right_logical)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if left is None or right is None:
+            return False
+        profiles.append((left, right))
+    for segment, (left, right) in enumerate(profiles):
+        left_crop = getattr(left, "source_crop_bbox", None)
+        right_crop = getattr(right, "source_crop_bbox", None)
+        if (
+            getattr(left, "split_kind", None) != "two_page_spread"
+            or getattr(right, "split_kind", None) != "two_page_spread"
+            or getattr(left, "segment_index", None) != segment
+            or getattr(right, "segment_index", None) != segment
+            or getattr(left, "transform_usable", None) is not True
+            or getattr(right, "transform_usable", None) is not True
+            or getattr(left, "selected_rotation", None) != getattr(right, "selected_rotation", None)
+            or not isinstance(left_crop, tuple)
+            or not isinstance(right_crop, tuple)
+            or len(left_crop) != 4
+            or len(right_crop) != 4
+            or any(not math.isfinite(float(value)) for value in (*left_crop, *right_crop))
+            or any(
+                not math.isclose(
+                    float(left_value),
+                    float(right_value),
+                    rel_tol=1e-7,
+                    abs_tol=1e-6,
+                )
+                for left_value, right_value in zip(left_crop, right_crop, strict=True)
+            )
+            or not math.isclose(float(getattr(left, "width", 0)), float(getattr(right, "width", 0)))
+            or not math.isclose(float(getattr(left, "height", 0)), float(getattr(right, "height", 0)))
+        ):
+            return False
+    return True
 
 
 def _local_paired_printed_adjacency(
@@ -3415,8 +4410,10 @@ def _exact_liability_card_anchors(
     evidence: Mapping[str, Any],
     *,
     after_top: float = -math.inf,
+    before_top: float = math.inf,
+    allow_account_detail_heading: bool = False,
 ) -> tuple[dict[str, Any], ...]:
-    """Return a dense run of exact, sealed ``账户 N`` line owners."""
+    """Return a dense run of exact, sealed numbered-card line owners."""
 
     page_width = _finite(evidence.get("page_width") or getattr(page, "width", 0))
     page_height = _finite(evidence.get("page_height") or getattr(page, "height", 0))
@@ -3426,17 +4423,23 @@ def _exact_liability_card_anchors(
         if not isinstance(line, Mapping):
             continue
         text = _compact(line.get("text") or line.get("content") or "")
-        match = _ACCOUNT_CARD_HEADING_RE.fullmatch(text)
+        match = (
+            _ACCOUNT_DETAIL_CARD_HEADING_RE.fullmatch(text)
+            if allow_account_detail_heading
+            else _ACCOUNT_CARD_HEADING_RE.fullmatch(text)
+        )
         if match is None:
             continue
         loose_bbox = _bbox(line)
-        if loose_bbox is not None and loose_bbox[1] < after_top:
+        if loose_bbox is not None and not (
+            after_top <= loose_bbox[1] < before_top
+        ):
             continue
         bbox = _exact_evidence_line_bbox(line)
         raw_ids = line.get("evidence_ids")
         if (
             bbox is None
-            or bbox[1] < after_top
+            or not (after_top <= bbox[1] < before_top)
             or (page_width > 0 and (bbox[0] < 0 or bbox[2] > page_width))
             or (page_height > 0 and (bbox[1] < 0 or bbox[3] > page_height))
             or not isinstance(raw_ids, list)
@@ -3563,7 +4566,7 @@ def _exact_printed_footer_owner(
 
 def _liability_anchor_table_bijection(
     anchors: Sequence[Mapping[str, Any]],
-    table_owners: Sequence[_ExactLiabilityTableOwner],
+    table_owners: Sequence[_DenseAccountTableOwner | _ExactLiabilityTableOwner],
     *,
     boundary_top: float,
 ) -> bool:
@@ -3600,6 +4603,287 @@ def _liability_anchor_table_bijection(
         and all(len(candidates) == 1 for candidates in candidate_tables_by_anchor)
         and all(len(candidates) == 1 for candidates in candidate_anchors_by_table.values())
     )
+
+
+def _mixed_account_liability_table_owners(
+    previous_page: Any,
+    previous_evidence: Mapping[str, Any],
+    previous_registration: Mapping[str, Any],
+    current_page: Any,
+    current_evidence: Mapping[str, Any],
+    *,
+    tables_continue: Callable[[str, str], bool | None] | None,
+) -> dict[str, dict[str, Any]]:
+    """Own one exact account-to-liability transition page table by table.
+
+    A PBOC account section can end at the top of the same physical page on
+    which the repayment-responsibility section starts.  This path is admitted
+    only through a closed graph: consecutive sealed footers, dense printed
+    account anchors and exact account tables above the unique liability
+    heading, dense liability anchors and complete liability tables below it,
+    plus one authoritative continuation edge for the leading monthly tail.
+    No value is used to decide a table's section.
+    """
+
+    if (
+        not callable(tables_continue)
+        or previous_registration.get("status") != "registered"
+        or previous_registration.get("template_id") != "credit_account_detail"
+    ):
+        return {}
+
+    heading = _exact_liability_section_heading_owner(current_page, current_evidence)
+    previous_footer = _exact_printed_footer_owner(previous_page, previous_evidence)
+    current_footer = _exact_printed_footer_owner(current_page, current_evidence)
+    if heading is None or previous_footer is None or current_footer is None:
+        return {}
+    if (
+        previous_footer["printed_total"] != current_footer["printed_total"]
+        or current_footer["printed_page"] != previous_footer["printed_page"] + 1
+    ):
+        return {}
+
+    heading_top = float(heading["bbox"][1])
+    heading_bottom = float(heading["bbox"][3])
+    previous_anchors = _exact_liability_card_anchors(
+        previous_page,
+        previous_evidence,
+        before_top=float(previous_footer["bbox"][1]),
+        allow_account_detail_heading=True,
+    )
+    account_anchors = _exact_liability_card_anchors(
+        current_page,
+        current_evidence,
+        before_top=heading_top,
+        allow_account_detail_heading=True,
+    )
+    liability_anchors = _exact_liability_card_anchors(
+        current_page,
+        current_evidence,
+        after_top=heading_bottom,
+        before_top=float(current_footer["bbox"][1]),
+    )
+    if (
+        not previous_anchors
+        or not account_anchors
+        or not liability_anchors
+        or account_anchors[0]["sequence"] != previous_anchors[-1]["sequence"] + 1
+    ):
+        return {}
+
+    current_account_owners = tuple(
+        sorted(
+            (
+                owner
+                for owner in _dense_account_table_owners(current_page)
+                if owner.bbox[1] < heading_top
+            ),
+            key=lambda owner: owner.bbox[1],
+        )
+    )
+    current_tables = tuple(getattr(current_page, "tables", None) or ())
+    previous_tables = tuple(getattr(previous_page, "tables", None) or ())
+    if not previous_tables or not current_tables:
+        return {}
+    current_table_boxes = {
+        str(getattr(table, "table_id", "") or ""): _bbox(table)
+        for table in current_tables
+    }
+    previous_table_boxes = {
+        str(getattr(table, "table_id", "") or ""): _bbox(table)
+        for table in previous_tables
+    }
+    if (
+        not all(current_table_boxes)
+        or not all(previous_table_boxes)
+        or len(current_table_boxes) != len(current_tables)
+        or len(previous_table_boxes) != len(previous_tables)
+        or any(box is None for box in current_table_boxes.values())
+        or any(box is None for box in previous_table_boxes.values())
+    ):
+        return {}
+
+    current_liability_owners = tuple(
+        sorted(
+            (
+                owner
+                for table in current_tables
+                if (box := _bbox(table)) is not None and box[1] >= heading_bottom
+                for owner in (_exact_liability_table_owner(table),)
+                if owner is not None
+            ),
+            key=lambda owner: owner.bbox[1],
+        )
+    )
+    tables_after_heading = {
+        table_id
+        for table_id, box in current_table_boxes.items()
+        if box is not None and box[1] >= heading_bottom
+    }
+    if (
+        not current_account_owners
+        or not current_liability_owners
+        or {owner.table_id for owner in current_liability_owners}
+        != tables_after_heading
+        or any(
+            box is not None and box[1] < heading_bottom < box[3]
+            for box in current_table_boxes.values()
+        )
+        or not _liability_anchor_table_bijection(
+            account_anchors,
+            current_account_owners,
+            boundary_top=heading_top,
+        )
+        or not _liability_anchor_table_bijection(
+            liability_anchors,
+            current_liability_owners,
+            boundary_top=float(current_footer["bbox"][1]),
+        )
+    ):
+        return {}
+
+    first_account_top = float(account_anchors[0]["bbox"][1])
+    leading_tables = [
+        table_id
+        for table_id, box in current_table_boxes.items()
+        if box is not None
+        and box[1] < first_account_top
+        and table_id not in {owner.table_id for owner in current_account_owners}
+    ]
+    owned_current_ids = {
+        *(owner.table_id for owner in current_account_owners),
+        *(owner.table_id for owner in current_liability_owners),
+        *leading_tables,
+    }
+    if len(leading_tables) != 1 or owned_current_ids != set(current_table_boxes):
+        return {}
+
+    terminal_top = max(
+        box[1]
+        for box in previous_table_boxes.values()
+        if box is not None
+    )
+    terminal_ids = [
+        table_id
+        for table_id, box in previous_table_boxes.items()
+        if box is not None and math.isclose(box[1], terminal_top, abs_tol=1e-6)
+    ]
+    if (
+        len(terminal_ids) != 1
+    ):
+        return {}
+    terminal_box = previous_table_boxes[terminal_ids[0]]
+    terminal_anchor_box = previous_anchors[-1].get("bbox")
+    if (
+        terminal_box is None
+        or not isinstance(terminal_anchor_box, tuple)
+        or not _heading_attaches_to_table(terminal_anchor_box, terminal_box)
+        or terminal_box[3] > float(previous_footer["bbox"][1]) + 1e-6
+    ):
+        return {}
+    for line in previous_evidence.get("lines") or ():
+        if not isinstance(line, Mapping):
+            continue
+        line_box = _exact_evidence_line_bbox(line)
+        if (
+            line_box is not None
+            and terminal_anchor_box[3] < line_box[1] < float(previous_footer["bbox"][1])
+            and canonical_registered_section_heading(
+                _compact(line.get("text") or line.get("content") or "")
+            )
+            is not None
+        ):
+            return {}
+    leading_id = leading_tables[0]
+    try:
+        if tables_continue(terminal_ids[0], leading_id) is not True:
+            return {}
+    except Exception:
+        return {}
+
+    previous_line_owners = {
+        evidence_id: (int(owner["line_index"]), owner["bbox"])
+        for owner in (*previous_anchors, previous_footer)
+        for evidence_id in owner["evidence_ids"]
+    }
+    current_line_owners = {
+        evidence_id: (int(owner["line_index"]), owner["bbox"])
+        for owner in (*account_anchors, heading, *liability_anchors, current_footer)
+        for evidence_id in owner["evidence_ids"]
+    }
+    previous_ids = {
+        *previous_line_owners,
+    }
+    current_deciding_owners = (*current_account_owners, *current_liability_owners)
+    current_ids = {
+        *current_line_owners,
+        *(
+            evidence_id
+            for owner in current_deciding_owners
+            for evidence_id in owner.evidence_ids
+        ),
+    }
+    if (
+        previous_ids.intersection(current_ids)
+        or len(previous_ids)
+        != len(previous_line_owners)
+        or len(current_ids)
+        != len(current_line_owners)
+        + sum(len(owner.evidence_ids) for owner in current_deciding_owners)
+        or not _continuation_deciding_evidence_is_page_unique(
+            previous_page,
+            previous_evidence,
+            table_owners=(),
+            anchor_owners=previous_line_owners,
+        )
+        or not _continuation_deciding_evidence_is_page_unique(
+            current_page,
+            current_evidence,
+            table_owners=current_deciding_owners,
+            anchor_owners=current_line_owners,
+        )
+    ):
+        return {}
+
+    result: dict[str, dict[str, Any]] = {
+        leading_id: {
+            "template_id": "credit_account_detail",
+            "table_id": leading_id,
+            "table_bbox": list(current_table_boxes[leading_id] or ()),
+            "continued_from_table_id": terminal_ids[0],
+            "binding": "authoritative_prior_account_table_continuation",
+        }
+    }
+    anchor_by_table: dict[str, Mapping[str, Any]] = {}
+    for anchor, owner in zip(account_anchors, current_account_owners, strict=True):
+        anchor_by_table[owner.table_id] = anchor
+    for owner in current_account_owners:
+        anchor = anchor_by_table[owner.table_id]
+        result[owner.table_id] = {
+            "template_id": "credit_account_detail",
+            "table_id": owner.table_id,
+            "table_bbox": list(owner.bbox),
+            "evidence_ids": list(owner.evidence_ids),
+            "printed_sequence": int(anchor["sequence"]),
+            "anchor_bbox": list(anchor["bbox"]),
+            "anchor_evidence_ids": list(anchor["evidence_ids"]),
+            "binding": "exact_prior_account_section_and_local_table",
+        }
+    for anchor, owner in zip(liability_anchors, current_liability_owners, strict=True):
+        result[owner.table_id] = {
+            "template_id": "repayment_responsibility",
+            "table_id": owner.table_id,
+            "table_bbox": list(owner.bbox),
+            "evidence_ids": list(owner.evidence_ids),
+            "heading_title": "相关还款责任信息",
+            "heading_bbox": list(heading["bbox"]),
+            "heading_evidence_ids": list(heading["evidence_ids"]),
+            "printed_sequence": int(anchor["sequence"]),
+            "anchor_bbox": list(anchor["bbox"]),
+            "anchor_evidence_ids": list(anchor["evidence_ids"]),
+            "binding": "exact_pboc_section_heading_and_liability_graph",
+        }
+    return result
 
 
 def _sealed_liability_page_continuation_proved(
@@ -3879,6 +5163,232 @@ def _heading_attaches_to_table(
     )
 
 
+def _information_summary_table_witness(table: Any) -> bool:
+    """Require a finite official summary metric family in every owned table."""
+
+    rows = _raw_rows(table)
+    cells = tuple(
+        _compact(value)
+        for row in rows
+        for value in row
+        if _compact(value)
+    )
+    compact = "".join(cells)
+    return bool(
+        cells
+        and (
+            any("信息汇总" in cell for cell in cells)
+            or (
+                "个人住房贷款" in compact
+                and "个人商用房贷款" in compact
+                and "其他类贷款" in compact
+            )
+            or ("查询机构数" in compact and "查询次数" in compact)
+        )
+    )
+
+
+def _information_summary_table_explicit_continuation_witness(table: Any) -> bool:
+    exact_internal_titles = {
+        "逾期(透支)信息汇总",
+        "非循环贷账户信息汇总",
+        "循环贷账户一信息汇总",
+        "循环贷账户二信息汇总",
+        "贷记卡账户信息汇总",
+        "准贷记卡账户信息汇总",
+    }
+    return any(
+        _compact(value) in exact_internal_titles
+        for row in _raw_rows(table)
+        for value in row
+    )
+
+
+def _sealed_information_summary_continuation_proved(
+    previous_page: Any,
+    previous_evidence: Mapping[str, Any],
+    previous_registration: Mapping[str, Any],
+    current_page: Any,
+    current_evidence: Mapping[str, Any],
+    *,
+    previous_authoritative_printed: Any = _PRINTED_IDENTITY_UNSPECIFIED,
+    current_authoritative_printed: Any = _PRINTED_IDENTITY_UNSPECIFIED,
+    current_table_owners: Mapping[str, Mapping[str, Any]] | None = None,
+) -> bool:
+    """Prove one headerless summary continuation from sealed local structure.
+
+    Summary tables repeat account-family labels that are top-level headings on
+    detail pages.  Those labels must not win when the immediately preceding
+    printed page owns ``信息概要`` and the current page independently carries
+    multiple exact summary-subsection headings attached to distinct tables.
+    Printed-page order, heading ownership, and local geometry are all
+    mandatory; page adjacency or table shape alone grants nothing.
+    """
+
+    if (
+        previous_registration.get("status") != "registered"
+        or previous_registration.get("template_id") != "information_summary"
+        or current_table_owners
+    ):
+        return False
+
+    def resolved_printed_identity(
+        value: Any,
+        evidence: Mapping[str, Any],
+    ) -> tuple[int, int] | None:
+        if value is _PRINTED_IDENTITY_UNSPECIFIED:
+            return _printed_identity(evidence)
+        if not isinstance(value, tuple) or len(value) != 2:
+            return None
+        page = _positive_int(value[0])
+        total = _positive_int(value[1])
+        return (page, total) if page is not None and total is not None and page <= total else None
+
+    previous_printed = resolved_printed_identity(
+        previous_authoritative_printed,
+        previous_evidence,
+    )
+    current_printed = resolved_printed_identity(
+        current_authoritative_printed,
+        current_evidence,
+    )
+    if (
+        previous_printed is None
+        or current_printed is None
+        or previous_printed[1] != current_printed[1]
+        or current_printed[0] != previous_printed[0] + 1
+    ):
+        return False
+
+    previous_summary_headings = [
+        tuple(str(value) for value in line.get("evidence_ids") or () if str(value or ""))
+        for line in previous_evidence.get("lines") or ()
+        if _exact_evidence_line_bbox(line) is not None
+        and canonical_registered_section_heading(_compact(line.get("text") or line.get("content") or "")) == "信息概要"
+    ]
+    if (
+        len(previous_summary_headings) != 1
+        or not previous_summary_headings[0]
+        or len(previous_summary_headings[0]) != len(set(previous_summary_headings[0]))
+    ):
+        return False
+
+    page_width = _finite(current_evidence.get("page_width") or getattr(current_page, "width", 0))
+    page_height = _finite(current_evidence.get("page_height") or getattr(current_page, "height", 0))
+    headings: list[
+        tuple[
+            str,
+            tuple[float, float, float, float],
+            tuple[str, ...],
+        ]
+    ] = []
+    account_family_lines: list[Mapping[str, Any]] = []
+    conflicting_top_level_role = False
+    for line in current_evidence.get("lines") or ():
+        bbox = _exact_evidence_line_bbox(line)
+        if bbox is None:
+            continue
+        if page_width > 0 and (bbox[0] < 0 or bbox[2] > page_width):
+            continue
+        if page_height > 0 and (bbox[1] < 0 or bbox[3] > page_height):
+            continue
+        text = _compact(line.get("text") or line.get("content") or "")
+        title = canonical_registered_section_heading(text)
+        if title is not None and REGISTERED_SECTION_TEMPLATE_BY_TITLE[title] != "information_summary":
+            conflicting_top_level_role = True
+        if _ACCOUNT_CARD_HEADING_RE.fullmatch(text) is not None or _MONTHLY_GRID_RE.search(text):
+            return False
+        if text in {
+            "非循环贷账户",
+            "循环贷账户一",
+            "循环贷账户二",
+            "贷记卡账户",
+            "准贷记卡账户",
+        }:
+            account_family_lines.append(line)
+        match = _INFORMATION_SUMMARY_SUBSECTION_RE.fullmatch(text)
+        if match is None:
+            continue
+        evidence_ids = tuple(str(value) for value in line.get("evidence_ids") or () if str(value or ""))
+        if not evidence_ids or len(evidence_ids) != len(set(evidence_ids)):
+            return False
+        headings.append((match.group("title"), bbox, evidence_ids))
+    if conflicting_top_level_role or len({title for title, _box, _ids in headings}) < 2:
+        return False
+    heading_ids = [evidence_id for _title, _box, evidence_ids in headings for evidence_id in evidence_ids]
+    if (
+        len(heading_ids) != len(set(heading_ids))
+        or set(previous_summary_headings[0]).intersection(heading_ids)
+    ):
+        return False
+
+    tables = tuple(getattr(current_page, "tables", None) or ())
+    table_boxes = [
+        (str(getattr(table, "table_id", "") or ""), table_bbox)
+        for table in tables
+        if (table_bbox := _bbox(table)) is not None
+    ]
+    table_ids = [table_id for table_id, _box in table_boxes]
+    if (
+        not table_boxes
+        or len(table_boxes) != len(tables)
+        or any(not table_id for table_id in table_ids)
+        or len(table_ids) != len(set(table_ids))
+        or any(
+            not any(_line_in_box(line, table_bbox) for _table_id, table_bbox in table_boxes)
+            for line in account_family_lines
+        )
+    ):
+        return False
+    if any(
+        not _information_summary_table_witness(table)
+        for table in tables
+    ):
+        return False
+    attached_table_ids: set[str] = set()
+    for _title, heading_bbox, _evidence_ids in headings:
+        candidates = [
+            (table_id, table_bbox)
+            for table_id, table_bbox in table_boxes
+            if max(
+                0.0,
+                min(heading_bbox[2], table_bbox[2]) - max(heading_bbox[0], table_bbox[0]),
+            )
+            > 0.0
+            and _heading_attaches_to_table(heading_bbox, table_bbox)
+        ]
+        if not candidates:
+            return False
+        nearest_top = min(table_bbox[1] for _table_id, table_bbox in candidates)
+        nearest = [
+            table_id
+            for table_id, table_bbox in candidates
+            if math.isclose(
+                table_bbox[1],
+                nearest_top,
+                rel_tol=1e-7,
+                abs_tol=1e-6,
+            )
+        ]
+        if len(nearest) != 1 or nearest[0] in attached_table_ids:
+            return False
+        attached_table_ids.add(nearest[0])
+    leading_table_id = min(table_boxes, key=lambda item: (item[1][1], item[1][0]))[0]
+    first_heading_top = min(heading_bbox[1] for _title, heading_bbox, _ids in headings)
+    explicit_continuations = {
+        str(getattr(table, "table_id", "") or "")
+        for table in tables
+        if _information_summary_table_explicit_continuation_witness(table)
+    }
+    if next(box for table_id, box in table_boxes if table_id == leading_table_id)[1] >= first_heading_top:
+        leading_table_id = ""
+    return bool(
+        len(attached_table_ids) >= 2
+        and set(table_ids)
+        <= attached_table_ids | explicit_continuations | {leading_table_id}
+    )
+
+
 def _template_spec(template_id: str) -> CanonicalTemplateSpec | None:
     return next((spec for spec in _TEMPLATES if spec.template_id == template_id), None)
 
@@ -3915,6 +5425,42 @@ def _printed_identity_candidates(
     )
 
 
+def _sealed_printed_identity(
+    evidence: Mapping[str, Any],
+) -> tuple[int, int] | None:
+    """Return one physically unique footer backed by unique source evidence."""
+
+    page_height = evidence.get("page_height") or evidence.get("height")
+    witnesses: list[tuple[int, int]] = []
+    for line in evidence.get("lines") or ():
+        if not isinstance(line, Mapping) or not _bottom_footer_geometry(
+            line,
+            page_height=page_height,
+        ):
+            continue
+        raw_ids = line.get("evidence_ids")
+        if isinstance(raw_ids, (str, bytes, bytearray)) or not isinstance(
+            raw_ids,
+            (list, tuple),
+        ):
+            continue
+        evidence_ids = tuple(str(value or "").strip() for value in raw_ids)
+        if (
+            not evidence_ids
+            or any(not value for value in evidence_ids)
+            or len(evidence_ids) != len(set(evidence_ids))
+        ):
+            continue
+        for match in _PRINTED_PAGE_RE.finditer(
+            str(line.get("text") or line.get("content") or "")
+        ):
+            page = int(match.group("page"))
+            total = int(match.group("total"))
+            if 1 <= page <= total:
+                witnesses.append((page, total))
+    return witnesses[0] if len(witnesses) == 1 else None
+
+
 def _printed_identity(evidence: Mapping[str, Any]) -> tuple[int, int] | None:
     """Return one full printed-page footer proved by local geometry."""
 
@@ -3948,8 +5494,12 @@ def _project_table(
     transform: Callable[[Sequence[float]], list[float]],
 ) -> Any:
     metadata = deepcopy(dict(getattr(table, "metadata", None) or {}))
+    source_geometry = metadata.get("geometry")
+    source_geometry = deepcopy(dict(source_geometry)) if isinstance(source_geometry, Mapping) else {}
     rows = _raw_rows(table)
     cell_boxes = metadata.get("cell_bboxes")
+    if not isinstance(cell_boxes, list):
+        cell_boxes = source_geometry.get("cell_bboxes")
     table_rows = list(getattr(table, "rows", None) or ())
     row_offset = 1 if getattr(table, "headers", None) and len(rows) == len(table_rows) + 1 else 0
     source_cell_objects: list[list[Any]] | None = None
@@ -4012,16 +5562,153 @@ def _project_table(
             cell_boxes = metadata.get("cell_bboxes")
     if rows:
         metadata["raw_rows"] = rows
+    table_box = _bbox(table)
+
+    def transformed_bbox(value: Any) -> list[float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            box = tuple(float(coordinate) for coordinate in value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not all(math.isfinite(coordinate) for coordinate in box)
+            or box[2] <= box[0]
+            or box[3] <= box[1]
+        ):
+            return None
+        return transform(box)
+
+    def transformed_bands(value: Any, *, axis: str) -> Any:
+        if not isinstance(value, list):
+            return deepcopy(value)
+        projected: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                return []
+            band = deepcopy(dict(item))
+            raw_band_bbox = band.get("bbox")
+            if isinstance(raw_band_bbox, (list, tuple)) and len(raw_band_bbox) == 4:
+                projected_bbox = transformed_bbox(raw_band_bbox)
+                if projected_bbox is None:
+                    return []
+                band["bbox"] = projected_bbox
+                if axis == "row":
+                    band["y0"], band["y1"] = projected_bbox[1], projected_bbox[3]
+                else:
+                    band["x0"], band["x1"] = projected_bbox[0], projected_bbox[2]
+            elif table_box is not None:
+                try:
+                    source_band_bbox = (
+                        (table_box[0], float(band["y0"]), table_box[2], float(band["y1"]))
+                        if axis == "row"
+                        else (float(band["x0"]), table_box[1], float(band["x1"]), table_box[3])
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return []
+                projected_bbox = transform(source_band_bbox)
+                band["bbox"] = projected_bbox
+                if axis == "row":
+                    band["y0"], band["y1"] = projected_bbox[1], projected_bbox[3]
+                else:
+                    band["x0"], band["x1"] = projected_bbox[0], projected_bbox[2]
+            else:
+                # Axis-only bands cannot be projected without an orthogonal
+                # table extent. Keep them on the raw plane only.
+                return []
+            projected.append(band)
+        return projected
+
+    def transformed_rules(value: Any, *, axis: str) -> Any:
+        if not isinstance(value, list) or table_box is None:
+            return []
+        projected: list[Any] = []
+        for item in value:
+            raw_coordinate = item
+            if isinstance(item, Mapping):
+                raw_coordinate = item.get(axis)
+                if raw_coordinate is None:
+                    raw_coordinate = item.get("position")
+            try:
+                coordinate = float(raw_coordinate)
+            except (TypeError, ValueError):
+                return []
+            if not math.isfinite(coordinate):
+                return []
+            source_rule_bbox = (
+                (coordinate, table_box[1], coordinate, table_box[3])
+                if axis == "x"
+                else (table_box[0], coordinate, table_box[2], coordinate)
+            )
+            projected_bbox = transform(source_rule_bbox)
+            projected_coordinate = projected_bbox[0] if axis == "x" else projected_bbox[1]
+            if isinstance(item, Mapping):
+                rule = deepcopy(dict(item))
+                if axis in rule:
+                    rule[axis] = projected_coordinate
+                elif "position" in rule:
+                    rule["position"] = projected_coordinate
+                else:
+                    rule[axis] = projected_coordinate
+                projected.append(rule)
+            else:
+                projected.append(projected_coordinate)
+        return projected
+
+    canonical_geometry = deepcopy(source_geometry)
     if isinstance(cell_boxes, list):
-        metadata["source_cell_bboxes"] = deepcopy(cell_boxes)
-        metadata["cell_bboxes"] = [
-            [transform(box) if isinstance(box, (list, tuple)) and len(box) == 4 else box for box in row]
-            if isinstance(row, list)
-            else row
+        projected_cell_boxes = [
+            [transformed_bbox(box) for box in row] if isinstance(row, list) else deepcopy(row)
             for row in cell_boxes
         ]
+        metadata["source_cell_bboxes"] = deepcopy(cell_boxes)
+        metadata["cell_bboxes"] = projected_cell_boxes
+        canonical_geometry["cell_bboxes"] = deepcopy(projected_cell_boxes)
+        canonical_geometry["source_cell_bboxes"] = deepcopy(cell_boxes)
+    for key in (
+        "cell_geometry_status",
+        "cell_geometry_loss_reason",
+        "cell_spans",
+        "cell_evidence_ids",
+        "cell_token_ids",
+        "cell_confidences",
+        "cell_geometry_confidences",
+        "geometry_source",
+        "coordinate_system",
+    ):
+        value = metadata.get(key, source_geometry.get(key))
+        if value is not None:
+            canonical_geometry[key] = deepcopy(value)
+            metadata[key] = deepcopy(value)
+    for key, axis in (("row_bands", "row"), ("col_bands", "col")):
+        value = metadata.get(key, source_geometry.get(key))
+        projected = transformed_bands(value, axis=axis)
+        if value is not None:
+            metadata[f"source_{key}"] = deepcopy(value)
+            metadata[key] = deepcopy(projected)
+            canonical_geometry[key] = deepcopy(projected)
+    for key, axis in (("vertical_lines", "x"), ("horizontal_lines", "y")):
+        value = metadata.get(key, source_geometry.get(key))
+        projected = transformed_rules(value, axis=axis)
+        if value is not None:
+            metadata[f"source_{key}"] = deepcopy(value)
+            metadata[key] = deepcopy(projected)
+            canonical_geometry[key] = deepcopy(projected)
+    canonical_geometry["coordinate_system"] = str(
+        canonical_geometry.get("coordinate_system") or "pdf_points_top_left"
+    )
+    if table_box is not None:
+        canonical_geometry["table_bbox"] = transform(table_box)
+    source_origin = transform((0.0, 0.0, 0.0, 0.0))
+    source_unit = transform((1.0, 1.0, 1.0, 1.0))
+    metadata["source_to_canonical_affine"] = {
+        "scale_x": float(source_unit[0]) - float(source_origin[0]),
+        "scale_y": float(source_unit[1]) - float(source_origin[1]),
+        "offset_x": float(source_origin[0]),
+        "offset_y": float(source_origin[1]),
+    }
+    metadata["canonical_geometry"] = canonical_geometry
     metadata["canonical_template_id"] = template_id
-    table_box = _bbox(table)
     return SimpleNamespace(
         table_id=str(getattr(table, "table_id", "") or ""),
         metadata=metadata,
@@ -4105,6 +5792,9 @@ class PBOCCanonicalTemplateAssembler:
             page = raw_pages.get(logical, SimpleNamespace(tables=[], texts=[]))
             result = _classify_page(page, page_evidence)
             table_owners = _mixed_page_section_table_owners(page, page_evidence)
+            inquiry_seed = _sealed_inquiry_seed_table_owner(page, page_evidence)
+            if inquiry_seed is not None and inquiry_seed[0] not in table_owners:
+                table_owners[inquiry_seed[0]] = inquiry_seed[1]
             if logical_index > 0:
                 previous_logical = ordered_logicals[logical_index - 1]
                 previous_page = raw_pages.get(previous_logical)
@@ -4121,6 +5811,54 @@ class PBOCCanonicalTemplateAssembler:
                             table_owners[table_id] = owner
                     previous_registration = registrations.get(previous_logical)
                     if isinstance(previous_registration, Mapping):
+                        transition_owners = _mixed_account_liability_table_owners(
+                            previous_page,
+                            evidence[previous_logical],
+                            previous_registration,
+                            page,
+                            page_evidence,
+                            tables_continue=getattr(
+                                self.issue_owner,
+                                "tables_continue",
+                                None,
+                            ),
+                        )
+                        for table_id, owner in transition_owners.items():
+                            if table_id not in table_owners:
+                                table_owners[table_id] = owner
+                        if _sealed_information_summary_continuation_proved(
+                            previous_page,
+                            evidence[previous_logical],
+                            previous_registration,
+                            page,
+                            page_evidence,
+                            previous_authoritative_printed=(
+                                (
+                                    int(previous_registration["printed_page"]),
+                                    int(previous_registration["printed_total"]),
+                                )
+                                if previous_registration.get("printed_identity_authoritative") is True
+                                and _positive_int(previous_registration.get("printed_page")) is not None
+                                and _positive_int(previous_registration.get("printed_total")) is not None
+                                else None
+                            ),
+                            current_authoritative_printed=self._authoritative_printed_identity(
+                                logical,
+                                page_evidence,
+                            )[0],
+                            current_table_owners=table_owners,
+                        ):
+                            result = (
+                                "information_summary",
+                                0.99,
+                                (
+                                    "exact_prior_information_summary_owner",
+                                    "consecutive_sealed_printed_footers",
+                                    "multiple_exact_summary_subsection_headings",
+                                    "distinct_heading_to_table_geometry",
+                                    "no_conflicting_top_level_section",
+                                ),
+                            )
                         if _sealed_liability_page_continuation_proved(
                             previous_page,
                             evidence[previous_logical],
@@ -4855,6 +6593,7 @@ class PBOCCanonicalTemplateAssembler:
                         template_id=table_template_id,
                         transform=transform,
                     )
+                    projected.metadata["coordinate_logical_page"] = representative
                     projected.metadata["source_logical_page"] = logical
                     projected.metadata["source_page"] = int(local_evidence.get("source_page") or logical)
                     if isinstance(section_owner, Mapping):
@@ -4875,6 +6614,7 @@ class PBOCCanonicalTemplateAssembler:
                         "source_bbox": list(box),
                         "bbox": transform(box),
                         "page": representative,
+                        "coordinate_logical_page": representative,
                         "source_logical_page": logical,
                         "canonical_page": int(group["canonical_page"]),
                         "canonical_template_id": template_id,
@@ -4892,6 +6632,7 @@ class PBOCCanonicalTemplateAssembler:
                     if str(value or "")
                 ],
                 source_bbox=list(line.get("source_bbox") or line.get("bbox") or []),
+                coordinate_logical_page=int(line.get("coordinate_logical_page") or representative),
                 source_logical_page=int(line.get("source_logical_page") or representative),
             )
             for line in output_lines

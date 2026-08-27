@@ -7,6 +7,8 @@ from copy import deepcopy
 
 import pytest
 
+from docmirror.models.entities.parse_result import ParseResult
+from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.plugins.credit_report.enterprise_native.projector import (
     enterprise_public_dataset_policy,
     project_enterprise_artifact_semantic,
@@ -220,7 +222,26 @@ def _payload() -> dict[str, object]:
     ]
     dataset_ids = [dataset["id"] for dataset in datasets]
     return {
-        "document": {"id": "doc:1"},
+        "schema": {
+            "name": "docmirror.community",
+            "version": "3.0.0",
+            "edition": "community",
+            "domain": "enterprise_credit_report",
+            "support_level": "ga",
+        },
+        "document": {
+            "id": "doc:1",
+            "type": "enterprise_credit_report",
+            "title": "企业信用报告",
+            "page_count": 3,
+            "language": ["zh-CN"],
+            "source_file": {
+                "name": "enterprise.pdf",
+                "mime_type": "application/pdf",
+                "sha256": "",
+            },
+            "units": {},
+        },
         "sections": [
             {
                 "id": "sec_enterprise",
@@ -236,6 +257,8 @@ def _payload() -> dict[str, object]:
         ],
         "datasets": datasets,
         "reading": {
+            "version": "1.0",
+            "profile": "community",
             "document_flow": [
                 {"order": 1, "kind": "document", "ref_id": "doc:1"},
                 {"order": 2, "kind": "section", "ref_id": "sec_enterprise"},
@@ -256,6 +279,13 @@ def _payload() -> dict[str, object]:
                 for dataset in datasets
             ],
         },
+        "files": {
+            "content_md": "001_content.md",
+            "enhanced_reading_md": "001_enhanced_reading.md",
+            "datasets_dir": "001_datasets",
+            "dataset_audit_csv": "001_datasets/_audit_cells.csv",
+        },
+        "warnings": [],
     }
 
 
@@ -295,6 +325,7 @@ def test_enterprise_public_projection_is_business_only_and_non_mutating() -> Non
     projected = project_enterprise_community_json(payload)
 
     assert payload == before
+    assert projected["schema"]["version"] == "4.0.0"
     datasets = {dataset["name"]: dataset for dataset in projected["datasets"]}
     assert "report_notes" not in datasets
     assert "enterprise_section_presence" not in datasets
@@ -314,15 +345,13 @@ def test_enterprise_public_projection_is_business_only_and_non_mutating() -> Non
     assert displayed["rows"][0] == {
         "record_id": "displayed:1",
         "normalized": expected_displayed_values,
-        "canonical_raw": expected_displayed_values,
-        "raw": expected_displayed_values,
         "source": {"page_range": [2, 3]},
     }
     assert [column["key"] for column in displayed["columns"]] == list(
         displayed["rows"][0]["normalized"]
     )
     assert all(
-        column["raw_available"] and not column["evidence_available"]
+        not column["raw_available"] and not column["evidence_available"]
         for column in displayed["columns"]
     )
 
@@ -331,10 +360,6 @@ def test_enterprise_public_projection_is_business_only_and_non_mutating() -> Non
     assert "amount" not in detail
     assert "amount_kind" not in detail
     assert "discount_amount_status" not in detail
-    detail_row = datasets["enterprise_attachment_credit_details"]["rows"][0]
-    assert detail_row["canonical_raw"]["discount_amount"] == "99.50"
-    assert "amount" not in detail_row["canonical_raw"]
-    assert "amount_kind" not in detail_row["canonical_raw"]
 
     group = datasets["enterprise_credit_detail_groups"]["rows"][0]["normalized"]
     assert group == {
@@ -353,8 +378,11 @@ def test_enterprise_public_projection_is_business_only_and_non_mutating() -> Non
         "overdue_months_or_repayment_status" not in row["normalized"]
         for row in liability_rows
     )
-    assert liability_rows[0]["canonical_raw"]["overdue_months"] == "0"
-    assert liability_rows[1]["raw"]["repayment_status"] == "N"
+    assert all(
+        set(row) == {"record_id", "normalized", "source"}
+        for dataset in datasets.values()
+        for row in dataset["rows"]
+    )
 
     profile = datasets["enterprise_profile"]["rows"][0]["normalized"]
     assert profile == {
@@ -382,6 +410,43 @@ def test_enterprise_public_projection_is_business_only_and_non_mutating() -> Non
     )
 
 
+@pytest.mark.parametrize("pool", ["raw", "canonical_raw"])
+def test_enterprise_v4_forbids_raw_pools_without_weakening_v3(pool: str) -> None:
+    projected = project_enterprise_community_json(_payload())
+    validation = validate_projection_payload("community", projected)
+    assert validation.valid, validation.errors
+
+    invalid_v4 = deepcopy(projected)
+    invalid_v4["datasets"][0]["rows"][0][pool] = {}
+    assert not validate_projection_payload("community", invalid_v4).valid
+
+    legacy = deepcopy(projected)
+    legacy["schema"]["version"] = "3.0.0"
+    for dataset in legacy["datasets"]:
+        for row in dataset["rows"]:
+            row["raw"] = deepcopy(row["normalized"])
+            row["canonical_raw"] = deepcopy(row["normalized"])
+    assert validate_projection_payload("community", legacy).valid
+    legacy["datasets"][0]["rows"][0].pop(pool)
+    assert not validate_projection_payload("community", legacy).valid
+
+
+def test_enterprise_json_replay_keeps_normalized_rows_without_raw_projections() -> None:
+    from docmirror.server.output_builder import materialize_community_bundle
+
+    payload = _payload()
+    payload["datasets"] = [
+        dataset for dataset in payload["datasets"] if dataset["name"] == "enterprise_profile"
+    ]
+    projected = project_enterprise_community_json(payload)
+    restored = materialize_community_bundle(projected, ParseResult())
+    replayed = restored.json_payload()
+
+    assert replayed["schema"]["version"] == "4.0.0"
+    assert replayed["datasets"] == projected["datasets"]
+    assert validate_projection_payload("community", replayed).valid
+
+
 def test_enterprise_artifact_projection_uses_clean_columns_with_rich_evidence() -> None:
     payload = _payload()
     semantic = {
@@ -395,10 +460,12 @@ def test_enterprise_artifact_projection_uses_clean_columns_with_rich_evidence() 
     }
     before = deepcopy(semantic)
     public = project_enterprise_community_json(payload)
+    public_before = deepcopy(public)
 
     artifact = project_enterprise_artifact_semantic(semantic, public)
 
     assert semantic == before
+    assert public == public_before
     datasets = {dataset["name"]: dataset for dataset in artifact["datasets"]}
     assert "report_notes" not in datasets
     displayed = datasets["enterprise_displayed_credit_summary"]["rows"][0]
@@ -409,6 +476,10 @@ def test_enterprise_artifact_projection_uses_clean_columns_with_rich_evidence() 
         {"page": 2, "table_id": "source-table"}
     ]
     assert displayed["confidence"] == 1.0
+    liability = datasets["enterprise_repayment_responsibility_accounts"]["rows"]
+    assert liability[0]["normalized"]["overdue_months"] == 0
+    assert liability[0]["canonical_raw"]["overdue_months"] == "0"
+    assert liability[1]["raw"]["repayment_status"] == "N"
 
 
 def test_enterprise_public_projection_rejects_unclassified_business_fields() -> None:

@@ -39,6 +39,7 @@ from docmirror.plugins.bank_statement.extract_pipeline import (
 )
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text, normalize_header_cell
 from docmirror.plugins.bank_statement.statement_context import (
+    _FIELD_ALIASES,
     attach_statement_context,
     build_statement_header_records,
     page_texts_with_business_headers,
@@ -112,6 +113,7 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "支出/收入金额",
             "收/支金额",
             "支/收交易金额",
+            "借方/贷方金额",
         ],
     ),
     "余额": ColumnMapping(field="balance", unit="CNY", aliases=["账户余额", "本次余额", "Balance"]),
@@ -126,6 +128,7 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "对方名称",
             "对手信息",
             "对手名称",
+            "对手户名",
             "交易对方",
             "交易对手信息",
             "Counter party",
@@ -158,12 +161,12 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
         aliases=["现/转", "现金/转账", "现转标志", "现金/转账标志"],
     ),
     "凭证种类": ColumnMapping(field="voucher_type", aliases=["凭证类型"]),
-    "凭证号": ColumnMapping(field="voucher_number", aliases=["凭证号码"]),
+    "凭证号": ColumnMapping(field="voucher_number", aliases=["凭证号码", "票据号"]),
     "交易代码": ColumnMapping(field="transaction_code", aliases=["业务代码"]),
     "交易机构": ColumnMapping(field="transaction_institution", aliases=["经办机构"]),
     "柜员号": ColumnMapping(field="teller_id", aliases=["柜员"]),
     "记账日期": ColumnMapping(field="posting_date", format_hint="date", aliases=["会计日期", "Accounting Date"]),
-    "交易名称": ColumnMapping(field="transaction_name", aliases=["交易描述", "Transaction Name"]),
+    "交易名称": ColumnMapping(field="transaction_name", aliases=["交易描述", "业务类型", "Transaction Name"]),
     "起息日": ColumnMapping(field="value_date", format_hint="date", aliases=["起息日期", "Value Date"]),
     "银行流水": ColumnMapping(field="bank_serial", aliases=["Bank Serial"]),
     "业务明细": ColumnMapping(field="business_detail", aliases=["Business Detail"]),
@@ -228,11 +231,13 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "account_type": {"label": "账户类型", "type": "string"},
         "deposit_type": {"label": "存款种类", "type": "string"},
         "statement_number": {"label": "账单号", "type": "string"},
+        "seal_code": {"label": "印章编码", "type": "string"},
         "query_period": {"label": "查询期间", "type": "string"},
         "period_start": {"label": "账期开始", "type": "date"},
         "period_end": {"label": "账期结束", "type": "date"},
         "print_date": {"label": "打印日期", "type": "date"},
         "document_date": {"label": "单据日期", "type": "date"},
+        "query_teller": {"label": "查询柜员", "type": "string"},
         "total_transactions": {"label": "交易总笔数", "type": "integer"},
         "total_amount": {"label": "交易总金额", "type": "money"},
         "debit_count": {"label": "借方总笔数", "type": "integer"},
@@ -346,6 +351,7 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
             "definition": "一行对应一个来源银行流水表头或账户账期范围。",
             "columns": {
                 "statement_title": {"label": "流水标题", "type": "string"},
+                "statement_disclaimer": {"label": "流水免责声明", "type": "string"},
                 "bank_name": {"label": "开户银行", "type": "string"},
                 "account_holder": {"label": "账户名称", "type": "string"},
                 "account_number": {
@@ -373,6 +379,7 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                     "display": "masked",
                 },
                 "branch_name": {"label": "开户机构", "type": "string"},
+                "branch_number": {"label": "网点编号", "type": "string"},
                 "transaction_institution": {"label": "交易机构", "type": "string"},
                 "accepting_branch": {"label": "受理机构", "type": "string"},
                 "account_type": {"label": "账户类型", "type": "string"},
@@ -387,6 +394,7 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "statement_month_number": {"label": "账单月", "type": "integer"},
                 "electronic_serial": {"label": "电子流水号", "type": "string"},
                 "verification_code": {"label": "验证码", "type": "string"},
+                "seal_code": {"label": "印章编码", "type": "string"},
                 "proof_number": {"label": "证明编号", "type": "string"},
                 "wechat_id": {"label": "微信号", "type": "string"},
                 "id_type": {"label": "证件类型", "type": "string"},
@@ -413,6 +421,11 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "document_date": {"label": "单据日期", "type": "date"},
                 "filter_condition": {"label": "筛选条件", "type": "string"},
                 "direction_filter": {"label": "交易方向筛选", "type": "string"},
+                "transaction_type_filter": {"label": "交易类型筛选", "type": "string"},
+                "transfer_amount_filter": {"label": "转账金额筛选", "type": "string"},
+                "counterparty_name_filter": {"label": "对方户名筛选", "type": "string"},
+                "counterparty_account_filter": {"label": "对方账号筛选", "type": "string"},
+                "purpose_note_filter": {"label": "用途/备注筛选", "type": "string"},
                 "sort_order": {"label": "排序方向", "type": "string"},
                 "print_channel": {"label": "打印渠道", "type": "string"},
                 "print_teller": {"label": "打印柜员", "type": "string"},
@@ -487,10 +500,13 @@ BANK_IDENTITY_FIELDS: Sequence[tuple[str, Sequence[str]]] = (
     ("account_number", ("Account number", "Card number", "Customer account number", "账号", "账户号", "卡号")),
     ("bank_name", ("Bank name", "Issuer bank", "银行名称")),
     ("branch_name", ("Bank branch", "Opening branch", "开户银行", "开户行", "开户机构", "打印机构")),
-    ("query_period", ("Query period", "From/to date", "Period", "查询时间段", "交易时段")),
+    (
+        "query_period",
+        ("Query period", "From/to date", "Period", "查询时间段", "交易时段", "账单所属期间"),
+    ),
     ("print_date", ("打印日期",)),
     ("total_transactions", ("总笔数", "总条数")),
-    ("currency", ("Currency", "币种")),
+    ("currency", ("Currency", "币种", "货币")),
 )
 
 
@@ -825,13 +841,6 @@ class BankStatementCommunityPlugin(BaseTableParser):
         text = " ".join(str(atom.get("text") or "").strip() for atom in identity_atoms)
         patterns = {
             "print_date": ("打印日期", r"打印日期\s*[:：]\s*(20\d{2}-\d{2}-\d{2})"),
-            "query_period": (
-                "交易时段",
-                r"(?:交易时段|交易时间|起止日期)\s*[:：]\s*"
-                r"(20\d{2}(?:-\d{2}-\d{2}|年\d{1,2}月\d{1,2}日)|20\d{6})\s*"
-                r"(?:至|~|-)\s*"
-                r"(20\d{2}(?:-\d{2}-\d{2}|年\d{1,2}月\d{1,2}日)|20\d{6})",
-            ),
             "total_transactions": ("总条数", r"(?:总笔数|总条数)\s*[:：]\s*(\d+)"),
             "account_holder": (
                 "客户名称",
@@ -864,46 +873,18 @@ class BankStatementCommunityPlugin(BaseTableParser):
             match = re.search(pattern, text)
             if not match:
                 continue
-            value = (
-                " 至 ".join(_normalize_evidence_date(group) for group in match.groups())
-                if field_name == "query_period"
-                else match.group(1).strip()
-            )
+            value = match.group(1).strip()
             if value:
                 detail = self._evidence_identity_detail(field_name, label, value, page_id=page_id)
                 if field_name == "currency" and "人民" in normalize_bank_matching_text(value):
                     detail["normalized_value"] = "CNY"
                 recovered[field_name] = detail
 
-        if "query_period" not in recovered:
-            year_month = re.search(r"年份\s*[:：]\s*(\d{4}).{0,30}?月份\s*[:：]\s*(\d{1,2})", text)
-            if year_month:
-                year = int(year_month.group(1))
-                month = int(year_month.group(2))
-                if 1 <= month <= 12:
-                    last_day = calendar.monthrange(year, month)[1]
-                    value = f"{year:04d}-{month:02d}-01 至 {year:04d}-{month:02d}-{last_day:02d}"
-                    recovered["query_period"] = self._evidence_identity_detail(
-                        "query_period",
-                        "年份/月",
-                        value,
-                        page_id=page_id,
-                    )
-
         document_period = _evidence_document_query_period(atoms_by_page)
         if document_period is not None:
-            period_value, period_page_ids, period_evidence_ids = document_period
-            detail = self._evidence_identity_detail(
-                "query_period",
-                "起始日期/截止日期",
-                period_value,
-                page_id=period_page_ids[0],
-                evidence_ids=period_evidence_ids,
-            )
-            detail["source_refs"] = [
-                {"source": "canonical_evidence_atoms", "page_id": source_page_id} for source_page_id in period_page_ids
-            ]
-            recovered["query_period"] = detail
+            recovered["query_period"] = document_period
+        elif year_month_period := _evidence_year_month_query_period(identity_atoms, page_id):
+            recovered["query_period"] = year_month_period
 
         if "total_transactions" not in recovered:
             expected_evidence = resolve_row_count_evidence(text)
@@ -974,8 +955,18 @@ class BankStatementCommunityPlugin(BaseTableParser):
                         lambda value: (
                             2 <= len(re.sub(r"\s+", "", value)) <= 80
                             and bool(re.search(r"[\u4e00-\u9fffA-Za-z]", value))
+                            and not value.rstrip().endswith((":", "："))
                             and not any(
-                                marker in value for marker in ("账号", "币种", "存款种类", "交易日期", "账户余额")
+                                marker in value
+                                for marker in (
+                                    "账号",
+                                    "币种",
+                                    "货币",
+                                    "存款种类",
+                                    "交易日期",
+                                    "账户余额",
+                                    "上页余额",
+                                )
                             )
                             and normalize_bank_matching_text(value).upper() not in {"人民币", "CNY", "RMB"}
                         ),
@@ -993,18 +984,40 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 evidence_ids=[str(holder_atom.get("id") or "")],
             )
 
-        currency_atom = _right_nearby_value(
-            "币种",
-            lambda value: (
-                normalize_bank_matching_text(value).upper()
-                in {"人民币", "CNY", "RMB", "美元", "USD", "港币", "HKD", "欧元", "EUR", "日元", "JPY"}
+        currency_match = next(
+            (
+                (label, atom)
+                for label in ("币种", "货币")
+                if (
+                    atom := _right_nearby_value(
+                        label,
+                        lambda value: (
+                            normalize_bank_matching_text(value).upper()
+                            in {
+                                "人民币",
+                                "CNY",
+                                "RMB",
+                                "美元",
+                                "USD",
+                                "港币",
+                                "HKD",
+                                "欧元",
+                                "EUR",
+                                "日元",
+                                "JPY",
+                            }
+                        ),
+                    )
+                )
             ),
+            None,
         )
-        if currency_atom is not None:
+        if currency_match is not None:
+            currency_label, currency_atom = currency_match
             currency_value = str(currency_atom.get("text") or "").strip()
             detail = self._evidence_identity_detail(
                 "currency",
-                "币种",
+                currency_label,
                 currency_value,
                 page_id=page_id,
                 evidence_ids=[str(currency_atom.get("id") or "")],
@@ -1029,12 +1042,15 @@ class BankStatementCommunityPlugin(BaseTableParser):
         branch_match = next(
             (
                 (label, atom)
-                for label in ("开户行", "开户机构", "打印机构")
+                for label in ("开户银行", "开户行", "开户机构", "打印机构")
                 if (
                     atom := _right_nearby_value(
                         label,
                         lambda value: (
-                            any(marker in value for marker in ("银行", "信用社", "信用合作联社"))
+                            any(
+                                marker in value
+                                for marker in ("银行", "信用社", "信用合作联社", "分行", "支行", "营业部")
+                            )
                             and len(value) <= 40
                         ),
                     )
@@ -1210,6 +1226,26 @@ class BankStatementCommunityPlugin(BaseTableParser):
         datasets.update(projection.datasets)
         semantic = dict(projection.semantic)
         semantic["dataset_document_order"] = ["statement_header", "transactions"]
+        if result.extraction_route.value == "digital":
+            # Presentation policy only: reuse existing source-label mappings;
+            # do not change normalized records or any extraction decision.
+            semantic["enhanced_markdown"] = {
+                **(semantic.get("enhanced_markdown") or {}),
+                "privacy_mode": "full",
+            }
+            semantic["compact_output"] = {
+                "omit_absent_fields": True,
+                "minify_json": True,
+                "normalized_only": True,
+                "business_view": True,
+                "source_aliases": {
+                    "statement_header": {key: list(aliases) for key, aliases in _FIELD_ALIASES.items()},
+                    "transactions": {
+                        mapping.field: [name, *(mapping.aliases or [])]
+                        for name, mapping in self.column_registry.items()
+                    },
+                },
+            }
         return projection.model_copy(
             update={
                 "entity_fields": entity_fields,
@@ -2026,34 +2062,242 @@ def _normalize_evidence_date(value: str) -> str:
 
 def _evidence_document_query_period(
     atoms_by_page: dict[str, list[dict[str, Any]]],
-) -> tuple[str, list[str], list[str]] | None:
-    """Aggregate issuer-stated page periods without using transaction dates."""
-    periods: list[tuple[str, str, str, list[str]]] = []
+) -> dict[str, Any] | None:
+    """Aggregate issuer-stated periods while retaining every exact source pair."""
+    components: list[dict[str, Any]] = []
     for page_id, page_atoms in sorted(atoms_by_page.items()):
         atoms = sorted(page_atoms, key=lambda atom: (float(atom["bbox"][1]), float(atom["bbox"][0])))
         header_top = _evidence_transaction_header_top(atoms)
         header_atoms = atoms if header_top is None else [atom for atom in atoms if float(atom["bbox"][3]) <= header_top]
-        text = " ".join(str(atom.get("text") or "").strip() for atom in header_atoms)
-        start_match = re.search(r"起始日期\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", text)
-        end_match = re.search(r"(?:截止日期|终止日期)\s*[:：]\s*(20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})", text)
-        if start_match is None or end_match is None:
+        text_parts: list[str] = []
+        atom_spans: list[tuple[int, int, dict[str, Any]]] = []
+        cursor = 0
+        for atom in header_atoms:
+            atom_text = str(atom.get("text") or "").strip()
+            if not atom_text:
+                continue
+            if text_parts:
+                cursor += 1
+            start_offset = cursor
+            text_parts.append(atom_text)
+            cursor += len(atom_text)
+            atom_spans.append((start_offset, cursor, atom))
+        text = " ".join(text_parts)
+        start_match = re.search(
+            r"(?P<label>起始日期)\s*[:：]\s*(?P<date>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})",
+            text,
+        )
+        end_match = re.search(
+            r"(?P<label>截止日期|终止日期)\s*[:：]\s*(?P<date>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2})",
+            text,
+        )
+        covered_period = re.search(
+            r"(?P<label>账单所属期间|Statement\s+Covered\s+Period)\s*[:：]?\s*"
+            r"(?P<start>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2}|20\d{2}年\d{1,2}月\d{1,2}日)"
+            r"(?:\s+(?:(?:至|~|—|-)\s*)?|\s*(?:至|~|—|-)\s*)"
+            r"(?P<end>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2}|20\d{2}年\d{1,2}月\d{1,2}日)",
+            text,
+            re.IGNORECASE,
+        )
+        labelled_period = re.search(
+            r"(?P<label>交易时段|交易时间|起止日期|起讫日期|查询期间|查询时间段|查询日期范围)\s*[:：]?\s*"
+            r"(?P<start>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2}|20\d{2}年\d{1,2}月\d{1,2}日)\s*"
+            r"(?:至|~|—|-)\s*"
+            r"(?P<end>20\d{6}|20\d{2}[-/]\d{2}[-/]\d{2}|20\d{2}年\d{1,2}月\d{1,2}日)",
+            text,
+            re.IGNORECASE,
+        )
+        matched_spans: list[tuple[int, int]]
+        if labelled_period is not None:
+            raw_start = labelled_period.group("start")
+            raw_end = labelled_period.group("end")
+            raw_start_name = labelled_period.group("label")
+            raw_end_name = raw_start_name
+            raw_name = raw_start_name
+            matched_spans = [labelled_period.span()]
+        elif covered_period is not None and (start_match is None or end_match is None):
+            raw_start = covered_period.group("start")
+            raw_end = covered_period.group("end")
+            raw_start_name = covered_period.group("label")
+            raw_end_name = raw_start_name
+            raw_name = raw_start_name
+            matched_spans = [covered_period.span()]
+        elif start_match is not None and end_match is not None:
+            raw_start = start_match.group("date")
+            raw_end = end_match.group("date")
+            raw_start_name = start_match.group("label")
+            raw_end_name = end_match.group("label")
+            raw_name = f"{raw_start_name}/{raw_end_name}"
+            matched_spans = [start_match.span(), end_match.span()]
+        else:
             continue
-        start = _normalize_evidence_date(start_match.group(1).replace("/", "-"))
-        end = _normalize_evidence_date(end_match.group(1).replace("/", "-"))
-        evidence_ids = [
-            str(atom.get("id") or "")
-            for atom in header_atoms
-            if any(marker in str(atom.get("text") or "") for marker in ("起始日期", "截止日期", "终止日期"))
-            and str(atom.get("id") or "")
+        normalized_start = _normalize_evidence_date(raw_start.replace("/", "-"))
+        normalized_end = _normalize_evidence_date(raw_end.replace("/", "-"))
+        if not _valid_evidence_period(normalized_start, normalized_end):
+            continue
+        matched_groups = [
+            [
+                atom
+                for atom_start, atom_end, atom in atom_spans
+                if atom_start < match_end and atom_end > match_start
+            ]
+            for match_start, match_end in matched_spans
         ]
-        periods.append((start, end, page_id, evidence_ids))
-    if not periods:
+        if not _bounded_period_evidence_groups(matched_groups):
+            continue
+        evidence_ids = list(
+            dict.fromkeys(str(atom["id"]) for group in matched_groups for atom in group)
+        )
+        components.append(
+            {
+                "page_id": page_id,
+                "raw_name": raw_name,
+                "raw_start_name": raw_start_name,
+                "raw_start": raw_start,
+                "raw_end_name": raw_end_name,
+                "raw_end": raw_end,
+                "normalized_start": normalized_start,
+                "normalized_end": normalized_end,
+                "evidence_ids": evidence_ids,
+                "source": "canonical_evidence_atoms",
+            }
+        )
+    if not components:
         return None
-    starts = [period[0] for period in periods]
-    ends = [period[1] for period in periods]
-    page_ids = list(dict.fromkeys(period[2] for period in periods))
-    evidence_ids = list(dict.fromkeys(evidence_id for period in periods for evidence_id in period[3]))
-    return f"{min(starts)} 至 {max(ends)}", page_ids, evidence_ids
+    starts = [str(component["normalized_start"]) for component in components]
+    ends = [str(component["normalized_end"]) for component in components]
+    source_refs = [
+        {"source": "canonical_evidence_atoms", "page_id": str(component["page_id"])}
+        for component in components
+    ]
+    evidence_ids = list(
+        dict.fromkeys(evidence_id for component in components for evidence_id in component["evidence_ids"])
+    )
+    raw_names = list(dict.fromkeys(str(component["raw_name"]) for component in components))
+    return {
+        "raw_name": raw_names[0] if len(raw_names) == 1 else "source period components",
+        "normalized_value": f"{min(starts)} 至 {max(ends)}",
+        "data_type": "string",
+        "source": "canonical_evidence_atoms",
+        "source_refs": source_refs,
+        "evidence_ids": evidence_ids,
+        "field_name": "query_period",
+        "derivation": "source_period_envelope",
+        "normalized_only": True,
+        "source_components": components,
+    }
+
+
+def _valid_evidence_period(start: str, end: str) -> bool:
+    try:
+        start_year, start_month, start_day = (int(part) for part in start.split("-"))
+        end_year, end_month, end_day = (int(part) for part in end.split("-"))
+        calendar.monthrange(start_year, start_month)[1]
+        calendar.monthrange(end_year, end_month)[1]
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= start_day <= calendar.monthrange(start_year, start_month)[1]:
+        return False
+    if not 1 <= end_day <= calendar.monthrange(end_year, end_month)[1]:
+        return False
+    return start <= end
+
+
+def _bounded_period_evidence_groups(groups: list[list[dict[str, Any]]]) -> bool:
+    """Require complete, same-row atom ownership for every matched KV segment."""
+    if not groups:
+        return False
+    group_centers: list[float] = []
+    for group in groups:
+        unique = list({str(atom.get("id") or ""): atom for atom in group}.values())
+        if not unique or any(not str(atom.get("id") or "") for atom in unique):
+            return False
+        boxes = [atom.get("bbox") for atom in unique]
+        if any(not isinstance(box, (list, tuple)) or len(box) < 4 for box in boxes):
+            return False
+        ordered = sorted(unique, key=lambda atom: float(atom["bbox"][0]))
+        centers = [(float(atom["bbox"][1]) + float(atom["bbox"][3])) / 2.0 for atom in ordered]
+        heights = [max(1.0, float(atom["bbox"][3]) - float(atom["bbox"][1])) for atom in ordered]
+        if max(centers) - min(centers) > max(4.0, max(heights)):
+            return False
+        for left, right in zip(ordered, ordered[1:]):
+            gap = float(right["bbox"][0]) - float(left["bbox"][2])
+            if not -4.0 <= gap <= 180.0:
+                return False
+        group_centers.append(sum(centers) / len(centers))
+    return max(group_centers) - min(group_centers) <= 96.0
+
+
+def _evidence_year_month_query_period(
+    atoms: list[dict[str, Any]],
+    page_id: str,
+) -> dict[str, Any] | None:
+    """Derive one calendar month from exact first-scope year/month atoms."""
+    ordered = sorted(atoms, key=lambda atom: (float(atom["bbox"][1]), float(atom["bbox"][0])))
+    parts: list[str] = []
+    spans: list[tuple[int, int, dict[str, Any]]] = []
+    cursor = 0
+    for atom in ordered:
+        atom_text = str(atom.get("text") or "").strip()
+        if not atom_text:
+            continue
+        if parts:
+            cursor += 1
+        start_offset = cursor
+        parts.append(atom_text)
+        cursor += len(atom_text)
+        spans.append((start_offset, cursor, atom))
+    text = " ".join(parts)
+    match = re.search(
+        r"(?P<year_label>年份|Year)\s*[:：]?\s*(?P<year>20\d{2}).{0,30}?"
+        r"(?P<month_label>月份|Month)\s*[:：]?\s*(?P<month>\d{1,2})(?!\d)",
+        text,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    year = int(match.group("year"))
+    month = int(match.group("month"))
+    if not 1 <= month <= 12:
+        return None
+    last_day = calendar.monthrange(year, month)[1]
+    matched_groups = [
+        [
+            atom
+            for atom_start, atom_end, atom in spans
+            if atom_start < end_offset and atom_end > start_offset
+        ]
+        for start_offset, end_offset in (
+            (match.start("year_label"), match.end("year")),
+            (match.start("month_label"), match.end("month")),
+        )
+    ]
+    if not _bounded_period_evidence_groups(matched_groups):
+        return None
+    evidence_ids = list(
+        dict.fromkeys(str(atom["id"]) for group in matched_groups for atom in group)
+    )
+    component = {
+        "page_id": page_id,
+        "raw_year_name": match.group("year_label"),
+        "raw_year": match.group("year"),
+        "raw_month_name": match.group("month_label"),
+        "raw_month": match.group("month"),
+        "evidence_ids": evidence_ids,
+        "source": "canonical_evidence_atoms",
+    }
+    return {
+        "raw_name": f'{match.group("year_label")}/{match.group("month_label")}',
+        "normalized_value": f"{year:04d}-{month:02d}-01 至 {year:04d}-{month:02d}-{last_day:02d}",
+        "data_type": "string",
+        "source": "canonical_evidence_atoms",
+        "source_refs": [{"source": "canonical_evidence_atoms", "page_id": page_id}],
+        "evidence_ids": evidence_ids,
+        "field_name": "query_period",
+        "derivation": "source_year_month_period",
+        "normalized_only": True,
+        "source_components": [component],
+    }
 
 
 def _raw_statement_after_table_lines(source_text: str, page: int) -> list[str]:

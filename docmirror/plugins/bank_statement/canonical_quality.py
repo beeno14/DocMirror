@@ -211,10 +211,22 @@ def physical_transaction_row_estimate(parse_result: Any) -> int:
             # table also contains an ordinary transaction row.  This local
             # lineage witness avoids treating an isolated date-and-money
             # furniture table as a ledger page.
+            metadata = getattr(table, "metadata", None) or {}
+            explicit_data_row_promotion = bool(
+                isinstance(metadata, dict)
+                and metadata.get("header_source") == "data_row"
+                and metadata.get("preserve_headers") is False
+            )
             promoted_transaction_header = (
                 row_count > 0
                 and _looks_like_physical_transaction_row(headers, headers)
-                and any(_transaction_values_match_role_signature(headers, signature) for signature in schema_signatures)
+                and (
+                    explicit_data_row_promotion
+                    or any(
+                        _transaction_values_match_role_signature(headers, signature)
+                        for signature in schema_signatures
+                    )
+                )
             )
             count = row_count + int(promoted_transaction_header)
             if count > 0:

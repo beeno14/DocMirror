@@ -1771,6 +1771,49 @@ def _dense_endpoint_is_credible(
     return bool(credible) and max(credible) == endpoint
 
 
+def _credible_typed_inquiry_endpoint_total(
+    ledger: Mapping[str, Any],
+) -> int:
+    """Sum independently dense typed inquiry populations from source proof."""
+
+    endpoints = ledger.get("inquiry_sequence_endpoints")
+    observed = ledger.get("inquiry_observed_sequences")
+    outliers = ledger.get("inquiry_sequence_outliers")
+    ordinal_observations = ledger.get("inquiry_ordinal_observations")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (endpoints, observed, ordinal_observations)
+    ):
+        return 0
+    outlier_map = outliers if isinstance(outliers, Mapping) else {}
+    admitted: list[int] = []
+    for inquiry_type, raw_endpoint in endpoints.items():
+        endpoint = _positive_int(raw_endpoint)
+        if (
+            str(inquiry_type) not in _INQUIRY_POPULATION_TYPES
+            or endpoint is None
+            or not _dense_endpoint_is_credible(
+                endpoint,
+                observed.get(inquiry_type),
+                outlier_map.get(inquiry_type),
+            )
+        ):
+            return 0
+        typed_observations = ordinal_observations.get(inquiry_type)
+        if not isinstance(typed_observations, Mapping) or any(
+            not (
+                isinstance(observation := typed_observations.get(str(sequence), typed_observations.get(sequence)), Mapping)
+                and observation.get("sequence") == sequence
+                and observation.get("inquiry_type") == str(inquiry_type)
+                and bool(_local_ordinal_source_refs(observation))
+            )
+            for sequence in range(1, endpoint + 1)
+        ):
+            return 0
+        admitted.append(endpoint)
+    return sum(admitted) if admitted else 0
+
+
 def _append_population_issue(
     issues: list[dict[str, Any]],
     existing_ids: set[str],
@@ -3200,6 +3243,7 @@ def _apply_source_completeness_ledger(
         int(source_inquiry_expected)
         if isinstance(source_inquiry_expected, int) and not isinstance(source_inquiry_expected, bool)
         else 0,
+        _credible_typed_inquiry_endpoint_total(ledger_map),
     )
     checks["inquiry_records"] = (inquiry_observed, inquiry_expected, inquiry_contiguous)
 
@@ -3296,9 +3340,41 @@ def _apply_account_month_closure_ledger(
     """Publish canonical identity closure and a conserved source-position ledger."""
 
     closure_proof_dataset = "_personal_detail_account_month_closure_proof"
+    population_guard_dataset = "_personal_detail_account_month_population_guard"
+    printed_population_proof_dataset = "_personal_detail_printed_month_population_proof"
+    previous_printed_census_required = any(
+        _record_values(row).get("schema") == "docmirror.pboc.account_month_population_guard.v1"
+        and _record_values(row).get("printed_grid_census_required") is True
+        for row in datasets.get(population_guard_dataset) or ()
+        if isinstance(row, Mapping)
+    )
     # ``content`` can be prepared more than once during projection.  Never let
-    # an earlier closure proof survive a later empty or invalid source plane.
+    # an earlier closure/proof survive a later empty or invalid source plane.
     datasets.pop(closure_proof_dataset, None)
+    datasets.pop(population_guard_dataset, None)
+    datasets.pop(printed_population_proof_dataset, None)
+    facts.pop("personal_detail_account_month_closure", None)
+    previous_states = facts.get("personal_detail_dataset_states")
+    previous_repayment_state = (
+        previous_states.get("repayment_records")
+        if isinstance(previous_states, Mapping)
+        else None
+    )
+    if isinstance(previous_repayment_state, Mapping) and str(
+        previous_repayment_state.get("reason") or ""
+    ) in {
+        "account_month_physical_owner_conflict",
+        "account_month_source_localization_invalid",
+        "account_month_source_position_partial_owner_unresolved",
+        "account_month_source_position_closure",
+        "account_month_identity_closure",
+    }:
+        # Other source-state producers retain ownership of their diagnostics.
+        # Only this function's previous repayment state is invalidated here.
+        if not isinstance(previous_states, dict):
+            previous_states = dict(previous_states)
+            facts["personal_detail_dataset_states"] = previous_states
+        previous_states.pop("repayment_records", None)
     month_pattern = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])\Z")
     alias_issue_code = "candidate_b_monthly_source_position_alias_reconciled"
     detached_alias_sibling_issue_code = (
@@ -3385,6 +3461,8 @@ def _apply_account_month_closure_ledger(
     def exact_issue_refs(
         issue: Any,
         values: Mapping[str, Any],
+        *,
+        expected_count: int = 2,
     ) -> list[Mapping[str, Any]] | None:
         """Retain raw container cardinality for strict producer claims."""
 
@@ -3394,47 +3472,58 @@ def _apply_account_month_closure_ledger(
         refs = containers[0]
         if (
             not isinstance(refs, (list, tuple))
-            or len(refs) != 2
+            or len(refs) != expected_count
             or any(not isinstance(ref, Mapping) for ref in refs)
         ):
             return None
         return list(refs)
 
-    def record_refs(record: Any, values: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-        refs: list[Mapping[str, Any]] = []
+    def ref_observations(containers: Iterable[Any]) -> list[list[dict[str, Any]]]:
+        """Preserve each producer's source-ref container as one observation."""
+
+        return [
+            [dict(ref) for ref in refs]
+            for refs in containers
+            if isinstance(refs, (list, tuple))
+            and refs
+            and all(isinstance(ref, Mapping) for ref in refs)
+        ]
+
+    def record_ref_observations(
+        record: Any,
+        values: Mapping[str, Any],
+    ) -> list[list[dict[str, Any]]]:
         owners = [values]
         if isinstance(record, Mapping) and record is not values:
             owners.append(record)
-        for owner in owners:
-            for key in ("source_cell_refs", "source_refs"):
-                refs.extend(
-                    ref
-                    for ref in owner.get(key) or ()
-                    if isinstance(ref, Mapping)
-                )
-        return refs
+            source = record.get("source")
+            if isinstance(source, Mapping):
+                owners.append(source)
+        return ref_observations(
+            owner[key]
+            for owner in owners
+            for key in ("source_cell_refs", "source_refs")
+            if key in owner
+        )
 
-    def physical_position_fingerprints(
+    def complete_physical_position_pairs(
         refs: Iterable[Mapping[str, Any]],
         *,
-        account_id: str,
         performance_month: str,
     ) -> tuple[
         set[tuple[Any, ...]],
         dict[tuple[Any, ...], list[dict[str, Any]]],
+        set[tuple[Any, ...]],
     ]:
-        """Return immutable, grid-alias-independent identities for one month.
+        """Return only closed, role-labelled status/amount physical pairs.
 
-        A source diagnostic can carry a detector-local ``grid_id`` that differs
-        from the canonical or alias inventory even though both point at the
-        same sealed cell.  Exact evidence atoms and exact physical geometry are
-        independent identity planes: a detector may refine a box without
-        changing its sealed evidence, or add evidence without changing the
-        physical box.  Requiring both at once turns either harmless refinement
-        into a second physical position.  Parser, table, and grid aliases
-        deliberately do not participate in either identity.  The exact source-
-        table month lattice also bridges an early grid-band alias ref to the
-        final source-table-calibrated cell refs produced later in the lifecycle.
+        A single shared token or cell box is not an alias proof.  A physical
+        pair is comparable only when both roles carry the same physical source
+        origin, source page, coordinate page, source table, and accepted exact
+        PDF geometry.  Producer/method labels and detector-local identifiers
+        are not physical identity.  Validated individual cells are returned
+        separately, solely to place field diagnostics within an independently
+        proven pair; they never create an alias pair or an ownership proof.
         """
 
         def exact_native_index(value: Any, *, positive: bool) -> int | None:
@@ -3457,271 +3546,252 @@ def _apply_account_month_closure_ledger(
             ):
                 return None
             bbox = tuple(float(coordinate) for coordinate in value)
-            if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
-                return None
-            return bbox
+            return bbox if bbox[2] > bbox[0] and bbox[3] > bbox[1] else None
 
-        def exact_source_table_cell_identity(
+        role_aliases = {
+            "status": "status",
+            "status_code": "status",
+            "repayment_status": "status",
+            "repayment_status_code": "status",
+            "overdue_amount": "overdue_amount",
+            "status_amount": "overdue_amount",
+        }
+
+        def normalized_role(ref: Mapping[str, Any]) -> str | None:
+            roles = {
+                role_aliases[value]
+                for key in ("source_field_name", "field_name")
+                if (value := str(ref.get(key) or "").strip()) in role_aliases
+            }
+            return next(iter(roles)) if len(roles) == 1 else None
+
+        def exact_cell(
             ref: Mapping[str, Any],
-            provenance: Any,
-            *,
-            page: int,
-            bbox: tuple[float, float, float, float] | None,
-        ) -> tuple[int, int | None, str] | None:
-            """Mirror the closed source-table month-cell identity contract."""
-
-            if not (
-                isinstance(provenance, Mapping)
-                and provenance.get("source") == "source_table_geometry"
-                and ref.get("coordinate_system") == "pdf_points_top_left"
-                and provenance.get("coordinate_system")
-                == "pdf_points_top_left"
-                and ref.get("geometry_scope") == "cell"
-                and "page" in ref
-                and "logical_page" in ref
-                and "logical_page" in provenance
-                and isinstance(provenance.get("table_id"), str)
-                and bool(provenance["table_id"].strip())
-                and provenance.get("calibrated_from_source_table_geometry")
-                is True
-                and provenance.get("active_cell_geometry_exact") is True
-                and provenance.get("value_inputs_used") is False
-                and bbox is not None
-            ):
-                return None
-
-            page_aliases = [
-                (ref, "page"),
-                (ref, "logical_page"),
-                (provenance, "logical_page"),
-            ]
-            if "page" in provenance:
-                page_aliases.append((provenance, "page"))
-            page_values: list[int] = []
-            for owner, key in page_aliases:
-                value = exact_native_index(owner.get(key), positive=True)
-                if value is None:
-                    return None
-                page_values.append(value)
-            if set(page_values) != {page}:
-                return None
-
-            table_ids = {provenance["table_id"].strip()}
-            if "table_id" in ref:
-                raw_table_id = ref.get("table_id")
-                if not isinstance(raw_table_id, str) or not raw_table_id.strip():
-                    return None
-                table_ids.add(raw_table_id.strip())
-            if len(table_ids) != 1:
-                return None
-
-            source_pages: set[int] = set()
-            for owner in (ref, provenance):
-                if "source_page" not in owner:
-                    continue
-                source_page = exact_native_index(
-                    owner.get("source_page"),
-                    positive=True,
-                )
-                if source_page is None:
-                    return None
-                source_pages.add(source_page)
-            if len(source_pages) > 1:
-                return None
-
-            if "bbox" in provenance:
-                provenance_bbox = exact_bbox(provenance.get("bbox"))
-                if provenance_bbox is None or provenance_bbox != bbox:
-                    return None
-            return page, next(iter(source_pages), None), next(iter(table_ids))
-
-        fingerprints: set[tuple[Any, ...]] = set()
-        physical_claim_refs: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-        expected_month = int(performance_month[5:7])
-        for ref in refs:
+        ) -> tuple[tuple[Any, ...], tuple[Any, ...]] | None:
+            provenance = ref.get("geometry_provenance")
+            provenance = provenance if isinstance(provenance, Mapping) else {}
+            role = normalized_role(ref)
             raw_ref_month = ref.get("performance_month")
             if raw_ref_month in (None, ""):
                 ref_month = ""
             elif isinstance(raw_ref_month, str):
                 ref_month = raw_ref_month.strip()
             else:
-                continue
+                return None
             if ref_month and ref_month != performance_month:
-                continue
+                return None
 
-            column_values: set[int] = set()
-            malformed_coordinate = False
-            for key in ("column", "col"):
-                if key not in ref:
-                    continue
-                column = exact_native_index(ref.get(key), positive=False)
-                if column is None:
-                    malformed_coordinate = True
-                    break
-                column_values.add(column)
-            if malformed_coordinate or len(column_values) > 1:
-                continue
-            if "row" in ref and exact_native_index(
-                ref.get("row"), positive=False
-            ) is None:
-                continue
-            raw_column = next(iter(column_values), None)
-            if ref_month:
-                if raw_column is not None and raw_column != expected_month:
-                    continue
-            elif raw_column != expected_month:
-                continue
-
-            page_values: set[int] = set()
-            malformed_page = False
-            for key in ("logical_page", "page"):
-                if key not in ref:
-                    continue
-                page_value = exact_native_index(ref.get(key), positive=True)
-                if page_value is None:
-                    malformed_page = True
-                    break
-                page_values.add(page_value)
-            if malformed_page or len(page_values) != 1:
-                continue
-            page = next(iter(page_values))
-            source_page: int | None = None
-            if "source_page" in ref:
-                source_page = exact_native_index(
-                    ref.get("source_page"), positive=True
+            page = exact_native_index(ref.get("page"), positive=True)
+            logical_page = exact_native_index(
+                ref.get("logical_page"),
+                positive=True,
+            )
+            if page is None or logical_page != page:
+                return None
+            provenance_pages = {
+                exact_native_index(owner.get(key), positive=True)
+                for owner, keys in (
+                    (ref, ("coordinate_logical_page",)),
+                    (provenance, ("page", "logical_page", "coordinate_logical_page")),
                 )
-                if source_page is None:
-                    continue
+                for key in keys
+                if key in owner
+            }
+            if None in provenance_pages or provenance_pages - {page}:
+                return None
 
-            geometry_scope = ref.get("geometry_scope")
-            if geometry_scope not in {"cell", "grid"}:
-                continue
-            coordinate_system = ref.get("coordinate_system")
-            bbox = exact_bbox(ref.get("bbox"))
-            table_id = ""
-            if (
-                geometry_scope == "grid"
-                and coordinate_system == "pdf_points_top_left"
-                and ref.get("source") == "candidate_b_monthly_grid_omission"
-                and ref.get("binding") == "source_account_month_alias"
-                and ref.get("binding_quality") == "source_account_month_alias"
-                and "page" in ref
-                and "logical_page" in ref
-                and bbox is not None
-                and isinstance(ref.get("table_id"), str)
-                and bool(ref["table_id"].strip())
-            ):
-                table_id = ref["table_id"].strip()
-            elif geometry_scope == "cell" and coordinate_system == "pdf_points_top_left":
-                provenance = ref.get("geometry_provenance")
-                identity = exact_source_table_cell_identity(
-                    ref,
-                    provenance,
-                    page=page,
-                    bbox=bbox,
-                )
-                if identity is not None:
-                    source_page = identity[1]
-                    table_id = identity[2]
-            if account_id and table_id:
-                fingerprints.add(
-                    (
-                        "physical_account_month_source_table_lattice",
-                        account_id,
-                        performance_month,
-                        page,
-                        source_page,
-                        table_id,
+            source_pages = {
+                exact_native_index(owner.get("source_page"), positive=True)
+                for owner in (ref, provenance)
+                if "source_page" in owner
+            }
+            if None in source_pages or len(source_pages) != 1:
+                return None
+            source_page = next(iter(source_pages))
+
+            source_origins: set[str] = set()
+            for owner in (ref, provenance):
+                if "source_origin" not in owner:
+                    continue
+                raw_origin = owner.get("source_origin")
+                if not isinstance(raw_origin, str) or not raw_origin.strip():
+                    return None
+                source_origins.add(raw_origin.strip())
+            if len(source_origins) > 1:
+                return None
+            source_origin = next(iter(source_origins), None)
+            source_logical_pages = {
+                exact_native_index(owner.get(key), positive=True)
+                for owner in (ref, provenance)
+                for key in ("source_logical_page", "source_origin_logical_page")
+                if key in owner
+            }
+            if None in source_logical_pages or len(source_logical_pages) > 1:
+                return None
+            if source_logical_pages:
+                source_logical_page = next(iter(source_logical_pages))
+            else:
+                # Old unregistered same-page refs did not retain a separate
+                # raw logical origin.  Only that legacy contract may inherit
+                # the coordinate page.  Registration metadata cannot silently
+                # erase an absent or contradictory source origin.
+                if any(
+                    key in owner
+                    for owner in (ref, provenance)
+                    for key in (
+                        "coordinate_status",
+                        "source_to_canonical_affine",
+                        "visual_source_to_coordinate_affine",
+                        "source_bbox",
                     )
-                )
-            raw_evidence_ids = ref.get("evidence_ids")
-            evidence_ids: tuple[str, ...] = ()
-            if isinstance(raw_evidence_ids, (list, tuple)) and raw_evidence_ids:
-                normalized_evidence_ids = tuple(
-                    value.strip()
-                    for value in raw_evidence_ids
-                    if isinstance(value, str) and value.strip()
-                )
-                if (
-                    len(normalized_evidence_ids) == len(raw_evidence_ids)
-                    and len(set(normalized_evidence_ids))
-                    == len(normalized_evidence_ids)
                 ):
-                    evidence_ids = tuple(sorted(normalized_evidence_ids))
-            for evidence_id in evidence_ids:
-                physical_claim = (
-                    "physical_account_month_evidence",
-                    performance_month,
-                    page,
-                    source_page,
-                    evidence_id,
-                )
-                fingerprints.add(
-                    (
-                        "physical_account_month_evidence",
-                        account_id,
-                        performance_month,
-                        page,
-                        source_page,
-                        evidence_id,
-                    )
-                )
-                physical_claim_refs.setdefault(physical_claim, []).append(dict(ref))
-            if bbox is not None:
-                physical_claim = (
-                    "physical_account_month_geometry",
-                    performance_month,
-                    page,
-                    source_page,
-                    geometry_scope,
-                    tuple(round(value, 6) for value in bbox),
-                )
-                fingerprints.add(
-                    (
-                        "physical_account_month_geometry",
-                        account_id,
-                        performance_month,
-                        page,
-                        source_page,
-                        geometry_scope,
-                        tuple(round(value, 6) for value in bbox),
-                    )
-                )
-                physical_claim_refs.setdefault(physical_claim, []).append(dict(ref))
-        return fingerprints, physical_claim_refs
+                    return None
+                source_logical_page = page
 
-    def unique_physical_position_count(
-        positions: set[tuple[str, str]],
-        fingerprints_by_position: Mapping[
-            tuple[str, str], set[tuple[Any, ...]]
-        ],
-    ) -> int:
-        """Count exact physical cells while retaining every alias observation."""
+            table_ids: set[str] = set()
+            for owner in (ref, provenance):
+                if "table_id" not in owner:
+                    continue
+                raw_table_id = owner.get("table_id")
+                if not isinstance(raw_table_id, str) or not raw_table_id.strip():
+                    return None
+                table_ids.add(raw_table_id.strip())
+            if len(table_ids) != 1:
+                return None
+            table_id = next(iter(table_ids))
 
-        parents = {position: position for position in positions}
+            coordinate_systems = {
+                str(owner.get("coordinate_system") or "").strip()
+                for owner in (ref, provenance)
+                if "coordinate_system" in owner
+            }
+            if coordinate_systems != {"pdf_points_top_left"}:
+                return None
+            provenance_exact = bool(
+                provenance.get("active_cell_geometry_exact") is True
+                and provenance.get("value_inputs_used") is False
+                and str(provenance.get("source") or "").strip()
+                == "source_table_geometry"
+            )
+            if "geometry_status" in ref:
+                geometry_status = ref.get("geometry_status")
+                if (
+                    not isinstance(geometry_status, str)
+                    or geometry_status.strip() not in {"accepted", "exact"}
+                ):
+                    # A stale exact provenance object cannot overrule an
+                    # explicit rejected, unresolved, or malformed status.
+                    return None
+            elif not provenance_exact:
+                return None
+            if str(ref.get("geometry_scope") or "") != "cell" or role is None:
+                return None
 
-        def find(position: tuple[str, str]) -> tuple[str, str]:
-            parent = parents[position]
-            while parent != parents[parent]:
-                parent = parents[parent]
-            while position != parent:
-                next_position = parents[position]
-                parents[position] = parent
-                position = next_position
-            return parent
+            row = exact_native_index(ref.get("row"), positive=False)
+            columns = {
+                exact_native_index(ref.get(key), positive=False)
+                for key in ("col", "column")
+                if key in ref
+            }
+            expected_column = int(performance_month[5:7])
+            if row is None or None in columns or columns != {expected_column}:
+                return None
+            bbox = exact_bbox(ref.get("bbox"))
+            if bbox is None:
+                return None
+            if "bbox" in provenance and exact_bbox(provenance.get("bbox")) != bbox:
+                return None
 
-        def union(left: tuple[str, str], right: tuple[str, str]) -> None:
-            left_root = find(left)
-            right_root = find(right)
-            if left_root != right_root:
-                parents[right_root] = left_root
+            locator = (
+                performance_month,
+                page,
+                source_page,
+                source_logical_page,
+                source_origin,
+                table_id,
+                "pdf_points_top_left",
+            )
+            descriptor = (role, row, expected_column, bbox)
+            return locator, descriptor
 
-        owners_by_fingerprint: dict[tuple[Any, ...], tuple[str, str]] = {}
-        for position in sorted(positions):
-            for fingerprint in fingerprints_by_position.get(position, ()):
-                prior = owners_by_fingerprint.setdefault(fingerprint, position)
-                union(position, prior)
-        return len({find(position) for position in positions})
+        cells_by_locator: dict[
+            tuple[Any, ...],
+            dict[str, dict[tuple[Any, ...], dict[str, Any]]],
+        ] = {}
+        for ref in refs:
+            validated = exact_cell(ref)
+            if validated is None:
+                if any(
+                    str(ref.get(key) or "").strip() in role_aliases
+                    for key in ("source_field_name", "field_name")
+                ):
+                    # A contradictory or rejected role claim in the same
+                    # observation cannot be hidden by selecting its accepted
+                    # duplicate.  Non-role provenance refs are not pair cells.
+                    return set(), {}, set()
+                continue
+            locator, descriptor = validated
+            role = str(descriptor[0])
+            cells_by_locator.setdefault(locator, {}).setdefault(role, {}).setdefault(
+                descriptor,
+                dict(ref),
+            )
+
+        # One observation cannot choose a complete pair from one locator while
+        # silently discarding an exact role cell from another locator.
+        if len(cells_by_locator) != 1:
+            return set(), {}, set()
+
+        pairs: set[tuple[Any, ...]] = set()
+        refs_by_pair: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        physical_cells = {
+            (*locator, role, descriptor[2], descriptor[3])
+            for locator, cells_by_role in cells_by_locator.items()
+            for role, cells in cells_by_role.items()
+            for descriptor in cells
+        }
+        for locator, cells_by_role in cells_by_locator.items():
+            if set(cells_by_role) != {"status", "overdue_amount"} or any(
+                len(cells_by_role[role]) != 1
+                for role in ("status", "overdue_amount")
+            ):
+                continue
+            status = next(iter(cells_by_role["status"]))
+            amount = next(iter(cells_by_role["overdue_amount"]))
+            _status_role, status_row, status_col, status_bbox = status
+            _amount_role, amount_row, amount_col, amount_bbox = amount
+            if not (
+                amount_row == status_row + 1
+                and amount_col == status_col
+                and status_bbox[0] == amount_bbox[0]
+                and status_bbox[2] == amount_bbox[2]
+                and status_bbox[1] < amount_bbox[1]
+                and status_bbox[3] < amount_bbox[3]
+            ):
+                continue
+            pair = (
+                "physical_account_month_status_amount_pair",
+                *locator,
+                (
+                    ("status", status_col, status_bbox),
+                    ("overdue_amount", amount_col, amount_bbox),
+                ),
+            )
+            # Detector-local rows prove adjacency within this observation, not
+            # physical identity across parsers whose row numbering can differ.
+            pairs.add(pair)
+            refs_by_pair[pair] = [
+                cells_by_role["status"][status],
+                cells_by_role["overdue_amount"][amount],
+            ]
+        if not pairs and any(
+            set(cells_by_role) == {"status", "overdue_amount"}
+            for cells_by_role in cells_by_locator.values()
+        ):
+            # A rejected two-role observation must not re-enter through the
+            # field-fragment path and bypass its own adjacency/alignment proof.
+            physical_cells = set()
+        return pairs, refs_by_pair, physical_cells
 
     def has_source_local_month_ref(
         refs: Iterable[Mapping[str, Any]],
@@ -3821,6 +3891,7 @@ def _apply_account_month_closure_ledger(
         grid_id: str,
         performance_month: str,
         alias: bool,
+        target_field_name: str = "performance_month",
     ) -> tuple[
         tuple[Any, ...],
         str,
@@ -3884,7 +3955,7 @@ def _apply_account_month_closure_ledger(
             and str(ref.get("role") or "") == ""
             and str(ref.get("grid_id") or "") == grid_id
             and str(ref.get("performance_month") or "") == performance_month
-            and str(ref.get("field_name") or "") == "performance_month"
+            and str(ref.get("field_name") or "") == target_field_name
             and source_field_name in {"status", "overdue_amount"}
             and str(ref.get("geometry_scope") or "") == "cell"
             and str(ref.get("coordinate_system") or "")
@@ -3935,6 +4006,49 @@ def _apply_account_month_closure_ledger(
 
         if len(refs) != 2:
             return None
+        physical_metadata_keys = {
+            "source",
+            "source_origin",
+            "source_logical_page",
+            "source_origin_logical_page",
+            "coordinate_logical_page",
+            "table_id",
+            "geometry_status",
+            "geometry_provenance",
+            "evidence_ids",
+        }
+        locator_refs = refs
+        if any(set(ref) & physical_metadata_keys for ref in refs):
+            # Enriched source-table observations retain the same closed owner
+            # declaration grammar.  Authenticate their complete physical pair
+            # before removing metadata solely for the legacy locator check.
+            complete_pairs, _pair_refs, _cells = complete_physical_position_pairs(
+                refs, performance_month=performance_month
+            )
+            if len(complete_pairs) != 1:
+                return None
+            for ref in refs:
+                if "evidence_ids" not in ref:
+                    continue
+                evidence_ids = ref.get("evidence_ids")
+                if not (
+                    isinstance(evidence_ids, (list, tuple))
+                    and evidence_ids
+                    and all(
+                        isinstance(value, str) and bool(value.strip())
+                        for value in evidence_ids
+                    )
+                    and len(evidence_ids) == len(set(evidence_ids))
+                ):
+                    return None
+            locator_refs = [
+                {
+                    key: value
+                    for key, value in ref.items()
+                    if key not in physical_metadata_keys
+                }
+                for ref in refs
+            ]
         by_role: dict[
             str,
             tuple[
@@ -3944,7 +4058,7 @@ def _apply_account_month_closure_ledger(
                 tuple[float, float, float, float],
             ],
         ] = {}
-        for ref in refs:
+        for ref in locator_refs:
             validated = exact_detached_cell_ref(
                 ref,
                 account_id=account_id,
@@ -4049,7 +4163,229 @@ def _apply_account_month_closure_ledger(
             return None
         return (grid_id, performance_month), identity, locator
 
+    def owned_physical_conflict_values(issue: Any) -> dict[str, Any] | None:
+        """Recognize this function's exact diagnostic grammar and stable IDs."""
+        if not isinstance(issue, dict):
+            return None
+        normalized = issue.get("normalized")
+        values = normalized if isinstance(normalized, dict) else issue
+        fixed_fields = {
+            "category": "schema_incompleteness",
+            "issue_code": "account_month_physical_owner_conflict",
+            "severity": "warning",
+            "parser_stage": "account_month_closure_ledger",
+            "target_dataset": "repayment_records",
+            "field_name": "account_id",
+        }
+        if any(values.get(key) != expected for key, expected in fixed_fields.items()):
+            return None
+        if str(values.get("status") or "") not in {"requires_review", "resolved"}:
+            return None
+        reasons = values.get("reason_codes")
+        if not (
+            isinstance(reasons, (list, tuple))
+            and len(reasons) == 4
+            and all(isinstance(reason, str) for reason in reasons)
+            and set(reasons)
+            == {
+                "physical_source_position_or_complete_pair",
+                "multiple_canonical_account_month_owners",
+                "cross_owner_alias_rejected",
+                "closure_proof_withheld",
+            }
+        ):
+            return None
+        observed = values.get("observed_value")
+        if not isinstance(observed, Mapping) or set(observed) != {
+            "claimed_account_month_identities",
+            "source_positions",
+            "shared_physical_fingerprint_count",
+            "shared_complete_status_amount_pair_count",
+        }:
+            return None
+
+        def ordered_pairs(
+            raw_rows: Any, key: str, minimum_count: int
+        ) -> tuple[tuple[str, str], ...] | None:
+            if not isinstance(raw_rows, list) or len(raw_rows) < minimum_count:
+                return None
+            pairs: list[tuple[str, str]] = []
+            for row in raw_rows:
+                if not isinstance(row, Mapping) or set(row) != {key, "performance_month"}:
+                    return None
+                identity = row.get(key)
+                performance_month = row.get("performance_month")
+                if not (
+                    isinstance(identity, str)
+                    and identity.strip()
+                    and identity == identity.strip()
+                    and isinstance(performance_month, str)
+                    and month_pattern.fullmatch(performance_month)
+                ):
+                    return None
+                pairs.append((identity, performance_month))
+            return tuple(pairs) if pairs == sorted(set(pairs)) else None
+
+        identities = ordered_pairs(
+            observed.get("claimed_account_month_identities"), "account_id", 2
+        )
+        source_positions = ordered_pairs(observed.get("source_positions"), "grid_id", 1)
+        fingerprint_count = observed.get("shared_physical_fingerprint_count")
+        pair_count = observed.get("shared_complete_status_amount_pair_count")
+        if (
+            identities is None
+            or source_positions is None
+            or type(fingerprint_count) is not int
+            or type(pair_count) is not int
+            or fingerprint_count < 0
+            or fingerprint_count != pair_count
+        ):
+            return None
+        expected_target = stable_record_id(
+            "source_account_month_physical_owner_conflict", identities, source_positions
+        )
+        if values.get("target_record_id") != expected_target:
+            return None
+        from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+            make_issue,
+        )
+
+        expected_identity = make_issue(
+            category="schema_incompleteness",
+            issue_code="account_month_physical_owner_conflict",
+            message="",
+            target_dataset="repayment_records",
+            target_record_id=expected_target,
+            field_name="account_id",
+            observed_value=observed,
+        )["extraction_issue_id"]
+        record_ids = [
+            owner["record_id"] for owner in (values, issue) if "record_id" in owner
+        ]
+        if (
+            values.get("extraction_issue_id") != expected_identity
+            or (
+                "extraction_issue_id" in issue
+                and issue["extraction_issue_id"] != expected_identity
+            )
+            or not record_ids
+            or any(record_id != expected_identity for record_id in record_ids)
+        ):
+            return None
+        return values
+
     source_issues = list(datasets.get("personal_detail_extraction_issues") or ())
+    from docmirror.plugins.credit_report.personal_detail_scanned.relations import (
+        _PRINTED_GRID_CENSUS_ISSUE_CODE,
+        _printed_anchor_identity_key,
+        _printed_anchor_inventory_source_refs,
+        _printed_grid_census_source_refs,
+        _validated_printed_anchor_inventory_issue,
+        _validated_printed_anchor_provenance,
+    )
+
+    census_issues = [
+        issue for issue in source_issues
+        if _record_values(issue).get("issue_code") == _PRINTED_GRID_CENSUS_ISSUE_CODE
+        and _record_values(issue).get("status") != "resolved"
+    ]
+    printed_grid_census_present = bool(census_issues) or previous_printed_census_required
+    anchor_inventory = (
+        _validated_printed_anchor_inventory_issue(census_issues[0])
+        if len(census_issues) == 1 else None
+    )
+
+    def printed_anchor_months(anchor: Mapping[str, Any]) -> list[str]:
+        start_year, start_month, end_year, end_month = anchor["date_range"]
+        return [
+            f"{index // 12:04d}-{index % 12 + 1:02d}"
+            for index in range(start_year * 12 + start_month - 1, end_year * 12 + end_month)
+        ]
+
+    def validated_printed_grid_census() -> list[dict[str, Any]] | None:
+        if anchor_inventory is None:
+            return None
+        entries: list[dict[str, Any]] = []
+        seen_detector_keys: set[tuple[str, str]] = set()
+        for entry in anchor_inventory["grids"]:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "plane", "grid_id", "printed_anchor_provenance", "observed_months",
+                "printed_months", "invalid_record_count", "duplicate_grid_id",
+                "account_id", "account_month_owner_basis",
+            }:
+                return None
+            plane, grid_id = entry.get("plane"), entry.get("grid_id")
+            provenance = _validated_printed_anchor_provenance(
+                entry.get("printed_anchor_provenance")
+            )
+            months = entry.get("observed_months")
+            printed_months = entry.get("printed_months")
+            if not (
+                isinstance(plane, str) and plane in {"canonical", "detached"}
+                and isinstance(grid_id, str) and grid_id and grid_id == grid_id.strip()
+                and (plane, grid_id) not in seen_detector_keys
+                and (entry.get("printed_anchor_provenance") is None or provenance is not None)
+                and type(entry.get("invalid_record_count")) is int
+                and entry["invalid_record_count"] >= 0
+                and type(entry.get("duplicate_grid_id")) is bool
+                and isinstance(months, list)
+                and all(isinstance(month, str) and month_pattern.fullmatch(month) for month in months)
+                and months == sorted(set(months))
+                and isinstance(printed_months, list)
+                and all(isinstance(month, str) and month_pattern.fullmatch(month) for month in printed_months)
+                and printed_months == sorted(set(printed_months))
+            ):
+                return None
+            account_id = entry.get("account_id")
+            owner_basis = entry.get("account_month_owner_basis")
+            if account_id is None:
+                if owner_basis is not None:
+                    return None
+            elif not (
+                isinstance(account_id, str) and account_id and account_id == account_id.strip()
+                and isinstance(owner_basis, str) and owner_basis in allowed_account_month_owner_bases
+            ):
+                return None
+            anchor_key = _printed_anchor_identity_key(provenance) if provenance is not None else None
+            if anchor_key is not None and anchor_key not in anchor_inventory["anchor_keys"]:
+                # An alleged original anchor outside the closed raw census is
+                # a contradiction, not a newly discovered source population.
+                return None
+            mapping_valid = bool(
+                provenance is not None
+                and printed_months == printed_anchor_months(provenance)
+                and set(months) <= set(printed_months)
+                and entry["invalid_record_count"] == 0
+                and not entry["duplicate_grid_id"]
+            )
+            seen_detector_keys.add((plane, grid_id))
+            entries.append({**entry, "anchor_key": anchor_key, "provenance": provenance, "mapping_valid": mapping_valid})
+        return entries
+
+    printed_grid_census = validated_printed_grid_census() if printed_grid_census_present else None
+    census_key_by_plane_position: dict[tuple[str, str, str], tuple[Any, ...]] = {}
+    current_census_observation_addresses: set[tuple[str, str, str]] = set()
+    if printed_grid_census is not None:
+        for entry in printed_grid_census:
+            current_census_observation_addresses.update(
+                (entry["plane"], entry["grid_id"], month) for month in entry["observed_months"]
+            )
+            if not entry["mapping_valid"]:
+                continue
+            for month in entry["printed_months"]:
+                census_key_by_plane_position[(entry["plane"], entry["grid_id"], month)] = (
+                    "printed_grid_month", entry["anchor_key"], month,
+                )
+    owned_physical_conflicts_by_id: dict[str, list[dict[str, Any]]] = {}
+    for issue in source_issues:
+        values = owned_physical_conflict_values(issue)
+        if values is not None:
+            owned_physical_conflicts_by_id.setdefault(
+                values["extraction_issue_id"], []
+            ).append(values)
+            # Keep diagnostic history, but re-establish every active conflict
+            # from the refreshed inventory below.  Empty refreshes retire it too.
+            values["status"] = "resolved"
     detached_alias_target_counts: Counter[str] = Counter()
     detached_alias_sibling_target_field_counts: dict[str, Counter[str]] = {}
     detached_alias_sibling_field_observation_counts: Counter[
@@ -4058,6 +4394,123 @@ def _apply_account_month_closure_ledger(
     detached_alias_sibling_counts: Counter[
         tuple[tuple[str, str], tuple[Any, ...]]
     ] = Counter()
+    detached_alias_sibling_validated_claims: dict[
+        tuple[str, str], dict[str, list[tuple[Any, ...]]]
+    ] = {}
+    detached_alias_sibling_validated_statuses: dict[
+        tuple[str, str], dict[str, list[str]]
+    ] = {}
+
+    def exact_detached_sibling_claim(
+        issue: Any,
+        values: Mapping[str, Any],
+    ) -> tuple[tuple[str, str], str, tuple[Any, ...]] | None:
+        """Validate one field-local member of a detached month diagnostic."""
+
+        observed = values.get("observed_value")
+        observed = observed if isinstance(observed, Mapping) else {}
+        grid_id = str(observed.get("grid_id") or "").strip()
+        performance_month = str(observed.get("performance_month") or "").strip()
+        field_name = str(values.get("field_name") or "")
+        candidate = values.get("candidate_value")
+        source_structure_key_count = observed.get("source_structure_key_count")
+        required_observed_keys = {
+            "grid_id",
+            "performance_month",
+            "field_state",
+        }
+        allowed_observed_keys = required_observed_keys | {
+            "source_observations",
+            "source_structure_key_count",
+        }
+        source_observations = observed.get("source_observations")
+        if not (
+            str(values.get("category") or "") == "ocr_structure_correction"
+            and str(values.get("issue_code") or "")
+            == detached_alias_sibling_issue_code
+            and str(values.get("status") or "")
+            in {"requires_review", "resolved"}
+            and str(values.get("parser_stage") or "")
+            == "canonical_monthly_grid_materialization"
+            and str(values.get("target_dataset") or "") == "repayment_records"
+            and field_name in detached_sibling_target_fields
+            and grid_id
+            and month_pattern.fullmatch(performance_month)
+            and str(values.get("target_record_id") or "")
+            == f"{grid_id}:{performance_month}"
+            and required_observed_keys <= set(observed) <= allowed_observed_keys
+            and str(observed.get("field_state") or "")
+            == "source_position_withheld"
+            and (
+                "source_observations" not in observed
+                or (
+                    isinstance(source_observations, list)
+                    and bool(source_observations)
+                    and (
+                        field_name != "performance_month"
+                        or source_observations == [performance_month]
+                    )
+                )
+            )
+            and (
+                "source_structure_key_count" not in observed
+                or (
+                    isinstance(source_structure_key_count, int)
+                    and not isinstance(source_structure_key_count, bool)
+                    and source_structure_key_count > 0
+                )
+            )
+            and isinstance(candidate, Mapping)
+            and set(candidate) == {"resolution"}
+            and str(candidate.get("resolution") or "")
+            == "withheld_pending_review"
+            and exact_reason_code_set(values, detached_sibling_reason_codes)
+        ):
+            return None
+        refs = exact_issue_refs(
+            issue,
+            values,
+            expected_count=1 if field_name != "performance_month" else 2,
+        )
+        if refs is None:
+            return None
+        position = (grid_id, performance_month)
+        if field_name == "performance_month":
+            locator = exact_detached_ref_locator(
+                refs,
+                account_id="",
+                grid_id=grid_id,
+                performance_month=performance_month,
+                alias=False,
+            )
+            return (position, field_name, locator) if locator is not None else None
+        if len(refs) != 1:
+            return None
+        validated = exact_detached_cell_ref(
+            refs[0],
+            account_id="",
+            grid_id=grid_id,
+            performance_month=performance_month,
+            alias=False,
+            target_field_name=field_name,
+        )
+        if validated is None:
+            return None
+        locator, source_field_name, row, column, bbox = validated
+        expected_source_field = {
+            "status_code": "status",
+            "status_amount": "overdue_amount",
+        }[field_name]
+        if source_field_name != expected_source_field:
+            return None
+        cell_fingerprint = (
+            source_field_name,
+            row,
+            column,
+            tuple(round(value, 6) for value in bbox),
+        )
+        return position, field_name, (locator, cell_fingerprint)
+
     for issue in source_issues:
         values = _record_values(issue)
         observed = values.get("observed_value")
@@ -4075,86 +4528,73 @@ def _apply_account_month_closure_ledger(
                     target_record_id,
                     Counter(),
                 )[field_name] += 1
-            addressed_positions: set[tuple[str, str]] = set()
-            if grid_id and month_pattern.fullmatch(performance_month):
-                addressed_positions.add((grid_id, performance_month))
-            recovered_address = exact_detached_ref_address(
-                issue,
-                values,
-                alias=False,
-            )
-            if recovered_address is not None:
-                addressed_positions.add(recovered_address[0])
-            for addressed_position in addressed_positions:
-                detached_alias_sibling_field_observation_counts[
-                    (addressed_position, field_name)
-                ] += 1
-        if not (
-            str(values.get("category") or "") == "ocr_structure_correction"
-            and str(values.get("issue_code") or "")
-            == detached_alias_sibling_issue_code
-            and str(values.get("status") or "") == "requires_review"
-            and str(values.get("parser_stage") or "")
-            == "canonical_monthly_grid_materialization"
-            and str(values.get("target_dataset") or "") == "repayment_records"
-            and str(values.get("field_name") or "") == "performance_month"
-        ):
+        validated_sibling = exact_detached_sibling_claim(issue, values)
+        if validated_sibling is None:
             continue
-        candidate = values.get("candidate_value")
-        source_structure_key_count = observed.get("source_structure_key_count")
-        required_observed_keys = {
-            "grid_id",
-            "performance_month",
-            "field_state",
-        }
-        allowed_observed_keys = required_observed_keys | {
-            "source_observations",
-            "source_structure_key_count",
-        }
-        if not (
-            grid_id
-            and month_pattern.fullmatch(performance_month)
-            and required_observed_keys <= set(observed) <= allowed_observed_keys
-            and str(observed.get("field_state") or "")
-            == "source_position_withheld"
-            and (
-                "source_observations" not in observed
-                or observed.get("source_observations") == [performance_month]
-            )
-            and (
-                "source_structure_key_count" not in observed
-                or (
-                    isinstance(source_structure_key_count, int)
-                    and not isinstance(source_structure_key_count, bool)
-                    and source_structure_key_count > 0
-                )
-            )
-            and isinstance(candidate, Mapping)
-            and set(candidate) == {"resolution"}
-            and str(candidate.get("resolution") or "")
-            == "withheld_pending_review"
-            and exact_reason_code_set(values, detached_sibling_reason_codes)
-        ):
-            continue
-        if str(values.get("target_record_id") or "") != (
-            f"{grid_id}:{performance_month}"
-        ):
-            continue
-        refs = exact_issue_refs(issue, values)
-        if refs is None:
-            continue
-        locator = exact_detached_ref_locator(
-            refs,
-            account_id="",
-            grid_id=grid_id,
-            performance_month=performance_month,
-            alias=False,
+        addressed_position, validated_field, claim = validated_sibling
+        detached_alias_sibling_field_observation_counts[
+            (addressed_position, validated_field)
+        ] += 1
+        detached_alias_sibling_validated_claims.setdefault(
+            addressed_position,
+            {},
+        ).setdefault(validated_field, []).append(claim)
+        detached_alias_sibling_validated_statuses.setdefault(
+            addressed_position,
+            {},
+        ).setdefault(validated_field, []).append(
+            str(values.get("status") or "")
         )
-        if locator is None:
-            continue
-        detached_alias_sibling_counts[((grid_id, performance_month), locator)] += 1
+        if validated_field == "performance_month":
+            detached_alias_sibling_counts[(addressed_position, claim)] += 1
 
-    def exact_detached_alias_claim(
+    def complete_detached_alias_sibling_claim(
+        position: tuple[str, str],
+    ) -> bool:
+        """Validate the optional status/amount siblings as one exact pair."""
+
+        claims_by_field = detached_alias_sibling_validated_claims.get(position, {})
+        if set(claims_by_field) != detached_sibling_target_fields or any(
+            len(claims_by_field[field]) != 1
+            for field in detached_sibling_target_fields
+        ):
+            return False
+        performance_claim = claims_by_field["performance_month"][0]
+        if len(performance_claim) != 5 or not isinstance(
+            performance_claim[-1], tuple
+        ):
+            return False
+        pair_locator = performance_claim[:-1]
+        pair_fingerprints = set(performance_claim[-1])
+        expected_sibling_roles = {
+            "status_code": "status",
+            "status_amount": "overdue_amount",
+        }
+        return all(
+            len(sibling_claim) == 2
+            and sibling_claim[0] == pair_locator
+            and isinstance(sibling_claim[1], tuple)
+            and bool(sibling_claim[1])
+            and sibling_claim[1][0] == expected_role
+            and sibling_claim[1] in pair_fingerprints
+            for field_name, expected_role in expected_sibling_roles.items()
+            for sibling_claim in (claims_by_field[field_name][0],)
+        )
+
+    def exact_alias_candidate(candidate: Any) -> bool:
+        if not isinstance(candidate, Mapping):
+            return False
+        if set(candidate) == {"resolution"}:
+            return candidate.get("resolution") == "reconciled_to_existing_account_month_identity"
+        return bool(
+            set(candidate) == {"resolution", "source_grid_plane"}
+            and candidate.get("resolution") == "reconciled_to_existing_account_month_identity"
+            and isinstance(candidate.get("source_grid_plane"), str)
+            and candidate["source_grid_plane"] in {"canonical", "detached"}
+            and printed_grid_census_present
+        )
+
+    def exact_detached_alias_declaration(
         values: Mapping[str, Any],
         observed: Mapping[str, Any],
         refs: list[Mapping[str, Any]],
@@ -4162,8 +4602,8 @@ def _apply_account_month_closure_ledger(
         account_id: str,
         grid_id: str,
         performance_month: str,
-    ) -> tuple[tuple[str, str], tuple[str, str]] | None:
-        """Return one closed detached-alias claim or fail closed."""
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Return one exact, identity-scoped alias declaration or fail closed."""
 
         owner_basis = str(
             observed.get("account_month_owner_basis") or ""
@@ -4191,10 +4631,7 @@ def _apply_account_month_closure_ledger(
             and str(observed.get("source_position_state") or "")
             == "owner_bound_alias"
             and owner_basis in allowed_account_month_owner_bases
-            and isinstance(candidate, Mapping)
-            and set(candidate) == {"resolution"}
-            and str(candidate.get("resolution") or "")
-            == "reconciled_to_existing_account_month_identity"
+            and exact_alias_candidate(candidate)
             and refs
             and exact_reason_code_set(values, detached_alias_reason_codes)
         ):
@@ -4207,49 +4644,252 @@ def _apply_account_month_closure_ledger(
             alias=True,
         )
         position = (grid_id, performance_month)
+        identity = (account_id, performance_month)
+        alias_target = canonical_account_month_target(account_id, performance_month)
+        if locator is None or detached_alias_target_counts[alias_target] != 1:
+            return None
+        return position, identity, locator
+
+    def exact_detached_alias_claim(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str]] | None:
+        """Return an alias sealed by its complete detached diagnostic trio."""
+
+        declaration = exact_detached_alias_declaration(
+            values,
+            observed,
+            refs,
+            account_id=account_id,
+            grid_id=grid_id,
+            performance_month=performance_month,
+        )
+        if declaration is None:
+            return None
+        position, identity, locator = declaration
         sibling_target = f"{grid_id}:{performance_month}"
         sibling_field_counts = detached_alias_sibling_target_field_counts.get(
             sibling_target,
             Counter(),
         )
-        alias_target = canonical_account_month_target(account_id, performance_month)
-        if (
-            locator is None
-            or detached_alias_target_counts[alias_target] != 1
-            or sibling_field_counts["performance_month"] != 1
-            or any(
-                field not in detached_sibling_target_fields or count != 1
-                for field, count in sibling_field_counts.items()
+        minimal_sibling_counts = Counter({"performance_month": 1})
+        complete_sibling_counts = Counter(
+            {field: 1 for field in detached_sibling_target_fields}
+        )
+        statuses_by_field = detached_alias_sibling_validated_statuses.get(
+            position,
+            {},
+        )
+        status_family_is_exact = (
+            sibling_field_counts == minimal_sibling_counts
+            and statuses_by_field == {"performance_month": ["requires_review"]}
+        ) or (
+            sibling_field_counts == complete_sibling_counts
+            and set(statuses_by_field) == detached_sibling_target_fields
+            and all(len(statuses_by_field[field]) == 1 for field in statuses_by_field)
+            and len(
+                {
+                    statuses_by_field[field][0]
+                    for field in detached_sibling_target_fields
+                }
             )
+            == 1
+        )
+        if (
+            sibling_field_counts
+            not in (minimal_sibling_counts, complete_sibling_counts)
+            or not status_family_is_exact
             or detached_alias_sibling_field_observation_counts[
                 (position, "performance_month")
             ]
             != 1
             or detached_alias_sibling_counts[(position, locator)] != 1
+            or (
+                sibling_field_counts == complete_sibling_counts
+                and not complete_detached_alias_sibling_claim(position)
+            )
         ):
             return None
-        return position, (account_id, performance_month)
+        return position, identity
+
+    def exact_grid_alias_declaration(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Validate the relationship stage's exact one-grid alias grammar."""
+
+        owner_basis = str(
+            observed.get("account_month_owner_basis") or ""
+        ).strip()
+        candidate = values.get("candidate_value")
+        if not (
+            str(values.get("category") or "") == "ocr_structure_correction"
+            and str(values.get("issue_code") or "") == alias_issue_code
+            and str(values.get("severity") or "") == "info"
+            and str(values.get("status") or "") in {"informational", "resolved"}
+            and str(values.get("parser_stage") or "")
+            == "candidate_b_relationship_schema"
+            and str(values.get("target_dataset") or "") == "repayment_records"
+            and str(values.get("field_name") or "") == "performance_month"
+            and str(values.get("target_record_id") or "")
+            == canonical_account_month_target(account_id, performance_month)
+            and set(observed)
+            == {
+                "account_id",
+                "grid_id",
+                "performance_month",
+                "source_position_state",
+                "account_month_owner_basis",
+            }
+            and str(observed.get("source_position_state") or "")
+            == "owner_bound_alias"
+            and owner_basis in allowed_account_month_owner_bases
+            and exact_alias_candidate(candidate)
+            and exact_reason_code_set(values, detached_alias_reason_codes)
+            and len(refs) == 1
+        ):
+            return None
+        ref = refs[0]
+        page = ref.get("page")
+        logical_page = ref.get("logical_page")
+        bbox = ref.get("bbox")
+        source_page = ref.get("source_page")
+        if not (
+            str(ref.get("source") or "") == "candidate_b_monthly_grid_omission"
+            and str(ref.get("binding") or "") == "source_account_month_alias"
+            and str(ref.get("binding_quality") or "")
+            == "source_account_month_alias"
+            and str(ref.get("account_id") or "") == account_id
+            and str(ref.get("grid_id") or "") == grid_id
+            and str(ref.get("performance_month") or "") == performance_month
+            and str(ref.get("field_name") or "") == "performance_month"
+            and str(ref.get("geometry_scope") or "") == "grid"
+            and str(ref.get("coordinate_system") or "")
+            == "pdf_points_top_left"
+            and isinstance(page, int)
+            and not isinstance(page, bool)
+            and page > 0
+            and logical_page == page
+            and (
+                source_page is None
+                or (
+                    isinstance(source_page, int)
+                    and not isinstance(source_page, bool)
+                    and source_page > 0
+                )
+            )
+            and isinstance(ref.get("table_id"), str)
+            and bool(str(ref.get("table_id") or "").strip())
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in bbox
+            )
+            and float(bbox[2]) > float(bbox[0])
+            and float(bbox[3]) > float(bbox[1])
+        ):
+            return None
+        return (
+            (grid_id, performance_month),
+            (account_id, performance_month),
+            ("relationship_grid_alias", page, source_page, ref["table_id"]),
+        )
+
+    def legacy_alias_declaration(
+        values: Mapping[str, Any],
+        observed: Mapping[str, Any],
+        refs: list[Mapping[str, Any]],
+        *,
+        account_id: str,
+        grid_id: str,
+        performance_month: str,
+    ) -> tuple[tuple[str, str], tuple[str, str], tuple[Any, ...]] | None:
+        """Read the former one-ref producer grammar without weakening v2 claims."""
+
+        identity = (account_id, performance_month)
+        target_record_id = str(values.get("target_record_id") or "")
+        if not (
+            set(observed)
+            == {
+                "account_id",
+                "grid_id",
+                "performance_month",
+                "source_position_state",
+            }
+            and str(observed.get("source_position_state") or "")
+            == "owner_bound_alias"
+            and identity in candidate_identities
+            and target_record_id.endswith(f":{performance_month}")
+            and str(values.get("category") or "") == "ocr_structure_correction"
+            and str(values.get("issue_code") or "") == alias_issue_code
+            and str(values.get("severity") or "") == "info"
+            and str(values.get("status") or "") in {"informational", "resolved"}
+            and str(values.get("parser_stage") or "")
+            == "candidate_b_relationship_schema"
+            and str(values.get("target_dataset") or "") == "repayment_records"
+            and str(values.get("field_name") or "") == "performance_month"
+            and len(refs) == 1
+        ):
+            return None
+        ref = refs[0]
+        logical_page = ref.get("logical_page") or ref.get("page")
+        bbox = ref.get("bbox")
+        raw_evidence_ids = ref.get("evidence_ids")
+        if not (
+            isinstance(logical_page, int)
+            and not isinstance(logical_page, bool)
+            and logical_page > 0
+            and str(ref.get("grid_id") or "") == grid_id
+            and str(ref.get("performance_month") or "") == performance_month
+            and str(ref.get("geometry_scope") or "") in {"cell", "grid"}
+            and isinstance(bbox, (list, tuple))
+            and len(bbox) == 4
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                for value in bbox
+            )
+            and float(bbox[2]) > float(bbox[0])
+            and float(bbox[3]) > float(bbox[1])
+            and (
+                raw_evidence_ids is None
+                or (
+                    isinstance(raw_evidence_ids, (list, tuple))
+                    and bool(raw_evidence_ids)
+                    and all(
+                        isinstance(value, str) and bool(value.strip())
+                        for value in raw_evidence_ids
+                    )
+                    and len(raw_evidence_ids) == len(set(raw_evidence_ids))
+                )
+            )
+        ):
+            return None
+        return (
+            (grid_id, performance_month),
+            identity,
+            ("legacy_relationship_alias", logical_page),
+        )
 
     candidate_identities: set[tuple[str, str]] = set()
     bound_positions_by_identity: dict[
         tuple[str, str], set[tuple[str, str]]
     ] = {}
-    fingerprints_by_source_position: dict[
-        tuple[str, str], set[tuple[Any, ...]]
-    ] = {}
-    raw_physical_fingerprints_by_source_position: dict[
-        tuple[str, str], set[tuple[Any, ...]]
-    ] = {}
-    physical_claims_by_source_position: dict[
-        tuple[str, str],
-        list[
-            tuple[
-                tuple[Any, ...],
-                tuple[str, str],
-                list[dict[str, Any]],
-            ]
-        ],
-    ] = {}
+    source_observation_claims: list[dict[str, Any]] = []
     for record in datasets.get("repayment_records") or ():
         values = _record_values(record)
         account_id = str(values.get("account_id") or "").strip()
@@ -4292,58 +4932,23 @@ def _apply_account_month_closure_ledger(
         if grid_id:
             source_position = (grid_id, performance_month)
             bound_positions_by_identity.setdefault(identity, set()).add(source_position)
-            fingerprints, physical_claim_refs = physical_position_fingerprints(
-                record_refs(record, values),
-                account_id=account_id,
-                performance_month=performance_month,
-            )
-            fingerprints_by_source_position.setdefault(source_position, set()).update(
-                fingerprints
-            )
-            raw_physical_fingerprints_by_source_position.setdefault(
-                source_position, set()
-            ).update(physical_claim_refs)
-            for physical_claim, claim_refs in physical_claim_refs.items():
-                physical_claims_by_source_position.setdefault(source_position, []).append(
-                    (physical_claim, identity, claim_refs)
-                )
+            source_observation_claims.append({
+                "position": source_position,
+                "identity": identity,
+                "observations": record_ref_observations(record, values),
+                "structural": False,
+                "canonical": True,
+                "source_plane": "canonical",
+            })
 
     localized_identities: set[tuple[str, str]] = set()
     raw_unresolved_source_positions: set[tuple[str, str]] = set()
+    structural_unresolved_source_positions: set[tuple[str, str]] = set()
     unlocalized_raw_positions: set[tuple[str, str]] = set()
     unlocalized_bound_identity_issues: set[tuple[str, str]] = set()
-    explicit_alias_positions: set[tuple[str, str]] = set()
-    detached_alias_observation_counts: Counter[
+    explicit_alias_claims: set[
         tuple[tuple[str, str], tuple[str, str]]
-    ] = Counter()
-    for issue in source_issues:
-        values = _record_values(issue)
-        if str(values.get("issue_code") or "") != alias_issue_code:
-            continue
-        observed = values.get("observed_value")
-        observed = observed if isinstance(observed, Mapping) else {}
-        account_id = str(observed.get("account_id") or "").strip()
-        grid_id = str(observed.get("grid_id") or "").strip()
-        performance_month = str(observed.get("performance_month") or "").strip()
-        addressed_claims: set[
-            tuple[tuple[str, str], tuple[str, str]]
-        ] = set()
-        if account_id and grid_id and month_pattern.fullmatch(performance_month):
-            addressed_claims.add(
-                ((grid_id, performance_month), (account_id, performance_month))
-            )
-        recovered_address = exact_detached_ref_address(
-            issue,
-            values,
-            alias=True,
-        )
-        if recovered_address is not None and recovered_address[1] is not None:
-            addressed_claims.add((recovered_address[0], recovered_address[1]))
-        for addressed_claim in addressed_claims:
-            detached_alias_observation_counts[addressed_claim] += 1
-    detached_alias_claims: Counter[
-        tuple[tuple[str, str], tuple[str, str]]
-    ] = Counter()
+    ] = set()
     for issue in source_issues:
         values = _record_values(issue)
         observed = values.get("observed_value")
@@ -4376,34 +4981,33 @@ def _apply_account_month_closure_ledger(
                 performance_month=performance_month,
             )
         )
+        issue_claim = None
         if source_position:
-            fingerprints, physical_claim_refs = physical_position_fingerprints(
-                refs,
-                account_id=account_id,
-                performance_month=performance_month,
-            )
-            fingerprints_by_source_position.setdefault(source_position, set()).update(
-                fingerprints
-            )
-            raw_physical_fingerprints_by_source_position.setdefault(
-                source_position, set()
-            ).update(physical_claim_refs)
-            if account_id:
-                identity = (account_id, performance_month)
-                for physical_claim, claim_refs in physical_claim_refs.items():
-                    physical_claims_by_source_position.setdefault(
-                        source_position, []
-                    ).append((physical_claim, identity, claim_refs))
+            if not account_id or issue_code == alias_issue_code:
+                issue_claim = {
+                    "position": source_position,
+                    "identity": None,
+                    "observations": ref_observations(
+                        raw_issue_ref_containers(issue, values)
+                    ),
+                    "structural": issue_code == detached_alias_sibling_issue_code,
+                    "source_plane": (
+                        str(values["candidate_value"].get("source_grid_plane") or "")
+                        if issue_code == alias_issue_code and isinstance(values.get("candidate_value"), Mapping)
+                        else "detached" if issue_code == detached_alias_sibling_issue_code else "canonical"
+                    ),
+                }
+                source_observation_claims.append(issue_claim)
+            # Other account-scoped diagnostics cannot supply canonical source
+            # geometry.  The validated owned-grid/range grammars below carry
+            # single refs for identity only, never a complete physical pair.
+            if issue_code == detached_alias_sibling_issue_code:
+                structural_unresolved_source_positions.add(source_position)
         if issue_code == alias_issue_code:
             if source_position_is_local and account_id:
-                explicit_alias_positions.add(source_position)
-                identity = (account_id, performance_month)
-                bound_positions_by_identity.setdefault(identity, set()).add(
-                    source_position
-                )
                 exact_refs = exact_issue_refs(issue, values)
-                detached_alias_claim = (
-                    exact_detached_alias_claim(
+                detached_alias_declaration = (
+                    exact_detached_alias_declaration(
                         values,
                         observed,
                         exact_refs,
@@ -4414,9 +5018,52 @@ def _apply_account_month_closure_ledger(
                     if exact_refs is not None
                     else None
                 )
-                if detached_alias_claim is not None:
-                    claimed_position, claimed_identity = detached_alias_claim
-                    detached_alias_claims[(claimed_position, claimed_identity)] += 1
+                grid_alias_declaration = exact_grid_alias_declaration(
+                    values,
+                    observed,
+                    refs,
+                    account_id=account_id,
+                    grid_id=grid_id,
+                    performance_month=performance_month,
+                )
+                legacy_declaration = legacy_alias_declaration(
+                    values,
+                    observed,
+                    refs,
+                    account_id=account_id,
+                    grid_id=grid_id,
+                    performance_month=performance_month,
+                )
+                declarations = [
+                    (kind, declaration)
+                    for kind, declaration in (
+                        ("detached", detached_alias_declaration),
+                        ("grid", grid_alias_declaration),
+                        ("legacy", legacy_declaration),
+                    )
+                    if declaration is not None
+                ]
+                alias_declaration = (
+                    declarations[0][1] if len(declarations) == 1 else None
+                )
+                if alias_declaration is not None:
+                    declared_position, declared_identity, _locator = alias_declaration
+                    bound_claim = (declared_position, declared_identity)
+                    explicit_alias_claims.add(bound_claim)
+                    bound_positions_by_identity.setdefault(
+                        declared_identity, set()
+                    ).add(declared_position)
+                    if issue_claim is not None:
+                        issue_claim["identity"] = declared_identity
+                        issue_claim["canonical"] = issue_claim.get("source_plane") == "canonical"
+                    # A relationship-stage grid envelope proves the alias's
+                    # account/month owner, but not one physical month cell.
+                    # Several account grids may share a source table and month;
+                    # only exact cell evidence may collapse their denominator.
+                else:
+                    # A malformed alias remains a physical source observation,
+                    # but cannot influence owner selection or physical counts.
+                    raw_unresolved_source_positions.add(source_position)
             elif source_position:
                 # An alias without an exact account owner is still a raw
                 # printed position, but it cannot be reconciled as bound.
@@ -4476,6 +5123,18 @@ def _apply_account_month_closure_ledger(
                     bound_positions_by_identity.setdefault(identity, set()).add(
                         source_position
                     )
+                    source_observation_claims.append({
+                        "position": source_position,
+                        "identity": identity,
+                        "observations": [],
+                        "structural": False,
+                        "identity_only": True,
+                        "source_plane": "canonical",
+                    })
+                    # A field-local missing-range issue proves an identity,
+                    # not a complete physical status/amount pair.  It may
+                    # contribute audit ownership, but never bridge a detached
+                    # two-cell diagnostic by assembling singleton claims.
             else:
                 # Do not promote an unlocalized diagnostic into the canonical
                 # denominator.  Keep it visible in the audit status instead.
@@ -4494,99 +5153,379 @@ def _apply_account_month_closure_ledger(
             if not source_position_is_local:
                 unlocalized_raw_positions.add(source_position)
 
+    # Invalid owned-grid issues can lack a generic source-ref claim, but must
+    # remain an explicit unresolved observation in the same physical inventory.
+    claimed_positions = {claim["position"] for claim in source_observation_claims}
+    source_observation_claims.extend(
+        {
+            "position": position,
+            "identity": None,
+            "observations": [],
+            "structural": position in structural_unresolved_source_positions,
+        }
+        for position in raw_unresolved_source_positions - claimed_positions
+    )
+
     closure = candidate_identities | localized_identities
     all_bound_source_positions = {
         position
         for positions in bound_positions_by_identity.values()
         for position in positions
     }
-    identities_by_bound_position: dict[
-        tuple[str, str], set[tuple[str, str]]
-    ] = {}
-    for identity, positions in bound_positions_by_identity.items():
-        for position in positions:
-            identities_by_bound_position.setdefault(position, set()).add(identity)
-    detached_audit_only_alias_positions: set[tuple[str, str]] = set()
-    for (position, identity), claim_count in detached_alias_claims.items():
-        if (
-            claim_count != 1
-            or detached_alias_observation_counts[(position, identity)] != 1
-        ):
-            continue
-        if identities_by_bound_position.get(position) != {identity}:
-            # Never hide a source position claimed by more than one owner.
-            continue
-        non_alias_positions = (
-            bound_positions_by_identity.get(identity, set())
-            - explicit_alias_positions
+    alias_bound_claims = set(explicit_alias_claims)
+    for identity, source_positions in bound_positions_by_identity.items():
+        primary_candidates = sorted(
+            position
+            for position in source_positions
+            if (position, identity) not in explicit_alias_claims
         )
-        if non_alias_positions:
-            detached_audit_only_alias_positions.add(position)
-    claims_by_physical_fingerprint: dict[
-        tuple[Any, ...],
-        list[tuple[tuple[str, str], tuple[str, str], list[dict[str, Any]]]],
-    ] = {}
-    for source_position in all_bound_source_positions:
-        for physical_claim, identity, claim_refs in physical_claims_by_source_position.get(
-            source_position, ()
-        ):
-            claims_by_physical_fingerprint.setdefault(physical_claim, []).append(
-                (identity, source_position, claim_refs)
+        if len(primary_candidates) > 1:
+            alias_bound_claims.update(
+                (position, identity) for position in primary_candidates[1:]
             )
+    alias_source_positions = {
+        position for position, _identity in alias_bound_claims
+    }
+    # Attach ownership to each coherent producer observation BEFORE grouping
+    # detector-local IDs.  Detectors can reuse a grid ID for distinct tables:
+    # pair P/owner A and pair Q/owner B must stay separate even at the same key.
+    # Equality remains direct; no singleton or transitive alias edge can create
+    # a complete physical pair.
+    inventory_source_positions = (
+        all_bound_source_positions | raw_unresolved_source_positions
+    )
+    physical_components: dict[tuple[Any, ...], dict[str, Any]] = {}
+    component_keys_by_source_position: dict[
+        tuple[str, str], set[tuple[Any, ...]]
+    ] = {}
+    pair_cells: dict[tuple[Any, ...], set[tuple[Any, ...]]] = {}
+    complete_pairs_by_position: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    structural_pairs_by_position: dict[tuple[str, str], set[tuple[Any, ...]]] = {}
+    structural_observation_keys: set[tuple[Any, ...]] = set()
+    structural_component_keys: set[tuple[Any, ...]] = set()
+    canonical_component_keys: set[tuple[Any, ...]] = set()
+    deficient_claims: list[dict[str, Any]] = []
+
+    def add_physical_component(
+        claim: Mapping[str, Any],
+        component_key: tuple[Any, ...],
+        component_refs: Iterable[Mapping[str, Any]],
+    ) -> None:
+        position = claim["position"]
+        component_keys_by_source_position.setdefault(position, set()).add(component_key)
+        component = physical_components.setdefault(
+            component_key,
+            {
+                "source_positions": set(),
+                "identities": set(),
+                "complete_pairs": set(),
+                "source_refs": [],
+            },
+        )
+        component["source_positions"].add(position)
+        if claim["identity"] is not None:
+            component["identities"].add(claim["identity"])
+        if component_key[0] == "complete_pair":
+            component["complete_pairs"].add(component_key[1])
+        if claim.get("canonical") and component_key[0] == "complete_pair":
+            canonical_component_keys.add(component_key)
+        component["source_refs"].extend(
+            dict(ref) for ref in component_refs if isinstance(ref, Mapping)
+        )
+        if claim["structural"]:
+            structural_component_keys.add(component_key)
+
+    independently_bound_claims = {
+        (claim["position"], claim["identity"])
+        for claim in source_observation_claims
+        if claim["identity"] is not None and not claim.get("identity_only")
+    }
+    for claim in source_observation_claims:
+        if (
+            claim.get("identity_only")
+            and (claim["position"], claim["identity"]) in independently_bound_claims
+        ):
+            # An owned-grid/range diagnostic repeats an account/month identity,
+            # not an additional physical observation.  Its singleton geometry
+            # cannot add a pair, bridge an alias, or create an opaque duplicate
+            # beside an independently bound canonical/alias observation.
+            # New owners and incomplete source-record/alias claims remain in
+            # the inventory; only these verified identity-only repeats retire.
+            continue
+        position = claim["position"]
+        complete_pairs: set[tuple[Any, ...]] = set()
+        valid_fragment_cells: set[tuple[Any, ...]] = set()
+        fragments_valid = bool(claim["observations"])
+        for observation in claim["observations"]:
+            observation_pairs, observation_refs, cells = complete_physical_position_pairs(
+                observation, performance_month=position[1]
+            )
+            fragments_valid = fragments_valid and bool(cells)
+            valid_fragment_cells.update(cells)
+            for pair in observation_pairs:
+                complete_pairs.add(pair)
+                pair_cells[pair] = cells
+                complete_pairs_by_position.setdefault(position, set()).add(pair)
+                add_physical_component(claim, ("complete_pair", pair), observation_refs[pair])
+                if claim["structural"]:
+                    structural_pairs_by_position.setdefault(position, set()).add(pair)
+                    structural_observation_keys.add((position, ("complete_pair", pair)))
+        if not complete_pairs:
+            deficient_claims.append({
+                **claim,
+                "fragment_cells": valid_fragment_cells if fragments_valid else set(),
+            })
+
+    unresolved_detector_collisions: set[tuple[str, str]] = set()
+    for claim in deficient_claims:
+        position = claim["position"]
+        cells = claim["fragment_cells"]
+        matches = {
+            pair for pair in complete_pairs_by_position.get(position, ())
+            if cells and cells <= pair_cells[pair]
+        }
+        # A field diagnostic can be placed within one independently proven
+        # same-detector pair by exact cell inclusion.  It contributes NO owner
+        # and cannot bridge detector IDs.  An incomplete owner claim cannot use
+        # this shortcut to claim somebody else's complete pair.
+        if claim["identity"] is None and len(matches) == 1:
+            component_key = ("complete_pair", next(iter(matches)))
+        else:
+            component_key = ("source_position", position)
+            if complete_pairs_by_position.get(position):
+                unresolved_detector_collisions.add(position)
+        add_physical_component(
+            claim, component_key,
+            (ref for observation in claim["observations"] for ref in observation),
+        )
+        if claim["structural"]:
+            # Authenticate the original aggregate against its own detail
+            # observations, independent of later canonical owner evidence.
+            # Field siblings may share a complete pair already in that detail
+            # plane, but may never synthesize one from pooled singleton cells.
+            structural_matches = {
+                pair for pair in structural_pairs_by_position.get(position, ())
+                if cells and cells <= pair_cells[pair]
+            }
+            basis_key = (
+                ("complete_pair", next(iter(structural_matches)))
+                if len(structural_matches) == 1
+                else ("source_position", position)
+            )
+            structural_observation_keys.add((position, basis_key))
+
+    # Printed-grid population and extracted cell geometry answer different
+    # questions.  Once the sealed anchor census is authenticated, partition its
+    # slots directly; deficient cell refs cannot add another printed month or
+    # make two detector namespaces refer to the same physical table.
+    census_unmapped_claims: set[tuple[str, str, str]] = set()
+    census_pair_locator_conflicts: set[tuple[Any, ...]] = set()
+    canonical_census_presence_keys: set[tuple[Any, ...]] = set()
+    census_source_positions: set[tuple[str, str]] = set()
+    census_observed_addresses: set[tuple[str, str, str]] = set()
+    if printed_grid_census is not None:
+        physical_components.clear()
+        component_keys_by_source_position.clear()
+        structural_component_keys.clear()
+        canonical_component_keys.clear()
+        unresolved_detector_collisions.clear()
+        pair_census_components: dict[tuple[Any, ...], set[tuple[Any, ...]]] = {}
+        for anchor in anchor_inventory["anchors"]:
+            anchor_key = _printed_anchor_identity_key(anchor)
+            locator_id = stable_record_id("sealed_printed_anchor", anchor_key)
+            for month in printed_anchor_months(anchor):
+                position = (locator_id, month)
+                inventory_source_positions.add(position)
+                census_source_positions.add(position)
+                add_physical_component({
+                    "position": position, "identity": None, "structural": False,
+                }, ("printed_grid_month", anchor_key, month),
+                    _printed_anchor_inventory_source_refs((anchor,)))
+        for entry in printed_grid_census:
+            if not entry["mapping_valid"]:
+                census_unmapped_claims.update(
+                    (entry["plane"], entry["grid_id"], month)
+                    for month in set(entry["observed_months"]) | set(entry["printed_months"])
+                )
+                continue
+            anchor_refs = _printed_grid_census_source_refs((entry,))
+            for month in entry["printed_months"]:
+                position = (entry["grid_id"], month)
+                address = (entry["plane"], *position)
+                component_key = census_key_by_plane_position[address]
+                identity = (entry["account_id"], month) if entry["account_id"] else None
+                census_source_positions.add(position)
+                census_observed_addresses.add(address)
+                inventory_source_positions.add(position)
+                add_physical_component({
+                    "position": position,
+                    "identity": identity,
+                    "structural": False,
+                }, component_key, anchor_refs)
+                if entry["plane"] == "canonical":
+                    canonical_census_presence_keys.add(component_key)
+
+        pending_census_claims: list[tuple[dict[str, Any], set[tuple[Any, ...]]]] = []
+
+        def attach_census_claim(
+            claim: Mapping[str, Any], key: tuple[Any, ...], pairs: set[tuple[Any, ...]],
+        ) -> None:
+            address = (str(claim.get("source_plane") or ""), *claim["position"])
+            census_observed_addresses.add(address)
+            census_unmapped_claims.discard(address)
+            census_source_positions.add(claim["position"])
+            add_physical_component(claim, key, (
+                ref for observation in claim["observations"] for ref in observation
+            ))
+            physical_components[key]["complete_pairs"].update(pairs)
+            for pair in pairs:
+                pair_census_components.setdefault(pair, set()).add(key)
+            if address[0] == "canonical" and claim.get("canonical") and address in current_census_observation_addresses:
+                canonical_census_presence_keys.add(key)
+                if len(pairs) == 1:
+                    # A range-only placeholder is present in the census, but
+                    # it has not reconstructed either physical field cell.
+                    canonical_component_keys.add(key)
+
+        for claim in source_observation_claims:
+            position = claim["position"]
+            plane = str(claim.get("source_plane") or "")
+            census_address = (plane, *position)
+            component_key = census_key_by_plane_position.get(census_address)
+            pairs: set[tuple[Any, ...]] = set()
+            for observation in claim["observations"]:
+                observation_pairs, _refs, _cells = complete_physical_position_pairs(
+                    observation, performance_month=position[1]
+                )
+                pairs.update(observation_pairs)
+            if component_key is None:
+                pending_census_claims.append((claim, pairs))
+            else:
+                attach_census_claim(claim, component_key, pairs)
+        # New page OCR may have a genuinely new anchor token ID.  It can map
+        # into the raw census only through a complete pair independently
+        # localized there; neither its date string nor detector ID is a bridge.
+        pair_mapped_addresses: dict[tuple[str, str, str], set[tuple[Any, ...]]] = {}
+        unresolved_pending_addresses: set[tuple[str, str, str]] = set()
+        for claim, pairs in pending_census_claims:
+            address = (str(claim.get("source_plane") or ""), *claim["position"])
+            matches = (
+                pair_census_components.get(next(iter(pairs)), set())
+                if len(pairs) == 1 and address in current_census_observation_addresses
+                else set()
+            )
+            if len(matches) == 1:
+                key = next(iter(matches))
+                attach_census_claim(claim, key, pairs)
+                pair_mapped_addresses.setdefault(address, set()).add(key)
+            else:
+                if not claim.get("identity_only"):
+                    unresolved_pending_addresses.add(address)
+        for claim, _pairs in pending_census_claims:
+            address = (str(claim.get("source_plane") or ""), *claim["position"])
+            matches = pair_mapped_addresses.get(address, set())
+            if claim.get("identity_only") and len(matches) == 1:
+                attach_census_claim(claim, next(iter(matches)), set())
+            elif claim.get("identity_only"):
+                unresolved_pending_addresses.add(address)
+        census_unmapped_claims.update(unresolved_pending_addresses)
+        unresolved_detector_collisions.update(
+            (grid_id, month) for _plane, grid_id, month in census_unmapped_claims
+        )
+        census_pair_locator_conflicts = {
+            pair for pair, keys in pair_census_components.items() if len(keys) > 1
+        }
+        structural_component_keys.update(
+            set(physical_components) - canonical_census_presence_keys
+        )
+
+    census_population_valid = bool(
+        printed_grid_census is not None
+        and anchor_inventory["complete"]
+    )
+    census_mapping_valid = bool(
+        census_population_valid
+        and not census_unmapped_claims
+        and not census_pair_locator_conflicts
+    )
+    if printed_grid_census_present:
+        for issue in census_issues:
+            if not isinstance(issue, dict):
+                continue
+            normalized = issue.get("normalized")
+            values = normalized if isinstance(normalized, dict) else issue
+            values["status"] = "informational" if census_mapping_valid else "requires_review"
+            values["severity"] = "info" if census_mapping_valid else "warning"
+
+    bound_physical_components: list[dict[str, Any]] = []
+    unresolved_physical_components: list[dict[str, Any]] = []
+    conflict_physical_components: list[dict[str, Any]] = []
+    for component in physical_components.values():
+        owner_count = len(component["identities"])
+        if owner_count == 1:
+            bound_physical_components.append(component)
+        elif owner_count == 0:
+            unresolved_physical_components.append(component)
+        else:
+            conflict_physical_components.append(component)
+
+    bound_component_source_positions = {
+        position
+        for component in bound_physical_components
+        for position in component["source_positions"]
+    }
+    unresolved_source_positions = {
+        position
+        for component in unresolved_physical_components
+        for position in component["source_positions"]
+    }
+    conflict_source_positions = {
+        position
+        for component in conflict_physical_components
+        for position in component["source_positions"]
+    }
+    reconciled_detached_diagnostic_positions = (
+        raw_unresolved_source_positions
+        - all_bound_source_positions
+        - alias_source_positions
+    ) & (
+        bound_component_source_positions
+        - unresolved_source_positions
+        - conflict_source_positions
+        - unresolved_detector_collisions
+    )
+    unlocalized_unresolved_positions = (
+        unlocalized_raw_positions & unresolved_source_positions
+    ) - census_source_positions
+
     physical_owner_conflict_groups: dict[
         tuple[tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]],
         dict[str, Any],
     ] = {}
-    for physical_fingerprint, claims in claims_by_physical_fingerprint.items():
-        identities = tuple(sorted({identity for identity, _position, _refs in claims}))
-        if len(identities) <= 1:
-            continue
-        source_positions = tuple(
-            sorted({position for _identity, position, _refs in claims})
-        )
-        conflict = physical_owner_conflict_groups.setdefault(
+    for component in conflict_physical_components:
+        identities = tuple(sorted(component["identities"]))
+        source_positions = tuple(sorted(component["source_positions"]))
+        group = physical_owner_conflict_groups.setdefault(
             (identities, source_positions),
             {"physical_fingerprints": set(), "source_refs": []},
         )
-        conflict["physical_fingerprints"].add(physical_fingerprint)
-        conflict["source_refs"].extend(
-            ref
-            for _identity, _position, refs in claims
-            for ref in refs
-            if isinstance(ref, Mapping)
-        )
-    alias_source_positions = set(explicit_alias_positions)
-    for source_positions in bound_positions_by_identity.values():
-        primary_candidates = sorted(source_positions - explicit_alias_positions)
-        if len(primary_candidates) > 1:
-            alias_source_positions.update(primary_candidates[1:])
-    inventoried_physical_fingerprints = {
-        fingerprint
-        for position in all_bound_source_positions | alias_source_positions
-        for fingerprint in raw_physical_fingerprints_by_source_position.get(position, ())
-    }
-    reconciled_detached_diagnostic_positions = {
-        position
-        for position in raw_unresolved_source_positions
-        if position not in all_bound_source_positions
-        and position not in alias_source_positions
-        and raw_physical_fingerprints_by_source_position.get(position, set())
-        & inventoried_physical_fingerprints
-    }
-    unresolved_source_positions = (
-        raw_unresolved_source_positions
-        - all_bound_source_positions
-        - alias_source_positions
-        - reconciled_detached_diagnostic_positions
-    )
-    unlocalized_unresolved_positions = (
-        unlocalized_raw_positions & unresolved_source_positions
-    )
+        # Retain the historical payload key while narrowing its contents to
+        # complete pairs.  Several conflicting pairs can share detector IDs;
+        # retain them all rather than overwriting the preceding conflict.
+        group["physical_fingerprints"].update(component["complete_pairs"])
+        group["source_refs"].extend(component["source_refs"])
+
     if not (
         closure
-        or unresolved_source_positions
+        or inventory_source_positions
         or alias_source_positions
         or unlocalized_bound_identity_issues
+        or printed_grid_census_present
+        or any(
+            values.get("issue_code") == "canonical_monthly_reconstruction_incomplete"
+            for issue in source_issues
+            for values in (_record_values(issue),)
+        )
     ):
         return
     digest_input = "".join(
@@ -4594,38 +5533,168 @@ def _apply_account_month_closure_ledger(
         for account_id, performance_month in sorted(closure)
     ).encode("utf-8")
     identity_sha256 = hashlib.sha256(digest_input).hexdigest()
-    # Source observations and canonical identities are deliberately separate
-    # ledgers.  Multiple parser/grid aliases can observe one exact physical
-    # cell; raw and owner-bound counts conserve that cell once while alias
-    # observations remain independently auditable.
-    source_month_position_observations = len(
-        all_bound_source_positions | raw_unresolved_source_positions
+    source_month_position_observations = sum(
+        len(component_keys)
+        for component_keys in component_keys_by_source_position.values()
     )
-    owner_bound_account_months = unique_physical_position_count(
-        all_bound_source_positions - detached_audit_only_alias_positions,
-        fingerprints_by_source_position,
-    )
-    owner_unresolved_positions = unique_physical_position_count(
-        unresolved_source_positions,
-        fingerprints_by_source_position,
-    )
-    raw_source_month_positions = (
-        owner_bound_account_months + owner_unresolved_positions
-    )
+    if printed_grid_census is not None:
+        source_month_position_observations = (
+            len(physical_components) + len(census_observed_addresses)
+        )
+    raw_source_month_positions = len(physical_components)
+    owner_bound_account_months = len(bound_physical_components)
+    owner_unresolved_positions = len(unresolved_physical_components)
+    owner_conflict_positions = len(conflict_physical_components)
     physical_alias_source_month_observations = (
         source_month_position_observations - raw_source_month_positions
     )
     balance_valid = raw_source_month_positions == (
-        owner_bound_account_months + owner_unresolved_positions
+        owner_bound_account_months
+        + owner_unresolved_positions
+        + owner_conflict_positions
     )
     if physical_owner_conflict_groups:
         ledger_status = "physical_owner_conflict"
-    elif unlocalized_bound_identity_issues or unlocalized_unresolved_positions:
+    elif (
+        unlocalized_bound_identity_issues
+        or unlocalized_unresolved_positions
+        or unresolved_detector_collisions
+        or (printed_grid_census_present and not census_mapping_valid)
+    ):
         ledger_status = "source_localization_invalid"
     elif unresolved_source_positions:
         ledger_status = "partial_owner_unresolved"
     else:
         ledger_status = "identity_closed"
+
+    # The materialization stage publishes its detached-position count before
+    # account ownership exists.  Reconcile that same diagnostic in place now
+    # that the combined physical inventory has partitioned every component.
+    # The stable issue ID is unaffected because candidate/status fields are not
+    # part of the issue identity contract.
+    structural_owner_unreconciled_positions = sum(
+        len(physical_components[component_key]["identities"]) != 1
+        or component_key not in canonical_component_keys
+        for component_key in structural_component_keys
+    )
+    structural_conflict_positions = sum(
+        len(physical_components[component_key]["identities"]) > 1
+        for component_key in structural_component_keys
+    )
+    structural_unlocalized_positions = (
+        structural_unresolved_source_positions & unlocalized_raw_positions
+    ) - census_source_positions
+    structural_reconciliation_basis = {
+        "schema": "docmirror.pboc.source_position_reconciliation.v1",
+        "source_position_observation_count": len(structural_observation_keys),
+        "source_position_identity_sha256": hashlib.sha256(
+            json.dumps(
+                sorted(structural_observation_keys, key=repr),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    structural_detail_plane_complete = all(
+        position in {key[0] for key in structural_observation_keys}
+        for position in structural_unresolved_source_positions
+    )
+    if structural_conflict_positions:
+        structural_localization_status = "physical_owner_conflict"
+    elif (
+        structural_unlocalized_positions
+        or (structural_unresolved_source_positions & unresolved_detector_collisions)
+        or (printed_grid_census_present and not census_mapping_valid)
+    ):
+        structural_localization_status = "source_localization_invalid"
+    elif structural_owner_unreconciled_positions:
+        # A detached grid can repeat an account/month in a different printed
+        # table.  Knowing its owner does not mean the canonical reconstruction
+        # covers that physical source position.  Keep that gap until the
+        # canonical component itself is proven, not just its business identity.
+        structural_localization_status = "pending_unique_account_owner_reconciliation"
+    else:
+        structural_localization_status = "identity_closed"
+    structural_reconciliation_invalid = False
+    for issue in source_issues:
+        if not isinstance(issue, dict):
+            continue
+        normalized_issue = issue.get("normalized")
+        issue_values = (
+            normalized_issue if isinstance(normalized_issue, dict) else issue
+        )
+        if (
+            str(issue_values.get("issue_code") or "")
+            != "canonical_monthly_reconstruction_incomplete"
+        ):
+            continue
+        candidate_value = issue_values.get("candidate_value")
+        if not isinstance(candidate_value, Mapping):
+            structural_reconciliation_invalid = True
+            issue_values["status"] = "requires_review"
+            continue
+        reported_unreconciled_positions = candidate_value.get(
+            "unreconciled_source_position_count"
+        )
+        previous_basis = candidate_value.get("source_position_reconciliation")
+        if "source_position_reconciliation" in candidate_value:
+            basis_valid = bool(
+                isinstance(previous_basis, Mapping)
+                and previous_basis.get("schema")
+                == structural_reconciliation_basis["schema"]
+                and type(previous_basis.get("source_position_observation_count"))
+                is int
+                and previous_basis.get("source_position_observation_count")
+                == structural_reconciliation_basis["source_position_observation_count"]
+                and previous_basis.get("source_position_identity_sha256")
+                == structural_reconciliation_basis["source_position_identity_sha256"]
+            )
+        else:
+            # The first reconciliation must prove the original aggregate
+            # against the complete detail plane, not against a reduced count.
+            basis_valid = bool(
+                type(reported_unreconciled_positions) is int
+                and reported_unreconciled_positions
+                == len(structural_observation_keys)
+            )
+        if not basis_valid or not structural_detail_plane_complete:
+            # Neither an unauthenticated initial aggregate nor a changed detail
+            # plane can certify completeness.  Preserve the reported count and
+            # reopen the diagnostic without inventing a reconciled denominator.
+            structural_reconciliation_invalid = True
+            invalid_candidate = dict(candidate_value)
+            invalid_candidate["account_month_expected_row_count"] = None
+            invalid_candidate["localization_status"] = (
+                "source_position_reconciliation_invalid"
+            )
+            issue_values["candidate_value"] = invalid_candidate
+            issue_values["status"] = "requires_review"
+            continue
+        reconciled_candidate = dict(candidate_value)
+        reconciled_candidate["source_position_reconciliation"] = dict(
+            structural_reconciliation_basis
+        )
+        reconciled_candidate["unreconciled_source_position_count"] = (
+            structural_owner_unreconciled_positions
+        )
+        reconciled_candidate["account_month_expected_row_count"] = (
+            len(closure)
+            if structural_localization_status == "identity_closed"
+            and ledger_status == "identity_closed"
+            else None
+        )
+        reconciled_candidate["localization_status"] = (
+            structural_localization_status
+        )
+        issue_values["candidate_value"] = reconciled_candidate
+        issue_values["status"] = (
+            "resolved"
+            if structural_localization_status == "identity_closed"
+            else "requires_review"
+        )
+    if structural_reconciliation_invalid and not physical_owner_conflict_groups:
+        ledger_status = "source_localization_invalid"
+
     facts["personal_detail_account_month_closure"] = {
         "schema": "docmirror.pboc.account_month_closure.v2",
         "identity_fields": ["account_id", "performance_month"],
@@ -4635,9 +5704,17 @@ def _apply_account_month_closure_ledger(
         ),
         "expected_identity_count": len(closure),
         "canonical_account_month_identity_count": len(closure),
+        "expected_source_position_count": raw_source_month_positions,
         "source_month_position_observations": source_month_position_observations,
         "raw_source_month_positions": raw_source_month_positions,
         "unique_physical_source_month_positions": raw_source_month_positions,
+        "canonical_covered_source_month_positions": sum(
+            len(physical_components[key]["identities"]) == 1
+            for key in canonical_component_keys
+        ),
+        "canonical_present_source_month_positions": (
+            len(canonical_census_presence_keys) if printed_grid_census is not None else None
+        ),
         "physical_alias_source_month_observations": (
             physical_alias_source_month_observations
         ),
@@ -4645,17 +5722,33 @@ def _apply_account_month_closure_ledger(
             physical_owner_conflict_groups
         ),
         "physical_owner_conflict_free": not physical_owner_conflict_groups,
+        "unresolved_detector_source_position_collisions": len(
+            unresolved_detector_collisions
+        ),
+        "physical_source_position_localization_valid": not unresolved_detector_collisions,
+        "printed_grid_census_required": printed_grid_census_present,
+        "printed_grid_census_valid": census_population_valid if printed_grid_census_present else None,
+        "printed_grid_census_mapping_valid": census_mapping_valid if printed_grid_census_present else None,
+        "printed_grid_census_unmapped_observation_count": len(census_unmapped_claims),
+        "printed_grid_census_cell_locator_conflict_count": len(census_pair_locator_conflicts),
         "owner_bound_account_months": owner_bound_account_months,
         "owner_unresolved_positions": owner_unresolved_positions,
-        "owner_unresolved_position_observations": len(
-            unresolved_source_positions
+        "owner_conflict_positions": owner_conflict_positions,
+        "owner_unresolved_position_observations": sum(
+            len(component["source_positions"])
+            for component in unresolved_physical_components
+        ),
+        "owner_conflict_position_observations": sum(
+            len(component["source_positions"])
+            for component in conflict_physical_components
         ),
         "alias_source_month_positions": len(alias_source_positions),
         "reconciled_detached_diagnostic_positions": len(
             reconciled_detached_diagnostic_positions
         ),
         "source_localized_owner_unresolved_positions": (
-            len(unresolved_source_positions) - len(unlocalized_unresolved_positions)
+            owner_unresolved_positions if printed_grid_census is not None
+            else len(unresolved_source_positions) - len(unlocalized_unresolved_positions)
         ),
         "unlocalized_owner_unresolved_positions": len(
             unlocalized_unresolved_positions
@@ -4665,14 +5758,43 @@ def _apply_account_month_closure_ledger(
         ),
         "source_position_balance": (
             "raw_source_month_positions = owner_bound_account_months + "
-            "owner_unresolved_positions"
+            "owner_unresolved_positions + owner_conflict_positions"
         ),
         "source_position_balance_valid": balance_valid,
+        "source_position_reconciliation_valid": not structural_reconciliation_invalid,
         "unresolved_source_position_count": len(unresolved_source_positions),
         "identity_sha256": identity_sha256,
         "status": ledger_status,
     }
-    if not physical_owner_conflict_groups:
+    # An absent proof after managed reconciliation is not the legacy direct-
+    # schema contract.  Keep that distinction even when conflicts/unknown
+    # localization prevent us from certifying a physical denominator.
+    datasets[population_guard_dataset] = [
+        {
+            "record_id": "personal_detail_account_month_population_guard:1",
+            "schema": "docmirror.pboc.account_month_population_guard.v1",
+            "physical_source_position_proof_required": True,
+            "printed_grid_census_required": printed_grid_census_present,
+            "status": ledger_status,
+        }
+    ]
+    if census_population_valid:
+        datasets[printed_population_proof_dataset] = [{
+            "record_id": "personal_detail_printed_month_population_proof:1",
+            "schema": "docmirror.pboc.printed_month_population_proof.v1",
+            "proof_basis": "complete_sealed_printed_anchor_inventory",
+            "census_issue_id": anchor_inventory["issue_id"],
+            "source_anchor_count": len(anchor_inventory["anchors"]),
+            "expected_source_position_count": raw_source_month_positions,
+        }]
+    if (
+        not physical_owner_conflict_groups
+        and not structural_reconciliation_invalid
+        and not unresolved_detector_collisions
+        and not unlocalized_bound_identity_issues
+        and not unlocalized_unresolved_positions
+        and not (printed_grid_census_present and not census_mapping_valid)
+    ):
         datasets[closure_proof_dataset] = [
             {
                 "record_id": "personal_detail_account_month_closure_proof:1",
@@ -4680,6 +5802,11 @@ def _apply_account_month_closure_ledger(
                 "identity_fields": ["account_id", "performance_month"],
                 "proof_basis": "exact_source_account_month_identity_set",
                 "expected_identity_count": len(closure),
+                "expected_source_position_count": raw_source_month_positions,
+                "owner_bound_source_position_count": owner_bound_account_months,
+                "owner_unresolved_source_position_count": owner_unresolved_positions,
+                "owner_conflict_source_position_count": owner_conflict_positions,
+                "source_position_balance_valid": balance_valid,
                 "identity_sha256": identity_sha256,
             }
         ]
@@ -4693,7 +5820,7 @@ def _apply_account_month_closure_ledger(
             issues = []
             datasets["personal_detail_extraction_issues"] = issues
         existing_issue_ids = {
-            str(issue.get("extraction_issue_id") or "")
+            str(_record_values(issue).get("extraction_issue_id") or "")
             for issue in issues
             if isinstance(issue, Mapping)
         }
@@ -4716,8 +5843,9 @@ def _apply_account_month_closure_ledger(
                 category="schema_incompleteness",
                 issue_code="account_month_physical_owner_conflict",
                 message=(
-                    "One exact monthly source cell was claimed by multiple canonical "
-                    "account-month owners; the closure proof was withheld."
+                    "One monthly source position or one exact status/amount pair was "
+                    "claimed by multiple canonical account-month owners; the closure "
+                    "proof was withheld."
                 ),
                 parser_stage="account_month_closure_ledger",
                 target_dataset="repayment_records",
@@ -4738,16 +5866,29 @@ def _apply_account_month_closure_ledger(
                     "shared_physical_fingerprint_count": len(
                         conflict["physical_fingerprints"]
                     ),
+                    "shared_complete_status_amount_pair_count": len(
+                        conflict["physical_fingerprints"]
+                    ),
                 },
                 source_refs=unique_refs,
                 reason_codes=(
-                    "exact_physical_source_cell",
+                    "physical_source_position_or_complete_pair",
                     "multiple_canonical_account_month_owners",
                     "cross_owner_alias_rejected",
                     "closure_proof_withheld",
                 ),
             )
-            if issue["extraction_issue_id"] not in existing_issue_ids:
+            owned_prior_rows = owned_physical_conflicts_by_id.get(
+                issue["extraction_issue_id"], []
+            )
+            if owned_prior_rows:
+                for prior_values in owned_prior_rows:
+                    prior_values["status"] = "requires_review"
+                    if "source_refs" in issue:
+                        prior_values["source_refs"] = issue["source_refs"]
+                    else:
+                        prior_values.pop("source_refs", None)
+            elif issue["extraction_issue_id"] not in existing_issue_ids:
                 issues.append(issue)
                 existing_issue_ids.add(issue["extraction_issue_id"])
     states = facts.setdefault("personal_detail_dataset_states", {})
@@ -4762,6 +5903,10 @@ def _apply_account_month_closure_ledger(
             or unlocalized_bound_identity_issues
             or unlocalized_unresolved_positions
             or physical_owner_conflict_groups
+            or structural_reconciliation_invalid
+            or unresolved_detector_collisions
+            or (printed_grid_census_present and not census_mapping_valid)
+            or raw_source_month_positions > len(candidate_identities)
             else "present"
         ),
         "reason": (
@@ -4769,16 +5914,28 @@ def _apply_account_month_closure_ledger(
             if physical_owner_conflict_groups
             else (
                 "account_month_source_localization_invalid"
-                if unlocalized_bound_identity_issues or unlocalized_unresolved_positions
+                if unlocalized_bound_identity_issues
+                or unlocalized_unresolved_positions
+                or structural_reconciliation_invalid
+                or unresolved_detector_collisions
+                or (printed_grid_census_present and not census_mapping_valid)
                 else (
-                    "account_month_identity_partial_owner_unresolved"
+                    "account_month_source_position_partial_owner_unresolved"
                     if unresolved_source_positions
-                    else "account_month_identity_closure"
+                    else (
+                        "account_month_source_position_closure"
+                        if raw_source_month_positions != len(closure)
+                        else "account_month_identity_closure"
+                    )
                 )
             )
         ),
         "observed_row_count": len(candidate_identities),
-        **({"expected_row_count": len(closure)} if closure else {}),
+        **(
+            {"expected_row_count": raw_source_month_positions}
+            if raw_source_month_positions
+            else {}
+        ),
     }
 
 

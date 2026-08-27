@@ -24,6 +24,7 @@ import re
 import unicodedata
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from docmirror.plugins._base.standardizer import normalize_amount, normalize_timestamp
@@ -82,7 +83,14 @@ _DEDICATED_DIRECTION_KEYS = (
 )
 _CLASSIFICATION_DIRECTION_KEYS = ("交易类别", "交易类型")
 _DIRECTION_KEYS = (*_DEDICATED_DIRECTION_KEYS, *_CLASSIFICATION_DIRECTION_KEYS)
+_GENERIC_SIGNED_AMOUNT_KEYS = ("交易金额", "金额", "发生额", "Amount")
 _MONEY_PREFIX_RE = re.compile(r"^[^\d+-]*([+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)")
+_STRICT_SOURCE_MONEY_RE = re.compile(
+    r"^(?:CNY|RMB|人民币|[¥￥])?"
+    r"(?P<amount>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)"
+    r"(?:元)?$",
+    re.IGNORECASE,
+)
 _COUNTERPARTY_KEYS = (
     "对方户名",
     "对方账户名",
@@ -1131,6 +1139,129 @@ def _normalize_direction_text(value: str) -> str:
     if "借" in text or re.search(r"\bDr\b", text, re.IGNORECASE):
         return "expense"
     return ""
+
+
+def _source_provenanced_signed_amount(
+    raw_txn: dict[str, Any],
+    normalized: dict[str, Any],
+    canonical_raw: dict[str, Any],
+) -> tuple[float, str | None] | None:
+    """Return a source-proven signed amount and any split-column direction."""
+    if not all(isinstance(pool, dict) for pool in (raw_txn, normalized, canonical_raw)):
+        return None
+
+    try:
+        normalized_amount = Decimal(str(normalized.get("amount")))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not normalized_amount.is_finite() or normalized_amount < 0:
+        return None
+
+    def matching_nonblank(aliases: tuple[str, ...]) -> list[str]:
+        return [
+            str(value).strip()
+            for header, value in raw_txn.items()
+            if _header_matches_aliases(header, aliases) and str(value or "").strip()
+        ]
+
+    income_values = matching_nonblank(_SPLIT_CREDIT_KEYS)
+    expense_values = matching_nonblank(_SPLIT_DEBIT_KEYS)
+    generic_values = matching_nonblank(_GENERIC_SIGNED_AMOUNT_KEYS)
+    if len(income_values) > 1 or len(expense_values) > 1 or len(generic_values) > 1:
+        return None
+    income_nonblank = bool(income_values)
+    expense_nonblank = bool(expense_values)
+
+    if income_nonblank or expense_nonblank:
+        if income_nonblank == expense_nonblank or generic_values:
+            return None
+        split_direction = "income" if income_nonblank else "expense"
+        source_amount_raw = income_values[0] if income_nonblank else expense_values[0]
+    else:
+        split_direction = None
+        if len(generic_values) != 1:
+            return None
+        source_amount_raw = generic_values[0]
+
+    canonical_amount_raw = canonical_raw.get("amount")
+    if (
+        isinstance(canonical_amount_raw, (bool, list, tuple, dict))
+        or canonical_amount_raw in (None, "")
+    ):
+        return None
+    source_text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", source_amount_raw)).strip()
+    canonical_text = re.sub(
+        r"\s+",
+        "",
+        unicodedata.normalize("NFKC", str(canonical_amount_raw)),
+    ).strip()
+    if source_text != canonical_text:
+        return None
+    source_match = _STRICT_SOURCE_MONEY_RE.fullmatch(source_text)
+    canonical_match = _STRICT_SOURCE_MONEY_RE.fullmatch(canonical_text)
+    if source_match is None or canonical_match is None:
+        return None
+    try:
+        source_amount = Decimal(source_match.group("amount").replace(",", ""))
+        canonical_amount = Decimal(canonical_match.group("amount").replace(",", ""))
+    except InvalidOperation:
+        return None
+    if source_amount != canonical_amount:
+        return None
+    if abs(abs(source_amount) - normalized_amount) > Decimal("0.005"):
+        return None
+    return float(source_amount), split_direction
+
+
+def source_provenanced_signed_amount(
+    raw_txn: dict[str, Any],
+    normalized: dict[str, Any],
+    canonical_raw: dict[str, Any],
+) -> float | None:
+    """Return an exact source/canonical signed amount, without inferring its side."""
+    fact = _source_provenanced_signed_amount(raw_txn, normalized, canonical_raw)
+    return fact[0] if fact is not None else None
+
+
+def source_owned_signed_directional_amount(
+    raw_txn: dict[str, Any],
+    normalized: dict[str, Any],
+    canonical_raw: dict[str, Any],
+) -> tuple[str, float] | None:
+    """Return a signed reversal fact only with independently owned direction."""
+    amount_fact = _source_provenanced_signed_amount(raw_txn, normalized, canonical_raw)
+    if amount_fact is None:
+        return None
+    signed_amount, split_direction = amount_fact
+
+    normalized_direction = str(normalized.get("direction") or "").strip()
+    if normalized_direction not in {"income", "expense"}:
+        return None
+    explicit_direction_value = _explicit_direction_source_value(raw_txn)
+    explicit_direction = ""
+    if explicit_direction_value:
+        if not _is_bounded_direction_label(explicit_direction_value):
+            return None
+        explicit_direction = _normalize_direction_text(explicit_direction_value)
+        if explicit_direction not in {"income", "expense"}:
+            return None
+
+    source_direction = split_direction or explicit_direction
+    if not source_direction or source_direction != normalized_direction:
+        return None
+    if split_direction and explicit_direction and split_direction != explicit_direction:
+        return None
+
+    canonical_direction_raw = str(canonical_raw.get("direction") or "").strip()
+    if canonical_direction_raw:
+        canonical_direction = (
+            canonical_direction_raw
+            if canonical_direction_raw in {"income", "expense"}
+            else _normalize_direction_text(canonical_direction_raw)
+        )
+        if canonical_direction != source_direction:
+            return None
+    return source_direction, signed_amount
 
 
 def _clean_wrapped_text(value: str) -> str:

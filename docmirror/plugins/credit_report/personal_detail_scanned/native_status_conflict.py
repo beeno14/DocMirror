@@ -13,10 +13,12 @@ module never promotes the native token or mutates ``ParseResult``.
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from collections.abc import Iterable, Mapping
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 from typing import Any
+from types import SimpleNamespace
 
 _CANONICAL_PBOC_STATUSES = frozenset(
     {
@@ -51,6 +53,14 @@ _OWNED_MONTH_GEOMETRIES = frozenset(
 _TOP_LEFT_PDF_COORDINATES = "pdf_points_top_left"
 _YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
 _DECIMAL_RE = re.compile(r"[+-]?(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d+)?")
+
+# This is an OCR-reading confidence threshold, not a table/geometry score.
+# It matches the existing independent-page candidate acceptance threshold:
+# an observation too weak to repair a field must not silently become a final
+# status merely because its glyph happens to be in the legal vocabulary.
+MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM = 0.72
+_MONTHLY_SLOT_SOURCE = "sealed_native_monthly_field_slot"
+_MONTHLY_SLOT_SCHEMA = "sealed_monthly_field_slot_v1"
 
 
 def _owned_geometry_provenance(value: Any) -> str | None:
@@ -278,19 +288,109 @@ def _rows(table: Any) -> list[Any]:
     return list(rows) if isinstance(rows, (list, tuple)) else []
 
 
-def _row_cell_map(row: Any) -> dict[int, Any] | None:
-    cells = _get(row, "cells")
-    if not isinstance(cells, (list, tuple)):
+def _owned_cell_index(value: Any) -> int | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         return None
-    result: dict[int, Any] = {}
-    for fallback_index, cell in enumerate(cells):
-        column = _integer(_get(cell, "col_index"))
-        if column is None:
-            column = fallback_index
-        if column in result:
-            return None
-        result[column] = cell
-    return result
+    return value
+
+
+def _typed_cells_by_raw_geometry_row(
+    table: Any,
+    *,
+    coordinate_page: int,
+) -> dict[int, dict[int, Any]] | None:
+    """Map raw lattice rows to typed cells only through exact source ownership.
+
+    ``TableBlock.rows`` contains typed rows.  When ``preserve_headers`` is true,
+    its first typed row owns raw lattice row 1 rather than row 0, so a raw
+    geometry index must never be used as a typed-container index.  The cell's
+    single ``source_cell_refs`` entry is the only admissible bridge.  ``page``
+    names the canonical coordinate page; the physical source-page origin is a
+    separate property of the page and does not participate in this row map.
+    """
+
+    if (
+        not isinstance(coordinate_page, int)
+        or isinstance(coordinate_page, bool)
+        or coordinate_page <= 0
+    ):
+        return None
+    table_id = str(_get(table, "table_id") or _get(table, "id") or "").strip()
+    rows = _rows(table)
+    if not table_id or not rows:
+        return None
+
+    # Empty typed rows make no ownership claim.  Invalid or competing owners
+    # affect only the raw rows they claim; an unrelated empty/damaged row must
+    # not disable an otherwise exact native witness elsewhere in the table.
+    owners_by_raw_row: dict[int, list[dict[int, Any] | None]] = {}
+    for row in rows:
+        cells = _get(row, "cells")
+        if not isinstance(cells, (list, tuple)) or not cells:
+            continue
+        row_raw_indices: set[int] = set()
+        row_typed_indices: set[int] = set()
+        owned_cells: dict[int, Any] = {}
+        valid_owner = True
+        for cell in cells:
+            typed_row = _owned_cell_index(_get(cell, "row_index"))
+            column = _owned_cell_index(_get(cell, "col_index"))
+            refs = _get(cell, "source_cell_refs")
+            if typed_row is not None:
+                row_typed_indices.add(typed_row)
+            if isinstance(refs, (list, tuple)):
+                # Keep even malformed claims local to their declared raw row.
+                # In particular, a duplicate ref must not disappear and leave
+                # another owner looking unique.
+                for candidate_ref in refs:
+                    if isinstance(candidate_ref, Mapping):
+                        claimed_row = _owned_cell_index(candidate_ref.get("raw_row"))
+                        if claimed_row is not None:
+                            row_raw_indices.add(claimed_row)
+            if (
+                typed_row is None
+                or column is None
+                or not isinstance(refs, (list, tuple))
+                or len(refs) != 1
+            ):
+                valid_owner = False
+                continue
+            [ref] = refs
+            if not isinstance(ref, Mapping):
+                valid_owner = False
+                continue
+            ref_row = _owned_cell_index(ref.get("row"))
+            raw_row = _owned_cell_index(ref.get("raw_row"))
+            ref_column = _owned_cell_index(ref.get("col"))
+            ref_page = _owned_cell_index(ref.get("page"))
+            if not (
+                str(ref.get("table_id") or "").strip() == table_id
+                and ref_row == typed_row
+                and raw_row is not None
+                and ref_column == column
+                and ref_page == coordinate_page
+            ):
+                valid_owner = False
+                continue
+            if column in owned_cells:
+                valid_owner = False
+            owned_cells[column] = cell
+        if len(row_raw_indices) != 1 or len(row_typed_indices) != 1:
+            valid_owner = False
+        for raw_row in row_raw_indices:
+            owners_by_raw_row.setdefault(raw_row, []).append(
+                owned_cells if valid_owner else None
+            )
+    # Two typed containers claiming one raw row are ambiguous even when their
+    # columns do not overlap.  Required rows absent from this index fail closed
+    # at the candidate lookup; there is no typed-position fallback.
+    cells_by_raw_row: dict[int, dict[int, Any]] = {}
+    for raw_row, owners in owners_by_raw_row.items():
+        if len(owners) == 1:
+            row_owner = owners[0]
+            if row_owner is not None:
+                cells_by_raw_row[raw_row] = row_owner
+    return cells_by_raw_row
 
 
 def _exact_cell(cell: Any, *, require_single_token: bool = False) -> bool:
@@ -342,7 +442,7 @@ def _year_cell_proves_row(cell: Any, expected_year: int) -> bool:
 
 
 def _year_anchor_proves_pair(
-    rows: list[Any],
+    cells_by_raw_row: Mapping[int, Mapping[int, Any]],
     *,
     status_row: int,
     amount_row: int,
@@ -351,29 +451,27 @@ def _year_anchor_proves_pair(
     """Bind one typed year anchor to a headerless continuation row pair."""
 
     matches: list[tuple[int, Any]] = []
-    for row_position in range(0, min(status_row, len(rows) - 1) + 1):
-        cells = _row_cell_map(rows[row_position])
-        cell = cells.get(0) if cells else None
+    for raw_row in sorted(cells_by_raw_row):
+        if raw_row > status_row:
+            continue
+        cells = cells_by_raw_row[raw_row]
+        cell = cells.get(0)
         if cell is None:
             continue
-        explicit_row = _integer(_get(cell, "row_index"))
-        explicit_col = _integer(_get(cell, "col_index"))
         row_span = _integer(_get(cell, "row_span", 1)) or 1
         col_span = _integer(_get(cell, "col_span", 1)) or 1
         years = _YEAR_RE.findall(str(_get(cell, "text") or ""))
         if not (
             _exact_cell(cell, require_single_token=True)
-            and (explicit_row is None or explicit_row == row_position)
-            and (explicit_col is None or explicit_col == 0)
+            and _owned_cell_index(_get(cell, "col_index")) == 0
             and col_span == 1
             and row_span >= 2
-            and row_position <= status_row
-            and row_position + row_span - 1 >= amount_row
+            and raw_row + row_span - 1 >= amount_row
             and len(years) == 1
             and int(years[0]) == expected_year
         ):
             continue
-        matches.append((row_position, cell))
+        matches.append((raw_row, cell))
     return matches[0] if len(matches) == 1 else None
 
 
@@ -648,18 +746,21 @@ def _base_provenance_bound_native_candidate(
         resolve_unique_source_table_year_plus_twelve_ownership,
     )
 
-    rows = _rows(table)
-    if not (
-        0 <= header_row < len(rows)
-        and 0 <= status_row < len(rows)
-        and 0 <= amount_row < len(rows)
-        and header_row + 1 == status_row
+    coordinate_page = _page_number(page, "page_number", "logical_page")
+    if coordinate_page is None or coordinate_page != logical_page:
+        return None
+    cells_by_raw_row = _typed_cells_by_raw_geometry_row(
+        table,
+        coordinate_page=coordinate_page,
+    )
+    if cells_by_raw_row is None or not (
+        header_row + 1 == status_row
         and status_row + 1 == amount_row
     ):
         return None
-    header_cells = _row_cell_map(rows[header_row])
-    status_cells = _row_cell_map(rows[status_row])
-    amount_cells = _row_cell_map(rows[amount_row])
+    header_cells = cells_by_raw_row.get(header_row)
+    status_cells = cells_by_raw_row.get(status_row)
+    amount_cells = cells_by_raw_row.get(amount_row)
     if not (
         header_cells
         and status_cells
@@ -680,8 +781,7 @@ def _base_provenance_bound_native_candidate(
         )
         if not (
             _exact_cell(header_cell)
-            and _integer(_get(header_cell, "row_index")) == header_row
-            and _integer(_get(header_cell, "col_index")) == month
+            and _owned_cell_index(_get(header_cell, "col_index")) == month
             and raw_header_box is not None
             and logical_header_box is not None
             and _overlap_is_same_cell(raw_header_box, logical_header_box)
@@ -690,8 +790,7 @@ def _base_provenance_bound_native_candidate(
             return None
     year_cell = status_cells[0]
     if not (
-        _integer(_get(year_cell, "row_index")) == status_row
-        and _integer(_get(year_cell, "col_index")) == 0
+        _owned_cell_index(_get(year_cell, "col_index")) == 0
         and _nonempty_equal_token_evidence(year_cell)
     ):
         return None
@@ -740,10 +839,8 @@ def _base_provenance_bound_native_candidate(
         and _overlap_is_same_cell(raw_amount_box, native_amount_box)
         and _overlap_is_same_cell(native_box, final_box)
         and _amount_overlap_is_same_cell(native_amount_box, final_amount_box)
-        and _integer(_get(status_cell, "row_index")) == status_row
-        and _integer(_get(status_cell, "col_index")) == expected_month
-        and _integer(_get(amount_cell, "row_index")) == amount_row
-        and _integer(_get(amount_cell, "col_index")) == expected_month
+        and _owned_cell_index(_get(status_cell, "col_index")) == expected_month
+        and _owned_cell_index(_get(amount_cell, "col_index")) == expected_month
     ):
         return None
     return (
@@ -790,13 +887,19 @@ def _provenance_bound_native_candidate(
         resolve_unique_source_table_year_plus_twelve_ownership,
     )
 
-    rows = _rows(table)
-    if not (0 <= status_row < len(rows) and 0 <= amount_row < len(rows)):
+    coordinate_page = _page_number(page, "page_number", "logical_page")
+    if coordinate_page is None or coordinate_page != logical_page:
         return None
-    status_cells = _row_cell_map(rows[status_row])
-    amount_cells = _row_cell_map(rows[amount_row])
+    cells_by_raw_row = _typed_cells_by_raw_geometry_row(
+        table,
+        coordinate_page=coordinate_page,
+    )
+    if cells_by_raw_row is None:
+        return None
+    status_cells = cells_by_raw_row.get(status_row)
+    amount_cells = cells_by_raw_row.get(amount_row)
     year_anchor = _year_anchor_proves_pair(
-        rows,
+        cells_by_raw_row,
         status_row=status_row,
         amount_row=amount_row,
         expected_year=expected_year,
@@ -845,8 +948,6 @@ def _provenance_bound_native_candidate(
     native_amount_box = lattice.amount_bboxes[expected_month - 1]
     raw_status_box = _bbox(_get(status_cell, "bbox"))
     raw_amount_box = _bbox(_get(amount_cell, "bbox"))
-    explicit_status_row = _integer(_get(status_cell, "row_index"))
-    explicit_amount_row = _integer(_get(amount_cell, "row_index"))
     if not (
         token is not None
         and _exact_cell(status_cell, require_single_token=True)
@@ -858,8 +959,8 @@ def _provenance_bound_native_candidate(
         and _overlap_is_same_cell(raw_amount_box, native_amount_box)
         and _overlap_is_same_cell(native_box, final_box)
         and _amount_overlap_is_same_cell(native_amount_box, final_amount_box)
-        and (explicit_status_row is None or explicit_status_row == status_row)
-        and (explicit_amount_row is None or explicit_amount_row == amount_row)
+        and _owned_cell_index(_get(status_cell, "col_index")) == expected_month
+        and _owned_cell_index(_get(amount_cell, "col_index")) == expected_month
     ):
         return None
     return (
@@ -923,6 +1024,9 @@ def _native_candidates(
         return []
     candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     for page in _candidate_pages(context, final_ref):
+        coordinate_page = _page_number(page, "page_number", "logical_page")
+        if coordinate_page is None or coordinate_page != logical_page:
+            continue
         tables = _get(page, "tables")
         if not isinstance(tables, (list, tuple)):
             continue
@@ -983,11 +1087,17 @@ def _native_candidates(
                 # Base-page source ownership is equally binding: malformed or
                 # ambiguous raw evidence may not trigger the generic scan.
                 continue
-            rows = _rows(table)
-            for row_position in range(1, len(rows) - 1):
-                header_cells = _row_cell_map(rows[row_position - 1])
-                status_cells = _row_cell_map(rows[row_position])
-                amount_cells = _row_cell_map(rows[row_position + 1])
+            cells_by_raw_row = _typed_cells_by_raw_geometry_row(
+                table,
+                coordinate_page=coordinate_page,
+            )
+            raw_cell_bboxes = table_geometry[0].get("cell_bboxes")
+            if cells_by_raw_row is None or not isinstance(raw_cell_bboxes, (list, tuple)):
+                continue
+            for row_position in range(1, len(raw_cell_bboxes) - 1):
+                header_cells = cells_by_raw_row.get(row_position - 1)
+                status_cells = cells_by_raw_row.get(row_position)
+                amount_cells = cells_by_raw_row.get(row_position + 1)
                 if not header_cells or not status_cells or not amount_cells:
                     continue
                 if not (
@@ -1029,8 +1139,6 @@ def _native_candidates(
                 native_amount_box = lattice.amount_bboxes[expected_month - 1]
                 raw_status_box = _bbox(_get(status_cell, "bbox"))
                 raw_amount_box = _bbox(_get(amount_cell, "bbox"))
-                explicit_status_row = _integer(_get(status_cell, "row_index"))
-                explicit_amount_row = _integer(_get(amount_cell, "row_index"))
                 if not (
                     token is not None
                     and _exact_cell(status_cell, require_single_token=True)
@@ -1046,18 +1154,17 @@ def _native_candidates(
                         native_amount_box,
                         final_amount_box,
                     )
-                    and (explicit_status_row is None or explicit_status_row == row_position)
-                    and (explicit_amount_row is None or explicit_amount_row == row_position + 1)
+                    and _owned_cell_index(_get(status_cell, "col_index")) == expected_month
+                    and _owned_cell_index(_get(amount_cell, "col_index")) == expected_month
                 ):
                     continue
-                row_index = explicit_status_row if explicit_status_row is not None else row_position
                 candidates.append(
                     (
                         token,
                         _native_source_ref(
                             page=page,
                             table=table,
-                            row_index=row_index,
+                            row_index=row_position,
                             column=expected_month,
                             cell=status_cell,
                             logical_bbox=native_box,
@@ -1066,7 +1173,7 @@ def _native_candidates(
                         _native_source_ref(
                             page=page,
                             table=table,
-                            row_index=(explicit_amount_row if explicit_amount_row is not None else row_position + 1),
+                            row_index=row_position + 1,
                             column=expected_month,
                             cell=amount_cell,
                             logical_bbox=native_amount_box,
@@ -1075,6 +1182,585 @@ def _native_candidates(
                     )
                 )
     return candidates
+
+
+class _MonthlySourceEvidence:
+    """Read-only indexes over one sealed acquisition, shared by a repair pass.
+
+    The exact resolver still decides admissibility. The index only narrows its
+    input to *all* atoms claiming the requested IDs, including malformed and
+    non-token claims, so indexing cannot hide duplicates or a competing owner.
+    """
+
+    def __init__(self, parse_result: Any) -> None:
+        from docmirror.plugins.credit_report.source_table_month_lattice import (
+            detached_source_table_geometry_by_page,
+        )
+
+        self.parse_result = parse_result
+        self.geometry = detached_source_table_geometry_by_page(parse_result)
+        self.tables: dict[tuple[int, str], list[tuple[Any, Any]]] = {}
+        for page in _get(parse_result, "pages", ()) or ():
+            logical = _owned_cell_index(_get(page, "page_number"))
+            if logical is None or logical <= 0:
+                continue
+            for table in _get(page, "tables", ()) or ():
+                table_id = str(_get(table, "table_id") or _get(table, "id") or "")
+                self.tables.setdefault((logical, table_id), []).append((page, table))
+        self.atoms: dict[str, list[Any]] = {}
+        plane = _get(parse_result, "evidence_plane")
+        evidence = _get(plane, "evidence")
+        for atom in _get(evidence, "text_atoms", ()) or ():
+            claims = {str(_get(atom, "id") or "")}
+            refs = _get(atom, "source_refs", ())
+            if isinstance(refs, Mapping):
+                refs = refs.keys()
+            elif isinstance(refs, str):
+                refs = (refs,)
+            elif not isinstance(refs, (list, tuple)):
+                refs = ()
+            claims.update(ref for ref in refs if isinstance(ref, str))
+            for claim in claims - {""}:
+                self.atoms.setdefault(claim, []).append(atom)
+        self.bundle_tokens: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        domain = _get(_get(parse_result, "entities"), "domain_specific")
+        bundles = domain.get("_page_evidence_bundles", ()) if isinstance(domain, Mapping) else ()
+        observations: dict[str, list[tuple[tuple[int, str], int, dict[str, Any]]]] = {}
+        for bundle_index, bundle in enumerate(bundles or ()):
+            if not isinstance(bundle, Mapping):
+                continue
+            page = bundle.get("page")
+            if _owned_cell_index(page) is None or page <= 0:
+                continue
+            for pool_name, pool in (("tokens", bundle), *(
+                (name, bundle.get(name)) for name in ("local_structure_evidence", "micro_grid_evidence")
+            )):
+                if not isinstance(pool, Mapping) or pool.get("page", page) != page:
+                    continue
+                for token in pool.get("tokens", ()) or ():
+                    if not isinstance(token, Mapping) or not isinstance(token.get("token_id"), str):
+                        continue
+                    source = str(token.get("source") or "").lower()
+                    if any(part in source for part in ("semantic", "synthetic", "expanded", "table_cell", "line_projection")):
+                        continue
+                    observations.setdefault(token["token_id"], []).append(((bundle_index, pool_name), page, dict(token)))
+        for token_id, claims in observations.items():
+            # The same immutable token is often serialized in both producer
+            # views. Collapse only identical cross-view aliases; repetitions
+            # within one view and conflicting text/score/geometry remain
+            # duplicate claims and therefore fail the exact resolver.
+            signatures = {
+                repr((page, sorted(token.items(), key=lambda item: str(item[0]))))
+                for _pool, page, token in claims
+            }
+            pools = [pool for pool, _page, _token in claims]
+            kept = claims[:1] if len(signatures) == 1 and len(set(pools)) == len(pools) else claims
+            self.bundle_tokens[token_id] = [(page, token) for _pool, page, token in kept]
+        self.token_cache: dict[tuple[int, tuple[str, ...]], Any] = {}
+        self.row_cache: dict[tuple[int, str], Any] = {}
+        self.witness_cache: dict[tuple[Any, ...], Any] = {}
+
+    @staticmethod
+    def ids(value: Any, *, allow_empty: bool = False) -> tuple[str, ...] | None:
+        if not isinstance(value, (list, tuple)) or (not value and not allow_empty):
+            return None
+        if any(not isinstance(item, str) or not item or item != item.strip() for item in value):
+            return None
+        return tuple(value) if len(set(value)) == len(value) else None
+
+    def tokens(self, logical_page: int, ids: tuple[str, ...]) -> Any:
+        from docmirror.plugins.credit_report.personal_detail_scanned.exact_evidence import (
+            resolve_exact_page_token_atoms,
+        )
+
+        key = (logical_page, ids)
+        if key not in self.token_cache:
+            if any(len(self.bundle_tokens.get(token_id, ())) > 1 for token_id in ids):
+                # The evidence builder may coalesce visually identical OCR
+                # payloads. It cannot erase conflicting immutable ID/score
+                # claims that remain in the original producer views.
+                self.token_cache[key] = None
+                return None
+            atoms: list[Any] = []
+            seen: set[int] = set()
+            for token_id in ids:
+                for atom in self.atoms.get(token_id, ()):
+                    if id(atom) not in seen:
+                        seen.add(id(atom))
+                        atoms.append(atom)
+            view = SimpleNamespace(
+                evidence_plane=SimpleNamespace(evidence=SimpleNamespace(text_atoms=atoms)),
+                entities=SimpleNamespace(domain_specific={
+                    "_page_evidence_bundles": [
+                        {"page": page, "tokens": [token]}
+                        for token_id in ids for page, token in self.bundle_tokens.get(token_id, ())
+                    ],
+                }),
+            )
+            self.token_cache[key] = resolve_exact_page_token_atoms(
+                view, ids, logical_page=logical_page, require_raw_tokens=True,
+            )
+        return self.token_cache[key]
+
+    def confidence(self, logical_page: int, token: tuple[Any, ...]) -> float | None:
+        text, box, token_id = token
+        observations: list[Any] = []
+        for atom in self.atoms.get(token_id, ()):
+            source_kind = str(_get(atom, "source_kind") or "").lower()
+            metadata = _get(atom, "metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            raw_kind = source_kind == "metadata_ocr_token" or (
+                metadata.get("granularity") == "token"
+                and ("ocr" in source_kind or source_kind in {
+                    "metadata", "micro_grid_evidence_token", "local_structure_evidence_token",
+                })
+                and not any(part in source_kind for part in ("table", "cell", "line", "semantic"))
+            )
+            if raw_kind and _get(atom, "page_id") == f"page:{logical_page:04d}":
+                observations.append(atom)
+        if not observations:
+            observations.extend(token for page, token in self.bundle_tokens.get(token_id, ()) if page == logical_page)
+        if len(observations) != 1:
+            return None
+        observation = observations[0]
+        if (
+            str(_get(observation, "text") or _get(observation, "content") or "").strip() != text
+            or _bbox(_get(observation, "bbox")) != box
+        ):
+            return None
+        score = _get(observation, "confidence")
+        if not isinstance(score, (int, float)) or isinstance(score, bool):
+            return None
+        return float(score) if isfinite(score) and 0.0 <= score <= 1.0 else None
+
+
+def _slot_contains(outer: tuple[float, ...], inner: tuple[float, ...]) -> bool:
+    # A one-point allowance covers rounded PDF coordinates, not neighbouring
+    # month cells or vertically merged observations.
+    return bool(
+        outer[0] - 1.0 <= inner[0] < inner[2] <= outer[2] + 1.0
+        and outer[1] - 1.0 <= inner[1] < inner[3] <= outer[3] + 1.0
+    )
+
+
+def _monthly_raw_cell_tokens(
+    evidence: _MonthlySourceEvidence, cell: Any, *, logical_page: int,
+) -> tuple[tuple[Any, ...], ...] | None:
+    ids = evidence.ids(_get(cell, "evidence_ids"), allow_empty=True)
+    token_ids = evidence.ids(_get(cell, "token_ids"), allow_empty=True)
+    if ids is None or token_ids is None or set(ids) != set(token_ids):
+        return None
+    if not ids:
+        return ()
+    box = _bbox(_get(cell, "bbox"))
+    tokens = evidence.tokens(logical_page, ids)
+    if box is None or tokens is None or any(not _slot_contains(box, token[1]) for token in tokens):
+        return None
+    return tokens
+
+
+def _monthly_header_rows(table: Any, rows: Mapping[int, Any], geometry: Mapping[str, Any]) -> dict[int, Any]:
+    """Retain the assembler's raw header owner when it is not a typed row.
+
+    ``preserve_headers`` moves raw row zero into ``TableBlock.headers``. Its
+    token IDs remain in the sealed geometry matrices; they are not replaced by
+    IDs synthesized from header text or typed-container positions.
+    """
+
+    result = dict(rows)
+    metadata = _get(table, "metadata")
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    headers = _get(table, "headers")
+    if 0 in rows or metadata.get("preserve_headers", True) is not True or not isinstance(headers, (list, tuple)) or len(headers) != 13:
+        return result
+    # An invalid/duplicate typed claim must not be laundered through fallback.
+    if any(
+        isinstance(ref, Mapping) and ref.get("raw_row") == 0
+        for row in _rows(table) for cell in _get(row, "cells", ()) or ()
+        for ref in _get(cell, "source_cell_refs", ()) or ()
+    ):
+        return result
+    raw_geometry = metadata.get("geometry")
+    raw_geometry = raw_geometry if isinstance(raw_geometry, Mapping) else metadata
+    cells: dict[int, dict[str, Any]] = {}
+    # The twelve ordinal cells establish the header. Column zero may be an
+    # unused blank label; retain it only when exact so a year anchored there
+    # still has to pass the separate, unchanged year-owner proof.
+    for col in (*range(1, 13), 0):
+        box = _bbox(_matrix_get(raw_geometry.get("cell_bboxes"), 0, col))
+        if (
+            box is None or box != _bbox(_matrix_get(geometry.get("cell_bboxes"), 0, col))
+            or _matrix_get(raw_geometry.get("cell_geometry_status"), 0, col) != "exact"
+        ):
+            if col == 0:
+                continue
+            return result
+        spans = [
+            span for span in raw_geometry.get("cell_spans", ()) or ()
+            if isinstance(span, Mapping) and span.get("row") == 0 and span.get("col") == col
+        ]
+        if len(spans) > 1 or any(
+            _owned_cell_index(span.get("row_span", 1)) is None or span.get("row_span", 1) < 1
+            or (col != 0 and span.get("row_span", 1) != 1) or span.get("col_span", 1) != 1
+            for span in spans
+        ):
+            if col == 0:
+                continue
+            return result
+        cells[col] = {
+            "bbox": box, "geometry_status": "exact", "row_span": spans[0].get("row_span", 1) if spans else 1, "col_span": 1,
+            "evidence_ids": _matrix_get(raw_geometry.get("cell_evidence_ids"), 0, col),
+            "token_ids": _matrix_get(raw_geometry.get("cell_token_ids"), 0, col),
+        }
+    result[0] = cells
+    return result
+
+
+def _monthly_raw_pair(
+    evidence: _MonthlySourceEvidence,
+    *, logical_page: int, table_id: str, year: int, month: int,
+    year_row: int, status_row: int, amount_row: int,
+) -> dict[str, Any] | None:
+    """Authenticate a physical row pair without trusting a published value."""
+
+    from docmirror.plugins.credit_report.source_table_month_lattice import (
+        resolve_unique_source_table_year_plus_twelve_ownership,
+    )
+
+    cache_key = (logical_page, table_id, year, month, year_row, status_row, amount_row)
+    if cache_key in evidence.witness_cache:
+        return evidence.witness_cache[cache_key]
+    evidence.witness_cache[cache_key] = None
+    owners = evidence.tables.get((logical_page, table_id), ())
+    geometries = [
+        table for table in evidence.geometry.get(logical_page, ())
+        if table.get("table_id") == table_id
+    ]
+    if len(owners) != 1 or len(geometries) != 1 or amount_row != status_row + 1:
+        return None
+    page, table = owners[0]
+    source_page = _owned_cell_index(_get(page, "source_page_number"))
+    if source_page is None or source_page <= 0:
+        return None
+    geometry = geometries[0]
+    if (
+        geometry.get("source_logical_page") != logical_page or geometry.get("canonical_geometry_registered")
+        or geometry.get("source_page") != source_page
+    ):
+        return None
+    row_key = (logical_page, table_id)
+    if row_key not in evidence.row_cache:
+        evidence.row_cache[row_key] = _typed_cells_by_raw_geometry_row(table, coordinate_page=logical_page)
+    rows = evidence.row_cache[row_key]
+    if not isinstance(rows, Mapping):
+        return None
+    rows = _monthly_header_rows(table, rows, geometry)
+    year_cell = rows.get(year_row, {}).get(0)
+    if not _exact_cell(year_cell):
+        return None
+    year_tokens = _monthly_raw_cell_tokens(evidence, year_cell, logical_page=logical_page)
+    year_text = " ".join(token[0] for token in year_tokens or ())
+    years = _YEAR_RE.findall(year_text)
+    if year_tokens is None or len(years) != 1 or int(years[0]) != year:
+        return None
+    year_box = _bbox(_get(year_cell, "bbox"))
+    if year_box is None or _bbox(_matrix_get(geometry.get("cell_bboxes"), year_row, 0)) != year_box:
+        return None
+    bands = [band for band in geometry.get("row_bands", ()) or () if isinstance(band, Mapping) and band.get("index") == status_row]
+    columns = [band for band in geometry.get("col_bands", ()) or () if isinstance(band, Mapping)]
+    column_bands = {band.get("index"): band for band in columns}
+    if len(bands) != 1 or len(columns) != 13 or set(column_bands) != set(range(13)):
+        # Effective split-column layouts are not silently treated as raw
+        # thirteen-column tables. They retain their explicit uncertainty.
+        return None
+    try:
+        status_box = tuple(float(value) for value in (
+            column_bands[1]["x0"], bands[0]["y0"], column_bands[12]["x1"], bands[0]["y1"],
+        ))
+    except (KeyError, TypeError, ValueError):
+        return None
+    lattice = resolve_unique_source_table_year_plus_twelve_ownership(
+        geometries, logical_page=logical_page, expected_year=year,
+        active_months=(month,), year_bbox=year_box, status_bbox=status_box,
+    )
+    if (
+        lattice is None or lattice.status_row_index != status_row
+        or lattice.amount_row_index != amount_row or lattice.year_anchor_row_index != year_row
+    ):
+        return None
+    header_candidates: list[tuple[int, tuple[str, ...]]] = []
+    for raw_row, cells in rows.items():
+        if raw_row >= status_row or not set(range(1, 13)).issubset(cells):
+            continue
+        matched: list[str] = []
+        matched_columns = 0
+        contradiction = False
+        for ordinal in range(1, 13):
+            cell = cells[ordinal]
+            if (
+                not _exact_cell(cell) or _integer(_get(cell, "row_span", 1)) != 1
+                or _bbox(_matrix_get(geometry.get("cell_bboxes"), raw_row, ordinal)) != _bbox(_get(cell, "bbox"))
+            ):
+                continue
+            tokens = _monthly_raw_cell_tokens(evidence, cell, logical_page=logical_page)
+            text = "".join(token[0] for token in tokens or ()).strip()
+            if not re.fullmatch(r"0?\d{1,2}", text):
+                continue
+            if 1 <= int(text) <= 12 and int(text) != ordinal:
+                contradiction = True
+            if int(text) == ordinal and tokens:
+                matched_columns += 1
+                matched.extend(token[2] for token in tokens)
+        if not contradiction and matched_columns >= 9 and len(set(matched)) == len(matched):
+            header_candidates.append((raw_row, tuple(matched)))
+    if not header_candidates:
+        return None
+    header_row, header_ids = max(header_candidates, key=lambda item: item[0])
+    result: dict[str, Any] = {
+        "logical_page": logical_page, "source_page": source_page, "table_id": table_id,
+        "year": year, "month": month, "year_row": year_row,
+        "status_row": status_row, "amount_row": amount_row,
+        "header_row": header_row, "year_evidence_ids": tuple(token[2] for token in year_tokens),
+        "header_evidence_ids": header_ids, "lattice_provenance": lattice.provenance_dict(), "fields": {},
+    }
+    for field_name, raw_row, slot in (
+        ("status", status_row, lattice.month_bboxes[month - 1]),
+        ("overdue_amount", amount_row, lattice.amount_bboxes[month - 1]),
+    ):
+        cell = rows.get(raw_row, {}).get(month)
+        if cell is None or not _exact_cell(cell):
+            continue
+        tokens = _monthly_raw_cell_tokens(evidence, cell, logical_page=logical_page)
+        if tokens is None:
+            continue
+        contained = tuple(token for token in tokens if _slot_contains(slot, token[1]))
+        ambiguous = any(
+            min(slot[2], token[1][2]) > max(slot[0], token[1][0])
+            and min(slot[3], token[1][3]) > max(slot[1], token[1][1])
+            and token not in contained for token in tokens
+        )
+        if ambiguous:
+            continue
+        scores = [evidence.confidence(logical_page, token) for token in contained]
+        result["fields"][field_name] = {
+            "bbox": tuple(slot), "evidence_ids": tuple(token[2] for token in contained),
+            "parent_evidence_ids": tuple(token[2] for token in tokens),
+            "raw_value": " ".join(token[0] for token in sorted(contained, key=lambda item: (item[1][1], item[1][0]))),
+            "confidence": min(scores) if scores and all(score is not None for score in scores) else None,
+        }
+    evidence.witness_cache[cache_key] = result
+    return result
+
+
+def monthly_field_slot_identity(ref: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Identify a narrow monthly slot; authentication is a separate operation."""
+
+    proof = ref.get("monthly_slot_proof")
+    if ref.get("source") != _MONTHLY_SLOT_SOURCE or not isinstance(proof, Mapping) or proof.get("schema") != _MONTHLY_SLOT_SCHEMA:
+        return None
+    field_name = ref.get("field_name")
+    canonical_field = "status" if field_name in _STATUS_FIELDS else "overdue_amount" if field_name in _AMOUNT_FIELDS else ""
+    indices = [ref.get("logical_page"), ref.get("source_page"), proof.get("year"), proof.get("month"), proof.get("year_row"), proof.get("status_row"), proof.get("amount_row")]
+    if (
+        not canonical_field or any(_owned_cell_index(value) is None for value in indices)
+        or not isinstance(proof.get("account_id"), str) or not proof["account_id"].strip()
+        or indices[0] <= 0 or indices[1] <= 0 or not 1900 <= indices[2] <= 2099
+        or not 1 <= indices[3] <= 12 or indices[6] != indices[5] + 1
+        or _owned_cell_index(ref.get("column")) != indices[3]
+        or _owned_cell_index(ref.get("row")) != proof.get("status_row" if canonical_field == "status" else "amount_row")
+        or not isinstance(ref.get("table_id"), str) or not ref["table_id"]
+        or _bbox(ref.get("bbox")) is None or ref.get("geometry_scope") != "cell"
+        or ref.get("geometry_status") != "exact" or ref.get("coordinate_system") != _TOP_LEFT_PDF_COORDINATES
+        or _MonthlySourceEvidence.ids(ref.get("evidence_ids"), allow_empty=True) is None
+    ):
+        return None
+    return (_MONTHLY_SLOT_SCHEMA, *indices, ref["table_id"], canonical_field, _bbox(ref["bbox"]), proof["account_id"])
+
+
+def resolve_sealed_monthly_field_slot(
+    parse_result: Any, ref: Mapping[str, Any], *, evidence: _MonthlySourceEvidence | None = None,
+) -> dict[str, Any] | None:
+    """Re-prove a blank/populated slot against the actual sealed source table."""
+
+    if monthly_field_slot_identity(ref) is None:
+        return None
+    proof = ref["monthly_slot_proof"]
+    evidence = evidence or _MonthlySourceEvidence(parse_result)
+    pair = _monthly_raw_pair(
+        evidence, logical_page=ref["logical_page"], table_id=ref["table_id"],
+        year=proof["year"], month=proof["month"], year_row=proof["year_row"],
+        status_row=proof["status_row"], amount_row=proof["amount_row"],
+    )
+    canonical_field = "status" if ref["field_name"] in _STATUS_FIELDS else "overdue_amount"
+    field = pair.get("fields", {}).get(canonical_field) if pair is not None else None
+    if (
+        field is None or pair["source_page"] != ref["source_page"]
+        or field["bbox"] != _bbox(ref["bbox"])
+        or set(field["evidence_ids"]) != set(_MonthlySourceEvidence.ids(ref.get("evidence_ids"), allow_empty=True) or ())
+        or any(proof.get(key) != pair[key] for key in ("header_row",))
+        or any(tuple(proof.get(key) or ()) != pair[key] for key in ("year_evidence_ids", "header_evidence_ids"))
+        or tuple(proof.get("parent_evidence_ids") or ()) != field["parent_evidence_ids"]
+    ):
+        return None
+    return {**field, "source_page": pair["source_page"]}
+
+
+def authenticated_monthly_field_slots(
+    context: Any, record: Mapping[str, Any], *, evidence: _MonthlySourceEvidence | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Map a registered grid/month to independently proven raw source slots.
+
+    The transform comes from the canonical table object, never from a caller's
+    field ref. All repair selection subsequently happens in the raw origin
+    page, while the original registered locator remains available for audits.
+    """
+
+    parse_result = _get(context, "parse_result", context)
+    evidence = evidence or _MonthlySourceEvidence(parse_result)
+    year_month = _performance_year_month(record)
+    values = _values(record)
+    account_ids = {str(owner.get("account_id") or "").strip() for owner in (values, record)} - {""}
+    if year_month is None or len(account_ids) != 1:
+        return {}
+    year, month = year_month
+    pages = _get(context, "pages")
+    if not isinstance(pages, (list, tuple)):
+        pages = _get(parse_result, "pages", ())
+    found: dict[tuple[Any, ...], tuple[dict[str, Any], tuple[float, ...], int, dict[str, Any]]] = {}
+    for ref in _record_refs(record):
+        field_name = str(ref.get("field_name") or "")
+        if field_name not in (*_STATUS_FIELDS, *_AMOUNT_FIELDS) or ref.get("geometry_scope") != "cell":
+            continue
+        logical = _owned_cell_index(ref.get("logical_page") or ref.get("page"))
+        box = _bbox(ref.get("bbox"))
+        provenance = ref.get("geometry_provenance")
+        if (
+            logical is None or logical <= 0 or box is None or ref.get("col") != month
+            or ref.get("geometry_status") not in (None, "", "exact")
+            or ref.get("coordinate_system") != _TOP_LEFT_PDF_COORDINATES
+            or not isinstance(provenance, Mapping)
+            or _owned_geometry_provenance(provenance) not in _OWNED_MONTH_GEOMETRIES
+        ):
+            continue
+        status_row = _owned_cell_index(provenance.get("status_row_index"))
+        amount_row = _owned_cell_index(provenance.get("amount_row_index"))
+        year_row = _owned_cell_index(provenance.get("year_anchor_row_index"))
+        if status_row is None or amount_row is None or year_row is None:
+            continue
+        for page in pages or ():
+            if _get(page, "page_number") != logical:
+                continue
+            for table in _get(page, "tables", ()) or ():
+                table_id = str(_get(table, "table_id") or _get(table, "id") or "")
+                if table_id != provenance.get("table_id"):
+                    continue
+                metadata = _get(table, "metadata")
+                metadata = metadata if isinstance(metadata, Mapping) else {}
+                origin = metadata.get("source_logical_page", logical)
+                if _owned_cell_index(origin) is None or origin <= 0 or metadata.get("coordinate_logical_page", logical) != logical:
+                    continue
+                raw_affine = metadata.get("source_to_canonical_affine")
+                if raw_affine is None and origin == logical and not metadata.get("canonical_geometry"):
+                    affine = (1.0, 1.0, 0.0, 0.0)
+                elif isinstance(raw_affine, Mapping):
+                    try:
+                        affine = tuple(float(raw_affine[key]) for key in ("scale_x", "scale_y", "offset_x", "offset_y"))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                else:
+                    continue
+                if not all(isfinite(value) for value in affine) or affine[0] <= 0.0 or affine[1] <= 0.0:
+                    continue
+                pair = _monthly_raw_pair(
+                    evidence, logical_page=origin, table_id=table_id, year=year, month=month,
+                    year_row=year_row, status_row=status_row, amount_row=amount_row,
+                )
+                if pair is None or any(
+                    owner.get(key) is not None and owner.get(key) != expected
+                    for owner in (metadata, provenance, ref)
+                    for key, expected in (("source_page", pair["source_page"]), ("source_logical_page", origin))
+                ):
+                    continue
+                canonical_field = "status" if field_name in _STATUS_FIELDS else "overdue_amount"
+                physical = pair.get("fields", {}).get(canonical_field) if pair is not None else None
+                if physical is None:
+                    continue
+                sx, sy, ox, oy = affine
+                raw_box = physical["bbox"]
+                registered = (raw_box[0] * sx + ox, raw_box[1] * sy + oy, raw_box[2] * sx + ox, raw_box[3] * sy + oy)
+                matcher = _overlap_is_same_cell if canonical_field == "status" else _amount_overlap_is_same_cell
+                if not matcher(registered, box):
+                    continue
+                marker = (origin, table_id, year, month, year_row, status_row, amount_row, logical, affine)
+                entry = found.setdefault(marker, (pair, affine, logical, {}))
+                field_refs = entry[3].setdefault(canonical_field, {})
+                # Trimmed/full-box aliases have already independently passed
+                # same-cell overlap. They may share one detector row, but two
+                # different row owners must not be collapsed.
+                field_marker = _owned_cell_index(ref.get("row"))
+                field_refs.setdefault(field_marker, dict(ref))
+    if len(found) != 1:
+        return {}
+    pair, affine, registered_page, field_witnesses = next(iter(found.values()))
+    if any(len(witnesses) != 1 for witnesses in field_witnesses.values()):
+        return {}
+    fallback_ref = next(iter(next(iter(field_witnesses.values())).values()))
+    result: dict[str, dict[str, Any]] = {}
+    for canonical_field, field in pair["fields"].items():
+        witnesses = field_witnesses.get(canonical_field)
+        registered_ref = next(iter(witnesses.values())) if witnesses else fallback_ref
+        actual_field = next((name for name in (_STATUS_FIELDS if canonical_field == "status" else _AMOUNT_FIELDS) if name in values), canonical_field)
+        sx, sy, ox, oy = affine
+        box = field["bbox"]
+        proof = {
+            "schema": _MONTHLY_SLOT_SCHEMA,
+            "account_id": next(iter(account_ids)),
+            **{key: pair[key] for key in ("year", "month", "year_row", "status_row", "amount_row", "header_row")},
+            "year_evidence_ids": list(pair["year_evidence_ids"]),
+            "header_evidence_ids": list(pair["header_evidence_ids"]),
+            "parent_evidence_ids": list(field["parent_evidence_ids"]),
+        }
+        registered_box = [box[0] * sx + ox, box[1] * sy + oy, box[2] * sx + ox, box[3] * sy + oy]
+        registered_row = _owned_cell_index(registered_ref.get("row"))
+        if registered_row is None:
+            continue
+        registered_is_status = registered_ref.get("field_name") in _STATUS_FIELDS
+        relative_row = (0 if canonical_field == "status" else 1) - (0 if registered_is_status else 1)
+        if registered_row + relative_row < 0:
+            continue
+        registered_field_ref = {
+            **deepcopy(registered_ref), "field_name": actual_field,
+            "row": registered_row + relative_row, "col": month, "bbox": registered_box,
+            "geometry_scope": "cell", "geometry_status": "exact",
+            "geometry_provenance": {
+                **deepcopy(registered_ref.get("geometry_provenance") or {}),
+                **deepcopy(pair["lattice_provenance"]),
+                "selection_basis": "source_table_year_plus_twelve_ownership", "source": "source_table_geometry",
+                "table_id": pair["table_id"], "status_row_index": pair["status_row"], "amount_row_index": pair["amount_row"],
+                "year_anchor_row_index": pair["year_row"], "coordinate_system": _TOP_LEFT_PDF_COORDINATES,
+                "logical_page": registered_page, "source_logical_page": pair["logical_page"],
+                "source_page": pair["source_page"], "value_inputs_used": False,
+            },
+        }
+        if not witnesses:
+            # A missing field may borrow its sibling's layout anchor, never
+            # that sibling's token/acquisition identity.
+            for key in ("token_ids", "evidence_ids", "acquisition_id"):
+                registered_field_ref.pop(key, None)
+            registered_field_ref["evidence_ids"] = list(field["evidence_ids"])
+        result[actual_field] = {
+            "source": _MONTHLY_SLOT_SOURCE, "evidence_plane": "sealed_native_source_table",
+            "logical_page": pair["logical_page"], "source_page": pair["source_page"],
+            "table_id": pair["table_id"], "row": pair["status_row" if canonical_field == "status" else "amount_row"],
+            "column": month, "field_name": actual_field, "geometry_scope": "cell", "geometry_status": "exact",
+            "coordinate_system": _TOP_LEFT_PDF_COORDINATES, "bbox": list(box),
+            "evidence_ids": list(field["evidence_ids"]), "monthly_slot_proof": proof,
+            "registered_logical_page": registered_page,
+            "registered_bbox": registered_box,
+            "registered_source_ref": registered_field_ref,
+            "source_ocr_confidence": field["confidence"], "observed_raw": field["raw_value"],
+        }
+    return result
 
 
 def _target_record_id(record: Mapping[str, Any], *, year: int, month: int) -> str:
@@ -1122,6 +1808,172 @@ def _withhold_status(
     canonical_raw["status"] = observations
 
 
+def _preserved_monthly_status_observation(
+    context: Any, record: Mapping[str, Any], *, native_token: str,
+    year: int, month: int, registered_ref: Mapping[str, Any],
+) -> str | None:
+    """Recover a diagnostic observation, never invent an already-null value."""
+
+    observations: set[str] = set()
+    record_audit = record.get("audit")
+    if isinstance(record_audit, Mapping) and record_audit.get("reason") == "corrected_status_planes_disagree":
+        raw = record_audit.get("observations")
+        raw = raw if isinstance(raw, Mapping) else {}
+        fallback, exact = raw.get("fallback"), raw.get("exact_source_cell")
+        if (
+            isinstance(fallback, (list, tuple)) and len(fallback) == 1
+            and isinstance(exact, (list, tuple)) and len(exact) == 1
+            and _canonical_status(exact[0]) == native_token
+            and (token := _canonical_status(fallback[0])) is not None and token != native_token
+        ):
+            observations.add(token)
+    target = _target_record_id(record, year=year, month=month)
+    registered_box = _bbox(registered_ref.get("bbox"))
+    registered_page = registered_ref.get("logical_page") or registered_ref.get("page")
+    for issue in getattr(context, "_personal_detail_extraction_issues", ()) or ():
+        if not isinstance(issue, Mapping):
+            continue
+        values = issue.get("normalized")
+        values = values if isinstance(values, Mapping) else issue
+        if not (
+            values.get("issue_code") == "candidate_b_independent_plane_repayment_status_conflict"
+            and values.get("parser_stage") == "candidate_b_cross_plane_repayment_reconciliation"
+            and values.get("target_dataset") == "repayment_records"
+            and values.get("target_record_id") == target and values.get("field_name") in _STATUS_FIELDS
+            and values.get("status", "requires_review") in {"open", "requires_review"}
+        ):
+            continue
+        raw = values.get("observed_value")
+        if not isinstance(raw, Mapping) or _canonical_status(raw.get("native_static")) != native_token:
+            continue
+        corrected = _canonical_status(raw.get("corrected_page"))
+        if corrected is None or corrected == native_token or registered_box is None:
+            continue
+        # The earlier two-plane issue must still name this very physical
+        # month on both planes; matching only a grid-local record ID is not
+        # enough to upgrade it into an exact sealed-cell conflict.
+        planes: set[str] = set()
+        for prior_ref in values.get("source_refs", ()) or ():
+            if not isinstance(prior_ref, Mapping):
+                continue
+            box = _bbox(prior_ref.get("bbox"))
+            if (
+                prior_ref.get("field_name") in _STATUS_FIELDS and prior_ref.get("geometry_scope") == "cell"
+                and prior_ref.get("geometry_status") in (None, "", "exact")
+                and prior_ref.get("coordinate_system") == _TOP_LEFT_PDF_COORDINATES
+                and (prior_ref.get("logical_page") or prior_ref.get("page")) == registered_page
+                and prior_ref.get("col") == month and box is not None
+                and _overlap_is_same_cell(registered_box, box)
+            ):
+                planes.add(str(prior_ref.get("evidence_plane") or ""))
+        if {"native_static", "corrected_page"}.issubset(planes):
+            observations.add(corrected)
+    return next(iter(observations)) if len(observations) == 1 else None
+
+
+def _guard_monthly_source_uncertainties(
+    context: Any, records: list[dict[str, Any]], audit: dict[str, Any],
+) -> set[int]:
+    """Keep weak readings and earlier field-local contradictions explicit."""
+
+    from docmirror.plugins.credit_report.personal_detail_scanned.extraction_issues import (
+        make_issue,
+        record_issue,
+    )
+
+    evidence = _MonthlySourceEvidence(context.parse_result)
+    handled: set[int] = set()
+    overlay = getattr(context, "_ocr_correction_overlay", None)
+    confirmer = getattr(overlay, "monthly_field_confirmation", None)
+    for record in records:
+        slots = authenticated_monthly_field_slots(context, record, evidence=evidence)
+        status_refs = [ref for field, ref in slots.items() if field in _STATUS_FIELDS]
+        if len(status_refs) != 1:
+            continue
+        ref = status_refs[0]
+        native_token = _canonical_status(ref.get("observed_raw"))
+        current = _single_status(record)
+        current_token = current[1] if current is not None else ""
+        score = ref.get("source_ocr_confidence")
+        weak_native = bool(
+            native_token is not None and isinstance(score, (int, float)) and not isinstance(score, bool)
+            and score < MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM
+        )
+        confirmation = confirmer(ref, value=current_token) if current_token and callable(confirmer) else None
+        if weak_native and confirmation is not None and confirmation.confidence > score:
+            handled.add(id(record))
+            audit["independent_monthly_field_confirmations"] += 1
+            continue
+        proof = ref["monthly_slot_proof"]
+        target = _target_record_id(record, year=proof["year"], month=proof["month"])
+        amount = _single_amount(record)
+        native_is_invalid_digit = bool(native_token in {"1", "2", "3", "4", "5", "6", "7"} and amount is not None and amount <= 0)
+        conflict_token = (
+            current_token if weak_native and current_token and current_token != native_token
+            else _preserved_monthly_status_observation(
+                context, record, native_token=native_token, year=proof["year"], month=proof["month"],
+                registered_ref=ref["registered_source_ref"],
+            )
+            if not current_token and native_token is not None else None
+        )
+        if native_is_invalid_digit:
+            conflict_token = None
+            # A weak but semantically impossible raw digit is not a competing
+            # reading against a valid symbolic status. Withhold the digit
+            # itself if published; leave a separately valid symbol unchanged.
+            if current_token and current_token != native_token:
+                audit["native_numeric_witnesses_rejected_for_nonpositive_amount"] += 1
+                handled.add(id(record))
+                continue
+        if weak_native:
+            _withhold_status(record, final_token=current_token or native_token, native_token=native_token)
+            audit["low_source_ocr_confidence_withheld"] += 1
+            record_issue(context, make_issue(
+                category="ocr_cell_level_error",
+                issue_code="candidate_b_monthly_source_ocr_confidence_unresolved",
+                message="A legal monthly status had insufficient source OCR confidence and no independently confirmed same-slot page reading; only the status was withheld.",
+                parser_stage="candidate_b_final_native_source_cell_guard",
+                target_dataset="repayment_records", target_record_id=target, field_name="status_code",
+                observed_value={
+                    "observed_status": native_token, "source_ocr_confidence": score,
+                    "minimum_source_ocr_confidence": MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM,
+                },
+                candidate_value={"resolution": "withheld_pending_independent_page_evidence"},
+                source_refs=({**deepcopy(ref), "field_name": "status_code"}, deepcopy(ref["registered_source_ref"])),
+                reason_codes=("low_source_ocr_confidence", "exact_monthly_source_slot", "independent_page_confirmation_missing", "normalized_value_withheld"),
+            ))
+            handled.add(id(record))
+        if conflict_token is None or native_token is None:
+            continue
+        # The currently withheld field has no value. Report the preserved
+        # conflicting observation explicitly, never fabricate a current one.
+        _withhold_status(record, final_token=conflict_token, native_token=native_token)
+        native_ref = {
+            **deepcopy(ref), "source": "sealed_native_physical_table_cell",
+            "col": ref["column"], "field_name": "status",
+            "token_ids": list(ref["evidence_ids"]),
+        }
+        record_issue(context, make_issue(
+            category="ocr_cell_level_error",
+            issue_code="candidate_b_native_source_cell_repayment_status_conflict",
+            message="A preserved corrected-plane monthly status disagreed with the unique sealed source-cell reading; the already-withheld field remains unresolved.",
+            parser_stage="candidate_b_final_native_source_cell_guard",
+            target_dataset="repayment_records", target_record_id=target, field_name="status_code",
+            observed_value={
+                "corrected_final": conflict_token, "sealed_native_source_cell": native_token,
+                "paired_status_amount": format(amount, "f") if amount is not None else None,
+                "corrected_final_already_withheld": not bool(current_token),
+            },
+            candidate_value={"resolution": "withheld_pending_review"},
+            source_refs=(deepcopy(ref["registered_source_ref"]), native_ref),
+            reason_codes=("exact_same_month_source_cell", "preserved_source_plane_conflict", "monthly_status_conflict", "normalized_value_withheld"),
+        ))
+        audit["conflicts_withheld"] += 1
+        audit["preserved_source_plane_conflicts"] += 1
+        handled.add(id(record))
+    return handled
+
+
 def apply_candidate_b_native_status_conflict_guard(
     context: Any,
     records: Iterable[dict[str, Any]],
@@ -1141,6 +1993,9 @@ def apply_candidate_b_native_status_conflict_guard(
         "native_numeric_witnesses_rejected_for_nonpositive_amount": 0,
         "agreements": 0,
         "conflicts_withheld": 0,
+        "low_source_ocr_confidence_withheld": 0,
+        "independent_monthly_field_confirmations": 0,
+        "preserved_source_plane_conflicts": 0,
     }
     if not enabled:
         return audit
@@ -1153,16 +2008,30 @@ def apply_candidate_b_native_status_conflict_guard(
         record_issue,
     )
 
-    for record in records:
-        if not isinstance(record, dict):
+    record_list = [record for record in records if isinstance(record, dict)]
+    handled = _guard_monthly_source_uncertainties(context, record_list, audit)
+    for record in record_list:
+        if id(record) in handled:
             continue
         status = _single_status(record)
         year_month = _performance_year_month(record)
         amount = _single_amount(record)
-        if status is None or year_month is None or amount is None:
+        if year_month is None or amount is None:
             continue
-        _field_name, final_token = status
         year, month = year_month
+        if status is None:
+            record_audit = record.get("audit")
+            has_preserved_audit = isinstance(record_audit, Mapping) and record_audit.get("reason") == "corrected_status_planes_disagree"
+            target = _target_record_id(record, year=year, month=month)
+            has_preserved_issue = any(
+                values.get("issue_code") == "candidate_b_independent_plane_repayment_status_conflict"
+                and values.get("target_record_id") == target
+                for issue in getattr(context, "_personal_detail_extraction_issues", ()) or ()
+                if isinstance(issue, Mapping)
+                for values in (issue.get("normalized") if isinstance(issue.get("normalized"), Mapping) else issue,)
+            )
+            if not has_preserved_audit and not has_preserved_issue:
+                continue
         final_ref = _exact_final_status_ref(record, month=month)
         if final_ref is None:
             continue
@@ -1194,6 +2063,12 @@ def apply_candidate_b_native_status_conflict_guard(
             audit[
                 "native_numeric_witnesses_rejected_for_nonpositive_amount"
             ] += 1
+            continue
+        already_withheld = status is None
+        final_token = status[1] if status is not None else _preserved_monthly_status_observation(
+            context, record, native_token=native_token, year=year, month=month, registered_ref=final_ref,
+        )
+        if final_token is None:
             continue
         if native_token == final_token:
             audit["agreements"] += 1
@@ -1228,6 +2103,7 @@ def apply_candidate_b_native_status_conflict_guard(
                     "corrected_final": final_token,
                     "sealed_native_source_cell": native_token,
                     "paired_status_amount": format(amount, "f"),
+                    **({"corrected_final_already_withheld": True} if already_withheld else {}),
                 },
                 candidate_value=None,
                 source_refs=(
@@ -1246,7 +2122,15 @@ def apply_candidate_b_native_status_conflict_guard(
             ),
         )
         audit["conflicts_withheld"] += 1
+        if already_withheld:
+            audit["preserved_source_plane_conflicts"] += 1
     return audit
 
 
-__all__ = ["apply_candidate_b_native_status_conflict_guard"]
+__all__ = [
+    "MONTHLY_SOURCE_OCR_CONFIDENCE_MINIMUM",
+    "apply_candidate_b_native_status_conflict_guard",
+    "authenticated_monthly_field_slots",
+    "monthly_field_slot_identity",
+    "resolve_sealed_monthly_field_slot",
+]

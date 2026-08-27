@@ -1618,6 +1618,11 @@ def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[lis
 
 
 _NATIVE_STATEMENT_SCOPE_TITLES = ("中国建设银行个人活期账户收入交易明细",)
+_DIRECTION_FILTER_RE = re.compile(
+    r"(?:收支类别|借贷方向|借/贷标记|交易方向)[:：]?(?:收入|支出|贷方|借方)"
+    r"|direction[:：]?(?:income|expense|credit|debit)",
+    re.IGNORECASE,
+)
 
 
 def _native_statement_scope_title(page: Any) -> str:
@@ -1637,6 +1642,28 @@ def _stable_native_statement_scope_title(titles: list[str]) -> str:
     # Require every populated page to repeat the exact title when there is more
     # than one page.  A nearby prose mention cannot scope a whole document.
     return nonempty[0] if len(nonempty) == len(titles) else ""
+
+
+def _source_declares_direction_filter(
+    text: str,
+    *,
+    page_texts: Iterable[tuple[int, str]] | None,
+    records: list[dict[str, Any]],
+) -> bool:
+    """Return whether the issuer explicitly scoped the export to one direction."""
+
+    sources = [
+        str(text or ""),
+        *(str(page_text or "") for _page, page_text in (page_texts or ())),
+        *(str(record.get("_document_scope_text") or "") for record in records),
+    ]
+    for source in sources:
+        compact = re.sub(r"\s+", "", unicodedata.normalize("NFKC", source))
+        if any(title in compact for title in _NATIVE_STATEMENT_SCOPE_TITLES):
+            return True
+        if _DIRECTION_FILTER_RE.search(compact):
+            return True
+    return False
 
 
 def _attach_private_table_column(table: list[list[str]], name: str, value: str) -> list[list[str]]:
@@ -2989,6 +3016,44 @@ def count_expected_rows_from_bank_footer(
     return resolve_row_count_evidence(text, page_texts=page_texts).count
 
 
+def _complete_source_signed_direction_totals(
+    records: list[dict[str, Any]],
+) -> tuple[float, float] | None:
+    """Return a complete source-sign plane with owned direction on every row.
+
+    Every amount must agree across raw, canonical_raw, and normalized magnitude.
+    Every component also needs an independent source-owned side; a normalized
+    direction alone cannot make the alternate reconciliation plane auditable.
+    """
+    from docmirror.plugins.bank_statement.styles.grid_standard import (
+        source_owned_signed_directional_amount,
+        source_provenanced_signed_amount,
+    )
+
+    totals = {"expense": 0.0, "income": 0.0}
+    saw_negative = False
+    if not records:
+        return None
+    for record in records:
+        raw = record.get("raw")
+        normalized = record.get("normalized")
+        canonical_raw = record.get("canonical_raw")
+        if not isinstance(raw, dict) or not isinstance(normalized, dict) or not isinstance(canonical_raw, dict):
+            return None
+        direction = str(normalized.get("direction") or "").strip()
+        signed_amount = source_provenanced_signed_amount(raw, normalized, canonical_raw)
+        if direction not in totals or signed_amount is None:
+            return None
+        owned_fact = source_owned_signed_directional_amount(raw, normalized, canonical_raw)
+        if owned_fact != (direction, signed_amount):
+            return None
+        totals[direction] += signed_amount
+        saw_negative = saw_negative or signed_amount < 0
+    if not saw_negative:
+        return None
+    return round(totals["expense"], 2), round(totals["income"], 2)
+
+
 def audit_bank_statement_invariants(
     records: list[dict[str, Any]],
     text: str,
@@ -2997,6 +3062,7 @@ def audit_bank_statement_invariants(
     row_count_evidence: RowCountEvidence | None = None,
 ) -> list[str]:
     """Hard semantic gates for bank ledger rows against source footer totals."""
+    page_texts = tuple(page_texts or ())
     failures: list[str] = []
     if page_gap_warning := _source_page_gap_warning(
         text,
@@ -3062,26 +3128,38 @@ def audit_bank_statement_invariants(
     paired_totals = _paired_direction_amount_totals(text) if aggregate_contract else None
     debit_total = column_major_totals[2] if column_major_totals else paired_totals[0] if paired_totals else None
     credit_total = column_major_totals[3] if column_major_totals else paired_totals[1] if paired_totals else None
-    if debit_total is not None:
-        actual = round(sum(_float(row.get("amount")) for row in debit_rows), 2)
-        if abs(actual - debit_total) > 0.01:
-            failures.append(f"bank_invariant_failed:debit_total:{actual:.2f}/{debit_total:.2f}")
-    if credit_total is not None:
-        actual = round(sum(_float(row.get("amount")) for row in credit_rows), 2)
-        if abs(actual - credit_total) > 0.01:
-            failures.append(f"bank_invariant_failed:credit_total:{actual:.2f}/{credit_total:.2f}")
-
-    filtered_income_scope = any(
-        title
-        in re.sub(
-            r"\s+",
-            "",
-            unicodedata.normalize("NFKC", str(record.get("_document_scope_text") or "")),
+    actual_debit_total = round(sum(_float(row.get("amount")) for row in debit_rows), 2)
+    actual_credit_total = round(sum(_float(row.get("amount")) for row in credit_rows), 2)
+    signed_totals_close = False
+    # Signed reconciliation is an all-or-nothing alternate aggregate plane.  It
+    # cannot rescue a single side, an incomplete direction census, or a footer
+    # that lacks both counts and both totals.
+    if (
+        aggregate_contract
+        and reported_counts == (len(debit_rows), len(credit_rows))
+        and len(debit_rows) + len(credit_rows) == len(records)
+        and debit_total is not None
+        and credit_total is not None
+    ):
+        source_signed_totals = _complete_source_signed_direction_totals(records)
+        signed_totals_close = bool(
+            source_signed_totals is not None
+            and abs(source_signed_totals[0] - debit_total) <= 0.01
+            and abs(source_signed_totals[1] - credit_total) <= 0.01
         )
-        for record in records
-        for title in _NATIVE_STATEMENT_SCOPE_TITLES
+    if debit_total is not None:
+        if abs(actual_debit_total - debit_total) > 0.01 and not signed_totals_close:
+            failures.append(f"bank_invariant_failed:debit_total:{actual_debit_total:.2f}/{debit_total:.2f}")
+    if credit_total is not None:
+        if abs(actual_credit_total - credit_total) > 0.01 and not signed_totals_close:
+            failures.append(f"bank_invariant_failed:credit_total:{actual_credit_total:.2f}/{credit_total:.2f}")
+
+    filtered_direction_scope = _source_declares_direction_filter(
+        text,
+        page_texts=page_texts,
+        records=records,
     )
-    if not filtered_income_scope:
+    if not filtered_direction_scope:
         breaks, checked = _best_balance_chain_breaks(normalized)
         if checked > 0 and breaks > 0:
             failures.append(f"bank_invariant_failed:balance_chain:{breaks}/{checked}")

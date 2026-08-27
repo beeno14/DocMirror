@@ -78,6 +78,54 @@ def test_header_only_canonical_subset_is_recognized() -> None:
     assert semantic.datasets["personal_report_metadata"][0]["marital_status"] == "married"
 
 
+def test_pipeline_debug_artifacts_and_compatibility_audit_are_lazy() -> None:
+    result = _result(
+        "个人信用报告 报告编号：2026071900012345678901 "
+        "报告时间：2026-07-19 09:08:07 姓名：张三 "
+        "证件类型：身份证 证件号码：11010519491231002X"
+    )
+
+    artifacts = run_personal_brief_pipeline(result)
+
+    assert artifacts._ir_debug_json is None
+    assert artifacts._semantic_debug_json is None
+    assert artifacts.semantic_document._credit_extraction_audit is None
+
+    ir_debug_json = artifacts.ir_debug_json
+    semantic_debug_json = artifacts.semantic_debug_json
+
+    assert artifacts.ir_debug_json is ir_debug_json
+    assert artifacts.semantic_debug_json is semantic_debug_json
+    assert artifacts.semantic_document._credit_extraction_audit is not None
+
+
+def test_canonical_pipeline_parses_the_source_summary_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    from docmirror.plugins.credit_report import business_records
+
+    original = business_records._personal_brief_summary_from_canonical_tables
+    calls = 0
+
+    def counting_summary_parser(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        business_records,
+        "_personal_brief_summary_from_canonical_tables",
+        counting_summary_parser,
+    )
+    result = _result(
+        "个人信用报告 报告编号：2026071900012345678901 "
+        "报告时间：2026-07-19 09:08:07 姓名：张三 "
+        "证件类型：身份证 证件号码：11010519491231002X"
+    )
+
+    run_personal_brief_pipeline(result)
+
+    assert calls == 1
+
+
 def test_unlabelled_marital_status_is_scoped_to_identity_metadata() -> None:
     blocks = [
         (1, "本报告不用于信贷申请及其他用途。"),

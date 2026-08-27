@@ -516,7 +516,7 @@ class BankLedgerOrchestrator:
                     sub_ctx = replace(ctx, tables=sub_tables)
                     sub_detection = self._resolve_detection(detection, sub_ctx)
             records, identity = self._registry.run_parser_chain(sub_detection, sub_ctx, plugin)
-            self._record_selection_diagnostics(meta)
+            selection_diagnostic = self._record_selection_diagnostics(meta)
             if sub_ctx is not ctx and sub_ctx.reconstruction is not None:
                 ctx.reconstruction = sub_ctx.reconstruction
             if blocks and blocks[0][0] is not None and getattr(blocks[0][0], "quality_passed", True):
@@ -524,7 +524,12 @@ class BankLedgerOrchestrator:
             elif records:
                 meta.tables_parsed = 1
             records = dedupe_transaction_rows(records)
-            if sub_ctx is not ctx:
+            primary_proves_document = bool(
+                selection_diagnostic
+                and selection_diagnostic.get("completion_state") == "proven"
+                and selection_diagnostic.get("deployment_mode") == "lazy_primary"
+            )
+            if sub_ctx is not ctx and not primary_proves_document:
                 document_records, document_identity, document_ctx, document_diagnostic = self._run_document_context(
                     detection, ctx, plugin, meta
                 )

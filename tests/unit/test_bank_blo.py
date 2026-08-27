@@ -580,6 +580,40 @@ def test_rejected_document_trial_does_not_replace_logical_reconstruction() -> No
     assert meta.candidate_diagnostics[0]["selected_candidate"] == "logical"
 
 
+def test_proven_single_logical_result_skips_document_context_rerun() -> None:
+    logical = _blo_logical_table("lt_complete")
+    ctx = StyleContext(
+        tables=[[['date', 'amount'], ['2024-01-01', '1']]],
+        full_text="",
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(logical_tables=[logical]),
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=1),
+    )
+
+    class Registry:
+        last_selection_diagnostics = {}
+        calls = 0
+
+        def run_parser_chain(self, _detection, _sub_ctx, _plugin):
+            self.calls += 1
+            self.last_selection_diagnostics = {
+                "selected_candidate": "parser:grid_standard",
+                "completion_state": "proven",
+                "deployment_mode": "lazy_primary",
+            }
+            return [_blo_record(1)], {}
+
+    registry = Registry()
+    records, _, meta = BankLedgerOrchestrator(registry).run(
+        BankStyleDetector().detect(ctx), ctx, BankStatementCommunityPlugin()
+    )
+
+    assert registry.calls == 1
+    assert len(records) == 1
+    assert meta.candidate_diagnostics[0]["completion_state"] == "proven"
+
+
 def test_larger_document_result_with_fewer_canonical_rows_is_not_preferred() -> None:
     logical = _blo_logical_table("lt_canonical")
     ctx = StyleContext(

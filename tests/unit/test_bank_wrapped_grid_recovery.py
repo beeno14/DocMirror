@@ -13,12 +13,18 @@ from docmirror.models.entities.parse_result import (
     LogicalTable,
     PageContent,
     ParseResult,
+    RowProvenance,
     TableRow,
 )
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin
 from docmirror.plugins.bank_statement.context import StyleContext
+from docmirror.plugins.bank_statement.extraction_dispatch import (
+    BankExtractionPolicy,
+    BankExtractionRoute,
+)
+from docmirror.plugins.bank_statement.ltro import ReconstructionMeta
 from docmirror.plugins.bank_statement.row_extract import extract_logical_rows_with_provenance
-from docmirror.plugins.bank_statement.style_detector import BankStyleDetector
+from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.styles.grid_standard import (
     _finalize_transactions,
@@ -122,6 +128,211 @@ def test_wrapped_wide_grid_preserves_every_raw_business_cell_and_canonicalizes_d
     assert [record["normalized"]["direction"] for record in records] == ["income", "expense"]
     assert [record["normalized"]["amount"] for record in records] == pytest.approx([88.2, 12.3])
     assert [record["normalized"]["balance"] for record in records] == pytest.approx([188.2, 175.9])
+
+
+_TWO_PAGE_GRID_HEADERS = [
+    "序号",
+    "交易日期",
+    "收/支",
+    "交易金额",
+    "余额",
+    "对方账号",
+    "对方户名",
+    "摘要",
+]
+_TWO_PAGE_GRID_VALUES = [
+    ["1", "20240801", "贷", "100.00", "1100.00", "622200001111", "甲公司", "收款"],
+    ["2", "20240802", "借", "20.00", "1080.00", "622200002222", "乙公司", "付款"],
+]
+
+
+def _two_page_grid_row(values: list[str], *, page: int, row_index: int) -> TableRow:
+    table_id = f"grid:p{page}"
+    refs = [
+        {
+            "page": page,
+            "table_id": table_id,
+            "row": row_index,
+            "raw_row": row_index + 1,
+            "col": col_index,
+        }
+        for col_index in range(len(values))
+    ]
+    return TableRow(
+        cells=[
+            CellValue(
+                text=value,
+                evidence_ids=[f"ev:p{page}:r{row_index}:c{col_index}"],
+                source_cell_refs=[refs[col_index]],
+            )
+            for col_index, value in enumerate(values)
+        ],
+        source_page=page,
+        source_physical_id=table_id,
+        source_row_index=row_index,
+        source_cell_refs=refs,
+    )
+
+
+def test_grid_strategy_conserves_two_page_raw_canonical_normalized_and_source_lineage() -> None:
+    source_rows = [
+        _two_page_grid_row(_TWO_PAGE_GRID_VALUES[0], page=1, row_index=4),
+        _two_page_grid_row(_TWO_PAGE_GRID_VALUES[1], page=2, row_index=2),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1), PageContent(page_number=2)],
+        entities=DocumentEntities(document_type="bank_statement"),
+        logical_tables=[
+            LogicalTable(
+                table_id="logical:grid:two-page",
+                headers=list(_TWO_PAGE_GRID_HEADERS),
+                rows=source_rows,
+                row_count=2,
+                data_row_estimate=2,
+                source_pages=[1, 2],
+                source_physical_ids=["grid:p1", "grid:p2"],
+                page_span=(1, 2),
+                provenance=[
+                    RowProvenance(
+                        source_page=row.source_page,
+                        source_table_id=row.source_physical_id,
+                        source_row_index=row.source_row_index,
+                    )
+                    for row in source_rows
+                ],
+                quality_passed=True,
+            )
+        ],
+    )
+    policy = BankExtractionPolicy(
+        route=BankExtractionRoute.DIGITAL,
+        allowed_parser_ids=frozenset({"grid_standard"}),
+    )
+    ctx = StyleContext(
+        tables=[[_TWO_PAGE_GRID_HEADERS, *_TWO_PAGE_GRID_VALUES]],
+        full_text="企业账户交易明细 第1/2页 第2/2页",
+        institution=None,
+        page_count=2,
+        parse_result=parse_result,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+        extraction_route=policy.route,
+        extraction_policy=policy,
+    )
+    detection = StyleDetectionResult(
+        primary_style="grid_standard",
+        confidence=1.0,
+        parser_chain=["grid_standard"],
+    )
+
+    records, _identity = BankStyleParserRegistry(adaptive=False).run(
+        detection,
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert [record["raw"] for record in records] == [
+        dict(zip(_TWO_PAGE_GRID_HEADERS, values, strict=True))
+        for values in _TWO_PAGE_GRID_VALUES
+    ]
+    assert [record["canonical_raw"] for record in records] == [
+        {
+            "sequence_no": "1",
+            "date": "20240801",
+            "direction": "贷",
+            "amount": "100.00",
+            "balance": "1100.00",
+            "counter_account": "622200001111",
+            "counter_party": "甲公司",
+            "summary": "收款",
+        },
+        {
+            "sequence_no": "2",
+            "date": "20240802",
+            "direction": "借",
+            "amount": "20.00",
+            "balance": "1080.00",
+            "counter_account": "622200002222",
+            "counter_party": "乙公司",
+            "summary": "付款",
+        },
+    ]
+    assert [
+        {
+            key: record["normalized"][key]
+            for key in (
+                "sequence_no",
+                "date",
+                "direction",
+                "amount",
+                "balance",
+                "counter_account",
+                "counter_party",
+                "summary",
+            )
+        }
+        for record in records
+    ] == [
+        {
+            "sequence_no": "1",
+            "date": "2024-08-01",
+            "direction": "income",
+            "amount": 100.0,
+            "balance": 1100.0,
+            "counter_account": "622200001111",
+            "counter_party": "甲公司",
+            "summary": "收款",
+        },
+        {
+            "sequence_no": "2",
+            "date": "2024-08-02",
+            "direction": "expense",
+            "amount": 20.0,
+            "balance": 1080.0,
+            "counter_account": "622200002222",
+            "counter_party": "乙公司",
+            "summary": "付款",
+        },
+    ]
+    assert [record["source"] for record in records] == [
+        {
+            "source": "canonical_table",
+            "source_page": 1,
+            "page_id": "page:0001",
+            "table_id": "grid:p1",
+            "source_row_index": 4,
+            "page_range": [1, 1],
+            "evidence_ids": [f"ev:p1:r4:c{col_index}" for col_index in range(8)],
+            "source_cell_refs": [
+                {
+                    "page": 1,
+                    "table_id": "grid:p1",
+                    "row": 4,
+                    "raw_row": 5,
+                    "col": col_index,
+                }
+                for col_index in range(8)
+            ],
+        },
+        {
+            "source": "canonical_table",
+            "source_page": 2,
+            "page_id": "page:0002",
+            "table_id": "grid:p2",
+            "source_row_index": 2,
+            "page_range": [2, 2],
+            "evidence_ids": [f"ev:p2:r2:c{col_index}" for col_index in range(8)],
+            "source_cell_refs": [
+                {
+                    "page": 2,
+                    "table_id": "grid:p2",
+                    "row": 2,
+                    "raw_row": 3,
+                    "col": col_index,
+                }
+                for col_index in range(8)
+            ],
+        },
+    ]
 
 
 def _logical_parse_result(*, rows: list[TableRow]) -> ParseResult:

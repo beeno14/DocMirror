@@ -199,45 +199,4 @@ def reconstruct_institution_inquiry_rows(parse_result: Any) -> list[dict[str, An
     return rows
 
 
-def build_institution_inquiry_reading_projection(parse_result: Any) -> Any | None:
-    """Build validated joins for wrapped institution fragments only."""
-    from docmirror.output.reading_projection import FragmentJoin, ReadingProjection
-
-    transforms = []
-    for row in reconstruct_institution_inquiry_rows(parse_result):
-        fragment_node_ids = tuple(str(value) for value in row.get("fragment_node_ids") or ())
-        if not fragment_node_ids:
-            continue
-        transforms.append(
-            FragmentJoin(
-                scope="credit_report.personal_brief.institution_inquiries",
-                source_node_ids=tuple(str(value) for value in row.get("source_node_ids") or ()),
-                anchor_node_id=str(row.get("anchor_node_id") or ""),
-                fragment_node_ids=fragment_node_ids,
-                reason="wrapped institution fragments follow the inquiry-reason column",
-                confidence=float(row.get("confidence") or 0.99),
-                evidence_ids=tuple(str(value) for value in row.get("evidence_ids") or ()),
-            )
-        )
-        reason_node_ids = tuple(str(value) for value in row.get("reason_node_ids") or ())
-        if len(reason_node_ids) > 1:
-            transforms.append(
-                FragmentJoin(
-                    scope="credit_report.personal_brief.institution_inquiries.reason",
-                    source_node_ids=tuple(str(value) for value in row.get("source_node_ids") or ()),
-                    anchor_node_id=reason_node_ids[0],
-                    fragment_node_ids=reason_node_ids[1:],
-                    reason="wrapped inquiry-reason fragments form one recognized reason",
-                    confidence=float(row.get("confidence") or 0.99),
-                    evidence_ids=tuple(str(value) for value in row.get("evidence_ids") or ()),
-                )
-            )
-    if not transforms:
-        return None
-    return ReadingProjection(plugin_id="credit_report", transforms=tuple(transforms))
-
-
-__all__ = [
-    "build_institution_inquiry_reading_projection",
-    "reconstruct_institution_inquiry_rows",
-]
+__all__ = ["reconstruct_institution_inquiry_rows"]

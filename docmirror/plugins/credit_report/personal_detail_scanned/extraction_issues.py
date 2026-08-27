@@ -90,6 +90,9 @@ _LIABILITY_UNRESOLVED_VALUES = frozenset(
     {"", "-", "--", "---", "未报告", "不详", "未知", "unknown", "unreadable"}
 )
 _FINAL_LIABILITY_ISSUE_RECORDS_ATTR = "_personal_detail_final_liability_issue_records"
+_CANDIDATE_B_ACTIVE_STAGE_ATTR = "_candidate_b_active_extraction_stage"
+_CANDIDATE_B_ISSUE_OWNERS_ATTR = "_candidate_b_issue_stage_owners"
+_CANDIDATE_B_REMAP_OWNERS_ATTR = "_candidate_b_remap_stage_owners"
 
 
 def _plain(value: Any) -> Any:
@@ -192,6 +195,25 @@ def record_issue(context: Any, issue: Mapping[str, Any]) -> None:
         rows = []
         setattr(context, "_personal_detail_extraction_issues", rows)
     issue_id = str(issue.get("extraction_issue_id") or "")
+    active_stage = str(
+        getattr(context, _CANDIDATE_B_ACTIVE_STAGE_ATTR, "") or ""
+    ).strip()
+    if issue_id and active_stage:
+        owners = getattr(context, _CANDIDATE_B_ISSUE_OWNERS_ATTR, None)
+        if not isinstance(owners, dict):
+            owners = {}
+            setattr(context, _CANDIDATE_B_ISSUE_OWNERS_ATTR, owners)
+        stage_names = owners.get(issue_id)
+        if not isinstance(stage_names, set):
+            stage_names = {
+                str(value)
+                for value in stage_names or ()
+                if str(value or "").strip()
+            }
+            owners[issue_id] = stage_names
+        # Record ownership before duplicate suppression: two independent
+        # stages may legitimately emit the same stable diagnostic.
+        stage_names.add(active_stage)
     if issue_id and any(str(row.get("extraction_issue_id") or "") == issue_id for row in rows):
         return
     rows.append(deepcopy(dict(issue)))
@@ -203,6 +225,24 @@ def register_issue_target_remap(context: Any, source_record_id: Any, target_reco
     target = str(target_record_id or "").strip()
     if not source or not target or source == target:
         return
+    active_stage = str(
+        getattr(context, _CANDIDATE_B_ACTIVE_STAGE_ATTR, "") or ""
+    ).strip()
+    if active_stage:
+        owners = getattr(context, _CANDIDATE_B_REMAP_OWNERS_ATTR, None)
+        if not isinstance(owners, dict):
+            owners = {}
+            setattr(context, _CANDIDATE_B_REMAP_OWNERS_ATTR, owners)
+        edge = (source, target)
+        stage_names = owners.get(edge)
+        if not isinstance(stage_names, set):
+            stage_names = {
+                str(value)
+                for value in stage_names or ()
+                if str(value or "").strip()
+            }
+            owners[edge] = stage_names
+        stage_names.add(active_stage)
     registry = getattr(context, "_personal_detail_issue_target_remaps", None)
     if not isinstance(registry, dict):
         registry = {}
@@ -250,6 +290,17 @@ def _remap_issue_target(context: Any, issue: Mapping[str, Any]) -> dict[str, Any
         target, ambiguous = _resolve_issue_target(registry, source)
         if target:
             row["target_record_id"] = target
+            if (
+                row.get("issue_code")
+                == "candidate_b_account_cluster_field_unresolved"
+            ):
+                row["reason_codes"] = [
+                    str(value)
+                    for value in row.get("reason_codes") or ()
+                    if value
+                    and str(value)
+                    != "record_not_emitted_due_to_unresolved_account_ownership"
+                ]
         elif ambiguous:
             row.pop("target_record_id", None)
             row["reason_codes"] = list(
@@ -665,6 +716,31 @@ def collect_extraction_issues(context: Any) -> list[dict[str, Any]]:
             if (localized := _localize_final_liability_issue(row, final_liabilities))
             is not None
         ]
+    precise_account_fields = {
+        (
+            str(row.get("target_dataset") or ""),
+            str(row.get("target_record_id") or ""),
+            str(row.get("field_name") or ""),
+        )
+        for row in rows
+        if row.get("issue_code")
+        == "candidate_b_account_cluster_field_unresolved"
+        and str(row.get("status") or "requires_review")
+        not in _NON_DEGRADING_STATUSES
+    }
+    rows = [
+        row
+        for row in rows
+        if not (
+            row.get("issue_code") == "pboc_cell_contract_unresolved"
+            and (
+                str(row.get("target_dataset") or ""),
+                str(row.get("target_record_id") or ""),
+                str(row.get("field_name") or ""),
+            )
+            in precise_account_fields
+        )
+    ]
     precise_by_agreement_field: dict[tuple[str, str, str], dict[str, Any]] = {}
     for row in rows:
         observed = row.get("observed_value")

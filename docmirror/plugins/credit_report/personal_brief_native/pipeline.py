@@ -7,16 +7,16 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 from docmirror.plugins.credit_report.personal_brief_native.contracts import (
     PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
     canonicalize_personal_brief_reporting_units,
 )
 from docmirror.plugins.credit_report.personal_brief_native.ir import (
-    CANONICAL_PERSONAL_BRIEF_SECTIONS,
     CanonicalPersonalBriefComponent,
     CanonicalPersonalBriefDocumentIR,
     PersonalBriefSourceRef,
@@ -24,14 +24,57 @@ from docmirror.plugins.credit_report.personal_brief_native.ir import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PersonalBriefSemanticDocument:
     facts: dict[str, Any]
     datasets: dict[str, list[dict[str, Any]]]
     credit_summary: dict[str, Any]
-    credit_extraction_audit: dict[str, Any]
     extraction_report: dict[str, Any]
     dataset_completeness: dict[str, dict[str, Any]]
+    _credit_extraction_audit: dict[str, Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    _credit_extraction_audit_factory: Callable[[], dict[str, Any]] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def __init__(
+        self,
+        facts: dict[str, Any],
+        datasets: dict[str, list[dict[str, Any]]],
+        credit_summary: dict[str, Any],
+        credit_extraction_audit: dict[str, Any] | None,
+        extraction_report: dict[str, Any],
+        dataset_completeness: dict[str, dict[str, Any]],
+        *,
+        credit_extraction_audit_factory: Callable[[], dict[str, Any]] | None = None,
+    ) -> None:
+        object.__setattr__(self, "facts", facts)
+        object.__setattr__(self, "datasets", datasets)
+        object.__setattr__(self, "credit_summary", credit_summary)
+        object.__setattr__(self, "extraction_report", extraction_report)
+        object.__setattr__(self, "dataset_completeness", dataset_completeness)
+        object.__setattr__(self, "_credit_extraction_audit", credit_extraction_audit)
+        object.__setattr__(
+            self,
+            "_credit_extraction_audit_factory",
+            credit_extraction_audit_factory,
+        )
+
+    @property
+    def credit_extraction_audit(self) -> dict[str, Any]:
+        """Materialize the legacy diagnostic audit only when it is requested."""
+        audit = self._credit_extraction_audit
+        if audit is None:
+            factory = self._credit_extraction_audit_factory
+            audit = factory() if factory is not None else {}
+            object.__setattr__(self, "_credit_extraction_audit", audit)
+            object.__setattr__(self, "_credit_extraction_audit_factory", None)
+        return audit
 
     def to_debug_payload(self) -> dict[str, Any]:
         return {
@@ -48,12 +91,40 @@ class PersonalBriefSemanticDocument:
         return json.dumps(self.to_debug_payload(), ensure_ascii=False, sort_keys=True, default=str)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class PersonalBriefPipelineArtifacts:
     document_ir: CanonicalPersonalBriefDocumentIR
     semantic_document: PersonalBriefSemanticDocument
-    ir_debug_json: str
-    semantic_debug_json: str
+    _ir_debug_json: str | None = field(default=None, repr=False, compare=False)
+    _semantic_debug_json: str | None = field(default=None, repr=False, compare=False)
+
+    def __init__(
+        self,
+        document_ir: CanonicalPersonalBriefDocumentIR,
+        semantic_document: PersonalBriefSemanticDocument,
+        ir_debug_json: str | None = None,
+        semantic_debug_json: str | None = None,
+    ) -> None:
+        object.__setattr__(self, "document_ir", document_ir)
+        object.__setattr__(self, "semantic_document", semantic_document)
+        object.__setattr__(self, "_ir_debug_json", ir_debug_json)
+        object.__setattr__(self, "_semantic_debug_json", semantic_debug_json)
+
+    @property
+    def ir_debug_json(self) -> str:
+        value = self._ir_debug_json
+        if value is None:
+            value = self.document_ir.to_debug_json()
+            object.__setattr__(self, "_ir_debug_json", value)
+        return value
+
+    @property
+    def semantic_debug_json(self) -> str:
+        value = self._semantic_debug_json
+        if value is None:
+            value = self.semantic_document.to_debug_json()
+            object.__setattr__(self, "_semantic_debug_json", value)
+        return value
 
 
 def _source_ref(
@@ -1425,6 +1496,53 @@ def _rejected_semantic_document(
     )
 
 
+def _build_personal_brief_compatibility_audit(
+    document: CanonicalPersonalBriefDocumentIR,
+    *,
+    content_mode: str,
+    datasets: dict[str, list[dict[str, Any]]],
+    credit_summary: dict[str, Any],
+    extraction_report: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the pre-projector diagnostic audit for explicit debug consumers."""
+    from docmirror.plugins.credit_report.business_assembly import _build_audit
+    from docmirror.plugins.credit_report.business_records import _personal_brief_credit_lines
+
+    accounts = datasets.get("credit_accounts", [])
+    audit = _build_audit(
+        parse_result=document,
+        full_text=document.full_text,
+        report_subtype="personal_brief",
+        content_mode=content_mode,
+        collections={
+            "credit_accounts": accounts,
+            "credit_lines": _personal_brief_credit_lines(accounts),
+            "repayment_liability_records": datasets.get("repayment_liability_records", []),
+            "repayment_records": datasets.get("repayment_records", []),
+            "overdue_records": datasets.get("overdue_records", []),
+            "inquiry_records": datasets.get("inquiry_records", []),
+            "public_records": datasets.get("public_records", []),
+        },
+        conflicts=[],
+        credit_summary=credit_summary,
+    )
+    failures = extraction_report.get("failures") or []
+    if failures:
+        audit["issues"] = list(
+            dict.fromkeys(
+                [
+                    *list(audit.get("issues") or []),
+                    *[
+                        f"canonical_extraction:{failure['code']}"
+                        for failure in failures
+                    ],
+                ]
+            )
+        )
+        audit["status"] = "review"
+    return audit
+
+
 def extract_personal_brief_semantic_document(
     document: CanonicalPersonalBriefDocumentIR,
     *,
@@ -1433,11 +1551,9 @@ def extract_personal_brief_semantic_document(
     """Apply the rigid personal-brief schema exactly once to the canonical IR."""
     if not isinstance(document, CanonicalPersonalBriefDocumentIR):
         raise TypeError("personal brief extraction requires CanonicalPersonalBriefDocumentIR")
-    from docmirror.plugins.credit_report.business_assembly import _build_audit
     from docmirror.plugins.credit_report.business_records import (
         _overdue_from_personal_brief_accounts,
         _page_texts,
-        _personal_brief_credit_lines,
         _personal_brief_summary_from_canonical_tables,
     )
     from docmirror.plugins.credit_report.personal_brief_native.extraction import (
@@ -1468,7 +1584,6 @@ def extract_personal_brief_semantic_document(
     liabilities = _repayment_liabilities_from_canonical_records(document)
     inquiries = _inquiry_records(document)
     overdue = _overdue_from_personal_brief_accounts(accounts)
-    credit_lines = _personal_brief_credit_lines(accounts)
     summary_text = _summary_source_text(document, text, document.full_text)
     source_summary = _personal_brief_summary_from_canonical_tables(
         table_view,
@@ -1513,6 +1628,7 @@ def extract_personal_brief_semantic_document(
         table_view,
         summary_text,
         expected_account_count=None,
+        parsed_summary=source_summary,
     )
     summary_components = [
         component
@@ -1614,46 +1730,23 @@ def extract_personal_brief_semantic_document(
         "canonical_ir_schema_version": document.schema_version,
     }
     facts = {key: value for key, value in facts.items() if value not in (None, "")}
-    collections = {
-        "credit_accounts": accounts,
-        "credit_lines": credit_lines,
-        "repayment_liability_records": liabilities,
-        "repayment_records": [],
-        "overdue_records": overdue,
-        "inquiry_records": inquiries,
-        "public_records": public_datasets.get("public_records", []),
-    }
-    audit = _build_audit(
-        parse_result=document,
-        full_text=document.full_text,
-        report_subtype="personal_brief",
-        content_mode=content_mode,
-        collections=collections,
-        conflicts=[],
-        credit_summary=credit_summary,
-    )
     completeness = _dataset_completeness(document, datasets, credit_summary)
     extraction = _extraction_report(document, datasets, completeness)
-    if extraction["failures"]:
-        audit["issues"] = list(
-            dict.fromkeys(
-                [
-                    *list(audit.get("issues") or []),
-                    *[
-                        f"canonical_extraction:{failure['code']}"
-                        for failure in extraction["failures"]
-                    ],
-                ]
-            )
-        )
-        audit["status"] = "review"
     return PersonalBriefSemanticDocument(
         facts=facts,
         datasets=datasets,
         credit_summary=credit_summary,
-        credit_extraction_audit=audit,
+        credit_extraction_audit=None,
         extraction_report=extraction,
         dataset_completeness=completeness,
+        credit_extraction_audit_factory=partial(
+            _build_personal_brief_compatibility_audit,
+            document,
+            content_mode=content_mode,
+            datasets=datasets,
+            credit_summary=credit_summary,
+            extraction_report=extraction,
+        ),
     )
 
 
@@ -1670,8 +1763,6 @@ def run_personal_brief_pipeline(
     return PersonalBriefPipelineArtifacts(
         document_ir=document,
         semantic_document=semantic,
-        ir_debug_json=document.to_debug_json(),
-        semantic_debug_json=semantic.to_debug_json(),
     )
 
 

@@ -16,10 +16,16 @@ from docmirror.plugins.bank_statement.canonical_quality import (
 )
 
 
-def _physical_table(headers: list[str], rows: list[list[str]]) -> SimpleNamespace:
+def _physical_table(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    metadata: dict | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         headers=headers,
         rows=[SimpleNamespace(cells=[SimpleNamespace(text=value) for value in row]) for row in rows],
+        metadata=metadata or {},
     )
 
 
@@ -60,6 +66,44 @@ def test_physical_estimate_does_not_trust_isolated_transaction_shaped_header() -
     )
 
     assert physical_transaction_row_estimate(parse_result) == 0
+
+
+def test_physical_estimate_counts_explicit_data_row_header_without_sibling_schema() -> None:
+    transaction_header = ["20231002", "网银费用", "-25.00", "1,547.50", "对公收入"]
+    parse_result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                tables=[
+                    _physical_table(
+                        transaction_header,
+                        [["20231007", "商户清算", "3,830.40", "5,377.90", "商户清算款项"]],
+                        metadata={"header_source": "data_row", "preserve_headers": False},
+                    )
+                ]
+            )
+        ]
+    )
+
+    assert physical_transaction_row_estimate(parse_result) == 2
+
+
+def test_physical_estimate_requires_explicit_false_preserve_headers_flag() -> None:
+    transaction_header = ["20231002", "网银费用", "-25.00", "1,547.50", "对公收入"]
+    parse_result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                tables=[
+                    _physical_table(
+                        transaction_header,
+                        [["20231007", "商户清算", "3,830.40", "5,377.90", "商户清算款项"]],
+                        metadata={"header_source": "data_row"},
+                    )
+                ]
+            )
+        ]
+    )
+
+    assert physical_transaction_row_estimate(parse_result) == 1
 
 
 def test_physical_estimate_requires_matching_source_schema_width() -> None:

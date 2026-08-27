@@ -1243,6 +1243,98 @@ def test_residence_phone_accepts_only_registered_presentation_separators() -> No
     assert records[0]["canonical_raw"]["residential_phone"] == "(010) 12345678"
 
 
+def test_lin_shaped_isolated_address_header_residue_preserves_residence_rows() -> None:
+    rows = [
+        ["编号", "居住地址 G", "住宅电话", "居住状况", "信息更新日期"],
+        ["1", "福建省厦门市湖里区凯悦新城49栋702", "13960812955", "自置", "2022.04.28"],
+        ["2", "鼓楼区华林路84号5座104单元", "059187582350", "亲属楼宇", "2022.03.29"],
+        ["3", "中国福建省福州市仓山区金山碧水三期冬馨苑17号楼501单元", "", "按揭", "2022.02.11"],
+        ["4", "仓山区中庚城19号楼704", "-", "租房", "2021.09.27"],
+        ["5", "福建省福州市仓山区泸滨路中庚城19号楼704", '"', "自置", "2021.09.26"],
+    ]
+    metadata = _exact_grid_metadata(
+        rows,
+        widths=[22.5, 160.0, 56.0, 55.0, 58.0],
+    )
+    metadata["canonical_template_id"] = "unresolved"
+    geometry = metadata["geometry"]
+    assert isinstance(geometry, dict)
+    geometry["cell_evidence_ids"][0][1] = [
+        "ocr:sp0001:lp0002:0002",
+        "ocr:sp0001:lp0002:0006",
+    ]
+    geometry["cell_token_ids"][0][1] = list(
+        geometry["cell_evidence_ids"][0][1]
+    )
+    table = SimpleNamespace(
+        table_id="pt_2_0",
+        metadata=metadata,
+        headers=[],
+        rows=[],
+        bbox=[52.5, 57.5, 404.0, 142.5],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=1,
+                canonical_template_id="unresolved",
+                tables=[table],
+                texts=[],
+            )
+        ],
+        tables_continue=lambda _left, _right: False,
+    )
+
+    records = _extract_raw_residence_records(result)
+
+    assert [record["sequence"] for record in records] == [1, 2, 3, 4, 5]
+    assert records[-1]["address"] == "福建省福州市仓山区泸滨路中庚城19号楼704"
+    assert "residential_phone" not in records[-1]
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("two_letters", "han_residue", "inexact_geometry", "duplicate_evidence"),
+)
+def test_residence_address_header_residue_repair_fails_closed(defect: str) -> None:
+    rows = [
+        ["编号", "居住地址 G", "住宅电话", "居住状况", "信息更新日期"],
+        ["1", "某市某区泛化路1号", "--", "自置", "2025.02.01"],
+    ]
+    if defect == "two_letters":
+        rows[0][1] = "居住地址 GG"
+    elif defect == "han_residue":
+        rows[0][1] = "居住地址 甲"
+    metadata = _exact_grid_metadata(rows)
+    metadata["canonical_template_id"] = "unresolved"
+    geometry = metadata["geometry"]
+    assert isinstance(geometry, dict)
+    if defect == "inexact_geometry":
+        geometry["cell_geometry_status"][0][1] = "derived"
+    elif defect == "duplicate_evidence":
+        geometry["cell_evidence_ids"][0][1] = geometry["cell_evidence_ids"][0][0]
+    table = SimpleNamespace(
+        table_id=f"residence-address-header-{defect}",
+        metadata=metadata,
+        headers=[],
+        rows=[],
+    )
+    result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(
+                page_number=2,
+                source_page_number=1,
+                canonical_template_id="unresolved",
+                tables=[table],
+            )
+        ],
+        tables_continue=lambda _left, _right: False,
+    )
+
+    assert _extract_raw_residence_records(result) == []
+
+
 def test_employment_fragments_join_by_header_columns_and_printed_sequence() -> None:
     basic = SimpleNamespace(
         table_id="employment-basic",

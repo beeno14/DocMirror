@@ -237,10 +237,11 @@ def test_digital_enterprise_accuracy_schema_contract(
     assert "public_record_type_counts" not in summary
     assert "attachment_credit_detail_count" not in summary
 
+    assert payload["schema"]["version"] == "4.0.0"
     for dataset in payload["datasets"]:
         columns = dictionary["datasets"].get(dataset["name"], {}).get("columns", {})
         for row in dataset["rows"]:
-            assert {"normalized", "raw", "canonical_raw"} <= set(row)
+            assert set(row) == {"record_id", "normalized", "source"}
             assert not any(
                 isinstance(value, (dict, list))
                 for value in row["normalized"].values()
@@ -258,6 +259,12 @@ def test_digital_enterprise_accuracy_schema_contract(
                     assert isinstance(value, bool)
                 elif field_type in {"string", "text", "date", "datetime", "long_id"}:
                     assert isinstance(value, str)
+
+    assert all(
+        {"normalized", "raw", "canonical_raw"} <= set(row)
+        for dataset in semantic["datasets"]
+        for row in dataset["rows"]
+    )
 
 
 def test_personal_brief_display_sample_projects_complete_business_schema() -> None:
