@@ -145,6 +145,7 @@ def test_all_editions_share_one_post_seal_plugin_registry(monkeypatch) -> None:
 
     assert registry.list_domains() == {
         "alipay_payment": ["community"],
+        "audit_report": ["community"],
         "balance_sheet": ["community"],
         "bank_reconciliation": ["community"],
         "bank_statement": ["community", "enterprise", "finance"],
