@@ -85,10 +85,23 @@ class CommunityProjector:
 
         if not isinstance(sealed, SealedParseResult):
             raise TypeError(f"{type(self).__name__}.project expects SealedParseResult")
-        if not self.supports(sealed) and self.domain_name != "generic":
+        default_support = getattr(self.supports, "__func__", None) is CommunityProjector.supports
+        if not default_support and not self.supports(sealed) and self.domain_name != "generic":
             return None
         before = sealed.integrity_fingerprint
         read_view = sealed.to_read_view()
+        if default_support:
+            document_type = str(read_view.entities.document_type or "")
+            supported = (
+                document_type in {"", "generic", "unknown"}
+                if self.domain_name == "generic"
+                else document_type == self.domain_name
+            )
+            # Extension/instance support hooks retain their original decision
+            # above. The default path inspects this view instead of creating
+            # another complete view just to read one scalar routing field.
+            if not supported and self.domain_name != "generic":
+                return None
         derived = self.derive(
             read_view,
             str(read_view.full_text or read_view.raw_text or ""),

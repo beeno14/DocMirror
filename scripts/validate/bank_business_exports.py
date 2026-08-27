@@ -5,10 +5,38 @@ from __future__ import annotations
 import copy
 import csv
 import io
+import re
+import unicodedata
 from collections import defaultdict
 from typing import Any
 
-from docmirror.output.bank_business_view import EXTRACTION_FIELDS, INTERNAL_ROW_FIELDS
+from docmirror.output.bank_business_view import INTERNAL_ROW_FIELDS
+
+# Deliberately separate from the production filter: the auditor permits only
+# these named page-local header fields to disappear, never arbitrary amounts.
+_PAGE_ONLY_LABELS = {
+    "本页支出笔数", "本页收入笔数", "本页借方笔数", "本页贷方笔数", "本页交易笔数",
+    "本页支出算数合计", "本页支出算术合计", "本页收入算数合计", "本页收入算术合计",
+    "本页支出合计", "本页收入合计", "本页借方合计", "本页贷方合计",
+    "本页支出金额合计", "本页收入金额合计", "本页借方金额合计", "本页贷方金额合计",
+    "pagedebittotal", "pagecredittotal", "pageexpensetotal", "pageincometotal",
+    "pagedebitcount", "pagecreditcount", "pageexpensecount", "pageincomecount",
+    "pagetransactioncount", "页码", "页号", "pagenumber", "source_header_page_label",
+}
+
+
+def _allowed_omission(dataset_name: str, key: str, descriptor: dict) -> bool:
+    if key in INTERNAL_ROW_FIELDS:
+        return True
+    if dataset_name != "statement_header":
+        return False
+    names = (key, descriptor.get("source_header", ""), descriptor.get("label", ""))
+    return any(re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(name))).strip(":").casefold()
+               in _PAGE_ONLY_LABELS for name in names)
+
+
+def _business_descriptor(column: dict) -> dict:
+    return {key: value for key, value in column.items() if key not in {"raw_available", "evidence_available"}}
 
 
 def evidence_delivery(evidence: dict) -> dict:
@@ -34,9 +62,11 @@ def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
     equal(original.get("warnings") or [], cleaned.get("extraction", {}).get("warnings"), "warnings")
     expected_sections = copy.deepcopy(original["sections"])
     for section in expected_sections:
-        section["items"] = [item for item in section["items"] if item["key"] not in EXTRACTION_FIELDS]
+        section["items"] = [item for item in section["items"]
+                            if not _allowed_omission("statement_header", item["key"], item)]
         for group in section["groups"]:
-            group["items"] = [item for item in group["items"] if item["key"] not in EXTRACTION_FIELDS]
+            group["items"] = [item for item in group["items"]
+                              if not _allowed_omission("statement_header", item["key"], item)]
         section["groups"] = [group for group in section["groups"] if group["items"]]
     equal(expected_sections, cleaned["sections"], "scalar business facts")
     if len(original["datasets"]) != len(cleaned["datasets"]):
@@ -46,13 +76,19 @@ def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
             equal(before.get(key), after.get(key), f"dataset {key}")
         if len(before["rows"]) != len(after["rows"]):
             raise AssertionError("business export changed row count")
-        standard = {column["key"]: column for column in before["columns"] if column["key"] not in INTERNAL_ROW_FIELDS}
+        if {"storage_role", "record_path"}.intersection(after):
+            raise AssertionError("internal storage metadata survived into the business dataset")
+        declared = {column["key"]: column for column in before["columns"]}
+        standard = {key: _business_descriptor(column) for key, column in declared.items()
+                    if not _allowed_omission(before["name"], key, column)}
         promoted = {}
         actual_columns = {}
         for column in after["columns"]:
             key = column["key"]
-            if key in actual_columns or key in INTERNAL_ROW_FIELDS:
+            if key in actual_columns or _allowed_omission(after["name"], key, column):
                 raise AssertionError("duplicate or intermediate business column")
+            if {"raw_available", "evidence_available"}.intersection(column):
+                raise AssertionError("internal availability flags survived into the business catalog")
             actual_columns[key] = column
             if key in standard:
                 equal(standard[key], column, "existing business column")
@@ -69,12 +105,19 @@ def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
         record_ids = []
         for before_row, after_row in zip(before["rows"], after["rows"], strict=True):
             expected_values = {key: copy.deepcopy(value) for key, value in before_row["normalized"].items()
-                               if key not in INTERNAL_ROW_FIELDS}
+                               if not _allowed_omission(before["name"], key, declared.get(key, {}))}
             occurrences: dict[str, int] = defaultdict(int)
             for item in before_row["normalized"].get("additional_fields") or []:
                 name = item["name"]
                 occurrences[name] += 1
                 identity = (name, occurrences[name])
+                # A literal source label matching a reserved implementation key
+                # is still a business field. Only explicit page summaries in
+                # statement headers may be omitted from source promotions.
+                if before["name"] == "statement_header" and _allowed_omission(
+                    "statement_header", "", {"source_header": name}
+                ):
+                    continue
                 if identity not in promoted:
                     raise AssertionError("source business field is missing from named columns")
                 key = promoted[identity]
@@ -115,7 +158,9 @@ def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
         equal([column["key"] for column in by_id[table["dataset_id"]]["columns"]], table["column_keys"], "reading columns")
 
 
-def assert_business_csv_conservation(original: str, cleaned: str, dataset: dict) -> None:
+def assert_business_csv_conservation(
+    original: str, cleaned: str, dataset: dict, *, original_dataset: dict | None = None
+) -> None:
     """Only absent/technical columns disappear; source-labelled columns replace the wrapper."""
     from scripts.validate.bank_compact_exports import _first_difference
 
@@ -124,9 +169,10 @@ def assert_business_csv_conservation(original: str, cleaned: str, dataset: dict)
     if len(before) != len(after):
         raise AssertionError("business CSV changed row count")
     source_columns = {column["key"] for column in dataset["columns"] if "source_header" in column}
+    declared = {column["key"]: column for column in (original_dataset or dataset)["columns"]}
     for old_row, new_row in zip(before, after, strict=True):
         for key, value in old_row.items():
-            if key in INTERNAL_ROW_FIELDS:
+            if _allowed_omission(dataset["name"], key, declared.get(key, {})):
                 continue
             if key not in new_row:
                 if value != "":
@@ -165,7 +211,7 @@ def assert_business_markdown_values(payload: dict, markdown: str) -> None:
         for row in dataset["rows"]:
             for value in row["normalized"].values():
                 check(value)
-        if any(column["key"] in INTERNAL_ROW_FIELDS for column in dataset["columns"]):
+        if any(_allowed_omission(dataset["name"], column["key"], column) for column in dataset["columns"]):
             raise AssertionError("intermediate field survived into the reading catalog")
     for section in payload["sections"]:
         items = [*section["items"], *(item for group in section["groups"] for item in group["items"])]

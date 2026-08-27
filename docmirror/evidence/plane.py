@@ -11,6 +11,7 @@ semantics.
 from __future__ import annotations
 
 import csv
+import logging
 import os
 import xml.etree.ElementTree as ET
 import zipfile
@@ -225,6 +226,11 @@ class _EvidenceIdFactory:
 
 class EvidencePlaneBuilder:
     """Build an EvidencePlane from supported sources."""
+
+    def __init__(self, *, max_page_workers: int = 1) -> None:
+        self.max_page_workers = max(1, int(max_page_workers))
+        # Execution diagnostics deliberately stay outside canonical evidence.
+        self.execution_stats: dict[str, Any] = {}
 
     def build(self, source: Any) -> EvidencePlane:
         document_source = DocumentSource.from_any(source)
@@ -706,7 +712,6 @@ class EvidencePlaneBuilder:
 
     def _from_pdf_path_pymupdf(self, source: DocumentSource) -> EvidencePlane:
         path = Path(source.value)
-        ids = _EvidenceIdFactory()
         pages: list[EvidencePage] = []
         evidence = EvidenceStore()
         diagnostics: list[dict[str, Any]] = []
@@ -733,138 +738,13 @@ class EvidencePlaneBuilder:
             return plane
 
         try:
-            for page_index, page in enumerate(doc):
-                page_number = page_index + 1
-                page_id = _page_id(page_number)
-                watermark_line_keys = _pymupdf_watermark_line_keys(page)
-                suppressed_watermark_words = 0
-                rect = page.rect
-                rotation = _normalized_rotation(getattr(page, "rotation", 0))
-                page_w = float(rect.width)
-                page_h = float(rect.height)
-                coordinate_transform = _coordinate_transform(page_w, page_h, rotation)
-                page_record = EvidencePage(
-                    page_id=page_id,
-                    page_index=page_index,
-                    page_number=page_number,
-                    width=page_w,
-                    height=page_h,
-                    original_rotation=rotation,
-                    normalized_rotation=0,
-                    coordinate_transform=coordinate_transform,
-                    normalization_trace=_normalization_trace_from_transform(
-                        page_id=page_id,
-                        width=page_w,
-                        height=page_h,
-                        rotation=rotation,
-                        coordinate_transform=coordinate_transform,
-                    ),
-                    content_mode="native_text",
-                )
-                page_text_start = len(evidence.text_atoms)
-                page_vector_start = len(evidence.vector_atoms)
-
-                for word in page.get_text("words") or []:
-                    x0, y0, x1, y1, text, block_no, line_no, word_no = word[:8]
-                    if (int(block_no), int(line_no)) in watermark_line_keys:
-                        suppressed_watermark_words += 1
-                        continue
-                    source_bbox = [float(x0), float(y0), float(x1), float(y1)]
-                    bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation)
-                    atom = _text_atom(
-                        ids,
-                        page_number=page_number,
-                        source_kind="pdf_native",
-                        text=str(text),
-                        bbox=bbox,
-                        confidence=1.0,
-                        source_refs=[],
-                        metadata={
-                            "block_no": int(block_no),
-                            "line_no": int(line_no),
-                            "word_no": int(word_no),
-                        },
-                        source_bbox=source_bbox,
-                        coordinate_transform=coordinate_transform,
-                    )
-                    if atom:
-                        evidence.text_atoms.append(atom)
-                        page_record.evidence_ids.append(atom.id)
-
-                for drawing_index, drawing in enumerate(page.get_drawings() or []):
-                    source_bbox = _rect_bbox(drawing.get("rect"))
-                    if not source_bbox:
-                        continue
-                    bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation)
-                    atom = EvidenceAtom(
-                        id=ids.next(page_number, "vector"),
-                        kind="rectangle",
-                        source_kind="pdf_vector",
-                        page_id=page_id,
-                        bbox=bbox,
-                        source_bbox=source_bbox,
-                        coordinate_transform=coordinate_transform,
-                        confidence=1.0,
-                        metadata={
-                            "drawing_index": drawing_index,
-                            "drawing_type": drawing.get("type", ""),
-                            "geometry": _pdf_drawing_geometry(drawing),
-                        },
-                    )
-                    evidence.vector_atoms.append(atom)
-                    page_record.evidence_ids.append(atom.id)
-
-                try:
-                    image_infos = page.get_image_info(xrefs=True) or []
-                except Exception:
-                    image_infos = []
-                for image_index, info in enumerate(image_infos):
-                    source_bbox = _bbox(info.get("bbox"))
-                    bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation) if source_bbox else None
-                    atom = EvidenceAtom(
-                        id=ids.next(page_number, "image"),
-                        kind="embedded_image",
-                        source_kind="pdf_image",
-                        page_id=page_id,
-                        bbox=bbox,
-                        source_bbox=source_bbox,
-                        coordinate_transform=coordinate_transform,
-                        confidence=1.0,
-                        metadata={
-                            "image_index": image_index,
-                            "xref": info.get("xref"),
-                            "width": info.get("width"),
-                            "height": info.get("height"),
-                        },
-                    )
-                    evidence.image_atoms.append(atom)
-                    page_record.evidence_ids.append(atom.id)
-
-                from docmirror.tables.native_pdf_candidates import extract_pymupdf_table_candidates
-
-                page_candidates = extract_pymupdf_table_candidates(
-                    page,
-                    page_number=page_number,
-                    page_id=page_id,
-                    normalize_bbox=lambda value: _normalize_bbox(value, page_w, page_h, rotation),
-                    text_atoms=evidence.text_atoms[page_text_start:],
-                    vector_atoms=evidence.vector_atoms[page_vector_start:],
-                    prefer_owned_text=bool(watermark_line_keys),
-                )
-                table_candidates.extend(page_candidates)
-                if suppressed_watermark_words:
-                    diagnostics.append(
-                        {
-                            "severity": "info",
-                            "message": "suppressed translucent PDF watermark text",
-                            "page_number": page_number,
-                            "word_count": suppressed_watermark_words,
-                        }
-                    )
-
-                if not page_record.evidence_ids:
-                    page_record.content_mode = "unknown"
-                pages.append(page_record)
+            for extracted in _iter_native_pdf_pages(path, doc, self.max_page_workers, self.execution_stats):
+                pages.append(extracted.page)
+                evidence.text_atoms.extend(extracted.evidence.text_atoms)
+                evidence.vector_atoms.extend(extracted.evidence.vector_atoms)
+                evidence.image_atoms.extend(extracted.evidence.image_atoms)
+                table_candidates.extend(extracted.table_candidates)
+                diagnostics.extend(extracted.diagnostics)
         finally:
             doc.close()
 
@@ -1042,6 +922,243 @@ class EvidencePlaneBuilder:
             content_mode="native_text",
             diagnostics=diagnostics,
         )
+
+
+@dataclass
+class _NativePDFPage:
+    page: EvidencePage
+    evidence: EvidenceStore
+    table_candidates: list[dict[str, Any]]
+    diagnostics: list[dict[str, Any]]
+
+
+def _extract_native_pdf_page(page: Any, page_index: int) -> _NativePDFPage:
+    """Original page extraction; IDs are scoped to source page and atom kind."""
+    ids = _EvidenceIdFactory()
+    evidence = EvidenceStore()
+    table_candidates: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    page_number = page_index + 1
+    page_id = _page_id(page_number)
+    watermark_line_keys = _pymupdf_watermark_line_keys(page)
+    suppressed_watermark_words = 0
+    rect = page.rect
+    rotation = _normalized_rotation(getattr(page, "rotation", 0))
+    page_w = float(rect.width)
+    page_h = float(rect.height)
+    coordinate_transform = _coordinate_transform(page_w, page_h, rotation)
+    page_record = EvidencePage(
+        page_id=page_id,
+        page_index=page_index,
+        page_number=page_number,
+        width=page_w,
+        height=page_h,
+        original_rotation=rotation,
+        normalized_rotation=0,
+        coordinate_transform=coordinate_transform,
+        normalization_trace=_normalization_trace_from_transform(
+            page_id=page_id,
+            width=page_w,
+            height=page_h,
+            rotation=rotation,
+            coordinate_transform=coordinate_transform,
+        ),
+        content_mode="native_text",
+    )
+    page_text_start = len(evidence.text_atoms)
+    page_vector_start = len(evidence.vector_atoms)
+
+    for word in page.get_text("words") or []:
+        x0, y0, x1, y1, text, block_no, line_no, word_no = word[:8]
+        if (int(block_no), int(line_no)) in watermark_line_keys:
+            suppressed_watermark_words += 1
+            continue
+        source_bbox = [float(x0), float(y0), float(x1), float(y1)]
+        bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation)
+        atom = _text_atom(
+            ids,
+            page_number=page_number,
+            source_kind="pdf_native",
+            text=str(text),
+            bbox=bbox,
+            confidence=1.0,
+            source_refs=[],
+            metadata={
+                "block_no": int(block_no),
+                "line_no": int(line_no),
+                "word_no": int(word_no),
+            },
+            source_bbox=source_bbox,
+            coordinate_transform=coordinate_transform,
+        )
+        if atom:
+            evidence.text_atoms.append(atom)
+            page_record.evidence_ids.append(atom.id)
+
+    drawings = page.get_drawings() or []
+    for drawing_index, drawing in enumerate(drawings):
+        source_bbox = _rect_bbox(drawing.get("rect"))
+        if not source_bbox:
+            continue
+        bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation)
+        atom = EvidenceAtom(
+            id=ids.next(page_number, "vector"),
+            kind="rectangle",
+            source_kind="pdf_vector",
+            page_id=page_id,
+            bbox=bbox,
+            source_bbox=source_bbox,
+            coordinate_transform=coordinate_transform,
+            confidence=1.0,
+            metadata={
+                "drawing_index": drawing_index,
+                "drawing_type": drawing.get("type", ""),
+                "geometry": _pdf_drawing_geometry(drawing),
+            },
+        )
+        evidence.vector_atoms.append(atom)
+        page_record.evidence_ids.append(atom.id)
+
+    try:
+        image_infos = page.get_image_info(xrefs=True) or []
+    except Exception:
+        image_infos = []
+    for image_index, info in enumerate(image_infos):
+        source_bbox = _bbox(info.get("bbox"))
+        bbox = _normalize_bbox(source_bbox, page_w, page_h, rotation) if source_bbox else None
+        atom = EvidenceAtom(
+            id=ids.next(page_number, "image"),
+            kind="embedded_image",
+            source_kind="pdf_image",
+            page_id=page_id,
+            bbox=bbox,
+            source_bbox=source_bbox,
+            coordinate_transform=coordinate_transform,
+            confidence=1.0,
+            metadata={
+                "image_index": image_index,
+                "xref": info.get("xref"),
+                "width": info.get("width"),
+                "height": info.get("height"),
+            },
+        )
+        evidence.image_atoms.append(atom)
+        page_record.evidence_ids.append(atom.id)
+
+    from docmirror.tables.native_pdf_candidates import extract_pymupdf_table_candidates
+
+    page_candidates = extract_pymupdf_table_candidates(
+        page,
+        page_number=page_number,
+        page_id=page_id,
+        normalize_bbox=lambda value: _normalize_bbox(value, page_w, page_h, rotation),
+        text_atoms=evidence.text_atoms[page_text_start:],
+        vector_atoms=evidence.vector_atoms[page_vector_start:],
+        prefer_owned_text=bool(watermark_line_keys),
+        paths=drawings,
+    )
+    table_candidates.extend(page_candidates)
+    if suppressed_watermark_words:
+        diagnostics.append(
+            {
+                "severity": "info",
+                "message": "suppressed translucent PDF watermark text",
+                "page_number": page_number,
+                "word_count": suppressed_watermark_words,
+            }
+        )
+
+    if not page_record.evidence_ids:
+        page_record.content_mode = "unknown"
+    return _NativePDFPage(page_record, evidence, table_candidates, diagnostics)
+
+
+def _extract_native_pdf_chunk(path: str, start: int, stop: int) -> list[_NativePDFPage]:
+    """Spawn-safe worker: never transfer a live PDF handle between processes."""
+    import fitz
+
+    with fitz.open(path) as document:
+        return [_extract_native_pdf_page(document[index], index) for index in range(start, stop)]
+
+
+def _iter_native_pdf_pages(
+    path: Path,
+    document: Any,
+    requested_workers: int,
+    stats: dict[str, Any],
+):
+    """Bound memory, preserve source order, and retry failed chunks serially once."""
+    import multiprocessing
+    from collections import deque
+    from concurrent.futures import Future, ProcessPoolExecutor
+
+    from docmirror.configs.runtime.performance import process_worker_allocation
+
+    page_count = len(document)
+    workers = min(max(1, requested_workers), 4, max(1, os.cpu_count() or 1), page_count or 1)
+    stats.update(mode="serial", workers=1, chunks=0, fallback_chunks=0)
+    if workers <= 1 or page_count < 4 or multiprocessing.current_process().daemon:
+        for index, page in enumerate(document):
+            yield _extract_native_pdf_page(page, index)
+        return
+
+    logger = logging.getLogger(__name__)
+    with process_worker_allocation(workers) as granted:
+        if granted <= 1:
+            for index, page in enumerate(document):
+                yield _extract_native_pdf_page(page, index)
+            return
+        try:
+            pool = ProcessPoolExecutor(
+                max_workers=granted,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+        except Exception as exc:
+            logger.warning("Native page pool unavailable; using sequential extraction: %s", exc)
+            stats["fallback_chunks"] += 1
+            for index, page in enumerate(document):
+                yield _extract_native_pdf_page(page, index)
+            return
+
+        stats.update(mode="process", workers=granted)
+        # At most two small chunks per worker are in flight. Ordered consumption
+        # preserves page/table/atom IDs even when later pages complete first.
+        chunk_size = min(4, max(1, (page_count + granted - 1) // granted))
+        ranges = iter((start, min(start + chunk_size, page_count)) for start in range(0, page_count, chunk_size))
+        pending: Any = deque()
+
+        def submit_next() -> bool:
+            bounds = next(ranges, None)
+            if bounds is None:
+                return False
+            start, stop = bounds
+            try:
+                future = pool.submit(_extract_native_pdf_chunk, str(path), start, stop)
+            except Exception as exc:
+                future = Future()
+                future.set_exception(exc)
+            pending.append((start, stop, future))
+            stats["chunks"] += 1
+            return True
+
+        try:
+            for _ in range(granted * 2):
+                if not submit_next():
+                    break
+            while pending:
+                start, stop, future = pending.popleft()
+                try:
+                    extracted = future.result()
+                    if [item.page.page_index for item in extracted] != list(range(start, stop)):
+                        raise ValueError("native worker returned incomplete or reordered pages")
+                except Exception as exc:
+                    logger.warning("Native page chunk %s:%s failed; retrying serially: %s", start, stop, exc)
+                    stats["fallback_chunks"] += 1
+                    extracted = [_extract_native_pdf_page(document[index], index) for index in range(start, stop)]
+                yield from extracted
+                submit_next()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _pymupdf_watermark_line_keys(page: Any) -> set[tuple[int, int]]:

@@ -77,11 +77,18 @@ def _write_community_bundle_files(
         "enhanced_reading": task_dir / f"{file_id}_enhanced_reading.md",
         "datasets": task_dir / f"{file_id}_datasets",
     }
-    content = bundle.render_markdown()
+    business_output = bundle.compact_output.get("business_view") is True
+    # Legacy source rendering can add image-omission warnings before projection.
+    content = "" if business_output else bundle.render_markdown()
     semantic_payload = bundle.semantic_payload()
-    enhanced_reading = bundle.render_enhanced_markdown(semantic_payload)
     community_payload = bundle.json_payload(semantic_payload)
-    dataset_csvs = bundle.render_dataset_csvs(semantic_payload)
+    if business_output:
+        enhanced_reading = bundle.render_enhanced_markdown(semantic_payload, public_payload=community_payload)
+        content = enhanced_reading
+        dataset_csvs = bundle.render_dataset_csvs(semantic_payload, public_payload=community_payload)
+    else:
+        enhanced_reading = bundle.render_enhanced_markdown(semantic_payload)
+        dataset_csvs = bundle.render_dataset_csvs(semantic_payload)
     semantic_validation = validate_projection_payload("community_semantic", semantic_payload)
     if not semantic_validation.valid:
         raise ValueError("Community semantic schema validation failed: " + "; ".join(semantic_validation.errors))

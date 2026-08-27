@@ -915,9 +915,16 @@ def _join_native_words(words: list[str]) -> str:
     return out
 
 
-def _native_table_blocks(plane: Any, *, page_id: str, page_number: int) -> list[Block]:
+def _native_table_blocks(
+    plane: Any,
+    *,
+    page_id: str,
+    page_number: int,
+    candidates: list[dict[str, Any]] | None = None,
+) -> list[Block]:
     """Project EvidencePlane table candidates into physical canonical blocks."""
-    candidates = list((getattr(plane.evidence, "indexes", None) or {}).get("table_candidates") or [])
+    if candidates is None:
+        candidates = list((getattr(plane.evidence, "indexes", None) or {}).get("table_candidates") or [])
     blocks: list[Block] = []
     for candidate in candidates:
         if str(candidate.get("page_id") or "") != page_id:
@@ -1124,6 +1131,7 @@ class CoreExtractor:
         self._seal_detector_fn = seal_detector_fn
         self._layout_detector = None
         self._max_page_concurrency = resolve_max_page_concurrency(max_page_concurrency)
+        self.native_page_execution_stats: dict[str, Any] = {}
         self._model_render_dpi = model_render_dpi
 
         # Formula recognition engine (Strategy pattern: UniMERNet ONNX > rapid_latex_ocr > empty)
@@ -1179,7 +1187,9 @@ class CoreExtractor:
         on_progress = options.get("on_progress")
         if on_progress:
             on_progress("load_document", 0.0, "Loading document evidence...")
-        plane = await asyncio.to_thread(EvidencePlaneBuilder().build, str(file_path))
+        builder = EvidencePlaneBuilder(max_page_workers=self._max_page_concurrency)
+        plane = await asyncio.to_thread(builder.build, str(file_path))
+        self.native_page_execution_stats = dict(getattr(builder, "execution_stats", {}))
         selected_indices = _selected_page_indices(plane, parse_policy)
         selected_pages = [page for page in plane.pages if page.page_index in selected_indices]
         selected_page_count = len(selected_pages)
@@ -1222,6 +1232,16 @@ class CoreExtractor:
         native_text_ocr_failed_pages: list[int] = []
         completed_page_count = 0
 
+        # Reuse page-local views of the unchanged evidence. Previously each
+        # page scanned all document atoms and all native table candidates.
+        native_atoms_by_page: dict[str, list[Any]] = {}
+        for atom in plane.evidence.text_atoms:
+            if str(atom.text or "").strip():
+                native_atoms_by_page.setdefault(atom.page_id, []).append(atom)
+        native_tables_by_page: dict[str, list[dict[str, Any]]] = {}
+        for candidate in (getattr(plane.evidence, "indexes", None) or {}).get("table_candidates") or []:
+            native_tables_by_page.setdefault(str(candidate.get("page_id") or ""), []).append(candidate)
+
         def report_page_complete() -> None:
             nonlocal completed_page_count
             completed_page_count += 1
@@ -1238,11 +1258,7 @@ class CoreExtractor:
                 continue
             source_page_number = int(page.page_number)
             logical_start = spread_plan.logical_start_for(source_page_number)
-            page_atoms = [
-                atom
-                for atom in plane.evidence.text_atoms
-                if atom.page_id == page.page_id and str(atom.text or "").strip()
-            ]
+            page_atoms = native_atoms_by_page.get(page.page_id, [])
             blocks = _native_text_blocks(page_atoms, page_number=logical_start)
             split_decision = spread_plan.decision_for(source_page_number)
             if not bool(getattr(split_decision, "should_split", False)):
@@ -1251,6 +1267,7 @@ class CoreExtractor:
                         plane,
                         page_id=page.page_id,
                         page_number=logical_start,
+                        candidates=native_tables_by_page.get(page.page_id, []),
                     )
                 )
             blocks = _canonical_reading_order(blocks)

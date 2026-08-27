@@ -2988,6 +2988,7 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     csv_rows = list(csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff"))))
     audit_rows = list(csv.DictReader(io.StringIO(bundle.render_audit_csv(semantic).lstrip("\ufeff"))))
     markdown = bundle.render_markdown()
+    source_markdown = bundle.render_source_markdown()
 
     record_ids = [row["extraction"]["record_id"] for row in json_rows]
     assert dataset["row_count"] == len(json_rows) == len(csv_rows) == 2
@@ -3012,7 +3013,18 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
     assert first_audit["balance"]["value"] == "1006296.3"
     assert first_audit["balance"]["raw"] == "1006296.\n3"
     assert first_audit["date"]["value"] == "2023-06-28"
-    assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in markdown
+    from scripts.validate.bank_business_exports import assert_business_markdown_values
+
+    assert markdown == bundle.render_enhanced_markdown(semantic)
+    assert_business_markdown_values(payload, markdown)
+    business_rows = [line for line in markdown.splitlines() if line.startswith(("| 13 |", "| 14 |"))]
+    assert len(business_rows) == 2
+    for row, line in zip(json_rows, business_rows, strict=True):
+        for key in ("sequence_no", "date", "amount", "balance", "counter_account", "counter_party"):
+            assert str(row["normalized"][key]) in line
+    assert business_rows[0].startswith("| 13 |")
+    assert business_rows[1].startswith("| 14 |")
+    assert "| 序号 | 交易时间 | 流水号 | 对方账号 | 对方户名 | 支出 | 收入 | 账户余额 | 摘要 | 附言 |" in source_markdown
     first_markdown_row = (
         "| 13 | 2023-06-28 19:50:16 | 1112052 | 727279800000011760 | 江西昌荣供应链有限公司 | "
         " | 1000000 | 1006296.3 | 超网-贷记转入 | 转户 |"
@@ -3021,6 +3033,6 @@ def test_cross_page_records_stay_consistent_across_community_artifacts():
         "| 14 | 2023-06-28 11:24:57 | 1069557 | 727279800000011760 | 江西昌荣供应链有限公司 | "
         "780000 |  | 6296.3 | 超网-贷记转出 | 转户 |"
     )
-    assert first_markdown_row in markdown
-    assert second_markdown_row in markdown
-    assert markdown.index(first_markdown_row) < markdown.index(second_markdown_row)
+    assert first_markdown_row in source_markdown
+    assert second_markdown_row in source_markdown
+    assert source_markdown.index(first_markdown_row) < source_markdown.index(second_markdown_row)

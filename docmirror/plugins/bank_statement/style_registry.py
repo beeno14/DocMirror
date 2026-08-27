@@ -229,6 +229,34 @@ def _expected_rows(ctx: StyleContext) -> int:
 
 
 def _run_parser(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[dict[str, Any]], Any]:
+    from docmirror.plugins.bank_statement.work_cache import active_bank_cache, reuse_bank_work
+
+    if not active_bank_cache(ctx.parse_result):
+        return _run_parser_uncached(parser_id, ctx, plugin)
+    key = (
+        parser_id,
+        id(plugin),
+        tuple(tuple(tuple(row) for row in table) for table in ctx.tables),
+        ctx.full_text,
+        ctx.institution,
+        ctx.institution_authority,
+        ctx.page_count,
+        ctx.prefer_context_tables,
+        ctx.extraction_route,
+        ctx.extraction_policy,
+        tuple(vars(ctx.reconstruction).items()) if ctx.reconstruction is not None else None,
+    )
+    return reuse_bank_work(
+        ctx.parse_result,
+        _run_parser_uncached,
+        key,
+        lambda: _run_parser_uncached(parser_id, ctx, plugin),
+        capture=lambda: ctx.reconstruction,
+        restore=lambda value: setattr(ctx, "reconstruction", value),
+    )
+
+
+def _run_parser_uncached(parser_id: str, ctx: StyleContext, plugin: Any) -> tuple[list[dict[str, Any]], Any]:
     if parser_id == "compact_merged":
         batch = compact_merged.extract_transactions(ctx.tables)
         if batch:

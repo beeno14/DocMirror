@@ -101,6 +101,9 @@
           "warnings": false,
           "datasets": {"items": {"properties": {
             "primary_key": {"const": "extraction.record_id"},
+            "storage_role": false,
+            "record_path": false,
+            "columns": {"items": {"properties": {"raw_available": false, "evidence_available": false}}},
             "rows": {"items": {
               "type": "object",
               "additionalProperties": false,
@@ -118,7 +121,8 @@
                     "classification_source", "doc_type_hint_source", "user_doc_type_hint", "user_doc_type_hint_strength",
                     "mirror_expected_data_rows", "mirror_ltqg_enabled", "mirror_ltqg_export_tables",
                     "mirror_ltqg_passed_tables", "mirror_ltqg_raw_max_rows", "mirror_ltqg_skipped_tables",
-                    "mirror_quarantined_logical_count", "mirror_quarantined_physical_count"
+                    "mirror_quarantined_logical_count", "mirror_quarantined_physical_count",
+                    "counterparty_status", "source_header_page_label"
                   ]}}
                 },
                 "extraction": {"$ref": "#/$defs/recordExtraction"}
@@ -133,6 +137,7 @@
           "extraction": false,
           "datasets": {"items": {"properties": {
             "primary_key": {"const": "record_id"},
+            "columns": {"items": {"required": ["raw_available", "evidence_available"]}},
             "rows": {"items": {"required": ["record_id", "source"]}}
           }}}
         }
@@ -258,7 +263,7 @@
       "column": {
         "type": "object",
         "additionalProperties": true,
-      "required": ["key", "label", "type", "nullable", "raw_available", "evidence_available"],
+      "required": ["key", "label", "type", "nullable"],
       "properties": {
         "key": {"type": "string", "minLength": 1},
         "label": {"type": "string"},

@@ -25,6 +25,7 @@ from typing import Any, Iterable
 
 from docmirror.evidence.repair import RepairRequest
 from docmirror.plugins.bank_statement.header_resolve import has_split_debit_credit_headers, normalize_header_cell
+from docmirror.plugins.bank_statement.work_cache import memoize_bank_document_work
 
 logger = logging.getLogger(__name__)
 
@@ -483,6 +484,7 @@ def _spdb_header_facts_from_source_atoms(parse_result: Any) -> dict[int, tuple[s
     return facts
 
 
+@memoize_bank_document_work
 def page_texts_from_parse_result(parse_result: Any) -> list[tuple[int, str]]:
     """Build page-local text scopes without relying on flattened PDF reading order."""
     if parse_result is None:
@@ -1532,6 +1534,29 @@ def resolve_row_count_evidence(
 
 
 def recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[list[list[str]]]:
+    """Reuse successful native recovery within one unchanged source request."""
+    from docmirror.plugins.bank_statement.work_cache import active_bank_cache, reuse_bank_work
+
+    if not active_bank_cache(parse_result):
+        return _recover_wide_bank_tables(parse_result, full_text)
+    pdf_path = _source_pdf_path(parse_result)
+    if pdf_path is None:
+        return _recover_wide_bank_tables(parse_result, full_text)
+    try:
+        stat = pdf_path.stat()
+        source_key = (str(pdf_path.resolve()), stat.st_size, stat.st_mtime_ns)
+    except (OSError, AttributeError):
+        return _recover_wide_bank_tables(parse_result, full_text)
+    return reuse_bank_work(
+        parse_result,
+        _recover_wide_bank_tables,
+        (source_key, full_text),
+        lambda: _recover_wide_bank_tables(parse_result, full_text),
+        cache_empty=False,
+    )
+
+
+def _recover_wide_bank_tables(parse_result: Any, full_text: str = "") -> list[list[list[str]]]:
     """Return high-confidence wide debit/credit table candidates from source PDF."""
     pdf_path = _source_pdf_path(parse_result)
     if not pdf_path:

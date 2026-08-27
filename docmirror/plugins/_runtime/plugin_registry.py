@@ -72,7 +72,13 @@ class _AliasProjector:
             read_view,
             str(read_view.full_text or read_view.raw_text or ""),
         )
-        derived = derived.model_copy(update={"document_type": self._domain_name})
+        semantic = copy.deepcopy(derived.semantic)
+        compact = semantic.get("compact_output")
+        if self._domain_name != "bank_statement" and isinstance(compact, dict):
+            # The bank-only v5 view cannot describe a different provider's
+            # schema. Aliases keep their existing normalized v4 contract.
+            compact.pop("business_view", None)
+        derived = derived.model_copy(update={"document_type": self._domain_name, "semantic": semantic})
         bundle = project_community_bundle(
             result,
             file_path=file_path,

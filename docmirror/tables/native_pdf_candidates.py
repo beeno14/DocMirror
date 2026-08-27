@@ -26,6 +26,7 @@ def extract_pymupdf_table_candidates(
     text_atoms: Sequence[Any],
     vector_atoms: Sequence[Any],
     prefer_owned_text: bool = False,
+    paths: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Return physical table candidates with exact native cell geometry.
 
@@ -34,7 +35,18 @@ def extract_pymupdf_table_candidates(
     which prevents a page-sized false positive from stealing nested tables.
     """
     try:
-        finder = page.find_tables()
+        # PyMuPDF temporarily transforms rotated pages before finding tables.
+        # Drawings captured before that transform are not interchangeable with
+        # its own paths, so retain the original call on rotated pages.
+        reuse_paths = paths is not None and not getattr(page, "rotation", 0)
+        try:
+            finder = page.find_tables(paths=paths) if reuse_paths else page.find_tables()
+        except TypeError as exc:
+            # Older supported backends and extension page adapters may not
+            # accept this optional optimization. Keep their original behavior.
+            if not reuse_paths or "unexpected keyword argument 'paths'" not in str(exc):
+                raise
+            finder = page.find_tables()
         native_tables = list(getattr(finder, "tables", None) or [])
     except Exception:
         return []

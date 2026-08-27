@@ -15,6 +15,8 @@ from decimal import Decimal, InvalidOperation
 from statistics import median
 from typing import Any
 
+from docmirror.plugins.bank_statement.work_cache import memoize_bank_document_work
+
 _DATE_ANY_RE = re.compile(r"20\d{6}|20\d{2}[-/]\d{1,2}[-/]\d{1,2}")
 _MONEY_RE = re.compile(r"^-?\d[\d,]*\.\d{2}$")
 _MONEY_ANY_RE = re.compile(r"-?\d[\d,]*\.\d{2}")
@@ -156,6 +158,7 @@ class PositionedBlockRecovery:
     expected_rows: int
 
 
+@memoize_bank_document_work
 def recovered_native_datetime_row_evidence(
     parse_result: Any,
     *,
@@ -627,6 +630,7 @@ def _bounded_cib_native_document_coverage(
     return len(ledger_rows), expected_account
 
 
+@memoize_bank_document_work
 def recover_positioned_record_block_bank_tables(
     parse_result: Any,
     *,
@@ -1316,6 +1320,40 @@ def _positioned_block_row_source(
 
 
 def recover_evidence_atom_bank_tables(
+    parse_result: Any,
+    *,
+    source_route: str | None = None,
+) -> list[list[list[str]]]:
+    """Reuse complete recovery results together with their row-source metadata."""
+    from docmirror.plugins.bank_statement.work_cache import reuse_bank_work
+
+    key = _recovery_cache_key(source_route)
+
+    def capture() -> Any:
+        domain = _domain_specific(parse_result)
+        return (key in domain, domain.get(key)) if domain is not None else (False, None)
+
+    def restore(state: Any) -> None:
+        domain = _domain_specific(parse_result)
+        if domain is None:
+            return
+        present, value = state
+        if present:
+            domain[key] = value
+        else:
+            domain.pop(key, None)
+
+    return reuse_bank_work(
+        parse_result,
+        _recover_evidence_atom_bank_tables,
+        source_route,
+        lambda: _recover_evidence_atom_bank_tables(parse_result, source_route=source_route),
+        capture=capture,
+        restore=restore,
+    )
+
+
+def _recover_evidence_atom_bank_tables(
     parse_result: Any,
     *,
     source_route: str | None = None,
@@ -3241,6 +3279,7 @@ def _is_account_bank_compound(value: str) -> bool:
     )
 
 
+@memoize_bank_document_work
 def _atoms_by_page(
     parse_result: Any,
     *,
@@ -3276,6 +3315,7 @@ def _atoms_by_page(
     return dict(grouped)
 
 
+@memoize_bank_document_work
 def _positioned_atoms_by_page(
     parse_result: Any,
     *,

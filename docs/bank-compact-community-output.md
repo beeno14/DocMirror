@@ -22,12 +22,23 @@ type preserves mixed native values, including strings with leading zeros,
 numbers, false, null, lists and objects. Absent schema-only columns disappear
 from the v5 catalog; sparse promoted fields stay sparse on replay.
 
-Enhanced Markdown shows business facts, account information, and transaction
+Both delivered Markdown files (`content.md` and `enhanced_reading.md`) show the
+same business facts, account information, and transaction
 tables. Common account context is shown once above the transaction table.
 Generated IDs, the supplemental-field wrapper, and parser diagnostics are not
 rendered in the business body. A short trailing extraction appendix preserves
 count-verification status and warnings. Values remain unmasked. Dataset CSVs
 follow the business columns; the internal audit CSV is unchanged.
+Generated counterparty-presence statuses, repeated page-number labels, and
+explicit page-local income/expense amounts and counts are not consumer fields.
+Whole-statement totals (including existing sums of explicit page totals),
+transaction amounts/directions, source transaction columns and unknown business
+fields remain unchanged. Page labels are matched exactly in header context;
+the filter never searches transaction cell contents. Internal source evidence
+and `render_source_markdown()` retain the original page summaries.
+The v5 catalog omits raw/evidence-availability flags and redundant storage-path
+metadata. Older v5 deliveries are cleaned on replay; v3/v4 contracts and other
+providers retain their original defaults.
 Source markup is displayed literally, not interpreted as HTML or Markdown.
 Within table cells, `↵` represents an original line break; lists use separators.
 The standalone artifact validator checks v5 identities and HTML-free Markdown

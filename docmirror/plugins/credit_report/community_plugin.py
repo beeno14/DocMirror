@@ -1512,6 +1512,12 @@ class _CreditReportCommunityBundle(CommunityBundle):
 
     def semantic_payload(self) -> dict[str, Any]:
         payload = super().semantic_payload()
+        if getattr(self, "_unvalidated_personal_detail", False):
+            from docmirror.plugins.credit_report.personal_detail_scanned.unvalidated import (
+                omit_validation,
+            )
+
+            return omit_validation(payload)
         domain = payload.get("domain") if isinstance(payload.get("domain"), dict) else {}
         facts = domain.get("facts") if isinstance(domain.get("facts"), dict) else {}
         if facts.get("report_subtype") != "enterprise":
@@ -1542,6 +1548,18 @@ class _CreditReportCommunityBundle(CommunityBundle):
 
     def json_payload(self, semantic: dict[str, Any] | None = None) -> dict[str, Any]:
         semantic_payload = semantic or self.semantic_payload()
+        if getattr(self, "_unvalidated_personal_detail", False):
+            from docmirror.plugins.credit_report.personal_detail_scanned.unvalidated import (
+                omit_validation,
+            )
+            from docmirror.plugins.credit_report.projection import _compact_public_datasets
+
+            payload = super().json_payload(semantic_payload)
+            for dataset in payload.get("datasets") or []:
+                if isinstance(dataset, dict):
+                    name = str(dataset.get("name") or dataset.get("id") or "dataset")
+                    dataset["rows"] = _compact_public_datasets({name: dataset.get("rows") or []})[name]
+            return omit_validation(payload)
         domain = (
             semantic_payload.get("domain")
             if isinstance(semantic_payload.get("domain"), dict)
@@ -1756,6 +1774,21 @@ class _CreditReportCommunityBundle(CommunityBundle):
 class CreditReportPlugin(CommunityProjector):
     """Community edition plugin for credit report document processing."""
 
+    def __init__(self, *, unvalidated: bool = False) -> None:
+        """Opt into extraction-only personal-detail output for this instance.
+
+        The default and other report variants retain their existing behavior.
+        Instance-local configuration avoids changing the registered singleton
+        or another request's mode. This flag is deliberately not a JSON fact.
+        """
+        if not isinstance(unvalidated, bool):
+            raise TypeError("unvalidated must be a boolean")
+        self._unvalidated = unvalidated
+
+    @property
+    def unvalidated(self) -> bool:
+        return self._unvalidated
+
     @property
     def domain_name(self) -> str:
         return "credit_report"
@@ -1800,6 +1833,12 @@ class CreditReportPlugin(CommunityProjector):
             )
 
             return derive_personal_brief_projection(self, parse_result, text)
+        if self.unvalidated and report_subtype == "personal_detail":
+            from docmirror.plugins.credit_report.personal_detail_scanned.unvalidated import (
+                derive_unvalidated_personal_detail,
+            )
+
+            return derive_unvalidated_personal_detail(self, parse_result, text)
         from docmirror.plugins.credit_report.projection import derive_credit_report_projection
 
         return derive_credit_report_projection(self, parse_result, text)
@@ -1828,6 +1867,9 @@ class CreditReportPlugin(CommunityProjector):
             str(read_view.full_text or read_view.raw_text or ""),
         )
         policy = load_projection_policy(type(self).__module__.rsplit(".", 1)[0])
+        unvalidated_personal_detail = bool(
+            self.unvalidated and derived.domain_facts.get("report_subtype") == "personal_detail"
+        )
         overrides = derived.semantic.get("community_projection_overrides")
         if isinstance(overrides, dict):
             for key, values in overrides.items():
@@ -1843,6 +1885,14 @@ class CreditReportPlugin(CommunityProjector):
                     policy[key] = list(
                         dict.fromkeys([*(policy.get(key) or ()), *map(str, values)])
                     )
+        if unvalidated_personal_detail:
+            policy.pop("completeness", None)
+            policy["publish_empty_datasets"] = []
+            # Never mix pre-existing domain output/control collections into
+            # this fresh extraction. Initial OCR evidence remains read-only.
+            source_keys = set(read_view.entities.domain_specific or {}) - set(derived.domain_facts) - set(derived.datasets)
+            for key in ("internal_fields", "internal_facts"):
+                policy[key] = list(dict.fromkeys([*(policy.get(key) or ()), *sorted(source_keys)]))
         projected = project_community_bundle(
             sealed,
             file_path=file_path,
@@ -1866,6 +1916,8 @@ class CreditReportPlugin(CommunityProjector):
             diagnostics=projected.diagnostics,
             content_markdown_override=projected.content_markdown_override,
         )
+        if unvalidated_personal_detail:
+            bundle._unvalidated_personal_detail = True
         bundle.render_markdown()
         if sealed.integrity_fingerprint != before or not sealed.verify_integrity():
             raise RuntimeError("Post-seal projector changed the sealed snapshot")
