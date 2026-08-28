@@ -6,7 +6,6 @@ import copy
 import math
 import re
 from collections.abc import Iterable
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from docmirror.plugins._base.financial_source_projection import ProjectedSegment
@@ -17,17 +16,27 @@ from docmirror.plugins.audit_report.table_projection import (
     audit_semantic,
     bind_datasets_to_sections,
     blocking_warning,
+    canonicalize_audit_dataset_columns,
     dataset_blocking_warnings,
     dataset_pages,
     embedded_financial_pages,
     merge_cross_page_continuations,
+    merge_horizontal_note_continuations,
+    name_note_datasets,
+    normalize_audit_label,
     normalize_audit_record,
     normalize_audit_text,
     page_lines,
     project_embedded_financial_statements,
     quality_warnings,
+    record_keys,
+    recover_note_text_continuations,
+    recover_owner_equity_label_rows,
     repair_note_datasets,
+    repair_stacked_note_headers,
+    resolve_note_table_candidates,
     statement_kind,
+    synchronize_audit_record_sources,
 )
 
 _HEADING_RE = re.compile(
@@ -71,6 +80,32 @@ _PUBLIC_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "currency": ("currency", "币种"),
     "auditor_name": ("auditor_name", "会计师事务所", "审计机构"),
 }
+_REPAIR_EVENT_CODES = frozenset(
+    {
+        "AUDIT_BALANCE_AMOUNT_SHIFT_RECOVERED",
+        "AUDIT_BALANCE_SECTION_LABEL_RECOVERED",
+        "AUDIT_CANONICAL_RAW_RECOVERED",
+        "AUDIT_CROSS_PAGE_TABLE_REPAIRED",
+        "AUDIT_FINANCIAL_PERIOD_HEADERS_RECOVERED",
+        "AUDIT_NOTE_ADJACENT_CELLS_SPLIT",
+        "AUDIT_NOTE_DUPLICATE_DATASET_REMOVED",
+        "AUDIT_NOTE_HEADER_ROWS_PROMOTED",
+        "AUDIT_NOTE_HEADER_SOURCE_RECOVERED",
+        "AUDIT_NOTE_HORIZONTAL_TABLE_MERGED",
+        "AUDIT_NOTE_MIXED_TABLE_SPLIT",
+        "AUDIT_NOTE_STACKED_HEADERS_RECOVERED",
+        "AUDIT_NOTE_TEXT_CONTINUATION_RECOVERED",
+        "AUDIT_OWNER_EQUITY_HEADER_ROWS_REMOVED",
+        "AUDIT_OWNER_EQUITY_LABEL_ROWS_RECOVERED",
+        "AUDIT_OWNER_EQUITY_LOGICAL_TABLE_REJECTED",
+        "AUDIT_OWNER_EQUITY_ROTATION_RECOVERED",
+        "AUDIT_STATEMENT_CELLS_RECOVERED",
+        "AUDIT_STATEMENT_HEADER_ROWS_REMOVED",
+        "AUDIT_STATEMENT_RECOVERY_SELECTED",
+        "AUDIT_STATEMENT_TEXT_ROWS_RECOVERED",
+        "AUDIT_STATEMENT_TEXT_ROWS_SELECTED",
+    }
+)
 
 
 def derive_audit_report_projection(parse_result: Any, *, full_text: str = "") -> ProjectionData:
@@ -80,10 +115,14 @@ def derive_audit_report_projection(parse_result: Any, *, full_text: str = "") ->
     datasets = {name: copy.deepcopy(rows) for name, rows in generic.datasets.items()}
     warnings = [warning for warning in generic.warnings if str(warning).strip().lower() != "community_generic_fallback"]
 
-    warnings.extend(merge_cross_page_continuations(datasets, parse_result))
     warnings.extend(repair_note_datasets(datasets))
+    warnings.extend(resolve_note_table_candidates(datasets, parse_result))
+    warnings.extend(merge_horizontal_note_continuations(datasets, parse_result))
+    warnings.extend(merge_cross_page_continuations(datasets, parse_result))
+    warnings.extend(repair_stacked_note_headers(datasets))
     financial_segments, financial_warnings = project_embedded_financial_statements(parse_result)
     warnings.extend(financial_warnings)
+    warnings.extend(recover_owner_equity_label_rows(financial_segments, parse_result))
     financial_pages = embedded_financial_pages(parse_result)
     unresolved_wide_pages = _unresolved_wide_statement_pages(
         datasets,
@@ -104,25 +143,47 @@ def derive_audit_report_projection(parse_result: Any, *, full_text: str = "") ->
             datasets.pop(name)
     for segment in financial_segments:
         datasets[segment.dataset_id] = copy.deepcopy(segment.records)
-    datasets = {name: [normalize_audit_record(record) for record in rows] for name, rows in datasets.items()}
 
     fields, field_details, metadata_warnings = _audit_fields(generic.domain_facts, parse_result, full_text)
     warnings.extend(metadata_warnings)
+    if fields.get("currency") and fields.get("currency_unit"):
+        warnings = [
+            warning for warning in warnings if not str(warning).startswith("precision:generic_currency_unknown:")
+        ]
     sections = _audit_sections(parse_result, generic.sections, financial_segments, field_details)
+    semantic_labels, naming_warnings = name_note_datasets(datasets, sections, parse_result)
+    warnings.extend(naming_warnings)
+    warnings.extend(recover_note_text_continuations(datasets, parse_result))
+    warnings.extend(synchronize_audit_record_sources(datasets))
+    note_schemas, schema_warnings = canonicalize_audit_dataset_columns(datasets)
+    warnings.extend(schema_warnings)
+    datasets = {name: [normalize_audit_record(record) for record in rows] for name, rows in datasets.items()}
     section_ids, dataset_labels = bind_datasets_to_sections(datasets, sections, parse_result)
+    dataset_labels.update(semantic_labels)
+    dataset_labels = {name: normalize_audit_label(label) for name, label in dataset_labels.items()}
     semantic = audit_semantic(generic.semantic, datasets, financial_segments, section_ids, dataset_labels)
+    page_dimensions = {
+        str(int(getattr(page, "page_number", 0) or 1)): {
+            "width": int(getattr(page, "width", 0) or 0),
+            "height": int(getattr(page, "height", 0) or 0),
+        }
+        for page in getattr(parse_result, "pages", None) or []
+        if getattr(page, "width", None) and getattr(page, "height", None)
+    }
+    if page_dimensions:
+        semantic.setdefault("enhanced_markdown", {})["page_dimensions"] = page_dimensions
     warnings.extend(quality_warnings(parse_result, fields, sections, datasets, financial_segments))
-    consistency_warnings = _financial_consistency_warnings(financial_segments)
-    warnings.extend(consistency_warnings)
-    dataset_blockers = _dataset_verification_blockers(financial_segments, warnings)
+    warnings = _discard_superseded_generic_precision_warnings(warnings, datasets)
+    warnings = _discard_superseded_financial_precision_warnings(warnings, financial_segments)
+    warnings, repair_events = _partition_repair_events(warnings)
+    dataset_blockers = _dataset_verification_blockers(datasets, financial_segments, warnings)
+    source_row_ledgers = _dataset_source_row_ledgers(datasets, financial_segments)
 
     domain_facts = {
         **fields,
         "field_details": field_details,
-        "data_dictionary": audit_data_dictionary(financial_segments),
-        "dataset_source_row_refs": {
-            segment.dataset_id: list(segment.source_row_refs) for segment in financial_segments if segment.records
-        },
+        "data_dictionary": audit_data_dictionary(financial_segments, note_schemas),
+        "dataset_source_row_refs": source_row_ledgers,
         "dataset_verification_blockers": dataset_blockers,
         "summary": {
             "field_count": len(fields),
@@ -135,6 +196,7 @@ def derive_audit_report_projection(parse_result: Any, *, full_text: str = "") ->
             "financial_statement_count": len(financial_segments),
             "section_count": len(sections),
             "source_conserving": True,
+            "repair_events": repair_events,
         },
     }
     return ProjectionData(
@@ -296,16 +358,20 @@ def _resolve_audit_number(
         fallback = _match_from_text(source_text, _INCOMPLETE_AUDIT_NUMBER_RE)
         incomplete_matches = [fallback] if fallback is not None else []
     incomplete = list(dict.fromkeys(re.sub(r"\s+", "", value) for value, _source in incomplete_matches))
-    warnings = [f"AUDIT_DOCUMENT_NUMBER_INCOMPLETE:values={'|'.join(incomplete)}"] if incomplete else []
     if not number_matches:
-        return "", {}, [*warnings, "AUDIT_DOCUMENT_NUMBER_MISSING"]
+        incomplete_warnings = [f"AUDIT_DOCUMENT_NUMBER_INCOMPLETE:values={'|'.join(incomplete)}"] if incomplete else []
+        return "", {}, [*incomplete_warnings, "AUDIT_DOCUMENT_NUMBER_MISSING"]
 
     normalized = [(re.sub(r"\s+", "", number), source) for number, source in number_matches]
+    warnings: list[str] = []
     distinct = list(dict.fromkeys(value for value, _source in normalized))
-    complete_years = {_audit_number_year(value) for value in distinct if _audit_number_year(value)}
-    incomplete_years = {_audit_number_year(value) for value in incomplete if _audit_number_year(value)}
-    if len(distinct) > 1 or bool(complete_years and incomplete_years - complete_years):
-        conflicts = list(dict.fromkeys([*distinct, *incomplete]))
+    top_authority = max(_audit_number_authority(source) for _number, source in normalized)
+    authoritative = [
+        (number, source) for number, source in normalized if _audit_number_authority(source) == top_authority
+    ]
+    authoritative_values = list(dict.fromkeys(number for number, _source in authoritative))
+    if len(authoritative_values) > 1:
+        conflicts = list(dict.fromkeys(authoritative_values))
         details = {
             "audit_document_number_candidates": {
                 "values": distinct,
@@ -316,9 +382,31 @@ def _resolve_audit_number(
         }
         return "", details, [*warnings, f"AUDIT_DOCUMENT_NUMBER_CONFLICT:values={'|'.join(conflicts)}"]
 
-    number, source = max(normalized, key=lambda item: _audit_number_authority(item[1]))
-    detail = {**source, **({"incomplete_candidates": incomplete} if incomplete else {})}
-    return number, {"audit_document_number": detail}, warnings
+    number, source = authoritative[0]
+    alternates = [value for value in distinct if value != number]
+    if alternates:
+        warnings.append(f"AUDIT_DOCUMENT_NUMBER_CANDIDATE_VARIANCE:selected={number}:alternates={'|'.join(alternates)}")
+    detail = {
+        **source,
+        "resolution": "authoritative_complete_candidate",
+        **({"alternate_candidates": alternates} if alternates else {}),
+        **({"incomplete_candidates": incomplete} if incomplete else {}),
+    }
+    candidate_detail = {
+        "values": distinct,
+        "incomplete_values": incomplete,
+        "sources": [copy.deepcopy(candidate_source) for _candidate, candidate_source in normalized],
+        "resolution": "selected_authoritative_complete_candidate",
+        "selected": number,
+    }
+    return (
+        number,
+        {
+            "audit_document_number": detail,
+            "audit_document_number_candidates": candidate_detail,
+        },
+        warnings,
+    )
 
 
 def _audit_sections(
@@ -380,7 +468,7 @@ def _audit_sections(
     deduplicated: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     for candidate in sorted(candidates, key=_section_sort_key):
-        key = (candidate["title"], candidate["page_start"])
+        key = (candidate["title"].rstrip(":："), candidate["page_start"])
         if key in seen:
             continue
         seen.add(key)
@@ -596,10 +684,17 @@ def _appendix_start_page(parse_result: Any) -> int:
 
 
 def _valid_section_heading(title: str) -> bool:
-    if not _HEADING_RE.fullmatch(title):
+    match = _HEADING_RE.fullmatch(title)
+    if not match:
         return False
     compact = title.replace(" ", "")
     if _BARE_NOTE_REFERENCE_RE.fullmatch(compact):
+        return False
+    marker = match.group("marker")
+    body = normalize_audit_text(match.group("title"))
+    if re.fullmatch(r"[（(]\d{1,2}[）)]", marker):
+        return False
+    if len(body) > 36 or re.search(r"[，,；;。！？!?]", body):
         return False
     return not bool(re.fullmatch(r"[一二三四五六七八九十百\d、.．（）()]+", compact))
 
@@ -699,143 +794,126 @@ def _unique_id(preferred: str, used: set[str]) -> str:
     return f"{preferred}_{suffix}"
 
 
-def _financial_consistency_warnings(segments: list[ProjectedSegment]) -> list[str]:
-    by_kind = {segment.kind: segment for segment in segments}
-    warnings: list[str] = []
-    balance = by_kind.get("balance_sheet")
-    owners = by_kind.get("owners_equity_changes")
-    income = by_kind.get("income_statement")
-
-    if balance is not None:
-        assets = _statement_value(balance, ("资产总计",), prefer=("ending_balance", "current"))
-        liabilities_equity = _statement_value(
-            balance,
-            ("负债和所有者权益总计", "负债及所有者权益总计", "负债和股东权益总计"),
-            prefer=("ending_balance", "current"),
-        )
-        _append_mismatch(warnings, "balance_equation", assets, liabilities_equity)
-
-    if balance is not None and owners is not None:
-        balance_equity = _statement_value(
-            balance,
-            ("所有者权益合计", "股东权益合计"),
-            prefer=("ending_balance", "current"),
-        )
-        owners_ending = _statement_value(
-            owners,
-            ("期末余额", "年末余额"),
-            prefer=("total", "合计", "ending", "current"),
-            last_amount=True,
-        )
-        _append_mismatch(warnings, "ending_equity", balance_equity, owners_ending)
-
-    if income is not None and owners is not None:
-        income_comprehensive = _statement_value(
-            income,
-            ("综合收益总额",),
-            prefer=("current_period", "current", "本期"),
-        )
-        owners_comprehensive = _statement_value(
-            owners,
-            ("综合收益总额",),
-            prefer=("total", "合计", "current", "本期"),
-            last_amount=True,
-        )
-        _append_mismatch(warnings, "comprehensive_income", income_comprehensive, owners_comprehensive)
-    return warnings
-
-
-def _statement_value(
-    segment: ProjectedSegment,
-    markers: tuple[str, ...],
-    *,
-    prefer: tuple[str, ...],
-    last_amount: bool = False,
-) -> tuple[Decimal, int, str] | None:
-    for record in segment.records:
-        raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
-        if not isinstance(raw, dict):
+def _dataset_source_row_ledgers(
+    datasets: dict[str, list[dict[str, Any]]],
+    segments: list[ProjectedSegment],
+) -> dict[str, list[dict[str, Any]]]:
+    segment_ledgers = {
+        segment.dataset_id: [copy.deepcopy(reference) for reference in segment.source_row_refs]
+        for segment in segments
+        if segment.records
+    }
+    ledgers: dict[str, list[dict[str, Any]]] = {}
+    for dataset_name, records in datasets.items():
+        if dataset_name in segment_ledgers:
+            ledgers[dataset_name] = segment_ledgers[dataset_name]
             continue
-        labels = [normalize_audit_text(value) for key, value in raw.items() if "item" in str(key)]
-        if not any(marker in label for marker in markers for label in labels):
-            continue
-        amounts: list[tuple[int, str, Decimal]] = []
-        for order, (key, value) in enumerate(raw.items()):
-            number = _decimal_value(value)
-            if number is not None:
-                amounts.append((order, str(key), number))
-        if not amounts:
-            continue
-        ranked = sorted(
-            amounts,
-            key=lambda item: (
-                max((len(prefer) - index for index, marker in enumerate(prefer) if marker in item[1]), default=0),
-                item[0] if last_amount else -item[0],
-            ),
-            reverse=True,
+        ledgers[dataset_name] = [
+            {
+                "page": int(source.get("page") or 0),
+                "table_id": str(source.get("table_id") or source.get("physical_table_id") or ""),
+                "source_row_index": source.get("source_row_index"),
+            }
+            for record in records
+            if isinstance((source := record.get("source")), dict)
+        ]
+    return ledgers
+
+
+def _discard_superseded_financial_precision_warnings(
+    warnings: Iterable[str],
+    segments: list[ProjectedSegment],
+) -> list[str]:
+    emitted_rows = {
+        (
+            str(source.get("table_id") or source.get("physical_table_id") or ""),
+            int(source.get("table_row_index", source.get("source_row_index", -1))),
         )
-        source = record.get("source") if isinstance(record.get("source"), dict) else {}
-        return ranked[0][2], int(source.get("page") or segment.source_page), ranked[0][1]
-    return None
+        for segment in segments
+        for record in segment.records
+        if isinstance((source := record.get("source")), dict)
+    }
+    statement_tables = {table_id for table_id, _row_index in emitted_rows if table_id}
+    retained: list[str] = []
+    for warning in warnings:
+        match = re.match(
+            r"precision:financial_amount_format_invalid:table=([^:]+):row=(\d+):",
+            str(warning),
+        )
+        if match and match.group(1) in statement_tables and (match.group(1), int(match.group(2))) not in emitted_rows:
+            continue
+        retained.append(str(warning))
+    return retained
 
 
-def _decimal_value(value: Any) -> Decimal | None:
-    text = normalize_audit_text(value).replace(",", "")
-    if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
-        return None
-    try:
-        return Decimal(text)
-    except InvalidOperation:
-        return None
+def _discard_superseded_generic_precision_warnings(
+    warnings: Iterable[str],
+    datasets: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    final_keys = {str(key) for records in datasets.values() for key in record_keys(records)}
+    schemas_resolved = not any(re.fullmatch(r"(?:col|column)_\d+", key) for key in final_keys)
+    normalization_loss = any(str(warning).startswith("AUDIT_NORMALIZATION_LOSS") for warning in warnings)
+    retained: list[str] = []
+    for warning in warnings:
+        value = str(warning)
+        if value.startswith("precision:generic_low_confidence_text_kv:"):
+            continue
+        if schemas_resolved and value.startswith(
+            ("precision:generic_header_repaired:", "precision:generic_header_repaired_ratio:")
+        ):
+            continue
+        if not normalization_loss and value.startswith("precision:generic_normalization_failed:"):
+            continue
+        retained.append(value)
+    return retained
 
 
-def _append_mismatch(
-    warnings: list[str],
-    metric: str,
-    left: tuple[Decimal, int, str] | None,
-    right: tuple[Decimal, int, str] | None,
-) -> None:
-    if left is None or right is None or abs(left[0] - right[0]) <= Decimal("0.01"):
-        return
-    warnings.append(
-        "AUDIT_STATEMENT_TOTAL_MISMATCH:"
-        f"metric={metric}:left={left[0]}@page={left[1]}:{left[2]}:"
-        f"right={right[0]}@page={right[1]}:{right[2]}"
-    )
+def _partition_repair_events(warnings: Iterable[str]) -> tuple[list[str], list[str]]:
+    """Keep successful audit repairs out of public Community warnings."""
+
+    public: list[str] = []
+    repairs: list[str] = []
+    for warning in warnings:
+        value = str(warning)
+        code = value.split(":", 1)[0]
+        (repairs if code in _REPAIR_EVENT_CODES else public).append(value)
+    return list(dict.fromkeys(public)), list(dict.fromkeys(repairs))
 
 
 def _dataset_verification_blockers(
+    datasets: dict[str, list[dict[str, Any]]],
     segments: list[ProjectedSegment],
     warnings: Iterable[str],
 ) -> dict[str, list[str]]:
     blockers = dataset_blocking_warnings(warnings)
+    segment_kinds = {segment.dataset_id: segment.kind for segment in segments}
     result: dict[str, list[str]] = {}
-    for segment in segments:
-        if not segment.records:
+    for dataset_name, records in datasets.items():
+        if not records:
             continue
-        pages = dataset_pages(segment.records)
+        pages = dataset_pages(records)
         relevant: list[str] = []
         for warning in blockers:
             dataset_match = re.search(r"dataset=([^:]+)", warning)
             kind_match = re.search(r"kind=([^:]+)", warning)
-            page_match = re.search(r"page=(\d+)", warning)
-            if dataset_match and dataset_match.group(1) != segment.dataset_id:
+            warning_pages = {int(match.group(1)) for match in re.finditer(r"page=(\d+)", warning)}
+            if dataset_match and dataset_match.group(1) != dataset_name:
                 continue
-            if kind_match and kind_match.group(1) != segment.kind:
+            if kind_match and kind_match.group(1) != segment_kinds.get(dataset_name):
                 continue
-            if page_match and pages and int(page_match.group(1)) not in pages:
+            if warning_pages and pages and not warning_pages.intersection(pages):
                 if not kind_match:
                     continue
             if (
                 not dataset_match
                 and not kind_match
-                and not page_match
-                and not warning.startswith("AUDIT_STATEMENT_TOTAL_MISMATCH")
+                and not warning_pages
+                and not (dataset_name in segment_kinds and warning.startswith("AUDIT_STATEMENT_TOTAL_MISMATCH"))
             ):
                 continue
             relevant.append(warning)
         if relevant:
-            result[segment.dataset_id] = relevant
+            result[dataset_name] = relevant
     return result
 
 

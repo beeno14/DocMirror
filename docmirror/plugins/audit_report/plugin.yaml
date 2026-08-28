@@ -7,7 +7,16 @@ provider:
   implementation: docmirror.plugins.audit_report.community_plugin:plugin
 
 projection:
-  internal_fields: [document_label, summary, audit_projection, dataset_source_row_refs, dataset_verification_blockers]
+  internal_fields:
+    - document_label
+    - summary
+    - audit_projection
+    - dataset_source_row_refs
+    - dataset_verification_blockers
+    - classification_source
+    - doc_type_hint_source
+    - user_doc_type_hint
+    - user_doc_type_hint_strength
   dataset_labels:
     balance_sheet: 资产负债表
     income_statement: 利润表
@@ -29,6 +38,11 @@ projection:
     形成审计意见的基础: basis_for_opinion
     财务报表: financial_statement
   completeness:
+    "*":
+      basis: domain_source_row_ledger
+      ledger_key: dataset_source_row_refs
+      verification_blocker_key: dataset_verification_blockers
+      public_basis: source_table_rows
     balance_sheet: &statement_completeness
       basis: domain_source_row_ledger
       ledger_key: dataset_source_row_refs
