@@ -106,3 +106,5 @@ build/
 *.class
 *.jar
 *.war
+
+integrations
