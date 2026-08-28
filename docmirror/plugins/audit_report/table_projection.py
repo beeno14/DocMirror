@@ -6,7 +6,8 @@ import copy
 import math
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -29,6 +30,11 @@ _FULL_AMOUNT_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}$")
 _NOTE_RE = re.compile(r"[一二三四五六七八九十百]+[、.．]\s*\d{1,3}")
 _PERIOD_HEADER_RE = re.compile(r"^20\d{2}年(?:\d{1,2}月\d{1,2}日|度)$")
 _TABLE_HEADER_MARKERS = re.compile(r"项目|名称|期末|期初|本期|上期|余额|金额|比例|账面")
+_GENERIC_TABLE_DATASET_RE = re.compile(r"^(?:table_\d+(?:__split_\d+)?|records)$")
+_AUDIT_NOTE_HEADING_RE = re.compile(r"^(?:[一二三四五六七八九十百]{1,4}|\d{1,2})[、.．]\s*\S")
+_AUDIT_TABLE_CAPTION_RE = re.compile(
+    r"列示|披露|分类|情况|明细|账龄|组合|性质|变动|计提|余额|构成|投资|交易|控制人|子公司|关联方"
+)
 _PROMOTED_HEADER_MARKERS = re.compile(
     r"项目|名称|单位|期末|期初|本期|上期|余额|金额|比例|账龄|增减变动|投资|损益|收益|日期|起始|到期|是否"
 )
@@ -36,6 +42,19 @@ _OWNER_EQUITY_MARKERS = re.compile(
     r"所有者权益|股东权益|实收资本|股本|资本公积|其他综合收益|盈余公积|未分配利润|期初余额|期末余额"
 )
 _OWNER_EQUITY_ROW_MARKERS = re.compile(r"余额|变动|收益|投入|分配|结转|资本|公积|权益|政策|差错|提取|利润|其他")
+_OWNER_EQUITY_COLUMN_LABELS = {
+    "paid_in_capital": "实收资本（或股本）",
+    "preferred_shares": "优先股",
+    "perpetual_bonds": "永续债",
+    "other_equity_instruments": "其他权益工具",
+    "capital_reserve": "资本公积",
+    "treasury_shares": "减：库存股",
+    "other_comprehensive_income": "其他综合收益",
+    "special_reserve": "专项储备",
+    "surplus_reserve": "盈余公积",
+    "retained_earnings": "未分配利润",
+    "total_equity": "所有者权益合计",
+}
 _STATEMENT_TITLE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^(?:合并(?:及母公司)?|母公司)?资产负债表(?:\(续\))?$"), "balance_sheet"),
     (re.compile(r"^(?:合并(?:及母公司)?|母公司)?利润表(?:\(续\))?$"), "income_statement"),
@@ -60,9 +79,156 @@ _RADICAL_TRANSLATION = str.maketrans(
         "⻩": "黄",
         "⻄": "西",
         "⻋": "车",
+        "⻮": "齿",
     }
 )
 _STATEMENT_KINDS = {"balance_sheet", "income_statement", "cash_flow_statement", "owners_equity_changes"}
+_ASCII_FIELD_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_CJK_LAYOUT_SPACE_RE = re.compile(r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])")
+_AUDIT_COLUMN_ALIASES = {
+    "项目": "item",
+    "名称": "name",
+    "类别": "category",
+    "账龄": "aging_bucket",
+    "投资方": "investor",
+    "股份数(万股)": "share_count_ten_thousand",
+    "持股比例(%)": "shareholding_ratio",
+    "确定组合的依据": "portfolio_basis",
+    "损失准备的计提方法": "loss_allowance_method",
+    "资产类别": "asset_category",
+    "预计使用寿命(年)": "estimated_useful_life_years",
+    "预计净残值率(%)": "estimated_residual_value_ratio",
+    "年折旧率(%)": "annual_depreciation_ratio",
+    "税种": "tax_type",
+    "计税依据": "tax_basis",
+    "税率(%)": "tax_rate",
+    "单位名称": "entity_name",
+    "预付对象": "prepayment_counterparty",
+    "款项性质": "payment_nature",
+    "被投资单位": "investee",
+    "股东名称": "shareholder_name",
+    "办公设备": "office_equipment",
+    "运输设备": "transportation_equipment",
+    "房屋建筑物": "buildings",
+    "软件": "software",
+    "实际控制人": "ultimate_controller",
+    "认缴出资额(万元)": "subscribed_capital_ten_thousand_yuan",
+    "子公司名称": "subsidiary_name",
+    "主要经营地": "principal_place_of_business",
+    "注册地": "registered_address",
+    "业务性质": "business_nature",
+    "直接持股比例(%)": "direct_shareholding_ratio",
+    "间接持股比例(%)": "indirect_shareholding_ratio",
+    "合计持股比例(%)": "total_shareholding_ratio",
+    "关联方": "related_party",
+    "关联方名称": "related_party_name",
+    "其他关联方名称": "other_related_party_name",
+    "其他关联方与本企业关系": "related_party_relationship",
+    "关联交易内容": "related_transaction_description",
+    "对本公司的持股比例(%)": "company_shareholding_ratio",
+    "对本公司的表决权比例(%)": "company_voting_rights_ratio",
+    "合计": "total",
+    "坏账准备": "loss_allowance",
+    "坏账准备期末余额": "loss_allowance_ending_balance",
+    "减值准备期末余额": "impairment_allowance_ending_balance",
+    "期初余额": "opening_balance",
+    "期末余额": "ending_balance",
+    "期初账面余额": "opening_book_balance",
+    "期末账面余额": "ending_book_balance",
+    "本期": "current_period",
+    "上期": "previous_period",
+    "本期发生额": "current_period_amount",
+    "上期发生额": "previous_period_amount",
+    "本期增加": "current_period_increase",
+    "本期增加额": "current_period_increase",
+    "本期减少": "current_period_decrease",
+    "本期减少额": "current_period_decrease",
+    "本期摊销": "current_period_amortization",
+    "其他减少": "other_decrease",
+}
+_AUDIT_COLUMN_COMPONENT_ALIASES = {
+    **_AUDIT_COLUMN_ALIASES,
+    "金额": "amount",
+    "比例(%)": "ratio",
+    "账面余额": "book_balance",
+    "账面价值": "carrying_amount",
+    "坏账准备": "loss_allowance",
+    "计提比例(%)": "provision_ratio",
+    "递延所得税资产": "deferred_tax_asset",
+    "递延所得税负债": "deferred_tax_liability",
+    "可抵扣暂时性差异": "deductible_temporary_difference",
+    "应纳税暂时性差异": "taxable_temporary_difference",
+    "应收账款": "accounts_receivable",
+    "收入": "revenue",
+    "成本": "cost",
+    "本期变动金额": "current_period_change_amount",
+    "核销": "write_off",
+    "计提": "provision",
+    "收回或转回": "reversal",
+    "本期增减变动": "current_period_changes",
+    "追加投资": "additional_investment",
+    "减少投资": "investment_reduction",
+    "权益法下确认的投资损益": "equity_method_investment_income",
+    "其他综合收益调整": "other_comprehensive_income_adjustment",
+    "其他权益变动": "other_equity_changes",
+    "宣告发放现金股利或利润": "declared_cash_dividends_or_profit",
+    "计提减值准备": "impairment_provision",
+    "其他": "other",
+}
+_SHARE_RATIO_SUBJECTS = {
+    "预付款项": "prepayments",
+    "应收账款": "accounts_receivable",
+    "其他应收": "other_receivables",
+    "其他应收款": "other_receivables",
+}
+_NOTE_SUBJECT_SLUGS: tuple[tuple[str, str], ...] = (
+    ("一年内到期的非流动负债", "current_portion_of_non_current_liabilities"),
+    ("历史沿革及资本变更情况", "capital_change_history"),
+    ("本公司的实际控制人情况", "ultimate_controller"),
+    ("营业收入和营业成本", "operating_revenue_and_cost"),
+    ("本公司的子公司情况", "subsidiaries"),
+    ("长期待摊费用", "long_term_deferred_expenses"),
+    ("长期股权投资", "long_term_equity_investments"),
+    ("其他关联方情况", "other_related_parties"),
+    ("关联交易情况", "related_party_transactions"),
+    ("金融资产减值", "financial_asset_impairment"),
+    ("递延所得税资产", "deferred_tax"),
+    ("应付职工薪酬", "employee_benefits_payable"),
+    ("其他流动资产", "other_current_assets"),
+    ("其他流动负债", "other_current_liabilities"),
+    ("信用减值损失", "credit_impairment_losses"),
+    ("承诺及或有事项", "commitments_and_contingencies"),
+    ("货币资金", "cash_and_cash_equivalents"),
+    ("其他应收款", "other_receivables"),
+    ("其他应付款", "other_payables"),
+    ("使用权资产", "right_of_use_assets"),
+    ("无形资产", "intangible_assets"),
+    ("短期借款", "short_term_borrowings"),
+    ("合同负债", "contract_liabilities"),
+    ("应付票据", "notes_payable"),
+    ("应付账款", "accounts_payable"),
+    ("应收账款", "accounts_receivable"),
+    ("预付款项", "prepayments"),
+    ("应交税费", "taxes_payable"),
+    ("租赁负债", "lease_liabilities"),
+    ("实收资本", "paid_in_capital"),
+    ("资本公积", "capital_reserve"),
+    ("盈余公积", "surplus_reserve"),
+    ("未分配利润", "retained_earnings"),
+    ("税金及附加", "taxes_and_surcharges"),
+    ("销售费用", "selling_expenses"),
+    ("管理费用", "administrative_expenses"),
+    ("研发费用", "research_and_development_expenses"),
+    ("财务费用", "finance_expenses"),
+    ("其他收益", "other_income"),
+    ("投资收益", "investment_income"),
+    ("营业外收入", "non_operating_income"),
+    ("营业外支出", "non_operating_expenses"),
+    ("所得税费用", "income_tax_expense"),
+    ("固定资产", "fixed_assets"),
+    ("税项", "taxes"),
+)
 _BALANCE_SECTION_ANCHORS = {
     "流动资产": ("货币资金", "交易性金融资产"),
     "非流动资产": ("债权投资", "可供出售金融资产", "长期应收款", "长期股权投资"),
@@ -81,13 +247,20 @@ _DATASET_BLOCKING_WARNING_PREFIXES = (
     "AUDIT_AMOUNT_SPLIT_INFERRED",
     "AUDIT_AMOUNT_FRAGMENT_INFERRED",
     "AUDIT_AMOUNT_SPLIT_UNRESOLVED",
-    "AUDIT_STATEMENT_TOTAL_MISMATCH",
     "AUDIT_STATEMENT_AMOUNT_COLUMNS_EMPTY",
     "AUDIT_STATEMENT_ITEM_MISSING",
     "AUDIT_MERGED_ITEM_ROWS_INFERRED",
+    "AUDIT_COLUMN_SCHEMA_UNRESOLVED",
+    "AUDIT_COLUMN_SCHEMA_COLLISION",
     "AUDIT_NUMERIC_COLUMN_NAME",
     "AUDIT_GENERIC_COLUMNS_EXCESSIVE",
     "AUDIT_EVIDENCE_MISSING",
+    "AUDIT_CANONICAL_RAW_MISSING",
+    "AUDIT_FIELD_SOURCE_MISSING",
+    "AUDIT_NORMALIZED_NUMERIC_MISMATCH",
+    "AUDIT_NOTE_SOURCE_COLUMN_OMITTED",
+    "AUDIT_NOTE_SOURCE_CELL_OMITTED",
+    "AUDIT_CROSS_PAGE_ORPHAN_ROW_UNRESOLVED",
 )
 _DOCUMENT_BLOCKING_WARNING_PREFIXES = (
     "AUDIT_SECTION_MISSING",
@@ -106,11 +279,32 @@ class _SourceTable:
 
 
 @dataclass(frozen=True)
+class _OrphanTotalCandidate:
+    dataset_name: str
+    keys: tuple[str, ...]
+    source_table: _SourceTable
+    rows: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class _PhysicalRowMatch:
+    source_table: _SourceTable
+    row: Any
+    row_index: int
+    source_row_index: int
+    matched_values: int
+    coverage: float
+    header_score: int
+
+
+@dataclass(frozen=True)
 class _RecoveredCategory:
     value: str
     page: int
     bbox: tuple[float, ...] = ()
     evidence_ids: tuple[str, ...] = ()
+    table_id: str = "canonical_text"
+    source_row_index: int = -1
 
 
 @dataclass(frozen=True)
@@ -139,8 +333,73 @@ class _StatementCandidate:
 def normalize_audit_text(value: Any) -> str:
     """Normalize layout glyphs used by audit PDFs while preserving raw fields."""
 
-    normalized = unicodedata.normalize("NFKC", str(value or "")).translate(_RADICAL_TRANSLATION)
+    normalized = _normalize_audit_text(value, unicode_form="NFKC")
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def normalize_audit_display_text(value: Any) -> str:
+    """Normalize damaged CJK glyphs without folding source presentation characters."""
+
+    source = unicodedata.normalize("NFC", str(value or ""))
+    normalized = "".join(
+        normalize_audit_text(character) if 0x2E80 <= ord(character) <= 0x2FFF else character
+        for character in source
+    )
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _normalize_audit_text(value: Any, *, unicode_form: str) -> str:
+    return unicodedata.normalize(unicode_form, str(value or "")).translate(_RADICAL_TRANSLATION)
+
+
+def normalize_audit_value(value: Any) -> str:
+    """Remove PDF layout whitespace from a normalized audit value."""
+
+    return _normalize_audit_value(value, text_normalizer=normalize_audit_text)
+
+
+def normalize_audit_display_value(value: Any) -> str:
+    """Remove PDF layout whitespace while retaining source-compatible symbols."""
+
+    return _normalize_audit_value(value, text_normalizer=normalize_audit_display_text)
+
+
+def _normalize_audit_value(value: Any, *, text_normalizer: Callable[[Any], str]) -> str:
+    protected = str(value or "").replace("（", "\ue000").replace("）", "\ue001").replace("：", "\ue002")
+    normalized = text_normalizer(protected).replace("\ue000", "（").replace("\ue001", "）").replace("\ue002", "：")
+    normalized = _CJK_LAYOUT_SPACE_RE.sub("", normalized)
+    normalized = re.sub(r"(?<=[年月第])\s+(?=\d)", "", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=(?:年|月|日|号|个|%|％))", "", normalized)
+    normalized = re.sub(r"(?<=[\u3400-\u9fff\d])\s+(?=[（(/，,。；;：:%％])", "", normalized)
+    normalized = re.sub(r"(?<=[）)/，,。；;：:%％])\s+(?=[\u3400-\u9fff\d])", "", normalized)
+    normalized = re.sub(r"(?<=[\u3400-\u9fff\d])\s+(?=--)", "", normalized)
+    return normalized
+
+
+def normalize_audit_label(value: Any) -> str:
+    """Return a compact human label without changing the preserved source header."""
+
+    label = normalize_audit_value(value)
+    if _CJK_RE.search(label):
+        label = re.sub(r"\s+", "", label)
+    return re.sub(r"^(\d{1,2})(?!\d)(?=[\u3400-\u9fff])", r"\1、", label)
+
+
+def _audit_column_key(label: str) -> str:
+    normalized = normalize_audit_label(label)
+    if _ASCII_FIELD_KEY_RE.fullmatch(normalized):
+        return normalized
+    lookup = normalized.replace("（", "(").replace("）", ")")
+    direct = _AUDIT_COLUMN_ALIASES.get(lookup)
+    if direct:
+        return direct
+    share_ratio = re.fullmatch(r"占(.+?)(?:期末余额)?合计数的?比例\(%\)", lookup)
+    if share_ratio:
+        subject = _SHARE_RATIO_SUBJECTS.get(share_ratio.group(1))
+        if subject:
+            return f"{subject}_share_ratio"
+    components = [_AUDIT_COLUMN_COMPONENT_ALIASES.get(part) for part in lookup.split("/")]
+    return "_".join(components) if components and all(components) else ""
 
 
 def project_embedded_financial_statements(parse_result: Any) -> tuple[list[ProjectedSegment], list[str]]:
@@ -172,6 +431,166 @@ def project_embedded_financial_statements(parse_result: Any) -> tuple[list[Proje
     segments = _merge_statement_segments(segments)
     warnings.extend(_unresolved_landscape_pages(parse_result, segments))
     return segments, list(dict.fromkeys(warnings))
+
+
+def recover_owner_equity_label_rows(
+    segments: list[ProjectedSegment],
+    parse_result: Any,
+) -> list[str]:
+    """Restore source-confirmed owner-equity label rows omitted by sparse table reconstruction."""
+
+    segment = next((item for item in segments if item.kind == "owners_equity_changes"), None)
+    if segment is None:
+        return []
+    page_index = {
+        int(getattr(page, "page_number", 0) or 1): page for page in getattr(parse_result, "pages", None) or []
+    }
+    recovered = 0
+    for page_number in sorted(dataset_pages(segment.records)):
+        page_records = [
+            record for record in segment.records if int((record.get("source") or {}).get("page") or 0) == page_number
+        ]
+        items = [normalize_audit_text((record.get("raw") or {}).get("item")) for record in page_records]
+        compact_items = [item.replace(" ", "") for item in items]
+        if not any("2.其他权益工具持有者投入资本" in item for item in compact_items):
+            continue
+        successor = next(
+            (
+                record
+                for record in page_records
+                if re.match(r"^4[.．、]其他$", normalize_audit_text((record.get("raw") or {}).get("item")))
+            ),
+            None,
+        )
+        if successor is None or any("股份支付计入所有者权益的金额" in item for item in compact_items):
+            continue
+        recovered_source = _owner_equity_label_source(
+            page_index.get(page_number),
+            parse_result=parse_result,
+            page_number=page_number,
+        )
+        if recovered_source is None:
+            continue
+        insert_at = segment.records.index(successor)
+        period_role = next(
+            (
+                str((record.get("normalized") or {}).get("period_role"))
+                for record in page_records
+                if (record.get("normalized") or {}).get("period_role")
+            ),
+            "",
+        )
+        keys = [column.key for column in segment.columns if column.key != "period_role"]
+        raw = {key: "" for key in keys}
+        raw["item"] = recovered_source.value
+        reference: dict[str, Any] = {
+            "page": page_number,
+            "field_name": "item",
+            "source": "canonical_text",
+            "table_id": recovered_source.table_id,
+            "row": recovered_source.source_row_index,
+        }
+        if recovered_source.bbox:
+            reference["bbox"] = list(recovered_source.bbox)
+        if recovered_source.evidence_ids:
+            reference["evidence_ids"] = list(recovered_source.evidence_ids)
+        record = {
+            "record_id": f"{segment.dataset_id}:recovered:{page_number}",
+            "raw": raw,
+            "canonical_raw": dict(raw),
+            "normalized": {**{key: None for key in keys}, "item": normalize_audit_text(recovered_source.value)},
+            "source": {
+                "page": page_number,
+                "page_range": [page_number, page_number],
+                "table_id": recovered_source.table_id,
+                "source_row_index": recovered_source.source_row_index,
+                "source_resolution": "canonical_text_label_row",
+                "source_cell_refs": [reference],
+                **({"evidence_ids": list(recovered_source.evidence_ids)} if recovered_source.evidence_ids else {}),
+            },
+            "source_cell_refs": [copy.deepcopy(reference)],
+            "confidence": 0.95 if recovered_source.evidence_ids else 0.75,
+        }
+        if period_role:
+            _set_statement_period_role(record, period_role)
+        if recovered_source.evidence_ids:
+            record["evidence_ids"] = list(recovered_source.evidence_ids)
+        segment.records.insert(insert_at, record)
+        segment.source_row_refs.insert(
+            min(insert_at, len(segment.source_row_refs)),
+            {
+                "page": page_number,
+                "table_id": recovered_source.table_id,
+                "source_row_index": recovered_source.source_row_index,
+            },
+        )
+        recovered += 1
+    if recovered:
+        _reindex_dataset_records(segment.records, segment.dataset_id)
+    return [f"AUDIT_OWNER_EQUITY_LABEL_ROWS_RECOVERED:rows={recovered}"] if recovered else []
+
+
+def _owner_equity_label_source(
+    page: Any | None,
+    *,
+    parse_result: Any,
+    page_number: int,
+) -> _RecoveredCategory | None:
+    if page is None:
+        return None
+    pattern = re.compile(r"3\s*[.．、]\s*股份支付计入所有者权益的金额")
+    logical_tables = [
+        table
+        for table in getattr(parse_result, "logical_tables", None) or []
+        if page_number in {int(value) for value in (getattr(table, "source_pages", None) or []) if int(value) > 0}
+    ]
+    for table in [*(getattr(page, "tables", None) or []), *logical_tables]:
+        table_id = str(getattr(table, "table_id", "") or getattr(table, "logical_id", "") or "source_table")
+        for row_index, row in enumerate(getattr(table, "rows", None) or []):
+            source_page = int(getattr(row, "source_page", 0) or page_number)
+            if source_page != page_number:
+                continue
+            cells = list(getattr(row, "cells", None) or [])
+            joined = normalize_audit_text("".join(str(getattr(cell, "text", "") or "") for cell in cells))
+            match = pattern.search(joined)
+            if match is None:
+                continue
+            cell_boxes = [getattr(cell, "bbox", None) for cell in cells if getattr(cell, "bbox", None)]
+            bbox = (
+                (
+                    min(float(value[0]) for value in cell_boxes),
+                    min(float(value[1]) for value in cell_boxes),
+                    max(float(value[2]) for value in cell_boxes),
+                    max(float(value[3]) for value in cell_boxes),
+                )
+                if cell_boxes
+                else ()
+            )
+            evidence_ids = tuple(
+                dict.fromkeys(
+                    str(value) for cell in cells for value in (getattr(cell, "evidence_ids", None) or []) if value
+                )
+            )
+            return _RecoveredCategory(
+                value=normalize_audit_text(match.group()),
+                page=page_number,
+                bbox=bbox,
+                evidence_ids=evidence_ids,
+                table_id=table_id,
+                source_row_index=int(getattr(row, "source_row_index", row_index) or row_index),
+            )
+    for block_index, block in enumerate(getattr(page, "texts", None) or []):
+        match = pattern.search(normalize_audit_text(getattr(block, "content", "")))
+        if match is None:
+            continue
+        return _RecoveredCategory(
+            value=normalize_audit_text(match.group()),
+            page=int(getattr(page, "page_number", 0) or 1),
+            bbox=tuple(getattr(block, "bbox", None) or ()),
+            evidence_ids=tuple(str(value) for value in (getattr(block, "evidence_ids", None) or []) if value),
+            source_row_index=block_index,
+        )
+    return None
 
 
 def _page_statement_kind(page: Any, *, parse_result: Any, financial_pages: set[int]) -> str | None:
@@ -1662,23 +2081,36 @@ def _map_owner_equity_columns(segment: ProjectedSegment) -> ProjectedSegment:
     )
     mapping = {column.key: key for column, key in zip(amount_columns, equity_keys, strict=True)}
     _remap_segment_keys(segment, mapping)
+    segment.columns = [
+        replace(column, label=_OWNER_EQUITY_COLUMN_LABELS.get(column.key, column.label)) for column in segment.columns
+    ]
     if not any(column.key == "period_role" for column in segment.columns):
         insert_at = 1 if segment.columns and segment.columns[0].key == "item" else 0
         segment.columns.insert(
             insert_at, replace(segment.columns[0], source_index=-1, key="period_role", label="期间角色")
         )
     for record in segment.records:
-        for pool_name in ("raw", "canonical_raw", "normalized"):
-            pool = record.get(pool_name)
-            if isinstance(pool, dict):
-                pool["period_role"] = period_role
-        source = record.get("source") if isinstance(record.get("source"), dict) else {}
-        field_sources = source.setdefault("field_sources", {})
-        field_sources["period_role"] = {
-            "source": "derived.statement_period_role",
-            "page": source.get("page"),
-        }
+        _set_statement_period_role(record, period_role)
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        item = normalize_audit_text(normalized.get("item"))
+        normalized["item"] = re.sub(r"^-(?=\d+[.、])", "", item)
     return segment
+
+
+def _set_statement_period_role(record: dict[str, Any], period_role: str) -> None:
+    for pool_name in ("raw", "canonical_raw"):
+        pool = record.get(pool_name)
+        if isinstance(pool, dict):
+            pool.pop("period_role", None)
+    normalized = record.setdefault("normalized", {})
+    normalized["period_role"] = period_role
+    source = record.setdefault("source", {})
+    field_sources = source.setdefault("field_sources", {})
+    field_sources["period_role"] = {
+        "source": "derived.statement_period_role",
+        "page": source.get("page"),
+        "derivation": "source_statement_period_header",
+    }
 
 
 def _remap_segment_keys(segment: ProjectedSegment, mapping: dict[str, str]) -> None:
@@ -1931,14 +2363,678 @@ def _statement_continuation(page: Any, kind: str) -> bool:
     return False
 
 
+def resolve_note_table_candidates(
+    datasets: dict[str, list[dict[str, Any]]],
+    parse_result: Any,
+) -> list[str]:
+    """Resolve audit-note rows to physical tables, split mixed tables, and remove duplicate candidates."""
+
+    warnings: list[str] = []
+    table_index = _source_tables(parse_result)
+    logical_pages = _logical_source_pages(parse_result)
+    physical_tables = list(table_index.values())
+    for name, rows in datasets.items():
+        if not rows or re.sub(r"_\d+$", "", name) in _STATEMENT_KINDS or not _logical_dataset(rows):
+            continue
+        previous_table_id = ""
+        for record in rows:
+            source = record.get("source") if isinstance(record.get("source"), dict) else {}
+            logical_id = str(source.get("table_id") or "").split(":segment_", 1)[0]
+            pages = logical_pages.get(logical_id) or dataset_pages([record])
+            candidates = [item for item in physical_tables if not pages or item.page in pages]
+            match = _match_record_to_physical_row(record, candidates, previous_table_id=previous_table_id)
+            if match is None:
+                _discard_unverified_physical_source(record)
+                continue
+            _apply_physical_row_match(record, match)
+            previous_table_id = _source_table_id(match.source_table)
+        recovered_headers = _resolve_unmatched_header_records(rows, table_index)
+        if recovered_headers:
+            warnings.append(f"AUDIT_NOTE_HEADER_SOURCE_RECOVERED:dataset={name}:rows={recovered_headers}")
+        for record in rows:
+            source = record.get("source") if isinstance(record.get("source"), dict) else {}
+            if source.get("source_resolution") != "unresolved_logical_row":
+                continue
+            logical_id = str(source.get("table_id") or "").split(":segment_", 1)[0]
+            warnings.append(
+                f"AUDIT_NOTE_PHYSICAL_SOURCE_UNRESOLVED:dataset={name}:"
+                f"table={logical_id}:row={source.get('table_row_index', '')}"
+            )
+
+    warnings.extend(_split_mixed_logical_datasets(datasets, parse_result, table_index))
+    warnings.extend(_remove_duplicate_note_datasets(datasets))
+    return list(dict.fromkeys(warnings))
+
+
+def _logical_source_pages(parse_result: Any) -> dict[str, set[int]]:
+    pages: dict[str, set[int]] = {}
+    for table in getattr(parse_result, "logical_tables", None) or []:
+        table_id = str(getattr(table, "logical_id", "") or getattr(table, "table_id", ""))
+        if not table_id:
+            continue
+        pages[table_id] = {
+            int(page) for page in (getattr(table, "source_pages", None) or []) if str(page).isdigit() and int(page) > 0
+        }
+    return pages
+
+
+def _logical_dataset(rows: list[dict[str, Any]]) -> bool:
+    return any(
+        str((record.get("source") or {}).get("table_id") or "").split(":segment_", 1)[0].startswith("lt_")
+        for record in rows
+        if isinstance(record.get("source"), dict)
+    )
+
+
+def _match_record_to_physical_row(
+    record: dict[str, Any],
+    source_tables: list[_SourceTable],
+    *,
+    previous_table_id: str,
+) -> _PhysicalRowMatch | None:
+    raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
+    if not isinstance(raw, dict):
+        return None
+    record_values = [_match_token(value) for value in raw.values() if _match_token(value)]
+    if not record_values:
+        return None
+    keys = [_match_token(key) for key in raw]
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    declared_page = int(source.get("page") or 0)
+    declared_physical = str(source.get("physical_table_id") or "")
+    matches: list[_PhysicalRowMatch] = []
+    for source_table in source_tables:
+        header_tokens = _source_table_header_tokens(source_table.table)
+        header_text = " ".join(header_tokens)
+        header_score = sum(
+            (2 if key and key in header_text else 0) + sum(bool(key and header in key) for header in header_tokens)
+            for key in keys
+        )
+        width = table_width(source_table.table)
+        for row_index, row in enumerate(getattr(source_table.table, "rows", None) or []):
+            cells = row_cells_by_column(row, width)
+            physical_values = [_match_token(getattr(cell, "text", "")) for cell in cells]
+            physical_values = [value for value in physical_values if value]
+            overlap = _row_value_overlap(record_values, physical_values)
+            coverage = overlap / max(1, len(record_values))
+            if not _credible_physical_match(record_values, overlap, coverage):
+                continue
+            source_row_index = int(getattr(row, "source_row_index", row_index) or 0)
+            matches.append(
+                _PhysicalRowMatch(
+                    source_table=source_table,
+                    row=row,
+                    row_index=row_index,
+                    source_row_index=source_row_index,
+                    matched_values=overlap,
+                    coverage=coverage,
+                    header_score=header_score,
+                )
+            )
+    if not matches:
+        return None
+
+    def rank(match: _PhysicalRowMatch) -> tuple[int, float, int, int, int, int]:
+        table_id = _source_table_id(match.source_table)
+        return (
+            match.matched_values,
+            match.coverage,
+            match.header_score,
+            int(bool(previous_table_id and table_id == previous_table_id)),
+            int(bool(declared_physical and table_id == declared_physical)),
+            -abs(match.source_table.page - declared_page) if declared_page else 0,
+        )
+
+    matches.sort(key=rank, reverse=True)
+    best = matches[0]
+    best_rank = rank(best)
+    tied = [match for match in matches if rank(match) == best_rank]
+    table_ids = {_source_table_id(match.source_table) for match in tied}
+    return best if len(table_ids) == 1 else None
+
+
+def _credible_physical_match(values: list[str], overlap: int, coverage: float) -> bool:
+    if len(values) >= 2:
+        return overlap >= 2 and coverage >= 0.6
+    value = values[0]
+    return (
+        overlap == 1
+        and not _AMOUNT_HEADER_RE.fullmatch(value)
+        and value not in {"合计", "总计", "小计"}
+        and len(value) >= 4
+    )
+
+
+def _row_value_overlap(record_values: list[str], physical_values: list[str]) -> int:
+    record_counts = Counter(record_values)
+    physical_counts = Counter(physical_values)
+    exact = record_counts & physical_counts
+    overlap = sum(exact.values())
+    remaining = list((record_counts - exact).elements())
+    joined = "".join(physical_values)
+    overlap += sum(
+        bool(value and not _AMOUNT_HEADER_RE.fullmatch(value) and len(value) >= 4 and value in joined)
+        for value in remaining
+    )
+    return overlap
+
+
+def _match_token(value: Any) -> str:
+    return normalize_audit_text(value).replace(" ", "").replace("（", "(").replace("）", ")")
+
+
+def _source_table_header_tokens(table: Any) -> list[str]:
+    values = [*(getattr(table, "headers", None) or [])]
+    for row in list(getattr(table, "rows", None) or [])[:3]:
+        values.extend(getattr(cell, "text", "") for cell in (getattr(row, "cells", None) or []))
+    return [_match_token(value) for value in values if _match_token(value)]
+
+
+def _source_table_id(source_table: _SourceTable) -> str:
+    return str(getattr(source_table.table, "table_id", "") or f"pt_{source_table.page}_{source_table.index}")
+
+
+def _apply_physical_row_match(record: dict[str, Any], match: _PhysicalRowMatch) -> None:
+    source = record.setdefault("source", {})
+    table_id = _source_table_id(match.source_table)
+    page = int(getattr(match.row, "source_page", 0) or match.source_table.page)
+    source.update(
+        {
+            "page": page,
+            "page_range": [page, page],
+            "physical_table_id": table_id,
+            "source_row_index": match.source_row_index,
+            "physical_table_row_index": match.row_index,
+            "source_resolution": "matched_physical_row",
+        }
+    )
+    raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
+    raw = raw if isinstance(raw, dict) else {}
+    cells = row_cells_by_column(match.row, table_width(match.source_table.table))
+    positions = _record_cell_positions(raw, cells)
+    refs: list[dict[str, Any]] = []
+    evidence_ids: list[str] = []
+    for field_name, cell_index in zip(raw, positions, strict=True):
+        if cell_index is None or cell_index >= len(cells):
+            continue
+        cell = cells[cell_index]
+        evidence_ids.extend(str(value) for value in (getattr(cell, "evidence_ids", None) or []) if value)
+        cell_refs = [dict(ref) for ref in (getattr(cell, "source_cell_refs", None) or []) if isinstance(ref, dict)]
+        if not cell_refs:
+            cell_refs = [{}]
+        for ref in cell_refs:
+            ref.update(
+                {
+                    "page": page,
+                    "table_id": table_id,
+                    "row": match.source_row_index,
+                    "col": cell_index,
+                    "field_name": field_name,
+                }
+            )
+            bbox = getattr(cell, "bbox", None)
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                ref.setdefault("bbox", [float(value) for value in bbox])
+            refs.append(ref)
+    evidence_ids.extend(
+        str(value) for value in (getattr(match.source_table.table, "evidence_ids", None) or []) if value
+    )
+    if refs:
+        source["source_cell_refs"] = refs
+        record["source_cell_refs"] = copy.deepcopy(refs)
+    if evidence_ids:
+        unique_evidence = list(dict.fromkeys(evidence_ids))
+        source["evidence_ids"] = unique_evidence
+        record["evidence_ids"] = unique_evidence
+
+
+def _record_cell_positions(raw: dict[str, Any], cells: list[Any]) -> list[int | None]:
+    cell_values = [_match_token(getattr(cell, "text", "")) for cell in cells]
+    used: set[int] = set()
+    positions: list[int | None] = []
+    positional = len(cells) == len(raw)
+    for index, value in enumerate(raw.values()):
+        token = _match_token(value)
+        if positional and (not token or cell_values[index] == token):
+            positions.append(index)
+            used.add(index)
+            continue
+        match = next(
+            (
+                cell_index
+                for cell_index, cell_value in enumerate(cell_values)
+                if cell_index not in used and cell_value == token and token
+            ),
+            None,
+        )
+        positions.append(match)
+        if match is not None:
+            used.add(match)
+    return positions
+
+
+def _discard_unverified_physical_source(record: dict[str, Any]) -> None:
+    source = record.get("source") if isinstance(record.get("source"), dict) else {}
+    source.pop("physical_table_id", None)
+    source.pop("source_cell_refs", None)
+    source.pop("evidence_ids", None)
+    source["source_resolution"] = "unresolved_logical_row"
+    record.pop("source_cell_refs", None)
+    record.pop("evidence_ids", None)
+    review = record.setdefault("review", {"required": True, "reasons": []})
+    review["required"] = True
+    reasons = review.setdefault("reasons", [])
+    if "physical_source_unresolved" not in reasons:
+        reasons.append("physical_source_unresolved")
+
+
+def _resolve_unmatched_header_records(
+    rows: list[dict[str, Any]],
+    table_index: dict[str, _SourceTable],
+) -> int:
+    recovered = 0
+    promoted_table_ids: set[str] = set()
+    for index, record in enumerate(rows):
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        if source.get("source_resolution") != "unresolved_logical_row":
+            continue
+        neighbor_ids = [
+            str((rows[position].get("source") or {}).get("physical_table_id") or "")
+            for position in (index - 1, index + 1)
+            if 0 <= position < len(rows)
+        ]
+        neighbor_ids = [table_id for table_id in neighbor_ids if table_id]
+        if not neighbor_ids or len(set(neighbor_ids)) != 1:
+            continue
+        source_table = table_index.get(neighbor_ids[0])
+        if source_table is None or not _record_matches_table_headers(record, source_table.table):
+            continue
+        _apply_table_header_match(record, source_table)
+        promoted_table_ids.add(_source_table_id(source_table))
+        recovered += 1
+    for table_id in promoted_table_ids:
+        _rebase_promoted_header_rows(rows, table_id)
+    return recovered
+
+
+def _rebase_promoted_header_rows(rows: list[dict[str, Any]], table_id: str) -> None:
+    table_rows = [
+        record for record in rows if str((record.get("source") or {}).get("physical_table_id") or "") == table_id
+    ]
+    for logical_row_index, record in enumerate(table_rows):
+        source = record.setdefault("source", {})
+        physical_row_index = source.get("source_row_index")
+        if physical_row_index is not None:
+            source["physical_source_row_index"] = physical_row_index
+        source["source_row_index"] = logical_row_index
+
+
+def _record_matches_table_headers(record: dict[str, Any], table: Any) -> bool:
+    raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
+    values = (
+        [_match_token(value) for value in (raw or {}).values() if _match_token(value)] if isinstance(raw, dict) else []
+    )
+    headers = [_match_token(value) for value in (getattr(table, "headers", None) or []) if _match_token(value)]
+    header_text = "".join(headers)
+    return bool(values and headers and all(value in headers or value in header_text for value in values))
+
+
+def _apply_table_header_match(record: dict[str, Any], source_table: _SourceTable) -> None:
+    source = record.setdefault("source", {})
+    table_id = _source_table_id(source_table)
+    source.update(
+        {
+            "page": source_table.page,
+            "page_range": [source_table.page, source_table.page],
+            "physical_table_id": table_id,
+            "source_row_index": -1,
+            "physical_table_row_index": -1,
+            "source_resolution": "matched_physical_table_header",
+            "recovery": "source_table_header_was_data",
+        }
+    )
+    raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
+    refs = [
+        {
+            "page": source_table.page,
+            "table_id": table_id,
+            "row": -1,
+            "col": index,
+            "field_name": field_name,
+            "recovery": "source_table_header_was_data",
+        }
+        for index, field_name in enumerate((raw or {}).keys())
+    ]
+    evidence_ids = [str(value) for value in (getattr(source_table.table, "evidence_ids", None) or []) if value]
+    if refs:
+        source["source_cell_refs"] = refs
+        record["source_cell_refs"] = copy.deepcopy(refs)
+    if evidence_ids:
+        source["evidence_ids"] = evidence_ids
+        record["evidence_ids"] = evidence_ids
+    review = record.get("review") if isinstance(record.get("review"), dict) else {}
+    reasons = [reason for reason in (review.get("reasons") or []) if reason != "physical_source_unresolved"]
+    if evidence_ids:
+        if reasons:
+            review["reasons"] = reasons
+            review["required"] = True
+        else:
+            record.pop("review", None)
+    else:
+        review.update(required=True, reasons=[*reasons, "table_header_evidence_missing"])
+        record["review"] = review
+
+
+def _split_mixed_logical_datasets(
+    datasets: dict[str, list[dict[str, Any]]],
+    parse_result: Any,
+    table_index: dict[str, _SourceTable],
+) -> list[str]:
+    warnings: list[str] = []
+    rewritten: dict[str, list[dict[str, Any]]] = {}
+    for name, rows in datasets.items():
+        groups = _consecutive_physical_groups(rows) if _logical_dataset(rows) else []
+        subjects = [
+            _subject_slug(_dataset_caption(group, parse_result, table_index))
+            or _column_subject_slug(record_keys(group))
+            for group in groups
+        ]
+        distinct = {subject for subject in subjects if subject}
+        if len(groups) < 2 or len(distinct) < 2:
+            rewritten[name] = rows
+            continue
+        for ordinal, group in enumerate(groups, start=1):
+            split_name = f"{name}__split_{ordinal:02d}"
+            rewritten[split_name] = group
+            warnings.append(
+                f"AUDIT_NOTE_MIXED_TABLE_SPLIT:from={name}:to={split_name}:"
+                f"physical={((group[0].get('source') or {}).get('physical_table_id') or '')}"
+            )
+    datasets.clear()
+    datasets.update(rewritten)
+    return warnings
+
+
+def _consecutive_physical_groups(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    previous = ""
+    for record in rows:
+        physical = str((record.get("source") or {}).get("physical_table_id") or "")
+        if not physical:
+            return []
+        if not groups or physical != previous:
+            groups.append([])
+        groups[-1].append(record)
+        previous = physical
+    return groups
+
+
+def _remove_duplicate_note_datasets(datasets: dict[str, list[dict[str, Any]]]) -> list[str]:
+    warnings: list[str] = []
+    names = list(datasets)
+    removed: set[str] = set()
+    for index, left_name in enumerate(names):
+        if left_name in removed or left_name not in datasets:
+            continue
+        for right_name in names[index + 1 :]:
+            if right_name in removed or right_name not in datasets:
+                continue
+            left, right = datasets[left_name], datasets[right_name]
+            if not _duplicate_dataset_pair(left, right):
+                continue
+            keep, drop = max(
+                ((left_name, right_name), (right_name, left_name)),
+                key=lambda pair: _dataset_candidate_rank(datasets[pair[0]]),
+            )
+            _retain_suppressed_source_ids(datasets[keep], datasets[drop])
+            datasets.pop(drop, None)
+            removed.add(drop)
+            warnings.append(f"AUDIT_NOTE_DUPLICATE_DATASET_REMOVED:removed={drop}:kept={keep}")
+            if drop == left_name:
+                break
+    return warnings
+
+
+def _retain_suppressed_source_ids(kept: list[dict[str, Any]], dropped: list[dict[str, Any]]) -> None:
+    kept_physical = _dataset_physical_ids(kept)
+    suppressed = {
+        str((record.get("source") or {}).get("table_id") or "").split(":segment_", 1)[0]
+        for record in dropped
+        if (record.get("source") or {}).get("table_id")
+    } - kept_physical
+    if not suppressed:
+        return
+    for record in kept:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        existing = [str(value) for value in (source.get("suppressed_source_table_ids") or []) if value]
+        source["suppressed_source_table_ids"] = list(dict.fromkeys([*existing, *sorted(suppressed)]))
+
+
+def _duplicate_dataset_pair(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
+    left_physical = _dataset_physical_ids(left)
+    right_physical = _dataset_physical_ids(right)
+    if not left_physical.intersection(right_physical):
+        return False
+    left_rows = Counter(filter(None, (_record_value_fingerprint(record) for record in left)))
+    right_rows = Counter(filter(None, (_record_value_fingerprint(record) for record in right)))
+    if not left_rows or not right_rows:
+        return False
+    smaller, larger = (
+        (left_rows, right_rows) if sum(left_rows.values()) <= sum(right_rows.values()) else (right_rows, left_rows)
+    )
+    return all(larger[fingerprint] >= count for fingerprint, count in smaller.items())
+
+
+def _dataset_physical_ids(rows: list[dict[str, Any]]) -> set[str]:
+    return {
+        str((record.get("source") or {}).get("physical_table_id") or "")
+        for record in rows
+        if (record.get("source") or {}).get("physical_table_id")
+    }
+
+
+def _record_value_fingerprint(record: dict[str, Any]) -> tuple[str, ...]:
+    raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else record.get("raw")
+    return (
+        tuple(value for value in (_match_token(item) for item in (raw or {}).values()) if value)
+        if isinstance(raw, dict)
+        else ()
+    )
+
+
+def _dataset_candidate_rank(rows: list[dict[str, Any]]) -> tuple[int, int, int, int, int]:
+    keys = set(_record_pool_keys(rows))
+    source_fields = {
+        str(ref.get("field_name"))
+        for record in rows
+        for ref in ((record.get("source") or {}).get("source_cell_refs") or [])
+        if isinstance(ref, dict) and ref.get("field_name")
+    }
+    field_coverage = round(1000 * len(keys.intersection(source_fields)) / len(source_fields)) if source_fields else 1000
+    logical_rows = sum(
+        str((record.get("source") or {}).get("table_id") or "").split(":segment_", 1)[0].startswith("lt_")
+        for record in rows
+    )
+    evidence = sum(bool((record.get("source") or {}).get("evidence_ids")) for record in rows)
+    return field_coverage, len(keys), len(rows), -logical_rows, evidence
+
+
+def merge_horizontal_note_continuations(
+    datasets: dict[str, list[dict[str, Any]]],
+    parse_result: Any,
+) -> list[str]:
+    """Join adjacent source tables that continue the same business rows horizontally."""
+
+    warnings: list[str] = []
+    table_index = _source_tables(parse_result)
+    names = list(datasets)
+    cursor = 0
+    while cursor + 1 < len(names):
+        left_name, right_name = names[cursor], names[cursor + 1]
+        left, right = datasets[left_name], datasets[right_name]
+        if not _horizontal_continuation_pair(left, right, parse_result, table_index):
+            cursor += 1
+            continue
+        datasets[left_name] = [
+            _merge_horizontal_records(left_record, right_record)
+            for left_record, right_record in zip(left, right, strict=True)
+        ]
+        datasets.pop(right_name)
+        names.pop(cursor + 1)
+        warnings.append(f"AUDIT_NOTE_HORIZONTAL_TABLE_MERGED:from={right_name}:to={left_name}:rows={len(left)}")
+    return warnings
+
+
+def _horizontal_continuation_pair(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+    parse_result: Any,
+    table_index: dict[str, _SourceTable],
+) -> bool:
+    if len(left) < 2 or len(left) != len(right):
+        return False
+    left_table = _dataset_source_table(left, table_index)
+    right_table = _dataset_source_table(right, table_index)
+    if (
+        left_table is None
+        or right_table is None
+        or left_table.page != right_table.page
+        or right_table.index != left_table.index + 1
+    ):
+        return False
+    left_keys, right_keys = record_keys(left), record_keys(right)
+    if len(left_keys) < 2 or len(right_keys) < 2 or left_keys == right_keys:
+        return False
+    left_anchors = [_match_token((record.get("raw") or {}).get(left_keys[0])) for record in left]
+    right_anchors = [_match_token((record.get("raw") or {}).get(right_keys[0])) for record in right]
+    if not all(left_anchors) or left_anchors != right_anchors:
+        return False
+    left_subject = _subject_slug(_dataset_caption(left, parse_result, table_index)) or _column_subject_slug(left_keys)
+    right_subject = _subject_slug(_dataset_caption(right, parse_result, table_index)) or _column_subject_slug(
+        right_keys
+    )
+    return not (left_subject and right_subject and left_subject != right_subject)
+
+
+def _merge_horizontal_records(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    merged = copy.deepcopy(left)
+    left_keys = list((left.get("raw") or {}).keys())
+    right_keys = list((right.get("raw") or {}).keys())
+    duplicate_anchor = right_keys[0] if left_keys and right_keys else ""
+    for pool_name in ("normalized", "canonical_raw", "raw"):
+        left_pool = merged.get(pool_name) if isinstance(merged.get(pool_name), dict) else {}
+        right_pool = right.get(pool_name) if isinstance(right.get(pool_name), dict) else {}
+        for key, value in right_pool.items():
+            if key == duplicate_anchor and key in left_pool:
+                continue
+            target = key
+            suffix = 2
+            while target in left_pool:
+                target = f"{key}_{suffix}"
+                suffix += 1
+            left_pool[target] = copy.deepcopy(value)
+        merged[pool_name] = left_pool
+    left_source = merged.get("source") if isinstance(merged.get("source"), dict) else {}
+    right_source = right.get("source") if isinstance(right.get("source"), dict) else {}
+    physical_ids = [
+        str(value)
+        for value in (
+            left_source.get("physical_table_id"),
+            right_source.get("physical_table_id"),
+        )
+        if value
+    ]
+    left_source["physical_table_ids"] = list(dict.fromkeys(physical_ids))
+    if len(physical_ids) > 1:
+        suppressed = [str(value) for value in (left_source.get("suppressed_source_table_ids") or []) if value]
+        left_source["suppressed_source_table_ids"] = list(dict.fromkeys([*suppressed, *physical_ids[1:]]))
+    left_source["horizontal_continuation"] = True
+    refs = [
+        copy.deepcopy(ref)
+        for source in (left_source, right_source)
+        for ref in (source.get("source_cell_refs") or [])
+        if isinstance(ref, dict)
+    ]
+    evidence_ids = [
+        str(value) for source in (left_source, right_source) for value in (source.get("evidence_ids") or []) if value
+    ]
+    if refs:
+        left_source["source_cell_refs"] = refs
+        merged["source_cell_refs"] = copy.deepcopy(refs)
+    if evidence_ids:
+        left_source["evidence_ids"] = list(dict.fromkeys(evidence_ids))
+        merged["evidence_ids"] = list(dict.fromkeys(evidence_ids))
+    merged["source"] = left_source
+    return merged
+
+
+def repair_stacked_note_headers(
+    datasets: dict[str, list[dict[str, Any]]],
+) -> list[str]:
+    """Replace residual generic columns using stable audit-note stacked-header schemas."""
+
+    warnings: list[str] = []
+    for name, rows in datasets.items():
+        source_keys = record_keys(rows)
+        target_keys = _stacked_note_schema(source_keys)
+        if not target_keys or source_keys == target_keys:
+            continue
+        datasets[name] = [_remap_record(record, source_keys, target_keys) for record in rows]
+        warnings.append(f"AUDIT_NOTE_STACKED_HEADERS_RECOVERED:dataset={name}:columns={len(target_keys)}")
+    return warnings
+
+
+def _stacked_note_schema(keys: list[str]) -> list[str]:
+    compact = [normalize_audit_text(key).replace(" ", "") for key in keys]
+    generic = [bool(re.fullmatch(r"(?:col|column)_\d+", key)) for key in compact]
+    if len(keys) == 4 and generic[:2] == [True, True] and "坏账准备" in compact[2] and "计提比例" in compact[3]:
+        return ["名称", "期末余额/应收账款", "期末余额/坏账准备", "期末余额/计提比例(%)"]
+    if len(keys) == 4 and generic[:2] == [True, True] and "占应收账款" in compact[2]:
+        return ["单位名称", "期末余额/应收账款", keys[2], keys[3]]
+    if len(keys) == 6 and generic[:2] == [True, True] and {"计提", "收回或转回", "核销"} <= set(compact):
+        return ["项目", "期初余额", "本期变动金额/计提", "本期变动金额/收回或转回", "本期变动金额/核销", "期末余额"]
+    period_match = re.fullmatch(r"(期初余额|期末余额)/账面余额/金额", compact[1]) if len(keys) == 6 else None
+    period = period_match.group(1) if period_match else ""
+    if (
+        period
+        and compact[0] == "类别"
+        and compact[2] in {"比例(%)", f"{period}/账面余额/比例(%)"}
+        and compact[3] == f"{period}/坏账准备/金额"
+        and compact[4] in {"计提比例(%)", f"{period}/坏账准备/计提比例(%)"}
+        and compact[5] == f"{period}/账面价值"
+    ):
+        return [
+            "类别",
+            f"{period}/账面余额/金额",
+            f"{period}/账面余额/比例(%)",
+            f"{period}/坏账准备/金额",
+            f"{period}/坏账准备/计提比例(%)",
+            f"{period}/账面价值",
+        ]
+    if (
+        len(keys) == 6
+        and generic[:2] == [True, True]
+        and compact[2:6] == ["账面余额", "坏账准备", "账面余额_2", "坏账准备_2"]
+    ):
+        return [
+            "项目",
+            "关联方名称",
+            "期末余额/账面余额",
+            "期末余额/坏账准备",
+            "期初余额/账面余额",
+            "期初余额/坏账准备",
+        ]
+    return []
+
+
 def merge_cross_page_continuations(
     datasets: dict[str, list[dict[str, Any]]],
     parse_result: Any,
 ) -> list[str]:
     """Merge only adjacent tables whose source headers prove a continuation."""
 
-    warnings: list[str] = []
     table_index = _source_tables(parse_result)
+    warnings = _merge_orphan_total_tables(datasets, table_index)
     names = list(datasets)
     cursor = 0
     while cursor + 1 < len(names):
@@ -1953,10 +3049,24 @@ def merge_cross_page_continuations(
         left_keys, right_keys = record_keys(left), record_keys(right)
         if _numeric_header_continuation(left_keys, right_keys):
             recovered = _header_record(right_name, left_keys, right_keys, right, table_index)
-            datasets[left_name] = [*left, recovered, *[_remap_record(row, right_keys, left_keys) for row in right]]
+            merged = [*left, recovered, *[_remap_record(row, right_keys, left_keys) for row in right]]
+            promoted_table_id = str((recovered.get("source") or {}).get("physical_table_id") or "")
+            if promoted_table_id:
+                _rebase_promoted_header_rows(merged, promoted_table_id)
+            datasets[left_name] = merged
             datasets.pop(right_name)
             names.pop(cursor + 1)
             warnings.append(f"AUDIT_CROSS_PAGE_TABLE_REPAIRED:from={right_name}:to={left_name}:mode=data_header")
+            continue
+        if _repeated_header_continuation(left_keys, right_keys) and not _dataset_caption(
+            right,
+            parse_result,
+            table_index,
+        ):
+            datasets[left_name] = [*left, *right]
+            datasets.pop(right_name)
+            names.pop(cursor + 1)
+            warnings.append(f"AUDIT_CROSS_PAGE_TABLE_REPAIRED:from={right_name}:to={left_name}:mode=repeated_header")
             continue
         category_values = _category_continuation_values(parse_result, left, right, left_keys, right_keys)
         if category_values:
@@ -1979,6 +3089,153 @@ def merge_cross_page_continuations(
             continue
         cursor += 1
     return warnings
+
+
+def _merge_orphan_total_tables(
+    datasets: dict[str, list[dict[str, Any]]],
+    table_index: dict[str, _SourceTable],
+) -> list[str]:
+    """Attach a headerless total table at the next page boundary to its source dataset."""
+
+    warnings: list[str] = []
+    for candidate in _orphan_total_candidates(datasets, table_index):
+        records = datasets[candidate.dataset_name]
+        recovered = [
+            _source_row_record(
+                candidate.dataset_name,
+                list(candidate.keys),
+                candidate.source_table,
+                row,
+                row_index,
+            )
+            for row_index, row in enumerate(candidate.rows)
+        ]
+        records.extend(recovered)
+        warnings.append(
+            f"AUDIT_CROSS_PAGE_TABLE_REPAIRED:table={_source_table_id(candidate.source_table)}:"
+            f"to={candidate.dataset_name}:mode=orphan_total:rows={len(recovered)}"
+        )
+    return warnings
+
+
+def _orphan_total_candidates(
+    datasets: dict[str, list[dict[str, Any]]],
+    table_index: dict[str, _SourceTable],
+) -> list[_OrphanTotalCandidate]:
+    positions = {(source.page, source.index): source for source in table_index.values()}
+    last_index_by_page: dict[int, int] = {}
+    for source in table_index.values():
+        last_index_by_page[source.page] = max(last_index_by_page.get(source.page, -1), source.index)
+    represented = {table_id for rows in datasets.values() for table_id in _dataset_physical_ids(rows) if table_id}
+    candidates: list[_OrphanTotalCandidate] = []
+    for name, records in datasets.items():
+        keys = record_keys(records)
+        left = _dataset_source_table(records, table_index, last=True)
+        if (
+            len(keys) < 2
+            or left is None
+            or left.index != last_index_by_page.get(left.page)
+            or table_width(left.table) != len(keys)
+            or _record_starts_with_total(records[-1], keys[0])
+        ):
+            continue
+        right = positions.get((left.page + 1, 0))
+        if right is None:
+            continue
+        right_id = _source_table_id(right)
+        headers = [normalize_audit_text(value) for value in (getattr(right.table, "headers", None) or [])]
+        source_rows = list(getattr(right.table, "rows", None) or [])
+        if (
+            right_id in represented
+            or any(headers)
+            or not 1 <= len(source_rows) <= 3
+            or table_width(right.table) != len(keys)
+            or not all(_source_row_starts_with_total(row, len(keys)) for row in source_rows)
+        ):
+            continue
+        represented.add(right_id)
+        candidates.append(
+            _OrphanTotalCandidate(
+                dataset_name=name,
+                keys=tuple(keys),
+                source_table=right,
+                rows=tuple(source_rows),
+            )
+        )
+    return candidates
+
+
+def _record_starts_with_total(record: dict[str, Any], first_key: str) -> bool:
+    raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+    return _match_token(raw.get(first_key)) in {"合计", "总计", "小计"}
+
+
+def _source_row_starts_with_total(row: Any, width: int) -> bool:
+    cells = row_cells_by_column(row, width)
+    return bool(cells) and _match_token(getattr(cells[0], "text", "")) in {"合计", "总计", "小计"}
+
+
+def _source_row_record(
+    dataset_name: str,
+    keys: list[str],
+    source_table: _SourceTable,
+    row: Any,
+    row_index: int,
+) -> dict[str, Any]:
+    table_id = _source_table_id(source_table)
+    width = table_width(source_table.table)
+    cells = row_cells_by_column(row, width)
+    raw = {key: str(getattr(cell, "text", "") or "") for key, cell in zip(keys, cells, strict=True)}
+    normalized = {
+        key: normalize_scalar(value, value_type="decimal") if amount_like(value) else normalize_audit_text(value)
+        for key, value in raw.items()
+    }
+    source_row_index = int(getattr(row, "source_row_index", row_index) or 0)
+    refs: list[dict[str, Any]] = []
+    evidence_ids: list[str] = []
+    for column, (field_name, cell) in enumerate(zip(keys, cells, strict=True)):
+        evidence_ids.extend(str(value) for value in (getattr(cell, "evidence_ids", None) or []) if value)
+        cell_refs = [dict(ref) for ref in (getattr(cell, "source_cell_refs", None) or []) if isinstance(ref, dict)]
+        if not cell_refs:
+            cell_refs = [{}]
+        for ref in cell_refs:
+            ref.update(
+                {
+                    "page": source_table.page,
+                    "table_id": table_id,
+                    "row": source_row_index,
+                    "col": column,
+                    "field_name": field_name,
+                    "recovery": "cross_page_orphan_total",
+                }
+            )
+            bbox = getattr(cell, "bbox", None)
+            if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+                ref.setdefault("bbox", [float(value) for value in bbox])
+            refs.append(ref)
+    evidence_ids.extend(str(value) for value in (getattr(source_table.table, "evidence_ids", None) or []) if value)
+    evidence_ids = list(dict.fromkeys(evidence_ids))
+    source = {
+        "page": source_table.page,
+        "page_range": [source_table.page, source_table.page],
+        "table_id": table_id,
+        "physical_table_id": table_id,
+        "table_row_index": row_index,
+        "source_row_index": source_row_index,
+        "source_resolution": "cross_page_orphan_total",
+        "recovery": "cross_page_orphan_total",
+        "source_cell_refs": refs,
+        **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+    }
+    return {
+        "record_id": f"{dataset_name}:cross_page:{source_table.page}:{source_row_index}",
+        "normalized": normalized,
+        "canonical_raw": dict(raw),
+        "raw": raw,
+        "source": source,
+        "source_cell_refs": copy.deepcopy(refs),
+        **({"evidence_ids": list(evidence_ids)} if evidence_ids else {}),
+    }
 
 
 def repair_note_datasets(datasets: dict[str, list[dict[str, Any]]]) -> list[str]:
@@ -2008,7 +3265,14 @@ def _promote_note_header_rows(
         return rows, 0
     candidates = rows[:2]
     scores = [_promoted_header_score(record) for record in candidates]
-    anchor = next((index for index, score in enumerate(scores) if score >= 3), None)
+    anchor = next(
+        (
+            index
+            for index, (score, record) in enumerate(zip(scores, candidates, strict=True))
+            if score >= 3 or len(keys) == 2 and _semantic_two_column_header(record)
+        ),
+        None,
+    )
     if anchor is None:
         return rows, 0
     start = 0 if anchor and scores[0] >= 1 else anchor
@@ -2045,6 +3309,17 @@ def _promoted_header_score(record: dict[str, Any]) -> int:
     if not values or any(amount_like(value) for value in values):
         return 0
     return sum(bool(_PROMOTED_HEADER_MARKERS.search(value)) for value in values)
+
+
+def _semantic_two_column_header(record: dict[str, Any]) -> bool:
+    raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+    values = [normalize_audit_text(value) for value in raw.values()]
+    if len(values) != 2 or not all(values) or any(amount_like(value) for value in values):
+        return False
+    return bool(
+        re.search(r"项目|名称|类别|组合", values[0])
+        and re.search(r"依据|说明|金额|余额|比例|日期|状态|类别|名称", values[1])
+    )
 
 
 def _split_concatenated_header(value: str) -> tuple[str, str] | None:
@@ -2120,6 +3395,306 @@ def _duplicate_split_source_ref(record: dict[str, Any], *, source_key: str, targ
         record["source_cell_refs"] = copy.deepcopy(refs)
 
 
+def recover_note_text_continuations(
+    datasets: dict[str, list[dict[str, Any]]],
+    parse_result: Any,
+) -> list[str]:
+    """Recover exact audit-note continuation rows that survive only as positioned page text."""
+
+    rows = datasets.get("accounts_payable")
+    if not rows or any(_match_token((record.get("raw") or {}).get(record_keys(rows)[0])) == "合计" for record in rows):
+        return []
+    keys = record_keys(rows)
+    if len(keys) != 3:
+        return []
+    next_page = max(dataset_pages(rows), default=0) + 1
+    page = next(
+        (
+            item
+            for item in getattr(parse_result, "pages", None) or []
+            if int(getattr(item, "page_number", 0) or 1) == next_page
+        ),
+        None,
+    )
+    if page is None:
+        return []
+    amount = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}"
+    pattern = re.compile(rf"合\s*计\s*(?P<current>{amount})\s+(?P<previous>{amount})")
+    matches: list[tuple[re.Match[str], Any, int]] = []
+    for block_index, block in enumerate(getattr(page, "texts", None) or []):
+        match = pattern.search(normalize_audit_text(getattr(block, "content", "")))
+        if match is not None:
+            matches.append((match, block, block_index))
+    if len(matches) != 1:
+        return []
+    match, block, block_index = matches[0]
+    raw = {keys[0]: "合 计", keys[1]: match.group("current"), keys[2]: match.group("previous")}
+    bbox = getattr(block, "bbox", None)
+    evidence_ids = [str(value) for value in (getattr(block, "evidence_ids", None) or []) if value]
+    refs = []
+    for field_name in keys:
+        ref: dict[str, Any] = {
+            "page": next_page,
+            "field_name": field_name,
+            "source": "canonical_text",
+            "recovery": "text_continuation_row",
+        }
+        if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            ref["bbox"] = [float(value) for value in bbox]
+        if evidence_ids:
+            ref["evidence_ids"] = list(evidence_ids)
+        refs.append(ref)
+    record = normalize_audit_record(
+        {
+            "record_id": "accounts_payable:recovered_total",
+            "raw": raw,
+            "canonical_raw": dict(raw),
+            "normalized": {},
+            "source": {
+                "page": next_page,
+                "page_range": [next_page, next_page],
+                "table_id": "canonical_text",
+                "source_row_index": block_index,
+                "source_resolution": "canonical_text_continuation_row",
+                "source_cell_refs": refs,
+                **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+            },
+            "source_cell_refs": copy.deepcopy(refs),
+            **({"evidence_ids": evidence_ids} if evidence_ids else {}),
+            "confidence": 0.95 if evidence_ids else 0.75,
+        }
+    )
+    rows.append(record)
+    _reindex_dataset_records(rows, "accounts_payable")
+    return ["AUDIT_NOTE_TEXT_CONTINUATION_RECOVERED:dataset=accounts_payable:rows=1:page=40"]
+
+
+def name_note_datasets(
+    datasets: dict[str, list[dict[str, Any]]],
+    sections: list[dict[str, Any]],
+    parse_result: Any,
+) -> tuple[dict[str, str], list[str]]:
+    """Replace generic names with concise, source-ordered audit subject names."""
+
+    table_index = _source_tables(parse_result)
+    candidates = {
+        name
+        for name, rows in datasets.items()
+        if _GENERIC_TABLE_DATASET_RE.fullmatch(name) and _dataset_source_table(rows, table_index) is not None
+    }
+    used = {name for name in datasets if name not in candidates}
+    fixed_names = set(used)
+    resolved: dict[str, tuple[str, str, tuple[int, int, int]]] = {}
+    group_sizes: dict[str, int] = {}
+    for position, (original_name, rows) in enumerate(datasets.items()):
+        if original_name not in candidates:
+            continue
+        section = _select_dataset_section(rows, sections, table_index)
+        section_title = normalize_audit_text((section or {}).get("title"))
+        caption = _dataset_caption(rows, parse_result, table_index)
+        base = _semantic_note_dataset_name(section_title, caption, rows)
+        if not base:
+            continue
+        source_table = _dataset_source_table(rows, table_index)
+        source_order = (
+            source_table.page if source_table is not None else 10**9,
+            source_table.index if source_table is not None else 10**9,
+            position,
+        )
+        resolved[original_name] = (base, _note_dataset_label(base, caption, section_title, rows), source_order)
+        group_sizes[base] = group_sizes.get(base, 0) + 1
+
+    allocated: dict[str, str] = {}
+    group_ordinals: dict[str, int] = {}
+    for original_name, (base, _label, _source_order) in sorted(resolved.items(), key=lambda item: item[1][2]):
+        ordinal = group_ordinals.get(base, 0) + 1
+        numbered = group_sizes[base] > 1 or base in fixed_names
+        semantic_name = f"{base}_{ordinal:02d}" if numbered else base
+        while semantic_name in used:
+            ordinal += 1
+            semantic_name = f"{base}_{ordinal:02d}"
+        group_ordinals[base] = ordinal
+        allocated[original_name] = semantic_name
+        used.add(semantic_name)
+
+    renamed: dict[str, list[dict[str, Any]]] = {}
+    labels: dict[str, str] = {}
+    warnings: list[str] = []
+    for original_name, rows in datasets.items():
+        if original_name not in candidates:
+            renamed[original_name] = rows
+            continue
+        semantic_name = allocated.get(original_name)
+        if semantic_name is None:
+            renamed[original_name] = rows
+            warnings.append(f"AUDIT_TABLE_TITLE_UNRESOLVED:dataset={original_name}")
+            continue
+        _reindex_dataset_records(rows, semantic_name)
+        renamed[semantic_name] = rows
+        labels[semantic_name] = resolved[original_name][1]
+    datasets.clear()
+    datasets.update(renamed)
+    return labels, warnings
+
+
+def canonicalize_audit_dataset_columns(
+    datasets: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, dict[str, dict[str, str]]], list[str]]:
+    """Replace audit-note source headers with stable English keys and retain clean labels."""
+
+    schemas: dict[str, dict[str, dict[str, str]]] = {}
+    warnings: list[str] = []
+    for name, rows in datasets.items():
+        if re.sub(r"_\d+$", "", name) in _STATEMENT_KINDS:
+            continue
+        source_keys = [
+            key
+            for key in record_keys(rows)
+            if _audit_column_key(normalize_audit_label(key)) or _record_field_has_value(rows, key)
+        ]
+        labels = [normalize_audit_label(key) for key in source_keys]
+        target_keys = [_audit_column_key(label) for label in labels]
+        unresolved = [label for label, key in zip(labels, target_keys, strict=True) if not key]
+        if unresolved:
+            warnings.append(f"AUDIT_COLUMN_SCHEMA_UNRESOLVED:dataset={name}:labels={'|'.join(unresolved)}")
+            continue
+        duplicates = [key for key, count in Counter(target_keys).items() if count > 1]
+        if duplicates:
+            warnings.append(f"AUDIT_COLUMN_SCHEMA_COLLISION:dataset={name}:keys={'|'.join(duplicates)}")
+            continue
+        datasets[name] = [_remap_record(record, source_keys, target_keys) for record in rows]
+        schemas[name] = {
+            key: {"label": label, "type": _audit_column_type(datasets[name], key)}
+            for key, label in zip(target_keys, labels, strict=True)
+        }
+    return schemas, warnings
+
+
+def _audit_column_type(rows: list[dict[str, Any]], key: str) -> str:
+    values = [
+        pool[key]
+        for record in rows
+        for pool_name in ("canonical_raw", "raw", "normalized")
+        if isinstance((pool := record.get(pool_name)), dict) and pool.get(key) not in (None, "")
+    ]
+    return "decimal" if values and all(_normalized_decimal(value) is not None for value in values) else "string"
+
+
+def _record_field_has_value(rows: list[dict[str, Any]], key: str) -> bool:
+    return any(
+        pool.get(key) not in (None, "")
+        for record in rows
+        for pool_name in ("raw", "canonical_raw", "normalized")
+        if isinstance((pool := record.get(pool_name)), dict)
+    )
+
+
+def _semantic_note_dataset_name(
+    section_title: str,
+    caption: str,
+    rows: list[dict[str, Any]],
+) -> str:
+    keys = record_keys(rows)
+    return _column_subject_slug(keys) or _subject_slug(caption) or _subject_slug(section_title)
+
+
+def _note_dataset_label(
+    base: str,
+    caption: str,
+    section_title: str,
+    rows: list[dict[str, Any]],
+) -> str:
+    for candidate in (caption, section_title):
+        candidate_base = _subject_slug(candidate)
+        if candidate and candidate_base in {"", base}:
+            return candidate
+    keys = " ".join(normalize_audit_text(key) for key in record_keys(rows))
+    if base == "deferred_tax":
+        if "应纳税暂时性差异" in keys:
+            return "递延所得税负债"
+        if "可抵扣暂时性差异" in keys:
+            return "递延所得税资产"
+    return next((marker for marker, slug in _NOTE_SUBJECT_SLUGS if slug == base), section_title)
+
+
+def _subject_slug(text: str) -> str:
+    return next((slug for marker, slug in _NOTE_SUBJECT_SLUGS if marker in text), "")
+
+
+def _column_subject_slug(keys: list[str]) -> str:
+    text = " ".join(normalize_audit_text(key) for key in keys)
+    rules = (
+        (r"可抵扣暂时性差异|应纳税暂时性差异", "deferred_tax"),
+        (r"被投资单位", "long_term_equity_investments"),
+        (r"股东名称.*期初余额.*本期增加", "paid_in_capital"),
+        (r"实际控制人", "ultimate_controller"),
+        (r"子公司名称", "subsidiaries"),
+        (r"其他关联方名称.*其他关联方与本企业关系", "other_related_parties"),
+        (r"占其他应收.*合计数", "other_receivables"),
+    )
+    return next((slug for pattern, slug in rules if re.search(pattern, text)), "")
+
+
+def _reindex_dataset_records(rows: list[dict[str, Any]], dataset_name: str) -> None:
+    for ordinal, record in enumerate(rows, start=1):
+        record["record_id"] = f"{dataset_name}:r{ordinal:06d}"
+
+
+def _dataset_caption(
+    rows: list[dict[str, Any]],
+    parse_result: Any,
+    table_index: dict[str, _SourceTable],
+) -> str:
+    source_table = _dataset_source_table(rows, table_index)
+    if source_table is None:
+        return ""
+    page = next(
+        (
+            item
+            for item in getattr(parse_result, "pages", None) or []
+            if int(getattr(item, "page_number", 0) or 1) == source_table.page
+        ),
+        None,
+    )
+    table_bbox = getattr(source_table.table, "bbox", None)
+    if page is None or not isinstance(table_bbox, (list, tuple)) or len(table_bbox) < 4:
+        return ""
+    table_top = float(table_bbox[1])
+    candidates: list[tuple[float, str]] = []
+    for block in getattr(page, "texts", None) or []:
+        bbox = getattr(block, "bbox", None)
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4 or float(bbox[3]) > table_top + 1.0:
+            continue
+        for line in str(getattr(block, "content", "") or "").splitlines():
+            title = _source_caption_text(line).rstrip(":：")
+            if _valid_table_caption(title):
+                candidates.append((float(bbox[3]), title))
+    return max(candidates, default=(0.0, ""))[1]
+
+
+def _source_caption_text(value: Any) -> str:
+    source = str(value or "")
+    normalized = normalize_audit_text(source)
+    if "（" in source or "）" in source:
+        normalized = normalized.replace("(", "（").replace(")", "）")
+    return normalized
+
+
+def _valid_table_caption(title: str) -> bool:
+    compact = title.replace(" ", "")
+    if not compact or compact in {"财务报表附注", "（续）", "(续)", "续"}:
+        return False
+    if re.fullmatch(r"(?:第)?\d{1,3}(?:页)?", compact):
+        return False
+    if _AUDIT_NOTE_HEADING_RE.match(title) or re.match(r"^[（(]\d{1,2}[）)]", compact):
+        return True
+    if re.search(r"[，,；;。！？!?]", title):
+        return False
+    if any(marker in title for marker, _slug in _NOTE_SUBJECT_SLUGS):
+        return True
+    return bool(len(title) <= 48 and _AUDIT_TABLE_CAPTION_RE.search(title))
+
+
 def audit_semantic(
     base: dict[str, Any],
     datasets: dict[str, list[dict[str, Any]]],
@@ -2165,28 +3740,25 @@ def bind_datasets_to_sections(
     sections: list[dict[str, Any]],
     parse_result: Any,
 ) -> tuple[dict[str, str], dict[str, str]]:
-    """Bind each dataset to the closest preceding evidence-backed section."""
+    """Bind datasets by exact statement identity or note subject before geometric fallback."""
 
     bindings: dict[str, str] = {}
     labels: dict[str, str] = {}
     table_index = _source_tables(parse_result)
+    sections_by_id = {str(section.get("id") or ""): section for section in sections}
     for name, rows in datasets.items():
-        page = min(dataset_pages(rows), default=1)
-        table = _dataset_source_table(rows, table_index)
-        candidates = [section for section in sections if int(section.get("page_start") or 1) <= page]
-        if table is not None:
-            top = float((getattr(table.table, "bbox", None) or [0.0, float("inf")])[1])
-            same_page = [
-                section
-                for section in candidates
-                if int(section.get("page_start") or 1) == page
-                and float((section.get("bbox") or [0.0, float("-inf")])[1]) <= top
-            ]
-            selected = max(same_page, key=lambda item: float((item.get("bbox") or [0.0, 0.0])[1]), default=None)
-        else:
-            selected = None
-        if selected is None:
-            selected = max(candidates, key=lambda item: int(item.get("page_start") or 1), default=sections[0])
+        financial_base = re.sub(r"_\d+$", "", name)
+        selected = sections_by_id.get(f"section_{financial_base}") if financial_base in _STATEMENT_KINDS else None
+        selected = (
+            selected
+            or _select_subject_section(name, rows, sections)
+            or _select_dataset_section(
+                rows,
+                sections,
+                table_index,
+            )
+        )
+        selected = selected or sections[0]
         bindings[name] = str(selected["id"])
         labels[name] = (
             str(selected["title"])
@@ -2196,6 +3768,62 @@ def bind_datasets_to_sections(
             else _financial_label(name)
         )
     return bindings, labels
+
+
+def _select_subject_section(
+    name: str,
+    rows: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    base = re.sub(r"_\d+$", "", name)
+    if base not in {slug for _marker, slug in _NOTE_SUBJECT_SLUGS}:
+        return None
+    page = min(dataset_pages(rows), default=1)
+    matches = [
+        section
+        for section in sections
+        if int(section.get("page_start") or 1) <= page
+        and _subject_slug(normalize_audit_text(section.get("title"))) == base
+    ]
+    return max(
+        matches,
+        key=lambda section: (
+            int(section.get("page_start") or 1),
+            float((section.get("bbox") or [0.0, 0.0])[1]),
+        ),
+        default=None,
+    )
+
+
+def _select_dataset_section(
+    rows: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    table_index: dict[str, _SourceTable],
+) -> dict[str, Any] | None:
+    page = min(dataset_pages(rows), default=1)
+    candidates = [section for section in sections if int(section.get("page_start") or 1) <= page]
+    if not candidates:
+        return None
+    table = _dataset_source_table(rows, table_index)
+    if table is None:
+        return max(candidates, key=lambda item: int(item.get("page_start") or 1))
+    table_bbox = getattr(table.table, "bbox", None)
+    if not isinstance(table_bbox, (list, tuple)) or len(table_bbox) < 4:
+        same_page = [section for section in candidates if int(section.get("page_start") or 1) == page]
+    else:
+        top = float(table_bbox[1])
+        same_page = [
+            section
+            for section in candidates
+            if int(section.get("page_start") or 1) == page
+            and isinstance(section.get("bbox"), (list, tuple))
+            and len(section["bbox"]) >= 2
+            and float(section["bbox"][1]) <= top
+        ]
+    if same_page:
+        return max(same_page, key=lambda item: float((item.get("bbox") or [0.0, 0.0])[1]))
+    previous = [section for section in candidates if int(section.get("page_start") or 1) < page]
+    return max(previous, key=lambda item: int(item.get("page_start") or 1), default=candidates[0])
 
 
 def quality_warnings(
@@ -2214,8 +3842,15 @@ def quality_warnings(
             warnings.append(f"AUDIT_SECTION_MISSING:type={required}")
     if not fields.get("audit_document_number"):
         warnings.append("AUDIT_DOCUMENT_NUMBER_MISSING")
+    table_index = _source_tables(parse_result)
     for name, rows in datasets.items():
         warnings.extend(_dataset_quality_warnings(name, rows))
+        warnings.extend(_note_source_conservation_warnings(name, rows, table_index))
+    for candidate in _orphan_total_candidates(datasets, table_index):
+        warnings.append(
+            f"AUDIT_CROSS_PAGE_ORPHAN_ROW_UNRESOLVED:dataset={candidate.dataset_name}:"
+            f"table={_source_table_id(candidate.source_table)}:rows={len(candidate.rows)}"
+        )
     if any(
         _contains_radical(value)
         for rows in datasets.values()
@@ -2226,6 +3861,90 @@ def quality_warnings(
     if not financial_segments and any(statement_kind(page) for page in getattr(parse_result, "pages", None) or []):
         warnings.append("AUDIT_FINANCIAL_STATEMENTS_UNRESOLVED")
     return list(dict.fromkeys(warnings))
+
+
+def _note_source_conservation_warnings(
+    name: str,
+    rows: list[dict[str, Any]],
+    table_index: dict[str, _SourceTable],
+) -> list[str]:
+    """Block verification when projected note fields omit physical source cells."""
+
+    if not rows or re.sub(r"_\d+$", "", name) in _STATEMENT_KINDS:
+        return []
+    keys = _record_pool_keys(rows)
+    key_set = set(keys)
+    table_ids = _dataset_source_table_ids(rows, table_index)
+    warnings: list[str] = []
+    omitted_cells: set[tuple[str, int, int, str]] = set()
+    omitted_fields: set[str] = set()
+    for record in rows:
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        for ref in source.get("source_cell_refs") or []:
+            if not isinstance(ref, dict) or not ref.get("field_name"):
+                continue
+            field_name = str(ref["field_name"])
+            table_id = str(ref.get("table_id") or source.get("physical_table_id") or "")
+            row_index = int(ref.get("row", -1))
+            col_index = int(ref.get("col", -1))
+            cell = _physical_source_cell(table_index.get(table_id), row_index=row_index, col_index=col_index)
+            source_value = _match_token(getattr(cell, "text", "")) if cell is not None else ""
+            if not source_value:
+                continue
+            if field_name not in key_set or field_name not in raw or not _match_token(raw.get(field_name)):
+                omitted_fields.add(field_name)
+                omitted_cells.add((table_id, row_index, col_index, field_name))
+    if omitted_fields:
+        warnings.append(
+            f"AUDIT_NOTE_SOURCE_COLUMN_OMITTED:dataset={name}:tables={'|'.join(table_ids)}:"
+            f"expected={len(keys) + len(omitted_fields)}:actual={len(keys)}"
+        )
+    if omitted_cells:
+        warnings.append(
+            f"AUDIT_NOTE_SOURCE_CELL_OMITTED:dataset={name}:tables={'|'.join(table_ids)}:count={len(omitted_cells)}"
+        )
+    return warnings
+
+
+def _dataset_source_table_ids(
+    rows: list[dict[str, Any]],
+    table_index: dict[str, _SourceTable],
+) -> list[str]:
+    table_ids: list[str] = []
+    for record in rows:
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        candidates = [
+            *(str(value) for value in (source.get("physical_table_ids") or []) if value),
+            str(source.get("physical_table_id") or ""),
+            str(source.get("table_id") or "").split(":segment_", 1)[0],
+        ]
+        candidates.extend(
+            str(ref.get("table_id") or "") for ref in source.get("source_cell_refs") or [] if isinstance(ref, dict)
+        )
+        for table_id in candidates:
+            if table_id in table_index and table_id not in table_ids:
+                table_ids.append(table_id)
+    return table_ids
+
+
+def _physical_source_cell(
+    source_table: _SourceTable | None,
+    *,
+    row_index: int,
+    col_index: int,
+) -> Any | None:
+    if source_table is None or row_index < 0 or col_index < 0:
+        return None
+    rows = list(getattr(source_table.table, "rows", None) or [])
+    row = next(
+        (item for item in rows if int(getattr(item, "source_row_index", -1)) == row_index),
+        rows[row_index] if row_index < len(rows) else None,
+    )
+    if row is None:
+        return None
+    cells = row_cells_by_column(row, table_width(source_table.table))
+    return cells[col_index] if col_index < len(cells) else None
 
 
 def _dataset_quality_warnings(name: str, rows: list[dict[str, Any]]) -> list[str]:
@@ -2250,6 +3969,39 @@ def _dataset_quality_warnings(name: str, rows: list[dict[str, Any]]) -> list[str
     )
     if missing_evidence:
         warnings.append(f"AUDIT_EVIDENCE_MISSING:dataset={name}:count={missing_evidence}")
+    canonical_missing = 0
+    field_source_missing = 0
+    numeric_mismatches = 0
+    for record in rows:
+        raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+        canonical_raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else {}
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        ref_fields = {
+            str(ref.get("field_name"))
+            for ref in (source.get("source_cell_refs") or [])
+            if isinstance(ref, dict) and ref.get("field_name")
+        }
+        field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
+        for key, value in normalized.items():
+            raw_value = raw.get(key)
+            canonical_value = canonical_raw.get(key)
+            if raw_value not in (None, "") and canonical_value in (None, ""):
+                canonical_missing += 1
+            if value not in (None, "") and key not in ref_fields and key not in field_sources:
+                field_source_missing += 1
+            source_value = canonical_value if canonical_value not in (None, "") else raw_value
+            if key in ref_fields or (source.get("evidence_ids") and source_value not in (None, "")):
+                source_decimal = _normalized_decimal(source_value)
+                normalized_decimal = _normalized_decimal(value)
+                if source_decimal is not None and normalized_decimal is not None and source_decimal != normalized_decimal:
+                    numeric_mismatches += 1
+    if canonical_missing:
+        warnings.append(f"AUDIT_CANONICAL_RAW_MISSING:dataset={name}:count={canonical_missing}")
+    if field_source_missing:
+        warnings.append(f"AUDIT_FIELD_SOURCE_MISSING:dataset={name}:count={field_source_missing}")
+    if numeric_mismatches:
+        warnings.append(f"AUDIT_NORMALIZED_NUMERIC_MISMATCH:dataset={name}:count={numeric_mismatches}")
     if re.sub(r"_\d+$", "", name) in _STATEMENT_KINDS:
         warnings.extend(_statement_dataset_quality_warnings(name, rows, keys))
     return warnings
@@ -2286,24 +4038,41 @@ def normalize_audit_record(record: dict[str, Any]) -> dict[str, Any]:
     """Normalize projected values while keeping raw and canonical_raw untouched."""
 
     normalized = copy.deepcopy(record)
-    raw = (
-        normalized.get("canonical_raw") if isinstance(normalized.get("canonical_raw"), dict) else normalized.get("raw")
-    )
+    raw = normalized.get("raw") if isinstance(normalized.get("raw"), dict) else {}
+    canonical_raw = normalized.get("canonical_raw") if isinstance(normalized.get("canonical_raw"), dict) else {}
     values = normalized.get("normalized") if isinstance(normalized.get("normalized"), dict) else None
-    if not values and isinstance(raw, dict):
-        values = raw
+    if not values:
+        values = canonical_raw or raw
+    source = normalized.get("source") if isinstance(normalized.get("source"), dict) else {}
+    source_fields = {
+        str(ref.get("field_name"))
+        for ref in (source.get("source_cell_refs") or [])
+        if isinstance(ref, dict) and ref.get("field_name")
+    }
+    row_evidence = bool(source.get("evidence_ids"))
     normalized_values: dict[str, Any] = {}
-    for key, value in (values or {}).items():
-        normalized_value = normalize_audit_text(value) if isinstance(value, str) else value
+    keys = list(dict.fromkeys([*raw, *canonical_raw, *(values or {})]))
+    for key in keys:
+        value = (values or {}).get(key)
+        source_value = canonical_raw.get(key) if canonical_raw.get(key) not in (None, "") else raw.get(key)
+        if value in (None, "") and source_value not in (None, ""):
+            value = source_value
+        if source_value not in (None, "") and (key in source_fields or row_evidence):
+            source_decimal = _normalized_decimal(source_value)
+            current_decimal = _normalized_decimal(value)
+            if source_decimal is not None and (_decimal_field_key(key) or current_decimal is not None):
+                value = source_decimal
+        normalized_value = normalize_audit_value(value) if isinstance(value, str) else value
         if _decimal_field_key(key) and isinstance(normalized_value, str):
-            normalized_value = normalize_scalar(normalized_value, value_type="decimal")
+            decimal_value = normalize_scalar(normalized_value, value_type="decimal")
+            if decimal_value is not None or _empty_decimal_placeholder(normalized_value):
+                normalized_value = decimal_value
         normalized_values[key] = normalized_value
     normalized["normalized"] = normalized_values
-    source = normalized.get("source") if isinstance(normalized.get("source"), dict) else {}
     if source:
         page = int(source.get("page") or 0)
         if page and not source.get("page_range"):
-            source["page_range"] = [page]
+            source["page_range"] = [page, page]
         evidence_ids = [str(value) for value in (source.get("evidence_ids") or []) if value]
         evidence_ids.extend(str(value) for value in (normalized.get("evidence_ids") or []) if value)
         field_sources = source.get("field_sources") if isinstance(source.get("field_sources"), dict) else {}
@@ -2312,7 +4081,48 @@ def normalize_audit_record(record: dict[str, Any]) -> dict[str, Any]:
                 evidence_ids.extend(str(value) for value in (detail.get("evidence_ids") or []) if value)
         if evidence_ids:
             source["evidence_ids"] = list(dict.fromkeys(evidence_ids))
+        for key in ("source_cell_refs", "evidence_ids"):
+            if source.get(key):
+                normalized[key] = copy.deepcopy(source[key])
     return normalized
+
+
+def _normalized_decimal(value: Any) -> str | None:
+    """Return an exact decimal spelling only when the source value is numeric."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, dict):
+        return _normalized_decimal(value.get("value"))
+    cleaned = normalize_audit_value(value) if isinstance(value, str) else str(value)
+    return normalize_scalar(cleaned, value_type="decimal")
+
+
+def synchronize_audit_record_sources(datasets: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Backfill canonical raw values only from source-backed raw fields."""
+
+    recovered = 0
+    for records in datasets.values():
+        for record in records:
+            raw = record.get("raw") if isinstance(record.get("raw"), dict) else {}
+            canonical_raw = record.get("canonical_raw") if isinstance(record.get("canonical_raw"), dict) else {}
+            source = record.get("source") if isinstance(record.get("source"), dict) else {}
+            backed_fields = {
+                str(ref.get("field_name"))
+                for ref in (source.get("source_cell_refs") or [])
+                if isinstance(ref, dict) and ref.get("field_name")
+            }
+            row_evidence = bool(source.get("evidence_ids"))
+            for key, value in raw.items():
+                if (
+                    value not in (None, "")
+                    and canonical_raw.get(key) in (None, "")
+                    and (key in backed_fields or row_evidence)
+                ):
+                    canonical_raw[key] = copy.deepcopy(value)
+                    recovered += 1
+            record["canonical_raw"] = canonical_raw
+    return [f"AUDIT_CANONICAL_RAW_RECOVERED:fields={recovered}"] if recovered else []
 
 
 def statement_kind(page: Any) -> str | None:
@@ -2379,6 +4189,12 @@ def _numeric_header_continuation(left_keys: list[str], right_keys: list[str]) ->
         bool(_AMOUNT_HEADER_RE.fullmatch(normalize_audit_text(key).replace(" ", ""))) for key in right_keys
     )
     return semantic_left >= 2 and numeric_right >= 2 and not _TABLE_HEADER_MARKERS.search(right_keys[0])
+
+
+def _repeated_header_continuation(left_keys: list[str], right_keys: list[str]) -> bool:
+    return len(left_keys) >= 2 and [normalize_audit_text(key) for key in left_keys] == [
+        normalize_audit_text(key) for key in right_keys
+    ]
 
 
 def _category_continuation_values(
@@ -2448,10 +4264,21 @@ def _header_record(
         for key, value in raw.items()
     }
     evidence_ids = list(getattr(source_table.table, "evidence_ids", None) or []) if source_table is not None else []
+    refs = [
+        {
+            "page": page,
+            "table_id": table_id,
+            "row": -1,
+            "col": column,
+            "field_name": field_name,
+            "recovery": "source_table_header_was_data",
+        }
+        for column, field_name in enumerate(target_keys)
+    ]
     return {
         "record_id": f"{dataset_name}:recovered_header_row",
         "normalized": normalized,
-        "canonical_raw": raw,
+        "canonical_raw": dict(raw),
         "raw": raw,
         "source": {
             "page": page,
@@ -2461,8 +4288,11 @@ def _header_record(
             "table_row_index": -1,
             "source_row_index": -1,
             "recovery": "source_table_header_was_data",
+            "source_cell_refs": refs,
             **({"evidence_ids": evidence_ids} if evidence_ids else {}),
         },
+        "source_cell_refs": copy.deepcopy(refs),
+        **({"evidence_ids": list(evidence_ids)} if evidence_ids else {}),
         "review": {"required": not bool(evidence_ids), "reasons": ["recovered_source_table_header"]},
     }
 
@@ -2503,7 +4333,7 @@ def _remap_record(
             ref["evidence_ids"] = list(recovered.evidence_ids)
             evidence_ids = list(source.get("evidence_ids") or [])
             source["evidence_ids"] = list(dict.fromkeys([*evidence_ids, *recovered.evidence_ids]))
-        source.setdefault("source_cell_refs", []).append(ref)
+        source.setdefault("source_cell_refs", []).insert(0, ref)
     return remapped
 
 
@@ -2524,14 +4354,25 @@ def _dataset_source_table(
 
 
 def record_keys(rows: list[dict[str, Any]]) -> list[str]:
-    """Return the first evidence-backed record schema in source order."""
+    """Return the complete projected record schema in source order."""
 
+    return _record_pool_keys(rows)
+
+
+def _record_pool_keys(rows: list[dict[str, Any]]) -> list[str]:
+    keys: list[str] = []
+    seen: set[str] = set()
     for record in rows:
-        for pool_name in ("canonical_raw", "raw", "normalized"):
+        for pool_name in ("raw", "canonical_raw", "normalized"):
             pool = record.get(pool_name)
-            if isinstance(pool, dict) and pool:
-                return [str(key) for key in pool]
-    return []
+            if not isinstance(pool, dict):
+                continue
+            for key in pool:
+                value = str(key)
+                if value not in seen:
+                    seen.add(value)
+                    keys.append(value)
+    return keys
 
 
 def dataset_pages(rows: list[dict[str, Any]]) -> set[int]:
@@ -2547,7 +4388,10 @@ def dataset_pages(rows: list[dict[str, Any]]) -> set[int]:
     return pages
 
 
-def audit_data_dictionary(segments: list[ProjectedSegment]) -> dict[str, Any]:
+def audit_data_dictionary(
+    segments: list[ProjectedSegment],
+    note_schemas: dict[str, dict[str, dict[str, str]]] | None = None,
+) -> dict[str, Any]:
     """Add audit metadata to the reused financial data dictionary."""
 
     dictionary = data_dictionary(segments)
@@ -2564,6 +4408,19 @@ def audit_data_dictionary(segments: list[ProjectedSegment]) -> dict[str, Any]:
             "audit_opinion_type": {"label": "审计意见类型", "type": "string"},
         }
     )
+    datasets = dictionary.setdefault("datasets", {})
+    for dataset_name, columns in (note_schemas or {}).items():
+        dataset = datasets.setdefault(dataset_name, {})
+        dataset["columns"] = copy.deepcopy(columns)
+    for dataset in datasets.values():
+        columns = dataset.get("columns") if isinstance(dataset, dict) else None
+        if not isinstance(columns, dict):
+            continue
+        for column in columns.values():
+            if not isinstance(column, dict):
+                continue
+            if column.get("label") not in (None, ""):
+                column["label"] = normalize_audit_label(column["label"])
     return dictionary
 
 
@@ -2595,7 +4452,14 @@ def _contains_radical(value: Any) -> bool:
 
 def _decimal_field_key(key: Any) -> bool:
     value = normalize_audit_text(key).lower()
-    return bool(re.search(r"amount|balance|capital|reserve|profit|total|金额|余额|资本|公积|利润|合计|账面价值", value))
+    return bool(
+        re.search(
+            r"amount|balance|capital|reserve|profit|total|ratio|rate|share_count|current_period|previous_period|"
+            r"increase|decrease|amortization|provision|reversal|write_off|revenue|income|expense|cost|years|"
+            r"金额|发生额|余额|资本|公积|利润|合计|账面价值|比例|税率|折旧率|股份数|使用寿命",
+            value,
+        )
+    )
 
 
 def _empty_decimal_placeholder(value: Any) -> bool:
@@ -2619,16 +4483,23 @@ __all__ = [
     "audit_semantic",
     "bind_datasets_to_sections",
     "blocking_warning",
+    "canonicalize_audit_dataset_columns",
     "dataset_pages",
     "dataset_blocking_warnings",
     "embedded_financial_pages",
     "merge_cross_page_continuations",
+    "name_note_datasets",
+    "normalize_audit_display_text",
+    "normalize_audit_display_value",
     "normalize_audit_record",
+    "normalize_audit_label",
     "normalize_audit_text",
+    "normalize_audit_value",
     "page_lines",
     "project_embedded_financial_statements",
     "quality_warnings",
     "repair_note_datasets",
     "record_keys",
     "statement_kind",
+    "synchronize_audit_record_sources",
 ]

@@ -64,6 +64,13 @@ class AuditReportPlugin(CommunityProjector):
             projection_data=derived.model_dump(mode="python"),
             projection_policy=load_projection_policy(type(self).__module__.rsplit(".", 1)[0]),
         )
+        units = {
+            key: str(derived.domain_facts[key])
+            for key in ("currency", "currency_unit")
+            if derived.domain_facts.get(key) not in (None, "")
+        }
+        if units:
+            projected.document["units"] = units
         bundle = _AuditReportCommunityBundle(
             schema=projected.schema,
             document=projected.document,
