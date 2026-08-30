@@ -44,6 +44,7 @@ from docmirror.plugins.credit_report.enterprise_native.extraction import (
     extract_enterprise_report_identity_records,
     extract_enterprise_report_metadata_records,
     extract_enterprise_report_notes,
+    extract_enterprise_report_qualifications,
     extract_enterprise_summary_datasets,
     project_enterprise_public_record_datasets,
 )
@@ -146,7 +147,6 @@ _LIABILITY_FIELDS = (
     "sequence",
     "account_identifier",
     "liability_date",
-    "open_date",
     "related_party_name",
     "related_party_id_type",
     "related_party_id_number",
@@ -155,9 +155,8 @@ _LIABILITY_FIELDS = (
     "responsibility_amount",
     "responsibility_amount_reported",
     "responsibility_amount_status",
-    "contract_number",
     "guarantee_contract_identifier",
-    "contract_number_status",
+    "guarantee_contract_identifier_status",
     "responsibility_currency",
     "responsibility_amount_unit",
     "obligation_currency",
@@ -224,7 +223,7 @@ class EnterpriseSemanticDocument:
 
     def to_debug_payload(self) -> dict[str, Any]:
         return {
-            "schema": {"id": "enterprise_credit_report", "version": "3.0.0"},
+            "schema": {"id": "enterprise_credit_report", "version": "4.0.0"},
             "facts": self.facts,
             "credit_summary": self.credit_summary,
             "credit_extraction_audit": self.credit_extraction_audit,
@@ -656,6 +655,7 @@ def _dataset_completeness(
         "repayment_liability": "enterprise_repayment_responsibility_accounts",
         "attachment_account": "enterprise_attachment_accounts",
         "attachment_credit_detail": "enterprise_attachment_credit_details",
+        "special_transaction": "enterprise_special_transactions",
     }
     audited: dict[str, dict[str, int]] = {}
     for row in continuation_audit:
@@ -695,8 +695,8 @@ def _dataset_completeness(
             basis = "canonical_continuation_contract"
         else:
             expected = len(rows)
-            verified = not bad_input and all(row.get("source_refs") or row.get("source_page") for row in rows)
-            basis = "canonical_source_component_count"
+            verified = False
+            basis = "emitted_records_only"
         output[dataset] = {
             "expected_row_count": expected,
             "emitted_row_count": len(rows),
@@ -706,6 +706,8 @@ def _dataset_completeness(
             "status": (
                 "bad_parseresult_input"
                 if bad_input
+                else "unverified"
+                if basis == "emitted_records_only"
                 else "complete"
                 if verified and expected == len(rows)
                 else "incomplete"
@@ -735,6 +737,38 @@ def _apply_quality_statuses(
             if not field or field not in normalized:
                 continue
             normalized[f"{field}_status"] = status
+
+
+def _apply_business_qualifications(
+    datasets: dict[str, list[dict[str, Any]]],
+    qualifications: list[dict[str, Any]],
+) -> None:
+    """Retain business scope in datasets; audit flags are not the data source."""
+    for qualification in qualifications:
+        if qualification["kind"] == "display_scope":
+            targets = datasets.get("enterprise_credit_overview") or datasets.get("enterprise_report_metadata") or []
+            values = {"source_display_limited": True}
+        else:
+            targets = datasets.get("enterprise_facility_summary") or []
+            values = {"available_limit_requires_estimation": True}
+        for row in targets:
+            row.update(values)
+            if qualification["kind"] == "display_scope":
+                scopes = row.setdefault("source_display_scopes", [])
+                if qualification["scope"] not in scopes:
+                    scopes.append(qualification["scope"])
+            ref = {
+                "source": "canonical_enterprise_business_qualification",
+                "page": qualification["source_page"],
+                "text": qualification["source_text"],
+            }
+            refs = row.setdefault("source_refs", [])
+            if ref not in refs:
+                refs.append(ref)
+            for field in values:
+                info = row.setdefault("field_info", {}).setdefault(field, {"source_state": "reported", "source_refs": []})
+                if ref not in info["source_refs"]:
+                    info["source_refs"].append(ref)
 
 
 def extract_enterprise_semantic_document(
@@ -867,6 +901,8 @@ def extract_enterprise_semantic_document(
     datasets["enterprise_capital_summary"] = extract_enterprise_capital_summary(profile_view)
     datasets["enterprise_facility_summary"] = facility_summary
     datasets["report_notes"] = extract_enterprise_report_notes(notes_view)
+    qualifications = extract_enterprise_report_qualifications(document)
+    _apply_business_qualifications(datasets, qualifications)
 
     sections = _sections(subset)
     datasets["enterprise_section_presence"] = _section_presence_records(subset, datasets)
@@ -877,7 +913,10 @@ def extract_enterprise_semantic_document(
 
     data_dictionary = variant.data_dictionary()
     _canonicalize_dataset_types(datasets, data_dictionary)
-    source_flags = tuple(flag.to_payload() for flag in assess_enterprise_source_information(document, datasets))
+    source_flags = tuple(
+        flag.to_payload()
+        for flag in assess_enterprise_source_information(document, datasets, qualifications=qualifications)
+    )
     quality_flags = tuple([*document.input_quality_flags, *source_flags])
     _apply_quality_statuses(datasets, quality_flags)
     source_limit_scopes = sorted(

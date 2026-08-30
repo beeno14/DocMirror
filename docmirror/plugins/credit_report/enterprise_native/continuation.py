@@ -739,6 +739,66 @@ ATTACHMENT_HISTORY_BODY_CONTRACT = ContinuationContract(
     forbidden_markers=("账户编号", "授信机构", "开户日期", "开立日期", "信息报告日期"),
 )
 
+_SPECIAL_TRANSACTION_COLUMNS = {
+    "transaction_type": "交易类型",
+    "transaction_date": "交易日期",
+    "transaction_amount": "交易金额",
+    "due_date_change_months": "到期日期变更月数",
+    "transaction_detail": "交易明细信息",
+}
+
+
+def special_transaction_cells(header: Iterable[str], row: Iterable[str]) -> dict[str, str] | None:
+    """Map a source grid or its compact continuation to the same business fields.
+
+    A table shared with a wider history grid contains structural spacer slots.
+    Its next-page continuation may contain only the five logical columns. The
+    header, not nonempty body values, determines which slots are structural;
+    genuine empty amounts and zero-month changes must keep their positions.
+    """
+    columns = tuple(re.sub(r"\s+", "", str(value or "")) for value in header)
+    cells = tuple(str(value if value is not None else "").strip() for value in row)
+    if any(columns.count(label) != 1 for label in _SPECIAL_TRANSACTION_COLUMNS.values()):
+        return None
+    anchors = {key: columns.index(label) for key, label in _SPECIAL_TRANSACTION_COLUMNS.items()}
+    if any(value and index not in anchors.values() for index, value in enumerate(columns)):
+        return None
+    if len(cells) == len(columns):
+        if any(value and index not in anchors.values() for index, value in enumerate(cells)):
+            return None
+        positions = anchors
+    elif len(cells) == len(anchors):
+        positions = {key: index for index, key in enumerate(sorted(anchors, key=anchors.get))}
+    else:
+        return None
+    return {key: cells[index] for key, index in positions.items()}
+
+
+def special_transaction_body_contract(header: Iterable[str]) -> ContinuationContract:
+    """Bind continuation evidence to logical source columns, not physical slots."""
+    columns = tuple(header)
+
+    def accepts(row: Row) -> bool:
+        values = special_transaction_cells(columns, row)
+        return bool(
+            values
+            and values["transaction_type"]
+            and not _date_like(values["transaction_type"])
+            and _date_like(values["transaction_date"])
+            and all(
+                _number_like(values[key]) or values[key] in {"", "-", "--", "—"}
+                for key in ("transaction_amount", "due_date_change_months")
+            )
+        )
+
+    return ContinuationContract(
+        name="enterprise_attachment_special_transaction",
+        expected_columns=frozenset(),
+        row_predicate=accepts,
+        forbidden_markers=("账户编号", "授信机构", "信息报告日期", "开户日期", "交易类型", "交易日期"),
+    )
+
+
 __all__ = [
     "ACCOUNT_SETTLED_DETAIL_CONTRACT",
     "ATTACHMENT_HISTORY_BODY_CONTRACT",
@@ -754,4 +814,6 @@ __all__ = [
     "PageBoundaryDecision",
     "TableFragment",
     "numeric_row",
+    "special_transaction_body_contract",
+    "special_transaction_cells",
 ]

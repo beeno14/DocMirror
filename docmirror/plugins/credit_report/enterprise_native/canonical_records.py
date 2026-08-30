@@ -18,6 +18,7 @@ from datetime import date
 from typing import Any, Iterator
 
 from docmirror.plugins.credit_report.currency_codes import normalize_currency_code
+from docmirror.plugins.credit_report.enterprise_native.business_values import opaque_identifier
 from docmirror.plugins.credit_report.enterprise_native.ir import (
     CanonicalEnterpriseDocumentIR,
 )
@@ -808,7 +809,7 @@ def extract_grouped_repayment_responsibility_details(
             if not raw_values["responsibility_type"] or account_count is None:
                 continue
             finish_pending()
-            contract_number = _identifier(raw_values["contract_number"])
+            contract_number = opaque_identifier(raw_values["contract_number"])
             responsibility_amount = parse_number(raw_values["responsibility_amount"])
             loan_amount = parse_number(raw_values["loan_amount"])
             guarantee_amount = parse_number(raw_values["guarantee_amount"])

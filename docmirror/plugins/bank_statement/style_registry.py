@@ -971,6 +971,18 @@ def _row_has_semantic_anomaly(transaction: dict[str, Any], normalized: dict[str,
         for raw_header in source
         if not str(raw_header or "").startswith("_")
     }
+    for raw_header, raw_value in source.items():
+        header = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(raw_header or "")))
+        if header not in {"对方账号户名/附言", "对方账户户名/附言"}:
+            continue
+        source_compound = _compact_semantic_value(raw_value)
+        if not source_compound:
+            continue
+        if any(
+            _compact_semantic_value(normalized.get(field)) == source_compound
+            for field in ("counter_account", "sub_account")
+        ):
+            return True
     delimited_layout = _DELIMITED_BUSINESS_LAYOUT_HEADERS.issubset(source_headers)
     for raw_header, value in source.items():
         header = re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(raw_header or "")))

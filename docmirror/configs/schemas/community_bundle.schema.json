@@ -138,9 +138,21 @@
           "datasets": {"items": {"properties": {
             "primary_key": {"const": "record_id"},
             "columns": {"items": {"required": ["raw_available", "evidence_available"]}},
-            "rows": {"items": {"required": ["record_id", "source"]}}
+            "rows": {"items": {"required": ["record_id"]}}
           }}}
-        }
+        },
+        "allOf": [{
+          "if": {"properties": {
+            "schema": {"properties": {"version": {"const": "4.0.0"}}},
+            "document": {"properties": {"type": {"const": "personal_credit_report_brief"}}}
+          }},
+          "then": {},
+          "else": {"properties": {
+            "datasets": {"items": {"properties": {
+              "rows": {"items": {"required": ["source"]}}
+            }}}
+          }}
+        }]
       }
     },
     {

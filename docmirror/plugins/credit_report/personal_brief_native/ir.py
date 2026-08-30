@@ -16,6 +16,11 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Literal
 
+from docmirror.plugins.credit_report.personal_brief_native.date_rules import (
+    PERSONAL_BRIEF_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN,
+    normalize_personal_brief_date,
+)
 from docmirror.plugins.credit_report.shared.entity_decoder import (
     CreditReportEntityContext,
     CreditReportUnit,
@@ -58,21 +63,21 @@ CANONICAL_PERSONAL_BRIEF_SECTIONS: tuple[tuple[str, str], ...] = (
 
 _SECTION_LABELS = dict(CANONICAL_PERSONAL_BRIEF_SECTIONS)
 _PAGE_NUMBER_RE = re.compile(r"^第\s*\d+\s*页\s*[,，]\s*共\s*\d+\s*页$")
-_DATE_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_DATE_RE = re.compile(PERSONAL_BRIEF_DATE_PATTERN)
 _DIRECT_INQUIRY_RE = re.compile(
     r"^\s*(?P<sequence>\d{1,4})[.、]?\s*"
-    r"(?P<date>20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*"
+    rf"(?P<date>{PERSONAL_BRIEF_DATE_PATTERN})\s*"
     r"(?P<tail>.+)$",
     re.DOTALL,
 )
 _UNNUMBERED_INQUIRY_RE = re.compile(
-    r"^\s*(?P<date>20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s*"
+    rf"^\s*(?P<date>{PERSONAL_BRIEF_DATE_PATTERN})\s*"
     r"(?P<tail>.+)$",
     re.DOTALL,
 )
 _STREAM_INQUIRY_RE = re.compile(
     r"(?<!\d)(?P<sequence>\d{1,4})[.、]?\s+"
-    r"(?P<date>20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日?)\s+"
+    rf"(?P<date>{PERSONAL_BRIEF_DATE_PATTERN})\s+"
 )
 _GENERIC_INSTITUTION_REASON_RE = re.compile(
     r"((?:个人|企业|信用卡|融资|授信|担保|法人|负责人|高管|贷后|保前|资信|客户|风险|关联|异议|账户|商户)"
@@ -128,10 +133,7 @@ def _bbox(value: Any) -> tuple[float, float, float, float] | None:
 
 
 def _iso_date(value: str) -> str:
-    match = _DATE_RE.search(str(value or ""))
-    if not match:
-        return ""
-    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    return normalize_personal_brief_date(value)
 
 
 def _normalize_reason(value: str, inquiry_type: str) -> str:
@@ -1117,11 +1119,11 @@ def _inquiry_candidates(
 
 _NUMBERED_ORDINAL_RE = re.compile(r"^\s*(?P<sequence>\d{1,4})[.、]\s*$")
 _LIABILITY_RECORD_START_RE = re.compile(
-    r"(?<!\d)20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[，,]?\s*为"
+    rf"(?<!\d){PERSONAL_BRIEF_DATE_PATTERN}\s*[，,]?\s*为"
 )
 _LIABILITY_RECORD_BOUNDARY_RE = re.compile(
     r"(?:(?<!\d)(?P<sequence>\d{1,4})[.、]\s*)?"
-    r"(?P<record>(?<!\d)20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*[，,]?\s*为)"
+    rf"(?P<record>(?<!\d){PERSONAL_BRIEF_DATE_PATTERN}\s*[，,]?\s*为)"
 )
 
 
@@ -1438,7 +1440,10 @@ def _score_liability_continuation(
     if re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]{5,}）", compact_incoming):
         score += 0.13
         signals.append("contract_number_completion")
-    if re.match(r"^截至20\d{2}年\d{1,2}月(?:\d{1,2}日)?[，,]", compact_incoming):
+    if re.match(
+        rf"^截至{PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN}[，,]",
+        compact_incoming,
+    ):
         score += 0.18
         signals.append("snapshot_tail")
     if "余额" in compact_incoming:

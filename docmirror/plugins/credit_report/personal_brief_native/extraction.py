@@ -8,9 +8,17 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from docmirror.plugins.credit_report.personal_brief_native.context import (
+    extract_personal_brief_lookback_years,
+)
 from docmirror.plugins.credit_report.personal_brief_native.contracts import (
     PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
     canonicalize_personal_brief_reporting_units,
+)
+from docmirror.plugins.credit_report.personal_brief_native.date_rules import (
+    PERSONAL_BRIEF_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_PATTERN,
+    PERSONAL_BRIEF_YEAR_PATTERN,
 )
 
 _MARITAL_STATUS_CODES = {
@@ -179,7 +187,8 @@ def _personal_header_datasets(
     compact = re.sub(r"\s+", "", header)
     report_number_match = re.search(r"报告编号[:：]([A-Za-z0-9-]+)", compact)
     report_time_match = re.search(
-        r"报告时间[:：](20\d{2})[-年](\d{1,2})[-月](\d{1,2})日?(\d{1,2})[:时](\d{1,2})[:分](\d{1,2})秒?",
+        rf"报告时间[:：]({PERSONAL_BRIEF_YEAR_PATTERN})[-年]"
+        r"(\d{1,2})[-月](\d{1,2})日?(\d{1,2})[:时](\d{1,2})[:分](\d{1,2})秒?",
         compact,
     )
     name_match = re.search(r"姓名[:：]([^:：]+?)(?=证件类型[:：])", compact)
@@ -489,9 +498,9 @@ def _asset_and_compensation_records(
     asset_section = compact[asset_start:asset_end] if asset_start >= 0 and asset_end > asset_start else ""
     for sequence, match in enumerate(
         re.finditer(
-            r"(\d+)\.(20\d{2}年\d{1,2}月\d{1,2}日)，?(.+?)接收债权，?"
-            r"金额为?([\d,.]+)。截至(20\d{2}年\d{1,2}月\d{1,2}日)，?"
-            r"余额为?([\d,.]+)，?最近一次还款日期为?(20\d{2}年\d{1,2}月\d{1,2}日)",
+            rf"(\d+)\.({PERSONAL_BRIEF_DATE_PATTERN})，?(.+?)接收债权，?"
+            rf"金额为?([\d,.]+)。截至({PERSONAL_BRIEF_DATE_PATTERN})，?"
+            rf"余额为?([\d,.]+)，?最近一次还款日期为?({PERSONAL_BRIEF_DATE_PATTERN})",
             asset_section,
         ),
         start=1,
@@ -520,8 +529,8 @@ def _asset_and_compensation_records(
     comp_section = compact[comp_start:comp_end] if comp_start >= 0 and comp_end > comp_start else ""
     for sequence, match in enumerate(
         re.finditer(
-            r"(\d+)\.(20\d{2}年\d{1,2}月\d{1,2}日)以来(.+?)累计代偿金额([\d,.]+)。"
-            r"(?:(20\d{2}年\d{1,2}月)(已结清))?",
+            rf"(\d+)\.({PERSONAL_BRIEF_DATE_PATTERN})以来(.+?)累计代偿金额([\d,.]+)。"
+            rf"(?:({PERSONAL_BRIEF_MONTH_PATTERN})(已结清))?",
             comp_section,
         ),
         start=1,
@@ -993,13 +1002,13 @@ def extract_personal_brief_section_content(
         },
         "non_credit_transaction_summary": {
             "record_status": "no_records" if "没有" in non_credit_statement else "reported",
-            "lookback_years": 5 if "5年" in non_credit_statement else None,
+            "lookback_years": extract_personal_brief_lookback_years(non_credit_statement),
             "source_statement": non_credit_statement,
             "source_page": non_credit_page or None,
         },
         "public_record_summary": {
             "record_status": "no_records" if "没有" in public_statement else "reported",
-            "lookback_years": 5 if "5年" in public_statement else None,
+            "lookback_years": extract_personal_brief_lookback_years(public_statement),
             "source_statement": public_statement,
             "source_page": public_page or None,
         },

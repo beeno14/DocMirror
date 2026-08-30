@@ -15,6 +15,24 @@ import re
 from typing import Any
 
 from docmirror.plugins.credit_report.currency_codes import normalize_currency_code
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    ACCOUNT_ACTION_PATTERN as _ACCOUNT_ACTION_PATTERN,
+)
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    ACCOUNT_DATE_PATTERN as _ACCOUNT_DATE_PATTERN,
+)
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    ACCOUNT_MONTH_OR_DATE_PATTERN,
+    account_narratives,
+    personal_brief_loan_business_type,
+)
+from docmirror.plugins.credit_report.personal_brief_native.date_rules import (
+    PERSONAL_BRIEF_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_PATTERN,
+    normalize_personal_brief_date,
+    normalize_personal_brief_month,
+)
 from docmirror.plugins.credit_report.value_utils import (
     compact_text as _compact,
 )
@@ -28,13 +46,7 @@ from docmirror.plugins.credit_report.value_utils import (
     stable_record_id as _stable_id,
 )
 
-_DATE_CN_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
-_ACCOUNT_DATE_PATTERN = r"20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
-_ACCOUNT_ACTION_PATTERN = r"(?:发放(?:了)?(?:的)?|办理(?:了)?(?:的)?|开立(?:了)?(?:的)?|提供(?:了)?(?:的)?|为(?=.{0,40}贷款授信))"
-_ACCOUNT_START_RE = re.compile(
-    rf"{_ACCOUNT_DATE_PATTERN}"
-    rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,180}}?{_ACCOUNT_ACTION_PATTERN})"
-)
+_DATE_CN_RE = re.compile(PERSONAL_BRIEF_DATE_PATTERN)
 _PERSONAL_BRIEF_CARD_TYPE_RE = re.compile(r"^(?P<business_type>准贷记卡|贷记卡)(?=[（(，,。；;账户]|$)")
 _INQUIRY_REASONS = tuple(
     sorted(
@@ -63,20 +75,11 @@ _INQUIRY_REASONS = tuple(
 
 
 def _iso_date(value: str) -> str:
-    match = _DATE_CN_RE.search(str(value or ""))
-    if match:
-        return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-    match = re.search(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", str(value or ""))
-    if not match:
-        return ""
-    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    return normalize_personal_brief_date(value)
 
 
 def _iso_month(value: str) -> str:
-    match = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", str(value or ""))
-    if not match:
-        return ""
-    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
+    return normalize_personal_brief_month(value)
 
 
 def _page_texts(parse_result: Any) -> list[tuple[int, str, str]]:
@@ -334,8 +337,8 @@ def _personal_brief_credit_lines(accounts: list[dict[str, Any]]) -> list[dict[st
                 "facility_type": account.get("business_type") or "贷款授信",
                 "total_limit": account.get("credit_limit"),
                 "used_limit": account.get("balance"),
-                "currency": account.get("currency") or "CNY",
-                "account_currency": account.get("account_currency") or account.get("currency") or "CNY",
+                "currency": account.get("currency"),
+                "account_currency": account.get("account_currency") or account.get("currency"),
                 "reporting_amount_currency": account.get("reporting_amount_currency") or "CNY",
                 "amount_unit": account.get("amount_unit") or "yuan",
                 "reporting_amount_unit": account.get("reporting_amount_unit") or "yuan",
@@ -380,23 +383,10 @@ def _personal_brief_accounts(text: str, page_texts: list[tuple[int, str, str]]) 
     # The date+institution+issuance anchor is narrow enough to scan the whole
     # report without treating query dates or repayment-liability prose as an
     # account start.
-    starts = list(_ACCOUNT_START_RE.finditer(text))
     accounts: list[dict[str, Any]] = []
     source_sequences = {"credit_card": 0, "loan": 0}
-    for index, match in enumerate(starts):
-        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
-        for marker in ("相关还款责任信息", "非信贷交易记录", "公共记录", "查询记录"):
-            marker_at = text.find(marker, match.end(), end)
-            if marker_at >= 0:
-                end = min(end, marker_at)
-        chunk = text[match.start() : end].strip()
-        if "承担相关还款责任" in _compact(chunk):
-            continue
-        if not any(marker in chunk for marker in ("贷记卡", "准贷记卡", "贷款", "授信")):
-            continue
-        if not re.search(_ACCOUNT_ACTION_PATTERN, chunk):
-            continue
-        account = _personal_brief_account_from_chunk(chunk, page_texts)
+    for narrative in account_narratives(text):
+        account = _personal_brief_account_from_chunk(narrative.text, page_texts)
         if not account or not account.get("account_id"):
             continue
         # The printed report owns two numbered account lists: credit cards and
@@ -413,7 +403,7 @@ def _personal_brief_accounts(text: str, page_texts: list[tuple[int, str, str]]) 
             account["sequence"],
         )
         if "ever_overdue" not in account:
-            section_state = _personal_brief_overdue_section_state(text, match.start())
+            section_state = _personal_brief_overdue_section_state(text, narrative.start)
             if section_state is not None:
                 account["ever_overdue"] = section_state
                 if not section_state:
@@ -451,10 +441,7 @@ def _personal_brief_account_from_chunk(
         business_type = business_match.group(1) if business_match else "贷款授信"
     else:
         account_type = "loan"
-        business_match = re.search(r"[）)]([\u3400-\u9fff（）()]{1,30}贷款)", compact_body)
-        if not business_match:
-            business_match = re.search(r"([\u3400-\u9fff（）()]{1,24}贷款)", compact_body)
-        business_type = business_match.group(1) if business_match else "贷款"
+        business_type = personal_brief_loan_business_type(compact_body) or "贷款"
 
     currency = _personal_brief_account_currency(compact_body)
     card_tail_match = re.search(r"卡片尾号[:：]?(\d{3,8})", compact_body)
@@ -517,6 +504,9 @@ def _personal_brief_account_from_chunk(
         )
     if card_tail:
         account["card_tail"] = card_tail
+    revolving = re.search(r"(?P<negative>不)?可循环使用", compact_body)
+    if revolving:
+        account["is_revolving"] = revolving.group("negative") is None
 
     patterns = {
         "loan_amount": r"发放的([\d,]+(?:\.\d+)?)元",
@@ -534,30 +524,42 @@ def _personal_brief_account_from_chunk(
         if issued_amount:
             account["loan_amount"] = _number(issued_amount.group(1))
 
-    due_match = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)到期", compact_chunk)
+    due_match = re.search(rf"({ACCOUNT_MONTH_OR_DATE_PATTERN})到期", compact_chunk)
     if due_match:
-        maturity_date = _iso_date(due_match.group(1))
+        maturity_date = _iso_date(due_match.group(1)) or _iso_month(due_match.group(1))
         account["due_date"] = maturity_date
         account["contract_maturity_date"] = maturity_date
-    close_match = re.search(r"(20\d{2}年\d{1,2}月)(?:已结清|销户)", compact_chunk)
+    close_match = re.search(
+        rf"({PERSONAL_BRIEF_MONTH_PATTERN})(?:已结清|销户)",
+        compact_chunk,
+    )
     if close_match:
         account["close_date"] = _iso_month(close_match.group(1))
         account["termination_event_date"] = account["close_date"]
         account["termination_event_type"] = (
             "account_closed" if account_status == "closed" else "debt_settled"
         )
-    transfer_match = re.search(r"(20\d{2}年\d{1,2}月)已转出", compact_chunk)
+    transfer_match = re.search(
+        rf"({PERSONAL_BRIEF_MONTH_PATTERN})已转出",
+        compact_chunk,
+    )
     if transfer_match:
         account["transfer_out_date"] = _iso_month(transfer_match.group(1))
         account["termination_event_date"] = account["transfer_out_date"]
         account["termination_event_type"] = "transferred_out"
-    validity_match = re.search(r"额度有效期至(20\d{2}年\d{1,2}月\d{1,2}日)", compact_chunk)
+    validity_match = re.search(
+        rf"额度有效期至({PERSONAL_BRIEF_DATE_PATTERN})",
+        compact_chunk,
+    )
     if validity_match:
         account["credit_line_validity_type"] = "fixed_term"
         account["credit_line_expiry_date"] = _iso_date(validity_match.group(1))
     elif "额度长期有效" in compact_chunk:
         account["credit_line_validity_type"] = "perpetual"
-    as_of_match = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)", compact_chunk)
+    as_of_match = re.search(
+        rf"截至({PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN})",
+        compact_chunk,
+    )
     if as_of_match:
         account["information_as_of"] = _iso_date(as_of_match.group(1)) or _iso_month(as_of_match.group(1))
 
@@ -597,8 +599,8 @@ def _personal_brief_account_from_chunk(
     return account
 
 
-def _personal_brief_account_currency(compact_body: str) -> str:
-    """Read the explicitly printed account currency, defaulting only if absent."""
+def _personal_brief_account_currency(compact_body: str) -> str | None:
+    """Read account denomination without confusing it with CNY reporting units."""
     for match in re.finditer(r"[（(]([^()（）]{1,48})[）)]", compact_body):
         segment = match.group(1).split("，", 1)[0].split(",", 1)[0]
         has_account_marker = segment.endswith("账户")
@@ -607,9 +609,9 @@ def _personal_brief_account_currency(compact_body: str) -> str:
         if normalized:
             return normalized
         # A future or non-ISO account label is still more truthful than CNY.
-        if has_account_marker and label:
+        if label and (has_account_marker or compact_body[: match.start()].endswith("元")):
             return label
-    return "CNY"
+    return None
 
 
 def _personal_brief_repayment_liabilities(
@@ -638,7 +640,7 @@ def _personal_brief_repayment_liabilities(
         chunk = section[match.start() : end].strip()
         compact = _compact(chunk)
         core = re.search(
-            r"^(20\d{2}年\d{1,2}月\d{1,2}日)[，,]?为"
+            rf"^({PERSONAL_BRIEF_DATE_PATTERN})[，,]?为"
             r"(.+?)[（(]证件类型[:：](.+?)[，,]证件号码[:：](.+?)[）)]"
             r"在(.+?)办理(?:的)?(.+?)承担相关还款责任[，,]"
             r"责任人类型为(.+?)[，,]相关还款责任金额([\d,.]+|--)"
@@ -648,9 +650,12 @@ def _personal_brief_repayment_liabilities(
         if not core:
             continue
         remainder = compact[core.end() :]
-        snapshot = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)，", remainder)
+        snapshot = re.search(
+            rf"截至({PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN})，",
+            remainder,
+        )
         snapshot_business = re.search(
-            r"截至20\d{2}年\d{1,2}月(?:\d{1,2}日)?，(.+?)余额",
+            rf"截至{PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN}，(.+?)余额",
             remainder,
         )
         balance = re.search(r"余额([\d,.]+)(?:（?人民币元）?)?", remainder)
@@ -816,7 +821,7 @@ def _personal_brief_inquiry_rows(
 ) -> list[dict[str, Any]]:
     matches = list(
         re.finditer(
-            r"(?<!\d)(\d{1,4})\s+(20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)\s+",
+            rf"(?<!\d)(\d{{1,4}})\s+({PERSONAL_BRIEF_DATE_PATTERN})\s+",
             section,
         )
     )

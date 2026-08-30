@@ -19,6 +19,7 @@ from docmirror.models.schemas.registry import validate_projection_payload
 from docmirror.server.edition_outputs import write_outputs
 from docmirror.server.output_builder import build_community_bundle
 from scripts.validate.validate_community_artifacts import validate_community_artifacts
+from tests.regression.enterprise_fixture_support import enterprise_fixture, enterprise_fixtures
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow, pytest.mark.tier_slow]
 _FIXTURE_DIR = Path("tests/fixtures-private/credit_report")
@@ -29,8 +30,7 @@ _SUPPLIED_PERSONAL_BRIEF_DIR = (
     / "征信测试集"
     / "Digital Personal Brief"
 )
-_DIGITAL_ENTERPRISE_DIR = _FIXTURE_DIR / "Digital Enterprise"
-_KUNMING_YUXUAN_FIXTURE = _DIGITAL_ENTERPRISE_DIR / "昆明煜萱.pdf"
+_KUNMING_YUXUAN_FIXTURE = enterprise_fixture("昆明煜萱.pdf")
 _PERSONAL_BRIEF_DISPLAY_SAMPLE = _FIXTURE_DIR / "个人信用报告（本人简版）展示样本.pdf"
 
 _DIGITAL_ENTERPRISE_ACCURACY_EXPECTED = {
@@ -115,10 +115,22 @@ CASES = [
     *_cases("*_个人详版征信报告.pdf", "personal_detail", "personal_credit_report_detailed"),
     *[
         pytest.param(path, "enterprise", "enterprise_credit_report", id=f"digital-enterprise-{index}")
-        for index, path in enumerate(sorted(_DIGITAL_ENTERPRISE_DIR.glob("*.pdf")), 1)
+        for index, path in enumerate(enterprise_fixtures(), 1)
     ],
-    *_cases("*_企业征信*.pdf", "enterprise", "enterprise_credit_report"),
 ]
+
+
+def _assert_enterprise_completeness(dataset: dict[str, object]) -> None:
+    """A matching emitted count must not masquerade as source verification."""
+    completeness = dataset["completeness"]
+    assert completeness["expected_row_count"] == completeness["emitted_row_count"] == dataset["row_count"]
+    assert completeness["omitted_row_count"] == 0
+    if completeness["basis"] == "emitted_records_only":
+        assert completeness["verified"] is False
+        assert dataset["status"] == "partial"
+    else:
+        assert completeness["verified"] is True
+        assert dataset["status"] == "complete"
 
 
 def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
@@ -148,15 +160,10 @@ def test_digital_enterprise_institution_credit_code_is_preserved() -> None:
         "sensitive": True,
     }
     identity_section = next(section for section in payload["sections"] if section["title"] == "身份标识")
-    identity_item = next(item for item in identity_section["items"] if item["key"] == "institution_credit_code")
-    assert identity_item == {
-        "key": "institution_credit_code",
-        "label": "机构信用代码",
-        "value": "G1053011404727700K",
-        "raw": "G1053011404727700K",
-        "type": "string",
-        "sensitive": True,
-    }
+    identity = next(dataset for dataset in payload["datasets"] if dataset["name"] == "enterprise_report_identity")
+    assert identity["rows"][0]["normalized"]["institution_credit_code"] == "G1053011404727700K"
+    assert identity["id"] in identity_section["dataset_refs"]
+    assert identity_section["items"] == []
 
 
 @pytest.mark.parametrize(
@@ -167,7 +174,7 @@ def test_digital_enterprise_accuracy_schema_contract(
     fixture_name: str,
     expected: dict[str, object],
 ) -> None:
-    fixture = _DIGITAL_ENTERPRISE_DIR / fixture_name
+    fixture = enterprise_fixture(fixture_name)
     if not fixture.exists():
         pytest.skip(f"digital-enterprise accuracy fixture is unavailable: {fixture_name}")
 
@@ -196,11 +203,11 @@ def test_digital_enterprise_accuracy_schema_contract(
         row["normalized"]["section_key"]: row["normalized"] for row in section_rows
     }
 
-    assert dictionary["version"] == "3.0.0"
+    assert dictionary["version"] == "4.0.0"
     assert semantic["extraction"]["status"] == "complete"
     assert semantic["extraction"]["failures"] == []
     assert len(section_rows) == 10
-    assert semantic_datasets["enterprise_section_presence"]["completeness"]["verified"] is True
+    _assert_enterprise_completeness(semantic_datasets["enterprise_section_presence"])
     assert section_by_key["public_records"]["presence_status"] == expected[
         "public_section_status"
     ]
@@ -242,10 +249,6 @@ def test_digital_enterprise_accuracy_schema_contract(
         columns = dictionary["datasets"].get(dataset["name"], {}).get("columns", {})
         for row in dataset["rows"]:
             assert set(row) == {"record_id", "normalized", "source"}
-            assert not any(
-                isinstance(value, (dict, list))
-                for value in row["normalized"].values()
-            ), (dataset["name"], row["record_id"])
             for field, metadata in columns.items():
                 value = row["normalized"].get(field)
                 if value is None:
@@ -257,6 +260,10 @@ def test_digital_enterprise_accuracy_schema_contract(
                     assert isinstance(value, int) and not isinstance(value, bool)
                 elif field_type == "boolean":
                     assert isinstance(value, bool)
+                elif field_type == "array":
+                    assert isinstance(value, list)
+                elif field_type == "object":
+                    assert isinstance(value, dict)
                 elif field_type in {"string", "text", "date", "datetime", "long_id"}:
                     assert isinstance(value, str)
 
@@ -320,6 +327,11 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     bad_debt = next(account for account in accounts if account["credit_quality_status"] == "bad_debt")
     unactivated = next(account for account in accounts if account["card_activation_state"] == "not_activated")
     quasi_card = next(account for account in accounts if account.get("credit_card_type") == "quasi_credit_card")
+    commercial_property = next(
+        account
+        for account in accounts
+        if account.get("loan_amount") == "2200000"
+    )
     assert credit_line["credit_line_validity_type"] == "perpetual"
     assert credit_line.get("credit_line_expiry_date") is None
     assert credit_line.get("due_date") is None
@@ -335,6 +347,7 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     assert unactivated["account_currency"] == "USD"
     assert unactivated["reporting_amount_currency"] == "CNY"
     assert quasi_card["business_type"] == "准贷记卡"
+    assert commercial_property["business_type"] == "个人商用房贷款（包括商住两用房）"
     assert all(account["reporting_amount_currency"] == "CNY" for account in accounts)
     overdue = [row["normalized"] for row in datasets["overdue_records"]["rows"]]
     assert [row.get("overdue_months") for row in overdue] == [None, 1, 2, 2, 2, 4, 16, 12]
@@ -368,6 +381,12 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
     penalties = [row["normalized"] for row in datasets["administrative_penalty_records"]["rows"]]
     assert penalties[0]["effective_date"] == "2021-08"
     assert penalties[0]["end_date"] == "2024-07"
+    section_items = {
+        section["type"]: {item["key"]: item["value"] for item in section["items"]}
+        for section in payload["sections"]
+    }
+    assert section_items["non_credit_transactions"]["lookback_years"] == 5
+    assert section_items["public_records"]["lookback_years"] == 5
 
     enhanced = bundle.render_enhanced_markdown(semantic)
     visible = "\n".join(
@@ -427,7 +446,7 @@ def test_personal_brief_display_sample_projects_complete_business_schema() -> No
 
 
 def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: Path) -> None:
-    fixtures = sorted(_DIGITAL_ENTERPRISE_DIR.glob("*(1).pdf"))
+    fixtures = enterprise_fixtures("*(1).pdf")
     if not fixtures:
         pytest.skip("audited private digital-enterprise fixture is unavailable")
     fixture = fixtures[0]
@@ -569,10 +588,8 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
         "not_reported",
         "not_overdue",
     ]
-    assert datasets["enterprise_credit_accounts"]["status"] == "complete"
-    assert datasets["enterprise_credit_accounts"]["completeness"]["verified"] is True
-    assert datasets["enterprise_credit_facilities"]["status"] == "complete"
-    assert datasets["enterprise_credit_facilities"]["completeness"]["verified"] is True
+    _assert_enterprise_completeness(datasets["enterprise_credit_accounts"])
+    _assert_enterprise_completeness(datasets["enterprise_credit_facilities"])
     assert "id_type" not in facts
     assert "id_number" not in facts
     assert "subject_id" not in facts
@@ -709,7 +726,7 @@ def test_digital_enterprise_stacked_accounts_and_facilities_are_exact(tmp_path: 
 
 
 def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() -> None:
-    fixtures = sorted(_DIGITAL_ENTERPRISE_DIR.glob("*20250710.pdf"))
+    fixtures = enterprise_fixtures("*20250710.pdf")
     if not fixtures:
         pytest.skip("audited 77-page digital-enterprise fixture is unavailable")
     fixture = fixtures[0]
@@ -748,7 +765,7 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         ("500", "300"),
         ("400", "300"),
     ]
-    assert datasets["enterprise_credit_facilities"]["completeness"]["verified"] is True
+    _assert_enterprise_completeness(datasets["enterprise_credit_facilities"])
     assert datasets["enterprise_credit_facilities"]["completeness"]["expected_row_count"] == 2
 
     assert facts["business_registration_number"] == "913100005515731558"
@@ -756,8 +773,10 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     assert capital["registered_capital_amount"] == "6000"
     assert capital["currency"] == "CNY"
     assert capital["amount_unit"] == "CNY_10K"
-    assert capital["source_page"] == 4
-    assert capital["contributor_source_page"] == 5
+    rich_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    rich_capital = rich_datasets["enterprise_capital_summary"]["rows"][0]["normalized"]
+    assert rich_capital["source_page"] == 4
+    assert rich_capital["contributor_source_page"] == 5
 
     closed = [
         row["normalized"]
@@ -779,6 +798,13 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     assert responsibility["other_credit_responsibility_amount"] == "4055"
     assert responsibility["other_credit_account_count"] == 3
     assert responsibility["other_credit_balance"] == "2180"
+    liabilities = [row["normalized"] for row in datasets["enterprise_repayment_responsibility_accounts"]["rows"]]
+    assert {row["guarantee_contract_identifier"] for row in liabilities} == {
+        "B10911000H0001053d0f821da4084c118dd76aebb26c0617",
+        "B10911000H00010563ef4075f7014c08bd578e1c071a0bcf",
+        "D10023010H00012025040100001054",
+    }
+    assert all("contract_number" not in row and "open_date" not in row for row in liabilities)
 
     attachment_accounts = [row["normalized"] for row in datasets["enterprise_attachment_accounts"]["rows"]]
     histories = [row["normalized"] for row in datasets["enterprise_credit_supplement"]["rows"]]
@@ -817,19 +843,28 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
         account_identifier: sum(row["account_identifier"] == account_identifier for row in histories)
         for account_identifier in expected_cross_page_history_counts
     } == expected_cross_page_history_counts
-    assert max(row["source_page"] for row in histories) == 77
+    assert max(row["source"]["page_range"][1] for row in datasets["enterprise_credit_supplement"]["rows"]) == 77
     assert histories[0]["account_identifier"] == "G10312900H000131055214010025006"
     assert histories[0]["institution"] == "上海农村商业银行股份有限公司宝山支行"
     assert len(details) == 109
     assert all(row["five_tier_class"] for row in details)
-    assert sum(row["five_tier_class_source"] == "parent_attachment_heading" for row in details) == 8
+    rich_details = [row["normalized"] for row in rich_datasets["enterprise_attachment_credit_details"]["rows"]]
+    assert sum(row["five_tier_class_source"] == "parent_attachment_heading" for row in rich_details) == 8
     active_discount = next(row for row in details if row["account_identifier"] == "D10123320H00012025070160898220")
     assert active_discount["guarantee_type"] == "信用/无担保"
     assert active_discount["snapshot_date"] == "2025-07-01"
-    assert active_discount["credit_agreement_identifier"] == ""
-    assert active_discount["credit_agreement_status"] == "not_reported"
-    assert max(row["source_page"] for row in details) == 77
-    assert len(transactions) == 23
+    assert "credit_agreement_identifier" not in active_discount
+    assert "credit_agreement_status" not in active_discount
+    rich_active_discount = next(row for row in rich_details if row["account_identifier"] == "D10123320H00012025070160898220")
+    assert rich_active_discount["credit_agreement_status"] == "not_reported"
+    assert max(row["source"]["page_range"][1] for row in datasets["enterprise_attachment_credit_details"]["rows"]) == 77
+    assert len(transactions) == 24
+    continued_transactions = [row for row in transactions if row["account_identifier"] == "B11215800H00019550862612896600001"]
+    assert {(row["transaction_type"], row["transaction_date"], row["transaction_amount"], row["due_date_change_months"])
+            for row in continued_transactions} == {
+        ("无还本续贷", "2023-11-15", "500", 12),
+        ("提前还款", "2024-11-13", "500", 0),
+    }
     attachment_ids = {row["attachment_account_id"] for row in attachment_accounts}
     assert all(row["attachment_account_id"] in attachment_ids for row in histories)
     assert all(row["attachment_account_id"] in attachment_ids for row in details)
@@ -861,15 +896,19 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
     )
     assert active_discount_csv["guarantee_type"] == "信用/无担保"
     assert active_discount_csv["snapshot_date"] == "2025-07-01"
-    assert active_discount_csv["credit_agreement_status"] == "not_reported"
+    assert active_discount_csv.get("credit_agreement_identifier", "") == ""
+    assert "credit_agreement_status" not in active_discount_csv
 
     summary = facts["credit_summary"]
-    assert summary["source_display_limited"] is True
+    assert datasets["enterprise_credit_overview"]["rows"][0]["normalized"]["source_display_limited"] is True
+    assert datasets["enterprise_credit_overview"]["rows"][0]["normalized"]["source_display_scopes"] == ["credit_records"]
+    assert all(row["normalized"]["available_limit_requires_estimation"] is True
+               for row in datasets["enterprise_facility_summary"]["rows"])
     assert summary["attachment_account_count"] == 201
     assert summary["attachment_history_row_count"] == 477
     assert summary["attachment_detail_card_count"] == 109
-    assert summary["attachment_special_transaction_count"] == 23
-    assert datasets["enterprise_credit_accounts"]["status"] == "complete"
+    assert summary["attachment_special_transaction_count"] == 24
+    _assert_enterprise_completeness(datasets["enterprise_credit_accounts"])
 
     enhanced = bundle.render_enhanced_markdown(semantic)
     for expected in (
@@ -892,7 +931,7 @@ def test_digital_enterprise_long_attachment_is_complete_and_correctly_bound() ->
 
 
 def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
-    fixture = _DIGITAL_ENTERPRISE_DIR / "安徽华英征信报告20250728.pdf"
+    fixture = enterprise_fixture("安徽华英征信报告20250728.pdf")
     if not fixture.exists():
         pytest.skip("audited cross-page digital-enterprise fixture is unavailable")
     sealed = asyncio.run(
@@ -915,10 +954,12 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     accounts = [row["normalized"] for row in datasets["enterprise_credit_accounts"]["rows"]]
     details = [row["normalized"] for row in datasets["enterprise_attachment_credit_details"]["rows"]]
 
-    assert sum(row["issuance_form"] == "新增" for row in accounts) == 5
+    assert sum(row.get("issuance_form") == "新增" for row in accounts) == 5
     assert len(details) == 188
+    rich_datasets = {dataset["name"]: dataset for dataset in semantic["datasets"]}
+    rich_details = [row["normalized"] for row in rich_datasets["enterprise_attachment_credit_details"]["rows"]]
     assert {
-        status: sum(row["credit_agreement_status"] == status for row in details)
+        status: sum(row["credit_agreement_status"] == status for row in rich_details)
         for status in ("reported", "not_reported", "not_applicable")
     } == {
         "reported": 1,
@@ -928,13 +969,13 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     guarantee_detail = next(
         row for row in details if row["account_identifier"] == "G10423771H00065402377100013202503281003069991742282"
     )
-    assert guarantee_detail["guarantee_type"] == ""
+    assert "guarantee_type" not in guarantee_detail
     assert guarantee_detail["counter_guarantee_type"] == "信用/无担保/保证金"
     assert guarantee_detail["deposit_ratio"] == "0.5"
     assert guarantee_detail["balance"] == "2000"
     assert guarantee_detail["risk_exposure_amount"] == "1000"
     assert guarantee_detail["credit_agreement_identifier"] == "G10423771H00065879024720250329"
-    assert guarantee_detail["credit_agreement_status"] == "reported"
+    assert next(row for row in rich_details if row["account_identifier"] == guarantee_detail["account_identifier"])["credit_agreement_status"] == "reported"
     assert guarantee_detail["snapshot_date"] == "2025-03-29"
     for account_identifier, expected_snapshot in (
         ("G10323310H0001DLC8022025000052", "2025-05-13"),
@@ -943,8 +984,8 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
         detail = next(row for row in details if row["account_identifier"] == account_identifier)
         assert detail["counter_guarantee_type"] == "信用/无担保/保证金"
         assert detail["deposit_ratio"] == "0.5"
-        assert detail["credit_agreement_identifier"] == ""
-        assert detail["credit_agreement_status"] == "not_reported"
+        assert "credit_agreement_identifier" not in detail
+        assert next(row for row in rich_details if row["account_identifier"] == account_identifier)["credit_agreement_status"] == "not_reported"
         assert detail["snapshot_date"] == expected_snapshot
 
     detail_csv = next(
@@ -994,25 +1035,25 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
         for row in datasets["enterprise_displayed_credit_summary"]["rows"]
     ]
     assert len(displayed) == 7
+    overview = datasets["enterprise_credit_overview"]["rows"][0]["normalized"]
+    assert overview["source_display_limited"] is True
+    assert overview["source_display_scopes"] == ["credit_records"]
     settled_discount = next(
         row
         for row in displayed
         if row["settlement_status"] == "settled"
         and row["business_category"] == "贴现"
     )
-    assert settled_discount["source_group_account_count"] == 100
-    assert settled_discount["source_account_count"] == 100
-    assert settled_discount["source_reported_amount"] == "3836.96"
-    assert settled_discount["amount_kind"] == "discount_amount"
+    assert settled_discount["account_count"] == 100
+    assert settled_discount["discount_amount"] == "3836.96"
     active_discount = next(
         row
         for row in displayed
         if row["settlement_status"] == "active"
         and row["business_category"] == "贴现"
     )
-    assert active_discount["source_group_account_count"] == 77
-    assert active_discount["source_account_count"] == 77
-    assert active_discount["source_reported_amount"] == "7511.68"
+    assert active_discount["account_count"] == 77
+    assert active_discount["balance"] == "7511.68"
     assert active_discount["overdue_total"] == "0"
     assert active_discount["overdue_principal"] == "0"
     displayed_csv = next(
@@ -1025,7 +1066,7 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     assert any(
         row["settlement_status"] == "settled"
         and row["business_category"] == "贴现"
-        and row["source_reported_amount"] == "3836.96"
+        and row["discount_amount"] == "3836.96"
         for row in displayed_csv_rows
     )
     assert "### 信贷记录明细分组汇总" in enhanced
@@ -1048,19 +1089,21 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
     ]
     assert len(liabilities) == 1
     assert liabilities[0]["account_identifier"] == "D10023330H00029030001124000265200"
-    assert liabilities[0]["contract_number"] == "D10023330H0002DB2024111100000171"
+    assert liabilities[0]["guarantee_contract_identifier"] == "D10023330H0002DB2024111100000171"
     assert liabilities[0]["responsibility_amount"] == "2200"
     assert liabilities[0]["loan_or_credit_amount"] == "1100"
     assert liabilities[0]["balance"] == "1100"
     assert liabilities[0]["five_tier_class"] == "正常"
     assert liabilities[0]["snapshot_date"] == "2025-07-20"
-    liability_preview = enhanced.split("### 相关还款责任信息\n", maxsplit=1)[1].split(
+    liability_preview = enhanced.split("### 企业相关还款责任账户\n", maxsplit=1)[1].split(
         "\n### ",
         maxsplit=1,
     )[0]
     assert "**保证合同编号:** D10023330H0002DB2024111100000171" in liability_preview
     assert "**还款责任金额:** 2200" in liability_preview
     assert "**借款金额/信用额度:** 1100" in liability_preview
+    # The source-faithful Markdown keeps the printed union heading; the public
+    # business JSON below has separate, correctly typed month/status fields.
     assert "**逾期月数/还款状态:** 0" in liability_preview
     assert "**信息截至日期:** 2025-07-20" in liability_preview
 
@@ -1076,8 +1119,10 @@ def test_digital_enterprise_cross_page_business_sections_are_complete() -> None:
         "license": 2,
         "certification": 1,
     }
-    assert "**许可记录:** 2" in enhanced
-    assert "**认证记录:** 1" in enhanced
+    assert datasets["enterprise_public_license_records"]["row_count"] == 2
+    assert datasets["enterprise_public_certification_records"]["row_count"] == 1
+    assert "### 行政许可记录" in enhanced
+    assert "### 认证记录" in enhanced
     assert "**license:**" not in enhanced
     assert "**certification:**" not in enhanced
     assert "public_record:" not in enhanced
@@ -1120,7 +1165,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     facts = semantic["domain"]["facts"]
 
     assert data_dictionary["schema_id"] == "enterprise_credit_report"
-    assert data_dictionary["version"] == "3.0.0"
+    assert data_dictionary["version"] == "4.0.0"
     assert "identity_documents" not in data_dictionary["datasets"]
     assert "enterprise_credit_accounts" in data_dictionary["datasets"]
     assert len(accounts) == 10
@@ -1218,9 +1263,7 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
         for row in dataset["rows"]
     )
     assert facts["credit_summary"]["reported_account_count"] == 28
-    assert datasets["enterprise_credit_accounts"]["completeness"]["basis"] == (
-        "canonical_source_component_count"
-    )
+    _assert_enterprise_completeness(datasets["enterprise_credit_accounts"])
     assert datasets["enterprise_credit_accounts"]["completeness"]["expected_row_count"] == 10
     assert "id_number" not in facts
     assert "subject_id" not in facts
@@ -1247,8 +1290,8 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert report_identity["organization_code"] == "18379731-3"
     assert report_identity["zhongzheng_code"] == "4103090000069511"
     assert report_metadata["query_institution"] == "中国某某银行北京分行"
-    assert "report_number" not in report_metadata
-    assert "report_number" not in facts
+    assert report_metadata["report_number"] == "2015110110051525534123"
+    assert facts["report_number"] == "2015110110051525534123"
     assert datasets["enterprise_dispute_overview"]["rows"][0]["normalized"][
         "in_progress_dispute_count"
     ] == 3
@@ -1296,6 +1339,12 @@ def test_enterprise_self_query_keeps_account_facility_and_public_record_grains_s
     assert datasets["enterprise_public_utility_payment_records"]["rows"][0]["normalized"][
         "cumulative_arrears"
     ] == "0.3"
+    assert datasets["enterprise_public_utility_payment_records"]["rows"][0]["normalized"][
+        "history_period_months"
+    ] == 24
+    assert datasets["enterprise_public_utility_payment_records"]["rows"][0]["normalized"][
+        "history_status"
+    ] == "见附件"
     patent = datasets["enterprise_public_patent_records"]["rows"][0]["normalized"]
     assert (
         patent["patent_number"],
@@ -1451,14 +1500,32 @@ def test_credit_report_subtype_projects_complete_v3(
         assert enterprise_audit_cells
         assert all(row["evidence_ref"] for row in enterprise_audit_cells)
         assert all(json.loads(row["evidence_ref"]) for row in enterprise_audit_cells)
-        assert all(dataset["completeness"]["verified"] for dataset in enterprise_datasets.values())
+        for dataset in enterprise_datasets.values():
+            _assert_enterprise_completeness(dataset)
+            columns = {column["key"]: column for column in dataset["columns"]}
+            for row in dataset["rows"]:
+                normalized = row["normalized"]
+                validity = normalized.get("registration_certificate_valid_through")
+                if validity == "长期":
+                    assert normalized["registration_certificate_validity_kind"] == "indefinite"
+                    assert columns["registration_certificate_valid_through"]["type"] == "string"
+                if "source_display_scopes" in normalized:
+                    assert normalized["source_display_scopes"] == ["credit_records"]
+                    assert columns["source_display_scopes"]["type"] == "array"
+                if dataset["name"] == "enterprise_repayment_responsibility_accounts":
+                    for field, value_type, label in (("overdue_months", "integer", "逾期月数"), ("repayment_status", "string", "还款状态")):
+                        if field in normalized:
+                            assert columns[field]["type"] == value_type
+                            assert columns[field]["label"] == label
         displayed_dataset = enterprise_datasets.get("enterprise_displayed_credit_summary")
         if displayed_dataset is not None:
             displayed_rows = [row["normalized"] for row in displayed_dataset["rows"]]
             assert displayed_rows
-            assert all(row["summary_scope"] == "displayed_detail_section" for row in displayed_rows)
-            assert all(row["source_group_account_count"] > 0 for row in displayed_rows)
-            assert all(row["source_account_count"] > 0 for row in displayed_rows)
+            assert all(row["account_count"] > 0 for row in displayed_rows)
+            # Settled guarantee summaries print the advance flag instead of an
+            # amount; absence of an unprinted balance must stay an absence.
+            assert all(any(field in row for field in ("balance", "discount_amount", "advance_flag")) for row in displayed_rows)
+            assert all("source_account_count" not in row and "source_reported_amount" not in row for row in displayed_rows)
     else:
         assert "enterprise_displayed_credit_summary" not in {
             dataset["name"] for dataset in payload["datasets"]

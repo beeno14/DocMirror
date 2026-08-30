@@ -220,6 +220,17 @@ def validate_personal_brief_public_record(
 ) -> None:
     """Validate closed enums and reporting-unit invariants for one public row."""
 
+    if (
+        dataset_name == "credit_accounts"
+        and values.get("is_revolving") is not None
+        and not isinstance(values["is_revolving"], bool)
+    ):
+        raise PersonalBriefContractError(
+            "PERSONAL_BRIEF_BOOLEAN_CONTRACT_VIOLATION: "
+            f"dataset={dataset_name!r}, record_id={record_id!r}, field='is_revolving', "
+            f"actual={values['is_revolving']!r}"
+        )
+
     for (rule_dataset, field), labels in PERSONAL_BRIEF_ENUM_CONTRACT.items():
         if rule_dataset != dataset_name or field not in values:
             continue

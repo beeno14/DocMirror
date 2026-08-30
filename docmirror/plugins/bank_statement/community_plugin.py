@@ -37,14 +37,21 @@ from docmirror.plugins.bank_statement.extract_pipeline import (
     is_source_bound_issuer_detail,
     run_bank_statement_extract,
 )
+from docmirror.plugins.bank_statement.extraction_dispatch import (
+    BankExtractionRoute,
+    resolve_bank_extraction_route,
+)
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text, normalize_header_cell
 from docmirror.plugins.bank_statement.statement_context import (
     _FIELD_ALIASES,
+    audit_source_fact_conservation,
     attach_statement_context,
+    build_source_metadata_records,
     build_statement_header_records,
     page_texts_with_business_headers,
     reconcile_source_unitemized_residuals,
 )
+from docmirror.plugins.bank_statement.work_cache import bank_work_session
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     page_texts_from_parse_result,
     resolve_row_count_evidence,
@@ -235,14 +242,27 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         },
         "bank_name": {"label": "开户银行", "type": "string"},
         "branch_name": {"label": "开户机构", "type": "string"},
+        "issuing_bank": {"label": "签发银行", "type": "string"},
+        "issuing_branch": {"label": "签发机构", "type": "string"},
         "account_type": {"label": "账户类型", "type": "string"},
         "deposit_type": {"label": "存款种类", "type": "string"},
         "statement_number": {"label": "账单号", "type": "string"},
         "seal_code": {"label": "印章编码", "type": "string"},
+        "seal_type": {"label": "印章类型", "type": "string"},
+        "metadata_field": {"label": "元数据字段", "type": "string"},
+        "metadata_name": {"label": "原文标签", "type": "string"},
+        "metadata_value": {"label": "原文值", "type": "string"},
+        "normalized_value": {"label": "规范值", "type": "string"},
+        "source_page_start": {"label": "来源起始页", "type": "integer"},
+        "source_page_end": {"label": "来源结束页", "type": "integer"},
+        "scope": {"label": "作用域", "type": "string", "enum_ref": "scope"},
         "query_period": {"label": "查询期间", "type": "string"},
         "period_start": {"label": "账期开始", "type": "date"},
         "period_end": {"label": "账期结束", "type": "date"},
         "print_date": {"label": "打印日期", "type": "date"},
+        "print_timestamp": {"label": "打印时间", "type": "datetime"},
+        "print_time": {"label": "打印时刻", "type": "string"},
+        "statement_cutoff_timestamp": {"label": "交易明细截止时间", "type": "datetime"},
         "document_date": {"label": "单据日期", "type": "date"},
         "query_teller": {"label": "查询柜员", "type": "string"},
         "total_transactions": {"label": "交易总笔数", "type": "integer"},
@@ -362,6 +382,8 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "statement_title": {"label": "流水标题", "type": "string"},
                 "statement_disclaimer": {"label": "流水免责声明", "type": "string"},
                 "bank_name": {"label": "开户银行", "type": "string"},
+                "issuing_bank": {"label": "签发银行", "type": "string"},
+                "issuing_branch": {"label": "签发机构", "type": "string"},
                 "account_holder": {"label": "账户名称", "type": "string"},
                 "account_number": {
                     "label": "账号",
@@ -404,6 +426,7 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "electronic_serial": {"label": "电子流水号", "type": "string"},
                 "verification_code": {"label": "验证码", "type": "string"},
                 "seal_code": {"label": "印章编码", "type": "string"},
+                "seal_type": {"label": "印章类型", "type": "string"},
                 "proof_number": {"label": "证明编号", "type": "string"},
                 "wechat_id": {"label": "微信号", "type": "string"},
                 "id_type": {"label": "证件类型", "type": "string"},
@@ -423,6 +446,8 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "query_date": {"label": "查询日期", "type": "string"},
                 "print_date": {"label": "打印日期", "type": "date"},
                 "print_timestamp": {"label": "打印时间", "type": "datetime"},
+                "print_time": {"label": "打印时刻", "type": "string"},
+                "statement_cutoff_timestamp": {"label": "交易明细截止时间", "type": "datetime"},
                 "query_timestamp": {"label": "查询时间", "type": "datetime"},
                 "application_time": {"label": "申请时间", "type": "datetime"},
                 "issue_date": {"label": "开立日期", "type": "date"},
@@ -478,7 +503,24 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
                 "amount_upper_limit": {"label": "金额上限", "type": "money"},
                 "amount_lower_limit": {"label": "金额下限", "type": "money"},
             },
-        }
+        },
+        "source_metadata": {
+            "label": "来源业务元数据",
+            "definition": "来源页面中无法无损压缩到单一账户表头的业务元数据事实。",
+            "columns": {
+                "metadata_field": {
+                    "label": "元数据字段",
+                    "type": "string",
+                    "enum_ref": "metadata_field",
+                },
+                "metadata_name": {"label": "原文标签", "type": "string"},
+                "metadata_value": {"label": "原文值", "type": "string"},
+                "normalized_value": {"label": "规范值", "type": "string"},
+                "source_page_start": {"label": "来源起始页", "type": "integer"},
+                "source_page_end": {"label": "来源结束页", "type": "integer"},
+                "scope": {"label": "作用域", "type": "string", "enum_ref": "scope"},
+            },
+        },
     },
     "enums": {
         "direction": {"income": "收入", "expense": "支出"},
@@ -487,6 +529,23 @@ BANK_DATA_DICTIONARY: dict[str, Any] = {
         "sort_order": {"asc": "升序", "ascending": "升序", "desc": "降序", "descending": "降序"},
         "extraction_route": {"digital": "数字文档", "scanned": "扫描文档"},
         "counterparty_status": {"present": "已提供", "source_null": "原文未提供"},
+        "scope": {"document": "整份文档", "page": "单页", "pages": "多页"},
+        "metadata_field": {
+            "page_label": "页码",
+            "seal_code": "印章编码",
+            "seal_type": "印章类型",
+            "issuing_bank": "签发银行",
+            "issuing_branch": "签发机构",
+            "print_channel": "打印渠道",
+            "print_timestamp": "打印时间",
+            "print_time": "打印时刻",
+            "statement_cutoff_timestamp": "交易明细截止时间",
+            "debit_count": "本页支出笔数",
+            "debit_total": "本页支出合计",
+            "credit_count": "本页收入笔数",
+            "credit_total": "本页收入合计",
+            "other": "其他来源元数据",
+        },
         "extract_status": {
             "success": "成功",
             "low_coverage": "覆盖率偏低",
@@ -742,6 +801,21 @@ class BankStatementCommunityPlugin(BaseTableParser):
             values.pop("counter_bank_name", None)
             values.pop("counter_bank_code", None)
             values.update(_decompose_compound_counterparty(str(compound_value)))
+
+        second_tier_value = _exact_source_value(
+            raw_txn,
+            ("对方账号户名/附言", "对方账户户名/附言"),
+        )
+        if second_tier_value not in (None, ""):
+            from docmirror.plugins.bank_statement.styles.grid_standard import (
+                _decompose_second_tier_counterparty,
+            )
+
+            values.pop("sub_account", None)
+            values.pop("counter_party", None)
+            values.pop("counter_account", None)
+            values.pop("remittance_note", None)
+            values.update(_decompose_second_tier_counterparty(str(second_tier_value)))
 
         account_bank_value = _exact_source_value(
             raw_txn,
@@ -1155,6 +1229,11 @@ class BankStatementCommunityPlugin(BaseTableParser):
         return recovered
 
     def derive(self, parse_result, text: str = "") -> ProjectionData:
+        route = resolve_bank_extraction_route(parse_result)
+        with bank_work_session(parse_result, enabled=route is BankExtractionRoute.DIGITAL):
+            return self._derive_in_work_session(parse_result, text)
+
+    def _derive_in_work_session(self, parse_result, text: str = "") -> ProjectionData:
         """Run the style-aware extractor and return projector-local facts."""
         result = run_bank_statement_extract(parse_result, text, self)
         if not is_source_bound_issuer_detail(result.identity_fields.get("bank_name")):
@@ -1228,6 +1307,26 @@ class BankStatementCommunityPlugin(BaseTableParser):
             parse_result,
             result.identity_fields,
         )
+        source_metadata_records = build_source_metadata_records(parse_result, statement_header_records)
+        source_conservation = audit_source_fact_conservation(
+            parse_result,
+            statement_header_records,
+            source_metadata_records,
+        )
+        if source_conservation["unrepresented_fact_count"]:
+            projection_warnings.append(
+                "BANK_SOURCE_METADATA_CONSERVATION_FAILED:"
+                f"represented={source_conservation['represented_fact_count']}:"
+                f"total={source_conservation['source_fact_count']}"
+            )
+            result.style_meta.extract_status = "degraded"
+        if source_conservation["embedded_ocr_status"] in {"ocr_unavailable", "source_unavailable"}:
+            projection_warnings.append(
+                "BANK_EMBEDDED_BUSINESS_METADATA_UNVERIFIED:"
+                f"status={source_conservation['embedded_ocr_status']}:"
+                f"candidates={source_conservation['embedded_candidate_images']}"
+            )
+            result.style_meta.extract_status = "degraded"
         records = attach_statement_context(records, statement_header_records)
         statement_header_records = reconcile_source_unitemized_residuals(
             parse_result,
@@ -1275,9 +1374,13 @@ class BankStatementCommunityPlugin(BaseTableParser):
         datasets: dict[str, list[dict[str, Any]]] = {}
         if statement_header_records:
             datasets["statement_header"] = statement_header_records
+        if source_metadata_records:
+            datasets["source_metadata"] = source_metadata_records
         datasets.update(projection.datasets)
         semantic = dict(projection.semantic)
-        semantic["dataset_document_order"] = ["statement_header", "transactions"]
+        semantic["dataset_document_order"] = [
+            name for name in ("statement_header", "source_metadata", "transactions") if name in datasets
+        ]
         if result.extraction_route.value == "digital":
             # Presentation policy only: reuse existing source-label mappings;
             # do not change normalized records or any extraction decision.
@@ -1292,6 +1395,15 @@ class BankStatementCommunityPlugin(BaseTableParser):
                 "business_view": True,
                 "source_aliases": {
                     "statement_header": {key: list(aliases) for key, aliases in _FIELD_ALIASES.items()},
+                    "source_metadata": {
+                        "metadata_field": ["元数据字段"],
+                        "metadata_name": ["原文标签"],
+                        "metadata_value": ["原文值"],
+                        "normalized_value": ["规范值"],
+                        "source_page_start": ["来源起始页"],
+                        "source_page_end": ["来源结束页"],
+                        "scope": ["作用域"],
+                    },
                     "transactions": {
                         mapping.field: [name, *(mapping.aliases or [])]
                         for name, mapping in self.column_registry.items()
@@ -1310,6 +1422,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
                     text,
                     document_type=str(getattr(parse_result.entities, "document_type", "") or ""),
                     source_pages=_parse_result_source_pages(parse_result),
+                    source_metadata_records=source_metadata_records,
                 ),
             }
         )
@@ -1323,9 +1436,10 @@ def _render_bank_statement_content_markdown(
     *,
     document_type: str = "bank_statement",
     source_pages: dict[int, str] | None = None,
+    source_metadata_records: Sequence[dict[str, Any]] | None = None,
 ) -> str:
     """Render a record-complete bank statement Markdown view from canonical plugin facts."""
-    if not records:
+    if not records and not source_metadata_records:
         return ""
     identity = dict(identity)
     if document_type == "bank_reconciliation" and not identity.get("statement_title"):
@@ -1373,7 +1487,51 @@ def _render_bank_statement_content_markdown(
             if page == page_numbers[0]:
                 parts.extend(_bank_statement_header_lines(identity, period))
             parts.append(_render_bank_statement_table(page_records))
+    if source_metadata_records:
+        parts.append(_render_source_metadata_markdown(source_metadata_records))
     return "\n\n".join(part for part in parts if part).rstrip() + "\n"
+
+
+def _render_source_metadata_markdown(records: Sequence[dict[str, Any]]) -> str:
+    """Render scoped source metadata without exposing extraction internals."""
+
+    field_labels = BANK_DATA_DICTIONARY.get("enums", {}).get("metadata_field", {})
+    scope_labels = BANK_DATA_DICTIONARY.get("enums", {}).get("scope", {})
+
+    def cell(value: Any) -> str:
+        return str(value if value not in (None, "") else "-").replace("|", "\\|").replace("\n", "<br>")
+
+    lines = [
+        "## 来源业务元数据",
+        "",
+        "| 元数据字段 | 原文标签 | 原文值 | 规范值 | 来源页 | 作用域 |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for record in records:
+        normalized = record.get("normalized") if isinstance(record.get("normalized"), dict) else {}
+        field = str(normalized.get("metadata_field") or "other")
+        page_start = normalized.get("source_page_start")
+        page_end = normalized.get("source_page_end")
+        page_text = (
+            f"{page_start}-{page_end}"
+            if page_end not in (None, "") and page_end != page_start
+            else str(page_start or "")
+        )
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    cell(field_labels.get(field, normalized.get("metadata_name") or field)),
+                    cell(normalized.get("metadata_name")),
+                    cell(normalized.get("metadata_value")),
+                    cell(normalized.get("normalized_value")),
+                    cell(page_text),
+                    cell(scope_labels.get(str(normalized.get("scope") or ""), normalized.get("scope"))),
+                )
+            )
+            + " |"
+        )
+    return "\n".join(lines)
 
 
 def _parse_result_source_pages(parse_result) -> dict[int, str]:

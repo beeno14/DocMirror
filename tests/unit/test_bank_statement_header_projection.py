@@ -211,6 +211,70 @@ def test_community_json_orders_statement_header_before_transactions(monkeypatch)
     assert bundle.conservation_issues(payload=payload) == []
 
 
+def test_source_business_metadata_is_public_normalized_data_and_markdown(monkeypatch) -> None:
+    parse_result = _parse_result()
+    metadata = [
+        {
+            "record_id": "source_metadata:r000001",
+            "normalized": {
+                "metadata_field": "seal_code",
+                "metadata_name": "业务印章编码",
+                "metadata_value": "8DD4EA031026",
+                "normalized_value": "8DD4EA031026",
+                "source_page_start": 1,
+                "source_page_end": 1,
+                "scope": "page",
+            },
+            "canonical_raw": {"metadata_name": "业务印章编码", "metadata_value": "8DD4EA031026"},
+            "raw": {"metadata_name": "业务印章编码", "metadata_value": "8DD4EA031026"},
+            "source": {"source": "embedded_image_ocr", "page_range": [1, 1]},
+            "confidence": 0.99,
+        }
+    ]
+    monkeypatch.setattr(community_module, "run_bank_statement_extract", lambda *_args: _synthetic_extract_result())
+    monkeypatch.setattr(
+        community_module,
+        "resolve_row_count_evidence",
+        lambda *_args, **_kwargs: RowCountEvidence.empty(),
+    )
+    monkeypatch.setattr(community_module, "build_source_metadata_records", lambda *_args: metadata)
+    monkeypatch.setattr(
+        community_module,
+        "audit_source_fact_conservation",
+        lambda *_args: {
+            "source_fact_count": 1,
+            "represented_fact_count": 1,
+            "unrepresented_fact_count": 0,
+            "unrepresented_fields": [],
+            "embedded_candidate_images": 1,
+            "embedded_ocr_images": 1,
+            "embedded_ocr_status": "complete",
+        },
+    )
+
+    projection = BankStatementCommunityPlugin().derive(parse_result, "")
+    bundle = project_community_bundle(
+        seal_parse_result(parse_result),
+        projection_data=projection.model_dump(mode="python"),
+        projection_policy=load_projection_policy("docmirror.plugins.bank_statement"),
+    )
+    payload = bundle.json_payload()
+
+    assert [dataset["name"] for dataset in payload["datasets"]] == [
+        "statement_header",
+        "source_metadata",
+        "transactions",
+    ]
+    public_metadata = next(dataset for dataset in payload["datasets"] if dataset["name"] == "source_metadata")["rows"][0]
+    assert public_metadata["normalized"]["metadata_value"] == "8DD4EA031026"
+    assert "raw" not in public_metadata and "canonical_raw" not in public_metadata
+    markdown = bundle.render_enhanced_markdown()
+    assert "来源业务元数据" in markdown
+    assert "业务印章编码" in markdown
+    assert "8DD4EA031026" in markdown
+    assert "canonical_raw" not in markdown
+
+
 def test_digital_bank_unmasks_all_identifier_fields_and_scanned_default_is_unchanged(monkeypatch) -> None:
     from docmirror.output.community_bundle import render_community_reading_markdown
     from docmirror.server.output_builder import materialize_community_bundle

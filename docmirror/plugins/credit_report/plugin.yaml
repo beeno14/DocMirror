@@ -600,6 +600,7 @@ projection:
     enterprise_relationships:
       - sequence
       - relationship_type
+      - relationship_type_label
       - name
       - identity_type
       - identity_number

@@ -432,8 +432,7 @@ def test_personal_brief_public_projection_is_lean_and_non_mutating() -> None:
     for dataset in datasets.values():
         assert not {"reading_columns", "storage_role", "record_path"} & set(dataset)
         for row in dataset["rows"]:
-            assert set(row) == {"record_id", "normalized", "source"}
-            assert row["source"] == {}
+            assert set(row) == {"record_id", "normalized"}
         assert all(not column["raw_available"] and not column["evidence_available"] for column in dataset["columns"])
 
     sections = {section["id"]: section for section in projected["sections"]}

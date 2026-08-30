@@ -309,8 +309,9 @@ def test_f5_does_not_compare_a_scoped_audit_count_to_a_whole_dataset() -> None:
     )["enterprise_attachment_credit_details"]
 
     assert completeness["expected_row_count"] == 43
-    assert completeness["verified"] is True
-    assert completeness["basis"] == "canonical_source_component_count"
+    assert completeness["verified"] is False
+    assert completeness["basis"] == "emitted_records_only"
+    assert completeness["status"] == "unverified"
 
 
 def _validation_dictionary() -> dict[str, Any]:

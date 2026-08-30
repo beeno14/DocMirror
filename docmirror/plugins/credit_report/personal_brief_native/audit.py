@@ -484,6 +484,7 @@ def _collect_dataset_envelopes(
                     "invalid_provenance_record_ids",
                     "uncovered_boundary_ids",
                     "duplicate_boundary_ids",
+                    "missing_source_fields",
                     "present_but_unobserved",
                 )
                 if completeness.get(key) not in (None, 0, [], (), {})
@@ -1503,6 +1504,78 @@ def _collect_section_status(
     return findings
 
 
+def _collect_source_field_coverage(
+    semantic_payload: Mapping[str, Any],
+    public_payload: Mapping[str, Any],
+) -> list[PersonalBriefAuditFinding]:
+    """Observe source-to-public field obligations, including pre-projection loss."""
+
+    domain = semantic_payload.get("domain") or {}
+    facts = domain.get("facts") or {}
+    report = facts.get("personal_brief_extraction_report") or {}
+    coverage = report.get("source_field_coverage") or {}
+    semantic_datasets = _datasets(semantic_payload)
+    public_datasets = _datasets(public_payload)
+    source_accounts = {
+        (values.get("source_section"), _positive_int(values.get("source_sequence"))): row
+        for row in _rows(semantic_datasets.get("credit_accounts"))
+        for values in (_normalized(row),)
+    }
+    public_accounts = {
+        str(row.get("record_id") or ""): row
+        for row in _rows(public_datasets.get("credit_accounts"))
+    }
+    public_overdue = {
+        str(_normalized(row).get("account_id") or ""): row
+        for row in _rows(public_datasets.get("overdue_records"))
+    }
+    findings = []
+    for requirement in coverage.get("accounts") or ():
+        key = (requirement.get("source_section"), requirement.get("source_sequence"))
+        rich = source_accounts.get(key, {})
+        record_id = str(rich.get("record_id") or f"{key[0]}:{key[1]}")
+        account = public_accounts.get(record_id, {})
+        account_id = str(_normalized(rich).get("account_id") or "")
+        for dataset_name, field_map in (requirement.get("fields") or {}).items():
+            row = account if dataset_name == "credit_accounts" else public_overdue.get(account_id, {})
+            values = _normalized(row)
+            missing = [field for field in field_map if not _has_value(values, field)]
+            if missing:
+                findings.append(_finding(
+                    "PERSONAL_BRIEF_AUDIT_SOURCE_FIELD_MISSING",
+                    "A business clause printed in the source has no structured public value.",
+                    dataset=dataset_name,
+                    record_id=str(row.get("record_id") or record_id),
+                    fields=missing,
+                    source_pages=requirement.get("source_pages") or (),
+                ))
+    sections = {
+        section.get("type"): section
+        for section in public_payload.get("sections") or ()
+        if isinstance(section, Mapping)
+    }
+    for requirement in coverage.get("sections") or ():
+        section = sections.get(requirement.get("section_type"), {})
+        values = {
+            item.get("key"): item.get("value")
+            for item in section.get("items") or ()
+            if isinstance(item, Mapping)
+        }
+        changed = [
+            field for field, expected in (requirement.get("fields") or {}).items()
+            if values.get(field) != expected
+        ]
+        if changed:
+            findings.append(_finding(
+                "PERSONAL_BRIEF_AUDIT_SOURCE_SECTION_FIELD_MISSING",
+                "A source section qualifier is missing or changed in Community JSON.",
+                section_id=str(section.get("id") or ""),
+                fields=changed,
+                source_pages=requirement.get("source_pages") or (),
+            ))
+    return findings
+
+
 def build_personal_brief_observational_findings(
     semantic_payload: Mapping[str, Any],
     public_payload: Mapping[str, Any],
@@ -1513,6 +1586,7 @@ def build_personal_brief_observational_findings(
     public_datasets = _datasets(public_payload)
     rich_rows = _rich_row_lookup(semantic_datasets)
     findings = [
+        *_collect_source_field_coverage(semantic_payload, public_payload),
         *_collect_projection_conservation(semantic_datasets, public_datasets),
         *_collect_dataset_envelopes(public_datasets),
         *_collect_provenance(public_datasets, rich_rows),

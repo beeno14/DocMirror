@@ -93,6 +93,38 @@ def test_validator_accepts_normalized_only_v4_bundle(tmp_path: Path) -> None:
     assert validate_community_artifacts(community_path) == []
 
 
+@pytest.mark.parametrize("document_type", ["personal_credit_report_brief", "personal_credit_report", "enterprise_credit_report", "alipay_payment"])
+def test_empty_source_wrapper_is_optional_only_for_personal_brief_v4(tmp_path: Path, document_type: str) -> None:
+    community_path = _write_bundle(tmp_path, "personal_brief_v4_envelope")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    strip_source_value_pools(payload)
+    payload["document"]["type"] = document_type
+    for dataset in payload["datasets"]:
+        for row in dataset["rows"]:
+            row.pop("source", None)
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    if document_type == "personal_credit_report_brief":
+        assert issues == []
+    else:
+        assert any("missing ['source']" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("document", [None, [], "personal_credit_report_brief"])
+def test_validator_reports_invalid_v4_document_instead_of_crashing(tmp_path: Path, document) -> None:
+    community_path = _write_bundle(tmp_path, "invalid_document")
+    payload = json.loads(community_path.read_text(encoding="utf-8"))
+    strip_source_value_pools(payload)
+    payload["document"] = document
+    community_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    issues = validate_community_artifacts(community_path)
+
+    assert any(issue.startswith("schema:") for issue in issues)
+
+
 @pytest.mark.parametrize("version", ["3.0.0", "4.0.0"])
 @pytest.mark.parametrize("block", ["record_id", "normalized", "source"])
 def test_validator_requires_business_record_blocks_in_both_versions(

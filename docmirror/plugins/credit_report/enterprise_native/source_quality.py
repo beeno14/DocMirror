@@ -5,37 +5,13 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
+from docmirror.plugins.credit_report.enterprise_native.extraction import extract_enterprise_report_qualifications
 from docmirror.plugins.credit_report.enterprise_native.ir import CanonicalEnterpriseDocumentIR
 from docmirror.plugins.credit_report.enterprise_native.quality import EnterpriseQualityFlag
 
-_SPACE = re.compile(r"\s+")
-_LIMITED = re.compile(r"(?:受?篇幅所限|受篇幅限制|仅展示|只展示|不展示全部)")
-_ESTIMATED_AVAILABLE = re.compile(r"(?:剩余)?可用额度.{0,32}(?:无法准确计算|不能准确计算|估算)")
 _PLACEHOLDERS = frozenset({"", "-", "--", "—", "－", "/", "不详", "未知"})
-
-
-def _compact(value: Any) -> str:
-    return _SPACE.sub("", str(value or ""))
-
-
-def _scope(text: str) -> tuple[str, ...]:
-    scopes: list[str] = []
-    for marker, scope in (
-        ("信贷", "credit_records"),
-        ("已结清", "settled_credit_records"),
-        ("非信贷", "non_credit_records"),
-        ("公共", "public_records"),
-    ):
-        if marker in text:
-            scopes.append(scope)
-    return tuple(scopes or ("document",))
-
-
-def _source_pages(document: CanonicalEnterpriseDocumentIR, pattern: re.Pattern[str]) -> tuple[int, ...]:
-    return tuple(page for page, text in document.page_texts.items() if pattern.search(_compact(text)))
 
 
 def _profile_truncation_flag(datasets: dict[str, list[dict[str, Any]]]) -> EnterpriseQualityFlag | None:
@@ -72,12 +48,16 @@ def _profile_truncation_flag(datasets: dict[str, list[dict[str, Any]]]) -> Enter
 def assess_enterprise_source_information(
     document: CanonicalEnterpriseDocumentIR,
     datasets: dict[str, list[dict[str, Any]]],
+    *,
+    qualifications: list[dict[str, Any]] | None = None,
 ) -> tuple[EnterpriseQualityFlag, ...]:
     """Flag limitations stated by the source and suspicious source omissions."""
     flags: list[EnterpriseQualityFlag] = []
-    for page, text in document.page_texts.items():
-        compact = _compact(text)
-        if _LIMITED.search(compact):
+    for qualification in (
+        extract_enterprise_report_qualifications(document) if qualifications is None else qualifications
+    ):
+        page = qualification["source_page"]
+        if qualification["kind"] == "display_scope":
             flags.append(
                 EnterpriseQualityFlag(
                     code="ENTERPRISE_SOURCE_SCOPE_LIMITED",
@@ -86,10 +66,11 @@ def assess_enterprise_source_information(
                     status="source_limited",
                     message="The report explicitly limits the records displayed; absence outside that scope is not proof of no record.",
                     source_pages=(page,),
-                    scope=_scope(compact),
+                    scope=(qualification["scope"],),
+                    details={"source_text": qualification["source_text"]},
                 )
             )
-        if _ESTIMATED_AVAILABLE.search(compact):
+        if qualification["kind"] == "available_limit_estimation":
             flags.append(
                 EnterpriseQualityFlag(
                     code="ENTERPRISE_SOURCE_VALUE_ESTIMATED",
@@ -100,6 +81,7 @@ def assess_enterprise_source_information(
                     source_pages=(page,),
                     scope=("credit_summary", "credit_records"),
                     field_name="available_limit",
+                    details={"source_text": qualification["source_text"]},
                 )
             )
 

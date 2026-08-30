@@ -173,6 +173,75 @@ def test_literal_source_status_is_preserved_even_when_its_generated_counterpart_
     assert row["normalized"]["counterparty_status_original"] == "bank supplied business status"
 
 
+def test_scoped_source_metadata_replaces_duplicate_dynamic_header_columns() -> None:
+    bundle, _ = _consumer_bundle()
+    original = evidence_delivery(bundle.semantic_payload())
+    metadata_columns = [
+        _column("metadata_field", label="元数据字段"),
+        _column("metadata_name", label="原文标签"),
+        _column("metadata_value", label="原文值"),
+        _column("source_page_start", label="来源起始页", type="integer"),
+        _column("scope", label="作用域"),
+    ]
+    metadata_rows = []
+    for index, (name, value) in enumerate(
+        (("业务说明", "本页收入合计并不代表全年总收入"), ("全年收入合计", "000005.00")),
+        start=1,
+    ):
+        metadata_rows.append(
+            {
+                "record_id": f"source_metadata:r{index:06d}",
+                "normalized": {
+                    "metadata_field": "other",
+                    "metadata_name": name,
+                    "metadata_value": value,
+                    "source_page_start": 1,
+                    "scope": "document",
+                },
+                "source": {"page_range": [1, 2]},
+            }
+        )
+    original["datasets"].insert(
+        1,
+        {
+            "id": "ds_source_metadata",
+            "name": "source_metadata",
+            "label": "来源业务元数据",
+            "type": "source_metadata",
+            "section_id": "sec_document",
+            "csv": "001_datasets/source_metadata.csv",
+            "row_count": 2,
+            "grain": "one row per source metadata fact",
+            "primary_key": "record_id",
+            "schema_version": "1.0",
+            "status": "complete",
+            "columns": metadata_columns,
+            "completeness": {
+                "expected_row_count": 2,
+                "emitted_row_count": 2,
+                "omitted_row_count": 0,
+                "verified": True,
+                "basis": "source_fact_conservation",
+            },
+            "rows": metadata_rows,
+        },
+    )
+
+    clean = business_view(original)
+
+    assert_business_value_conservation(original, clean)
+    header = clean["datasets"][0]
+    assert not any(
+        column.get("source_header") in {"业务说明", "全年收入合计"}
+        for column in header["columns"]
+    )
+    metadata = clean["datasets"][1]
+    assert [row["normalized"]["metadata_value"] for row in metadata["rows"]] == [
+        "本页收入合计并不代表全年总收入",
+        "000005.00",
+    ]
+
+
 @pytest.mark.parametrize("field", ["amount", "direction", "debit_total", "credit_total", "total_transactions", "全年收入合计"])
 def test_auditor_still_rejects_loss_of_real_transaction_or_statement_facts(field):
     bundle, _ = _consumer_bundle()

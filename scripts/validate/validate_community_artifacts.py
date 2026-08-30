@@ -171,6 +171,12 @@ def validate_community_artifacts(community_path: str | Path) -> list[str]:
         issues.append(f"community: top-level blocks={sorted(payload)}")
     if business_view:
         record_blocks = _BUSINESS_RECORD_BLOCKS
+    elif (
+        schema.get("version") == "4.0.0"
+        and isinstance(payload.get("document"), dict)
+        and payload["document"].get("type") == "personal_credit_report_brief"
+    ):
+        record_blocks = _NORMALIZED_RECORD_BLOCKS - {"source"}
     else:
         record_blocks = _NORMALIZED_RECORD_BLOCKS if schema.get("version") == "4.0.0" else _RECORD_BLOCKS
 

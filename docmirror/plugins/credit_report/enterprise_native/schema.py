@@ -12,7 +12,7 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
     """Return an enterprise-owned dictionary with no personal-report fields."""
     return {
         "schema_id": "enterprise_credit_report",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "definitions": {
             "authoritative_business_records": "datasets",
             "amount_storage": (
@@ -36,7 +36,15 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
             ),
             "date_semantics": (
                 "maturity_date is contractual 到期日; expiry_date is a validity/许可截止日期; "
-                "close_date is settlement or account closure; snapshot_date is 信息报告日期."
+                "close_date is settlement or account closure; snapshot_date is 信息报告日期. "
+                "registration_certificate_valid_through retains dates and indefinite source text; "
+                "registration_certificate_validity_kind distinguishes dated/indefinite values."
+            ),
+            "business_contract_v4": (
+                "Responsibility accounts publish guarantee_contract_identifier and open_or_receive_date, "
+                "not their legacy contract_number/open_date aliases. Opaque contract identifiers preserve "
+                "case and punctuation. Source display scope and estimation qualifications are business data. "
+                "Emitted-only row counts never establish source completeness."
             ),
             "extraction_failure_protocol": (
                 "The semantic JSON extraction object reports schema, field, and record "
@@ -118,6 +126,12 @@ def enterprise_credit_report_data_dictionary() -> dict[str, Any]:
                 "RECORD_RECONSTRUCTION_MISMATCH": "Expected and extracted record populations disagree.",
                 "UNCONSUMED_BUSINESS_TEXT": "A source unit was not assigned to the component graph.",
                 "UNSTRUCTURED_BUSINESS_CONTENT": "Multiple fields remain packed into one content value.",
+                "CANONICAL_POSITIVE_FIELD_NOT_CONSERVED": (
+                    "Unique positive canonical source evidence is absent from the business datasets."
+                ),
+                "CANONICAL_POSITIVE_FIELD_VALUE_MISMATCH": (
+                    "A business value conflicts with unique positive canonical source evidence."
+                ),
             },
         },
     }
@@ -141,6 +155,7 @@ def enterprise_credit_report_semantic_extensions() -> dict[str, Any]:
                 "report_number",
                 "account_identifier",
                 "contract_number",
+                "guarantee_contract_identifier",
                 "limit_identifier",
                 "identity_number",
                 "business_registration_number",

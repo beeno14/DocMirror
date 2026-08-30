@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,16 @@ class PersonalBriefExtractionContext:
         return getattr(self.parse_result, name)
 
 
+_LOOKBACK_YEARS_RE = re.compile(r"最近\s*(?P<years>\d+)\s*年")
+
+
+def extract_personal_brief_lookback_years(value: Any) -> int | None:
+    """Decode a printed lookback even when PDF layout inserts whitespace."""
+
+    match = _LOOKBACK_YEARS_RE.search(str(value or ""))
+    return int(match.group("years")) if match is not None else None
+
+
 def build_personal_brief_extraction_context(parse_result: Any) -> PersonalBriefExtractionContext:
     """Decode page entities once for the Personal Brief projection."""
     if isinstance(parse_result, PersonalBriefExtractionContext):
@@ -41,4 +52,5 @@ def build_personal_brief_extraction_context(parse_result: Any) -> PersonalBriefE
 __all__ = [
     "PersonalBriefExtractionContext",
     "build_personal_brief_extraction_context",
+    "extract_personal_brief_lookback_years",
 ]

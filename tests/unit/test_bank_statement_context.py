@@ -2836,6 +2836,48 @@ def test_canonical_physical_contract_accepts_container_inherited_cell_ref_owner(
     assert set(carry_facts) == {1, 2, 3}
 
 
+def test_rotated_physical_carry_uses_exact_table_owned_atoms(monkeypatch):
+    parse_result, _records = _physical_census_parse_result(_residual_records())
+    table = parse_result.pages[0].tables[0]
+    carry_row, first_transaction = table.rows
+
+    for column, cell in enumerate(carry_row.cells):
+        cell.bbox = [455.0, 20.0 + column * 40.0, 467.0, 55.0 + column * 40.0]
+    for column, cell in enumerate(first_transaction.cells):
+        cell.bbox = [430.0, 20.0 + column * 40.0, 455.0, 55.0 + column * 40.0]
+
+    carry_row.cells[1].evidence_ids = []
+    carry_row.cells[4].evidence_ids = []
+    carry_label = _atom(1, "承前", 20.0, 20.0, 40.0, 34.0, 30)
+    carry_balance = _atom(1, "100.00", 60.0, 20.0, 100.0, 34.0, 24)
+    later_balance = _atom(1, "100.00", 60.0, 60.0, 100.0, 74.0, 68)
+    table.evidence_ids = []
+
+    second_transaction = deepcopy(first_transaction)
+    second_transaction.source_row_index = 2
+    second_transaction.cells[0].text = "2023-03-02"
+    second_transaction.cells[4].text = "80.00"
+    for column, cell in enumerate(second_transaction.cells):
+        cell.bbox = [405.0, 20.0 + column * 40.0, 430.0, 55.0 + column * 40.0]
+        cell.evidence_ids = []
+        cell.source_cell_refs[0]["row"] = 2
+        cell.source_cell_refs[0]["raw_row"] = 3
+    table.rows.append(second_transaction)
+
+    monkeypatch.setattr(
+        statement_context,
+        "_group_atoms",
+        lambda _result: {1: [carry_balance, carry_label, later_balance]},
+    )
+
+    facts_by_page = statement_context._physical_brought_forward_facts(parse_result)
+
+    [fact] = facts_by_page[1]
+    assert fact.normalized_value == "100.00"
+    assert fact.evidence_ids == (carry_label["id"], carry_balance["id"])
+    assert fact.derivation == "physical_brought_forward_row"
+
+
 def test_exact_physical_carry_provenance_wins_duplicate_atom_fact(monkeypatch):
     parse_result, _records = _physical_census_parse_result(_residual_records())
     duplicate_atoms = [
@@ -3425,6 +3467,23 @@ def test_page_layout_fact_and_nearby_seal_code_remain_separate(monkeypatch, pars
     assert source["components"][0]["value_evidence_id"] == "ev:0001:text:000007"
 
 
+def test_wide_centered_code_below_business_stamp_is_source_bound() -> None:
+    atoms = [
+        _atom(1, "业务专用章", 468.0, 83.7, 508.0, 92.3, 1),
+        _atom(1, "09Y8SQYVR3WE4JFZ", 442.0, 93.7, 533.0, 103.6, 2),
+    ]
+
+    fact = statement_context._seal_code_fact(atoms, 1)
+
+    assert fact is not None
+    assert fact.normalized_value == "09Y8SQYVR3WE4JFZ"
+    assert fact.derivation == "seal_code_adjacent_to_explicit_business_stamp"
+    assert fact.evidence_ids == (
+        "ev:0001:text:000002",
+        "ev:0001:text:000001",
+    )
+
+
 def test_body_carry_below_ledger_header_cannot_become_statement_balance(monkeypatch, parse_result):
     atoms = [
         _atom(1, "交通银行上海市分行明细对账单", 180, 10, 400, 25, 1),
@@ -3519,9 +3578,187 @@ def test_multiple_nearby_seal_codes_fail_closed():
     assert statement_context._seal_code_fact(atoms, 1) is None
 
 
+def test_generation_timestamp_joins_split_native_date_and_time() -> None:
+    row = [
+        _atom(1, "生成时间:", 20, 50, 80, 64, 1),
+        _atom(1, "2022-10-25", 85, 50, 155, 64, 2),
+        _atom(1, "21:15:20", 160, 50, 215, 64, 3),
+    ]
+
+    facts = statement_context._facts_from_row(row, 1)
+
+    timestamp = next(fact for fact in facts if fact.field_key == "print_timestamp")
+    assert timestamp.raw_value == "2022-10-2521:15:20"
+    assert timestamp.normalized_value == "2022-10-25 21:15:20"
+
+
+def test_clock_only_print_time_is_not_misrepresented_as_a_timestamp() -> None:
+    row = [
+        _atom(1, "打印操作员:", 20, 50, 90, 64, 1),
+        _atom(1, "15824217661", 95, 50, 175, 64, 2),
+        _atom(1, "打印时间:", 190, 50, 250, 64, 3),
+        _atom(1, "09:31:18", 255, 50, 310, 64, 4),
+    ]
+
+    facts = statement_context._facts_from_row(row, 1)
+    normalized = {fact.field_key: fact.normalized_value for fact in facts}
+
+    assert normalized["print_teller"] == "15824217661"
+    assert normalized["print_time"] == "09:31:18"
+    assert "print_timestamp" not in normalized
+
+
+def test_terminal_income_expense_totals_map_to_directional_business_fields() -> None:
+    rows = [
+        [_atom(1, "总收入笔数:", 20, 50, 90, 64, 1), _atom(1, "54", 95, 50, 115, 64, 2)],
+        [_atom(1, "总收入金额:", 20, 70, 90, 84, 3), _atom(1, "3110533.96", 95, 70, 165, 84, 4)],
+        [_atom(1, "总支出入笔数:", 20, 90, 100, 104, 5), _atom(1, "183", 105, 90, 130, 104, 6)],
+        [_atom(1, "总支出金额:", 20, 110, 90, 124, 7), _atom(1, "3208574.64", 95, 110, 165, 124, 8)],
+    ]
+
+    normalized = {
+        fact.field_key: fact.normalized_value
+        for row in rows
+        for fact in statement_context._facts_from_row(row, 1)
+    }
+
+    assert normalized == {
+        "credit_count": 54,
+        "credit_total": "3110533.96",
+        "debit_count": 183,
+        "debit_total": "3208574.64",
+    }
+
+
+def test_explicit_debit_credit_summary_footer_maps_to_directional_totals() -> None:
+    rows = [
+        [
+            _atom(1, "借方发生额汇总", 80, 230, 136, 238, 1),
+            _atom(1, ":", 192, 230, 196, 238, 2),
+            _atom(1, "37.98", 210, 230, 230, 238, 3),
+        ],
+        [
+            _atom(1, "贷方发生额汇总", 80, 255, 136, 263, 4),
+            _atom(1, ":", 192, 255, 196, 263, 5),
+            _atom(1, "40.00", 210, 255, 230, 263, 6),
+        ],
+    ]
+
+    normalized = {
+        fact.field_key: fact.normalized_value
+        for row in rows
+        for fact in statement_context._facts_from_row(row, 1)
+    }
+
+    assert normalized == {"debit_total": "37.98", "credit_total": "40.00"}
+
+
+def test_composite_footer_is_atomized_into_notice_and_cutoff_timestamp() -> None:
+    source = "截至打印时间下方无其他明细内容，交易明细截止2023年08月30日16时00分"
+    rows = [[_atom(3, source, 20, 700, 500, 716, 1)]]
+
+    disclaimer = statement_context._statement_disclaimer_fact(rows, 3)
+    cutoff = statement_context._statement_cutoff_timestamp_fact(rows, 3)
+
+    assert disclaimer is not None
+    assert disclaimer.raw_value == "截至打印时间下方无其他明细内容"
+    assert disclaimer.derivation == "atomic_notice_from_composite_footer"
+    assert cutoff is not None
+    assert cutoff.raw_value == "2023年08月30日16时00分"
+    assert cutoff.normalized_value == "2023-08-30 16:00:00"
+
+
+def test_expanded_business_stamp_marker_is_preserved_as_business_metadata() -> None:
+    atoms = [
+        _atom(1, "零售业务", 400, 30, 450, 50, 1),
+        _atom(1, "电子凭证", 452, 30, 502, 50, 2),
+        _atom(1, "专用章", 504, 30, 544, 50, 3),
+    ]
+
+    [fact] = statement_context._seal_type_facts(atoms, 1)
+
+    assert fact.raw_value == "零售业务电子凭证专用章"
+    assert fact.normalized_value == "零售业务电子凭证专用章"
+
+
 def test_community_dictionary_declares_seal_code_as_statement_header_field():
     from docmirror.plugins.bank_statement.community_plugin import BANK_DATA_DICTIONARY
 
     expected = {"label": "印章编码", "type": "string"}
     assert BANK_DATA_DICTIONARY["fields"]["seal_code"] == expected
     assert BANK_DATA_DICTIONARY["datasets"]["statement_header"]["columns"]["seal_code"] == expected
+
+
+def _header_fact(
+    field_key: str,
+    raw_name: str,
+    raw_value: str,
+    normalized_value,
+    page: int,
+) -> statement_context._HeaderFact:
+    return statement_context._HeaderFact(
+        field_key=field_key,
+        raw_name=raw_name,
+        raw_value=raw_value,
+        normalized_value=normalized_value,
+        page=page,
+        page_id=f"page:{page:04d}",
+        bbox=(10.0, 10.0, 100.0, 20.0),
+        evidence_ids=(f"ev:{page:04d}:{field_key}",),
+    )
+
+
+def test_source_metadata_is_page_scoped_atomic_and_losslessly_conserved(monkeypatch):
+    parse_result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1),
+            SimpleNamespace(page_number=2, source_page_number=2),
+        ]
+    )
+    facts_by_page = {
+        1: [
+            _header_fact("account_number", "账号", "62220001", "62220001", 1),
+            _header_fact("source_header_page_label", "页码", "1/2", "1/2", 1),
+            _header_fact("debit_count", "本页支出笔数:", "3", 3, 1),
+            _header_fact("source_header_terminal_id", "终端号", "T-01", "T-01", 1),
+        ],
+        2: [
+            _header_fact("account_number", "账号", "62220001", "62220001", 2),
+            _header_fact("source_header_page_label", "页码", "2/2", "2/2", 2),
+            _header_fact("debit_count", "本页支出笔数", "3", 3, 2),
+            _header_fact("source_header_terminal_id", "终端号", "T-02", "T-02", 2),
+        ],
+    }
+    monkeypatch.setattr(statement_context, "_page_header_facts", lambda _result: (facts_by_page, {}))
+    monkeypatch.setattr(
+        statement_context,
+        "extract_embedded_business_metadata",
+        lambda _result: SimpleNamespace(candidate_images=0, ocr_images=0, status="not_needed"),
+    )
+    headers = [
+        {
+            "normalized": {"account_number": "62220001"},
+            "source": {"page_range": [1, 2]},
+        }
+    ]
+
+    records = statement_context.build_source_metadata_records(parse_result, headers)
+
+    normalized = [record["normalized"] for record in records]
+    assert not any(record["metadata_field"] == "account_number" for record in normalized)
+    assert [record["source_page_start"] for record in normalized if record["metadata_field"] == "debit_count"] == [
+        1,
+        2,
+    ]
+    assert all(record["scope"] == "page" for record in normalized)
+    assert all(record["source_page_end"] == record["source_page_start"] for record in normalized)
+    assert all(record["normalized_value"] not in (None, "") for record in normalized)
+    assert any(record["metadata_name"] == "本页支出笔数:" for record in normalized)
+    audit = statement_context.audit_source_fact_conservation(parse_result, headers, records)
+    assert audit["source_fact_count"] == 8
+    assert audit["represented_fact_count"] == 8
+    assert audit["unrepresented_fact_count"] == 0
+
+    incomplete = records[:-1]
+    failed = statement_context.audit_source_fact_conservation(parse_result, headers, incomplete)
+    assert failed["unrepresented_fact_count"] == 1

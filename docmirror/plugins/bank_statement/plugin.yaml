@@ -8,10 +8,11 @@ provider:
 
 projection:
   dataset_aliases: {statement_header: statement_header, records: transactions}
-  dataset_labels: {statement_header: 流水表头, transactions: 交易流水}
-  dataset_types: {statement_header: statement_header, transactions: transaction}
+  dataset_labels: {statement_header: 流水表头, source_metadata: 来源业务元数据, transactions: 交易流水}
+  dataset_types: {statement_header: statement_header, source_metadata: source_metadata, transactions: transaction}
   dataset_grains:
     statement_header: one row per source statement/account period
+    source_metadata: one row per atomic scoped source metadata fact
     transactions: one row per transaction
   dataset_foreign_keys:
     transactions:
@@ -48,5 +49,6 @@ projection_outputs:
   document_type: bank_statement
   datasets:
     - statement_header
+    - source_metadata
     - transactions
   domain_fact_prefix: bank_statement

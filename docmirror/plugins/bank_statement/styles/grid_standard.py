@@ -105,6 +105,7 @@ _COUNTERPARTY_KEYS = (
 _COUNTER_ACCOUNT_KEYS = ("对方账户", "对方账号", "counter_account")
 _ACCOUNT_BANK_COMPOUND_KEYS = ("对方账户/对方银行", "对方账号/对方银行")
 _COMPOUND_COUNTERPARTY_KEYS = ("交易对手信息", "对方账号与户名", "对方户名/账号")
+_SECOND_TIER_COUNTERPARTY_KEYS = ("对方账号户名/附言", "对方账户户名/附言")
 _COMPOUND_COUNTERPARTY_NUMBER_RE = re.compile(r"(?<!\d)([0-9*＊]{6,32})(?!\d)")
 _SHORT_MONTH_DAY_RE = re.compile(r"^(?P<month>\d{2})[-/](?P<day>\d{2})$")
 _STATEMENT_PERIOD_RE = re.compile(
@@ -588,6 +589,17 @@ def _normalize_source_counterparty_columns(
         normalized["counter_account"] = ""
         normalized["counter_bank_name"] = ""
         normalized["counter_bank_code"] = ""
+
+    second_tier = _exact_source_column_value(raw_txn, _SECOND_TIER_COUNTERPARTY_KEYS)
+    if second_tier:
+        # This physical column belongs to a subordinate line of the same
+        # logical transaction.  Its complete source value is retained in raw,
+        # while only source-proved atoms may enter typed identifier/note roles.
+        second_tier_fields = _decompose_second_tier_counterparty(second_tier)
+        normalized["sub_account"] = ""
+        normalized["counter_party"] = ""
+        normalized["counter_account"] = second_tier_fields.get("counter_account", "")
+        normalized["remittance_note"] = second_tier_fields.get("remittance_note", "")
 
     counter_account = _explicit_source_column_value(raw_txn, _COUNTER_ACCOUNT_KEYS)
     embedded_account_party = _decompose_account_with_trailing_party(counter_account)
@@ -1349,6 +1361,29 @@ def _decompose_compound_counterparty(value: str) -> dict[str, str]:
     }
 
 
+def _decompose_second_tier_counterparty(value: str) -> dict[str, str]:
+    """Atomize ``对方账号户名/附言`` without inventing an undelimited role.
+
+    A leading identifier is explicitly owned by the source header.  ``UA`` and
+    ``NG`` references are issuer delimiters for the complete following note.
+    Text between those two boundaries is preserved in the original compound;
+    it is not guessed to be a party name or purpose.
+    """
+
+    text = _clean_wrapped_text(str(value or ""))
+    if not text:
+        return {}
+    match = re.fullmatch(r"\s*(?P<account>[0-9*＊]{6,32})(?P<tail>.*?)\s*", text)
+    if match is None:
+        return {}
+    fields = {"counter_account": _clean_account(match.group("account"))}
+    tail = match.group("tail").strip(" /／,，;；")
+    note = re.search(r"(?i)(?:UA|NG)[0-9A-Z]{6,}.*$", tail)
+    if note is not None:
+        fields["remittance_note"] = _clean_wrapped_text(note.group(0))
+    return fields
+
+
 def _decompose_account_with_trailing_party(value: str) -> dict[str, str]:
     """Split an account/name pair proven within one dedicated account cell.
 
@@ -1622,7 +1657,7 @@ def _transaction_source_page(transaction: dict[str, Any]) -> int | None:
 def _needs_counterparty_recovery(transaction: dict[str, Any]) -> bool:
     # A same-row D2/D3 compound cell is authoritative.  Flattened page text
     # cannot improve it and must not invent a dedicated raw party column.
-    if _exact_source_column_value(transaction, _COMPOUND_COUNTERPARTY_KEYS):
+    if _exact_source_column_value(transaction, (*_COMPOUND_COUNTERPARTY_KEYS, *_SECOND_TIER_COUNTERPARTY_KEYS)):
         return False
     counter_account = _cell_value(transaction, *_COUNTER_ACCOUNT_KEYS)
     if not counter_account:
