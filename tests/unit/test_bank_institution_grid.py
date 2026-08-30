@@ -24,6 +24,7 @@ from docmirror.models.entities.parse_result import (
 )
 from docmirror.models.sealed import seal_parse_result
 from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
+from docmirror.plugins.bank_statement import style_registry as style_registry_module
 from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
 from docmirror.plugins.bank_statement.extract_pipeline import (
     _apply_source_reported_transaction_count,
@@ -467,6 +468,57 @@ def test_compound_counterparty_maps_exact_account_only_value() -> None:
 
     assert normalized["counter_party"] == ""
     assert normalized["counter_account"] == "6226230006293805"
+
+
+def test_second_tier_counterparty_line_preserves_only_source_proved_roles() -> None:
+    plugin = BankStatementCommunityPlugin()
+    raw = {
+        "日期时间": "20220911 112748",
+        "日志号": "797063924",
+        "短摘要": "微信支付",
+        "交易金额": "-12.13",
+        "本次余额": "13181.12",
+        "对方账号户名/附言": "243300133 UA0911754783924513扫二维码付款",
+    }
+
+    normalized = normalize_record(raw, plugin)
+
+    assert normalized["counter_account"] == "243300133"
+    assert normalized["sub_account"] == ""
+    assert normalized["counter_party"] == ""
+    assert normalized["remittance_note"] == "UA0911754783924513扫二维码付款"
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+    assert canonical_raw["counter_account"] == "243300133"
+    assert canonical_raw["remittance_note"] == "UA0911754783924513扫二维码付款"
+    assert "sub_account" not in canonical_raw
+    assert raw["对方账号户名/附言"] == "243300133 UA0911754783924513扫二维码付款"
+
+
+def test_second_tier_undelimited_tail_is_not_guessed_into_typed_roles() -> None:
+    normalized = normalize_record(
+        {
+            "日期时间": "20220911 145445",
+            "交易金额": "19100.00",
+            "本次余额": "32281.12",
+            "对方账号户名/附言": "6214673590001999710曹社兵",
+        },
+        BankStatementCommunityPlugin(),
+    )
+
+    assert normalized["counter_account"] == "6214673590001999710"
+    assert normalized["sub_account"] == ""
+    assert normalized["counter_party"] == ""
+    assert normalized["remittance_note"] == ""
+
+
+def test_completion_proof_rejects_whole_compound_copied_into_identifier_roles() -> None:
+    raw = {"对方账号户名/附言": "243300133 UA0911754783924513扫二维码付款"}
+    polluted = {
+        "counter_account": "243300133 UA0911754783924513扫二维码付款",
+        "sub_account": "243300133 UA0911754783924513扫二维码付款",
+    }
+
+    assert style_registry_module._row_has_semantic_anomaly(raw, polluted)
 
 
 def test_labelled_note_preserves_source_and_decomposes_business_roles() -> None:

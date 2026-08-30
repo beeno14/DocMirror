@@ -20,12 +20,15 @@ from docmirror.plugins.credit_report.currency_codes import (
     CURRENCY_CODE_BY_ALIAS,
     normalize_currency_code,
 )
+from docmirror.plugins.credit_report.enterprise_native.business_values import opaque_identifier
 from docmirror.plugins.credit_report.enterprise_native.continuation import (
     ACCOUNT_SETTLED_DETAIL_CONTRACT,
     ATTACHMENT_HISTORY_BODY_CONTRACT,
     CLOSED_SUMMARY_BODY_CONTRACT,
     FACILITY_VALUE_CONTRACT,
     EnterpriseContinuationResolver,
+    special_transaction_body_contract,
+    special_transaction_cells,
 )
 from docmirror.plugins.credit_report.enterprise_native.ir import (
     CanonicalEnterpriseDocumentIR,
@@ -1812,7 +1815,7 @@ def extract_enterprise_repayment_liability_records(
             if not detail_section or len(row) < 10:
                 continue
             account_identifier = _identifier(row[0])
-            contract_number = _identifier(row[2])
+            contract_number = opaque_identifier(row[2])
             responsibility_amount = _number(row[4])
             open_date = _date(row[7])
             due_date = _date(row[8])
@@ -1830,9 +1833,8 @@ def extract_enterprise_repayment_liability_records(
                 "liability_id": f"repayment_liability:{account_identifier}",
                 "account_identifier": account_identifier,
                 "responsibility_type": _compact(row[1]),
-                "contract_number": contract_number,
                 "guarantee_contract_identifier": contract_number,
-                "contract_number_status": ("reported" if contract_number else "not_reported"),
+                "guarantee_contract_identifier_status": ("reported" if contract_number else "not_reported"),
                 "responsibility_currency": currency,
                 "responsibility_amount_unit": _amount_unit_for_currency(currency),
                 "obligation_currency": obligation_currency,
@@ -1844,7 +1846,6 @@ def extract_enterprise_repayment_liability_records(
                 "responsibility_amount_status": ("reported" if responsibility_amount is not None else "not_reported"),
                 "institution": _compact(row[5]),
                 "business_type": _compact(row[6]),
-                "open_date": open_date,
                 "open_or_receive_date": open_date,
                 "due_date": due_date,
                 "due_date_status": "reported" if due_date else "not_reported",
@@ -1858,6 +1859,58 @@ def extract_enterprise_repayment_liability_records(
             }
     finish_pending()
     return records
+
+
+def _special_transaction_source_count(parse_result: Any) -> int:
+    """Inventory printed transaction rows independently of emitted records.
+
+    A date-shaped source cell counts even if its value cannot be decoded. This
+    deliberately does not call the transaction decoder or its boundary scorer.
+    """
+    attachment_started = False
+    active = False
+    count = 0
+    for _page, kind, value in _page_flow(parse_result):
+        if kind == "text":
+            text = _compact(value)
+            if text == "附件" or re.search(r"附件\d*[:：]?信用记录补充信息", text):
+                attachment_started = True
+            if _attachment_category_heading(text) or re.search(r"\d+\.(?:已结清|未结清)", text):
+                active = False
+            continue
+        if not attachment_started:
+            continue
+        _table_id, rows = value
+        for row in rows:
+            cells = [_compact(cell) for cell in row]
+            if "交易类型" in cells and "交易日期" in cells:
+                active = True
+                source_header = cells
+                continue
+            if not active or not any(cells):
+                continue
+            # Inventory by printed column labels, independent of the decoder.
+            # A headerless table may drop slots introduced by another grid on
+            # the preceding page, but may not drop an actual business column.
+            logical_header = [label for label in source_header if label]
+            if len(cells) == len(source_header):
+                aligned_header = source_header
+            elif len(cells) == len(logical_header):
+                aligned_header = logical_header
+            else:
+                active = False
+                continue
+            type_index = aligned_header.index("交易类型")
+            date_index = aligned_header.index("交易日期")
+            if (
+                len(cells) > max(type_index, date_index)
+                and cells[type_index]
+                and re.match(r"\d{4}[-年./]\d{1,2}", cells[date_index])
+            ):
+                count += 1
+            else:
+                active = False
+    return count
 
 
 def extract_enterprise_continuation_audit(
@@ -1874,6 +1927,7 @@ def extract_enterprise_continuation_audit(
         "repayment_responsibility_summary": 0,
         "repayment_liability": 0,
         "attachment_account": 0,
+        "special_transaction": _special_transaction_source_count(parse_result),
     }
     for fragment in resolver.fragments:
         rows = [[_compact(value) for value in row] for row in fragment.rows]
@@ -1953,7 +2007,14 @@ def extract_enterprise_continuation_audit(
         resolved["enterprise_repayment_responsibility_accounts"] = (
             extract_enterprise_repayment_liability_records(parse_result)
         )
-    if "enterprise_attachment_accounts" not in resolved or "enterprise_attachment_credit_details" not in resolved:
+    if any(
+        dataset not in resolved
+        for dataset in (
+            "enterprise_attachment_accounts",
+            "enterprise_attachment_credit_details",
+            "enterprise_special_transactions",
+        )
+    ):
         attachment_datasets = extract_enterprise_attachment_datasets(parse_result)
         for name, records in attachment_datasets.items():
             resolved.setdefault(name, records)
@@ -1965,6 +2026,7 @@ def extract_enterprise_continuation_audit(
             resolved.get("enterprise_repayment_responsibility_accounts") or []
         ),
         "attachment_account": len(resolved.get("enterprise_attachment_accounts") or []),
+        "special_transaction": len(resolved.get("enterprise_special_transactions") or []),
     }
     audits: list[dict[str, Any]] = []
     for sequence, family in enumerate(expected, start=1):
@@ -2646,6 +2708,55 @@ def extract_enterprise_report_notes(parse_result: Any) -> list[dict[str, Any]]:
     return []
 
 
+def extract_enterprise_report_qualifications(parse_result: Any) -> list[dict[str, Any]]:
+    """Decode source-stated business limitations, independently of auditing."""
+    qualifications: list[dict[str, Any]] = []
+    scope_names = {"信贷": "credit_records", "非信贷": "non_credit_records", "公共": "public_records"}
+    for page, text in _page_texts(parse_result).items():
+        compact = _compact(text)
+        for match in re.finditer(r"(?:只|仅)展示部分(?P<scope>非信贷|信贷|公共)记录", compact):
+            qualifications.append(
+                {
+                    "kind": "display_scope",
+                    "scope": scope_names[match.group("scope")],
+                    "source_page": page,
+                    "source_text": match.group(0),
+                }
+            )
+        match = re.search(r"(?:剩余)?可用额度[^。！？]{0,64}?(?:无法准确计算|不能准确计算|需.{0,16}估算)", compact)
+        if match:
+            qualifications.append(
+                {
+                    "kind": "available_limit_estimation",
+                    "scope": "credit_summary",
+                    "source_page": page,
+                    "source_text": match.group(0),
+                }
+            )
+    return qualifications
+
+
+_RELATIONSHIP_TYPE_BY_SOURCE_LABEL = {
+    "实际控制人": "actual_controller",
+    "集团母公司": "group_parent_company",
+    "集团子公司": "group_subsidiary",
+    "关联企业": "related_enterprise",
+}
+_RELATIONSHIP_LABEL_BY_TYPE = {
+    value: label for label, value in _RELATIONSHIP_TYPE_BY_SOURCE_LABEL.items()
+}
+
+
+def _canonical_relationship_type(source_label: str) -> tuple[str, str]:
+    compact = _compact(source_label)
+    if compact in _RELATIONSHIP_LABEL_BY_TYPE:
+        return compact, _RELATIONSHIP_LABEL_BY_TYPE[compact]
+    for label, code in _RELATIONSHIP_TYPE_BY_SOURCE_LABEL.items():
+        if label in compact:
+            return code, label
+    return "other", compact or "其他关系"
+
+
 def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dict[str, Any]]]:
     """Extract the canonical wide profile and disjoint related-party tables."""
     profile: dict[str, Any] = {
@@ -2839,6 +2950,15 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                 if field == "establishment_year":
                     number = _number(value)
                     value = int(number) if number is not None else value
+                elif field == "registration_certificate_valid_through" and source_state == "reported":
+                    compact_value = _compact(value)
+                    profile["registration_certificate_validity_kind"] = (
+                        "indefinite"
+                        if compact_value in {"长期", "长期有效", "永久", "永久有效"}
+                        else "dated"
+                        if _date(compact_value)
+                        else "unresolved"
+                    )
                 profile[field] = value
                 profile[f"{field}_status"] = source_state
                 field_source: dict[str, Any] = {
@@ -2940,15 +3060,26 @@ def extract_enterprise_profile_datasets(parse_result: Any) -> dict[str, list[dic
                     continue
                 has_type_column = "类型" == headers[0]
                 heading = headings.get(table_id, "")
-                relationship_type = (
+                source_relationship_type = (
                     row[0]
                     if has_type_column
-                    else ("actual_controller" if "实际控制人" in heading else "related_enterprise")
+                    else next(
+                        (
+                            label
+                            for label in _RELATIONSHIP_TYPE_BY_SOURCE_LABEL
+                            if label in heading
+                        ),
+                        "关联企业",
+                    )
+                )
+                relationship_type, relationship_type_label = _canonical_relationship_type(
+                    source_relationship_type
                 )
                 relationships.append(
                     {
                         "sequence": len(relationships) + 1,
                         "relationship_type": relationship_type,
+                        "relationship_type_label": relationship_type_label,
                         "name": row[1] if has_type_column else row[0],
                         "identity_type": row[2] if has_type_column else row[1],
                         "identity_number": row[3] if has_type_column and len(row) > 3 else row[2],
@@ -3348,8 +3479,10 @@ def _attachment_contexts_and_records(
     current: dict[str, Any] | None = None
     pending_history: tuple[list[str], dict[str, Any], int, str, int] | None = None
     pending_detail_header: tuple[list[list[str]], dict[str, Any], dict[str, Any]] | None = None
+    pending_special_header: tuple[list[str], dict[str, Any], str, dict[str, Any]] | None = None
     spatial_heading_contexts = _attachment_spatial_heading_contexts(parse_result)
     resolver = EnterpriseContinuationResolver(parse_result)
+    fragments_by_id = {fragment.table_id: fragment for fragment in resolver.fragments}
     allowed_history_continuation_tables: set[str] = set()
     for fragment in resolver.fragments:
         fragment_rows = [[_compact(value) for value in row] for row in fragment.rows]
@@ -3455,9 +3588,10 @@ def _attachment_contexts_and_records(
         status: str,
         account_identifier: str = "",
     ) -> dict[str, Any]:
-        nonlocal pending_detail_header, pending_history
+        nonlocal pending_detail_header, pending_history, pending_special_header
         pending_history = None
         pending_detail_header = None
+        pending_special_header = None
         identifier = _identifier(account_identifier)
         attachment_account_id = _stable_id(
             "enterprise_attachment_account",
@@ -4080,37 +4214,54 @@ def _attachment_contexts_and_records(
         page: int,
         table_id: str,
     ) -> bool:
+        nonlocal pending_special_header
         header_index = next(
             (index for index, row in enumerate(rows) if "交易类型" in row and "交易日期" in row),
             -1,
         )
         if header_index < 0:
-            return False
-        header = rows[header_index]
+            if pending_special_header is None or pending_special_header[1] is not context:
+                return False
+            header, _, previous_table_id, header_ref = pending_special_header
+            previous = fragments_by_id.get(previous_table_id)
+            candidate = fragments_by_id.get(table_id)
+            contract = special_transaction_body_contract(header)
+            # Only empty table furniture can precede a continuation. Searching
+            # ahead for a date-shaped row would skip unrelated business headers.
+            first_body = next((index for index, row in enumerate(rows) if any(_compact(cell) for cell in row)), -1)
+            if (
+                previous is None
+                or candidate is None
+                or first_body < 0
+                or not contract.row_predicate(rows[first_body])
+                or not resolver.table_continues(previous, candidate, contract, candidate_row_index=first_body)
+            ):
+                pending_special_header = None
+                return False
+            body_start = first_body
+        else:
+            header = rows[header_index]
+            header_ref = _source_ref(page, table_id, header_index)
+            body_start = header_index + 1
 
-        def index_of(marker: str) -> int:
-            return next(
-                (index for index, value in enumerate(header) if marker in value),
-                -1,
-            )
+        pending_special_header = (header, context, table_id, header_ref)
 
-        indexes = {
-            "transaction_type": index_of("交易类型"),
-            "transaction_date": index_of("交易日期"),
-            "transaction_amount": index_of("交易金额"),
-            "due_date_change_months": index_of("到期日期变更月数"),
-            "transaction_detail": index_of("交易明细信息"),
-        }
-        for row_index, row in enumerate(rows[header_index + 1 :], start=header_index + 1):
+        for row_index, row in enumerate(rows[body_start:], start=body_start):
+            if not any(_compact(cell) for cell in row):
+                continue
+            values = special_transaction_cells(header, row)
+            if values is None:
+                pending_special_header = None
+                break
 
             def value(field: str) -> str:
-                index = indexes[field]
-                return _compact(row[index]) if 0 <= index < len(row) else ""
+                return _compact(values[field])
 
             transaction_type = value("transaction_type")
             transaction_date = _date(value("transaction_date"))
             if not transaction_type or not transaction_date:
-                continue
+                pending_special_header = None
+                break
             special_records.append(
                 {
                     "special_transaction_id": _stable_id(
@@ -4138,7 +4289,7 @@ def _attachment_contexts_and_records(
                     "source_page": page,
                     "source_table_id": table_id,
                     "source": "canonical_enterprise_special_transaction",
-                    "source_refs": [_source_ref(page, table_id, row_index)],
+                    "source_refs": [header_ref, _source_ref(page, table_id, row_index)],
                     "confidence": 1.0,
                 }
             )
@@ -4158,6 +4309,7 @@ def _attachment_contexts_and_records(
                 current = None
                 pending_history = None
                 pending_detail_header = None
+                pending_special_header = None
             account_match = re.search(
                 r"(\d+)\.(已结清|未结清)账户编号[:：]?([0-9A-Z]{6,})",
                 text,
@@ -4198,12 +4350,14 @@ def _attachment_contexts_and_records(
                 table_id,
                 allow_headerless=True,
             ):
+                pending_special_header = None
                 continue
         if _history_table(rows) or table_id in allowed_history_continuation_tables:
             consume_history(rows, current, page, table_id)
             consume_special_transactions(rows, current, page, table_id)
             continue
         if consume_credit_details(rows, current, page, table_id):
+            pending_special_header = None
             continue
         consume_special_transactions(rows, current, page, table_id)
 
@@ -4348,6 +4502,7 @@ _PUBLIC_ATTRIBUTE_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
         "cumulative_arrears": ("累计欠费金额", "累计欠费金额（元）", "累计欠费"),
         "statistics_month": ("统计年月",),
         "history_status": ("查看过去24个月缴费情况", "查看过去 24 个月缴费情况"),
+        "history_period_months": ("过去缴费情况月数",),
     },
     "tax_arrears": {
         "tax_authority": ("主管税务机关",),
@@ -4724,6 +4879,12 @@ _PUBLIC_HISTORY_POINTER_RE = re.compile(
     r"(?:(?:住房公积金|社会保险|社会保障|公积金|社保))?"
     r"(?:缴费|缴存)情况(?P<status>详?见附件)"
 )
+_PUBLIC_HISTORY_HEADER_RE = re.compile(
+    r"(?:查看)?(?:过去|近(?:期)?|最近)(?P<months>\d+)个月(?:的)?"
+    r"(?:(?:住房公积金|社会保险|社会保障|公积金|社保))?"
+    r"(?:缴费|缴存)情况"
+)
+_PUBLIC_HISTORY_STATUS_RE = re.compile(r"^(?P<status>详?见附件)[。.;；]*$")
 _PUBLIC_HISTORY_POINTER_CANDIDATE_RE = re.compile(r"(?:缴费|缴存)情况.{0,16}附件")
 
 
@@ -4918,7 +5079,7 @@ def _public_history_reference(
 ) -> tuple[dict[str, Any], _SemanticResolution | None]:
     """Structure a bounded source pointer to an attached contribution history."""
 
-    candidates: list[tuple[int, str, dict[str, Any], str]] = []
+    candidates: list[tuple[int, str, tuple[dict[str, Any], ...], str]] = []
     unparsed: list[tuple[str, dict[str, Any]]] = []
     for row_index, row in enumerate(rows):
         for column_index, cell in enumerate(row):
@@ -4931,10 +5092,39 @@ def _public_history_reference(
                     (
                         int(match.group("months")),
                         match.group("status"),
-                        source_ref,
+                        (source_ref,),
                         compact,
                     )
                 )
+                continue
+            header_match = _PUBLIC_HISTORY_HEADER_RE.search(compact)
+            if header_match:
+                header_ref = _source_ref(page, table_id, row_index)
+                header_ref["column"] = column_index
+                split_statuses: list[tuple[str, dict[str, Any]]] = []
+                for value_row_index in range(row_index + 1, len(rows)):
+                    value_row = rows[value_row_index]
+                    if column_index >= len(value_row):
+                        continue
+                    status_match = _PUBLIC_HISTORY_STATUS_RE.fullmatch(
+                        _compact(value_row[column_index])
+                    )
+                    if status_match:
+                        value_ref = _source_ref(page, table_id, value_row_index)
+                        value_ref["column"] = column_index
+                        split_statuses.append((status_match.group("status"), value_ref))
+                if split_statuses:
+                    for status, value_ref in split_statuses:
+                        candidates.append(
+                            (
+                                int(header_match.group("months")),
+                                status,
+                                (header_ref, value_ref),
+                                f"{compact}{status}",
+                            )
+                        )
+                else:
+                    unparsed.append((compact, header_ref))
             elif _PUBLIC_HISTORY_POINTER_CANDIDATE_RE.search(compact):
                 source_ref = _source_ref(page, table_id, row_index)
                 source_ref["column"] = column_index
@@ -4943,23 +5133,29 @@ def _public_history_reference(
         match = _PUBLIC_HISTORY_POINTER_RE.search(text)
         if match:
             candidates.append(
-                (int(match.group("months")), match.group("status"), dict(source_ref), text)
+                (
+                    int(match.group("months")),
+                    match.group("status"),
+                    (dict(source_ref),),
+                    text,
+                )
             )
         elif _PUBLIC_HISTORY_POINTER_CANDIDATE_RE.search(text):
             unparsed.append((text, dict(source_ref)))
     if not candidates and not unparsed:
         return {}, None
 
-    values = {(months, status) for months, status, _source_ref_value, _text in candidates}
+    values = {(months, status) for months, status, _source_refs, _text in candidates}
     unique_refs: list[dict[str, Any]] = []
-    for _months, _status, ref, _text in candidates:
-        if ref not in unique_refs:
-            unique_refs.append(ref)
+    for _months, _status, refs, _text in candidates:
+        for ref in refs:
+            if ref not in unique_refs:
+                unique_refs.append(ref)
     for _text, ref in unparsed:
         if ref not in unique_refs:
             unique_refs.append(ref)
     if unparsed or len(values) != 1:
-        source_values = [text for _months, _status, _ref, text in candidates]
+        source_values = [text for _months, _status, _refs, text in candidates]
         source_values.extend(text for text, _ref in unparsed)
         return {}, _SemanticResolution(
             value="",
@@ -4978,14 +5174,19 @@ def _public_history_reference(
             source_refs=tuple(unique_refs),
         )
     months, status = next(iter(values))
-    source_values = [text for _months, _status, _ref, text in candidates]
+    source_values = [text for _months, _status, _refs, text in candidates]
+    split_pointer = any(len(refs) > 1 for _months, _status, refs, _text in candidates)
     return {
         "history_period_months": months,
         "history_status": status,
     }, _SemanticResolution(
         value=status,
         status="reported",
-        basis="bounded_adjacent_pointer",
+        basis=(
+            "bounded_header_value_pointer"
+            if split_pointer
+            else "bounded_adjacent_pointer"
+        ),
         source_value=";".join(dict.fromkeys(source_values)),
         source_refs=tuple(unique_refs),
     )
@@ -5192,7 +5393,11 @@ def extract_enterprise_public_records_from_tables(
                 report_default=default_amount_unit,
             )
             history_resolution: _SemanticResolution | None = None
-            if record_type in {"housing_fund_payment", "social_security_payment"}:
+            if record_type in {
+                "utility_payment",
+                "housing_fund_payment",
+                "social_security_payment",
+            }:
                 history_attributes, history_resolution = _public_history_reference(
                     rows,
                     trailing_pointers.get(table_id, ()),

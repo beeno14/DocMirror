@@ -173,7 +173,13 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "establishment_year": {"label": "成立年份", "type": "integer"},
                 "registration_certificate_valid_through": {
                     "label": "登记证书有效截止日期",
-                    "type": "date",
+                    "type": "string",
+                    "definition": "保留源报告的截止日期或长期等无限期表述；由 registration_certificate_validity_kind 区分。",
+                },
+                "registration_certificate_validity_kind": {
+                    "label": "登记证书有效期限类型",
+                    "type": "string",
+                    "enum_ref": "registration_certificate_validity_kind",
                 },
                 "registered_address": {"label": "登记地址", "type": "string"},
                 "operating_address": {"label": "办公/经营地址", "type": "string"},
@@ -356,12 +362,22 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "text",
                 },
                 "source_display_limited": {
-                    "label": "源报告是否声明信息展示范围受限",
+                    "label": "源报告是否仅展示部分记录",
                     "type": "boolean",
                     "definition": (
-                        "包括受篇幅限制仅展示部分信贷记录，或仅展示一定期限范围内的"
-                        "已结清信贷、非信贷和公共信息。"
+                        "仅在报告明示只展示部分记录时为 true；适用范围见 source_display_scopes。"
+                        "不表示概要统计缺失；字段缺省不等于报告明示展示全部记录。"
                     ),
+                },
+                "source_display_scopes": {
+                    "label": "部分展示的业务范围",
+                    "type": "array",
+                    "enum_ref": "source_display_scope",
+                },
+                "available_limit_requires_estimation": {
+                    "label": "剩余可用额度是否需结合授信明细估算",
+                    "type": "boolean",
+                    "definition": "报告声明额度控制使剩余可用额度不能准确计算；不改写报告印出的额度。",
                 },
                 "attachment_account_count": {
                     "label": "附件账户/业务数",
@@ -403,6 +419,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "ownership_percentage": {"label": "出资比例", "type": "string"},
                 "relationship_type": {"label": "关系类型", "type": "string"},
+                "relationship_type_label": {
+                    "label": "关系类型（源报告）",
+                    "type": "string",
+                },
                 "registered_capital_amount": {"label": "注册资本", "type": "money"},
                 "contributor_count": {"label": "主要出资人记录数", "type": "integer"},
                 "contributor_status": {"label": "主要出资人信息状态", "type": "string"},
@@ -697,6 +717,11 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "type": "long_id",
                     "sensitive": True,
                 },
+                "guarantee_contract_identifier_status": {
+                    "label": "保证合同编号报告状态",
+                    "type": "string",
+                    "enum_ref": "source_state",
+                },
                 "responsibility_currency": {"label": "还款责任金额币种", "type": "string"},
                 "responsibility_amount_unit": {"label": "还款责任金额单位", "type": "string"},
                 "obligation_currency": {"label": "借款/授信金额币种", "type": "string"},
@@ -930,7 +955,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "sequence",
             "account_identifier",
             "responsibility_type",
-            "contract_number",
             "guarantee_contract_identifier",
             "currency",
             "amount_unit",
@@ -941,7 +965,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "responsibility_amount",
             "institution",
             "business_type",
-            "open_date",
             "open_or_receive_date",
             "due_date",
             "loan_or_credit_amount",
@@ -952,7 +975,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "overdue_months_or_repayment_status",
             "remaining_periods",
             "snapshot_date",
-            "contract_number_status",
+            "guarantee_contract_identifier_status",
             "responsibility_amount_status",
             "due_date_status",
             "continuation_complete",
@@ -1032,6 +1055,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "report_number": fields["report_number"],
                 "query_institution": fields["query_institution"],
                 "report_time": fields["report_time"],
+                "source_display_limited": fields["source_display_limited"],
+                "source_display_scopes": fields["source_display_scopes"],
                 "source_page": fields["source_page"],
             },
         }
@@ -1124,6 +1149,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "guarantee_attention_balance",
                     "guarantee_adverse_balance",
                     "recovered_debt_balance",
+                    "source_display_limited",
+                    "source_display_scopes",
                     "currency",
                     "amount_unit",
                     "source_page",
@@ -1196,6 +1223,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "used_limit",
                     "available_limit",
                     "utilization_rate",
+                    "available_limit_requires_estimation",
                     "currency",
                     "amount_unit",
                 )
@@ -1217,6 +1245,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "industry",
                     "establishment_year",
                     "registration_certificate_valid_through",
+                    "registration_certificate_validity_kind",
                     "registered_address",
                     "operating_address",
                     "operating_status",
@@ -1301,6 +1330,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 for key in (
                     "sequence",
                     "relationship_type",
+                    "relationship_type_label",
                     "name",
                     "identity_type",
                     "identity_number",
@@ -1716,7 +1746,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         }
         enums["relationship_type"] = {
             "actual_controller": "实际控制人",
+            "group_parent_company": "集团母公司",
+            "group_subsidiary": "集团子公司",
             "related_enterprise": "关联企业",
+            "other": "其他关系",
         }
         enums["contributor_status"] = {
             "no_records": "无记录",
@@ -1733,6 +1766,17 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
         enums["revolving_flag"] = {"true": "是", "false": "否"}
         enums["account_population_comparable"] = {"true": "是", "false": "否"}
         enums["source_display_limited"] = {"true": "是", "false": "否"}
+        enums["source_display_scope"] = {
+            "credit_records": "信贷记录明细及附件（非概要统计）",
+            "non_credit_records": "非信贷记录",
+            "public_records": "公共记录",
+        }
+        enums["available_limit_requires_estimation"] = {"true": "是", "false": "否"}
+        enums["registration_certificate_validity_kind"] = {
+            "dated": "具体截止日期",
+            "indefinite": "长期有效",
+            "unresolved": "源有效期限尚未分类",
+        }
         enums["account_dataset_scope"] = {
             "main_report_account_cards": "报告正文账户卡片",
         }
@@ -1820,7 +1864,6 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
             "extracted_record_count",
             "projected_account_count",
             "reconciliation_status",
-            "source_display_limited",
             "unexpected_record_count",
             "unresolved_record_count",
         ):
@@ -1835,7 +1878,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "maturity_date_status": {"label": "到期日报告状态", "type": "string"},
             }
         )
-        for name in ("account_population_comparable", "due_date_status", "source_display_limited"):
+        for name in ("account_population_comparable", "due_date_status"):
             enums.pop(name, None)
         enums["maturity_date_status"] = {"reported": "已报告", "not_reported": "未报告"}
         return dictionary
@@ -1872,10 +1915,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "sequence",
                 "account_identifier",
                 "responsibility_type",
-                "contract_number",
+                "guarantee_contract_identifier",
                 "institution",
                 "business_type",
-                "open_date",
+                "open_or_receive_date",
                 "maturity_date",
                 "responsibility_amount",
                 "loan_or_credit_amount",
@@ -1903,6 +1946,8 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "report_number",
                         "query_institution",
                         "report_time",
+                        "source_display_limited",
+                        "source_display_scopes",
                     ],
                 },
                 "report_notes": {
@@ -1918,7 +1963,10 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "hidden": True,
                 },
                 "enterprise_credit_overview": {
-                    "hidden": True,
+                    "mode": "record_cards",
+                    "hide_title": True,
+                    "hide_record_titles": True,
+                    "columns": ["source_display_limited", "source_display_scopes"],
                 },
                 "enterprise_public_record_counts": {
                     "columns": [
@@ -1970,7 +2018,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 },
                 "enterprise_relationships": {
                     "mode": "record_cards",
-                    "title_fields": ["relationship_type"],
+                    "title_fields": ["relationship_type_label"],
                     "columns": [
                         "name",
                         "identity_type",
@@ -1986,6 +2034,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                         "total_limit",
                         "used_limit",
                         "available_limit",
+                        "available_limit_requires_estimation",
                         "currency",
                         "amount_unit",
                     ],
@@ -2064,11 +2113,9 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                     "title_fields": ["responsibility_type", "account_identifier"],
                     "columns": [
                         "account_identifier",
-                        "contract_number",
                         "guarantee_contract_identifier",
                         "institution",
                         "business_type",
-                        "open_date",
                         "open_or_receive_date",
                         "maturity_date",
                         "currency",
@@ -2336,6 +2383,7 @@ class EnterpriseNativeVariant(CreditReportVariantAdapter):
                 "establishment_year",
                 "establishment_year_source_institution",
                 "registration_certificate_valid_through",
+                "registration_certificate_validity_kind",
                 "registration_certificate_valid_through_source_institution",
                 "registered_address",
                 "registered_address_source_institution",

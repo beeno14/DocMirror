@@ -77,6 +77,11 @@ def _personal_brief_data_dictionary_template() -> dict[str, Any]:
             "type": "enum",
             "definition": "信用卡、贷款或其他业务。",
         },
+        "is_revolving": {
+            "label": "可循环使用",
+            "type": "boolean",
+            "definition": "源文明确说明的授信额度是否可循环使用；不根据贷款授信类型推断。",
+        },
         "institution_statement_id": {"label": "机构说明记录ID", "type": "string"},
         "statement_content": {"label": "说明内容", "type": "string"},
         "added_date": {"label": "添加日期", "type": "date"},
@@ -85,7 +90,7 @@ def _personal_brief_data_dictionary_template() -> dict[str, Any]:
     dictionary["datasets"]["credit_accounts"]["columns"].update(
         {
             field_name: deepcopy(dictionary["fields"][field_name])
-            for field_name in ("source_section", "source_sequence", "business_category")
+            for field_name in ("source_section", "source_sequence", "business_category", "is_revolving")
         }
     )
     dictionary["datasets"]["credit_accounts"]["columns"]["close_date"][
@@ -110,7 +115,7 @@ def _personal_brief_data_dictionary_template() -> dict[str, Any]:
     }
 
     enums["is_primary"] = {"true": "是", "false": "否"}
-    for field_name in ("ever_overdue", "over_90_days", "current_overdue"):
+    for field_name in ("ever_overdue", "over_90_days", "current_overdue", "is_revolving"):
         enums[field_name] = {"true": "是", "false": "否"}
     enums["settlement_state"] = {
         "settled": "已结清",
@@ -257,7 +262,10 @@ def personal_brief_semantic_extensions() -> dict[str, Any]:
             ],
         },
         "institution_statements": {"omit_unlisted": True},
-        "inquiries": {"omit_unlisted": True},
+        "inquiries": {
+            "omit_unlisted": True,
+            "groups": [{"hide_title": True, "fields": ["lookback_years", "source_statement"]}],
+        },
         "notes": {"omit_unlisted": True},
     }
     dataset_layouts = presentation.setdefault("dataset_layouts", {})
@@ -332,6 +340,7 @@ def personal_brief_semantic_extensions() -> dict[str, Any]:
                     "snapshot_date",
                     "contract_maturity_date",
                     "credit_line_expiry_date",
+                    "is_revolving",
                     "close_date",
                     "account_currency",
                     "loan_amount",
@@ -376,6 +385,12 @@ def personal_brief_semantic_extensions() -> dict[str, Any]:
     }
 
     overrides = semantic.setdefault("community_projection_overrides", {})
+    overrides["summary_facts"] = {
+        "credit_summary": "credit_summary",
+        "non_credit_transaction_summary": "non_credit_transactions",
+        "public_record_summary": "public_records",
+        "inquiry_record_summary": "inquiries",
+    }
     overrides["section_markers"] = {
         "personal_report_metadata": ["report_header"],
         "identity_documents": ["report_header"],

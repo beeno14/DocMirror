@@ -57,6 +57,7 @@ def _perception_hashes(hashes: dict[str, str]) -> dict[str, str]:
         for key, value in hashes.items()
         if key.startswith("docmirror/")
         and not key.startswith(("docmirror/plugins/", "docmirror/output/", "docmirror/server/"))
+        and key != "docmirror/configs/schemas/community_bundle.schema.json"
     }
 
 
@@ -214,7 +215,14 @@ async def _perceive(source: Path, policy: Any, workers: int, stats: dict):
 
 
 def _run_one(
-    entry: dict, baseline: dict, source: Path, output: Path, args: Any, code_hashes: dict, auditor: Any
+    entry: dict,
+    baseline: dict,
+    source: Path,
+    output: Path,
+    args: Any,
+    code_hashes: dict,
+    auditor: Any,
+    golden: dict[str, Any] | None,
 ) -> dict:
     from docmirror.plugins.bank_statement.community_plugin import plugin
 
@@ -281,31 +289,40 @@ def _run_one(
     semantic = bundle.semantic_payload()
     auditor._atomic_write_json(output / "projection.community.json", public)
     auditor._atomic_write_json(output / "projection.community.evidence.json", semantic)
-    try:
-        assert_equal(baseline["public"], public, "public output")
-        assert_semantic_preserved(
-            baseline["semantic"], semantic, baseline["parse_meta"]["sealed_fingerprint"], sealed.integrity_fingerprint
-        )
-    except AssertionError as exc:
-        result["errors"].append(str(exc))
+    if not args.accept_projection_changes:
+        try:
+            assert_equal(baseline["public"], public, "public output")
+            assert_semantic_preserved(
+                baseline["semantic"],
+                semantic,
+                baseline["parse_meta"]["sealed_fingerprint"],
+                sealed.integrity_fingerprint,
+            )
+        except AssertionError as exc:
+            result["errors"].append(str(exc))
     artifacts = export_validation["artifacts"]
-    for kind in ("content", "enhanced_reading"):
-        if Path(artifacts[kind]).read_bytes() != Path(baseline["artifacts"][kind]).read_bytes():
-            result["errors"].append(f"{kind} Markdown differs from frozen output")
-    expected_csvs = Path(baseline["artifacts"]["datasets"])
-    actual_csvs = Path(artifacts["datasets"])
-    expected_names = sorted(path.name for path in expected_csvs.glob("*.csv"))
-    actual_names = sorted(path.name for path in actual_csvs.glob("*.csv"))
-    if expected_names != actual_names:
-        result["errors"].append("dataset/audit CSV file inventory differs")
-    for name in expected_names:
-        if (
-            not (actual_csvs / name).is_file()
-            or (actual_csvs / name).read_bytes() != (expected_csvs / name).read_bytes()
-        ):
-            result["errors"].append(f"dataset/audit CSV differs: {name}")
+    if not args.accept_projection_changes:
+        for kind in ("content", "enhanced_reading"):
+            if Path(artifacts[kind]).read_bytes() != Path(baseline["artifacts"][kind]).read_bytes():
+                result["errors"].append(f"{kind} Markdown differs from frozen output")
+        expected_csvs = Path(baseline["artifacts"]["datasets"])
+        actual_csvs = Path(artifacts["datasets"])
+        expected_names = sorted(path.name for path in expected_csvs.glob("*.csv"))
+        actual_names = sorted(path.name for path in actual_csvs.glob("*.csv"))
+        if expected_names != actual_names:
+            result["errors"].append("dataset/audit CSV file inventory differs")
+        for name in expected_names:
+            if (
+                not (actual_csvs / name).is_file()
+                or (actual_csvs / name).read_bytes() != (expected_csvs / name).read_bytes()
+            ):
+                result["errors"].append(f"dataset/audit CSV differs: {name}")
     audit = auditor.audit_community_payload(
-        public, effective_page_count=entry["effective_page_count"], parse_result=actual, evidence_payload=semantic
+        public,
+        effective_page_count=entry["effective_page_count"],
+        parse_result=actual,
+        evidence_payload=semantic,
+        golden=golden,
     )
     auditor._atomic_write_json(output / "audit.json", audit)
     if audit["status"] != "pass":
@@ -317,6 +334,12 @@ def _run_one(
         statement_header_rows=audit["statement_header_rows"],
         completion_status=audit["completion_status"],
         audit_status=audit["status"],
+        golden_checked=audit["golden_checked"],
+        golden_check_count=(
+            len((golden or {}).get("dataset_row_counts") or {})
+            + len((golden or {}).get("assertions") or [])
+            + int(isinstance((golden or {}).get("dataset_order"), list))
+        ),
         export_validation=export_validation,
     )
     result["timings"]["export_and_audit_seconds"] = round(time.perf_counter() - phase_start, 3)
@@ -436,6 +459,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--page-workers", type=int, default=4)
     parser.add_argument("--cases", type=int, nargs="+")
     parser.add_argument("--retry-failures-from", type=Path)
+    parser.add_argument("--golden", type=Path)
+    parser.add_argument(
+        "--accept-projection-changes",
+        action="store_true",
+        help=(
+            "Allow reviewed bank-projection fixes to differ from the frozen output; "
+            "perception/facts, export contracts, the source auditor, and --golden still gate the run"
+        ),
+    )
     replay = parser.add_mutually_exclusive_group()
     replay.add_argument("--reuse-extraction-from", type=Path)
     replay.add_argument("--replay-only-from", type=Path)
@@ -473,6 +505,13 @@ def main(argv: list[str] | None = None) -> int:
             raise AssertionError("baseline parse policy no longer matches")
     code_hashes = _hashes()
     auditor = _load_auditor()
+    golden_by_sha, golden_fingerprint = auditor._golden_entries(args.golden.resolve() if args.golden else None)
+    selected_shas = {entry["source_sha256"] for entry in entries}
+    missing_goldens = sorted(selected_shas - set(golden_by_sha)) if args.golden else []
+    if missing_goldens:
+        raise ValueError(f"selected sources are absent from the golden manifest: {missing_goldens}")
+    if args.accept_projection_changes and not args.golden:
+        raise ValueError("--accept-projection-changes requires --golden")
     output.mkdir(parents=True, exist_ok=False)
     started = time.perf_counter()
     report: dict[str, Any] = {
@@ -482,6 +521,8 @@ def main(argv: list[str] | None = None) -> int:
         "code_hashes": code_hashes,
         "baseline_report": f"bank_business_output_20260827/{args.tier}_final.json",
         "operation": "artifact_replay" if args.replay_only_from else "fresh_validation",
+        "golden_fingerprint": golden_fingerprint,
+        "accept_projection_changes": bool(args.accept_projection_changes),
     }
     for entry in entries:
         print(f"START {args.tier} {entry['filename']}", flush=True)
@@ -504,6 +545,7 @@ def main(argv: list[str] | None = None) -> int:
                     args,
                     code_hashes,
                     auditor,
+                    golden_by_sha.get(entry["source_sha256"]),
                 )
         except Exception as exc:
             result = {

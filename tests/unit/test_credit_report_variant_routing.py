@@ -200,7 +200,7 @@ def test_enterprise_semantics_do_not_inherit_personal_brief_identity_or_relation
     )
     assert "enterprise_extraction_audit" not in enterprise_order
     assert enterprise_dictionary["schema_id"] == "enterprise_credit_report"
-    assert enterprise_dictionary["version"] == "3.0.0"
+    assert enterprise_dictionary["version"] == "4.0.0"
     assert "identity_documents" not in enterprise_dictionary["datasets"]
     assert "enterprise_credit_accounts" in enterprise_dictionary["datasets"]
 
@@ -215,7 +215,10 @@ def test_enterprise_enhanced_markdown_uses_business_only_allowlists() -> None:
     assert layouts["report_notes"] == {"hidden": True}
     assert layouts["enterprise_section_presence"] == {"hidden": True}
     assert layouts["enterprise_report_identity"] == {"hidden": True}
-    assert layouts["enterprise_credit_overview"] == {"hidden": True}
+    assert layouts["enterprise_credit_overview"]["columns"] == [
+        "source_display_limited", "source_display_scopes",
+    ]
+    assert layouts["enterprise_credit_overview"]["hide_record_titles"] is True
     assert set(enterprise.dataset_names()) == set(layouts)
     assert all(layout.get("hidden") or layout.get("columns") for layout in layouts.values())
     assert enhanced["section_layouts"]["identity"]["omit_unlisted"] is True

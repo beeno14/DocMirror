@@ -69,6 +69,90 @@ def _source_entries(row: dict[str, Any]):
         yield (name, occurrences[name]), item
 
 
+def _source_metadata_index(payload: dict[str, Any]) -> list[tuple[str, Any, int, int]]:
+    """Index normalized metadata facts that replace header raw promotions."""
+
+    entries: list[tuple[str, Any, int, int]] = []
+    dataset = next(
+        (item for item in payload.get("datasets") or [] if item.get("name") == "source_metadata"),
+        None,
+    )
+    if not isinstance(dataset, dict):
+        return entries
+    for row in dataset.get("rows") or []:
+        normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+        name = _label(normalized.get("metadata_name") or "")
+        if not name or "metadata_value" not in normalized:
+            continue
+        try:
+            page_start = int(normalized.get("source_page_start") or 0)
+            page_end = int(normalized.get("source_page_end") or page_start)
+        except (TypeError, ValueError):
+            page_start = page_end = 0
+        entries.append((name, normalized["metadata_value"], page_start, page_end))
+    return entries
+
+
+def source_fact_represented_by_metadata(payload: dict[str, Any], name: str, value: Any) -> bool:
+    """Return whether a header source value is losslessly present in source_metadata."""
+
+    index = _source_metadata_index(payload)
+    source_name = _label(name)
+
+    def represented(item: Any, page: int = 0) -> bool:
+        return any(
+            entry_name == source_name
+            and _same(entry_value, item)
+            and (page <= 0 or page_start <= page <= page_end)
+            for entry_name, entry_value, page_start, page_end in index
+        )
+
+    if isinstance(value, list):
+        if not value:
+            return False
+        for item in value:
+            if isinstance(item, dict) and "value" in item and set(item) <= {"page", "value"}:
+                try:
+                    page = int(item.get("page") or 0)
+                except (TypeError, ValueError):
+                    return False
+                if not represented(item["value"], page):
+                    return False
+            elif not represented(item):
+                return False
+        return True
+    return represented(value)
+
+
+def _suppress_relocated_header_source_fields(payload: dict[str, Any]) -> None:
+    """Avoid duplicating facts normalized into the scoped metadata dataset."""
+
+    if not _source_metadata_index(payload):
+        return
+    for dataset in payload.get("datasets") or []:
+        if dataset.get("name") != "statement_header":
+            continue
+        for row in dataset.get("rows") or []:
+            normalized = row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
+            fields = normalized.get("additional_fields")
+            if not isinstance(fields, list):
+                continue
+            retained = [
+                item
+                for item in fields
+                if not (
+                    isinstance(item, dict)
+                    and isinstance(item.get("name"), str)
+                    and "value" in item
+                    and source_fact_represented_by_metadata(payload, item["name"], item["value"])
+                )
+            ]
+            if retained:
+                normalized["additional_fields"] = retained
+            else:
+                normalized.pop("additional_fields", None)
+
+
 def _business_columns(dataset: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[tuple[str, int], str]]:
     rows = dataset.get("rows") or []
     declared = {column["key"]: column for column in dataset.get("columns") or []}
@@ -186,6 +270,7 @@ def business_view(payload: dict[str, Any]) -> dict[str, Any]:
     if (payload.get("schema") or {}).get("version") != "4.0.0":
         raise ValueError("business bank view requires an evidence-accounted normalized v4 source")
     result = copy.deepcopy(payload)
+    _suppress_relocated_header_source_fields(result)
     result["schema"]["version"] = BUSINESS_VIEW_VERSION
     for dataset in result.get("datasets") or []:
         columns, promoted = _business_columns(dataset)

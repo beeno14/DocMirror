@@ -130,7 +130,7 @@ class PersonalBriefNativeVariant(CreditReportVariantAdapter):
                 "inquiries",
                 "查询记录",
                 "inquiries",
-                ("institution_inquiries", "personal_inquiries"),
+                ("inquiries_container", "institution_inquiries", "personal_inquiries"),
             ),
             ("notes", "说明", "notes", ("report_notes",)),
         )

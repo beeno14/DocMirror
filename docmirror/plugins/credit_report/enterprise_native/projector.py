@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import Any
@@ -35,6 +36,8 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "report_number",
         "query_institution",
         "report_time",
+        "source_display_limited",
+        "source_display_scopes",
     ),
     "enterprise_exchange_rates": (
         "exchange_rate_usd_cny",
@@ -70,6 +73,8 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "guarantee_attention_balance",
         "guarantee_adverse_balance",
         "recovered_debt_balance",
+        "source_display_limited",
+        "source_display_scopes",
         "currency",
         "amount_unit",
     ),
@@ -97,6 +102,7 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "total_limit",
         "used_limit",
         "available_limit",
+        "available_limit_requires_estimation",
         "utilization_rate",
         "currency",
         "amount_unit",
@@ -162,6 +168,7 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "establishment_year",
         "establishment_year_source_institution",
         "registration_certificate_valid_through",
+        "registration_certificate_validity_kind",
         "registration_certificate_valid_through_source_institution",
         "registered_address",
         "registered_address_source_institution",
@@ -198,6 +205,7 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "enterprise_relationships": (
         "relationship_type",
+        "relationship_type_label",
         "name",
         "identity_type",
         "identity_number",
@@ -330,11 +338,9 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "related_party_id_number",
         "liability_date",
         "account_identifier",
-        "contract_number",
         "guarantee_contract_identifier",
         "institution",
         "business_type",
-        "open_date",
         "open_or_receive_date",
         "maturity_date",
         "responsibility_amount",
@@ -737,7 +743,7 @@ def _known_non_business_field(key: str, allowed: set[str]) -> bool:
 
 
 def _project_business_columns(
-    dataset_name: str,
+    structured_types: dict[str, str],
     dataset: dict[str, Any],
     field_order: tuple[str, ...],
     rows: list[dict[str, Any]],
@@ -762,8 +768,8 @@ def _project_business_columns(
         column.update(
             {
                 "key": key,
-                "label": str(column.get("label") or _DERIVED_COLUMN_LABELS.get(key) or key),
-                "type": str(column.get("type") or _DERIVED_COLUMN_TYPES.get(key) or "string"),
+                "label": str(_DERIVED_COLUMN_LABELS.get(key) or column.get("label") or key),
+                "type": str(structured_types.get(key) or _DERIVED_COLUMN_TYPES.get(key) or column.get("type") or "string"),
                 "nullable": any(
                     not _has_business_value((row.get("normalized") or {}).get(key))
                     for row in rows
@@ -779,10 +785,16 @@ def _project_business_columns(
 def _project_business_dataset(
     dataset: dict[str, Any],
     field_order: tuple[str, ...],
+    column_schema: dict[str, Any],
 ) -> dict[str, Any]:
     projected = deepcopy(dataset)
     dataset_name = str(projected.get("name") or "")
     allowed = set(field_order)
+    structured_types = {
+        key: str(info["type"])
+        for key, info in column_schema.items()
+        if key in allowed and info.get("type") in {"array", "object", "json"}
+    }
     rows: list[dict[str, Any]] = []
     for row in projected.get("rows") or []:
         if not isinstance(row, dict):
@@ -791,6 +803,19 @@ def _project_business_dataset(
             row.get("normalized") if isinstance(row.get("normalized"), dict) else {}
         )
         transformed = _normalize_public_business_row(dataset_name, source_normalized)
+        # The generic tabular exporter serializes containers as text. Restore
+        # only schema-declared containers at this enterprise-specific boundary;
+        # never guess that an arbitrary business string is embedded JSON.
+        for key, value_type in structured_types.items():
+            value = transformed.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, str):
+                value = json.loads(value)
+            expected_type = {"array": list, "object": dict}.get(value_type)
+            if expected_type is not None and not isinstance(value, expected_type):
+                raise ValueError(f"enterprise {dataset_name}.{key} must be {value_type}")
+            transformed[key] = value
         unknown = sorted(
             key
             for key in source_normalized
@@ -823,7 +848,7 @@ def _project_business_dataset(
     projected["rows"] = rows
     projected["row_count"] = len(rows)
     projected["columns"] = _project_business_columns(
-        dataset_name,
+        structured_types,
         projected,
         field_order,
         rows,
@@ -1088,6 +1113,9 @@ def project_enterprise_community_json(payload: dict[str, Any]) -> dict[str, Any]
     projected = deepcopy(payload)
     projected.setdefault("schema", {})["version"] = "4.0.0"
     policy = enterprise_public_dataset_policy()
+    from docmirror.plugins.credit_report.enterprise_native.variant import variant
+
+    dataset_schema = variant.data_dictionary()["datasets"]
     datasets: list[dict[str, Any]] = []
     for dataset in projected.get("datasets") or []:
         if not isinstance(dataset, dict):
@@ -1098,7 +1126,7 @@ def project_enterprise_community_json(payload: dict[str, Any]) -> dict[str, Any]
         fields = policy[dataset_name]
         if fields is None:
             continue
-        datasets.append(_project_business_dataset(dataset, fields))
+        datasets.append(_project_business_dataset(dataset, fields, dataset_schema[dataset_name]["columns"]))
     projected["datasets"] = datasets
     _validate_section_business_conservation(
         list(projected.get("sections") or []),
@@ -1282,13 +1310,17 @@ def derive_enterprise_projection(plugin: Any, parse_result: Any, full_text: str 
     )
     for dataset_name, details in semantic_document.dataset_completeness.items():
         count_key = f"enterprise_expected_{dataset_name}_count"
+        status_key = f"enterprise_expected_{dataset_name}_verification"
         domain_facts[count_key] = int(details.get("expected_row_count") or 0)
-        internal_fields.append(count_key)
-        internal_facts.append(count_key)
+        domain_facts[status_key] = "complete" if details.get("verified") is True else "unverified"
+        internal_fields.extend((count_key, status_key))
+        internal_facts.extend((count_key, status_key))
         completeness[dataset_name] = {
             "basis": "domain_fact_count",
             "count_key": count_key,
-            "public_basis": str(details.get("basis") or "canonical_source_component_count"),
+            "public_basis": str(details.get("basis") or "emitted_records_only"),
+            "verification_status_key": status_key,
+            "verified_statuses": ["complete"],
         }
     return ProjectionData(
         projector_id=plugin.projector_id,

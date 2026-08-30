@@ -307,6 +307,57 @@ def test_corpus_audit_accepts_exact_source_unitemized_reconciliation(monkeypatch
     assert len(payload["datasets"][1]["rows"]) == 3
 
 
+def test_corpus_audit_accepts_atomic_scoped_source_metadata_between_business_datasets(
+    monkeypatch, audit_module
+):
+    payload = _reconciled_payload(monkeypatch)
+    metadata = {
+        "record_id": "source_metadata:r000001",
+        "normalized": {
+            "metadata_field": "seal_code",
+            "metadata_name": "业务印章编码",
+            "metadata_value": "8DD4EA031026",
+            "source_page_start": 2,
+            "scope": "page",
+        },
+        "canonical_raw": {"metadata_name": "业务印章编码", "metadata_value": "8DD4EA031026"},
+        "raw": {"metadata_name": "业务印章编码", "metadata_value": "8DD4EA031026"},
+        "source": {"page_range": [2, 2]},
+    }
+    payload["datasets"].insert(1, {"name": "source_metadata", "rows": [metadata]})
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=3)
+
+    assert audit["status"] == "pass"
+    assert audit["dataset_order"] == ["statement_header", "source_metadata", "transactions"]
+    assert audit["source_metadata_rows"] == 1
+
+
+def test_corpus_audit_rejects_unstructured_or_mis_scoped_source_metadata(monkeypatch, audit_module):
+    payload = _reconciled_payload(monkeypatch)
+    metadata = {
+        "record_id": "source_metadata:r000001",
+        "normalized": {
+            "metadata_field": "other",
+            "metadata_name": "终端号",
+            "metadata_value": "T-01",
+            "source_page_start": 2,
+            "scope": "document",
+            "content": "终端号=T-01",
+        },
+        "canonical_raw": {"metadata_name": "终端号", "metadata_value": "T-01"},
+        "raw": {"metadata_name": "终端号", "metadata_value": "T-01"},
+        "source": {"page_range": [2, 2]},
+    }
+    payload["datasets"].insert(1, {"name": "source_metadata", "rows": [metadata]})
+
+    audit = audit_module.audit_community_payload(payload, effective_page_count=3)
+
+    assert audit["status"] == "fail"
+    assert audit["finding_counts"]["source_metadata_unstructured_fields"] == 1
+    assert audit["finding_counts"]["source_metadata_scope_invalid"] == 1
+
+
 def test_corpus_audit_rejects_normalized_opaque_identifier_corruption(monkeypatch, audit_module):
     payload = _reconciled_payload(monkeypatch)
     row = payload["datasets"][1]["rows"][0]

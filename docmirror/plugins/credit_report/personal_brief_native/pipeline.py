@@ -12,9 +12,31 @@ from functools import partial
 from types import SimpleNamespace
 from typing import Any, Callable
 
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    ACCOUNT_ACTION_PATTERN as _ACCOUNT_ACTION_PATTERN,
+)
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    ACCOUNT_DATE_PATTERN as _ACCOUNT_DATE_PATTERN,
+)
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    OTHER_BUSINESS_TYPES as _OTHER_BUSINESS_TYPES,
+)
+from docmirror.plugins.credit_report.personal_brief_native.account_rules import (
+    account_narratives,
+    account_source_fields,
+)
+from docmirror.plugins.credit_report.personal_brief_native.context import (
+    extract_personal_brief_lookback_years,
+)
 from docmirror.plugins.credit_report.personal_brief_native.contracts import (
     PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
     canonicalize_personal_brief_reporting_units,
+)
+from docmirror.plugins.credit_report.personal_brief_native.date_rules import (
+    PERSONAL_BRIEF_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN,
+    PERSONAL_BRIEF_MONTH_PATTERN,
+    PERSONAL_BRIEF_YEAR_PATTERN,
 )
 from docmirror.plugins.credit_report.personal_brief_native.ir import (
     CanonicalPersonalBriefComponent,
@@ -280,7 +302,11 @@ def _account_section_text(
         if component.kind == "numbered_record":
             if ordinal_only.fullmatch(value):
                 continue
-            value = re.sub(r"^\s*\d{1,4}[.、]\s*(?=20\d{2}年)", "", value)
+            value = re.sub(
+                rf"^\s*\d{{1,4}}[.、]\s*(?={PERSONAL_BRIEF_YEAR_PATTERN}年)",
+                "",
+                value,
+            )
         if value.strip():
             parts.append(value)
     text = re.sub(r"\s+", " ", "\n".join(parts)).strip()
@@ -353,6 +379,35 @@ def _inquiry_records(document: CanonicalPersonalBriefDocumentIR) -> list[dict[st
     )
 
 
+def _inquiry_scope(document: CanonicalPersonalBriefDocumentIR) -> dict[str, Any]:
+    """Read the source's inquiry scope even when its sentence crosses units/pages."""
+
+    text = ""
+    ranges: list[tuple[int, int, CanonicalPersonalBriefComponent]] = []
+    for component in document.components:
+        if component.kind == "logical_table" or component.section_key not in {
+            "inquiries_container", "institution_inquiries", "personal_inquiries"
+        }:
+            continue
+        start = len(text)
+        text += _compact(component.text)
+        ranges.append((start, len(text), component))
+    match = re.search(r"这部分包含您的信用报告最近(?P<years>\d+)年内被查询的记录[。.]?", text)
+    if match is None:
+        return {}
+    pages = sorted({
+        page
+        for start, end, component in ranges
+        if start < match.end() and end > match.start()
+        for page in component.source_pages
+    })
+    return {
+        "lookback_years": int(match.group("years")),
+        "source_statement": match.group(0),
+        "source_pages": pages,
+    }
+
+
 def _numbered_chunks(
     document: CanonicalPersonalBriefDocumentIR,
     section_key: str,
@@ -385,44 +440,9 @@ def _numbered_chunks(
     return chunks
 
 
-_ACCOUNT_DATE_PATTERN = r"20\d{2}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"
-_ACCOUNT_ACTION_PATTERN = r"(?:发放(?:了)?(?:的)?|办理(?:了)?(?:的)?|开立(?:了)?(?:的)?|提供(?:了)?(?:的)?|为(?=.{0,40}贷款授信))"
-_ACCOUNT_BOUNDARY_RE = re.compile(
-    rf"{_ACCOUNT_DATE_PATTERN}"
-    rf"(?=(?:(?!{_ACCOUNT_DATE_PATTERN}).){{4,180}}?{_ACCOUNT_ACTION_PATTERN})"
-)
-_OTHER_BUSINESS_TYPES = (
-    "约定购回式证券交易",
-    "股票质押式回购交易",
-    "融资融券交易",
-    "融资租赁",
-)
-
-
 def _valid_account_boundary_count(text: str) -> int:
     """Count record starts independently from the business row decoder."""
-    starts = list(_ACCOUNT_BOUNDARY_RE.finditer(text))
-    count = 0
-    for index, match in enumerate(starts):
-        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
-        chunk = text[match.start() : end]
-        compact = _compact(chunk)
-        if "承担相关还款责任" in compact:
-            continue
-        action = re.search(_ACCOUNT_ACTION_PATTERN, chunk[match.end() - match.start() :])
-        if action is None:
-            continue
-        remainder = chunk[match.end() - match.start() :]
-        institution = _compact(remainder[: action.start()]).strip("，,。.;；")
-        if not 4 <= len(institution) <= 80:
-            continue
-        if not any(
-            marker in compact
-            for marker in ("贷记卡", "准贷记卡", "贷款", "授信", *_OTHER_BUSINESS_TYPES)
-        ):
-            continue
-        count += 1
-    return count
+    return len(account_narratives(text))
 
 
 def _account_boundary_expectations(
@@ -443,12 +463,16 @@ def _partial_account_record(
     text: str,
     components: list[CanonicalPersonalBriefComponent],
 ) -> dict[str, Any]:
-    from docmirror.plugins.credit_report.business_records import _iso_date, _iso_month
+    from docmirror.plugins.credit_report.business_records import (
+        _iso_date,
+        _iso_month,
+        _personal_brief_account_currency,
+    )
     from docmirror.plugins.credit_report.value_utils import parse_number, stable_record_id
 
     compact = _compact(text)
     date_match = re.search(_ACCOUNT_DATE_PATTERN, compact)
-    snapshot_match = re.search(r"(20\d{2}年\d{1,2}月)", compact)
+    snapshot_match = re.search(rf"({PERSONAL_BRIEF_MONTH_PATTERN})", compact)
     institution_match = re.search(
         rf"{_ACCOUNT_DATE_PATTERN}(.{{4,80}}?){_ACCOUNT_ACTION_PATTERN}",
         compact,
@@ -487,8 +511,8 @@ def _partial_account_record(
         "management_institution_status": "reported" if institution_match else "unresolved",
         "open_date": _iso_date(date_match.group(0)) if date_match else None,
         "open_date_status": "reported" if date_match else "unresolved",
-        "currency": "CNY",
-        "account_currency": "CNY",
+        "currency": _personal_brief_account_currency(compact),
+        "account_currency": _personal_brief_account_currency(compact),
         "reporting_amount_currency": "CNY",
         "amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
         "reporting_amount_unit": PERSONAL_BRIEF_REPORTING_AMOUNT_UNIT,
@@ -597,17 +621,15 @@ def _extract_account_section(
     if section_key != "other_business":
         records = _personal_brief_accounts(section_text, page_texts)
     else:
-        starts = list(_ACCOUNT_BOUNDARY_RE.finditer(section_text))
         records = []
-        for index, match in enumerate(starts):
-            end = starts[index + 1].start() if index + 1 < len(starts) else len(section_text)
+        for narrative in account_narratives(section_text):
             record = _personal_brief_account_from_chunk(
-                section_text[match.start() : end].strip(),
+                narrative.text,
                 page_texts,
             )
             if record is None:
                 continue
-            compact = _compact(section_text[match.start() : end])
+            compact = _compact(narrative.text)
             record["account_type"] = "other_business"
             record["business_type"] = next(
                 (value for value in _OTHER_BUSINESS_TYPES if value in compact),
@@ -643,7 +665,7 @@ def _repayment_liabilities_from_canonical_records(
     for source_sequence, text, components in chunks:
         compact = re.sub(r"\s+", "", text)
         core = re.search(
-            r"^(20\d{2}年\d{1,2}月\d{1,2}日)[，,]?为"
+            rf"^({PERSONAL_BRIEF_DATE_PATTERN})[，,]?为"
             r"(.+?)[（(]证件类型[:：](.+?)[，,]证件号码[:：](.+?)[）)]"
             r"在(.+?)(?:办理|办.{1,20}?理)(?:的)?(.+?)承担相关还款责任[，,]"
             r"责任人类型为(.+?)[，,]相关还款责任金额([\d,.]+|--)",
@@ -652,9 +674,12 @@ def _repayment_liabilities_from_canonical_records(
         if not core:
             continue
         contract_match = re.search(r"保证合同编号[:：]([^）)]+)", compact)
-        snapshot_match = re.search(r"截至(20\d{2}年\d{1,2}月(?:\d{1,2}日)?)[，,]", compact)
+        snapshot_match = re.search(
+            rf"截至({PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN})[，,]",
+            compact,
+        )
         snapshot_business = re.search(
-            r"截至20\d{2}年\d{1,2}月(?:\d{1,2}日)?[，,](.+?)余额",
+            rf"截至{PERSONAL_BRIEF_MONTH_OR_DATE_PATTERN}[，,](.+?)余额",
             compact,
         )
         balance_match = re.search(r"余额(?:为)?([\d,.]+)", compact)
@@ -1228,12 +1253,61 @@ def _valid_record_provenance(
     return False
 
 
+def _account_source_requirements(
+    document: CanonicalPersonalBriefDocumentIR,
+    accounts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Observe printed fields before judging decoder or projection completeness."""
+
+    by_source = {
+        (row.get("source_section"), int(row.get("source_sequence") or row.get("sequence") or 0)): row
+        for row in accounts
+    }
+    requirements = []
+    for section_key in ("credit_cards", "loans", "other_business"):
+        for sequence, narrative in enumerate(account_narratives(_account_section_text(document, section_key)), 1):
+            account = by_source.get((section_key, sequence), {})
+            fields: dict[str, dict[str, str]] = {}
+            for semantic_field, dataset_name, public_field in account_source_fields(narrative.text):
+                if dataset_name == "overdue_records" and account.get("ever_overdue") is False:
+                    continue  # a never-overdue account has no separate overdue view
+                fields.setdefault(dataset_name, {})[public_field] = semantic_field
+            pages = sorted({
+                page
+                for component in document.components_for(section_key)
+                if _compact(narrative.text)[:40] in _compact(component.text)
+                for page in component.source_pages
+            })
+            pages = sorted(set(pages) | {
+                int(ref.get("page") or ref.get("source_page") or 0)
+                for ref in account.get("source_refs") or []
+                if ref.get("page") or ref.get("source_page")
+            })
+            requirements.append({
+                "source_section": section_key,
+                "source_sequence": sequence,
+                "source_pages": pages,
+                "fields": fields,
+                "missing_fields": sorted({
+                    public_field
+                    for field_map in fields.values()
+                    for public_field, semantic_field in field_map.items()
+                    if account.get(semantic_field) in (None, "")
+                }),
+            })
+    return requirements
+
+
 def _dataset_completeness(
     document: CanonicalPersonalBriefDocumentIR,
     datasets: dict[str, list[dict[str, Any]]],
     credit_summary: dict[str, Any],
+    *,
+    account_requirements: list[dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     del credit_summary  # summary totals and displayed detail have intentionally different scopes
+    if account_requirements is None:
+        account_requirements = _account_source_requirements(document, datasets.get("credit_accounts", []))
     expected, basis = _expected_record_counts(document, datasets)
     output: dict[str, dict[str, Any]] = {}
     for dataset_name, rows in datasets.items():
@@ -1268,6 +1342,7 @@ def _dataset_completeness(
         invalid_provenance_ids: list[str] = []
         uncovered_boundary_ids: list[str] = []
         duplicate_boundary_ids: list[str] = []
+        missing_source_fields: list[dict[str, Any]] = []
         required = _REQUIRED_FIELDS.get(dataset_name, ())
         for index, row in enumerate(rows, start=1):
             row_id = _record_identifier(dataset_name, row, index)
@@ -1276,6 +1351,16 @@ def _dataset_completeness(
             if not _valid_record_provenance(document, row):
                 invalid_provenance_ids.append(row_id)
         if dataset_name == "credit_accounts":
+            missing_source_fields = [
+                {
+                    "source_section": requirement["source_section"],
+                    "source_sequence": requirement["source_sequence"],
+                    "fields": list(requirement["missing_fields"]),
+                    "source_pages": list(requirement["source_pages"]),
+                }
+                for requirement in account_requirements
+                if requirement["missing_fields"]
+            ]
             account_expectations = _account_boundary_expectations(document)
             for section_key, section_expected in account_expectations.items():
                 section_rows = [
@@ -1321,6 +1406,7 @@ def _dataset_completeness(
             and not invalid_provenance_ids
             and not uncovered_boundary_ids
             and not duplicate_boundary_ids
+            and not missing_source_fields
             and not present_but_unobserved
         )
         if verified and not present_sections and not rows:
@@ -1343,6 +1429,7 @@ def _dataset_completeness(
             "invalid_provenance_record_ids": invalid_provenance_ids,
             "uncovered_boundary_ids": uncovered_boundary_ids,
             "duplicate_boundary_ids": duplicate_boundary_ids,
+            "missing_source_fields": missing_source_fields,
             "present_but_unobserved": present_but_unobserved,
             "verified": verified,
             "basis": basis.get(dataset_name, "canonical_source_record_boundaries"),
@@ -1384,6 +1471,7 @@ def _extraction_report(
                             "present_but_unobserved",
                             "uncovered_boundary_ids",
                             "duplicate_boundary_ids",
+                            "missing_source_fields",
                         )
                     )
                     else "warning"
@@ -1583,6 +1671,7 @@ def extract_personal_brief_semantic_document(
         accounts.extend(_extract_account_section(document, section_key, page_texts))
     liabilities = _repayment_liabilities_from_canonical_records(document)
     inquiries = _inquiry_records(document)
+    inquiry_scope = _inquiry_scope(document)
     overdue = _overdue_from_personal_brief_accounts(accounts)
     summary_text = _summary_source_text(document, text, document.full_text)
     source_summary = _personal_brief_summary_from_canonical_tables(
@@ -1652,6 +1741,10 @@ def extract_personal_brief_semantic_document(
             record["evidence_ids"] = list(summary_evidence)
     non_credit_page, non_credit_statement = _statement_after(blocks, "非信贷交易记录")
     public_page, public_statement = _statement_after(blocks, "公共记录")
+    non_credit_lookback_years = extract_personal_brief_lookback_years(
+        non_credit_statement
+    )
+    public_lookback_years = extract_personal_brief_lookback_years(public_statement)
     notes = _report_notes(blocks)
     institution_statements = _institution_statement_records(document)
 
@@ -1708,7 +1801,7 @@ def extract_personal_brief_semantic_document(
                 if datasets.get("postpaid_records") or non_credit_statement
                 else "unresolved"
             ),
-            "lookback_years": 5 if "5年" in non_credit_statement else None,
+            "lookback_years": non_credit_lookback_years,
             "source_statement": non_credit_statement,
             "source_page": non_credit_page or None,
         },
@@ -1722,7 +1815,7 @@ def extract_personal_brief_semantic_document(
                 if public_datasets.get("public_records") or public_statement
                 else "unresolved"
             ),
-            "lookback_years": 5 if "5年" in public_statement else None,
+            "lookback_years": public_lookback_years,
             "source_statement": public_statement,
             "source_page": public_page or None,
         },
@@ -1730,8 +1823,38 @@ def extract_personal_brief_semantic_document(
         "canonical_ir_schema_version": document.schema_version,
     }
     facts = {key: value for key, value in facts.items() if value not in (None, "")}
-    completeness = _dataset_completeness(document, datasets, credit_summary)
+    if inquiry_scope:
+        facts["inquiry_record_summary"] = inquiry_scope
+    account_requirements = _account_source_requirements(document, accounts)
+    completeness = _dataset_completeness(
+        document, datasets, credit_summary, account_requirements=account_requirements
+    )
     extraction = _extraction_report(document, datasets, completeness)
+    section_requirements = []
+    for section_type, years, page in (
+        ("non_credit_transactions", non_credit_lookback_years, non_credit_page),
+        ("public_records", public_lookback_years, public_page),
+    ):
+        if years is not None:
+            section_requirements.append(
+                {
+                    "section_type": section_type,
+                    "fields": {"lookback_years": years},
+                    "source_pages": [page] if page else [],
+                }
+            )
+    if inquiry_scope:
+        section_requirements.append(
+            {
+                "section_type": "inquiries",
+                "fields": {"lookback_years": inquiry_scope["lookback_years"]},
+                "source_pages": inquiry_scope["source_pages"],
+            }
+        )
+    extraction["source_field_coverage"] = {
+        "accounts": account_requirements,
+        "sections": section_requirements,
+    }
     return PersonalBriefSemanticDocument(
         facts=facts,
         datasets=datasets,

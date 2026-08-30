@@ -32,6 +32,23 @@ _MARKDOWN_ENUM_LABELS = {
     "direction_filter": {"income": "收入", "expense": "支出", "all": "全部"},
     "sort_order": {"asc": "升序", "ascending": "升序", "desc": "降序", "descending": "降序"},
     "document_type": {"bank_statement": "银行流水", "bank_reconciliation": "银行对账单"},
+    "scope": {"document": "整份文档", "page": "单页", "pages": "多页"},
+    "metadata_field": {
+        "page_label": "页码",
+        "seal_code": "印章编码",
+        "seal_type": "印章类型",
+        "issuing_bank": "签发银行",
+        "issuing_branch": "签发机构",
+        "print_channel": "打印渠道",
+        "print_timestamp": "打印时间",
+        "print_time": "打印时刻",
+        "statement_cutoff_timestamp": "交易明细截止时间",
+        "debit_count": "本页支出笔数",
+        "debit_total": "本页支出合计",
+        "credit_count": "本页收入笔数",
+        "credit_total": "本页收入合计",
+        "other": "其他来源元数据",
+    },
 }
 
 
@@ -59,6 +76,7 @@ def evidence_delivery(evidence: dict) -> dict:
 
 
 def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
+    from docmirror.output.bank_business_view import source_fact_represented_by_metadata
     from scripts.validate.bank_compact_exports import _first_difference
 
     def equal(expected: Any, actual: Any, subject: str) -> None:
@@ -121,6 +139,13 @@ def assert_business_value_conservation(original: dict, cleaned: dict) -> None:
                 name = item["name"]
                 occurrences[name] += 1
                 identity = (name, occurrences[name])
+                if before["name"] == "statement_header" and source_fact_represented_by_metadata(
+                    original, name, item["value"]
+                ):
+                    # The fact was upgraded into the normalized, page-scoped
+                    # source_metadata schema; requiring a second dynamic header
+                    # column would test duplication rather than conservation.
+                    continue
                 # A literal source label matching a reserved implementation key
                 # is still a business field. Only explicit page summaries in
                 # statement headers may be omitted from source promotions.

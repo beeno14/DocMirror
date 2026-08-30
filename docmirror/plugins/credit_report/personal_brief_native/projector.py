@@ -92,6 +92,7 @@ _PUBLIC_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
         "contract_maturity_date",
         "credit_line_expiry_date",
         "credit_line_validity_type",
+        "is_revolving",
         "termination_event_date",
         "termination_event_type",
         "account_currency",
@@ -571,7 +572,6 @@ def _project_business_dataset(
                     for key in field_order
                     if key in source_normalized and _has_business_value(source_normalized[key])
                 },
-                "source": {},
             }
         )
 
@@ -852,6 +852,10 @@ def derive_personal_brief_projection(
     )
 
     datasets: dict[str, list[dict[str, Any]]] = {}
+    observed_account_fields = {
+        (entry["source_section"], entry["source_sequence"]): entry["fields"].get("credit_accounts", {})
+        for entry in semantic_document.extraction_report.get("source_field_coverage", {}).get("accounts", [])
+    }
     for name, rows in raw_datasets.items():
         if not rows:
             continue
@@ -866,9 +870,17 @@ def derive_personal_brief_projection(
                     # so preserve this personal-brief contract explicitly.
                     normalized_payload["content"] = row["content"]
                 if name == "credit_accounts":
-                    for field in ("source_section", "source_sequence", "business_category"):
+                    for field in ("source_section", "source_sequence", "business_category", "is_revolving"):
                         if row.get(field) not in (None, ""):
                             normalized_payload[field] = row[field]
+                    observed = observed_account_fields.get(
+                        (row.get("source_section"), row.get("source_sequence")), {}
+                    )
+                    for field in ("credit_limit", "used_amount", "loan_amount", "balance"):
+                        if field in observed and row.get(field) in (None, ""):
+                            # A source-present value that failed decoding is an
+                            # extraction warning, never a claim of source absence.
+                            normalized_payload.pop(f"{field}_status", None)
                 normalized_rows.append(normalized)
             datasets[name] = normalized_rows
         else:

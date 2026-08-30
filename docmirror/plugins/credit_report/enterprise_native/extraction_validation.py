@@ -16,6 +16,22 @@ _SPACE = re.compile(r"\s+")
 _NUMBER = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _DATE_DIGITS = re.compile(r"\d")
 _LABEL_SUFFIX = re.compile(r"^[：:]+")
+_CANONICAL_REPORT_NUMBER_RE = re.compile(
+    r"(?:NO\.?|报告编号[:：]?)(?P<value>[0-9]{16,32})",
+    re.IGNORECASE,
+)
+_CANONICAL_QUERY_INSTITUTION_RE = re.compile(
+    r"查询机构[:：]?(?P<value>.+?)(?=报告时间[:：]?|$)"
+)
+_CANONICAL_REPORT_TIME_RE = re.compile(
+    r"报告时间[:：]?(?P<value>(?:19|20)\d{2}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+)
+_CANONICAL_HISTORY_HEADER_RE = re.compile(
+    r"(?:查看)?(?:过去|近(?:期)?|最近)(?P<months>\d+)个月(?:的)?"
+    r"(?:(?:住房公积金|社会保险|社会保障|公积金|社保))?"
+    r"(?:缴费|缴存)情况"
+)
+_CANONICAL_HISTORY_STATUS_RE = re.compile(r"^(?P<status>详?见附件)[。.;；]*$")
 _MISSING_MARKERS = frozenset(
     {
         "",
@@ -67,6 +83,7 @@ _CONTINUATION_DATASETS = {
     "repayment_liability": "enterprise_repayment_responsibility_accounts",
     "attachment_account": "enterprise_attachment_accounts",
     "attachment_credit_detail": "enterprise_attachment_credit_details",
+    "special_transaction": "enterprise_special_transactions",
 }
 
 
@@ -550,6 +567,257 @@ def _validate_singleton_fields(
     return failures, checked, satisfied, verified_equal, present_unverified
 
 
+def _positive_conservation_warning(
+    *,
+    dataset: str,
+    record_id: str,
+    field_name: str,
+    source_label: str,
+    source_value: Any,
+    extracted_value: Any,
+    source_pages: tuple[int, ...],
+    source_refs: tuple[dict[str, Any], ...],
+) -> EnterpriseExtractionFailure:
+    missing = extracted_value in (None, "")
+    return EnterpriseExtractionFailure(
+        code=(
+            "CANONICAL_POSITIVE_FIELD_NOT_CONSERVED"
+            if missing
+            else "CANONICAL_POSITIVE_FIELD_VALUE_MISMATCH"
+        ),
+        severity="warning",
+        message=(
+            f"Canonical source field {source_label} is positively populated but "
+            f"{dataset}.{field_name} is absent."
+            if missing
+            else f"Canonical source field {source_label} conflicts with {dataset}.{field_name}."
+        ),
+        stage="canonical_validation",
+        path=f"/data/{dataset}/{record_id}/{field_name}",
+        dataset=dataset,
+        record_id=record_id,
+        field_name=field_name,
+        source_pages=source_pages,
+        source_refs=source_refs,
+        evidence={
+            "source_label": source_label,
+            "source_value": source_value,
+            **(
+                {"extracted_value": extracted_value}
+                if extracted_value not in (None, "")
+                else {}
+            ),
+        },
+    )
+
+
+def _positive_report_metadata_evidence(
+    document: CanonicalEnterpriseDocumentIR,
+) -> tuple[tuple[str, str, Any, tuple[int, ...], tuple[dict[str, Any], ...]], ...]:
+    compact = _compact(document.full_text)
+    evidence: list[
+        tuple[str, str, Any, tuple[int, ...], tuple[dict[str, Any], ...]]
+    ] = []
+    patterns = (
+        ("report_number", "报告编号", _CANONICAL_REPORT_NUMBER_RE),
+        ("query_institution", "查询机构", _CANONICAL_QUERY_INSTITUTION_RE),
+        ("report_time", "报告时间", _CANONICAL_REPORT_TIME_RE),
+    )
+    for field_name, label, pattern in patterns:
+        match = pattern.search(compact)
+        if not match:
+            continue
+        pages = tuple(
+            sorted(
+                page
+                for page, text in document.page_texts.items()
+                if pattern.search(_compact(text))
+            )
+        )
+        refs: list[dict[str, Any]] = []
+        for source_unit in document.source_units:
+            if label not in _compact(source_unit.text):
+                continue
+            source_ref = {
+                "source": source_unit.source_view,
+                "page": source_unit.source_page,
+            }
+            if source_ref not in refs:
+                refs.append(source_ref)
+        evidence.append(
+            (
+                field_name,
+                label,
+                match.group("value"),
+                pages or (1,),
+                tuple(refs) or tuple(
+                    {"source": "canonical_native_text", "page": page}
+                    for page in (pages or (1,))
+                ),
+            )
+        )
+    if "自主查询版" in compact:
+        pages = tuple(
+            page
+            for page, text in document.page_texts.items()
+            if "自主查询版" in _compact(text)
+        ) or (1,)
+        evidence.append(
+            (
+                "report_edition",
+                "报告版本",
+                "independent_query",
+                pages,
+                tuple(
+                    {"source": "canonical_native_text", "page": page}
+                    for page in pages
+                ),
+            )
+        )
+    return tuple(evidence)
+
+
+def _positive_history_evidence(
+    document: CanonicalEnterpriseDocumentIR,
+) -> tuple[tuple[int, str, int, int, str], ...]:
+    evidence: list[tuple[int, str, int, int, str]] = []
+    for page, table_id, rows in document.table_rows:
+        for header_row_index, row in enumerate(rows):
+            for column_index, cell in enumerate(row):
+                match = _CANONICAL_HISTORY_HEADER_RE.search(_compact(cell))
+                if not match:
+                    continue
+                for value_row_index in range(header_row_index + 1, len(rows)):
+                    value_row = rows[value_row_index]
+                    if column_index >= len(value_row):
+                        continue
+                    status = _CANONICAL_HISTORY_STATUS_RE.fullmatch(
+                        _compact(value_row[column_index])
+                    )
+                    if status:
+                        evidence.append(
+                            (
+                                int(page),
+                                str(table_id),
+                                value_row_index,
+                                int(match.group("months")),
+                                status.group("status"),
+                            )
+                        )
+    return tuple(dict.fromkeys(evidence))
+
+
+def _record_references_table_row(
+    record: dict[str, Any],
+    *,
+    page: int,
+    table_id: str,
+    row_index: int,
+) -> bool:
+    for ref in record.get("source_refs") or ():
+        if not isinstance(ref, dict):
+            continue
+        ref_page = ref.get("page", ref.get("source_page"))
+        ref_table = ref.get("table_id", ref.get("source_table_id"))
+        if ref_page == page and str(ref_table or "") == table_id and ref.get("row") == row_index:
+            return True
+    return False
+
+
+def _positive_canonical_field_failures(
+    document: CanonicalEnterpriseDocumentIR,
+    datasets: dict[str, list[dict[str, Any]]],
+) -> tuple[list[EnterpriseExtractionFailure], int, int]:
+    """Warn when uniquely positive canonical evidence is not conserved."""
+
+    failures: list[EnterpriseExtractionFailure] = []
+    checked = 0
+    satisfied = 0
+
+    metadata_dataset = "enterprise_report_metadata"
+    metadata_records = datasets.get(metadata_dataset) or []
+    metadata_record = metadata_records[0] if metadata_records else {}
+    metadata_record_id = _record_id(metadata_dataset, metadata_record, 1)
+    for field_name, label, expected, pages, refs in _positive_report_metadata_evidence(document):
+        checked += 1
+        extracted = _record_value(metadata_record, field_name)
+        equivalent = _compact(extracted) == _compact(expected)
+        if equivalent:
+            satisfied += 1
+            continue
+        failures.append(
+            _positive_conservation_warning(
+                dataset=metadata_dataset,
+                record_id=metadata_record_id,
+                field_name=field_name,
+                source_label=label,
+                source_value=expected,
+                extracted_value=extracted,
+                source_pages=pages,
+                source_refs=refs,
+            )
+        )
+
+    history_datasets = (
+        "enterprise_public_utility_payment_records",
+        "enterprise_public_housing_fund_payment_records",
+        "enterprise_public_social_security_payment_records",
+    )
+    for page, table_id, row_index, months, status in _positive_history_evidence(document):
+        matches: list[tuple[str, int, dict[str, Any]]] = []
+        for dataset in history_datasets:
+            for index, record in enumerate(datasets.get(dataset) or (), start=1):
+                if _record_references_table_row(
+                    record,
+                    page=page,
+                    table_id=table_id,
+                    row_index=row_index,
+                ):
+                    matches.append((dataset, index, record))
+        if not matches:
+            for dataset in history_datasets:
+                for index, record in enumerate(datasets.get(dataset) or (), start=1):
+                    if (
+                        record.get("source_page") == page
+                        and str(record.get("source_table_id") or "") == table_id
+                    ):
+                        matches.append((dataset, index, record))
+        if not matches:
+            matches.append(("enterprise_public_records", 1, {}))
+        for dataset, index, record in matches:
+            record_id = _record_id(dataset, record, index)
+            refs = (
+                {
+                    "source": "canonical_physical_table",
+                    "page": page,
+                    "table_id": table_id,
+                    "row": row_index,
+                },
+            )
+            for field_name, label, expected in (
+                ("history_period_months", "过去缴费情况月数", months),
+                ("history_status", "过去缴费情况状态", status),
+            ):
+                checked += 1
+                extracted = _record_value(record, field_name)
+                if _compact(extracted) == _compact(expected):
+                    satisfied += 1
+                    continue
+                failures.append(
+                    _positive_conservation_warning(
+                        dataset=dataset,
+                        record_id=record_id,
+                        field_name=field_name,
+                        source_label=label,
+                        source_value=expected,
+                        extracted_value=extracted,
+                        source_pages=(page,),
+                        source_refs=refs,
+                    )
+                )
+    return failures, checked, satisfied
+
+
 def _record_contract_failures(
     datasets: dict[str, list[dict[str, Any]]],
     continuation_audit: Iterable[dict[str, Any]],
@@ -594,6 +862,9 @@ def _record_contract_failures(
         )
     for dataset, details in dataset_completeness.items():
         if dataset in failed_datasets or details.get("verified") is not False:
+            continue
+        if details.get("status") == "unverified":
+            # No independent denominator is not a proven extraction failure.
             continue
         checked += 1
         failures.append(
@@ -992,11 +1263,15 @@ def build_enterprise_extraction_report(
     )
     amount_failures, amount_checked = _attachment_amount_resolution_failures(datasets)
     public_failures, public_checked = _public_resolution_failures(public_records)
+    positive_failures, positive_checked, positive_satisfied = (
+        _positive_canonical_field_failures(document, datasets)
+    )
     failures.extend(singleton_failures)
     failures.extend(row_failures)
     failures.extend(record_failures)
     failures.extend(amount_failures)
     failures.extend(public_failures)
+    failures.extend(positive_failures)
     failures.extend(_unstructured_content_failures(datasets, labels))
 
     deduplicated: list[EnterpriseExtractionFailure] = []
@@ -1009,8 +1284,8 @@ def build_enterprise_extraction_report(
         deduplicated.append(failure)
     fatal = any(failure.code == "INPUT_INTEGRITY_VIOLATION" for failure in deduplicated)
     status = "failed" if fatal else "partial" if deduplicated else "complete"
-    checked_fields = singleton_checked + row_checked
-    satisfied_fields = singleton_satisfied + row_satisfied
+    checked_fields = singleton_checked + row_checked + positive_checked
+    satisfied_fields = singleton_satisfied + row_satisfied + positive_satisfied
     return EnterpriseExtractionReport(
         status=status,
         failures=tuple(deduplicated),
@@ -1022,6 +1297,7 @@ def build_enterprise_extraction_report(
             "present_unverified_field_count": singleton_unverified + row_unverified,
             "record_contract_count": record_checked,
             "semantic_resolution_check_count": amount_checked + public_checked,
+            "positive_field_conservation_check_count": positive_checked,
             "source_component_count": len(document.components),
             "source_components_conserved": bool(document.entity_context.content_conserved),
         },

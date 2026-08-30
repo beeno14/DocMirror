@@ -18,6 +18,9 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from docmirror.plugins.credit_report.enterprise_native.continuation import TableFragment
+from docmirror.plugins.credit_report.enterprise_native.header_visual_recovery import (
+    recover_enterprise_header_visual_fields,
+)
 from docmirror.plugins.credit_report.enterprise_native.input_quality import (
     assess_enterprise_parse_result,
 )
@@ -320,6 +323,7 @@ class _CollectedEnterpriseSource:
     source_pages: tuple[int, ...]
     page_modes: Mapping[int, str]
     origins: Mapping[str, CanonicalEnterpriseSourceUnit]
+    recovery_quality_flags: tuple[dict[str, Any], ...] = ()
 
 
 def _flow_inventory(parse_result: Any) -> tuple[dict[str, int], list[Any]]:
@@ -665,6 +669,34 @@ def _collect_enterprise_source(parse_result: Any) -> _CollectedEnterpriseSource:
             for evidence_id in _value(pair, "evidence_ids") or ():
                 register_alias(str(evidence_id or ""), unit_id)
 
+    header_recovery = recover_enterprise_header_visual_fields(
+        parse_result,
+        existing_text="\n".join(
+            str(item.get("text") or "") for item in candidates.values() if item.get("text")
+        ),
+    )
+    for recovery_index, field in enumerate(header_recovery.fields, start=1):
+        label = {"report_number": "\u62a5\u544a\u7f16\u53f7"}.get(
+            field.field_name,
+            field.field_name,
+        )
+        source_pages.add(field.source_page)
+        page_modes.setdefault(field.source_page, "native_text")
+        add_candidate(
+            unit_id=f"visual_header:{field.field_name}:p{field.source_page}",
+            source_view="bounded_header_visual_recovery",
+            kind="text",
+            source_page=field.source_page,
+            page_instance=1,
+            source_index=recovery_index,
+            text=f"{label}\uff1a{field.value}",
+            bbox=field.bbox,
+            reading_order=recovery_index,
+            source_id=f"bounded_header_visual_recovery:{field.field_name}:p{field.source_page}",
+            source_key=label,
+            source_value=field.value,
+        )
+
     logical_views: list[CanonicalEnterpriseLogicalTable] = []
     used_logical_ids: set[str] = set()
     logical_aliases: dict[str, str] = {}
@@ -863,6 +895,9 @@ def _collect_enterprise_source(parse_result: Any) -> _CollectedEnterpriseSource:
         source_pages=tuple(sorted(page for page in source_pages if page > 0)),
         page_modes=MappingProxyType(page_modes),
         origins=MappingProxyType(origins),
+        recovery_quality_flags=tuple(
+            flag.to_payload() for flag in header_recovery.quality_flags
+        ),
     )
 
 
@@ -1073,10 +1108,13 @@ def build_canonical_enterprise_document(parse_result: Any) -> CanonicalEnterpris
     if isinstance(parse_result, CanonicalEnterpriseDocumentIR):
         return parse_result
 
-    input_quality_flags = tuple(
+    structural_input_quality_flags = tuple(
         flag.to_payload() for flag in assess_enterprise_parse_result(parse_result)
     )
     collected = _collect_enterprise_source(parse_result)
+    input_quality_flags = tuple(
+        [*structural_input_quality_flags, *collected.recovery_quality_flags]
+    )
     context = decode_credit_report_units(
         collected.units,
         report_family="enterprise",
