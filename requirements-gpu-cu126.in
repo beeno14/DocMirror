@@ -1,0 +1,10 @@
+# DocMirror hybrid GPU deployment input (CUDA 12.6).
+# Compile for the deployment platform with:
+#   uv pip compile requirements-gpu-cu126.in --python-version 3.12 \
+#     --python-platform x86_64-manylinux_2_28 --emit-index-url \
+#     --emit-find-links -o requirements-gpu-cu126.txt
+--index-url https://pypi.org/simple
+--find-links https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/
+
+.[gpu]
+paddlepaddle-gpu==3.3.1

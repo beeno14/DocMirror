@@ -30,7 +30,18 @@ def test_bundled_domains_use_the_unified_post_seal_registry(monkeypatch) -> None
     registry = PluginRegistry()
 
     assert len(get_canonical_premium_domains()) == 6
-    assert len(registry.list_providers()) == 7
+    assert {provider.provider_id for provider in registry.list_providers()} == {
+        "bundled.alipay_payment",
+        "bundled.audit_report",
+        "bundled.bank_statement",
+        "bundled.business_license",
+        "bundled.credit_report",
+        "bundled.financial_statement",
+        "bundled.generic",
+        "bundled.tax_return",
+        "bundled.vat_invoice",
+        "bundled.wechat_payment",
+    }
     assert registry.get_projector("bank_statement", "community") is not None
     assert registry.get_projector("bank_statement", "enterprise") is None
 

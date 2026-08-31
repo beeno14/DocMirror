@@ -150,6 +150,9 @@ class DocMirrorSettings:
     ocr_dpi: int = 150
     ocr_retry_dpi: int = 300
     ocr_language: str = "auto"
+    ocr_backend: str = "auto"
+    paddle_ocr_device: str = "gpu:0"
+    paddle_ocr_profile: str = "server"
     validator_pass_threshold: float = 0.7
     log_level: str = "INFO"
     fail_strategy: str = "skip"
@@ -209,6 +212,18 @@ class DocMirrorSettings:
             max_pages=_env_int("DOCMIRROR_MAX_PAGES", int(business.get("max_pages", 200))),
             max_page_concurrency=max_conc,
             ocr_dpi=int(layout_cfg.get("render_dpi", 150)),
+            ocr_backend=_env_str(
+                "DOCMIRROR_OCR_BACKEND",
+                str(ocr_cfg.get("provider", "auto")),
+            ),
+            paddle_ocr_device=_env_str(
+                "DOCMIRROR_PADDLE_DEVICE",
+                str(ocr_cfg.get("paddle_device", "gpu:0")),
+            ),
+            paddle_ocr_profile=_env_str(
+                "DOCMIRROR_PADDLE_PROFILE",
+                str(ocr_cfg.get("paddle_profile", "server")),
+            ),
             validator_pass_threshold=_env_float(
                 "DOCMIRROR_VALIDATOR_THRESHOLD",
                 float(business.get("validator_pass_threshold", 0.7)),
@@ -312,6 +327,11 @@ class DocMirrorSettings:
             "enhance_mode": self.default_enhance_mode,
             "EvidenceEngine": {},
             "Validator": {"pass_threshold": self.validator_pass_threshold},
+            "OCR": {
+                "backend": self.ocr_backend,
+                "paddle_device": self.paddle_ocr_device,
+                "paddle_profile": self.paddle_ocr_profile,
+            },
             "MirrorCore": {
                 "schema": self.mirror_core_schema,
                 "profile": self.mirror_core_profile,

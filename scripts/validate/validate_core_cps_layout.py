@@ -187,6 +187,22 @@ def _py_files(base: Path) -> list[Path]:
     return [p for p in base.rglob("*.py") if "__pycache__" not in p.parts]
 
 
+def _has_material_content(path: Path) -> bool:
+    """Ignore generated cache-only remnants when validating removed folders."""
+
+    if path.is_file():
+        return True
+    if not path.is_dir():
+        return False
+    return any(
+        candidate.is_file()
+        and "__pycache__" not in candidate.relative_to(path).parts
+        and candidate.suffix != ".pyc"
+        and candidate.name != ".DS_Store"
+        for candidate in path.rglob("*")
+    )
+
+
 def _imports_in_file(path: Path) -> list[str]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -203,7 +219,11 @@ def _imports_in_file(path: Path) -> list[str]:
 
 def main() -> int:
     errors: list[str] = []
-    actual_top_level_dirs = {p.name for p in DOCMIRROR.iterdir() if p.is_dir() and p.name != "__pycache__"}
+    actual_top_level_dirs = {
+        p.name
+        for p in DOCMIRROR.iterdir()
+        if p.is_dir() and p.name != "__pycache__" and _has_material_content(p)
+    }
     unexpected = sorted(actual_top_level_dirs - EXPECTED_TOP_LEVEL_DIRS)
     missing = sorted(EXPECTED_TOP_LEVEL_DIRS - actual_top_level_dirs)
     for name in unexpected:
@@ -217,7 +237,7 @@ def main() -> int:
         if not path.is_file():
             errors.append(f"missing file: {path.relative_to(ROOT)}")
     for path in REMOVED_PATHS:
-        if path.exists():
+        if _has_material_content(path):
             errors.append(f"removed path still exists: {path.relative_to(ROOT)}")
 
     for path in _py_files(DOCMIRROR) + _py_files(ROOT / "tests") + _py_files(ROOT / "scripts"):

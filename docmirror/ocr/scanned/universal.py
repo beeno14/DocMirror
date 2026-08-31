@@ -95,8 +95,8 @@ def _group_words_into_lines(words: list[tuple], y_tolerance: float = 12.0) -> li
     return lines
 
 
-def _words_to_ocr_tokens(words: list[tuple], *, page_idx: int) -> list[OCRToken]:
-    """Convert RapidOCR word tuples to OCRToken objects using the universal factory.
+def _words_to_ocr_tokens(words: list[tuple], *, page_idx: int, source: str = "ocr") -> list[OCRToken]:
+    """Convert canonical OCR word tuples to OCRToken objects.
 
     Returns OCRToken objects so downstream consumers get rich typed data
     with bbox, confidence, source tracking, and confidence_tier.
@@ -105,11 +105,20 @@ def _words_to_ocr_tokens(words: list[tuple], *, page_idx: int) -> list[OCRToken]
     tokens: list[OCRToken] = []
     for idx, word in enumerate(words or []):
         try:
-            token = OCRToken.from_rapidocr_word(word, page=page_idx + 1, source="rapidocr", idx=idx)
+            token = OCRToken.from_ocr_word(word, page=page_idx + 1, source=source, idx=idx)
             tokens.append(token)
         except (ValueError, TypeError):
             continue
     return tokens
+
+
+def _active_local_ocr_source() -> str:
+    try:
+        from docmirror.ocr.vision.engine import get_ocr_engine
+
+        return str(get_ocr_engine().source_id)
+    except Exception:
+        return "ocr"
 
 
 def _correct_general_words(
@@ -317,6 +326,7 @@ def ocr_extract_universal(
                             pre_existing_words=table_words,
                             pre_existing_img=img,
                             pre_existing_page_h=page_h,
+                            ocr_source="external_ocr",
                         )
                         if table_result:
                             table_result["content_type"] = "table"
@@ -330,7 +340,7 @@ def ocr_extract_universal(
                                 locale=correction_locale,
                                 pack_ids=correction_pack_ids,
                             )
-                    raw_tokens = _words_to_ocr_tokens(all_words, page_idx=page_idx)
+                    raw_tokens = _words_to_ocr_tokens(all_words, page_idx=page_idx, source="external_ocr")
                     corrected_words, correction_audit = _correct_general_words(
                         all_words,
                         page_idx=page_idx,
@@ -357,6 +367,8 @@ def ocr_extract_universal(
         if all_words is None:
             return None
 
+        local_ocr_source = _active_local_ocr_source()
+
         page_w = img.shape[1] if img is not None else 0
 
         # Decide: table or general?
@@ -372,6 +384,7 @@ def ocr_extract_universal(
                 pre_existing_words=table_words,
                 pre_existing_img=img,
                 pre_existing_page_h=page_h,
+                ocr_source=local_ocr_source,
             )
             if table_result:
                 table_result["content_type"] = "table"
@@ -388,7 +401,7 @@ def ocr_extract_universal(
             # If table pipeline fails, fall through to general
 
         # General document: output all text lines in reading order
-        tokens_for_general = _words_to_ocr_tokens(all_words, page_idx=page_idx)
+        tokens_for_general = _words_to_ocr_tokens(all_words, page_idx=page_idx, source=local_ocr_source)
         corrected_words, correction_audit = _correct_general_words(
             all_words,
             page_idx=page_idx,

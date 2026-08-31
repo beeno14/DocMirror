@@ -236,7 +236,7 @@ def test_community_mirror_document_type_consistency():
 
 def test_enterprise_not_generated_when_package_missing():
     try:
-        importlib.import_module("docmirror_enterprise")
+        importlib.import_module("docmirror_enterprise.enable")
     except ImportError:
         outputs = build_all_projections(seal_parse_result(_minimal_mirror()))
         assert outputs["enterprise"] is None

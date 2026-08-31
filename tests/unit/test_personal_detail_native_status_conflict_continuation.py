@@ -9,11 +9,11 @@ from typing import Any
 
 import pytest
 
-from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
-    apply_candidate_b_native_status_conflict_guard,
-)
 from docmirror.plugins.credit_report.personal_detail_scanned.candidate_b import (
     _withhold_repayment_plane_conflicts,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.native_status_conflict import (
+    apply_candidate_b_native_status_conflict_guard,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.schema import project_personal_detail_datasets
 

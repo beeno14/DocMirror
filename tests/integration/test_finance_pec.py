@@ -9,7 +9,7 @@ import importlib
 
 import pytest
 
-pytest.importorskip("docmirror_finance")
+pytest.importorskip("docmirror_finance.enable")
 pytestmark = [pytest.mark.integration]
 
 

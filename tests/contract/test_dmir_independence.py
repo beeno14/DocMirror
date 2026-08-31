@@ -227,7 +227,7 @@ class TestDMIRDeterminism:
         """Normal delivery must never import the on-demand DMIR serializer."""
         import docmirror.server.edition_outputs as eo
         import docmirror.server.output_builder as ob
-        src1 = open(ob.__file__).read()
-        src2 = open(eo.__file__).read()
+        src1 = open(ob.__file__, encoding="utf-8").read()
+        src2 = open(eo.__file__, encoding="utf-8").read()
         assert "serialize_dmir" not in src1
         assert "serialize_dmir" not in src2

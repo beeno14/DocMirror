@@ -23,8 +23,8 @@ from docmirror.models.entities.parse_result import (
     TextBlock,
 )
 from docmirror.models.sealed import seal_parse_result
-from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
 from docmirror.plugins.bank_statement import style_registry as style_registry_module
+from docmirror.plugins.bank_statement.community_plugin import BankStatementCommunityPlugin, _sanitize_bank_records
 from docmirror.plugins.bank_statement.context import StyleContext, build_style_context
 from docmirror.plugins.bank_statement.extract_pipeline import (
     _apply_source_reported_transaction_count,

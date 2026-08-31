@@ -2249,7 +2249,7 @@ def test_cross_page_native_income_expense_table_inherits_header():
 
 
 def test_removed_detector_is_not_registered():
-    pytest.importorskip("docmirror_enterprise", reason="enterprise package is not available in OSS CI")
+    pytest.importorskip("docmirror_enterprise.enable", reason="enterprise package is not available in OSS CI")
 
     with pytest.raises(ImportError):
         from docmirror_enterprise.plugins.bank_statement.detectors.template_detector import (  # noqa: F401

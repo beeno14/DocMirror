@@ -283,13 +283,15 @@ def _detect_business_license_copy_type(image: Any) -> str:
         import cv2
         import numpy as np
         from PIL import Image, ImageEnhance
-        from rapidocr_onnxruntime import RapidOCR
+
+        from docmirror.ocr.vision.engine import get_ocr_engine
 
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         gray = Image.fromarray(rgb).convert("L").rotate(45, expand=True, fillcolor=255)
         enhanced = ImageEnhance.Contrast(gray).enhance(2.0).convert("RGB")
-        results, _ = RapidOCR()(np.asarray(enhanced))
-        texts = [str(item[1] or "").strip() for item in results or [] if len(item) > 1]
+        enhanced_bgr = cv2.cvtColor(np.asarray(enhanced), cv2.COLOR_RGB2BGR)
+        results = get_ocr_engine().detect_image_words(enhanced_bgr)
+        texts = [str(item[4] or "").strip() for item in results or [] if len(item) > 4]
         if any("副本" in text for text in texts):
             return "副本"
         if any("正本" in text for text in texts):

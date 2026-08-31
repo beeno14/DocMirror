@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-pytest.importorskip("docmirror_finance")
+pytest.importorskip("docmirror_finance.enable")
 
 from docmirror_finance.plugins.wechat_payment.plugin import (
     WeChatPaymentFinancePlugin,

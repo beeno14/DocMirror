@@ -303,12 +303,13 @@ def _default_crop_ocr_runner(crop_path: Path, _asset: dict[str, Any]) -> dict[st
         img = cv2.imread(str(crop_path))
         if img is None:
             return {"status": "not_evaluated", "reason": "image_read_failed"}
-        words = get_ocr_engine().detect_image_words(img, multi_scale=False)
+        engine = get_ocr_engine()
+        words = engine.detect_image_words(img, multi_scale=False)
         text_items = [str(word[4]).strip() for word in words if len(word) >= 5 and str(word[4]).strip()]
         confidences = [float(word[8]) for word in words if len(word) >= 9]
         if text_items:
             return {
-                "engine": "rapidocr",
+                "engine": str(getattr(engine, "engine_id", "rapidocr_onnxruntime")),
                 "text": " ".join(text_items),
                 "confidence": sum(confidences) / len(confidences) if confidences else 0.8,
             }

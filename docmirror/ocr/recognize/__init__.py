@@ -14,6 +14,6 @@ Downstream: ``ocr.reconstruct``, ``ocr.postprocess``.
 """
 
 from docmirror.ocr.aistudio_provider import call_aistudio_layout_ocr
-from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
+from docmirror.ocr.vision.engine import get_ocr_engine
 
 __all__ = ["call_aistudio_layout_ocr", "get_ocr_engine"]

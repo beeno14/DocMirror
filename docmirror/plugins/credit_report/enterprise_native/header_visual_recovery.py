@@ -199,6 +199,8 @@ def _ocr_header_strip(page: Any, bbox: tuple[float, float, float, float]) -> tup
     zoom = 4.0
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    if image.ndim == 3 and image.shape[2] >= 3:
+        image = image[:, :, :3][:, :, ::-1].copy()  # PyMuPDF RGB -> OpenCV BGR
     if pix.n >= 3:
         image = image[:, :, :3]
     engine = get_ocr_engine()

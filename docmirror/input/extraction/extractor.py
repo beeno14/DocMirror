@@ -68,7 +68,7 @@ class _OcrLogicalPage:
 
 
 def _ocr_word_confidence(word: Any, default: float = 1.0) -> float:
-    """Read confidence from either legacy 6-tuples or RapidOCR word 9-tuples."""
+    """Read confidence from either legacy 6-tuples or canonical OCR 9-tuples."""
     for index in (-1, 8, 5):
         try:
             value = float(word[index])
@@ -77,6 +77,32 @@ def _ocr_word_confidence(word: Any, default: float = 1.0) -> float:
         if 0.0 <= value <= 1.0:
             return value
     return default
+
+
+def _ocr_backend_source(engine: Any, scope: str) -> str:
+    from docmirror.ocr.vision.backend import backend_source
+
+    return backend_source(engine, scope)
+
+
+def _ocr_backend_id(engine: Any) -> str:
+    return str(getattr(engine, "engine_id", "rapidocr_onnxruntime"))
+
+
+def _ocr_engine_id_from_pages(pages: list[Any]) -> str:
+    """Describe the engines that actually produced persisted OCR blocks."""
+
+    engine_ids: list[str] = []
+    for page in pages:
+        for block in getattr(page, "blocks", ()) or ():
+            engine_id = str((getattr(block, "attrs", None) or {}).get("ocr_engine") or "").strip()
+            if engine_id and engine_id not in engine_ids:
+                engine_ids.append(engine_id)
+    if not engine_ids:
+        return "local_ocr"
+    if len(engine_ids) == 1:
+        return engine_ids[0]
+    return "mixed:" + ",".join(engine_ids)
 
 
 def _selected_page_indices(plane: Any, parse_policy: Any) -> set[int]:
@@ -134,6 +160,7 @@ def _ocr_blocks_for_pdf_page(
     page_number: int,
     *,
     start_order: int = 0,
+    _failover_retry: bool = False,
 ) -> tuple[list[Block], Any | None, dict[str, Any]]:
     import fitz
 
@@ -150,17 +177,32 @@ def _ocr_blocks_for_pdf_page(
     if pix.n >= 3:
         image = image[:, :, :3]
 
+    if image.ndim == 3 and image.shape[2] >= 3:
+        image = image[:, :, :3][:, :, ::-1].copy()  # PyMuPDF RGB -> OpenCV BGR
+    engine = get_ocr_engine()
+    from docmirror.ocr.vision.backend import backend_revision
+
+    initial_backend_revision = backend_revision(engine)
     words, rotation, selected_image, page_width, page_height, ocr_metrics = _select_ocr_orientation(
-        image, get_ocr_engine(), zoom=zoom
+        image, engine, zoom=zoom
     )
     from docmirror.layout.normalization import hough_deskew_image
 
     selected_image, deskew = hough_deskew_image(selected_image)
     if deskew.get("applied") is True:
-        words = get_ocr_engine().detect_image_words(selected_image)
+        words = engine.detect_image_words(selected_image)
         ocr_metrics = _ocr_orientation_metrics(words)
         page_width = round(float(selected_image.shape[1]) / zoom, 4)
         page_height = round(float(selected_image.shape[0]) / zoom, 4)
+    if backend_revision(engine) != initial_backend_revision and not _failover_retry:
+        logger.info("OCR backend changed during physical page %s; restarting with %s", page_number, engine.engine_id)
+        return _ocr_blocks_for_pdf_page(
+            file_path,
+            page_index,
+            page_number,
+            start_order=start_order,
+            _failover_retry=True,
+        )
     deskew = {
         **deskew,
         "ocr_rotation": rotation,
@@ -189,7 +231,8 @@ def _ocr_blocks_for_pdf_page(
                 page=page_number,
                 raw_content=text,
                 attrs={
-                    "ocr_source": "rapidocr_pdf_page",
+                    "ocr_source": _ocr_backend_source(engine, "pdf_page"),
+                    "ocr_engine": _ocr_backend_id(engine),
                     "confidence": round(confidence, 4),
                     "ocr_rotation": rotation,
                     "ocr_orientation_score": ocr_metrics["score"],
@@ -208,6 +251,36 @@ def _ocr_blocks_for_pdf_page(
 
 
 def _select_ocr_orientation(
+    image: Any,
+    engine: Any,
+    *,
+    zoom: float,
+    forced_rotations: tuple[int, ...] = (),
+    probe_low_quality: bool = True,
+) -> tuple[list[Any], int, Any, float, float, dict[str, Any]]:
+    from docmirror.ocr.vision.backend import backend_revision
+
+    initial_backend_revision = backend_revision(engine)
+    result = _select_ocr_orientation_once(
+        image,
+        engine,
+        zoom=zoom,
+        forced_rotations=forced_rotations,
+        probe_low_quality=probe_low_quality,
+    )
+    if backend_revision(engine) != initial_backend_revision:
+        logger.info("OCR backend changed during orientation probing; restarting with %s", engine.engine_id)
+        result = _select_ocr_orientation_once(
+            image,
+            engine,
+            zoom=zoom,
+            forced_rotations=forced_rotations,
+            probe_low_quality=probe_low_quality,
+        )
+    return result
+
+
+def _select_ocr_orientation_once(
     image: Any,
     engine: Any,
     *,
@@ -369,7 +442,7 @@ def _probe_document_ocr_rotation(file_path: Path, spread_plan: DocumentSpreadPla
             pix = doc[source_page_number - 1].get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
         if pix.n >= 3:
-            image = image[:, :, :3]
+            image = image[:, :, :3][:, :, ::-1].copy()  # PyMuPDF RGB -> OpenCV BGR
         _words, rotation, _selected, _width, _height, _metrics = _select_ocr_orientation(
             image,
             get_ocr_engine(),
@@ -394,6 +467,7 @@ def _ocr_logical_pages_for_pdf_page(
     decision: PageSplitDecision,
     page_split_mode: str,
     preferred_rotation: int | None = None,
+    _failover_retry: bool = False,
 ) -> list[_OcrLogicalPage]:
     """OCR one physical page and return one or more logical page results."""
     if not decision.should_split:
@@ -462,9 +536,12 @@ def _ocr_logical_pages_for_pdf_page(
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     image = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
     if pix.n >= 3:
-        image = image[:, :, :3]
+        image = image[:, :, :3][:, :, ::-1].copy()  # PyMuPDF RGB -> OpenCV BGR
 
     engine = get_ocr_engine()
+    from docmirror.ocr.vision.backend import backend_revision
+
+    initial_backend_revision = backend_revision(engine)
     if preferred_rotation is not None and preferred_rotation in decision.rotation_candidates:
         rotation = int(preferred_rotation) % 360
         selected_image = _rotate_image(image, rotation)
@@ -523,6 +600,8 @@ def _ocr_logical_pages_for_pdf_page(
             page_height=deskewed_height,
             metrics=metrics,
             deskew=deskew,
+            ocr_source=_ocr_backend_source(engine, "pdf_logical_page"),
+            ocr_engine=_ocr_backend_id(engine),
         )
         transform = _logical_page_transform_from_slice(
             page_slice,
@@ -543,6 +622,24 @@ def _ocr_logical_pages_for_pdf_page(
                 image=deskewed_image,
             )
         )
+    if backend_revision(engine) != initial_backend_revision and not _failover_retry:
+        logger.info(
+            "OCR backend changed during logical page %s; restarting with %s",
+            source_page_number,
+            engine.engine_id,
+        )
+        return _ocr_logical_pages_for_pdf_page(
+            file_path,
+            page_index,
+            source_page_number,
+            logical_start=logical_start,
+            source_width=source_width,
+            source_height=source_height,
+            decision=decision,
+            page_split_mode=page_split_mode,
+            preferred_rotation=preferred_rotation,
+            _failover_retry=True,
+        )
     return out
 
 
@@ -557,6 +654,8 @@ def _ocr_words_to_blocks(
     page_height: float,
     metrics: dict[str, Any],
     deskew: dict[str, Any] | None = None,
+    ocr_source: str = "ocr_pdf_logical_page",
+    ocr_engine: str = "local_ocr",
 ) -> list[Block]:
     deskew = dict(deskew or {})
     blocks: list[Block] = []
@@ -580,7 +679,8 @@ def _ocr_words_to_blocks(
                 page=logical_page_number,
                 raw_content=text,
                 attrs={
-                    "ocr_source": "rapidocr_pdf_logical_page",
+                    "ocr_source": ocr_source,
+                    "ocr_engine": ocr_engine,
                     "confidence": round(confidence, 4),
                     "ocr_rotation": rotation,
                     "ocr_orientation_score": metrics["score"],
@@ -1395,7 +1495,7 @@ class CoreExtractor:
             "pipeline": "udtr_vnext",
             "elapsed_ms": round((_clock() - started_at) * 1000.0, 3),
             "extraction_method": extraction_method,
-            "ocr_engine": "rapidocr_onnxruntime" if has_scanned else None,
+            "ocr_engine": _ocr_engine_id_from_pages(pages) if has_scanned else None,
             "table_engine": (
                 "scanned_image_line_grid"
                 if table_count and has_scanned

@@ -144,6 +144,7 @@ def doctor() -> None:
         "core": ["pydantic", "yaml", "rich", "filetype", "click"],
         "pdf": ["fitz", "pdfplumber"],
         "ocr": ["numpy", "cv2", "rapidocr_onnxruntime"],
+        "ocr-paddle": ["numpy", "cv2", "rapidocr_onnxruntime", "paddle", "paddleocr"],
         "office": ["docx", "openpyxl", "pptx"],
         "server": ["fastapi", "uvicorn"],
         "ai": ["openai", "google.generativeai"],
@@ -157,6 +158,17 @@ def doctor() -> None:
             click.echo(f"- {name}: missing {', '.join(missing)}{install}")
         else:
             click.echo(f"- {name}: ok")
+    try:
+        from docmirror.ocr.vision.engine import get_ocr_backend_status
+
+        status = get_ocr_backend_status(initialize=False)
+        click.echo(
+            "- ocr-route: requested={requested}, active={active}, paddle={paddle_status}, device={paddle_device}".format(
+                **status
+            )
+        )
+    except Exception as exc:
+        click.echo(f"- ocr-route: unavailable ({exc})")
 
 
 def _find_spec_quiet(module_name: str) -> Any:

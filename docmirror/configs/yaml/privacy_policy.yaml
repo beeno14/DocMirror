@@ -56,6 +56,7 @@ redaction_profiles:
 provider_allowlist:
   ocr:
     - rapidocr
+    - paddleocr
     - paddlex_ocr
   vlm:
     - openai

@@ -1,0 +1,37 @@
+services:
+  docmirror-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+    image: docmirror:gpu-cu126
+    container_name: docmirror-gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      - docmirror_gpu_cache:/root/.cache
+      - docmirror_gpu_data:/root/.docmirror
+      - docmirror_gpu_models:/root/.paddlex
+    environment:
+      - DOCMIRROR_OCR_BACKEND=auto
+      - DOCMIRROR_PADDLE_DEVICE=gpu:0
+      - DOCMIRROR_PADDLE_PROFILE=server
+      - PADDLE_PDX_MODEL_SOURCE=BOS
+      # A Paddle model is process-local. Keep one parse and one file worker per
+      # GPU until deployment-specific VRAM/concurrency tests prove a higher cap.
+      - DOCMIRROR_MAX_ACTIVE_PARSES=1
+      - DOCMIRROR_MAX_QUEUED_PARSES=50
+      - DOCMIRROR_WORKERS_PER_PARSE=1
+      - DOCMIRROR_PARSE_TIMEOUT_SECONDS=1800
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  docmirror_gpu_cache:
+  docmirror_gpu_data:
+  docmirror_gpu_models:

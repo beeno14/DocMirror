@@ -1267,7 +1267,6 @@ def test_lin_field_repair_policy_reaches_target_without_replacing_pages() -> Non
         if key[0] != "institution" or key[1] not in date_repair_sequences:
             assert repaired["inquiry_date"] == discovery["inquiry_date"]
 
-    deferred_sequences = set(expected["deferred_repair_sequences"])
     assert date_repair_sequences.issubset(repaired_by_sequence)
     assert {8, 9}.issubset(repaired_by_sequence)
     assert all(

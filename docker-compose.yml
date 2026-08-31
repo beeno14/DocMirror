@@ -14,6 +14,8 @@ services:
       # Optional: Enable full enhancement mode for parsing
       - DOCMIRROR_ENHANCE_MODE=standard
       - DOCMIRROR_LOG_LEVEL=info
+      # Lightweight image: RapidOCR is the only local OCR backend installed.
+      - DOCMIRROR_OCR_BACKEND=rapidocr
       # Optional: Control concurrency
       - OMP_NUM_THREADS=4
       # Process-local FIFO: 10 active parses plus up to 50 waiting requests
@@ -32,7 +34,7 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
-    # Optional: If you intend to run GPU-accelerated OCR in the future
+    # For PaddleOCR GPU deployment use docker-compose.gpu.yml instead.
     # deploy:
     #   resources:
     #     reservations:

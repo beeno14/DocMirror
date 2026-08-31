@@ -1,0 +1,34 @@
+# Hybrid GPU runtime: PaddleOCR is primary and RapidOCR remains the fallback.
+FROM python:3.12-slim
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    DOCMIRROR_OCR_BACKEND=auto \
+    DOCMIRROR_PADDLE_DEVICE=gpu:0 \
+    DOCMIRROR_PADDLE_PROFILE=server \
+    PADDLE_PDX_MODEL_SOURCE=BOS
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# The Linux/CUDA lock is compiled from requirements-gpu-cu126.in. It contains
+# both OCR backends plus Paddle's CUDA-specific runtime wheel.
+RUN python -m pip install --no-cache-dir -r requirements-gpu-cu126.txt && \
+    python -m pip check && \
+    python -c "import paddle, paddleocr; assert paddle.is_compiled_with_cuda(); import docmirror"
+
+EXPOSE 8000
+VOLUME ["/root/.cache", "/root/.docmirror", "/root/.paddlex"]
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "docmirror.server.api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

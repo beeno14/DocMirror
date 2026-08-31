@@ -35,7 +35,7 @@ def _block_token(block: Any, *, page: int, index: int) -> dict[str, Any] | None:
         "bbox": [round(float(value), 4) for value in bbox],
         "confidence": round(confidence, 4),
         "page": page,
-        "source": str(attrs.get("ocr_source") or "rapidocr_pdf_logical_page"),
+        "source": str(attrs.get("ocr_source") or "ocr_pdf_logical_page"),
         "evidence_ids": evidence_ids or [token_id],
     }
 
@@ -91,7 +91,7 @@ def _group_tokens_into_lines(tokens: list[dict[str, Any]], *, page: int) -> list
                 ],
                 "confidence": round(confidence, 4),
                 "page": page,
-                "source": "rapidocr_pdf_logical_page",
+                "source": str(row[0].get("source") or "ocr_pdf_logical_page"),
                 "evidence_ids": list(dict.fromkeys(evidence_ids)),
                 "token_ids": [str(token["token_id"]) for token in row],
             }
@@ -115,6 +115,7 @@ def build_scanned_page_evidence_bundle(
         if (token := _block_token(block, page=page, index=index)) is not None
     ]
     lines = _group_tokens_into_lines(tokens, page=page)
+    bundle_source = str(tokens[0].get("source") if tokens else "ocr_pdf_logical_page")
 
     from docmirror.ocr.local_structure import extract_local_structure_evidence
 
@@ -132,7 +133,7 @@ def build_scanned_page_evidence_bundle(
         "source_page": source_page,
         "page_width": page_width,
         "page_height": page_height,
-        "source": "rapidocr_pdf_logical_page",
+        "source": bundle_source,
         "lines": lines,
         "tokens": tokens,
         "candidates": list(local.get("candidates") or []),
@@ -147,7 +148,7 @@ def build_scanned_page_evidence_bundle(
         "source_page": source_page,
         "page_width": page_width,
         "page_height": page_height,
-        "source": "rapidocr_pdf_logical_page",
+        "source": bundle_source,
         "lines": lines,
         "tokens": tokens,
     }
@@ -156,7 +157,7 @@ def build_scanned_page_evidence_bundle(
         "source_page_number": source_page,
         "page_width": page_width,
         "page_height": page_height,
-        "source": "rapidocr_pdf_logical_page",
+        "source": bundle_source,
         "tokens": tokens,
         "local_structure_evidence": local_evidence,
         "micro_grid_evidence": micro_grid_evidence,

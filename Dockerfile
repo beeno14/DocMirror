@@ -3,7 +3,8 @@ FROM python:3.12-slim AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    DOCMIRROR_OCR_BACKEND=rapidocr
 
 # Install system build dependencies required for compiling Python packages and OpenCV/ONNX
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,7 +29,8 @@ FROM python:3.12-slim
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    DOCMIRROR_OCR_BACKEND=rapidocr
 
 # Install runtime C++ libraries required by OpenCV (rapidocr) and ONNX Runtime
 # Also install curl for healthcheck

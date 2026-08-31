@@ -24,7 +24,10 @@ def _cases_for_track(track_file: str) -> list[TQGCase]:
 
 
 def _edition_package_available(edition: str) -> bool:
-    modules = {"enterprise": "docmirror_enterprise", "finance": "docmirror_finance"}
+    modules = {
+        "enterprise": "docmirror_enterprise.enable",
+        "finance": "docmirror_finance.enable",
+    }
     module_path = modules.get(edition)
     if not module_path:
         return True

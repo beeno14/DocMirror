@@ -11,8 +11,8 @@ from docmirror.models.entities.parse_result import DocumentEntities, ParseResult
 from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
     BANK_DATA_DICTIONARY,
-    _parse_result_source_table_headers,
     _mark_represented_header_delivery_exclusions,
+    _parse_result_source_table_headers,
     _raw_statement_after_table_lines,
     _raw_statement_header_lines,
     _render_bank_statement_content_markdown,

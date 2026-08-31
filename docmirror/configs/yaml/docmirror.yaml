@@ -154,11 +154,15 @@ performance:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ocr:
-  # OCR provider (rapid | paddle | external)
-  # rapid = RapidOCR (default, fast)
-  # paddle = PaddleOCR (more accurate, slower)
-  # external = External API (Alibaba, Tencent, etc.)
-  provider: rapid
+  # Local OCR provider (auto | rapidocr | paddleocr)
+  # auto = PaddleOCR on a healthy GPU, otherwise RapidOCR
+  # rapidocr = always use the lightweight ONNX backend
+  # paddleocr = require PaddleOCR and fail clearly if unavailable
+  provider: auto
+  paddle_device: gpu:0
+  # small = small detector/recognizer; server = small detector + medium
+  # recognizer (recommended); medium = medium detector/recognizer.
+  paddle_profile: server
   
   # External OCR quality threshold
   # If page quality < this, delegate to external OCR

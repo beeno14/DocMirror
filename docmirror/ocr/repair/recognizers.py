@@ -10,14 +10,25 @@ from tempfile import NamedTemporaryFile
 from typing import Any
 
 
-def rapidocr_recognize(image: Any, *, source: str = "rapidocr") -> list[dict[str, Any]]:
-    """Run RapidOCR on an image crop."""
+def local_ocr_recognize(image: Any, *, source: str | None = None) -> list[dict[str, Any]]:
+    """Run the selected local OCR backend on an image crop."""
+    explicit_source = source
     try:
-        from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
+        from docmirror.ocr.vision.engine import get_ocr_engine
 
-        words = get_ocr_engine().detect_image_words(image, multi_scale=True)
+        engine = get_ocr_engine()
+        words = engine.detect_image_words(image, multi_scale=True)
+        source = explicit_source or engine.source_id
     except Exception as exc:
-        return [{"source": source, "status": "not_evaluated", "reason": str(exc), "text": "", "confidence": 0.0}]
+        return [
+            {
+                "source": source or "local_ocr",
+                "status": "not_evaluated",
+                "reason": str(exc),
+                "text": "",
+                "confidence": 0.0,
+            }
+        ]
 
     out: list[dict[str, Any]] = []
     for word in words:
@@ -27,6 +38,12 @@ def rapidocr_recognize(image: Any, *, source: str = "rapidocr") -> list[dict[str
         confidence = float(word[8] if len(word) > 8 else 0.0)
         out.append({"source": source, "text": text, "confidence": confidence, "bbox": list(word[:4])})
     return out
+
+
+def rapidocr_recognize(image: Any, *, source: str | None = None) -> list[dict[str, Any]]:
+    """Compatibility alias for the historical recognizer name."""
+
+    return local_ocr_recognize(image, source=source)
 
 
 def tesseract_recognize(
@@ -64,4 +81,4 @@ def tesseract_recognize(
         return [{"source": source, "status": "not_evaluated", "reason": str(exc), "text": "", "confidence": 0.0}]
 
 
-__all__ = ["rapidocr_recognize", "tesseract_recognize"]
+__all__ = ["local_ocr_recognize", "rapidocr_recognize", "tesseract_recognize"]

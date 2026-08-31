@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from docmirror.plugins.bank_statement.embedded_metadata import (
-    _Observation,
     _bank_matches,
     _branch_matches,
     _candidate_image_atoms,
@@ -14,6 +13,7 @@ from docmirror.plugins.bank_statement.embedded_metadata import (
     _facts_from_ocr_words,
     _forced_multiline_code_observations,
     _inline_image_bytes,
+    _Observation,
     _select_observation,
 )
 

@@ -150,7 +150,10 @@ async def _execute_perceive(case: TQGCase) -> tuple[Any, dict[str, Any]]:
 
 
 def _edition_package_available(edition: str) -> bool:
-    modules = {"enterprise": "docmirror_enterprise", "finance": "docmirror_finance"}
+    modules = {
+        "enterprise": "docmirror_enterprise.enable",
+        "finance": "docmirror_finance.enable",
+    }
     module_path = modules.get(edition)
     if not module_path:
         return True

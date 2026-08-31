@@ -12,6 +12,9 @@ optional_modules:
   - numpy
   - onnxruntime
   - openai
+  - paddle
+  - paddleocr
+  - paddlex
   - pdfplumber
   - rapidocr_onnxruntime
 allowed_top_level_optional_import_prefixes:

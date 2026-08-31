@@ -50,7 +50,7 @@ def test_finance_tier_includes_public_entitlements():
 
 
 def test_finance_tier_covers_installed_finance_registry():
-    pytest.importorskip("docmirror_finance", reason="finance package is not available in OSS CI")
+    pytest.importorskip("docmirror_finance.enable", reason="finance package is not available in OSS CI")
 
     finance = set(tier_features("finance"))
     assert len(finance) >= 120

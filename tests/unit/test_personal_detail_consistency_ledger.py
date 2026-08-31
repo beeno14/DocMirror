@@ -8,8 +8,8 @@ from docmirror.models.entities.parse_result import DocumentEntities, PageContent
 from docmirror.models.sealed import seal_parse_result
 from docmirror.output.community_bundle import project_community_bundle
 from docmirror.plugins.credit_report.community_plugin import (
-    _CreditReportCommunityBundle,
     _apply_personal_detail_dataset_status,
+    _CreditReportCommunityBundle,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.consistency_ledger import (
     apply_document_consistency_ledger,

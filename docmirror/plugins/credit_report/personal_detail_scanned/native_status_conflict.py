@@ -13,12 +13,12 @@ module never promotes the native token or mutates ``ParseResult``.
 from __future__ import annotations
 
 import re
-from copy import deepcopy
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from math import isfinite
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 
 _CANONICAL_PBOC_STATUSES = frozenset(
     {

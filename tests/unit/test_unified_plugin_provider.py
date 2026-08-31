@@ -142,6 +142,7 @@ def test_bundled_domains_are_post_seal_plugin_providers(monkeypatch):
     provider_ids = {provider.provider_id for provider in registry.list_providers()}
     assert provider_ids == {
         *(f"bundled.{domain}" for domain in CANONICAL_DOMAIN_IDS),
+        "bundled.audit_report",
         "bundled.financial_statement",
         "bundled.tax_return",
     }

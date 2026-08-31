@@ -44,11 +44,18 @@ DEFAULT_OUTPUT_DIR = Path(os.environ.get("DOCMIRROR_TASK_OUTPUT_DIR", "output"))
 DEFAULT_MIRROR_LEVEL = os.environ.get("DOCMIRROR_MIRROR_LEVEL", "standard")
 
 
-def _safe_str(s: str) -> str:
-    """Encode/decode to replace surrogates so console.print() never raises UnicodeEncodeError."""
+def _safe_str(s: str, *, encoding: str | None = None) -> str:
+    """Return text representable by the active console's output encoding."""
     if not isinstance(s, str):
         s = str(s)
-    return s.encode("utf-8", errors="replace").decode("utf-8")
+    target_encoding = encoding or getattr(console, "encoding", None) or "utf-8"
+    try:
+        return s.encode(target_encoding, errors="replace").decode(
+            target_encoding,
+            errors="replace",
+        )
+    except LookupError:
+        return s.encode("utf-8", errors="replace").decode("utf-8")
 
 
 def _community_review_summary(path: Path | None) -> dict[str, object] | None:
@@ -328,11 +335,19 @@ async def parse_document(
 
             # All phases complete — real "Done!" after all work
             bus.emit("extended_plugins", 100.0, "All editions complete")
-            progress.update(overall_task, completed=100.0, description="[bold green]✅ Done![/bold green]")
+            progress.update(
+                overall_task,
+                completed=100.0,
+                description=_safe_str("[bold green]✅ Done![/bold green]"),
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            progress.update(overall_task, completed=100.0, description="[bold red]❌ Failed[/bold red]")
+            progress.update(
+                overall_task,
+                completed=100.0,
+                description=_safe_str("[bold red]❌ Failed[/bold red]"),
+            )
             console.print(f"[bold red]Critical Error:[/bold red] {_safe_str(str(e))}")
             return
 
@@ -343,7 +358,7 @@ async def parse_document(
     try:
         result_view = result.to_read_view() if result is not None else None
         if result_view is not None and result_view.success:
-            console.print("\n[bold green]\u2705 Parsing Complete![/bold green]")
+            console.print(_safe_str("\n[bold green]\u2705 Parsing Complete![/bold green]"))
 
             table = Table(show_header=False, border_style="green")
             table.add_column("Metric", style="cyan")
@@ -373,12 +388,14 @@ async def parse_document(
             _entities = getattr(result_view, "entities", None)
             _doc_type = getattr(_entities, "document_type", "unknown") if _entities else "unknown"
             console.print(
-                f"\n[bold magenta]📊[/bold magenta] Performance: {speed:.0f} chars/sec  "
-                f"| type={_doc_type}  | pages={result_view.page_count}  "
-                f"| extraction={_extraction_ms}ms  build={_build_ms}ms"
+                _safe_str(
+                    f"\n[bold magenta]📊[/bold magenta] Performance: {speed:.0f} chars/sec  "
+                    f"| type={_doc_type}  | pages={result_view.page_count}  "
+                    f"| extraction={_extraction_ms}ms  build={_build_ms}ms"
+                )
             )
         else:
-            console.print("\n[bold red]\u274c Parsing Failed[/bold red]")
+            console.print(_safe_str("\n[bold red]\u274c Parsing Failed[/bold red]"))
             if result_view is not None and result_view.error:
                 console.print(f"[red]{_safe_str(result_view.error.message)}[/red]")
 
@@ -390,7 +407,11 @@ async def parse_document(
         # Display edition summaries (already written inside progress context)
         if not no_save and saved_path:
             label = "Mirror" if "mirror" in written else "Community output"
-            console.print(f"[bold blue]\U0001f4be {label} saved to:[/bold blue] [white]{saved_path}[/white]")
+            console.print(
+                _safe_str(
+                    f"[bold blue]\U0001f4be {label} saved to:[/bold blue] [white]{saved_path}[/white]"
+                )
+            )
             _show_community_review_summary(written.get("community"))
 
     except Exception as e:
@@ -595,7 +616,7 @@ def main() -> None:
             """Parse a single file in batch mode (no Rich Progress per file)."""
             async with _semaphore:
                 name = fp.name
-                console.print(f"[bold cyan][{idx}/{total}][/bold cyan] ⏳ {name}")
+                console.print(_safe_str(f"[bold cyan][{idx}/{total}][/bold cyan] ⏳ {name}"))
                 try:
                     from docmirror.input.entry.factory import PerceiveOptions
                     from docmirror.input.pipeline import perceive_document
@@ -614,10 +635,17 @@ def main() -> None:
 
                     if success:
                         console.print(
-                            f"[bold cyan][{idx}/{total}][/bold cyan] ✅ {name}  → {doctype} ({pages}p, {text_len} chars)"
+                            _safe_str(
+                                f"[bold cyan][{idx}/{total}][/bold cyan] ✅ {name}  → {doctype} "
+                                f"({pages}p, {text_len} chars)"
+                            )
                         )
                     else:
-                        console.print(f"[bold yellow][{idx}/{total}][/bold yellow] ⚠️ {name}  → parse returned failure")
+                        console.print(
+                            _safe_str(
+                                f"[bold yellow][{idx}/{total}][/bold yellow] ⚠️ {name}  → parse returned failure"
+                            )
+                        )
 
                     if not args.no_save:
                         _save_outputs(
@@ -628,13 +656,13 @@ def main() -> None:
                             all_outputs=args.all_outputs,
                         )
                 except Exception as e:
-                    console.print(f"[bold red][{idx}/{total}][/bold red] ❌ {name}: {e}")
+                    console.print(_safe_str(f"[bold red][{idx}/{total}][/bold red] ❌ {name}: {e}"))
                     console.print(f"[dim red]{traceback.format_exc()[:300]}[/dim red]")
 
         async def _batch_parse():
             tasks = [_process_one(fp, i, len(files)) for i, fp in enumerate(files, 1)]
             await asyncio.gather(*tasks)
-            console.print(f"[bold green]\n🎉 All {len(files)} files processed![/bold green]")
+            console.print(_safe_str(f"[bold green]\n🎉 All {len(files)} files processed![/bold green]"))
 
         asyncio.run(_batch_parse())
     else:

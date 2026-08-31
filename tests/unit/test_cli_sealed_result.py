@@ -12,6 +12,16 @@ from docmirror.models.entities.parse_result import ParseResult, ResultStatus
 from docmirror.models.sealed import seal_parse_result
 
 
+def test_cli_safe_string_respects_legacy_console_encoding() -> None:
+    from docmirror.__main__ import _safe_str
+
+    rendered = _safe_str("❌ failed", encoding="gbk")
+
+    assert "❌" not in rendered
+    assert rendered.endswith(" failed")
+    rendered.encode("gbk")
+
+
 def test_single_file_cli_displays_sealed_parse_result(monkeypatch, tmp_path):
     import docmirror.__main__ as cli
     import docmirror.input.entry.factory as factory

@@ -10,6 +10,7 @@ __pycache__
 dist
 build
 .eggs
+.venv
 
 # IDE
 .vscode
@@ -25,6 +26,8 @@ htmlcov
 
 # Output artifacts & model caches
 /output/
+/.tmp/
+/tmp/
 model_cache/
 *.onnx
 
@@ -37,7 +40,5 @@ docs/
 *.md
 !README.md
 
-# Test fixtures (large binaries)
-tests/*.pdf
-tests/*.png
-tests/*.jpg
+# Tests include private regression fixtures and never belong in runtime images.
+/tests/

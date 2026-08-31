@@ -415,6 +415,10 @@ required = {
     "docmirror/pyproject.toml",
     "docmirror/Dockerfile",
     "docmirror/docker-compose.yml",
+    "docmirror/Dockerfile.gpu",
+    "docmirror/docker-compose.gpu.yml",
+    "docmirror/requirements-gpu-cu126.in",
+    "docmirror/requirements-gpu-cu126.txt",
     "docmirror/docmirror/server/api.py",
 }
 

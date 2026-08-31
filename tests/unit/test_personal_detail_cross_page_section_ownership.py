@@ -20,11 +20,11 @@ from docmirror.plugins.credit_report.personal_detail_scanned.native_extraction i
     _extract_inquiries,
     _inquiry_source_coverage,
 )
-from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
-    PersonalDetailPageTopology,
-)
 from docmirror.plugins.credit_report.personal_detail_scanned.ocr_correction import (
     PersonalDetailOCRCorrectionOverlay,
+)
+from docmirror.plugins.credit_report.personal_detail_scanned.page_topology import (
+    PersonalDetailPageTopology,
 )
 from docmirror.plugins.credit_report.personal_detail_scanned.table_ownership import (
     INQUIRY_AUTHORITY_CLOSED_PHYSICAL_ORDINAL,

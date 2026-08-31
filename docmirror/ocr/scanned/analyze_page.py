@@ -21,8 +21,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-from typing import Any
-
 from docmirror.ocr.micro_grid.models import OCRToken
 from docmirror.ocr.preprocess.pipeline import (
     _deskew_image,
@@ -46,6 +44,8 @@ def analyze_scanned_page(
     pre_existing_words: list[tuple] | None = None,
     pre_existing_img: Any | None = None,
     pre_existing_page_h: int | None = None,
+    ocr_source: str | None = None,
+    _failover_retry: bool = False,
 ) -> dict[str, Any] | None:
     """Perform OCR-based extraction on a scanned document page.
 
@@ -75,6 +75,8 @@ def analyze_scanned_page(
 
         from ..extraction.foundation import FitzEngine
 
+        selected_ocr_source = str(ocr_source or "ocr")
+
         # ── Hybrid text–vision prompt prior ──
         text_prior = ""
         if table_bbox:
@@ -93,16 +95,19 @@ def analyze_scanned_page(
             best_angle = 0  # Already oriented by the primary OCR pass
         else:
             # ── Path B: Full OCR (original rendering + recognition) ──
+            ocr_engine = None
             try:
-                from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
+                from docmirror.ocr.vision.backend import backend_is_available, backend_revision
+                from docmirror.ocr.vision.engine import get_ocr_engine
 
                 ocr_engine = get_ocr_engine()
-            except ImportError:
-                pass
+            except Exception as exc:
+                logger.debug("OCR backend initialization failed: %s", exc)
 
-            if ocr_engine is None or not ocr_engine._engine:
+            if ocr_engine is None or not backend_is_available(ocr_engine):
                 logger.debug("OCR skipped: no OCR engine available")
                 return None
+            initial_backend_revision = backend_revision(ocr_engine)
 
             # ── Auto-orientation probe ──
             probe_pix = fitz_page.get_pixmap(dpi=100)
@@ -155,6 +160,22 @@ def analyze_scanned_page(
 
                 if len(all_words) >= 10 or dpi == 300:
                     break
+
+            # A transparent auto-mode demotion may have occurred in the
+            # orientation or DPI passes. Source is sampled after inference so
+            # fallback results are never attributed to PaddleOCR.
+            if backend_revision(ocr_engine) != initial_backend_revision and not _failover_retry:
+                logger.info("OCR backend changed during page analysis; restarting the page with %s", ocr_engine.engine_id)
+                return analyze_scanned_page(
+                    fitz_page,
+                    page_idx,
+                    min_confidence=min_confidence,
+                    table_bbox=table_bbox,
+                    target_dpi=target_dpi,
+                    ocr_source=None,
+                    _failover_retry=True,
+                )
+            selected_ocr_source = str(getattr(ocr_engine, "source_id", selected_ocr_source))
 
         if len(all_words) < 3:
             return None
@@ -225,7 +246,7 @@ def analyze_scanned_page(
         evidence_tokens: list[dict] = []
         for i, w in enumerate(all_words):
             try:
-                token = OCRToken.from_rapidocr_word(w, page=page_idx, idx=i)
+                token = OCRToken.from_ocr_word(w, page=page_idx, source=selected_ocr_source, idx=i)
                 evidence_tokens.append(token.to_dict())
             except (ValueError, IndexError):
                 pass
@@ -259,7 +280,8 @@ def analyze_scanned_page(
                     from docmirror.ocr.reconstruct.gcr import GCRColumns
 
                     tokens = [
-                        OCRToken.from_rapidocr_word(w, page=page_idx, idx=i) for i, w in enumerate(pre_existing_words)
+                        OCRToken.from_ocr_word(w, page=page_idx, source=selected_ocr_source, idx=i)
+                        for i, w in enumerate(pre_existing_words)
                     ]
                     gcr = GCRColumns.from_tokens(tokens)
                     if gcr.col_bands and len(gcr.col_bands) >= 2:

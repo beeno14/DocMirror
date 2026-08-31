@@ -188,6 +188,42 @@ def _merge_multi_scale_words(all_scale_words: list[tuple[int, list[tuple]]]) -> 
 
 
 def _run_ocr(fitz_page, min_confidence: float = 0.3, *, dpi_list: list[int] | None = None):
+    """Run a page atomically with respect to auto-mode backend failover."""
+
+    try:
+        from docmirror.ocr.vision.backend import backend_revision
+        from docmirror.ocr.vision.engine import get_ocr_engine
+
+        ocr_engine = get_ocr_engine()
+    except Exception as exc:
+        logger.debug("[universal] OCR skipped: no OCR engine available (%s)", exc)
+        return None, None, 0
+
+    initial_revision = backend_revision(ocr_engine)
+    result = _run_ocr_once(
+        fitz_page,
+        min_confidence=min_confidence,
+        dpi_list=dpi_list,
+        ocr_engine=ocr_engine,
+    )
+    if backend_revision(ocr_engine) != initial_revision:
+        logger.info("OCR backend changed during a multi-pass page; restarting with %s", ocr_engine.engine_id)
+        result = _run_ocr_once(
+            fitz_page,
+            min_confidence=min_confidence,
+            dpi_list=dpi_list,
+            ocr_engine=ocr_engine,
+        )
+    return result
+
+
+def _run_ocr_once(
+    fitz_page,
+    min_confidence: float = 0.3,
+    *,
+    dpi_list: list[int] | None = None,
+    ocr_engine,
+):
     """Run OCR on a fitz page with adaptive strategy escalation.
 
     Performance-optimized approach:
@@ -211,26 +247,6 @@ def _run_ocr(fitz_page, min_confidence: float = 0.3, *, dpi_list: list[int] | No
     if dpi_list is None:
         dpi_list = [150, 200, 300]
 
-    # Locate OCR engine
-    ocr_engine = None
-    try:
-        from rapidocr_onnxruntime import RapidOCR as _RapidOCR
-
-        ocr_engine = _RapidOCR()
-    except ImportError:
-        try:
-            from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
-
-            _eng = get_ocr_engine()
-            if _eng and _eng._engine:
-                ocr_engine = _eng._engine
-        except ImportError:
-            pass
-
-    if ocr_engine is None:
-        logger.debug("[universal] OCR skipped: no OCR engine available")
-        return None, None, 0
-
     # ── Auto-orientation ──
     # Try EXIF first (reliable), fall back to probe
     best_angle = _read_exif_orientation(fitz_page)
@@ -248,29 +264,22 @@ def _run_ocr(fitz_page, min_confidence: float = 0.3, *, dpi_list: list[int] | No
         img_pp = preprocess_fn(img_input.copy())
         img_pp, _ = _deskew_image(img_pp)
         try:
-            result, _ = ocr_engine(img_pp)
+            result = ocr_engine.detect_image_words(img_pp)
         except Exception as exc:
             logger.debug(f"operation: suppressed {exc}")
             return [], 0.0
         if not result:
             return [], 0.0
         words = []
-        for box, text, conf in result:
-            text = text.strip()
+        for item in result:
+            if len(item) < 5:
+                continue
+            x0, y0, x1, y1, text = item[:5]
+            conf = float(item[8]) if len(item) > 8 else float(item[5]) if len(item) > 5 else 0.0
+            text = str(text or "").strip()
             if not text:
                 continue
-            x_coords = [p[0] for p in box]
-            y_coords = [p[1] for p in box]
-            words.append(
-                (
-                    min(x_coords),
-                    min(y_coords),
-                    max(x_coords),
-                    max(y_coords),
-                    text,
-                    conf,
-                )
-            )
+            words.append((float(x0), float(y0), float(x1), float(y1), text, conf))
         score = sum(w[5] for w in words)
         logger.debug(f"[OCR] {label}: {len(words)} words, score={score:.1f}")
         return words, score
@@ -332,8 +341,6 @@ def _run_ocr(fitz_page, min_confidence: float = 0.3, *, dpi_list: list[int] | No
         """Force REC on regions that DET missed using OpenCV morphology."""
         import cv2
 
-        from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
-
         # 1. Enhance and binarize for connected components
         gray = cv2.cvtColor(img_input, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -380,8 +387,7 @@ def _run_ocr(fitz_page, min_confidence: float = 0.3, *, dpi_list: list[int] | No
         # Force recognize these candidate regions
         rescued_words = []
         if candidate_regions:
-            engine = get_ocr_engine()
-            raw_rescued = engine.force_recognize_regions(img_input, candidate_regions)
+            raw_rescued = ocr_engine.force_recognize_regions(img_input, candidate_regions)
             rescued_words = list(raw_rescued)
 
         score = sum(w[5] for w in rescued_words)

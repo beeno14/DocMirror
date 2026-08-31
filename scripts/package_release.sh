@@ -46,6 +46,10 @@ required_entries=(
     LICENSE
     Dockerfile
     docker-compose.yml
+    Dockerfile.gpu
+    docker-compose.gpu.yml
+    requirements-gpu-cu126.in
+    requirements-gpu-cu126.txt
     docmirror
 )
 
@@ -163,6 +167,10 @@ for required_member in \
     docmirror/requirements.txt \
     docmirror/Dockerfile \
     docmirror/docker-compose.yml \
+    docmirror/Dockerfile.gpu \
+    docmirror/docker-compose.gpu.yml \
+    docmirror/requirements-gpu-cu126.in \
+    docmirror/requirements-gpu-cu126.txt \
     docmirror/docmirror/server/api.py; do
     grep -Fqx "$required_member" <<<"$archive_listing" \
         || fail "Created archive is missing: $required_member"

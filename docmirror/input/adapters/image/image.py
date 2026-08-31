@@ -43,6 +43,7 @@ class ImageAdapter(BaseParser):
         )
 
         logger.info(f"[ImageAdapter] Starting image parsing for: {file_path}")
+        self._last_ocr_engine_id = None
         ocr_mode = str(kwargs.get("ocr_mode") or "auto").lower()
         texts, width, height = ([], None, None) if ocr_mode == "off" else await self._extract_text_blocks(file_path)
         logger.info(f"[ImageAdapter] Completed image parsing for: {file_path}")
@@ -55,6 +56,7 @@ class ImageAdapter(BaseParser):
                 parser_name="ImageAdapter",
                 page_count=1,
                 extraction_method=ExtractionMethod.OCR,
+                ocr_engine=self._last_ocr_engine_id,
                 overall_confidence=0.8,
             ),
         )
@@ -109,12 +111,14 @@ class ImageAdapter(BaseParser):
                 out = None
             if out is not None:
                 logger.info(f"[ImageAdapter] Delegated to external OCR (quality={quality})")
+                self._last_ocr_engine_id = "external_ocr"
                 return self._blocks_from_ocr_result(out)
         try:
             from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
 
             engine = get_ocr_engine()
             words = engine.detect_image_words(img)
+            self._last_ocr_engine_id = str(getattr(engine, "engine_id", "rapidocr_onnxruntime"))
             return self._blocks_from_words(words)
         except Exception as e:
             logger.warning(f"[ImageAdapter] OCR fallback failed: {e}")

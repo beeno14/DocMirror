@@ -19,7 +19,7 @@ class OCRToken:
     bbox: BBox
     confidence: float = 1.0
     page: int = 0
-    source: str = "rapidocr"
+    source: str = "ocr"
     coordinate_system: str = "pdf_points_top_left"
     raw_bbox: BBox | None = None
     raw_coordinate_system: str = "image_pixels"
@@ -58,24 +58,24 @@ class OCRToken:
         return self.confidence >= threshold
 
     @staticmethod
-    def from_rapidocr_word(
+    def from_ocr_word(
         word: tuple,
         page: int = 1,
-        source: str = "rapidocr",
+        source: str = "ocr",
         idx: int = 0,
     ) -> OCRToken:
-        """Convert a RapidOCR word tuple to an OCRToken.
+        """Convert a canonical local-OCR word tuple to an OCRToken.
 
         Expected word tuple format: (x0, y0, x1, y1, text, confidence)
         Compatible with output from runner._run_ocr() and
-        rapidocr_engine.RapidOCREngine.detect_image_words().
+        every backend's ``detect_image_words()`` method.
         """
         if len(word) < 5:
-            raise ValueError(f"RapidOCR word tuple too short: {len(word)} elements")
+            raise ValueError(f"OCR word tuple too short: {len(word)} elements")
 
         text = str(word[4] or "").strip()
         if not text:
-            raise ValueError("Empty text in RapidOCR word tuple")
+            raise ValueError("Empty text in OCR word tuple")
 
         try:
             x0 = float(word[0])
@@ -83,7 +83,7 @@ class OCRToken:
             x1 = float(word[2])
             y1 = float(word[3])
         except (TypeError, ValueError) as e:
-            raise ValueError(f"Invalid bbox in RapidOCR word tuple: {e}") from e
+            raise ValueError(f"Invalid bbox in OCR word tuple: {e}") from e
 
         # Extract confidence — try different positions for compatibility
         confidence = 1.0
@@ -108,6 +108,17 @@ class OCRToken:
             raw_bbox=bbox,
             raw_coordinate_system="image_pixels",
         )
+
+    @staticmethod
+    def from_rapidocr_word(
+        word: tuple,
+        page: int = 1,
+        source: str = "rapidocr",
+        idx: int = 0,
+    ) -> OCRToken:
+        """Backward-compatible alias for pre-backend-neutral consumers."""
+
+        return OCRToken.from_ocr_word(word, page=page, source=source, idx=idx)
 
 
 @dataclass(frozen=True)

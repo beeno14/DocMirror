@@ -2172,7 +2172,7 @@ def _coerce_token(obj: Any, *, page: int, idx: int) -> OCRToken | None:
         bbox=b,
         confidence=_confidence(obj),
         page=page,
-        source=str(obj.get("source", "rapidocr") if isinstance(obj, dict) else getattr(obj, "source", "rapidocr")),
+        source=str(obj.get("source", "ocr") if isinstance(obj, dict) else getattr(obj, "source", "ocr")),
         coordinate_system=str(
             obj.get("coordinate_system", "pdf_points_top_left")
             if isinstance(obj, dict)

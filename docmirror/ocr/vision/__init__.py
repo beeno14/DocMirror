@@ -7,10 +7,11 @@
 """
 OCR vision subpackage — local vision models (OCR, seal detection).
 
-Purpose: Namespace for on-device vision engines (RapidOCR, seal/stamp
+Purpose: Namespace for on-device vision engines (RapidOCR, PaddleOCR, seal/stamp
 detection) used during extraction.
 
-Main components: ``RapidOCREngine``, ``SealDetector``.
+Main components: ``OCRBackend``, ``get_ocr_engine``, ``RapidOCREngine``,
+``PaddleOCREngine``, ``SealDetector``.
 
 Upstream: Preprocessed page/zone images.
 

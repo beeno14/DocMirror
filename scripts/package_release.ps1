@@ -62,6 +62,10 @@ $requiredEntries = @(
     "LICENSE",
     "Dockerfile",
     "docker-compose.yml",
+    "Dockerfile.gpu",
+    "docker-compose.gpu.yml",
+    "requirements-gpu-cu126.in",
+    "requirements-gpu-cu126.txt",
     "docmirror"
 )
 
@@ -135,6 +139,10 @@ try {
         "docmirror/requirements.txt",
         "docmirror/Dockerfile",
         "docmirror/docker-compose.yml",
+        "docmirror/Dockerfile.gpu",
+        "docmirror/docker-compose.gpu.yml",
+        "docmirror/requirements-gpu-cu126.in",
+        "docmirror/requirements-gpu-cu126.txt",
         "docmirror/docmirror/server/api.py",
         "docmirror/docmirror/server/parse_process_manager.py",
         "docmirror/docmirror/server/parse_worker.py"

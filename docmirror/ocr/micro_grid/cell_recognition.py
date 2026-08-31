@@ -125,15 +125,14 @@ def recognize_micro_cell_from_image(
         import cv2
         import numpy as np
 
+        from docmirror.ocr.vision.backend import backend_revision
         from docmirror.ocr.vision.rapidocr_engine import get_ocr_engine
 
         crop = page_image[region[1] : region[3], region[0] : region[2]]
         if crop is None or getattr(crop, "size", 0) == 0:
             return CellRecognition("", 0.0, "unavailable", audit={"reason": "empty_crop", "region": region})
-        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY) if len(crop.shape) == 3 else crop.copy()
-        color = (
-            cv2.cvtColor(crop, cv2.COLOR_RGB2BGR) if len(crop.shape) == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        )
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop.copy()
+        color = crop.copy() if len(crop.shape) == 3 else cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         border = max(1, int(round(min(gray.shape[:2]) * 0.07)))
         cleaned = gray.copy()
         cleaned[:border, :] = 255
@@ -213,24 +212,32 @@ def recognize_micro_cell_from_image(
                 ]
             )
         engine = get_ocr_engine()
-        observations: list[dict[str, Any]] = []
-        for variant_name, variant in variants:
-            vh, vw = variant.shape[:2]
-            raw = engine.force_recognize_regions(variant, [(0, 0, vw, vh)])
-            if not raw:
-                observations.append({"variant": variant_name, "raw_text": "", "text": "", "confidence": 0.0})
-                continue
-            best = max(raw, key=lambda item: float(item[5]) if len(item) > 5 else 0.0)
-            raw_text = str(best[4] if len(best) > 4 else "")
-            confidence = float(best[5] if len(best) > 5 else 0.0)
-            observations.append(
-                {
-                    "variant": variant_name,
-                    "raw_text": raw_text,
-                    "text": normalize_allowlist_text(raw_text, allowed_charset, max_chars=max_chars),
-                    "confidence": round(confidence, 4),
-                }
-            )
+
+        def _recognize_variants() -> list[dict[str, Any]]:
+            results: list[dict[str, Any]] = []
+            for variant_name, variant in variants:
+                vh, vw = variant.shape[:2]
+                raw = engine.force_recognize_regions(variant, [(0, 0, vw, vh)])
+                if not raw:
+                    results.append({"variant": variant_name, "raw_text": "", "text": "", "confidence": 0.0})
+                    continue
+                best = max(raw, key=lambda item: float(item[5]) if len(item) > 5 else 0.0)
+                raw_text = str(best[4] if len(best) > 4 else "")
+                confidence = float(best[5] if len(best) > 5 else 0.0)
+                results.append(
+                    {
+                        "variant": variant_name,
+                        "raw_text": raw_text,
+                        "text": normalize_allowlist_text(raw_text, allowed_charset, max_chars=max_chars),
+                        "confidence": round(confidence, 4),
+                    }
+                )
+            return results
+
+        initial_backend_revision = backend_revision(engine)
+        observations = _recognize_variants()
+        if backend_revision(engine) != initial_backend_revision:
+            observations = _recognize_variants()
         if max_chars == 1 and "*" in set(allowed_charset):
             star_confidence = _star_shape_confidence(otsu, np=np, cv2=cv2)
             if star_confidence >= 0.65:

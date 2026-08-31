@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from importlib.util import find_spec
 from typing import Any
 
@@ -98,11 +99,14 @@ class RapidOCREngine:
       2. Post-process via ``_split_ocr_block`` to split merged text into
          word-level units.
       3. Output format matches PyMuPDF exactly:
-         ``(x0, y0, x1, y1, text, block_no, line_no, word_no)``.
+         ``(x0, y0, x1, y1, text, block_no, line_no, word_no, confidence)``.
     """
 
     _instance = None
     _engine = None
+    _inference_lock = threading.RLock()
+    engine_id = "rapidocr_onnxruntime"
+    source_id = "rapidocr"
 
     def __new__(cls, *args, **kwargs):
         if not cls._instance:
@@ -171,7 +175,13 @@ class RapidOCREngine:
                 self._engine = RapidOCR(det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True, **tuning_kwargs)
             else:
                 self._engine = RapidOCR(**tuning_kwargs)
-            logger.info("RapidOCR model loaded with Extreme CPU Tuning.")
+            logger.info("RapidOCR model loaded (GPU=%s).", use_cuda)
+
+    @property
+    def is_available(self) -> bool:
+        """Whether the underlying ONNX models initialized successfully."""
+
+        return self._engine is not None
 
     def _detect_only(self, img: Any) -> Any | None:
         """Runs only the Detection (DET) model on an image and returns un-scaled bounding boxes."""
@@ -238,7 +248,7 @@ class RapidOCREngine:
 
     def detect_multiscale_words(
         self, img: Any, scales: list[float] | None = None
-    ) -> list[tuple[float, float, float, float, str, int, int, int]]:
+    ) -> list[tuple[float, float, float, float, str, int, int, int, float]]:
         """
         Multi-Scale OCR with NMS (Non-Maximum Suppression).
         1. Runs the DET model multiple times at different scales.
@@ -315,13 +325,14 @@ class RapidOCREngine:
 
     def detect_image_words(
         self, img: Any, multi_scale: bool = False
-    ) -> list[tuple[float, float, float, float, str, int, int, int]]:
+    ) -> list[tuple[float, float, float, float, str, int, int, int, float]]:
         """
         Detect words in an image and return them in PyMuPDF 'words' format.
         Wraps detect_multiscale_words for unified access.
         """
         scales = [1.0, 2.0] if multi_scale else [1.0]
-        return self.detect_multiscale_words(img, scales=scales)
+        with self._inference_lock:
+            return self.detect_multiscale_words(img, scales=scales)
 
     def force_recognize_regions(
         self, img: Any, regions: list[tuple[int, int, int, int]]
@@ -357,8 +368,10 @@ class RapidOCREngine:
 
         results = []
         try:
-            # Process all valid crops into a single batched ONNX REC inference
-            rec_res, _ = self._engine.text_rec(crop_list)
+            # Process all valid crops into a single batched ONNX REC inference.
+            # The package engine is not documented as thread-safe.
+            with self._inference_lock:
+                rec_res, _ = self._engine.text_rec(crop_list)
             for (x0, y0, x1, y1), rec_data in zip(valid_regions, rec_res):
                 if rec_data and rec_data[0]:
                     text, conf = rec_data
@@ -370,11 +383,9 @@ class RapidOCREngine:
         return results
 
 
-ocr_engine: RapidOCREngine | None = None
+def get_ocr_engine():
+    """Compatibility shim for the historical RapidOCR-specific import path."""
 
+    from docmirror.ocr.vision.engine import get_ocr_engine as select_ocr_engine
 
-def get_ocr_engine() -> RapidOCREngine:
-    global ocr_engine
-    if ocr_engine is None:
-        ocr_engine = RapidOCREngine()
-    return ocr_engine
+    return select_ocr_engine()

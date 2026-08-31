@@ -113,13 +113,13 @@ def resolve_edition_tier() -> str:
     if not _has_any_license():
         return "community"
     try:
-        import docmirror_finance  # noqa: F401
+        import docmirror_finance.enable  # noqa: F401
 
         return "finance"
     except ImportError:
         pass
     try:
-        import docmirror_enterprise  # noqa: F401
+        import docmirror_enterprise.enable  # noqa: F401
 
         return "enterprise"
     except ImportError:

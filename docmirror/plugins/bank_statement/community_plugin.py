@@ -44,18 +44,18 @@ from docmirror.plugins.bank_statement.extraction_dispatch import (
 from docmirror.plugins.bank_statement.header_resolve import normalize_bank_matching_text, normalize_header_cell
 from docmirror.plugins.bank_statement.statement_context import (
     _FIELD_ALIASES,
-    audit_source_fact_conservation,
     attach_statement_context,
+    audit_source_fact_conservation,
     build_source_metadata_records,
     build_statement_header_records,
     page_texts_with_business_headers,
     reconcile_source_unitemized_residuals,
 )
-from docmirror.plugins.bank_statement.work_cache import bank_work_session
 from docmirror.plugins.bank_statement.wide_table_recovery import (
     page_texts_from_parse_result,
     resolve_row_count_evidence,
 )
+from docmirror.plugins.bank_statement.work_cache import bank_work_session
 
 BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
     "序号": ColumnMapping(

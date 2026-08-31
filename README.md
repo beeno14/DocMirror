@@ -40,6 +40,32 @@ pip install "docmirror[server]"   # HTTP API
 pip install "docmirror[all]"      # all public OSS extras
 ```
 
+The `ocr` extra is the lightweight, RapidOCR-only installation. For a hybrid
+CUDA 12.6 installation that selects PaddleOCR on a healthy GPU and retains
+RapidOCR as the automatic fallback, install Paddle's hardware runtime first:
+
+```bash
+python -m pip install "paddlepaddle-gpu==3.3.1" \
+  --find-links https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/
+python -m pip install "docmirror[ocr-paddle]"
+```
+
+Set `DOCMIRROR_OCR_BACKEND=auto` (the default), `rapidocr`, or `paddleocr`.
+Paddle's wheel index must match the deployment CUDA/driver platform; it is
+intentionally not hidden inside a generic Python extra. Container users can
+choose `Dockerfile` for RapidOCR or `Dockerfile.gpu` / `docker-compose.gpu.yml`
+for the hybrid GPU runtime.
+
+With Docker Compose, a compatible NVIDIA driver, and NVIDIA Container Toolkit:
+
+```bash
+docker compose -f docker-compose.gpu.yml up --build
+```
+
+The GPU profile reserves one GPU and persists PaddleX model weights across
+container recreations. Its first OCR request still needs network access to fetch
+the official models.
+
 Commercial Enterprise and Finance extensions are distributed separately and are not required for the open-source package.
 
 ## 10-Minute Trusted Parse

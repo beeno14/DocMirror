@@ -16,7 +16,7 @@ from docmirror.evidence.repair import RepairCandidate, RepairRequest
 from docmirror.ocr.repair.crop_variants import crop_regions
 from docmirror.ocr.repair.fusion import fuse_text_candidates
 from docmirror.ocr.repair.preprocess_variants import build_preprocess_variants
-from docmirror.ocr.repair.recognizers import rapidocr_recognize, tesseract_recognize
+from docmirror.ocr.repair.recognizers import local_ocr_recognize, tesseract_recognize
 
 OCRRecognizer = Callable[[Any], list[dict[str, Any]]]
 
@@ -26,7 +26,7 @@ class LocalOCRRepairEngine:
 
     def __init__(self, recognizers: list[OCRRecognizer] | None = None) -> None:
         self.recognizers = recognizers or [
-            lambda image: rapidocr_recognize(image, source="rapidocr"),
+            local_ocr_recognize,
             lambda image: tesseract_recognize(image, source="tesseract"),
         ]
 

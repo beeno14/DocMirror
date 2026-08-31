@@ -24,6 +24,9 @@ OPTIONAL_MODULES = {
     "numpy",
     "onnxruntime",
     "openai",
+    "paddle",
+    "paddleocr",
+    "paddlex",
     "pdfplumber",
     "rapidocr_onnxruntime",
 }

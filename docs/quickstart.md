@@ -43,6 +43,19 @@ pip install "docmirror[server]"   # FastAPI server
 pip install "docmirror[all]"      # all public OSS extras
 ```
 
+`docmirror[ocr]` is the light RapidOCR-only choice. For a CUDA 12.6 host that
+should use PaddleOCR on GPU while retaining RapidOCR fallback:
+
+```bash
+python -m pip install "paddlepaddle-gpu==3.3.1" \
+  --find-links https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/
+python -m pip install "docmirror[ocr-paddle]"
+```
+
+From a repository checkout with NVIDIA Container Toolkit installed, the locked
+container equivalent is `docker compose -f docker-compose.gpu.yml up --build`.
+Use `DOCMIRROR_OCR_BACKEND=auto` (default), `rapidocr`, or strict `paddleocr`.
+
 ## 3. Parse A Commercial Document
 
 ```bash

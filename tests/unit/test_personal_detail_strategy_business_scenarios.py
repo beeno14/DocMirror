@@ -44,7 +44,6 @@ from docmirror.plugins.credit_report.personal_detail_scanned.extraction_strategy
     SectionState,
 )
 
-
 _BUSINESS_SECTION_FRAGMENTS: dict[str, tuple[int, ...]] = {
     REPORT_HEADER_SECTION: (1,),
     SUMMARY_SECTION: (2,),

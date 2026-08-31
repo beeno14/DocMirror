@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+
 def test_canonical_premium_domains_are_six():
     from docmirror.configs.domain.registry import get_canonical_premium_domains
 

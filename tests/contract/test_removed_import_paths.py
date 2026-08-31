@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
 
 from scripts.code_hygiene.clean_manifest import load_clean_manifest
 
@@ -12,9 +13,14 @@ from scripts.code_hygiene.clean_manifest import load_clean_manifest
 def _find_spec(module: str):
     """Return no spec when any parent in an already-removed path is absent."""
     try:
-        return importlib.util.find_spec(module)
+        spec = importlib.util.find_spec(module)
     except (AttributeError, ModuleNotFoundError):
         return None
+    if spec is not None and spec.loader is None and spec.submodule_search_locations:
+        locations = (Path(location) for location in spec.submodule_search_locations)
+        if not any(location.is_dir() and any(location.rglob("*.py")) for location in locations):
+            return None
+    return spec
 
 
 def test_removed_pre_refactor_import_paths_do_not_resolve():
