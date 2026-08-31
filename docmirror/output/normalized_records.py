@@ -124,6 +124,21 @@ def source_fields(
     return matches
 
 
+def _delivery_value_excluded(source: dict[str, Any], pool: str, name: str, value: Any) -> bool:
+    """Match one exact producer-proved exclusion retained with internal evidence."""
+
+    source_detail = source.get("source") if isinstance(source.get("source"), dict) else {}
+    exclusions = source_detail.get("_delivery_value_exclusions") or []
+    return any(
+        isinstance(item, dict)
+        and item.get("pool") == pool
+        and item.get("name") == name
+        and "value" in item
+        and _same(item["value"], value)
+        for item in exclusions
+    )
+
+
 def additional_business_fields(
     row: dict[str, Any],
     columns: list[dict[str, Any]],
@@ -144,6 +159,8 @@ def additional_business_fields(
     result: list[dict[str, Any]] = []
 
     for name, value in raw.items():
+        if _delivery_value_excluded(source, "raw", str(name), value):
+            continue
         fields = source_fields(str(name), row, columns, aliases)
         if any(
             key in normalized and value_is_represented(value, normalized[key], descriptors[key])
@@ -152,6 +169,8 @@ def additional_business_fields(
             continue
         result.append({"name": str(name), "value": copy.deepcopy(value)})
     for key, value in (source.get("canonical_raw") or {}).items():
+        if _delivery_value_excluded(source, "canonical_raw", str(key), value):
+            continue
         if key in normalized and value_is_represented(value, normalized[key], descriptors.get(key, {})):
             continue
         if value in (None, ""):

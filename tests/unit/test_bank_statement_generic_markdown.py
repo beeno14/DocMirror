@@ -12,6 +12,7 @@ from docmirror.plugins.bank_statement.canonical import dedupe_transaction_rows
 from docmirror.plugins.bank_statement.community_plugin import (
     BANK_DATA_DICTIONARY,
     _parse_result_source_table_headers,
+    _mark_represented_header_delivery_exclusions,
     _raw_statement_after_table_lines,
     _raw_statement_header_lines,
     _render_bank_statement_content_markdown,
@@ -1222,3 +1223,93 @@ def test_bank_statement_counterparty_pollution_allows_one_long_identifier_only()
 
     assert sanitized[0]["normalized"]["counter_party"] == "供应商统一代码 123456789012345678"
     assert sanitized[1]["normalized"]["counter_party"] == ""
+
+
+def test_bank_statement_counterparty_sanitizer_rejects_concatenated_page_marker() -> None:
+    record = {
+        "raw": {
+            "对方账号": "10311101940040251",
+            "对方户名": "999999 转存第10页/共29页",
+            "对方开户行": "999999",
+            "摘要": "转存",
+        },
+        "canonical_raw": {
+            "counter_account": "10311101940040251",
+            "counter_party": "999999 转存第10页/共29页",
+            "counter_bank_name": "999999",
+            "summary": "转存",
+        },
+        "normalized": {
+            "counter_account": "10311101940040251",
+            "counter_party": "999999 转存第10页/共29页",
+            "counter_party_original": "999999 转存第10页/共29页",
+            "counter_bank_name": "999999",
+            "summary": "转存",
+            "additional_fields": [
+                {
+                    "name": "对方户名",
+                    "field": "counter_party",
+                    "value": "999999 转存第10页/共29页",
+                }
+            ],
+        },
+    }
+
+    sanitized = _sanitize_bank_records([record])[0]
+
+    assert sanitized["raw"] == record["raw"]
+    assert sanitized["canonical_raw"] == record["canonical_raw"]
+    assert sanitized["normalized"]["counter_party"] == ""
+    assert sanitized["normalized"]["counter_party_original"] == ""
+    assert sanitized["normalized"]["additional_fields"][0]["value"] == ""
+    assert sanitized["normalized"]["counterparty_status"] == "present"
+    exclusions = sanitized["source"]["_delivery_value_exclusions"]
+    assert {item["pool"] for item in exclusions} == {"raw", "canonical_raw"}
+
+
+def test_bank_statement_delivery_does_not_repromote_excluded_counterparty_source_noise() -> None:
+    from docmirror.output.normalized_records import additional_business_fields
+
+    record = {
+        "raw": {"对方户名": "999999 转存第10页/共29页", "摘要": "转存"},
+        "canonical_raw": {
+            "counter_party": "999999 转存第10页/共29页",
+            "summary": "转存",
+        },
+        "normalized": {"counter_party": "", "summary": "转存"},
+    }
+    sanitized = _sanitize_bank_records([record])[0]
+    columns = [
+        {"key": "counter_party", "label": "对方户名", "type": "string"},
+        {"key": "summary", "label": "摘要", "type": "string"},
+    ]
+
+    assert additional_business_fields(
+        sanitized,
+        columns,
+        {"counter_party": ["对方户名"]},
+    ) == []
+    assert sanitized["raw"] == record["raw"]
+    assert sanitized["canonical_raw"] == record["canonical_raw"]
+
+
+def test_bank_statement_delivery_does_not_duplicate_a_reconstructed_disclaimer_fragment() -> None:
+    from docmirror.output.normalized_records import additional_business_fields
+
+    first = "本明细仅限于查询账户交易流水使用,在跨行退回、日终冲账等特殊情况下存在后续变动可能,"
+    complete = "重要提示:" + first + "若与实际交易不符,以银行对账单为准。"
+    record = {
+        "raw": {"重要提示": first, "document_disclaimer": complete},
+        "canonical_raw": {"statement_disclaimer": complete},
+        "normalized": {"statement_disclaimer": complete},
+        "source": {},
+    }
+    _mark_represented_header_delivery_exclusions([record])
+
+    assert additional_business_fields(
+        record,
+        [{"key": "statement_disclaimer", "label": "流水免责声明", "type": "string"}],
+        {},
+    ) == []
+    assert record["raw"]["重要提示"] == first
+    assert record["canonical_raw"]["statement_disclaimer"] == complete

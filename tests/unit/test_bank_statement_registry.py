@@ -27,7 +27,9 @@ from docmirror.plugins.bank_statement.style_registry import (
     BankStyleParserRegistry,
     BankTableCandidate,
     _candidate_expected_rows,
+    _candidate_from_batch,
     _candidate_sequence_continuity,
+    _candidate_source_fragment_coverage,
     _select_candidate,
 )
 from docmirror.plugins.bank_statement.wide_table_recovery import RowCountEvidence, _recover_cross_page_wide_tables
@@ -305,6 +307,101 @@ def test_fuller_candidate_can_use_strict_source_page_superset_over_local_balance
     selected, _diagnostics = _select_candidate([short, fuller])
 
     assert selected is fuller
+
+
+def test_candidate_selection_scores_the_same_balance_refinement_used_by_delivery() -> None:
+    """A complete 3-page plane must not lose to a locally perfect 2-page prefix."""
+
+    short = replace(
+        _candidate_for_authority_test(
+            "parser:grid_standard",
+            4,
+            RowCountEvidence(4, "candidate_rows", 0.55),
+        ),
+        records=_candidate_records_on_pages(4, [1, 2]),
+    )
+    raw_records: list[dict[str, object]] = []
+    balance = 100.0
+    for index in range(6):
+        amount = float(index + 1)
+        balance += amount
+        raw_records.append(
+            {
+                "date": f"2025-01-{index + 1:02d}",
+                "amount": amount,
+                "balance": balance,
+                "direction": "income" if index == 0 else "",
+                "summary": f"row {index + 1}",
+                "reference": f"ref-{index + 1}",
+                "counter_party": f"party-{index + 1}",
+                "_source": {
+                    "source_page": index // 2 + 1,
+                    "page_range": [index // 2 + 1, index // 2 + 1],
+                    "table_id": "evidence:whole-document",
+                    "source_row_index": index,
+                    "bbox": [10.0, index * 20.0, 200.0, index * 20.0 + 8.0],
+                },
+            }
+        )
+
+    def normalize(raw: dict[str, object]) -> dict[str, object]:
+        return {
+            "date": raw["date"],
+            "amount": raw["amount"],
+            "balance": raw["balance"],
+            "direction": raw["direction"],
+        }
+
+    fuller = _candidate_from_batch(
+        candidate_id="evidence_atom",
+        transactions=raw_records,
+        normalize_fn=normalize,
+        plugin=BankStatementCommunityPlugin(),
+        source="canonical_evidence_table",
+        expected_rows=RowCountEvidence(6, "positioned_date_anchors", 0.80),
+        extraction_confidence=0.90,
+    )
+
+    selected, _diagnostics = _select_candidate([short, fuller])
+
+    assert fuller.canonical_rows == 6
+    assert fuller.canonical_coverage == 1.0
+    assert selected is fuller
+
+
+def test_strict_cross_page_fragments_beat_equal_native_grid_and_survive_native_override() -> None:
+    parser_records = _candidate_records_on_pages(4, [1, 2])
+    parser_records[0]["_source"].update(
+        {
+            "source_page": 1,
+            "page_range": [1, 2],
+            "source_refs": [{"source_page": 1}, {"source_page": 2}],
+        }
+    )
+    parser = replace(
+        _candidate_for_authority_test(
+            "parser:grid_standard",
+            4,
+            RowCountEvidence(4, "native_wide_rows", 0.70),
+        ),
+        records=parser_records,
+        source_fragment_coverage=_candidate_source_fragment_coverage(parser_records),
+    )
+    native = replace(
+        _candidate_for_authority_test(
+            "native_wide_table:0",
+            4,
+            RowCountEvidence(4, "native_wide_rows", 0.70),
+        ),
+        records=_candidate_records_on_pages(4, [1, 2]),
+        native_cell_coverage=1.0,
+    )
+
+    selected, diagnostics = _select_candidate([native, parser])
+
+    assert parser.source_fragment_coverage == 0.25
+    assert selected is parser
+    assert "fragment_coverage=0.250" in diagnostics["selection_reason"]
 
 
 def test_complete_three_page_two_scope_candidate_beats_nonempty_partial_plane() -> None:
@@ -681,6 +778,7 @@ def test_primary_collector_invokes_only_first_allowed_detected_parser(
                 "parser:grid_standard",
                 "parser:compact_merged",
                 "semantic_text",
+                "schema_guided_page_text",
                 "physical_table",
                 "positioned_record_block",
                 "evidence_atom",
@@ -1571,6 +1669,7 @@ def test_empty_or_partial_primary_selects_one_complete_whole_document_alternate(
         "parser:signed_amount",
         "parser:compact_merged",
         "semantic_text",
+        "schema_guided_page_text",
         "physical_table",
         "positioned_record_block",
         "evidence_atom",
@@ -1597,6 +1696,141 @@ def test_empty_or_partial_primary_selects_one_complete_whole_document_alternate(
         (3, "statement_header:scope-b", "3", "evidence_atom:complete:plane"),
         (3, "statement_header:scope-b", "4", "evidence_atom:complete:plane"),
     ]
+
+
+def test_eager_deployment_composes_adjacent_source_disjoint_page_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different normalizers may own adjacent components of one statement."""
+
+    def component(candidate_id: str, pages: list[int], field_prefix: str) -> BankTableCandidate:
+        raw_records = [
+            {
+                f"{field_prefix}_date": f"2025-01-{index + 1:02d}",
+                f"{field_prefix}_amount": f"{index + 1}.00",
+                f"{field_prefix}_direction": "income",
+                f"{field_prefix}_summary": f"{field_prefix}-row-{index + 1}",
+                "_source": {
+                    "source_page": page,
+                    "page_range": [page, page],
+                    "table_id": f"{candidate_id}:page:{page}",
+                    "source_row_index": index,
+                    "bbox": [10.0, index * 20.0, 200.0, index * 20.0 + 8.0],
+                },
+            }
+            for index, page in enumerate(pages)
+        ]
+
+        def normalize(raw: dict[str, object]) -> dict[str, object]:
+            return {
+                "date": raw[f"{field_prefix}_date"],
+                "amount": float(str(raw[f"{field_prefix}_amount"])),
+                "direction": raw[f"{field_prefix}_direction"],
+                "summary": raw[f"{field_prefix}_summary"],
+            }
+
+        return replace(
+            _candidate_for_authority_test(
+                candidate_id,
+                len(raw_records),
+                RowCountEvidence(len(raw_records), "candidate_rows", 0.55),
+            ),
+            records=raw_records,
+            normalize_fn=normalize,
+            source_column_width=4.0,
+        )
+
+    page_one = component("parser:signed_amount", [1, 1], "head")
+    page_tail = component("physical_table", [2, 2, 3, 3], "tail")
+    monkeypatch.setattr(style_registry, "_collect_table_candidates", lambda *_args, **_kwargs: [page_one, page_tail])
+
+    detection = StyleDetectionResult(
+        primary_style="signed_amount",
+        confidence=0.95,
+        parser_chain=["signed_amount"],
+    )
+    ctx = StyleContext(
+        tables=[],
+        full_text="",
+        institution=None,
+        page_count=3,
+        reconstruction=ReconstructionMeta(source="canonical_table"),
+    )
+    registry = BankStyleParserRegistry(adaptive=False)
+
+    records, _identity = registry.run_parser_chain(detection, ctx, BankStatementCommunityPlugin())
+
+    assert len(records) == 6
+    assert [record["source"]["source_page"] for record in records] == [1, 1, 2, 2, 3, 3]
+    assert [record["normalized"]["summary"] for record in records] == [
+        "head-row-1",
+        "head-row-2",
+        "tail-row-1",
+        "tail-row-2",
+        "tail-row-3",
+        "tail-row-4",
+    ]
+    assert registry.last_selection_diagnostics["selected_candidate"] == (
+        "composite:parser:signed_amount+physical_table"
+    )
+    assert registry.last_selection_diagnostics["composed_candidates"] == [
+        "parser:signed_amount",
+        "physical_table",
+    ]
+    assert ctx.reconstruction.source == "source_disjoint_page_components"
+
+
+def test_eager_deployment_does_not_compose_disjoint_pages_across_an_uncovered_gap() -> None:
+    page_one = replace(
+        _candidate_for_authority_test(
+            "parser:grid_standard",
+            2,
+            RowCountEvidence(2, "candidate_rows", 0.55),
+        ),
+        records=_candidate_records_on_pages(2, [1]),
+    )
+    page_three = replace(
+        _candidate_for_authority_test(
+            "physical_table",
+            2,
+            RowCountEvidence(2, "candidate_rows", 0.55),
+        ),
+        records=_candidate_records_on_pages(2, [3]),
+    )
+
+    components = style_registry._source_disjoint_candidate_components(page_one, [page_one, page_three])
+
+    assert components == [page_one]
+
+
+def test_eager_deployment_preserves_material_validated_rows_across_source_gaps() -> None:
+    page_one = replace(
+        _candidate_for_authority_test(
+            "parser:signed_amount",
+            2,
+            RowCountEvidence(2, "candidate_rows", 0.55),
+        ),
+        records=_candidate_records_on_pages(2, [1]),
+    )
+    tail_records = _candidate_records_on_pages(30, [3, 4])
+    partial_tail = replace(
+        _candidate_for_authority_test(
+            "physical_table",
+            30,
+            RowCountEvidence(30, "physical_rows", 0.55),
+        ),
+        records=tail_records,
+        canonical_rows=28,
+        directional_rows=28,
+        canonical_coverage=28 / 30,
+        field_completeness=0.97,
+        balance_chain_score=0.99,
+        source_column_width=6.0,
+    )
+
+    components = style_registry._source_disjoint_candidate_components(page_one, [page_one, partial_tail])
+
+    assert components == [page_one, partial_tail]
 
 
 @pytest.mark.parametrize(

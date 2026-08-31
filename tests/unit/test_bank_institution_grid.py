@@ -80,6 +80,24 @@ def test_normalize_table_headers_preserves_exact_bojs_date_role() -> None:
     assert normalized[0][0] == headers
 
 
+def test_exact_counterparty_unit_label_outranks_fuzzy_neighboring_fields() -> None:
+    raw = {
+        "交易日期": "2023-07-26",
+        "交易时间": "10:52:44",
+        "借贷标志": "贷",
+        "交易金额": "200.00",
+        "余额": "300.00",
+        "对方单位": "胡晓敏",
+    }
+    plugin = BankStatementCommunityPlugin()
+
+    normalized = normalize_record(raw, plugin)
+    canonical_raw = plugin._canonical_raw_values(raw, normalized)
+
+    assert normalized["counter_party"] == "胡晓敏"
+    assert canonical_raw["counter_party"] == "胡晓敏"
+
+
 def test_bojs_grid_extraction_preserves_exact_source_roles_end_to_end() -> None:
     headers = ["序号", "摘要/附言", "币别", "交易日期", "交易类型", "交易金额", "账户余额", "对方账号", "对方户名"]
     row = [
@@ -2302,6 +2320,32 @@ def test_split_grid_rejects_column_ordered_page_text_as_counterparty():
     assert records[1]["normalized"]["counter_party"] == "WL支付宝"
 
 
+def test_split_grid_keeps_named_source_null_party_when_tail_is_bank_and_summary() -> None:
+    headers = ["交易时间", "收入金额", "支出金额", "账户余额", "对方账号", "对方户名", "对方开户行", "摘要"]
+    row = ["2023-04-21\n05:22:53", "177.11", "", "525.78", "10311101940040251", "", "999999", "转存"]
+    source_text = "2023-04-21 05:22:53 177.11 525.78 10311101940040251 999999 转存"
+    ctx = StyleContext(
+        tables=[[headers, row]],
+        full_text=source_text,
+        institution=None,
+        page_count=1,
+        parse_result=ParseResult(pages=[PageContent(page_number=1, texts=[TextBlock(content=source_text)])]),
+        reconstruction=ReconstructionMeta(source="canonical_table", expected_primary_rows=1),
+    )
+
+    records, _identity = BankStyleParserRegistry().run(
+        BankStyleDetector().detect(ctx),
+        ctx,
+        BankStatementCommunityPlugin(),
+    )
+
+    assert len(records) == 1
+    assert records[0]["raw"]["对方户名"] == ""
+    assert records[0]["normalized"]["counter_party"] == ""
+    assert records[0]["normalized"]["counter_bank_name"] == "999999"
+    assert records[0]["normalized"]["summary"] == "转存"
+
+
 def test_signed_grid_keeps_source_null_interest_counterparty_empty():
     headers = ["交易日期", "对方户名", "对方账号/卡号", "交易摘要", "发生额", "余额", "币种"]
     row = ["2024-06-20\n20:59:30", "", "0000000000000", "结存款息", "4.37", "17486.33", "CNY"]
@@ -2977,6 +3021,76 @@ def test_spdb_cross_page_continuation_survives_repeated_child_header() -> None:
     assert first["交易对手信息"].replace("\n", "") == "中国农业银行股份有限公司无锡石塘湾支行"
     assert first["col_6"].replace("\n", "") == "无锡康城物流有限公司"
     assert first["_source"]["page_range"] == [1, 2]
+    assert stats["stitched_continuation_rows"] == 1
+
+
+def test_cross_page_continuation_without_sequence_or_reference_uses_date_anchor() -> None:
+    headers = ["交易时间", "收入金额", "支出金额", "账户余额", "对方账号", "对方户名", "对方开户行", "摘要"]
+    rows = [
+        _sourced_bank_row(
+            [
+                "2023-05-19",
+                "35464.67",
+                "",
+                "36149.52",
+                "62122611040036481",
+                "上海赫程国际旅行",
+                "招商银行股份有限",
+                "转存",
+            ],
+            page=1,
+            row_index=13,
+        ),
+        _sourced_bank_row(
+            ["16:24:44", "", "", "", "84", "社有限公司南通分公司", "公司上海分行营业部", ""],
+            page=2,
+            row_index=0,
+        ),
+        _sourced_bank_row(
+            ["2023-05-18\n09:00:00", "", "100.00", "36049.52", "123456", "下一交易", "下一银行", "转取"],
+            page=2,
+            row_index=1,
+        ),
+    ]
+    parse_result = ParseResult(
+        pages=[PageContent(page_number=1), PageContent(page_number=2)],
+        entities=DocumentEntities(document_type="bank_statement"),
+        logical_tables=[
+            LogicalTable(
+                table_id="lt_no_sequence",
+                headers=headers,
+                rows=rows,
+                row_count=len(rows),
+                source_pages=[1, 2],
+                source_physical_ids=["pt_1_0", "pt_2_0"],
+                page_span=(1, 2),
+                provenance=[
+                    RowProvenance(source_page=1, source_table_id="pt_1_0", source_row_index=13),
+                    RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=0, is_continuation=True),
+                    RowProvenance(source_page=2, source_table_id="pt_2_0", source_row_index=1, is_continuation=True),
+                ],
+                quality_passed=True,
+                data_row_estimate=2,
+            )
+        ],
+    )
+    stats: dict[str, int] = {}
+
+    extracted = extract_logical_rows_with_provenance(
+        parse_result,
+        BankStatementCommunityPlugin().column_registry,
+        stats=stats,
+    )
+    normalized = [normalize_record(record, BankStatementCommunityPlugin()) for record in extracted]
+
+    assert len(extracted) == 2
+    assert normalized[0]["timestamp"] == "2023-05-19T16:24:44"
+    assert normalized[0]["counter_account"] == "6212261104003648184"
+    assert normalized[0]["counter_party"] == "上海赫程国际旅行社有限公司南通分公司"
+    assert normalized[0]["counter_bank_name"] == "招商银行股份有限公司上海分行营业部"
+    assert extracted[0]["_source"]["page_range"] == [1, 2]
+    assert len(extracted[0]["_source"]["source_refs"]) == 2
+    assert normalized[1]["counter_party"] == "下一交易"
     assert stats["stitched_continuation_rows"] == 1
 
 

@@ -32,6 +32,7 @@ class BankExtractionPolicy:
     route: BankExtractionRoute
     allowed_parser_ids: frozenset[str]
     allow_semantic_text: bool = False
+    allow_schema_guided_page_text: bool = False
     allow_physical_tables: bool = False
     allow_positioned_records: bool = False
     allow_evidence_atoms: bool = False
@@ -46,6 +47,7 @@ DIGITAL_POLICY = BankExtractionPolicy(
     route=BankExtractionRoute.DIGITAL,
     allowed_parser_ids=frozenset({"compact_merged", "grid_standard", "signed_amount"}),
     allow_semantic_text=True,
+    allow_schema_guided_page_text=True,
     allow_physical_tables=True,
     allow_positioned_records=True,
     allow_evidence_atoms=True,

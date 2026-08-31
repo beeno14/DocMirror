@@ -175,6 +175,70 @@ def test_existing_logical_transaction_source_is_repaired_before_early_return() -
     assert {ref["row"] for ref in source["source_cell_refs"]} == {0}
 
 
+def test_stitched_source_refs_recover_each_exact_physical_fragment_geometry() -> None:
+    first_values = ["2023-05-19", "35464.67", "上海赫程国际旅行"]
+    second_values = ["16:24:44", "", "社有限公司南通分公司"]
+
+    def physical_table(page: int, values: list[str]) -> SimpleNamespace:
+        return SimpleNamespace(
+            table_id=f"pt_{page}_0",
+            headers=[],
+            rows=[],
+            metadata={"raw_rows": [values], "geometry": _geometry([values])},
+        )
+
+    fragments = []
+    combined_refs = []
+    for page, values in ((1, first_values), (2, second_values)):
+        refs = [
+            {"page": page, "table_id": f"pt_{page}_0", "row": 0, "raw_row": 0, "col": col}
+            for col in range(len(values))
+        ]
+        combined_refs.extend(refs)
+        fragments.append(
+            {
+                "source_page": page,
+                "table_id": f"pt_{page}_0",
+                "source_row_index": 0,
+                "source_cell_refs": refs,
+            }
+        )
+
+    parse_result = SimpleNamespace(
+        pages=[
+            SimpleNamespace(page_number=1, source_page_number=1, tables=[physical_table(1, first_values)]),
+            SimpleNamespace(page_number=2, source_page_number=2, tables=[physical_table(2, second_values)]),
+        ],
+        logical_tables=[],
+    )
+    transaction = {
+        "交易时间": "2023-05-19\n16:24:44",
+        "收入金额": "35464.67",
+        "对方户名": "上海赫程国际旅行\n社有限公司南通分公司",
+        "_source": {
+            "source": "canonical_table",
+            "source_page": 1,
+            "table_id": "pt_1_0",
+            "source_row_index": 0,
+            "page_range": [1, 2],
+            "source_refs": fragments,
+            "source_cell_refs": combined_refs,
+        },
+    }
+
+    source = _with_internal_row_sources([transaction], parse_result)[0]["_source"]
+
+    assert [ref["bbox"] for ref in source["source_refs"]] == [
+        [0.0, 0.0, 28.0, 6.0],
+        [0.0, 0.0, 28.0, 6.0],
+    ]
+    assert [ref["evidence_ids"] for ref in source["source_refs"]] == [
+        ["ev:0:0", "ev:0:1", "ev:0:2"],
+        ["ev:0:0", "ev:0:1", "ev:0:2"],
+    ]
+    assert source["evidence_ids"] == ["ev:0:0", "ev:0:1", "ev:0:2"]
+
+
 def test_unique_match_without_physical_geometry_keeps_logical_provenance() -> None:
     values = ["acct", "2023-10-13 13:39:37"]
     logical = _logical_row(values, raw_row=4, source_row_index=3)

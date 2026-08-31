@@ -452,6 +452,34 @@ def test_bilingual_known_heading_does_not_become_an_unmapped_business_field() ->
     assert additional_business_fields(row, [_column("amount", label="交易金额", type="money")], {}) == []
 
 
+def test_explicit_delivery_exclusion_preserves_internal_source_but_skips_public_supplement() -> None:
+    from docmirror.output.normalized_records import additional_business_fields
+
+    row = _record(counter_party="")
+    value = "999999 转存第10页/共29页"
+    row["raw"] = {"对方户名": value}
+    row["canonical_raw"] = {"counter_party": value}
+    row["source"] = {
+        "_delivery_value_exclusions": [
+            {"pool": "raw", "name": "对方户名", "value": value, "reason": "proved_noise"},
+            {
+                "pool": "canonical_raw",
+                "name": "counter_party",
+                "value": value,
+                "reason": "proved_noise",
+            },
+        ]
+    }
+    before = copy.deepcopy(row)
+
+    assert additional_business_fields(
+        row,
+        [_column("counter_party", label="对方户名")],
+        {"counter_party": ["对方户名"]},
+    ) == []
+    assert row == before
+
+
 def test_v4_replay_keeps_native_supplemental_fields_sparse_rows_and_no_fabricated_raw(tmp_path) -> None:
     import csv
     import io

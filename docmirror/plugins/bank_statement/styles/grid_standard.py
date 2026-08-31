@@ -97,6 +97,7 @@ _COUNTERPARTY_KEYS = (
     "对方名称",
     "对手信息",
     "对手名称",
+    "对方单位",
     "交易对方",
     "交易对手",
     "Counterparty Name",
@@ -125,6 +126,10 @@ _COUNTERPARTY_RECOVERY_BOUNDARY_MARKERS = (
     "打印时间",
     "本页支出算术合计",
     "本页收入算术合计",
+    "总收入笔数",
+    "总支出笔数",
+    "总收入金额",
+    "总支出金额",
     "交易提示",
     "CPKYG",
 )
@@ -632,6 +637,7 @@ def _normalize_source_counterparty_columns(
             "对方名称",
             "对手信息",
             "对手名称",
+            "对方单位",
             "交易对方",
             "Counterparty Name",
         ),
@@ -1508,6 +1514,7 @@ def _with_internal_row_sources(
 ) -> list[dict[str, Any]]:
     parse_result = _read_view(parse_result)
     physical_raw_rows = _physical_raw_row_geometry_sources(parse_result)
+    physical_raw_rows_by_ref = _physical_raw_row_geometry_sources_by_ref(physical_raw_rows)
     inferred_sources = _infer_row_sources(
         transactions,
         parse_result,
@@ -1520,6 +1527,10 @@ def _with_internal_row_sources(
                 transaction,
                 source,
                 physical_raw_rows,
+            )
+            _augment_source_ref_fragments_from_physical_raw_rows(
+                source,
+                physical_raw_rows_by_ref,
             )
             source_page = _positive_int(source.get("source_page"))
             source.setdefault("page_range", [source_page, source_page])
@@ -1552,6 +1563,10 @@ def _with_internal_row_sources(
             transaction,
             row_source,
             physical_raw_rows,
+        )
+        _augment_source_ref_fragments_from_physical_raw_rows(
+            row_source,
+            physical_raw_rows_by_ref,
         )
         _ensure_row_bbox_source_ref(row_source)
         transaction["_source"] = row_source
@@ -1915,6 +1930,8 @@ def _recovered_counterparty_repeats_transaction_fields(
 ) -> bool:
     """Reject a source-null counterparty slice made from later row columns."""
     compact = _signature_value(value)
+    if _recovered_counterparty_is_only_other_source_fields(compact, transaction):
+        return True
     summary = _signature_value(_cell_value(transaction, "交易摘要", "摘要", "备注", "用途"))
     if not summary or not compact.startswith(summary):
         return False
@@ -1925,6 +1942,48 @@ def _recovered_counterparty_repeats_transaction_fields(
         _cell_value(transaction, "余额", "账户余额", "本次余额", "账面余额"),
     )
     return any(_signature_value(value) in compact for value in monetary_values if value)
+
+
+def _recovered_counterparty_is_only_other_source_fields(
+    compact_value: str,
+    transaction: dict[str, Any],
+) -> bool:
+    """Reject a page-text slice fully explained by non-party cells in the row.
+
+    A blank named party cell can be followed in flattened PDF text by the bank
+    and summary cells (for example ``999999 转存``).  Those are valid source
+    facts, but they do not become a counterparty merely because the party cell
+    is empty.  Consume only exact same-row source values and reject the slice
+    when no independent text remains.
+    """
+    if not compact_value:
+        return False
+
+    party_aliases = {_signature_value(alias).casefold() for alias in _COUNTERPARTY_KEYS}
+    other_values: set[str] = set()
+    for raw_header, raw_value in transaction.items():
+        if str(raw_header).startswith("_") or raw_value in (None, ""):
+            continue
+        header_parts = {
+            _signature_value(part).casefold()
+            for part in str(raw_header or "").splitlines()
+            if _signature_value(part)
+        }
+        if header_parts.intersection(party_aliases):
+            continue
+        source_value = _signature_value(raw_value)
+        if source_value:
+            other_values.add(source_value)
+
+    residue = compact_value
+    consumed = False
+    for source_value in sorted(other_values, key=len, reverse=True):
+        if source_value not in residue:
+            continue
+        residue = residue.replace(source_value, "")
+        consumed = True
+    residue = re.sub(r"[\s|/\\:：;；,，.。()（）\[\]【】_\-]+", "", residue)
+    return consumed and not residue
 
 
 def _prefix_by_compact_length(value: str, compact_length: int) -> str:
@@ -2187,6 +2246,71 @@ def _physical_raw_row_geometry_sources(
                 for source_table_id in table_ids:
                     indexed.setdefault((page_number, source_table_id, values), []).append(physical)
     return indexed
+
+
+def _physical_raw_row_geometry_sources_by_ref(
+    physical_raw_rows: dict[tuple[int, str, tuple[str, ...]], list[dict[str, Any]]],
+) -> dict[tuple[int, str, int], list[dict[str, Any]]]:
+    """Index the same exact physical rows by their declared raw-row identity."""
+
+    indexed: dict[tuple[int, str, int], list[dict[str, Any]]] = {}
+    for (page, table_id, _values), candidates in physical_raw_rows.items():
+        for physical in candidates:
+            raw_row_index = _positive_or_zero_int(physical.get("raw_row_index", -1))
+            if raw_row_index is None:
+                continue
+            bucket = indexed.setdefault((page, table_id, raw_row_index), [])
+            if physical not in bucket:
+                bucket.append(physical)
+    return indexed
+
+
+def _augment_source_ref_fragments_from_physical_raw_rows(
+    source: dict[str, Any],
+    physical_raw_rows_by_ref: dict[tuple[int, str, int], list[dict[str, Any]]],
+) -> None:
+    """Restore geometry on each exact fragment of a stitched logical row.
+
+    A cross-page logical transaction cannot equal either physical fragment as a
+    whole, so the ordinary complete-row matcher intentionally fails closed.
+    Its fragment cell refs still carry an exact page/table/raw-row identity;
+    use only that identity and require one physical candidate before restoring
+    bbox/evidence to the corresponding page-local provenance carrier.
+    """
+
+    fragments = source.get("source_refs")
+    if not isinstance(fragments, list):
+        return
+
+    all_evidence = [str(value) for value in source.get("evidence_ids") or [] if str(value)]
+    for fragment in fragments:
+        if not isinstance(fragment, dict):
+            continue
+        cell_refs = [ref for ref in fragment.get("source_cell_refs") or [] if isinstance(ref, dict)]
+        identities: set[tuple[int, str, int]] = set()
+        for ref in cell_refs:
+            page = _positive_int(ref.get("page") or ref.get("source_page") or fragment.get("source_page"))
+            table_id = str(ref.get("table_id") or fragment.get("table_id") or "")
+            raw_row_index = _positive_or_zero_int(ref.get("raw_row", -1))
+            if page is not None and table_id and raw_row_index is not None:
+                identities.add((page, table_id, raw_row_index))
+        if len(identities) != 1:
+            continue
+        candidates = physical_raw_rows_by_ref.get(next(iter(identities)), [])
+        if len(candidates) != 1:
+            continue
+        physical = candidates[0]
+        if physical.get("bbox") is not None and not _geometry_bbox(fragment.get("bbox")):
+            fragment["bbox"] = list(physical["bbox"])
+        evidence_ids = [str(value) for value in physical.get("evidence_ids") or [] if str(value)]
+        if evidence_ids:
+            fragment["evidence_ids"] = list(
+                dict.fromkeys([*(fragment.get("evidence_ids") or []), *evidence_ids])
+            )
+            all_evidence.extend(evidence_ids)
+
+    if all_evidence:
+        source["evidence_ids"] = list(dict.fromkeys(all_evidence))
 
 
 def _physical_row_indexes_by_raw_row(table: Any) -> dict[int, int]:
@@ -2513,7 +2637,7 @@ def _positive_int(value: Any) -> int | None:
 
 def _positive_or_zero_int(value: Any) -> int | None:
     try:
-        number = int(str(value or "").strip())
+        number = int(str("" if value is None else value).strip())
     except (TypeError, ValueError):
         return None
     return number if number >= 0 else None

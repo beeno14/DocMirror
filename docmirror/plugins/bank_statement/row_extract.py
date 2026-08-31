@@ -311,7 +311,11 @@ def _is_cross_page_continuation(
 
     previous_anchors = _values_at(previous_values, [*sequence_indexes, *reference_indexes])
     current_anchors = _values_at(current_values, [*sequence_indexes, *reference_indexes])
-    if not any(value for value in previous_anchors) or any(value for value in current_anchors):
+    if any(value for value in current_anchors):
+        return False
+    previous_has_anchor = any(value for value in previous_anchors)
+    previous_has_date = any(_looks_like_date(value) for value in _values_at(previous_values, date_indexes))
+    if not previous_has_anchor and not previous_has_date:
         return False
     if any(_looks_like_date(value) for value in _values_at(current_values, date_indexes)):
         return False

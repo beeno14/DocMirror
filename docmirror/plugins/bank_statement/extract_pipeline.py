@@ -45,6 +45,7 @@ from docmirror.plugins.bank_statement.statement_context import page_texts_with_b
 from docmirror.plugins.bank_statement.style_detector import BankStyleDetector, StyleDetectionResult
 from docmirror.plugins.bank_statement.style_registry import BankStyleParserRegistry
 from docmirror.plugins.bank_statement.wide_table_recovery import (
+    RowCountEvidence,
     audit_bank_statement_invariants,
     page_texts_from_parse_result,
     resolve_row_count_evidence,
@@ -573,6 +574,91 @@ def _row_accounting_view(
     return canonical_records, parsed_rows, direction_count, direction_expected_count, sourced_count
 
 
+def _deployment_row_count_evidence(blo_meta: Any, parsed_rows: int) -> RowCountEvidence | None:
+    """Recover bounded count evidence retained by the winning deployment."""
+
+    candidates: list[RowCountEvidence] = []
+    tolerance = max(2, int(parsed_rows or 0) // 100)
+    for diagnostic in (getattr(blo_meta, "candidate_diagnostics", None) or []):
+        if not isinstance(diagnostic, dict):
+            continue
+        try:
+            count = int(diagnostic.get("selected_expected_rows") or 0)
+            confidence = float(diagnostic.get("selected_expected_confidence") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        source = str(diagnostic.get("selected_expected_source") or "")
+        if count <= 0 or abs(count - parsed_rows) > tolerance:
+            continue
+        candidates.append(RowCountEvidence(count=count, source=source, confidence=confidence))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda evidence: (evidence.confidence, evidence.count))
+
+
+def _retain_count_proven_direction_unresolved_rows(
+    raw_records: list[dict[str, Any]],
+    canonical_records: list[dict[str, Any]],
+    source_reported_count: Any,
+    *,
+    physical_expected: int = 0,
+) -> list[dict[str, Any]]:
+    """Keep source-backed transactions when only direction remains unresolved.
+
+    Canonical quality is an auditor, not permission to erase an otherwise
+    source-proven business row.  Retention is deliberately narrow: a bounded
+    independent row plane must match the parsed count exactly, every omitted
+    row must have valid date/amount semantics and single-page provenance, and
+    the unresolved tail must be small.  The missing direction remains blank
+    and is reported by the existing quality warnings; no business value is
+    invented.
+    """
+
+    parsed_rows = len(raw_records)
+    if parsed_rows == len(canonical_records):
+        return canonical_records
+    expected_counts = {int(physical_expected)} if int(physical_expected or 0) > 0 else set()
+    try:
+        expected_rows = int(getattr(source_reported_count, "count", 0) or 0)
+        confidence = float(getattr(source_reported_count, "confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        expected_rows = 0
+        confidence = 0.0
+    source = str(getattr(source_reported_count, "source", "") or "")
+    if (
+        expected_rows > 0
+        and confidence >= 0.80
+        and source in (_ROW_PLANE_COUNT_SOURCES | ISSUER_ROW_COUNT_EVIDENCE_SOURCES)
+    ):
+        expected_counts.add(expected_rows)
+
+    unresolved = [record for record in raw_records if not is_canonical_row(record.get("normalized") or {})]
+    if not unresolved:
+        return canonical_records
+    direction_unresolved: list[dict[str, Any]] = []
+    for record in unresolved:
+        normalized = record.get("normalized") or {}
+        if (
+            normalized.get("direction") not in {"income", "expense"}
+            and _has_single_page_source(record)
+            and any(
+            is_canonical_row({**normalized, "direction": direction})
+            for direction in ("income", "expense")
+            )
+        ):
+            direction_unresolved.append(record)
+    if not direction_unresolved:
+        return canonical_records
+    if len(direction_unresolved) > max(2, parsed_rows // 50):
+        return canonical_records
+    deliverable_ids = {id(record) for record in canonical_records}
+    deliverable_ids.update(id(record) for record in direction_unresolved)
+    deliverable = [record for record in raw_records if id(record) in deliverable_ids]
+    if len(deliverable) not in expected_counts:
+        return canonical_records
+    return deliverable
+
+
 def _zero_amount_direction_exempt(record: dict[str, Any]) -> bool:
     """Return whether a source-backed zero value makes direction meaningless."""
 
@@ -717,8 +803,21 @@ def _run_bank_statement_extract(
             invariant_failures = None
 
     canonical_rows = len(records)
-    emitted_rows = canonical_rows
-    blocked_noncanonical_count = parsed_rows - canonical_rows
+    deployment_count_evidence = _deployment_row_count_evidence(blo_meta, parsed_rows)
+    retention_count_evidence = (
+        source_reported_count
+        if is_authoritative_issuer_row_count(source_reported_count)
+        else deployment_count_evidence or source_reported_count
+    )
+    records = _retain_count_proven_direction_unresolved_rows(
+        raw_records,
+        records,
+        retention_count_evidence,
+        physical_expected=physical_expected,
+    )
+    emitted_rows = len(records)
+    retained_direction_unresolved_count = emitted_rows - canonical_rows
+    blocked_noncanonical_count = parsed_rows - emitted_rows
     identity_fields = enrich_identity_fields(identity_fields, ctx.full_text, parse_result)
     try:
         evidence_identity = plugin._recover_identity_from_evidence(parse_result)
@@ -759,6 +858,12 @@ def _run_bank_statement_extract(
         )
         if style_meta.extract_status == "success":
             style_meta.extract_status = "degraded"
+    if retained_direction_unresolved_count > 0:
+        warnings.append(
+            "BANK_DATASET_DIRECTION_UNRESOLVED_ROWS_RETAINED:"
+            f"retained={retained_direction_unresolved_count}:parsed={parsed_rows}"
+        )
+        style_meta.extract_status = "degraded"
     if direction_expected_count > 0 and direction_count < direction_expected_count:
         warnings.append(
             "BANK_DIRECTION_COVERAGE_LOW:"

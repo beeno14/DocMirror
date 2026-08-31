@@ -51,7 +51,11 @@ def _source_value_equal(source: Any, value: Any) -> bool:
 def _audit_additional_fields(
     row: dict, delivered: dict, columns: list, aliases: dict, source: dict, *, serialized_sources: bool = False
 ) -> None:
-    from docmirror.output.normalized_records import source_fields, value_is_represented
+    from docmirror.output.normalized_records import (
+        _delivery_value_excluded,
+        source_fields,
+        value_is_represented,
+    )
 
     normalized = delivered["normalized"]
     additional = normalized.get("additional_fields") or []
@@ -76,6 +80,8 @@ def _audit_additional_fields(
         if not (raw_backed or (name == field and canonical_backed)) or (field and not canonical_backed):
             raise AssertionError("supplemental normalized field is not source-backed")
     for name, value in (source.get("raw") or {}).items():
+        if _delivery_value_excluded(source, "raw", str(name), value):
+            continue
         fields = source_fields(name, row, columns, aliases)
         represented = any(
             key in normalized and value_is_represented(value, normalized[key], descriptors[key])
@@ -86,6 +92,8 @@ def _audit_additional_fields(
             raise AssertionError(f"unrepresented original source field: {name}")
     for key, value in (source.get("canonical_raw") or {}).items():
         if value in (None, ""):
+            continue
+        if _delivery_value_excluded(source, "canonical_raw", str(key), value):
             continue
         represented = key in normalized and value_is_represented(value, normalized[key], descriptors.get(key, {}))
         retained = any(item.get("field") == key and equal(value, item["value"]) for item in additional)

@@ -1374,6 +1374,25 @@ def test_disclaimer_is_preserved_but_never_claimed_as_statement_title():
     assert title.evidence_ids == ("ev:0001:text:000002",)
 
 
+def test_adjacent_multiline_statement_disclaimer_is_preserved_as_one_complete_fact():
+    first_line = "重要提示：本明细仅限于查询账户交易流水使用，在跨行退回、日终冲账等特殊情况下存在后续变动可能，"
+    second_line = "若与实际交易不符，以银行对账单为准。文件下载后请妥善保管，如若被伪造、变造、篡改，不具有法律效力。"
+    rows = [
+        [_atom(1, first_line, 20, 548, 500, 556, 1)],
+        [_atom(1, second_line, 12, 558, 510, 566, 2)],
+        [_atom(1, "第1页/共29页", 150, 568, 250, 576, 3)],
+    ]
+
+    disclaimer = statement_context._statement_disclaimer_fact(rows, 1)
+
+    assert disclaimer is not None
+    assert disclaimer.raw_value == statement_context._nfkc(first_line + second_line)
+    assert disclaimer.normalized_value == statement_context._nfkc(first_line + second_line)
+    assert disclaimer.derivation == "joined_adjacent_statement_disclaimer_lines"
+    assert disclaimer.evidence_ids == ("ev:0001:text:000001", "ev:0001:text:000002")
+    assert "第1页" not in disclaimer.raw_value
+
+
 def test_english_disclaimer_is_source_business_text_but_never_a_statement_title():
     disclaimer_text = (
         "Disclaimer: This account statement is provided for reference only and is not legal proof."
@@ -3762,3 +3781,45 @@ def test_source_metadata_is_page_scoped_atomic_and_losslessly_conserved(monkeypa
     incomplete = records[:-1]
     failed = statement_context.audit_source_fact_conservation(parse_result, headers, incomplete)
     assert failed["unrepresented_fact_count"] == 1
+
+
+def test_complete_header_disclaimer_subsumes_redundant_physical_line_metadata(monkeypatch):
+    first_line = "本明细仅限于查询账户交易流水使用,在跨行退回、日终冲账等特殊情况下存在后续变动可能,"
+    complete = (
+        "重要提示:" + first_line
+        + "若与实际交易不符,以银行对账单为准。文件下载后请妥善保管,如若被伪造、变造、篡改,不具有法律效力。"
+    )
+    parse_result = SimpleNamespace(
+        pages=[SimpleNamespace(page_number=1, source_page_number=1)]
+    )
+    facts_by_page = {
+        1: [
+            _header_fact(
+                "source_header_important_notice",
+                "重要提示",
+                first_line,
+                first_line,
+                1,
+            )
+        ]
+    }
+    monkeypatch.setattr(statement_context, "_page_header_facts", lambda _result: (facts_by_page, {}))
+    monkeypatch.setattr(
+        statement_context,
+        "extract_embedded_business_metadata",
+        lambda _result: SimpleNamespace(candidate_images=0, ocr_images=0, status="not_needed"),
+    )
+    headers = [
+        {
+            "normalized": {"statement_disclaimer": complete},
+            "source": {"page_range": [1, 1]},
+        }
+    ]
+
+    records = statement_context.build_source_metadata_records(parse_result, headers)
+    audit = statement_context.audit_source_fact_conservation(parse_result, headers, records)
+
+    assert records == []
+    assert audit["source_fact_count"] == 1
+    assert audit["represented_fact_count"] == 1
+    assert audit["unrepresented_fact_count"] == 0

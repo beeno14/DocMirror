@@ -136,6 +136,7 @@ BANK_COLUMN_REGISTRY: dict[str, ColumnMapping] = {
             "对手信息",
             "对手名称",
             "对手户名",
+            "对方单位",
             "交易对方",
             "交易对手信息",
             "Counter party",
@@ -830,7 +831,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
 
         exact_party_value = _exact_source_value(
             raw_txn,
-            ("对方户名", "对方账户名", "对方名称", "对手信息", "对手名称", "交易对方"),
+            ("对方户名", "对方账户名", "对方名称", "对手信息", "对手名称", "对方单位", "交易对方"),
         )
         if exact_party_value not in (None, ""):
             from docmirror.plugins.bank_statement.styles.grid_standard import _split_embedded_counter_account
@@ -1307,6 +1308,7 @@ class BankStatementCommunityPlugin(BaseTableParser):
             parse_result,
             result.identity_fields,
         )
+        _mark_represented_header_delivery_exclusions(statement_header_records)
         source_metadata_records = build_source_metadata_records(parse_result, statement_header_records)
         source_conservation = audit_source_fact_conservation(
             parse_result,
@@ -1596,6 +1598,68 @@ def _sanitize_bank_records(records: list[dict]) -> list[dict]:
     return sanitized
 
 
+def _add_delivery_value_exclusion(
+    record: dict,
+    *,
+    pool: str,
+    name: str,
+    value: Any,
+    reason: str,
+) -> None:
+    """Keep source evidence intact while preventing a proved non-business promotion."""
+
+    if value in (None, ""):
+        return
+    source = record.setdefault("source", {})
+    if not isinstance(source, dict):
+        return
+    exclusions = source.setdefault("_delivery_value_exclusions", [])
+    if not isinstance(exclusions, list):
+        return
+    exclusion = {
+        "pool": pool,
+        "name": str(name),
+        "value": copy.deepcopy(value),
+        "reason": reason,
+    }
+    if exclusion not in exclusions:
+        exclusions.append(exclusion)
+
+
+def _mark_represented_header_delivery_exclusions(records: list[dict]) -> None:
+    """Do not re-promote a raw disclaimer fragment already present in full."""
+
+    for record in records:
+        normalized = record.get("normalized")
+        raw = record.get("raw")
+        if not isinstance(normalized, dict) or not isinstance(raw, dict):
+            continue
+        complete = _compat_compact(normalized.get("statement_disclaimer"))
+        if not complete:
+            continue
+        for name, value in raw.items():
+            fragment = _compat_compact(value)
+            source_name = _compat_compact(name).casefold()
+            disclaimer_named = (
+                any(marker in source_name for marker in ("提示", "免责声明", "声明"))
+                or "disclaimer" in source_name
+                or "notice" in source_name
+                or _is_statement_disclaimer(f"{name}:{value}")
+            )
+            if (
+                fragment
+                and fragment in complete
+                and disclaimer_named
+            ):
+                _add_delivery_value_exclusion(
+                    record,
+                    pool="raw",
+                    name=str(name),
+                    value=value,
+                    reason="represented_by_complete_statement_disclaimer",
+                )
+
+
 def _sanitize_bank_value_pool(pool: dict) -> None:
     for key, value in list(pool.items()):
         if not isinstance(value, str):
@@ -1604,7 +1668,15 @@ def _sanitize_bank_value_pool(pool: dict) -> None:
         text = _clean_footer_text(value)
         if key_text in {"balance", "amount", "amount_cny", "余额", "交易金额"}:
             text = _clean_money_text(text)
-        if key_text in {"counter_party", "对方户名", "对方名称", "对手信息", "对手名称", "交易对手"}:
+        if key_text in {
+            "counter_party",
+            "counter_party_original",
+            "对方户名",
+            "对方名称",
+            "对手信息",
+            "对手名称",
+            "交易对手",
+        }:
             text = _clean_counterparty_text(text)
         pool[key] = text
 
@@ -1663,7 +1735,15 @@ def _repair_counterparty_canonical_raw(record: dict) -> None:
     if not isinstance(canonical_raw, dict) or not isinstance(raw, dict):
         return
     explicit_headers = {
-        "对方户名": ("对方户名", "对方名称", "对手名称", "交易对方", "Counterparty Name", "对方账号与户名"),
+        "对方户名": (
+            "对方户名",
+            "对方名称",
+            "对手名称",
+            "对方单位",
+            "交易对方",
+            "Counterparty Name",
+            "对方账号与户名",
+        ),
         "对方行名": ("对方行名", "对手机构", "对方开户行", "对方银行名称", "Counterparty Institution"),
     }
     for canonical_header, aliases in explicit_headers.items():
@@ -1702,33 +1782,90 @@ def _sanitize_record_counterparty(record: dict, aliases: dict[str, str]) -> None
     account = _record_counter_account(record)
     summary = _record_summary(record)
     alias = aliases.get(account, "") if account else ""
+
+    def sanitize_value(value: str) -> str:
+        cleaned = _clean_counterparty_text(value)
+        polluted = _looks_like_counterparty_pollution(value) or _looks_like_counterparty_pollution(cleaned)
+        residue = _looks_like_counterparty_residue(cleaned)
+        if alias and cleaned and cleaned.startswith(alias):
+            # The alias only shortens a value that is already present in
+            # this source row.  It must never populate an empty/residual
+            # party from another transaction that happens to share the
+            # same counter-account.
+            cleaned = alias
+        elif polluted or residue:
+            cleaned = ""
+        if _is_fee_residue_counterparty(cleaned, summary):
+            cleaned = ""
+        return cleaned
+
     for pool_name in ("normalized",):
         pool = record.get(pool_name)
         if not isinstance(pool, dict):
             continue
-        for key in ("对方户名", "对方名称", "交易对手", "counter_party"):
+        for key in ("对方户名", "对方名称", "交易对手", "counter_party", "counter_party_original"):
             value = pool.get(key)
             if not isinstance(value, str):
                 continue
-            cleaned = _clean_counterparty_text(value)
-            polluted = _looks_like_counterparty_pollution(value) or _looks_like_counterparty_pollution(cleaned)
-            residue = _looks_like_counterparty_residue(cleaned)
-            if alias and cleaned and cleaned.startswith(alias):
-                # The alias only shortens a value that is already present in
-                # this source row.  It must never populate an empty/residual
-                # party from another transaction that happens to share the
-                # same counter-account.
-                cleaned = alias
-            elif polluted or residue:
-                cleaned = ""
-            if _is_fee_residue_counterparty(cleaned, summary):
-                cleaned = ""
-            pool[key] = cleaned
+            pool[key] = sanitize_value(value)
+        additional_fields = pool.get("additional_fields")
+        if isinstance(additional_fields, list):
+            for item in additional_fields:
+                if not isinstance(item, dict) or item.get("field") != "counter_party":
+                    continue
+                value = item.get("value")
+                if isinstance(value, str):
+                    item["value"] = sanitize_value(value)
     normalized = record.get("normalized")
     if isinstance(normalized, dict):
         counter_party = str(normalized.get("counter_party") or "").strip()
         counter_account = str(normalized.get("counter_account") or "").strip()
         normalized["counterparty_status"] = "present" if counter_party or counter_account else "source_null"
+
+    def non_business_source_value(value: Any) -> bool:
+        if not isinstance(value, str) or not value.strip():
+            return False
+        cleaned = _clean_counterparty_text(value)
+        return (
+            _looks_like_counterparty_pollution(value)
+            or _looks_like_counterparty_pollution(cleaned)
+            or _looks_like_counterparty_residue(cleaned)
+            or _is_fee_residue_counterparty(cleaned, summary)
+        )
+
+    raw = record.get("raw")
+    counterparty_names = (
+        "对方户名",
+        *BANK_COLUMN_REGISTRY["对方户名"].aliases,
+    )
+    counterparty_labels = {_compat_compact(name) for name in counterparty_names}
+    if isinstance(raw, dict):
+        for name, value in raw.items():
+            header = str(name)
+            header_parts = {_compat_compact(part) for part in header.splitlines()}
+            if (
+                (_compat_compact(header) in counterparty_labels or bool(header_parts & counterparty_labels))
+                and non_business_source_value(value)
+            ):
+                _add_delivery_value_exclusion(
+                    record,
+                    pool="raw",
+                    name=header,
+                    value=value,
+                    reason="counterparty_non_business_contamination",
+                )
+    canonical_raw = record.get("canonical_raw")
+    if isinstance(canonical_raw, dict):
+        for key in ("counter_party", "counter_party_original"):
+            value = canonical_raw.get(key)
+            if non_business_source_value(value):
+                _add_delivery_value_exclusion(
+                    record,
+                    pool="canonical_raw",
+                    name=key,
+                    value=value,
+                    reason="counterparty_non_business_contamination",
+                )
 
 
 def _record_counter_account(record: dict) -> str:
@@ -1761,7 +1898,7 @@ def _record_counterparty_values(record: dict) -> list[str]:
         pool = record.get(pool_name)
         if not isinstance(pool, dict):
             continue
-        for key in ("counter_party", "对方户名", "对方名称", "交易对手"):
+        for key in ("counter_party", "counter_party_original", "对方户名", "对方名称", "交易对手"):
             value = str(pool.get(key) or "").strip()
             if value:
                 values.append(value)
@@ -1857,6 +1994,11 @@ def _looks_like_counterparty_pollution(value: str) -> bool:
         # One long identifier can be a legitimate party suffix; two usually mean
         # that an adjacent account or transaction row leaked into the name cell.
         or long_number_count > 1
+        # A positioned page marker can be concatenated to the final physical
+        # row by a PDF table detector.  It is document furniture, never part of
+        # the source counterparty cell.  A clean alias from another row may
+        # still recover a genuine prefix before this predicate clears residue.
+        or bool(re.search(r"第\s*\d+\s*页\s*[/／]\s*共\s*\d+\s*页", normalized))
         or bool(re.fullmatch(r"[\d*＊,./:：-]{8,}", compact))
         or sum(compact.count(marker) for marker in ("WL财付通", "WL支付宝", "微信转账")) > 2
     )

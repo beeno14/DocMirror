@@ -51,6 +51,7 @@ from docmirror.plugins.bank_statement.ocr_implicit_table_recovery import (
     recovered_ocr_implicit_row_count,
     recovered_ocr_implicit_row_evidence,
 )
+from docmirror.plugins.bank_statement.schema_guided_page_text import recover_schema_guided_page_text
 from docmirror.plugins.bank_statement.statement_context import statement_scope_count
 from docmirror.plugins.bank_statement.style_detector import StyleDetectionResult
 from docmirror.plugins.bank_statement.styles import (
@@ -109,6 +110,7 @@ _ROW_PLANE_COUNT_SOURCES = frozenset(
         "ocr_page_ordinal_census",
         "page_transaction_anchors",
         "physical_rows",
+        "schema_guided_page_text_rows",
         "positioned_date_anchors",
         "positioned_record_blocks",
     }
@@ -171,6 +173,8 @@ def _batch_field_completeness(
     transactions: list[dict[str, str]],
     normalize_fn: Any,
     plugin: Any,
+    *,
+    normalized_rows: list[dict[str, Any]] | None = None,
 ) -> float:
     if not transactions:
         return 0.0
@@ -184,8 +188,10 @@ def _batch_field_completeness(
     )
     fields = ("date", "amount", "direction", *(("balance",) if balance_expected else ()))
     scores = []
-    for txn in transactions:
-        norm = ensure_canonical_normalized(nf(txn), plugin.standard_fields)
+    rows = normalized_rows
+    if rows is None:
+        rows = [ensure_canonical_normalized(nf(txn), plugin.standard_fields) for txn in transactions]
+    for norm in rows:
         scores.append(sum(1 for f in fields if norm.get(f) not in (None, "")) / len(fields))
     return sum(scores) / len(scores)
 
@@ -398,6 +404,7 @@ class BankTableCandidate:
     normalize_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     canonical_coverage: float = 0.0
     source_page_coverage: float = 0.0
+    source_fragment_coverage: float = 0.0
     extraction_confidence: float = 0.0
     source_column_width: float = 0.0
     sequence_continuity: float = 0.0
@@ -771,6 +778,33 @@ def _candidate_source_page_coverage(transactions: list[dict[str, Any]]) -> float
     return sourced / len(transactions)
 
 
+def _candidate_source_fragment_coverage(transactions: list[dict[str, Any]]) -> float:
+    """Return coverage by rows proven from adjacent cross-page source fragments."""
+    if not transactions:
+        return 0.0
+    stitched = 0
+    for transaction in transactions:
+        source = transaction.get("_source")
+        if not isinstance(source, dict):
+            continue
+        page_range = source.get("page_range")
+        refs = source.get("source_refs")
+        if not isinstance(page_range, (list, tuple)) or len(page_range) != 2 or not isinstance(refs, list):
+            continue
+        try:
+            first_page, last_page = (int(page) for page in page_range)
+            ref_pages = {
+                int(ref.get("source_page") or ref.get("page") or 0)
+                for ref in refs
+                if isinstance(ref, dict)
+            }
+        except (TypeError, ValueError):
+            continue
+        if first_page > 0 and last_page == first_page + 1 and {first_page, last_page}.issubset(ref_pages):
+            stitched += 1
+    return stitched / len(transactions)
+
+
 def _candidate_native_cell_coverage(transactions: list[dict[str, Any]]) -> float:
     """Return coverage by native PDF grid rows with explicit physical cell bounds."""
     if not transactions:
@@ -793,6 +827,37 @@ def _candidate_native_cell_coverage(transactions: list[dict[str, Any]]) -> float
     return sourced / len(transactions)
 
 
+def _apply_delivery_refinement_for_candidate_quality(
+    transactions: list[dict[str, Any]],
+    normalized_rows: list[dict[str, Any]],
+) -> None:
+    """Score candidates after the same deterministic refinement used on output.
+
+    Candidate selection previously measured canonical coverage before the
+    already-deployed balance-chain refinement, then applied that refinement
+    only to the winning candidate.  That made a complete whole-document plane
+    look sparse and allowed a locally perfect page prefix to win.  Use the
+    existing refinement here as an evaluation step; no extraction strategy or
+    source value is changed.
+    """
+
+    if not transactions or len(transactions) != len(normalized_rows):
+        return
+    from docmirror.plugins._base.base_table_parser import public_record_raw
+
+    provisional_records: list[dict[str, Any]] = []
+    for transaction, normalized in zip(transactions, normalized_rows, strict=True):
+        record: dict[str, Any] = {
+            "raw": public_record_raw(dict(transaction)),
+            "normalized": normalized,
+        }
+        scope_text = str(transaction.get("_document_scope_text") or "").strip()
+        if scope_text:
+            record["_document_scope_text"] = scope_text
+        provisional_records.append(record)
+    grid_standard.refine_missing_directions_from_balance_chain(provisional_records)
+
+
 def _candidate_from_batch(
     *,
     candidate_id: str,
@@ -810,6 +875,7 @@ def _candidate_from_batch(
     directional_rows = 0
     semantic_anomaly_rows = 0
     aggregate_anomaly_rows = 0
+    semantic_anomaly_flags: list[bool] = []
     rejected_row_indexes: list[int] = []
     role_swap_eligible = 0
     role_swap_rows = 0
@@ -829,19 +895,22 @@ def _candidate_from_batch(
             normalized = {}
         normalized_rows.append(normalized)
         retained_transactions.append(transaction)
-        if normalized.get("direction") in {"income", "expense"}:
-            directional_rows += 1
         source_date, source_summary = _source_date_and_summary(transaction)
         if source_date and source_summary:
             role_swap_eligible += 1
             if _compact_semantic_value(source_date) == _compact_semantic_value(source_summary):
                 role_swap_rows += 1
         semantic_anomaly = _row_has_semantic_anomaly(transaction, normalized)
+        semantic_anomaly_flags.append(semantic_anomaly)
         if semantic_anomaly:
             semantic_anomaly_rows += 1
             rejected_row_indexes.append(row_index)
-        if is_canonical_row(normalized) and not semantic_anomaly:
-            canonical_rows += 1
+    _apply_delivery_refinement_for_candidate_quality(retained_transactions, normalized_rows)
+    directional_rows = sum(row.get("direction") in {"income", "expense"} for row in normalized_rows)
+    canonical_rows = sum(
+        is_canonical_row(normalized) and not semantic_anomaly
+        for normalized, semantic_anomaly in zip(normalized_rows, semantic_anomaly_flags, strict=True)
+    )
     role_swap_ratio = role_swap_rows / role_swap_eligible if role_swap_eligible else 0.0
     rejection_reason = ""
     nonaggregate_anomalies = semantic_anomaly_rows - aggregate_anomaly_rows
@@ -864,9 +933,15 @@ def _candidate_from_batch(
         canonical_coverage = min(canonical_rows / expected_count, 1.0)
     else:
         canonical_coverage = canonical_rows / max(len(transactions), 1)
-    field_completeness = _batch_field_completeness(retained_transactions, normalize_fn, plugin)
+    field_completeness = _batch_field_completeness(
+        retained_transactions,
+        normalize_fn,
+        plugin,
+        normalized_rows=normalized_rows,
+    )
     source_column_width = _batch_raw_width(retained_transactions)
     source_page_coverage = _candidate_source_page_coverage(retained_transactions)
+    source_fragment_coverage = _candidate_source_fragment_coverage(retained_transactions)
     native_cell_coverage = _candidate_native_cell_coverage(retained_transactions)
     balance_chain_score = _candidate_balance_chain_score(normalized_rows)
     sequence_continuity = _candidate_sequence_continuity(normalized_rows, retained_transactions)
@@ -891,6 +966,7 @@ def _candidate_from_batch(
         normalize_fn=normalize_fn,
         canonical_coverage=canonical_coverage,
         source_page_coverage=source_page_coverage,
+        source_fragment_coverage=source_fragment_coverage,
         extraction_confidence=extraction_confidence,
         source_column_width=source_column_width,
         sequence_continuity=sequence_continuity,
@@ -1063,6 +1139,7 @@ def _is_semantically_comparable_fuller_candidate(
     return (
         candidate_density >= selected_density - 0.01
         and candidate.canonical_coverage >= selected.canonical_coverage - 0.03
+        and candidate.source_fragment_coverage >= selected.source_fragment_coverage - 0.01
         and candidate.source_page_coverage >= selected.source_page_coverage - 0.05
         and candidate.field_completeness >= selected.field_completeness - 0.05
         and balance_is_comparable
@@ -1104,6 +1181,182 @@ def _candidate_source_pages(transactions: list[dict[str, Any]]) -> set[int]:
         if 0 < first_page <= last_page and last_page - first_page <= 10_000:
             pages.update(range(first_page, last_page + 1))
     return pages
+
+
+def _candidate_is_safe_page_component(candidate: BankTableCandidate) -> bool:
+    """Return whether a candidate can safely contribute a disjoint page span."""
+
+    row_count = len(candidate.records)
+    pages = _candidate_source_pages(candidate.records)
+    return bool(
+        row_count
+        and pages
+        and candidate.canonical_rows / row_count >= 0.99
+        and candidate.canonical_coverage >= 0.99
+        and candidate.source_page_coverage >= 0.99
+        and candidate.field_completeness >= 0.95
+        and candidate.balance_chain_score >= 0.45
+        and not candidate.rejection_reason
+        and pages == set(range(min(pages), max(pages) + 1))
+    )
+
+
+def _candidate_is_safe_material_partial_component(
+    candidate: BankTableCandidate,
+    selected: BankTableCandidate,
+) -> bool:
+    """Return whether a disjoint partial plane adds many validated rows safely."""
+
+    row_count = len(candidate.records)
+    pages = _candidate_source_pages(candidate.records)
+    evidence = candidate.expected_rows
+    return bool(
+        row_count
+        and len(pages) >= 2
+        and pages.isdisjoint(_candidate_source_pages(selected.records))
+        and candidate.canonical_rows >= max(25, selected.canonical_rows * 2)
+        and candidate.canonical_rows / row_count >= 0.90
+        and candidate.canonical_coverage >= 0.90
+        and candidate.source_page_coverage >= 0.99
+        and candidate.field_completeness >= 0.95
+        and candidate.balance_chain_score >= 0.90
+        and candidate.source_column_width >= 4.0
+        and not candidate.rejection_reason
+        and evidence is not None
+        and evidence.count >= candidate.canonical_rows
+        and evidence.source in _ROW_PLANE_COUNT_SOURCES
+    )
+
+
+def _material_source_disjoint_components(
+    selected: BankTableCandidate,
+    candidates: list[BankTableCandidate],
+) -> list[BankTableCandidate]:
+    """Preserve a large validated partial plane without claiming completeness."""
+
+    supplements = [
+        candidate
+        for candidate in candidates
+        if candidate is not selected and _candidate_is_safe_material_partial_component(candidate, selected)
+    ]
+    if not supplements:
+        return [selected]
+    supplement = max(
+        supplements,
+        key=lambda candidate: (
+            candidate.canonical_rows,
+            candidate.canonical_rows / max(len(candidate.records), 1),
+            candidate.field_completeness,
+            candidate.balance_chain_score,
+            candidate.score,
+        ),
+    )
+    components = [selected, supplement]
+    components.sort(key=lambda candidate: min(_candidate_source_pages(candidate.records)))
+    canonical_total = sum(candidate.canonical_rows for candidate in components)
+    authoritative_counts = {
+        evidence.count
+        for candidate in candidates
+        if (evidence := candidate.expected_rows) is not None
+        and evidence.confidence >= 0.85
+        and evidence.source in _ISSUER_ROW_COUNT_SOURCES
+    }
+    if authoritative_counts and canonical_total > max(authoritative_counts):
+        return [selected]
+    return components
+
+
+def _source_disjoint_candidate_components(
+    selected: BankTableCandidate,
+    candidates: list[BankTableCandidate],
+) -> list[BankTableCandidate]:
+    """Return an exact, source-disjoint page cover anchored by ``selected``.
+
+    Acquisition routes are alternatives when they observe the same pages, but
+    long digital statements can expose adjacent physical components to
+    different routes.  Treating those components as competing whole-document
+    candidates discards valid pages.  Composition is allowed only when every
+    component is locally canonical, has complete provenance, and the chosen
+    components form a contiguous exact cover of all safely represented pages.
+    """
+
+    if not _candidate_is_safe_page_component(selected):
+        return [selected]
+    selected_reliable = _candidate_reliable_count_coverage(selected)
+    if selected_reliable is not None and selected_reliable >= 0.99:
+        return [selected]
+
+    eligible = [candidate for candidate in candidates if _candidate_is_safe_page_component(candidate)]
+    page_universe = set().union(*(_candidate_source_pages(candidate.records) for candidate in eligible))
+    if not page_universe or page_universe != set(range(min(page_universe), max(page_universe) + 1)):
+        return _material_source_disjoint_components(selected, candidates)
+
+    selected_pages = _candidate_source_pages(selected.records)
+    missing_pages = page_universe - selected_pages
+    if not missing_pages:
+        return _material_source_disjoint_components(selected, candidates)
+
+    def component_rank(candidate: BankTableCandidate) -> tuple[float, ...]:
+        return (
+            candidate.canonical_rows / max(len(candidate.records), 1),
+            candidate.source_fragment_coverage,
+            candidate.field_completeness,
+            candidate.balance_chain_score,
+            candidate.source_column_width,
+            candidate.score,
+            float(candidate.canonical_rows),
+        )
+
+    # Candidates over identical pages are alternative planes.  Retain only
+    # the strongest one before solving the disjoint cover.
+    by_pages: dict[frozenset[int], BankTableCandidate] = {}
+    for candidate in eligible:
+        if candidate is selected:
+            continue
+        pages = frozenset(_candidate_source_pages(candidate.records))
+        if not pages or not pages.issubset(missing_pages):
+            continue
+        incumbent = by_pages.get(pages)
+        if incumbent is None or component_rank(candidate) > component_rank(incumbent):
+            by_pages[pages] = candidate
+
+    options = list(by_pages.values())
+
+    def exact_cover(remaining: set[int]) -> list[BankTableCandidate] | None:
+        if not remaining:
+            return []
+        first_page = min(remaining)
+        matches = [
+            candidate
+            for candidate in options
+            if first_page in _candidate_source_pages(candidate.records)
+            and _candidate_source_pages(candidate.records).issubset(remaining)
+        ]
+        matches.sort(key=lambda candidate: (len(_candidate_source_pages(candidate.records)), component_rank(candidate)), reverse=True)
+        for candidate in matches:
+            pages = _candidate_source_pages(candidate.records)
+            tail = exact_cover(remaining - pages)
+            if tail is not None:
+                return [candidate, *tail]
+        return None
+
+    supplements = exact_cover(set(missing_pages))
+    if not supplements:
+        return _material_source_disjoint_components(selected, candidates)
+    components = [selected, *supplements]
+    components.sort(key=lambda candidate: min(_candidate_source_pages(candidate.records)))
+
+    canonical_total = sum(candidate.canonical_rows for candidate in components)
+    authoritative_counts = {
+        evidence.count
+        for candidate in candidates
+        if (evidence := candidate.expected_rows) is not None
+        and evidence.confidence >= 0.85
+        and evidence.source in _ISSUER_ROW_COUNT_SOURCES
+    }
+    if authoritative_counts and canonical_total not in authoritative_counts:
+        return [selected]
+    return components
 
 
 def _candidate_overlap_signature(
@@ -1232,6 +1485,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
             evidence_authority,
             float(evidence.count) if reliable_coverage is not None and evidence is not None else 0.0,
             candidate.canonical_coverage,
+            candidate.source_fragment_coverage,
             candidate.sequence_continuity,
             candidate.source_page_coverage,
             candidate.field_completeness,
@@ -1258,6 +1512,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         )
         and candidate.canonical_rows >= selected.canonical_rows
         and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
+        and candidate.source_fragment_coverage >= selected.source_fragment_coverage - 0.01
         and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
         and candidate.field_completeness >= selected.field_completeness - 0.01
         and candidate.balance_chain_score >= selected.balance_chain_score - 0.01
@@ -1281,6 +1536,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
         and len(candidate.records) >= len(selected.records)
         and candidate.canonical_rows >= selected.canonical_rows
         and candidate.canonical_coverage >= selected.canonical_coverage - 0.01
+        and candidate.source_fragment_coverage >= selected.source_fragment_coverage - 0.01
         and candidate.source_page_coverage >= selected.source_page_coverage - 0.01
         and candidate.field_completeness >= selected.field_completeness - 0.01
         and (candidate.balance_chain_score >= selected.balance_chain_score - 0.01)
@@ -1317,6 +1573,7 @@ def _select_candidate(candidates: list[BankTableCandidate]) -> tuple[BankTableCa
             )
     reason = (
         f"score={selected.score:.3f}:canonical_coverage={selected.canonical_coverage:.3f}:"
+        f"fragment_coverage={selected.source_fragment_coverage:.3f}:"
         f"sequence_continuity={selected.sequence_continuity:.3f}:"
         f"source_coverage={selected.source_page_coverage:.3f}:"
         f"balance_chain={selected.balance_chain_score:.3f}"
@@ -1343,6 +1600,8 @@ def _eligible_strategy_ids(detection: StyleDetectionResult, ctx: StyleContext) -
         return strategy_ids
     if policy.allow_semantic_text:
         strategy_ids.append("semantic_text")
+    if policy.allow_schema_guided_page_text:
+        strategy_ids.append("schema_guided_page_text")
     if policy.allow_physical_tables:
         strategy_ids.append("physical_table")
     if policy.allow_positioned_records:
@@ -2165,6 +2424,26 @@ def _collect_table_candidates(
             confidence=0.65,
         )
 
+    schema_guided = (
+        recover_schema_guided_page_text(ctx.parse_result, source_route=policy.route.value)
+        if policy.allow_schema_guided_page_text
+        else None
+    )
+    if schema_guided is not None and schema_guided.records:
+        add(
+            "schema_guided_page_text",
+            schema_guided.records,
+            lambda transaction: signed_amount.normalize_record(transaction, plugin),
+            "schema_guided_page_text",
+            _candidate_expected_rows(
+                source_evidence,
+                count=schema_guided.expected_rows,
+                source="schema_guided_page_text_rows",
+                confidence=0.80,
+            ),
+            confidence=0.92,
+        )
+
     physical_tables = (
         collect_physical_tables_from_parse_result(ctx.parse_result) if policy.allow_physical_tables else []
     )
@@ -2405,11 +2684,56 @@ class BankStyleParserRegistry:
         self.last_selection_diagnostics = diagnostics
         transactions: list[dict[str, Any]] = []
         normalize_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+        record_normalizers: dict[int, Callable[[dict[str, Any]], dict[str, Any]] | None] = {}
         if selected is not None:
-            rejected = set(selected.rejected_row_indexes)
-            transactions = selected.records
+            components = _source_disjoint_candidate_components(selected, candidates)
+            rejected_count = sum(len(candidate.rejected_row_indexes) for candidate in components)
+            transactions = [record for candidate in components for record in candidate.records]
+            for candidate in components:
+                for record in candidate.records:
+                    record_normalizers[id(record)] = candidate.normalize_fn
             normalize_fn = selected.normalize_fn
             selected_expected = selected.expected_rows
+            deployment_source = selected.source
+            if len(components) > 1:
+                component_ids = [candidate.candidate_id for candidate in components]
+                canonical_total = sum(candidate.canonical_rows for candidate in components)
+                composed_pages = set().union(
+                    *(_candidate_source_pages(candidate.records) for candidate in components)
+                )
+                exact_contiguous_cover = (
+                    all(_candidate_is_safe_page_component(candidate) for candidate in components)
+                    and composed_pages
+                    == set(range(min(composed_pages), max(composed_pages) + 1))
+                )
+                matching_evidence = [
+                    evidence
+                    for candidate in candidates
+                    if (evidence := candidate.expected_rows) is not None and evidence.count == canonical_total
+                ]
+                if matching_evidence:
+                    selected_expected = max(matching_evidence, key=lambda evidence: evidence.confidence)
+                deployment_source = "source_disjoint_page_components"
+                diagnostics.update(
+                    {
+                        "selected_candidate": f"composite:{'+'.join(component_ids)}",
+                        "composed_candidates": component_ids,
+                        "composition_reason": (
+                            "contiguous_exact_source_page_cover"
+                            if exact_contiguous_cover
+                            else "material_source_disjoint_partial_recovery"
+                        ),
+                        "composed_canonical_rows": canonical_total,
+                    }
+                )
+            if selected_expected is not None:
+                diagnostics.update(
+                    {
+                        "selected_expected_rows": selected_expected.count,
+                        "selected_expected_source": selected_expected.source,
+                        "selected_expected_confidence": selected_expected.confidence,
+                    }
+                )
             if ctx.reconstruction is not None:
                 retained_evidence_source = ctx.reconstruction.expected_evidence_source
                 retained_evidence_confidence = ctx.reconstruction.expected_evidence_confidence
@@ -2428,7 +2752,7 @@ class BankStyleParserRegistry:
                     retained_expected_rows = 0
                 ctx.reconstruction = replace(
                     ctx.reconstruction,
-                    source=selected.source,
+                    source=deployment_source,
                     expected_primary_rows=(
                         selected_expected.count
                         if selected_expected is not None and selected_expected.confidence >= 0.85
@@ -2448,9 +2772,9 @@ class BankStyleParserRegistry:
                 )
             logger.info(
                 "[BankStyleRegistry] selected candidate=%s rows=%d rejected=%d reason=%s",
-                selected.candidate_id,
+                diagnostics["selected_candidate"],
                 len(transactions),
-                len(rejected),
+                rejected_count,
                 diagnostics["selection_reason"],
             )
 
@@ -2469,8 +2793,12 @@ class BankStyleParserRegistry:
 
             normalize_fn = _plugin_normalize
 
+        def _normalizer_for(raw: dict[str, Any]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+            per_record = record_normalizers.get(id(raw), normalize_fn)
+            return per_record or plugin._normalize
+
         def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
-            normalized = normalize_fn(raw)
+            normalized = _normalizer_for(raw)(raw)
             # ``amount_cny`` is not a second source business fact.  It is only
             # valid when an actual FX conversion was evidenced, which none of
             # the bank style normalizers performs.  Keep the source currency
@@ -2479,7 +2807,7 @@ class BankStyleParserRegistry:
             return ensure_canonical_normalized(normalized, plugin.standard_fields)
 
         def _canonical_raw(raw: dict[str, Any], normalized: dict[str, Any]) -> dict[str, Any]:
-            if normalize_fn is compact_merged.normalize_record:
+            if _normalizer_for(raw) is compact_merged.normalize_record:
                 return compact_merged.canonical_raw_values(raw, normalized, plugin)
             return plugin._canonical_raw_values(raw, normalized)
 

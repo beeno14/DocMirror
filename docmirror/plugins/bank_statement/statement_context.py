@@ -1710,17 +1710,59 @@ def _statement_disclaimer_fact(
     header_rows: Sequence[Sequence[dict[str, Any]]],
     page: int,
 ) -> _HeaderFact | None:
-    candidates = [
-        (atom, _atomic_disclaimer_value(atom.get("text")))
-        for row in header_rows
-        for atom in row
-        if _is_statement_disclaimer(atom.get("text"))
-    ]
-    values = {value for _atom, value in candidates if value}
+    row_candidates: list[tuple[int, list[dict[str, Any]], str]] = []
+    for row_index, row in enumerate(header_rows):
+        ordered = sorted(row, key=lambda atom: float(atom["bbox"][0]))
+        text = "".join(_nfkc(atom.get("text")) for atom in ordered if _nfkc(atom.get("text")))
+        if text:
+            row_candidates.append((row_index, ordered, text))
+
+    seed_indexes = {
+        index
+        for index, (_row_index, _atoms, text) in enumerate(row_candidates)
+        if _is_statement_disclaimer(text)
+    }
+    if not seed_indexes:
+        return None
+
+    selected_indexes = set(seed_indexes)
+    for seed_index in sorted(seed_indexes):
+        cursor = seed_index
+        while cursor + 1 < len(row_candidates):
+            _row_index, current_atoms, current_text = row_candidates[cursor]
+            next_row_index, next_atoms, next_text = row_candidates[cursor + 1]
+            if next_row_index != row_candidates[cursor][0] + 1:
+                break
+            if not re.search(r"[,，;；:：]\s*$", current_text):
+                break
+            current_bottom = max(float(atom["bbox"][3]) for atom in current_atoms)
+            next_top = min(float(atom["bbox"][1]) for atom in next_atoms)
+            current_height = max(float(atom["bbox"][3]) - float(atom["bbox"][1]) for atom in current_atoms)
+            if next_top - current_bottom > max(6.0, current_height * 1.5):
+                break
+            if re.search(r"^\s*第\s*\d+\s*页", next_text) or _is_transaction_data_row(next_atoms):
+                break
+            selected_indexes.add(cursor + 1)
+            cursor += 1
+
+    runs: list[list[int]] = []
+    for index in sorted(selected_indexes):
+        if not runs or index > runs[-1][-1] + 1:
+            runs.append([index])
+        else:
+            runs[-1].append(index)
+
+    candidates: list[tuple[list[dict[str, Any]], str]] = []
+    for run in runs:
+        atoms = [atom for index in run for atom in row_candidates[index][1]]
+        value = "".join(_atomic_disclaimer_value(row_candidates[index][2]) for index in run)
+        if value:
+            candidates.append((atoms, value))
+    values = {value for _atoms, value in candidates if value}
     if len(values) != 1:
         return None
     value = next(iter(values))
-    atoms = [atom for atom, atomic_value in candidates if atomic_value == value]
+    atoms = [atom for candidate_atoms, candidate_value in candidates if candidate_value == value for atom in candidate_atoms]
     first = atoms[0]
     composite = next(
         (_nfkc(atom.get("text")) for atom in atoms if _FOOTER_CUTOFF_RE.search(_nfkc(atom.get("text")))),
@@ -1736,16 +1778,22 @@ def _statement_disclaimer_fact(
         _bbox_union(atoms),
         tuple(dict.fromkeys(str(atom.get("id") or "") for atom in atoms if str(atom.get("id") or ""))),
         _context_source_kind(atoms),
-        derivation="atomic_notice_from_composite_footer" if composite else "",
+        derivation=(
+            "atomic_notice_from_composite_footer"
+            if composite
+            else "joined_adjacent_statement_disclaimer_lines"
+            if len(atoms) > 1
+            else ""
+        ),
         source_detail=(
             {
                 "page": page,
-                "source_text": composite,
+                "source_text": composite or "".join(_nfkc(atom.get("text")) for atom in atoms),
                 "raw_value": value,
                 "source": _context_source_kind(atoms),
                 "normalized_only": False,
             }
-            if composite
+            if composite or len(atoms) > 1
             else None
         ),
     )
@@ -3751,14 +3799,26 @@ def _fact_is_represented_by_header(
     fact: _HeaderFact,
     header_records: Sequence[dict[str, Any]],
 ) -> bool:
-    if fact.field_key.startswith("source_header_"):
-        return False
     header = _header_record_for_page(fact.page, header_records)
     if header is None:
         return False
     normalized = header.get("normalized") if isinstance(header.get("normalized"), dict) else {}
-    observed = normalized.get(fact.field_key)
     expected = fact.normalized_value
+    is_disclaimer_fact = fact.field_key == "statement_disclaimer" or _is_statement_disclaimer(
+        f"{fact.raw_name}:{fact.raw_value}"
+    )
+    if is_disclaimer_fact:
+        # Positioned text extractors can expose both the first physical line
+        # and the reconstructed complete disclaimer.  Once the complete header
+        # fact contains that exact normalized fragment, emitting the fragment
+        # again as generic source metadata is redundant rather than lossless.
+        observed_compact = _compact(normalized.get("statement_disclaimer"))
+        expected_compact = _compact(expected)
+        if expected_compact and expected_compact in observed_compact:
+            return True
+    if fact.field_key.startswith("source_header_"):
+        return False
+    observed = normalized.get(fact.field_key)
     if isinstance(observed, (int, float)) or isinstance(expected, (int, float)):
         return observed == expected
     return _nfkc(observed) == _nfkc(expected) and bool(_nfkc(expected))

@@ -213,6 +213,101 @@ def test_zero_amount_business_row_is_exempt_from_direction_coverage() -> None:
     assert "direction_coverage_incomplete" not in failures
 
 
+def test_count_proven_transaction_is_retained_when_only_direction_is_unresolved() -> None:
+    records = [
+        {
+            "normalized": {"date": "2023-09-01", "amount": 10.0, "direction": "income"},
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "normalized": {
+                "date": "2023-09-02",
+                "amount": 20.0,
+                "direction": "",
+                "balance": 120.0,
+                "summary": "转账",
+            },
+            "source": {"source_page": 2, "page_range": [2, 2]},
+        },
+    ]
+    canonical, *_accounting = extract_pipeline._row_accounting_view(records)
+
+    delivered = extract_pipeline._retain_count_proven_direction_unresolved_rows(
+        records,
+        canonical,
+        RowCountEvidence(2, "positioned_date_anchors", 0.80),
+    )
+
+    assert delivered == records
+    assert delivered[1]["normalized"]["direction"] == ""
+
+
+def test_deployment_count_evidence_survives_as_a_bounded_acceptance_fact() -> None:
+    meta = SimpleNamespace(
+        candidate_diagnostics=[
+            {
+                "selected_expected_rows": 570,
+                "selected_expected_source": "positioned_date_anchors",
+                "selected_expected_confidence": 0.80,
+            }
+        ]
+    )
+
+    evidence = extract_pipeline._deployment_row_count_evidence(meta, 570)
+
+    assert evidence == RowCountEvidence(570, "positioned_date_anchors", 0.80)
+    assert extract_pipeline._deployment_row_count_evidence(meta, 500) is None
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        RowCountEvidence(1, "positioned_date_anchors", 0.80),
+        RowCountEvidence(2, "candidate_rows", 0.80),
+        RowCountEvidence(2, "positioned_date_anchors", 0.79),
+    ],
+)
+def test_unresolved_transaction_is_not_retained_without_exact_independent_count(evidence: RowCountEvidence) -> None:
+    records = [
+        {
+            "normalized": {"date": "2023-09-01", "amount": 10.0, "direction": "income"},
+            "source": {"source_page": 1, "page_range": [1, 1]},
+        },
+        {
+            "normalized": {"date": "2023-09-02", "amount": 20.0, "direction": ""},
+            "source": {"source_page": 2, "page_range": [2, 2]},
+        },
+    ]
+    canonical, *_accounting = extract_pipeline._row_accounting_view(records)
+
+    assert extract_pipeline._retain_count_proven_direction_unresolved_rows(records, canonical, evidence) == canonical
+
+
+def test_physical_count_retains_transaction_core_but_not_repeated_header_furniture() -> None:
+    canonical_record = {
+        "normalized": {"date": "2023-09-01", "amount": 10.0, "direction": "income"},
+        "source": {"source_page": 1, "page_range": [1, 1]},
+    }
+    unresolved_record = {
+        "normalized": {"date": "2023-09-02", "amount": 20.0, "direction": "", "balance": 120.0},
+        "source": {"source_page": 2, "page_range": [2, 2]},
+    }
+    repeated_header = {
+        "normalized": {"date": "", "amount": None, "direction": "", "summary": "Balance"},
+        "source": {"source_page": 2, "page_range": [2, 2]},
+    }
+    records = [canonical_record, unresolved_record, repeated_header]
+
+    delivered = extract_pipeline._retain_count_proven_direction_unresolved_rows(
+        records,
+        [canonical_record],
+        RowCountEvidence(0, "none", 0.0),
+        physical_expected=2,
+    )
+
+    assert delivered == [canonical_record, unresolved_record]
+
+
 def test_lazy_final_gate_failure_forces_one_fresh_eager_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
